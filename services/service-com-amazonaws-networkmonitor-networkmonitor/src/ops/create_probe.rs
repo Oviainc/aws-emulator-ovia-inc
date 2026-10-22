@@ -138,7 +138,8 @@ impl From<CreateProbeErrorModeled> for CreateProbeError {
 /// This service's `ValidationException` (HTTP 400), carrying `message`.
 ///
 /// Used for the probe rules the model documents in prose but its constraints
-/// cannot express — see [`crate::state::build_probe`].
+/// cannot express — the `sourceArn` subnet rule and the `destination` /
+/// `destinationPort` rules; see [`crate::state::build_probe`].
 fn validation(message: String) -> CreateProbeError {
     CreateProbeErrorModeled::ValidationException(ValidationException {
         message: Some(message),
@@ -256,7 +257,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.monitors.contains_key(&input.monitor_name) {
             return Err(CreateProbeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("monitor {} does not exist", input.monitor_name)),
+                    message: Some(crate::state::monitor_not_found_message(
+                        &input.monitor_name,
+                    )),
                 },
             )
             .into());
@@ -282,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let probe_id = probe.probe_id.clone();
         let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
             CreateProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("monitor {} does not exist", input.monitor_name)),
+                message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
             })
         })?;
         monitor.probes.insert(probe_id.clone(), probe);

@@ -2,9 +2,12 @@
 
 //! @op CreateMonitor
 //! Inserts a monitor record — with a probe record for each entry in `probes` —
-//! into [`crate::state`] and answers from it. A second create naming a monitor
-//! that already exists is a RETRY only when it repeats the stored
-//! `clientToken`; any other repeat is refused with `ConflictException`.
+//! into [`crate::state`] and answers from it. A monitor created with no probe
+//! has nothing to aggregate, so it is stored (and reported) `INACTIVE`; one
+//! created with probes is `PENDING` until the clock makes its activation due.
+//! A second create naming a monitor that already exists is a RETRY only when it
+//! repeats the stored `clientToken`; any other repeat is refused with
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -251,12 +254,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        if let Some(existing) = store.monitors.get(&input.monitor_name) {
+        if store.monitors.contains_key(&input.monitor_name) {
+            // The conflict is stated from the request and the caller identity
+            // alone (see `crate::state::monitor_conflict_message`), so it names
+            // nothing this emulator generated.
             return Err(CreateMonitorErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "monitor {} already exists ({})",
-                        existing.monitor_name, existing.monitor_arn
+                    message: Some(crate::state::monitor_conflict_message(
+                        &input.monitor_name,
                     )),
                 },
             )
@@ -297,7 +302,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut monitor = crate::state::Monitor {
             monitor_arn: crate::state::monitor_arn(&region, &input.monitor_name),
             monitor_name: input.monitor_name.clone(),
-            state: crate::state::MONITOR_STATE_PENDING.to_string(),
+            // A monitor with no probe has nothing to aggregate, so it is stored
+            // `INACTIVE`; one created WITH probes is `PENDING` until the clock
+            // makes its activation due.
+            state: crate::state::initial_monitor_state(!probes.is_empty()).to_string(),
             aggregation_period,
             tags: monitor_tags,
             probes,
@@ -306,8 +314,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: now,
             client_token: input.client_token.clone(),
         };
-        // A monitor with no probes has nothing to aggregate, so nothing is due;
-        // one created WITH probes is owed its activation.
+        // Nothing is due for a probe-free monitor; one created with probes is
+        // owed its activation.
         if !monitor.probes.is_empty() {
             monitor.schedule_activation(now);
         }

@@ -151,7 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.monitors.remove(&input.monitor_name).is_none() {
             return Err(DeleteMonitorErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("monitor {} does not exist", input.monitor_name)),
+                    message: Some(crate::state::monitor_not_found_message(
+                        &input.monitor_name,
+                    )),
                 },
             )
             .into());

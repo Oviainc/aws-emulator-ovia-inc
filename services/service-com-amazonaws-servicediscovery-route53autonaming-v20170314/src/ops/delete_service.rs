@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one stored service, resolved by its id or its ARN, together with the
+//! `(namespace, name)` index entry that reaches it — so the name is free for a new
+//! service and every later call naming the deleted one answers `ServiceNotFound`.
+//! Everything the service owns (its tags, and the service attributes a future
+//! `UpdateServiceAttributes` will store) lives on the `ServiceRecord`, so it is dropped
+//! with the record, which is what "and all associated service attributes" means. A
+//! service that still holds registered instances is refused with the modelled
+//! `ResourceInUse` and left exactly as it was.
+//!
+//! `DeleteService` files NO operation record: its response carries no `OperationId` and
+//! the model's `OperationType` enum has no `DELETE_SERVICE` value.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +144,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteService"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteServiceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        let mut state = state.lock();
+
+        // `Id` is modelled as `Arn`, and the docs say a service whose namespace is shared
+        // with the account is named by its ARN, so both forms resolve to the one record.
+        let Some(service_id) = state.resolve_service_id(&input.id) else {
+            return Err(DeleteServiceErrorModeled::ServiceNotFound(ServiceNotFound {
+                message: Some(format!(
+                    "No service exists with the specified ID {}.",
+                    input.id
+                )),
+            })
+            .into());
+        };
+
+        // Documented on this operation: "If the service still contains one or more
+        // registered instances, the request fails." Refused BEFORE anything is removed,
+        // so a refused delete leaves the service and its instances untouched.
+        let instance_count = state
+            .services
+            .get(&service_id)
+            .map(crate::state::ServiceRecord::instance_count)
+            .expect("the resolved service id is present");
+        if instance_count > 0 {
+            return Err(DeleteServiceErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "The service {service_id} can't be deleted because it still contains \
+                     {instance_count} registered instance(s)."
+                )),
+            })
+            .into());
+        }
+
+        let removed = state
+            .services
+            .remove(&service_id)
+            .expect("the resolved service id is present");
+        // Keep the name index in step with the record map. The entry is dropped only when
+        // it still reaches the service just removed, so a service re-created under the
+        // same name is never unindexed by a later delete naming the old id.
+        let name_key = (removed.namespace_id.clone(), removed.name.clone());
+        if state
+            .service_ids_by_namespace_and_name
+            .get(&name_key)
+            .is_some_and(|indexed| *indexed == service_id)
+        {
+            state.service_ids_by_namespace_and_name.remove(&name_key);
+        }
+
+        Ok(DeleteServiceOutput {})
     }
 }

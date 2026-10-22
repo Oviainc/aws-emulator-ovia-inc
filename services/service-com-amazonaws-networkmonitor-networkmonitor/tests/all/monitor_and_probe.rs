@@ -11,6 +11,8 @@
 //!   makes every read of that name 404 `ResourceNotFoundException`;
 //! * `aggregationPeriod` is one of the two values the model documents, and `60`
 //!   when the request names none;
+//! * a monitor's `state` follows the probes it holds: `INACTIVE` with none,
+//!   `PENDING` until the clock makes its activation due, then `ACTIVE`;
 //! * a probe's `addressFamily` is derived from its `destination`, and the
 //!   documented `destinationPort` rules (required for TCP, at least `1`) are
 //!   enforced where the model's own constraints cannot express them;
@@ -36,10 +38,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host, Signature=00";
 
 /// The region in [`AUTHORIZATION`]'s credential scope.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The one account id a generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Longer than the monitor's activation span, so a read after this sleep
 /// observes the `PENDING` -> `ACTIVE` transition the clock has already made due.
@@ -49,18 +51,18 @@ const ACCOUNT: &str = "000000000000";
 /// `Cargo.toml` that declares it is not editable from here, so the `time`
 /// feature is not available. The handlers read the wall clock, so the wait has
 /// to be real either way.
-const PAST_ACTIVATION: Duration = Duration::from_millis(900);
+pub(crate) const PAST_ACTIVATION: Duration = Duration::from_millis(900);
 
 /// The alphabet the `ResourceName` pattern admits: `^[a-zA-Z0-9_-]+$`.
 const NAME_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
 
 /// A subnet ARN to use as a probe's `sourceArn`; the model types it as `Arn`
 /// with `@length(20..2048)` and `@pattern("^arn:.*$")`.
-fn source_arn() -> String {
+pub(crate) fn source_arn() -> String {
     format!("arn:aws:ec2:{REGION}:{ACCOUNT}:subnet/subnet-0123456789abcdef0")
 }
 
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -72,7 +74,7 @@ fn router() -> MultiServiceRouter {
 
 /// Send one request and return its status and parsed JSON body (`Value::Null`
 /// for an empty body).
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -101,29 +103,29 @@ async fn call(
 }
 
 /// The wire error code of an error response (`__type`), or `"<none>"`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<none>")
         .to_string()
 }
 
-fn string_at(body: &Value, member: &str) -> String {
+pub(crate) fn string_at(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
 }
 
-async fn create_monitor(router: &MultiServiceRouter, body: &str) -> (u16, Value) {
+pub(crate) async fn create_monitor(router: &MultiServiceRouter, body: &str) -> (u16, Value) {
     call(router, "POST", "/monitors", Some(body)).await
 }
 
-async fn get_monitor(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
+pub(crate) async fn get_monitor(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
     call(router, "GET", &format!("/monitors/{name}"), None).await
 }
 
-async fn create_probe(router: &MultiServiceRouter, name: &str, body: &str) -> (u16, Value) {
+pub(crate) async fn create_probe(router: &MultiServiceRouter, name: &str, body: &str) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -133,13 +135,13 @@ async fn create_probe(router: &MultiServiceRouter, name: &str, body: &str) -> (u
     .await
 }
 
-async fn list_monitors(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
+pub(crate) async fn list_monitors(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
     call(router, "GET", &format!("/monitors{query}"), None).await
 }
 
 /// The `monitorName`s a `ListMonitors` page reports, in the order it reports
 /// them.
-fn page_names(body: &Value) -> Vec<String> {
+pub(crate) fn page_names(body: &Value) -> Vec<String> {
     body.get("monitors")
         .and_then(Value::as_array)
         .map(|monitors| {
@@ -152,7 +154,7 @@ fn page_names(body: &Value) -> Vec<String> {
 }
 
 /// The probes a `GetMonitor` body reports.
-fn probes_of(body: &Value) -> Vec<Value> {
+pub(crate) fn probes_of(body: &Value) -> Vec<Value> {
     body.get("probes")
         .and_then(Value::as_array)
         .cloned()
@@ -161,7 +163,7 @@ fn probes_of(body: &Value) -> Vec<Value> {
 
 /// Whether `id` satisfies the model's `ProbeId` pattern,
 /// `^probe-[a-z0-9A-Z-]{21,64}$`.
-fn is_modelled_probe_id(id: &str) -> bool {
+pub(crate) fn is_modelled_probe_id(id: &str) -> bool {
     let Some(rest) = id.strip_prefix("probe-") else {
         return false;
     };
@@ -172,7 +174,7 @@ fn is_modelled_probe_id(id: &str) -> bool {
 /// A deterministic name of `length` characters drawn from [`NAME_ALPHABET`], so
 /// the length bound is exercised across the whole admitted alphabet rather than
 /// on one hand-picked spelling.
-fn name_of_length(length: usize) -> String {
+pub(crate) fn name_of_length(length: usize) -> String {
     (0..length)
         .map(|i| char::from(NAME_ALPHABET[(i * 7 + length) % NAME_ALPHABET.len()]))
         .collect()
@@ -252,8 +254,8 @@ async fn a_monitor_round_trips_through_create_get_list_and_delete() {
         );
         assert_eq!(
             string_at(&created, "state"),
-            "PENDING",
-            "case {case:?}: a monitor with no probes is PENDING, got {created:?}"
+            "INACTIVE",
+            "case {case:?}: a monitor with no probes is INACTIVE, got {created:?}"
         );
         assert_eq!(
             created.get("aggregationPeriod").and_then(Value::as_i64),
@@ -290,8 +292,8 @@ async fn a_monitor_round_trips_through_create_get_list_and_delete() {
         );
         assert_eq!(
             string_at(&got, "state"),
-            "PENDING",
-            "case {case:?}: a monitor with no probes stays PENDING, got {got:?}"
+            "INACTIVE",
+            "case {case:?}: a monitor with no probes stays INACTIVE, got {got:?}"
         );
         assert!(
             probes_of(&got).is_empty(),
@@ -343,21 +345,50 @@ async fn a_monitor_round_trips_through_create_get_list_and_delete() {
 /// none. The table carries both published values, the absent case, and values
 /// either side of them — including `29`, one below the shape's own
 /// `@range(min: 30)`.
+///
+/// The two refusal CLASSES are distinguished too: a value outside the shape's
+/// own `@range` is a body the front door refuses (`BadRequestException`), while
+/// one inside the range but outside the documented value list is refused by the
+/// handler with the modelled `ValidationException`.
 #[tokio::test]
 async fn aggregation_period_accepts_only_the_documented_values() {
-    // (case, body fragment, expected status, expected stored period)
-    let cases: &[(&str, &str, u16, Option<i64>)] = &[
-        ("the documented floor", r#","aggregationPeriod":30"#, 200, Some(30)),
-        ("the documented default, named", r#","aggregationPeriod":60"#, 200, Some(60)),
-        ("named nowhere: the documented default", "", 200, Some(60)),
-        ("below the modelled range", r#","aggregationPeriod":29"#, 400, None),
-        ("between the two documented values", r#","aggregationPeriod":45"#, 400, None),
-        ("above both documented values", r#","aggregationPeriod":90"#, 400, None),
-        ("far above", r#","aggregationPeriod":3600"#, 400, None),
+    // (case, body fragment, expected status, expected stored period, expected error code)
+    let cases: &[(&str, &str, u16, Option<i64>, &str)] = &[
+        ("the documented floor", r#","aggregationPeriod":30"#, 200, Some(30), ""),
+        ("the documented default, named", r#","aggregationPeriod":60"#, 200, Some(60), ""),
+        ("named nowhere: the documented default", "", 200, Some(60), ""),
+        (
+            "below the modelled range",
+            r#","aggregationPeriod":29"#,
+            400,
+            None,
+            "BadRequestException",
+        ),
+        (
+            "between the two documented values",
+            r#","aggregationPeriod":45"#,
+            400,
+            None,
+            "ValidationException",
+        ),
+        (
+            "above both documented values",
+            r#","aggregationPeriod":90"#,
+            400,
+            None,
+            "ValidationException",
+        ),
+        (
+            "far above",
+            r#","aggregationPeriod":3600"#,
+            400,
+            None,
+            "ValidationException",
+        ),
     ];
 
     let router = router();
-    for (index, (case, fragment, expected_status, expected_period)) in
+    for (index, (case, fragment, expected_status, expected_period, expected_code)) in
         cases.iter().enumerate()
     {
         let name = format!("period-case-{index}");
@@ -385,8 +416,8 @@ async fn aggregation_period_accepts_only_the_documented_values() {
             None => {
                 assert_eq!(
                     error_code(&created),
-                    "ValidationException",
-                    "case {case:?}: expected ValidationException, got {created:?}"
+                    *expected_code,
+                    "case {case:?}: expected {expected_code}, got {created:?}"
                 );
                 let (status, missing) = get_monitor(&router, &name).await;
                 assert_eq!(
@@ -405,76 +436,91 @@ async fn aggregation_period_accepts_only_the_documented_values() {
 ///
 /// The table spans protocol, address family, and each published bound of
 /// `destinationPort` (`1`..`65536`) and `packetSize` (`56`..`8500`) plus one
-/// value past it.
+/// value past it. The two refusal CLASSES are distinguished: a value past a
+/// bound the MODEL declares is a body the front door refuses
+/// (`BadRequestException`), while one that only breaks a rule the model states
+/// in prose reaches the handler, which refuses it with the modelled
+/// `ValidationException`.
 #[tokio::test]
 async fn a_probe_is_stored_and_its_address_family_follows_the_destination() {
-    // (case, probe JSON, expected status, expected addressFamily)
-    let cases: &[(&str, &str, u16, &str)] = &[
+    // (case, probe JSON, expected status, expected addressFamily, expected error code)
+    let cases: &[(&str, &str, u16, &str, &str)] = &[
         (
             "the recorded case: ICMP to an IPv4 address",
             r#"{"sourceArn":"SOURCE","destination":"10.0.0.1","protocol":"ICMP","packetSize":56}"#,
             200,
             "IPV4",
+            "",
         ),
         (
             "ICMP to an IPv6 address",
             r#"{"sourceArn":"SOURCE","destination":"2001:db8::1","protocol":"ICMP","packetSize":1500}"#,
             200,
             "IPV6",
+            "",
         ),
         (
             "TCP at the documented destinationPort floor",
             r#"{"sourceArn":"SOURCE","destination":"192.0.2.10","protocol":"TCP","destinationPort":1,"packetSize":56}"#,
             200,
             "IPV4",
+            "",
         ),
         (
             "TCP at the modelled destinationPort ceiling",
             r#"{"sourceArn":"SOURCE","destination":"198.51.100.7","protocol":"TCP","destinationPort":65536,"packetSize":8500}"#,
             200,
             "IPV4",
+            "",
         ),
         (
             "TCP to an IPv6 address at the packetSize floor",
             r#"{"sourceArn":"SOURCE","destination":"2001:db8::dead:beef","protocol":"TCP","destinationPort":443,"packetSize":56}"#,
             200,
             "IPV6",
+            "",
         ),
         (
             "TCP with no destinationPort: required for TCP",
             r#"{"sourceArn":"SOURCE","destination":"203.0.113.1","protocol":"TCP","packetSize":56}"#,
             400,
             "",
+            "ValidationException",
         ),
         (
             "destinationPort 0: one below the documented floor",
             r#"{"sourceArn":"SOURCE","destination":"203.0.113.2","protocol":"TCP","destinationPort":0,"packetSize":56}"#,
             400,
             "",
+            "ValidationException",
         ),
         (
             "destinationPort 65537: one past the modelled ceiling",
             r#"{"sourceArn":"SOURCE","destination":"203.0.113.3","protocol":"TCP","destinationPort":65537,"packetSize":56}"#,
             400,
             "",
+            "BadRequestException",
         ),
         (
             "packetSize 55: one below the modelled floor",
             r#"{"sourceArn":"SOURCE","destination":"203.0.113.4","protocol":"ICMP","packetSize":55}"#,
             400,
             "",
+            "BadRequestException",
         ),
         (
             "packetSize 8501: one past the modelled ceiling",
             r#"{"sourceArn":"SOURCE","destination":"203.0.113.5","protocol":"ICMP","packetSize":8501}"#,
             400,
             "",
+            "BadRequestException",
         ),
         (
             "a destination that is not an IP address",
             r#"{"sourceArn":"SOURCE","destination":"example.internal","protocol":"ICMP","packetSize":56}"#,
             400,
             "",
+            "ValidationException",
         ),
     ];
 
@@ -483,7 +529,7 @@ async fn a_probe_is_stored_and_its_address_family_follows_the_destination() {
     assert_eq!(status, 200, "setup: CreateMonitor should succeed");
 
     let mut minted: BTreeSet<String> = BTreeSet::new();
-    for (case, probe, expected_status, expected_family) in cases {
+    for (case, probe, expected_status, expected_family, expected_code) in cases {
         let probe = probe.replace("SOURCE", &source_arn());
         let body = format!(r#"{{"probe":{probe}}}"#);
         let (status, created) = create_probe(&router, "probe-host", &body).await;
@@ -494,8 +540,8 @@ async fn a_probe_is_stored_and_its_address_family_follows_the_destination() {
         if *expected_status != 200 {
             assert_eq!(
                 error_code(&created),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {created:?}"
+                *expected_code,
+                "case {case:?}: expected {expected_code}, got {created:?}"
             );
             continue;
         }
@@ -737,7 +783,7 @@ async fn list_monitors_filters_on_state() {
             status, 200,
             "case {state:?}: expected ListMonitors 200, got {status} {body:?}"
         );
-        let expected: Vec<String> = if *state == "PENDING" {
+        let expected: Vec<String> = if *state == "INACTIVE" {
             vec!["filter-a".to_string(), "filter-b".to_string()]
         } else {
             Vec::new()
@@ -765,8 +811,8 @@ async fn list_monitors_filters_on_state() {
 
 /// The `PENDING` -> `ACTIVE` transition is owed to the CLOCK: a monitor that has
 /// a probe is `PENDING` straight after the call and `ACTIVE` once its due
-/// instant has passed, while a monitor with no probes has nothing due and stays
-/// `PENDING` however long anyone waits.
+/// instant has passed, while a monitor with no probes has nothing to aggregate,
+/// so it is `INACTIVE` with nothing due however long anyone waits.
 #[tokio::test]
 async fn a_monitor_with_probes_activates_when_the_clock_makes_it_due() {
     let router = router();
@@ -838,7 +884,7 @@ async fn a_monitor_with_probes_activates_when_the_clock_makes_it_due() {
     let (_, idle) = get_monitor(&router, "idle").await;
     assert_eq!(
         string_at(&idle, "state"),
-        "PENDING",
+        "INACTIVE",
         "case \"a monitor with no probes\": nothing is due, got {idle:?}"
     );
 
@@ -861,7 +907,7 @@ async fn a_monitor_with_probes_activates_when_the_clock_makes_it_due() {
     );
     assert_eq!(
         string_at(&emptied, "state"),
-        "PENDING",
+        "INACTIVE",
         "a monitor whose last probe was deleted has nothing to aggregate, got {emptied:?}"
     );
 }
@@ -927,7 +973,8 @@ async fn an_unstored_resource_is_reported_as_not_found() {
 ///
 /// `UpdateMonitor` and `UntagResource` are no longer among them: both are
 /// implemented, and `tests/all/update_monitor.rs` and
-/// `tests/all/resource_tags.rs` assert what they do.
+/// `tests/all/resource_tags.rs` assert what they do. Nor is `GetProbe`, which
+/// `tests/all/monitor_lifecycle_and_front_door.rs` asserts.
 ///
 /// A fixer implementing one of the rows below deletes that row in the same
 /// change: the point of the case is that a not-yet-written operation never
@@ -944,6 +991,12 @@ async fn the_unimplemented_operations_still_answer_501() {
     let cases: Vec<(&str, &str, String, Option<String>)> = vec![
         // `UpdateMonitor` used to be a row here; it is implemented now, and its
         // behaviour is pinned by `tests/all/update_monitor.rs`.
+        (
+            "UpdateProbe",
+            "PATCH",
+            format!("/monitors/still-stubbed/probes/probe-{}", "a".repeat(21)),
+            Some(r#"{"packetSize":56}"#.to_string()),
+        ),
         (
             "ListTagsForResource",
             "GET",

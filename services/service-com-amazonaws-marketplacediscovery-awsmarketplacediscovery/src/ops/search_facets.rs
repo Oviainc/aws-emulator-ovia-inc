@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchFacets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchFacets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchFacets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Counts the facet values available over the listings a `searchText`/`filters` query
+//! matches: the same match set `SearchListings` answers from, so `totalResults` and every
+//! facet count agree with what a search for the same criteria reports.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,284 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchFacets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchFacetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchFacets"))
+        let _ = ctx;
+        // The model declares no error for this operation (`OPERATIONS.md`: "Errors:
+        // (none)"), so the scaffold's 400 `ValidationException` is the only refusal channel
+        // this handler has — the same one `search_listings.rs` uses.
+        let store = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| SearchFacetsError::validation("the catalog store is unavailable"))?;
+        let state = store.lock();
+
+        let locale = crate::state::resolve_requested_locale(input.locale.as_deref())
+            .map_err(SearchFacetsError::validation)?;
+
+        let search_text = input.search_text.as_deref().unwrap_or("").trim().to_string();
+        let filters = input.filters.clone().unwrap_or_default();
+        let facet_types = requested_facet_types(input.facet_types.as_deref())
+            .map_err(SearchFacetsError::validation)?;
+
+        // `filters` are "filters to apply BEFORE retrieving facets", so both the counts and
+        // `totalResults` are computed over the one match set this query selects — the same
+        // set `SearchListings` pages over for the same `searchText` and `filters`.
+        let matches = state
+            .search_matches(locale, &search_text, &filters)
+            .map_err(SearchFacetsError::validation)?;
+        let total_results = i64::try_from(matches.len()).unwrap_or(i64::MAX);
+
+        let identity = query_identity(locale, &search_text, &filters, &facet_types);
+        let (page, next_token) = crate::state::page(
+            &facet_types,
+            input.next_token.as_deref(),
+            &identity,
+            FACET_TYPES_PER_PAGE,
+        )
+        .map_err(SearchFacetsError::validation)?;
+
+        Ok(SearchFacetsOutput {
+            total_results,
+            listing_facets: page
+                .iter()
+                .map(|facet_type| {
+                    (
+                        (*facet_type).to_string(),
+                        facet_values(&state, &matches, facet_type),
+                    )
+                })
+                .collect(),
+            next_token,
+        })
+    }
+}
+
+/// How many facet types one response carries.
+///
+/// `SearchFacets` models no `maxResults`, and `listingFacets` is keyed by `SearchFacetType`,
+/// so a response can never hold more entries than that enum has values: one page always
+/// carries every requested facet type and `nextToken` is never returned. An incoming
+/// `nextToken` is still decoded, so a token this service did not mint for this query is
+/// refused rather than silently answered from the first page.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+const FACET_TYPES_PER_PAGE: i32 = SEARCH_FACET_TYPE_VALUES.len() as i32;
+
+/// The rating buckets the `AVERAGE_CUSTOMER_RATING` facet reports.
+///
+/// `SearchFacetType` names the facet but the model documents no bucketing, and
+/// `ListingFacet$value` is "the internal value used for filtering when passed back in a
+/// search filter" — for a rating that filter is `MIN_AVERAGE_CUSTOMER_RATING`, which
+/// "accept[s] a single value between 0.0 and 5.0" (`SearchFilter$filterValues`). So each
+/// bucket is a MINIMUM rating and its count is the listings rating at least that much,
+/// which is exactly what filtering on that value returns.
+const RATING_FACET_BUCKETS: &[(f64, &str, &str)] = &[
+    (5.0, "5.0", "5.0 and up"),
+    (4.0, "4.0", "4.0 and up"),
+    (3.0, "3.0", "3.0 and up"),
+    (2.0, "2.0", "2.0 and up"),
+    (1.0, "1.0", "1.0 and up"),
+];
+
+/// The facet types a request asks for: the ones it names, deduplicated and in request
+/// order, or every facet type when `facetTypes` is absent or empty.
+///
+/// Source: `SearchFacetsInput$facetTypes` — "A list of specific facet types to retrieve. If
+/// empty or null, all available facets are returned." The facet types themselves come from
+/// the model-generated `SEARCH_FACET_TYPE_VALUES` (the `SearchFacetType` enum), so this
+/// cannot drift from the model. `Err` is the refusal message for a value outside it.
+fn requested_facet_types(requested: Option<&[String]>) -> Result<Vec<&'static str>, String> {
+    let Some(requested) = requested.filter(|types| !types.is_empty()) else {
+        return Ok(SEARCH_FACET_TYPE_VALUES.to_vec());
+    };
+    let mut resolved: Vec<&'static str> = Vec::new();
+    for facet_type in requested {
+        let known = SEARCH_FACET_TYPE_VALUES
+            .iter()
+            .copied()
+            .find(|known| *known == facet_type.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "facetTypes: '{facet_type}' is not a supported facetType; supported facet types are {}",
+                    SEARCH_FACET_TYPE_VALUES.join(", ")
+                )
+            })?;
+        if !resolved.contains(&known) {
+            resolved.push(known);
+        }
+    }
+    Ok(resolved)
+}
+
+/// The query whose result set a `nextToken` belongs to: everything that changes WHICH
+/// facets a response carries.
+fn query_identity(
+    locale: &str,
+    search_text: &str,
+    filters: &[SearchFilter],
+    facet_types: &[&str],
+) -> String {
+    let filters: Vec<String> = filters
+        .iter()
+        .map(|filter| format!("{}={}", filter.filter_type, filter.filter_values.join("|")))
+        .collect();
+    format!(
+        "SearchFacets/{locale}/{search_text}/{}/{}",
+        filters.join(";"),
+        facet_types.join(",")
+    )
+}
+
+/// One facet value per distinct value of `facet_type` among `matches`, each counting the
+/// matching listings that carry it, most common first and then by value so the order is
+/// stable.
+///
+/// A value no matching listing carries is not reported: `SearchFacets` "[r]eturns available
+/// facet values for filtering listings", and filtering on a value with no matches is not
+/// available.
+fn facet_values(
+    state: &crate::state::ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState,
+    matches: &[&crate::state::Listing],
+    facet_type: &str,
+) -> Vec<ListingFacet> {
+    let mut counts: std::collections::BTreeMap<String, (String, i64)> =
+        std::collections::BTreeMap::new();
+    for listing in matches {
+        // A listing counts ONCE per facet value however many of its records carry it (two
+        // products deployed on AWS are still one listing matching `DEPLOYED_ON_AWS`).
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for (value, display_name) in listing_facet_values(state, listing, facet_type) {
+            if seen.iter().any(|(already, _)| *already == value) {
+                continue;
+            }
+            seen.push((value, display_name));
+        }
+        for (value, display_name) in seen {
+            // `ListingFacet$displayName` is required and non-blank, so a record with no
+            // display name of its own is displayed by its value; and where two records
+            // disagree about one value's name the smallest is taken, so the response does
+            // not depend on which listing was visited first.
+            let display_name = if display_name.trim().is_empty() {
+                value.clone()
+            } else {
+                display_name
+            };
+            let entry = counts
+                .entry(value)
+                .or_insert_with(|| (display_name.clone(), 0));
+            if display_name < entry.0 {
+                entry.0 = display_name;
+            }
+            entry.1 += 1;
+        }
+    }
+
+    let mut facets: Vec<ListingFacet> = counts
+        .into_iter()
+        .map(|(value, (display_name, count))| ListingFacet {
+            value,
+            display_name,
+            // The catalog's categories are flat, and no other facet type is hierarchical,
+            // so no facet value has a parent to report.
+            parent: None,
+            count,
+        })
+        .collect();
+    facets.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    facets
+}
+
+/// The `(value, displayName)` pairs one listing contributes to `facet_type`.
+///
+/// Each value is what the matching `SearchFilterType` filters on, so passing one back as a
+/// filter value selects exactly the listings its count came from.
+fn listing_facet_values(
+    state: &crate::state::ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState,
+    listing: &crate::state::Listing,
+    facet_type: &str,
+) -> Vec<(String, String)> {
+    match facet_type {
+        "CATEGORY" => listing
+            .categories
+            .iter()
+            .map(|category| (category.category_id.clone(), category.display_name.clone()))
+            .collect(),
+        "PUBLISHER" => vec![(
+            listing.publisher.seller_profile_id.clone(),
+            listing.publisher.display_name.clone(),
+        )],
+        // A listing is fulfilled through its products, so the fulfillment options it offers
+        // are the de-duplicated union of theirs — the same projection the
+        // `FULFILLMENT_OPTION_TYPE` filter and `ListingSummary` read.
+        "FULFILLMENT_OPTION_TYPE" => state
+            .listing_fulfillment_option_summaries(listing)
+            .iter()
+            .map(|option| {
+                (
+                    option.fulfillment_option_type.clone(),
+                    option.display_name.clone(),
+                )
+            })
+            .collect(),
+        "PRICING_MODEL" => listing
+            .pricing_models
+            .iter()
+            .map(|model| (model.pricing_model_type.clone(), model.display_name.clone()))
+            .collect(),
+        "PRICING_UNIT" => listing
+            .pricing_units
+            .iter()
+            .map(|unit| (unit.pricing_unit_type.clone(), unit.display_name.clone()))
+            .collect(),
+        // The `DEPLOYED_ON_AWS` filter matches a listing through its PRODUCTS' deployment
+        // status (`Product$deployedOnAws`), so the facet values come from there too.
+        "DEPLOYED_ON_AWS" => listing
+            .product_ids
+            .iter()
+            .filter_map(|product_id| state.products.get(product_id))
+            .map(|product| {
+                (
+                    product.deployed_on_aws.clone(),
+                    deployed_on_aws_display_name(&product.deployed_on_aws).to_string(),
+                )
+            })
+            .collect(),
+        "NUMBER_OF_PRODUCTS" => {
+            let products = listing.product_ids.len();
+            let display_name = if products == 1 {
+                "1 product".to_string()
+            } else {
+                format!("{products} products")
+            };
+            vec![(products.to_string(), display_name)]
+        }
+        "AVERAGE_CUSTOMER_RATING" => {
+            let rating = crate::state::average_customer_rating(listing.review_summary.as_ref());
+            RATING_FACET_BUCKETS
+                .iter()
+                .filter(|(minimum, _, _)| rating >= *minimum)
+                .map(|(_, value, display_name)| {
+                    ((*value).to_string(), (*display_name).to_string())
+                })
+                .collect()
+        }
+        // Unreachable: `requested_facet_types` refuses anything the `SearchFacetType` enum
+        // does not hold, so no other facet type reaches here.
+        _ => Vec::new(),
+    }
+}
+
+/// The human-readable name of a product's deployment status.
+///
+/// Source: the model's `DeployedOnAwsStatus` enum, generated as
+/// `DEPLOYED_ON_AWS_STATUS_VALUES` — `DEPLOYED`, `NOT_APPLICABLE`, `NOT_DEPLOYED`.
+/// A status the enum gains later is displayed by its own value until it is named here.
+fn deployed_on_aws_display_name(status: &str) -> &str {
+    match status {
+        "DEPLOYED" => "Deployed on AWS",
+        "NOT_DEPLOYED" => "Not deployed on AWS",
+        "NOT_APPLICABLE" => "Not applicable",
+        other => other,
     }
 }

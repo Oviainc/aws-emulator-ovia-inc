@@ -27,11 +27,21 @@ const ARN_NAMESPACE: &str = "networkmonitor";
 /// no SigV4 credential scope to read a region from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// `MonitorState` of a monitor that is not aggregating metrics yet (model enum
-/// `MonitorState`).
+/// `MonitorState` of a monitor that is provisioning the probes it holds and is
+/// not aggregating metrics yet (model enum `MonitorState`). TRANSIENT: the clock
+/// owes such a monitor the [`MONITOR_STATE_ACTIVE`] transition
+/// ([`ACTIVATION_AFTER`]).
 pub const MONITOR_STATE_PENDING: &str = "PENDING";
 /// `MonitorState` of a monitor whose probes are live.
 pub const MONITOR_STATE_ACTIVE: &str = "ACTIVE";
+/// `MonitorState` of a monitor that holds no probe.
+///
+/// A monitor aggregates what its probes measure, so one with no probe has
+/// nothing to activate: it is reported `INACTIVE` straight away and stays there
+/// — nothing is due — until a probe is added. This is the state a monitor
+/// created with an empty (or absent) `probes` list is in, and the one a monitor
+/// returns to when its last probe is deleted.
+pub const MONITOR_STATE_INACTIVE: &str = "INACTIVE";
 
 /// `ProbeState` of a probe that is not sending packets yet (model enum
 /// `ProbeState`).
@@ -106,6 +116,113 @@ pub const MAX_CLIENT_TOKENS: usize = 1_000;
 /// in-memory store that never forgets a caller-chosen key grows with the request
 /// count.
 pub const CLIENT_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The AWS service namespace a probe's `sourceArn` must name.
+///
+/// The model documents `ProbeInput$sourceArn` as "The ARN of the subnet", and a
+/// VPC subnet is an Amazon EC2 resource, so the ARN's service segment is `ec2`.
+/// The shape's own `@pattern("^arn:.*$")` cannot express that, so the service
+/// checks it.
+pub const SUBNET_ARN_SERVICE: &str = "ec2";
+
+/// The resource type a VPC subnet ARN names:
+/// `arn:aws:ec2:<region>:<account>:subnet/<subnetId>`.
+pub const SUBNET_ARN_RESOURCE_TYPE: &str = "subnet";
+
+/// The id prefix every VPC subnet carries (`subnet-0123456789abcdef0`).
+pub const SUBNET_ID_PREFIX: &str = "subnet-";
+
+/// The lengths of the id part that follows an EC2 resource-id prefix: AWS's
+/// "Resource IDs" documentation gives EC2 ids in the short (8 character) and
+/// long (17 character) forms, and nothing else.
+pub const EC2_ID_SUFFIX_LENGTHS: &[usize] = &[8, 17];
+
+/// The `ResourceNotFoundException` message for a monitor this service does not
+/// hold, built from the request and the caller identity: the account the request
+/// was made under, and the `monitorName` it named.
+pub fn monitor_not_found_message(monitor_name: &str) -> String {
+    format!(
+        "No existing monitor found for account {} and monitorName {monitor_name}.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The `ConflictException` message for a `CreateMonitor` naming a monitor this
+/// service already holds — the same two facts as
+/// [`monitor_not_found_message`], stated as a conflict.
+///
+/// It names nothing the service generated (no ARN): a message built from the
+/// request and the caller identity reads the same in every environment.
+pub fn monitor_conflict_message(monitor_name: &str) -> String {
+    format!(
+        "Existing monitor found for account {} and monitorName {monitor_name}.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The `ResourceNotFoundException` message for a probe a stored monitor does not
+/// hold — the probe's id beside the same account and `monitorName` as
+/// [`monitor_not_found_message`].
+pub fn probe_not_found_message(probe_id: &str, monitor_name: &str) -> String {
+    format!(
+        "No existing probe {probe_id} found for account {} and monitorName {monitor_name}.",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The resource an ARN names, as a message states it: the last `/`- or
+/// `:`-separated segment (`subnet-0123…` of a subnet ARN, `my-topic` of an SNS
+/// topic ARN). The whole string when it carries no separator.
+pub fn arn_resource_id(arn: &str) -> &str {
+    arn.rsplit(['/', ':']).next().unwrap_or(arn)
+}
+
+/// The subnet id a probe's `sourceArn` names, when it names a VPC subnet of this
+/// account at all; `None` for anything else.
+///
+/// AWS resolves `sourceArn` against the caller's VPC subnets and refuses a probe
+/// whose source is not one, so this is the structural half of that lookup an
+/// emulator holding no EC2 inventory can perform: the ARN must be an
+/// [`SUBNET_ARN_SERVICE`] ARN of this emulator's account
+/// ([`::engine::emulator_account_id`]) whose resource is a
+/// [`SUBNET_ARN_RESOURCE_TYPE`] with a well-formed EC2 id.
+pub fn subnet_id_of(source_arn: &str) -> Option<&str> {
+    // arn : partition : service : region : account : resource
+    let mut segments = source_arn.splitn(6, ':');
+    if segments.next()? != "arn" {
+        return None;
+    }
+    let _partition = segments.next()?;
+    if segments.next()? != SUBNET_ARN_SERVICE {
+        return None;
+    }
+    let _region = segments.next()?;
+    if segments.next()? != ::engine::emulator_account_id() {
+        return None;
+    }
+    let (resource_type, subnet_id) = segments.next()?.split_once('/')?;
+    if resource_type != SUBNET_ARN_RESOURCE_TYPE {
+        return None;
+    }
+    let suffix = subnet_id.strip_prefix(SUBNET_ID_PREFIX)?;
+    if !EC2_ID_SUFFIX_LENGTHS.contains(&suffix.len())
+        || !suffix.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(subnet_id)
+}
+
+/// The state a monitor is in the instant it is stored: `INACTIVE` when it holds
+/// no probe (nothing to aggregate, so nothing is due) and `PENDING` when it
+/// holds at least one (the clock owes it [`MONITOR_STATE_ACTIVE`]).
+pub fn initial_monitor_state(has_probes: bool) -> &'static str {
+    if has_probes {
+        MONITOR_STATE_PENDING
+    } else {
+        MONITOR_STATE_INACTIVE
+    }
+}
 
 /// The ARN of a monitor: `arn:aws:networkmonitor:<region>:<account>:monitor/<name>`.
 pub fn monitor_arn(region: &str, monitor_name: &str) -> String {
@@ -199,12 +316,21 @@ pub struct ProbeSpec {
 ///   `0` (which the shape's `@range(min: 0)` admits), are refused.
 ///
 /// `Err` carries a message naming the offending member.
+/// * `sourceArn` is "The ARN of the subnet", so an ARN that names anything other
+///   than a VPC subnet of this account ([`subnet_id_of`]) is refused — the
+///   shape's `@pattern("^arn:.*$")` admits any ARN at all.
 pub fn build_probe(
     spec: ProbeSpec,
     probe_id: String,
     region: &str,
     now: SystemTime,
 ) -> Result<Probe, String> {
+    if subnet_id_of(&spec.source_arn).is_none() {
+        return Err(format!(
+            "The specified subnet {} does not exist or could not be found.",
+            arn_resource_id(&spec.source_arn)
+        ));
+    }
     let Some(address_family) = address_family_of(&spec.destination) else {
         return Err(format!(
             "destination must be an IPv4 or IPv6 address, got {:?}",
@@ -282,7 +408,8 @@ pub struct Monitor {
     pub probes: BTreeMap<String, Probe>,
     /// When the clock owes this monitor its `PENDING` -> `ACTIVE` transition,
     /// set by the call that gave it its first probe. `None` while the monitor
-    /// holds no probes: it has nothing to aggregate, so it stays `PENDING`.
+    /// holds no probes: it has nothing to aggregate, so it stays
+    /// [`MONITOR_STATE_INACTIVE`].
     pub activates_at: Option<SystemTime>,
     pub created_at: SystemTime,
     pub modified_at: SystemTime,
@@ -299,17 +426,23 @@ impl Monitor {
     /// Called only by the mutating operations that add a probe. A monitor that
     /// already has an activation due keeps the earlier instant: adding a second
     /// probe does not postpone the first one's activation.
+    ///
+    /// A monitor that was `INACTIVE` — nothing to aggregate — is provisioning
+    /// the new probe, so it moves to `PENDING` and the clock owes it `ACTIVE`.
     pub fn schedule_activation(&mut self, now: SystemTime) {
         if self.activates_at.is_none() {
             self.activates_at = now.checked_add(ACTIVATION_AFTER);
+            if self.state == MONITOR_STATE_INACTIVE {
+                self.state = MONITOR_STATE_PENDING.to_string();
+            }
         }
     }
 
     /// Give up the activation the clock owed: a monitor with no probes has
-    /// nothing to aggregate, so it goes back to `PENDING` with nothing due.
+    /// nothing to aggregate, so it goes back to `INACTIVE` with nothing due.
     pub fn clear_activation(&mut self) {
         self.activates_at = None;
-        self.state = MONITOR_STATE_PENDING.to_string();
+        self.state = MONITOR_STATE_INACTIVE.to_string();
     }
 }
 

@@ -15,8 +15,10 @@
 mod availability_zones;
 #[path = "all/describe_vpcs.rs"]
 mod describe_vpcs;
-// The shared ec2Query plumbing both describes drive the service through.
+// The shared ec2Query plumbing every describe drives the service through.
 #[path = "all/ec2_query.rs"]
 mod ec2_query;
+#[path = "all/instance_type_offerings.rs"]
+mod instance_type_offerings;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

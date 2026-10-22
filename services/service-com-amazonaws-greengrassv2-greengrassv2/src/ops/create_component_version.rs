@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComponentVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComponentVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComponentVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a component version from an inline recipe, parsing the recipe to derive
+//! the component's name, version and platform metadata, and persisting the recipe
+//! bytes verbatim so `GetComponent` can return them.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +190,195 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComponentVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComponentVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComponentVersion"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateComponentVersionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the greengrassv2 state store is unavailable".to_string(),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        };
+
+        // "You must specify either inlineRecipe or lambdaFunction."
+        let recipe_bytes = match (&input.inline_recipe, &input.lambda_function) {
+            (Some(recipe), None) => recipe.clone(),
+            (Some(_), Some(_)) => {
+                return Err(invalid(
+                    "You must specify either inlineRecipe or lambdaFunction, not both.",
+                    "OTHER",
+                    None,
+                ))
+            }
+            (None, None) => {
+                return Err(invalid(
+                    "You must specify either inlineRecipe or lambdaFunction.",
+                    "OTHER",
+                    None,
+                ))
+            }
+            (None, Some(_)) => {
+                // Creating a component from a Lambda function means generating a
+                // recipe and artifacts out of that function's deployment package.
+                // This emulator cannot do that faithfully, so it says so rather
+                // than inventing a component that no recipe describes.
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "CreateComponentVersion with lambdaFunction",
+                ));
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = st::request_region(ctx.parts());
+
+        // Parse the untrusted recipe BEFORE taking the shared lock: the parse is
+        // the only unbounded-in-the-input work this handler does, so it must not
+        // run inside the critical section every other request waits on.
+        let recipe = match st::parse_recipe(&recipe_bytes) {
+            Ok(recipe) => recipe,
+            Err(st::RecipeError::Unparseable(detail)) => {
+                return Err(invalid(detail, "CANNOT_PARSE", Some("inlineRecipe")))
+            }
+            Err(st::RecipeError::OutOfBounds(detail)) => {
+                return Err(invalid(detail, "FIELD_VALIDATION_FAILED", Some("inlineRecipe")))
+            }
+            Err(st::RecipeError::MissingKey(key)) => {
+                return Err(invalid(
+                    format!("The recipe must declare {key}."),
+                    "FIELD_VALIDATION_FAILED",
+                    Some("inlineRecipe"),
+                ))
+            }
+        };
+
+        let mut store = state.lock();
+        store.expire_tokens(now);
+
+        // A replayed client token returns the result the first request produced
+        // instead of creating a second version.
+        if let Some(arn) = store.recall_token(Self::NAME, input.client_token.as_deref(), now) {
+            if let Some(existing) = store.component_version(&arn) {
+                return Ok(output_for(existing, now));
+            }
+        }
+
+        let arn = st::component_version_arn(&region, &recipe.component_name, &recipe.component_version);
+        // The conflict names the ARN of the version that is ALREADY stored, not a
+        // recomputed one, so the error identifies the resource the caller collided
+        // with even when it was published through a differently-signed request.
+        if let Some(existing) = store
+            .components
+            .get(&recipe.component_name)
+            .and_then(|component| component.versions.get(&recipe.component_version))
+        {
+            return Err(CreateComponentVersionErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The component version {}:{} already exists.",
+                        recipe.component_name, recipe.component_version
+                    ),
+                    resource_id: existing.arn.clone(),
+                    resource_type: "COMPONENT_VERSION".to_string(),
+                },
+            )
+            .into());
+        }
+        if store.component_version_count >= st::MAX_COMPONENT_VERSIONS {
+            return Err(
+                CreateComponentVersionErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "You have reached the maximum number of component versions ({}).",
+                            st::MAX_COMPONENT_VERSIONS
+                        ),
+                        resource_id: Some(arn),
+                        resource_type: Some("COMPONENT_VERSION".to_string()),
+                        quota_code: st::COMPONENT_VERSION_QUOTA_CODE.to_string(),
+                        service_code: st::ARN_NAMESPACE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let entry = st::ComponentVersionEntry {
+            arn: arn.clone(),
+            component_name: recipe.component_name.clone(),
+            component_version: recipe.component_version.clone(),
+            recipe: recipe_bytes,
+            recipe_format: recipe.format,
+            description: recipe.description,
+            publisher: recipe.publisher,
+            platforms: recipe.platforms,
+            creation_timestamp: now,
+            status: CloudComponentStatus {
+                // `componentState` is not stored: it is derived from
+                // `deployable_at` by `ComponentVersionEntry::status_at`.
+                component_state: None,
+                message: None,
+                errors: None,
+                vendor_guidance: Some(st::VENDOR_GUIDANCE_ACTIVE.to_string()),
+                vendor_guidance_message: None,
+            },
+            deployable_at: now + st::COMPONENT_VALIDATION_SPAN,
+            scope: st::SCOPE_PRIVATE.to_string(),
+            tags: st::tags_in(input.tags.as_ref()),
+        };
+
+        let name_arn = st::component_name_arn(&region, &recipe.component_name);
+        store.insert_component_version(&name_arn, entry.clone());
+        store.remember_token(Self::NAME, input.client_token.as_deref(), &arn, now);
+        drop(store);
+
+        // Audit record for a state-changing call: who asked, what changed, and how
+        // it ended. The presented access-key id is an identifier, never a secret.
+        ::tracing::info!(
+            target: "audit",
+            operation = Self::NAME,
+            outcome = "created",
+            principal = %::engine::extract_akid(&ctx.parts().headers),
+            region = %region,
+            resource = %arn,
+            "published a component version"
+        );
+
+        Ok(output_for(&entry, now))
     }
+}
+
+/// The response for a stored component version — computed from what is persisted,
+/// so a create and a replayed create answer identically.
+fn output_for(
+    entry: &crate::state::ComponentVersionEntry,
+    now: ::std::time::SystemTime,
+) -> CreateComponentVersionOutput {
+    CreateComponentVersionOutput {
+        arn: Some(entry.arn.clone()),
+        component_name: entry.component_name.clone(),
+        component_version: entry.component_version.clone(),
+        creation_timestamp: crate::state::to_datetime(entry.creation_timestamp),
+        status: entry.status_at(now),
+    }
+}
+
+/// A modelled `ValidationException` (HTTP 400) naming the member at fault.
+fn invalid(
+    message: impl Into<String>,
+    reason: &str,
+    field: Option<&str>,
+) -> CreateComponentVersionError {
+    let message = message.into();
+    CreateComponentVersionErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: Some(reason.to_string()),
+        fields: field.map(|name| {
+            vec![ValidationExceptionField {
+                name: name.to_string(),
+                message,
+            }]
+        }),
+    })
+    .into()
 }

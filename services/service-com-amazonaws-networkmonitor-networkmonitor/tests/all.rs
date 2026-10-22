@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/monitor_and_probe.rs"]
 mod monitor_and_probe;
+#[path = "all/monitor_lifecycle_and_front_door.rs"]
+mod monitor_lifecycle_and_front_door;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

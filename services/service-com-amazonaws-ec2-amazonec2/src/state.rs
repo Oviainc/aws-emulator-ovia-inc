@@ -12,6 +12,11 @@
 //! writes nothing at all: two calls signed for the same Region report the same zones,
 //! and a read can never change what a later caller sees.
 //!
+//! The instance types a location offers are facts of that location in exactly the
+//! same way — no EC2 operation creates or withdraws an offering — so
+//! [`instance_type_offerings`] derives them from the Region and the modelled
+//! `InstanceType` catalog, and `DescribeInstanceTypeOfferings` writes nothing either.
+//!
 //! ## Resources callers create are stored
 //!
 //! [`ComAmazonawsEc2Amazonec2State::vpcs`] holds the account's VPCs as the modelled
@@ -26,8 +31,9 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    AvailabilityZone, AvailabilityZoneMessage, BlockPublicAccessStates, Tag, Vpc,
-    VpcCidrBlockAssociation, VpcCidrBlockState,
+    AvailabilityZone, AvailabilityZoneMessage, BlockPublicAccessStates, INSTANCE_TYPE_VALUES,
+    InstanceTypeOffering, LOCATION_TYPE_VALUES, Tag, Vpc, VpcCidrBlockAssociation,
+    VpcCidrBlockState,
 };
 
 /// The Region a request belongs to when it carries no SigV4 credential scope to read
@@ -366,7 +372,159 @@ fn abbreviate_region_component(part: &str) -> String {
     }
 }
 
-/// Does the EC2 filter value `pattern` match `value`?
+/// Every filter `DescribeInstanceTypeOfferings` documents, as its `Filters` member
+/// lists them
+/// (`smithy_query(query="doc",shape="DescribeInstanceTypeOfferingsRequest",member="Filters")`).
+/// A filter outside this set is refused; each filter inside it compares against ONE
+/// field of an offering — `instance-type` against its instance type, `location`
+/// against its location — which is what lets a describe narrow each field before
+/// building the offerings themselves.
+pub const INSTANCE_TYPE_OFFERING_FILTERS: [&str; 2] = ["instance-type", "location"];
+
+/// The `LocationType` a `DescribeInstanceTypeOfferings` request that names none asks
+/// about: the operation's own doc says "If no location is specified, the default is to
+/// list the instance types that are offered in the current Region".
+pub const DEFAULT_LOCATION_TYPE: &str = "region";
+
+/// One instance type offered in one location, as the describe reads it.
+///
+/// `instance_type` and `location_type` are `&'static str` because each is one value of
+/// its modelled enum, taken from that enum's generated value list rather than from a
+/// request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceTypeOfferingRecord {
+    /// `t3.micro` — a value of the modelled `InstanceType` enum.
+    pub instance_type: &'static str,
+    /// `region`, `availability-zone`, `availability-zone-id` or `outpost`.
+    pub location_type: &'static str,
+    /// The identifier of the location, in the form `location_type` selects: a Region
+    /// name, a zone name, a zone id or an Outpost ARN.
+    pub location: String,
+}
+
+impl InstanceTypeOfferingRecord {
+    /// This offering as the modelled `InstanceTypeOffering` shape.
+    pub fn to_instance_type_offering(&self) -> InstanceTypeOffering {
+        InstanceTypeOffering {
+            instance_type: Some(self.instance_type.to_string()),
+            location_type: Some(self.location_type.to_string()),
+            location: Some(self.location.clone()),
+        }
+    }
+}
+
+/// The modelled `LocationType` `requested` names — [`DEFAULT_LOCATION_TYPE`] when it
+/// names none — or `None` when it is not one of the enum's values
+/// (`crate::ops::types::LOCATION_TYPE_VALUES`, generated from the model).
+pub fn location_type(requested: Option<&str>) -> Option<&'static str> {
+    let requested = requested.unwrap_or(DEFAULT_LOCATION_TYPE);
+    LOCATION_TYPE_VALUES
+        .iter()
+        .copied()
+        .find(|value| *value == requested)
+}
+
+/// The locations of type `location_type` that Region `region` has.
+///
+/// Each form is the one the `LocationType` member's own doc gives for that value: the
+/// current Region for `region`, an Availability Zone of the Region for
+/// `availability-zone`, an AZ ID of the Region for `availability-zone-id` — both taken
+/// from [`availability_zones_in_region`], so one zone list serves every operation —
+/// and an Outpost ARN for `outpost`.
+///
+/// An Outpost is hardware AWS installs in a customer's own facility and no operation
+/// of this service creates one, so a Region here has no Outpost locations and reports
+/// no offering in one.
+pub fn locations_of_type(region: &str, location_type: &str) -> Vec<String> {
+    match location_type {
+        "region" => vec![region.to_string()],
+        "availability-zone" => availability_zones_in_region(region)
+            .into_iter()
+            .map(|zone| zone.zone_name)
+            .collect(),
+        "availability-zone-id" => availability_zones_in_region(region)
+            .into_iter()
+            .map(|zone| zone.zone_id)
+            .collect(),
+        "outpost" => Vec::new(),
+        // Unreachable through [`location_type`], which answers only values of the
+        // modelled enum: a value outside it names no location of any kind, so it is
+        // reported as no locations rather than as the Region's.
+        _ => Vec::new(),
+    }
+}
+
+/// The instance types this emulator offers, in the catalog's own order.
+///
+/// The catalog is the modelled `InstanceType` enum's generated value list
+/// (`crate::ops::types::INSTANCE_TYPE_VALUES`, from
+/// `smithy_query(query="shape",shape="InstanceType")`), so an instance type is offered
+/// exactly when the model declares it. AWS offers a Region-specific subset of them,
+/// and neither the model nor a request carries WHICH subset a Region has, so the set
+/// is the same in every Region rather than a per-Region subset invented here.
+pub fn offered_instance_types() -> &'static [&'static str] {
+    INSTANCE_TYPE_VALUES
+}
+
+/// Every offering of `instance_types` in `locations`, reported as `location_type`.
+///
+/// The caller passes the locations and the instance types that the request's filters
+/// leave, which is what keeps the cost of a filtered describe proportional to
+/// locations + types rather than to their product: a filter on this operation compares
+/// against one field of an offering, so narrowing each field BEFORE the product is
+/// built answers exactly what testing every built offering would.
+///
+/// The result is in cursor order — location first, then instance type, as
+/// [`offering_page_cursor`] joins them — which is the order a `NextToken` walk resumes
+/// in, so it is sorted here rather than inherited from the order `locations` or
+/// `instance_types` happen to arrive in.
+pub fn instance_type_offerings(
+    locations: &[String],
+    instance_types: &[&'static str],
+    location_type: &'static str,
+) -> Vec<InstanceTypeOfferingRecord> {
+    let mut offerings: Vec<InstanceTypeOfferingRecord> = locations
+        .iter()
+        .flat_map(|location| {
+            instance_types
+                .iter()
+                .map(move |instance_type| InstanceTypeOfferingRecord {
+                    instance_type,
+                    location_type,
+                    location: location.clone(),
+                })
+        })
+        .collect();
+    offerings.sort_by_cached_key(offering_page_cursor);
+    offerings
+}
+
+/// The pagination cursor naming `offering`: its location and its instance type, joined
+/// by a space.
+///
+/// Paging is by cursor rather than by index, the way [`encode_page_token`] and
+/// `DescribeVpcs` do it, so a token names the offering the next page starts at instead
+/// of a position a changed filter would shift. A cursor sorts the same way
+/// [`instance_type_offerings`] orders the offerings themselves — location first, then
+/// instance type — because the separator sorts ahead of every character a location or
+/// an instance type can carry, so one location being a prefix of another cannot
+/// reorder the two.
+pub fn offering_page_cursor(offering: &InstanceTypeOfferingRecord) -> String {
+    format!("{} {}", offering.location, offering.instance_type)
+}
+
+/// One token of a compiled filter value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FilterToken {
+    /// A literal character, whether or not it was escaped.
+    Literal(char),
+    /// `*`: zero or more characters.
+    Many,
+    /// `?`: exactly one character.
+    One,
+}
+
+/// One EC2 filter value, compiled once so it can be matched against many candidates.
 ///
 /// Filter values are case-sensitive and carry two wildcards, documented in "List and
 /// filter using the CLI and API" — the guide the modelled `Filter` shape links to:
@@ -374,64 +532,78 @@ fn abbreviate_region_component(part: &str) -> String {
 /// escapes either so a value can hold a literal `*` or `?`. That escaping is EC2's
 /// own, which is why the matcher is written here rather than taken from a glob crate:
 /// the maintained ones implement `*`/`?` without the backslash escape.
-pub fn filter_value_matches(pattern: &str, value: &str) -> bool {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Token {
-        /// A literal character, whether or not it was escaped.
-        Literal(char),
-        /// `*`: zero or more characters.
-        Many,
-        /// `?`: exactly one character.
-        One,
-    }
+///
+/// Compiling is separate from matching so a describe that compares one filter value
+/// against a whole candidate set parses the value once instead of once per candidate.
+#[derive(Clone, Debug)]
+pub struct FilterPattern {
+    tokens: Vec<FilterToken>,
+}
 
-    let mut tokens: Vec<Token> = Vec::new();
-    let mut chars = pattern.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next() {
-                // A trailing backslash escapes nothing, so it is itself a literal.
-                None => tokens.push(Token::Literal('\\')),
-                Some(escaped) => tokens.push(Token::Literal(escaped)),
-            },
-            '*' => tokens.push(Token::Many),
-            '?' => tokens.push(Token::One),
-            other => tokens.push(Token::Literal(other)),
-        }
-    }
-
-    let value: Vec<char> = value.chars().collect();
-    // Greedy match with one backtrack point per `*`, which is all a pattern with no
-    // alternation needs: on a mismatch, the most recent `*` consumes one more
-    // character and matching resumes after it.
-    let (mut token, mut position) = (0usize, 0usize);
-    let mut backtrack: Option<(usize, usize)> = None;
-    while position < value.len() {
-        let matched = match tokens.get(token) {
-            Some(Token::Many) => {
-                backtrack = Some((token, position));
-                token += 1;
-                continue;
+impl FilterPattern {
+    /// Compile one filter value.
+    pub fn compile(pattern: &str) -> Self {
+        let mut tokens: Vec<FilterToken> = Vec::new();
+        let mut chars = pattern.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    // A trailing backslash escapes nothing, so it is itself a literal.
+                    None => tokens.push(FilterToken::Literal('\\')),
+                    Some(escaped) => tokens.push(FilterToken::Literal(escaped)),
+                },
+                '*' => tokens.push(FilterToken::Many),
+                '?' => tokens.push(FilterToken::One),
+                other => tokens.push(FilterToken::Literal(other)),
             }
-            Some(Token::One) => true,
-            Some(Token::Literal(c)) => *c == value[position],
-            None => false,
-        };
-        if matched {
-            token += 1;
-            position += 1;
-        } else if let Some((star, consumed)) = backtrack {
-            token = star + 1;
-            position = consumed + 1;
-            backtrack = Some((star, consumed + 1));
-        } else {
-            return false;
         }
+        Self { tokens }
     }
-    // The value is exhausted: what is left of the pattern must match nothing.
-    tokens[token.min(tokens.len())..]
-        .iter()
-        .all(|token| *token == Token::Many)
+
+    /// Does this filter value match `value`?
+    pub fn matches(&self, value: &str) -> bool {
+        let tokens = &self.tokens;
+        let value: Vec<char> = value.chars().collect();
+        // Greedy match with one backtrack point per `*`, which is all a pattern with no
+        // alternation needs: on a mismatch, the most recent `*` consumes one more
+        // character and matching resumes after it.
+        let (mut token, mut position) = (0usize, 0usize);
+        let mut backtrack: Option<(usize, usize)> = None;
+        while position < value.len() {
+            let matched = match tokens.get(token) {
+                Some(FilterToken::Many) => {
+                    backtrack = Some((token, position));
+                    token += 1;
+                    continue;
+                }
+                Some(FilterToken::One) => true,
+                Some(FilterToken::Literal(c)) => *c == value[position],
+                None => false,
+            };
+            if matched {
+                token += 1;
+                position += 1;
+            } else if let Some((star, consumed)) = backtrack {
+                token = star + 1;
+                position = consumed + 1;
+                backtrack = Some((star, consumed + 1));
+            } else {
+                return false;
+            }
+        }
+        // The value is exhausted: what is left of the pattern must match nothing.
+        tokens[token.min(tokens.len())..]
+            .iter()
+            .all(|token| *token == FilterToken::Many)
+    }
+}
+
+/// Does the EC2 filter value `pattern` match `value`?
+///
+/// The one-shot form of [`FilterPattern`], for a comparison made once; a describe that
+/// compares one value against many candidates should compile the pattern instead.
+pub fn filter_value_matches(pattern: &str, value: &str) -> bool {
+    FilterPattern::compile(pattern).matches(value)
 }
 
 /// Refuse a request member's value the way EC2 does: HTTP 400 `InvalidParameterValue`,

@@ -16,7 +16,10 @@
 //!   ([`encode_page_token`], [`decode_page_token`], [`page`]);
 //! * the projections from stored records onto wire shapes
 //!   ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::listing_summary`],
-//!   [`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::purchase_options`]).
+//!   [`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::purchase_options`]);
+//! * the listing match set `SearchListings` pages over and `SearchFacets` counts facets
+//!   from ([`ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState::search_matches`],
+//!   [`matches_every_search_filter`]).
 
 use std::collections::BTreeMap;
 
@@ -36,7 +39,7 @@ use crate::ops::types::{
     RateCardItem, RecurringPaymentTerm, Resource, ReviewSourceSummary,
     ReviewSummary, SaasFulfillmentOption, SageMakerAlgorithmFulfillmentOption,
     SageMakerAlgorithmRecommendation, SageMakerModelFulfillmentOption,
-    SageMakerModelRecommendation, SellerEngagement, SellerInformation, SupportTerm,
+    SageMakerModelRecommendation, SearchFilter, SellerEngagement, SellerInformation, SupportTerm,
     UsageBasedPricingTerm, UsageBasedRateCardItem, UseCase, UseCaseEntry, ValidityTerm,
 };
 
@@ -463,6 +466,41 @@ impl Default for ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
 }
 
 impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
+    /// The listings a `searchText`/`filters` pair selects, in listing-id order.
+    ///
+    /// This is the match set BOTH search operations answer from: `SearchListings` orders and
+    /// pages it and reports its size as `totalResults`, and `SearchFacets` counts facet
+    /// values over it and reports the same size — so the two can never disagree about how
+    /// many listings a query matches.
+    ///
+    /// `searchText` matches a listing whose name or short description contains it, compared
+    /// case-insensitively, and an absent or empty `searchText` matches every listing;
+    /// `filters` then narrow the result per [`matches_every_search_filter`]. `Err` is that
+    /// function's refusal message.
+    pub fn search_matches(
+        &self,
+        preferred: &'static str,
+        search_text: &str,
+        filters: &[SearchFilter],
+    ) -> Result<Vec<&Listing>, String> {
+        // Refuse a malformed `filters` list BEFORE any listing is considered, so a request is
+        // refused for what it says rather than for whether a listing happened to reach the
+        // predicate below.
+        validate_search_filters(filters)?;
+        let needle = search_text.trim().to_lowercase();
+        let mut matches: Vec<&Listing> = Vec::new();
+        for listing in self.listings.values() {
+            if !needle.is_empty() && !search_haystack(listing, preferred).contains(&needle) {
+                continue;
+            }
+            if !matches_every_search_filter(self, listing, filters)? {
+                continue;
+            }
+            matches.push(listing);
+        }
+        Ok(matches)
+    }
+
     /// The listing summary `SearchListings` returns for `listing`, in `preferred` locale.
     pub fn listing_summary(&self, listing: &Listing, preferred: &'static str) -> ListingSummary {
         let locale = listing.text.content_locale(preferred);
@@ -823,6 +861,147 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState>)
+}
+
+// ---------------------------------------------------------------------------
+// Searching the catalog: what `SearchListings` and `SearchFacets` share.
+// ---------------------------------------------------------------------------
+
+/// The text a `searchText` is matched against: a listing's name and its short description,
+/// in the locale its content is returned in, lowercased.
+pub fn search_haystack(listing: &Listing, preferred: &'static str) -> String {
+    let locale = listing.text.content_locale(preferred);
+    let text = listing.text.text(locale);
+    format!("{} {}", text.name, text.short_description).to_lowercase()
+}
+
+/// Refuse a `filters` list the model's `SearchFilterType` enum cannot reject on its own: an
+/// unsupported filter type, a range filter carrying more than one value or a rating outside
+/// the documented 0.0–5.0 range, or a `NUMBER_OF_PRODUCTS` value that is not a count.
+///
+/// Checked up front rather than per listing, so the refusal is a property of the REQUEST:
+/// the same malformed filter is refused whether or not any listing reaches the predicate.
+pub fn validate_search_filters(filters: &[SearchFilter]) -> Result<(), String> {
+    for filter in filters {
+        let values = &filter.filter_values;
+        match filter.filter_type.as_str() {
+            // Term filters take identifiers and enum values; the values themselves name
+            // catalog records, and one no record carries simply matches nothing.
+            "CATEGORY" | "PUBLISHER" | "FULFILLMENT_OPTION_TYPE" | "PRICING_MODEL"
+            | "PRICING_UNIT" | "DEPLOYED_ON_AWS" => {}
+            "NUMBER_OF_PRODUCTS" => {
+                for value in values {
+                    product_count(value)?;
+                }
+            }
+            "MIN_AVERAGE_CUSTOMER_RATING" | "MAX_AVERAGE_CUSTOMER_RATING" => {
+                rating_bound(&filter.filter_type, values)?;
+            }
+            other => {
+                return Err(format!("filters: '{other}' is not a supported filterType"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a listing satisfies every search filter (AND across filters, OR within one).
+///
+/// Source: `SearchListingsInput$filters` / `SearchFacetsInput$filters` — "Multiple filters
+/// are combined with AND logic. Multiple values within the same filter are combined with OR
+/// logic."
+///
+/// `Err` is the refusal message for a filter value the model's `SearchFilterType` enum
+/// cannot reject on its own — a range filter with more than one value, or a rating outside
+/// the documented 0.0–5.0 range.
+pub fn matches_every_search_filter(
+    state: &ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState,
+    listing: &Listing,
+    filters: &[SearchFilter],
+) -> Result<bool, String> {
+    for filter in filters {
+        let values = &filter.filter_values;
+        let matched = match filter.filter_type.as_str() {
+            "CATEGORY" => listing
+                .categories
+                .iter()
+                .any(|category| values.contains(&category.category_id)),
+            "PUBLISHER" => values.contains(&listing.publisher.seller_profile_id),
+            "FULFILLMENT_OPTION_TYPE" => state
+                .listing_fulfillment_option_summaries(listing)
+                .iter()
+                .any(|option| values.contains(&option.fulfillment_option_type)),
+            "PRICING_MODEL" => listing
+                .pricing_models
+                .iter()
+                .any(|model| values.contains(&model.pricing_model_type)),
+            "PRICING_UNIT" => listing
+                .pricing_units
+                .iter()
+                .any(|unit| values.contains(&unit.pricing_unit_type)),
+            "DEPLOYED_ON_AWS" => listing.product_ids.iter().any(|product_id| {
+                state
+                    .products
+                    .get(product_id)
+                    .is_some_and(|product| values.contains(&product.deployed_on_aws))
+            }),
+            "NUMBER_OF_PRODUCTS" => {
+                let products = listing.product_ids.len();
+                let mut matched = false;
+                for value in values {
+                    matched |= product_count(value)? == products;
+                }
+                matched
+            }
+            // Range filters: "accept a single value between 0.0 and 5.0"
+            // (SearchFilter$filterValues documentation).
+            "MIN_AVERAGE_CUSTOMER_RATING" => {
+                let bound = rating_bound(&filter.filter_type, values)?;
+                average_customer_rating(listing.review_summary.as_ref()) >= bound
+            }
+            "MAX_AVERAGE_CUSTOMER_RATING" => {
+                let bound = rating_bound(&filter.filter_type, values)?;
+                average_customer_rating(listing.review_summary.as_ref()) <= bound
+            }
+            other => {
+                return Err(format!("filters: '{other}' is not a supported filterType"));
+            }
+        };
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The product count a `NUMBER_OF_PRODUCTS` filter value names, refusing a value that is
+/// not a non-negative integer.
+fn product_count(value: &str) -> Result<usize, String> {
+    value.parse().map_err(|_| {
+        format!("filters: NUMBER_OF_PRODUCTS expects a non-negative integer, got '{value}'")
+    })
+}
+
+/// The single rating a range filter carries, refusing a value list or a rating outside the
+/// documented 0.0–5.0 range.
+///
+/// Both refusals are built from the request and follow AWS's recorded template for a range
+/// filter: they name the offending `filterType`, and the out-of-range one also carries the
+/// offending value bare after `"got: "`. A value that is not a number at all is not a
+/// rating between 0.0 and 5.0 either, so it is refused by the same message.
+fn rating_bound(filter_type: &str, values: &[String]) -> Result<f64, String> {
+    let [value] = values else {
+        return Err(format!(
+            "Range filter {filter_type} requires exactly one value"
+        ));
+    };
+    let rating: f64 = value.parse().unwrap_or(f64::NAN);
+    if !(0.0..=5.0).contains(&rating) {
+        return Err(format!(
+            "Range filter {filter_type} value must be between 0.0 and 5.0, got: {value}"
+        ));
+    }
+    Ok(rating)
 }
 
 // ---------------------------------------------------------------------------

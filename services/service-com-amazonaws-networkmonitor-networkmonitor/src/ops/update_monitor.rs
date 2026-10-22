@@ -9,7 +9,9 @@
 //! `aggregationPeriod` outside the documented value list
 //! ([`crate::state::AGGREGATION_PERIODS`], which the shape's own
 //! `@range(min: 30)` cannot express) with the modelled 400
-//! `ValidationException`.
+//! `ValidationException` — in which case the stored monitor is left exactly as
+//! it was. The monitor's `state` is not moved by an update: changing how often
+//! metrics are aggregated neither activates nor deactivates a monitor.
 //!
 //! ## Shape of an operation
 //!
@@ -125,7 +127,8 @@ impl From<UpdateMonitorErrorModeled> for UpdateMonitorError {
 /// This service's modelled `ValidationException` (HTTP 400), carrying `message`.
 ///
 /// Used for the one rule the model documents in prose but its constraints
-/// cannot express: the `aggregationPeriod` value list.
+/// cannot express: the `aggregationPeriod` value list (see
+/// [`crate::state::resolve_aggregation_period`]).
 fn validation(message: String) -> UpdateMonitorError {
     UpdateMonitorErrorModeled::ValidationException(ValidationException {
         message: Some(message),
@@ -149,6 +152,7 @@ fn output_for(monitor: &crate::state::Monitor) -> UpdateMonitorOutput {
         ),
     }
 }
+
 
 /// The `UpdateMonitor` operation.
 ///
@@ -189,7 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         // `monitorName`'s length bound and `@pattern`, and `aggregationPeriod`'s
         // `@range(min: 30)`, are refused by the framework BEFORE this handler
-        // runs, so reaching here means the input satisfies each of them.
+        // runs, so reaching here means the input satisfies each of them; the
+        // documented VALUE LIST is narrower than that range, so the handler
+        // applies it below.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateMonitorErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
@@ -199,7 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The documented value list, applied to the REQUIRED member: the same
         // rule `CreateMonitor` applies, so a period a create would refuse is not
-        // reachable through an update either.
+        // reachable through an update either. Checked BEFORE the store is
+        // touched, so a refused update leaves the stored period exactly as it
+        // was.
         let aggregation_period =
             crate::state::resolve_aggregation_period(Some(input.aggregation_period))
                 .map_err(validation)?;
@@ -212,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_monitor(&input.monitor_name, now);
         let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
             UpdateMonitorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("monitor {} does not exist", input.monitor_name)),
+                message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
             })
         })?;
 

@@ -157,15 +157,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
             DeleteProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("monitor {} does not exist", input.monitor_name)),
+                message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
             })
         })?;
         if monitor.probes.remove(&input.probe_id).is_none() {
             return Err(DeleteProbeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "monitor {} has no probe {}",
-                        input.monitor_name, input.probe_id
+                    message: Some(crate::state::probe_not_found_message(
+                        &input.probe_id,
+                        &input.monitor_name,
                     )),
                 },
             )
@@ -173,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         monitor.modified_at = now;
         // A monitor with no probes left has nothing to aggregate, so it goes
-        // back to `PENDING` with no activation due — the same state a monitor
+        // back to `INACTIVE` with no activation due — the same state a monitor
         // created without probes is in.
         if monitor.probes.is_empty() {
             monitor.clear_activation();

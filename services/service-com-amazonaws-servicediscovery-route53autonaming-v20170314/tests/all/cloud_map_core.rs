@@ -126,7 +126,7 @@ pub(crate) async fn service(router: &MultiServiceRouter, namespace_id: &str, nam
 }
 
 /// The `InstanceId`s `DiscoverInstances` answers with for the given request body.
-async fn discovered(router: &MultiServiceRouter, body: Value) -> BTreeSet<String> {
+pub(crate) async fn discovered(router: &MultiServiceRouter, body: Value) -> BTreeSet<String> {
     let found = ok(router, "DiscoverInstances", body).await;
     found["Instances"]
         .as_array()
