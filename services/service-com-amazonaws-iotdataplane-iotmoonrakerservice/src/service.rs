@@ -39,11 +39,69 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The media type a shadow document is announced with
+//!
+//! The data plane answers a request whose response body is a shadow state document
+//! with `content-type: application/json`: the body IS a JSON document, and a client
+//! or proxy decides whether to decode it from that header. On the wire that document
+//! is the `JsonDocument` blob these operations bind as their `@httpPayload`
+//! (`smithy_query(query="shape", shape="GetThingShadowResponse,UpdateThingShadowResponse,DeleteThingShadowResponse,JsonDocument")`),
+//! and restJson1's generic default for a bound blob — `application/octet-stream` —
+//! describes opaque bytes, not a JSON document. `override_protocol` below therefore
+//! serves a protocol that is the model's restJson1 in every respect except one: a
+//! response whose `@httpPayload` is this service's `JsonDocument` shape is announced
+//! as `application/json`. Every other response, including the blob members
+//! `GetRetainedMessage` carries in its JSON body, keeps exactly what the model's
+//! protocol produces.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
+use aws_smithy_schema::{Schema, ShapeType};
+use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
+
+/// The media type the data plane announces for a shadow state document.
+const JSON_DOCUMENT_MEDIA_TYPE: &str = "application/json";
+
+/// Every output shape of this service whose `@httpPayload` member targets the
+/// `JsonDocument` shape.
+///
+/// Source: `smithy_query(query="shape", shape="GetThingShadowResponse,
+/// UpdateThingShadowResponse,DeleteThingShadowResponse,JsonDocument")` — each
+/// declares the single member `payload` with `target: JsonDocument`,
+/// `httpPayload: true`, `type: blob`, and `JsonDocument` is a `blob`. No other
+/// operation of this service binds a `@httpPayload` in its output
+/// (`smithy_query(query="digest")` lists all 11), so this is the complete set. The
+/// set is recorded as output shapes because a runtime `Schema` member carries its
+/// target's TYPE but not its target's shape id, so `JsonDocument` cannot be told
+/// from any other blob at serialize time.
+const JSON_DOCUMENT_PAYLOAD_OUTPUTS: &[&str] = &[
+    "DeleteThingShadowResponse",
+    "GetThingShadowResponse",
+    "UpdateThingShadowResponse",
+];
+
+/// True when this output shape's response body is a `JsonDocument` — a
+/// `@httpPayload` blob member on one of the shapes [`JSON_DOCUMENT_PAYLOAD_OUTPUTS`]
+/// names. Both halves are required: the shape must be one the model gives a
+/// `JsonDocument` payload, and the schema it is serialized against must still bind
+/// that payload as a blob.
+fn carries_json_document(output_schema: &Schema) -> bool {
+    let id = output_schema.shape_id();
+    if id.namespace() != "com.amazonaws.iotdataplane"
+        || !JSON_DOCUMENT_PAYLOAD_OUTPUTS.contains(&id.shape_name())
+    {
+        return false;
+    }
+    output_schema
+        .members()
+        .iter()
+        .any(|member| member.http_payload().is_some() && member.shape_type() == ShapeType::Blob)
+}
 
 /// The `com-amazonaws-iotdataplane-iotmoonrakerservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -62,6 +120,101 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
         }
+    }
+}
+
+/// The protocol this service answers modeled requests in: the model's restJson1,
+/// with the one media-type correction the module docs state.
+///
+/// It is implemented on the service itself because the model-derived protocol it
+/// delegates to is owned by the generated entry and reached by reference
+/// (`self.entry.protocol()`), and [`Service::override_protocol`] hands back a borrow
+/// of `&self` — so there is one protocol instance, the generated one, and no second
+/// route table to drift from the model.
+impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
+    type Request = WireRequest;
+    type Response = WireResponse;
+
+    fn protocol_id(&self) -> &aws_smithy_schema::ShapeId {
+        self.entry.protocol().protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a WireRequest) -> Result<&'a str, ProtocolError> {
+        self.entry.protocol().routing_key(request)
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a WireRequest,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn aws_smithy_schema::serde::ShapeDeserializer + 'a>, ProtocolError> {
+        self.entry
+            .protocol()
+            .deserialize_input(request, input_schema)
+    }
+
+    fn serialize_output(
+        &self,
+        output: &dyn aws_smithy_schema::serde::SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<WireResponse, ProtocolError> {
+        let mut response = self.entry.protocol().serialize_output(
+            output,
+            output_schema,
+            operation_name,
+            success_status,
+        )?;
+        // The body the protocol just wrote is the `JsonDocument` payload verbatim, so
+        // only the media type announcing it changes — never the bytes, the status or
+        // any other header.
+        if carries_json_document(output_schema) {
+            response
+                .headers_mut()
+                .insert("content-type", JSON_DOCUMENT_MEDIA_TYPE);
+        }
+        Ok(response)
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn aws_smithy_schema::serde::SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<WireResponse, ProtocolError> {
+        // A modelled failure carries no `@httpPayload`: it is the protocol's JSON
+        // error envelope, which already announces `application/json`.
+        self.entry
+            .protocol()
+            .serialize_error(error, error_schema, error_code, http_status)
+    }
+
+    fn serialize_event_stream_message(
+        &self,
+        event_type: &str,
+        is_exception: bool,
+        event: &dyn aws_smithy_schema::serde::SerializableStruct,
+        event_schema: &Schema,
+    ) -> Result<WireResponse, ProtocolError> {
+        self.entry.protocol().serialize_event_stream_message(
+            event_type,
+            is_exception,
+            event,
+            event_schema,
+        )
+    }
+}
+
+/// `ServerProtocol` requires `Debug`; the generated entry is not `Debug`, so this
+/// names the protocol being served rather than the service's internals.
+impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmulatedService")
+            .field("protocol", &self.entry.protocol().protocol_id())
+            .field("json_document_payloads", &JSON_DOCUMENT_PAYLOAD_OUTPUTS)
+            .finish()
     }
 }
 
@@ -107,6 +260,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // leaving both alone.
         let _ = refusal;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every response a modeled operation of this service produces is serialized
+        // by the protocol returned here, so this is the one place the media type it
+        // announces is decided. See the module docs: a shadow state document — the
+        // `JsonDocument` blob these operations bind as their `@httpPayload` — is
+        // announced `application/json`, and every other response is left exactly as
+        // the model's restJson1 protocol renders it.
+        Some(self)
     }
 
     fn override_routing_error(
