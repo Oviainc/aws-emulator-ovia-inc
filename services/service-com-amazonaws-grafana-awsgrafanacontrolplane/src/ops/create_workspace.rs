@@ -324,6 +324,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             configuration: input
                 .configuration
                 .unwrap_or_else(|| crate::state::DEFAULT_WORKSPACE_CONFIGURATION.to_string()),
+            // A SAML configuration arrives only through
+            // `UpdateWorkspaceAuthentication`: `CreateWorkspaceRequest` carries
+            // no `samlConfiguration`, so a workspace created with the SAML
+            // provider starts out enabled but NOT_CONFIGURED.
+            saml_configuration: None,
             // A licence is associated by `AssociateLicense`, never at create.
             license_type: None,
             tags: input.tags.unwrap_or_default().into_iter().collect(),

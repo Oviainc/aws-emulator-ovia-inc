@@ -170,9 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(plugin) = state.custom_plugins.get(&input.custom_plugin_arn) else {
             return Err(DescribeCustomPluginErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "No custom plugin exists with the ARN {}.",
-                    input.custom_plugin_arn
+                message: Some(crate::state::invalid_parameter_because(
+                    "customPluginArn",
+                    crate::state::RESOURCE_DOES_NOT_EXIST,
                 )),
             })
             .into());

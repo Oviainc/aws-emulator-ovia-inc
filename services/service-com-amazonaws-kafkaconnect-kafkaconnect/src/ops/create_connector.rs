@@ -208,9 +208,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no list length, so the framework cannot refuse this one.
         if input.plugins.len() != 1 {
             return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
-                message: Some(format!(
-                    "plugins must be a single-element list containing one customPlugin object; got {} elements.",
-                    input.plugins.len()
+                message: Some(crate::state::invalid_parameter_because(
+                    "plugins",
+                    "Specify a single-element list containing one customPlugin object.",
                 )),
             })
             .into());
@@ -222,10 +222,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let provisioned = input.capacity.provisioned_capacity.is_some();
         if auto_scaled == provisioned {
             return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
-                message: Some(
-                    "capacity must name exactly one of autoScaling or provisionedCapacity."
-                        .to_string(),
-                ),
+                message: Some(crate::state::invalid_parameter_because(
+                    "capacity",
+                    "Specify exactly one of autoScaling or provisionedCapacity.",
+                )),
+            })
+            .into());
+        }
+
+        // The connector runs under an IAM role the request names by ARN; a
+        // value that is not an ARN at all names no role. The model types the
+        // member as a plain `__string`, so the framework cannot refuse it at
+        // the boundary.
+        if !crate::state::is_arn_for(
+            &input.service_execution_role_arn,
+            crate::state::IAM_ARN_SERVICE,
+        ) {
+            return Err(CreateConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_parameter_because(
+                    "serviceExecutionRoleArn",
+                    crate::state::INVALID_ARN,
+                )),
             })
             .into());
         }
@@ -264,29 +281,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // against a plugin that may never become usable.
                     return Err(CreateConnectorErrorModeled::BadRequestException(
                         BadRequestException {
-                            message: Some(format!(
-                                "The custom plugin {} is {}, not ACTIVE. Correct your request and then retry it.",
-                                reference.custom_plugin_arn, stored.state
+                            message: Some(crate::state::invalid_parameter_because(
+                                "customPluginArn",
+                                "The custom plugin is not ACTIVE.",
                             )),
                         },
                     )
                     .into());
                 }
                 Some(stored) if stored.revision == reference.revision => {}
-                Some(stored) => {
+                Some(_) => {
                     return Err(CreateConnectorErrorModeled::NotFoundException(NotFoundException {
-                        message: Some(format!(
-                            "The custom plugin {} has no revision {}; its latest revision is {}.",
-                            reference.custom_plugin_arn, reference.revision, stored.revision
+                        message: Some(crate::state::invalid_parameter_because(
+                            "revision",
+                            crate::state::RESOURCE_DOES_NOT_EXIST,
                         )),
                     })
                     .into());
                 }
                 None => {
                     return Err(CreateConnectorErrorModeled::NotFoundException(NotFoundException {
-                        message: Some(format!(
-                            "No custom plugin exists with the ARN {}.",
-                            reference.custom_plugin_arn
+                        message: Some(crate::state::invalid_parameter_because(
+                            "customPluginArn",
+                            crate::state::RESOURCE_DOES_NOT_EXIST,
                         )),
                     })
                     .into());

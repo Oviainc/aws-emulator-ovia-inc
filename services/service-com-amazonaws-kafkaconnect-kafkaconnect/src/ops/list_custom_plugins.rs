@@ -181,11 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Ok(page) = crate::state::page(keyed, input.max_results, input.next_token.as_deref())
         else {
+            // Same rejected member, same message form, as in every other
+            // kafkaconnect parameter rejection.
             return Err(ListCustomPluginsErrorModeled::BadRequestException(BadRequestException {
-                message: Some(
-                    "The nextToken is not one this service issued. Correct your request and then retry it."
-                        .to_string(),
-                ),
+                message: Some(crate::state::invalid_parameter("nextToken")),
             })
             .into());
         };
