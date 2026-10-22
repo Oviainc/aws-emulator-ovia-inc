@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDiscoveredSchema
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDiscoveredSchema`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDiscoveredSchema::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Infers a schema from a sample of JSON events and returns it as the document the
+//! requested `Type` names.
+//!
+//! ## What this operation computes
+//!
+//! Schema discovery is a pure function of the sampled events: each `Events` entry is
+//! parsed as JSON, the per-event structures are unified into one description of what
+//! the sample showed at every position, and that description is rendered as an
+//! OpenAPI 3.0 document (`Type=OpenApi3`) or a JSON Schema draft-04 document
+//! (`Type=JSONSchemaDraft4`).
+//!
+//! Unification is what makes a sample of events, rather than one event, worth sending:
+//!
+//! * a member every sampled event carries is `required`; one only some carry is not;
+//! * a position seen as both an integer and a fractional number widens to `number`,
+//!   because every integer is a number;
+//! * a position also seen as `null` is nullable, spelled with OpenAPI 3.0's `nullable`
+//!   keyword and with draft-04's `["<type>", "null"]` type union;
+//! * a position two events disagree about (a string in one, an object in another), and
+//!   one nothing but `null` or an empty array was ever seen at, carries no `type` at
+//!   all — the empty schema, which admits any value.
+//!
+//! Nothing is persisted: this operation names no registry and no schema, and a schema
+//! enters this service's store only through `CreateSchema`. So the handler neither
+//! reads nor writes the service state.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +91,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+
+use serde_json::{Map, Value};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -107,6 +128,356 @@ pub type GetDiscoveredSchemaError = crate::scaffolded::Scaffolded<GetDiscoveredS
 impl From<GetDiscoveredSchemaErrorModeled> for GetDiscoveredSchemaError {
     fn from(modeled: GetDiscoveredSchemaErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The name the inferred schema carries in the document this operation returns.
+///
+/// The events are this operation's only input — it names no registry, no schema and
+/// no discoverer — so the inferred shape is named for what it describes.
+const ROOT_SCHEMA_NAME: &str = "Event";
+
+/// The OpenAPI dialect `Type=OpenApi3` asks for. 3.0.x is the dialect whose `nullable`
+/// keyword [`write_type`] writes; 3.1 replaced it with a `null` type union.
+const OPENAPI_VERSION: &str = "3.0.0";
+
+/// The `info.version` of the OpenAPI document. This is the version of the document
+/// itself, which discovery mints fresh on every call, so it is always the first.
+const DOCUMENT_VERSION: &str = "1.0.0";
+
+/// The `$schema` of the document `Type=JSONSchemaDraft4` asks for.
+const JSON_SCHEMA_DRAFT4: &str = "http://json-schema.org/draft-04/schema#";
+
+/// The `format` both dialects give a string that carries an RFC-3339 timestamp.
+const DATE_TIME_FORMAT: &str = "date-time";
+
+/// Which document the request's `Type` asks for.
+///
+/// The two values are [`TYPE_VALUES`], the model's `Type` enum. They differ in more
+/// than the envelope: each dialect spells a nullable position its own way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    OpenApi3,
+    JsonSchemaDraft4,
+}
+
+impl Dialect {
+    /// The dialect a request's `Type` names, or `None` for a value the model's enum
+    /// does not hold.
+    fn from_modeled(r#type: &str) -> Option<Self> {
+        match r#type {
+            "OpenApi3" => Some(Self::OpenApi3),
+            "JSONSchemaDraft4" => Some(Self::JsonSchemaDraft4),
+            _ => None,
+        }
+    }
+}
+
+/// What the sampled events showed at ONE position in the JSON tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Observed {
+    /// The type (or types, once widened) seen at this position.
+    kind: Kind,
+    /// `null` was seen here, so the position admits it.
+    nullable: bool,
+}
+
+/// The type lattice a sample of events is unified in. [`Kind::merge`] is its join:
+/// associative and commutative, so the inferred schema does not depend on the order
+/// the events arrived in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Kind {
+    /// No typed value was ever seen here: every event had `null`, or an array at
+    /// this position was always empty. The sample names no type.
+    Unconstrained,
+    Boolean,
+    /// Every number seen here was integral.
+    Integer,
+    /// At least one number seen here had a fractional part.
+    Number,
+    String {
+        /// Every string seen here was an RFC-3339 timestamp.
+        date_time: bool,
+    },
+    /// An array, with what was seen across ALL of its elements.
+    Array(Box<Observed>),
+    Object(ObjectShape),
+    /// Two events disagreed about the type here (a string in one, an object in
+    /// another), so no single type describes the position.
+    Conflicting,
+}
+
+/// What the sample showed about an object position: which members appeared, in how
+/// many of the objects seen there, and what each one held.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ObjectShape {
+    /// How many objects were observed at this position — the denominator `required`
+    /// is decided against.
+    samples: u64,
+    /// Member name → (how many of those objects carried it, what it held).
+    ///
+    /// `BTreeMap` so `properties` and `required` come out in a stable order: the
+    /// same sample must render the same document on every call.
+    members: BTreeMap<String, (u64, Observed)>,
+}
+
+impl Observed {
+    /// A position seen holding `kind` and never `null`.
+    fn of(kind: Kind) -> Self {
+        Self {
+            kind,
+            nullable: false,
+        }
+    }
+
+    /// Unify two observations of the same position.
+    fn merge(self, other: Self) -> Self {
+        Self {
+            kind: self.kind.merge(other.kind),
+            nullable: self.nullable || other.nullable,
+        }
+    }
+}
+
+impl Kind {
+    /// The join of two types seen at one position: the narrowest type that
+    /// describes both.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            // A position nothing was ever seen at takes whatever the other sample
+            // showed, which is what makes `null`-only and empty-array positions
+            // learn their type from the rest of the sample.
+            (Self::Unconstrained, known) | (known, Self::Unconstrained) => known,
+            // Already irreconcilable: a third sample cannot narrow it.
+            (Self::Conflicting, _) | (_, Self::Conflicting) => Self::Conflicting,
+            (Self::Boolean, Self::Boolean) => Self::Boolean,
+            (Self::Integer, Self::Integer) => Self::Integer,
+            // Every integer is a number, so a position seen as both is a number —
+            // not a conflict.
+            (Self::Integer | Self::Number, Self::Integer | Self::Number) => Self::Number,
+            // `date-time` is claimed only when EVERY string seen here was one: a
+            // single free-form string makes the member a plain string.
+            (Self::String { date_time: left }, Self::String { date_time: right }) => Self::String {
+                date_time: left && right,
+            },
+            (Self::Array(left), Self::Array(right)) => {
+                Self::Array(Box::new((*left).merge(*right)))
+            }
+            (Self::Object(left), Self::Object(right)) => Self::Object(left.merge(right)),
+            _ => Self::Conflicting,
+        }
+    }
+}
+
+impl ObjectShape {
+    /// Unify two object observations: the members are the union, each member's
+    /// presence count is the sum, and what a shared member holds is unified in turn.
+    fn merge(mut self, other: Self) -> Self {
+        self.samples = self.samples.saturating_add(other.samples);
+        for (name, (count, observed)) in other.members {
+            let unified = match self.members.remove(&name) {
+                Some((seen, mine)) => (seen.saturating_add(count), mine.merge(observed)),
+                None => (count, observed),
+            };
+            self.members.insert(name, unified);
+        }
+        self
+    }
+}
+
+/// What one sampled JSON value shows about the position it sits at, and about every
+/// position below it.
+///
+/// Depth is bounded by `serde_json`'s own nesting limit, which refused the event
+/// before this walk sees it.
+fn observe(value: &Value) -> Observed {
+    match value {
+        Value::Null => Observed {
+            kind: Kind::Unconstrained,
+            nullable: true,
+        },
+        Value::Bool(_) => Observed::of(Kind::Boolean),
+        // `is_f64` is true exactly for a number that did not fit an integer: a
+        // fractional value, or one outside `i64`/`u64`.
+        Value::Number(number) => Observed::of(if number.is_f64() {
+            Kind::Number
+        } else {
+            Kind::Integer
+        }),
+        Value::String(text) => Observed::of(Kind::String {
+            date_time: is_date_time(text),
+        }),
+        // Every element of an array describes the SAME position (`items`), so they
+        // are unified with each other exactly as two events are.
+        Value::Array(elements) => Observed::of(Kind::Array(Box::new(
+            elements
+                .iter()
+                .map(observe)
+                .fold(Observed::of(Kind::Unconstrained), Observed::merge),
+        ))),
+        Value::Object(members) => Observed::of(Kind::Object(ObjectShape {
+            samples: 1,
+            members: members
+                .iter()
+                .map(|(name, value)| (name.clone(), (1, observe(value))))
+                .collect(),
+        })),
+    }
+}
+
+/// Whether a sampled string carries an RFC-3339 timestamp, which both dialects
+/// describe with `"format": "date-time"`.
+///
+/// Read with the SDK's own date-time parser rather than matched as text, so what
+/// counts as a timestamp here is exactly what a client can read back as one. Both the
+/// `Z` and the numeric-offset spellings are accepted; neither is more of a timestamp
+/// than the other.
+fn is_date_time(text: &str) -> bool {
+    [
+        ::aws_smithy_types::date_time::Format::DateTime,
+        ::aws_smithy_types::date_time::Format::DateTimeWithOffset,
+    ]
+    .into_iter()
+    .any(|format| ::aws_smithy_types::DateTime::from_str(text, format).is_ok())
+}
+
+/// Render an observation as one schema node in `dialect`.
+///
+/// An empty map is the empty schema: it constrains nothing, which is the honest
+/// answer for a position the sample disagreed about or never showed a value at.
+fn render(observed: &Observed, dialect: Dialect) -> Map<String, Value> {
+    let mut node = Map::new();
+    match &observed.kind {
+        Kind::Unconstrained | Kind::Conflicting => return node,
+        Kind::Boolean => write_type(&mut node, "boolean", observed.nullable, dialect),
+        Kind::Integer => write_type(&mut node, "integer", observed.nullable, dialect),
+        Kind::Number => write_type(&mut node, "number", observed.nullable, dialect),
+        Kind::String { date_time } => {
+            write_type(&mut node, "string", observed.nullable, dialect);
+            if *date_time {
+                node.insert(
+                    "format".to_string(),
+                    Value::String(DATE_TIME_FORMAT.to_string()),
+                );
+            }
+        }
+        Kind::Array(items) => {
+            write_type(&mut node, "array", observed.nullable, dialect);
+            node.insert("items".to_string(), Value::Object(render(items, dialect)));
+        }
+        Kind::Object(shape) => {
+            write_type(&mut node, "object", observed.nullable, dialect);
+            // A member is required when EVERY object seen at this position carried
+            // it; one that only some carried is optional.
+            let required: Vec<Value> = shape
+                .members
+                .iter()
+                .filter(|(_, (seen, _))| *seen >= shape.samples)
+                .map(|(name, _)| Value::String(name.clone()))
+                .collect();
+            // Neither dialect allows an empty `required` array, so an object with
+            // no member common to the whole sample carries no `required` at all.
+            if !required.is_empty() {
+                node.insert("required".to_string(), Value::Array(required));
+            }
+            node.insert(
+                "properties".to_string(),
+                Value::Object(
+                    shape
+                        .members
+                        .iter()
+                        .map(|(name, (_, member))| {
+                            (name.clone(), Value::Object(render(member, dialect)))
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
+    node
+}
+
+/// Write a node's `type`, in the spelling `dialect` uses for a position that also
+/// held `null`.
+fn write_type(node: &mut Map<String, Value>, name: &str, nullable: bool, dialect: Dialect) {
+    let named = Value::String(name.to_string());
+    let r#type = match (nullable, dialect) {
+        (false, _) => named,
+        // OpenAPI 3.0 has no `null` type: a nullable position is the type plus the
+        // `nullable` keyword.
+        (true, Dialect::OpenApi3) => {
+            node.insert("nullable".to_string(), Value::Bool(true));
+            named
+        }
+        // JSON Schema draft-04 has no `nullable` keyword: a nullable position is a
+        // union of the type with `null`.
+        (true, Dialect::JsonSchemaDraft4) => {
+            Value::Array(vec![named, Value::String("null".to_string())])
+        }
+    };
+    node.insert("type".to_string(), r#type);
+}
+
+/// Wrap the inferred schema in the document envelope `dialect` defines.
+fn document(root: &Observed, dialect: Dialect) -> Value {
+    let schema = render(root, dialect);
+    match dialect {
+        // An OpenAPI document describes an API, so the inferred shape is a component
+        // schema; there are no operations to describe, hence the empty `paths`.
+        Dialect::OpenApi3 => {
+            let mut schemas = Map::new();
+            schemas.insert(ROOT_SCHEMA_NAME.to_string(), Value::Object(schema));
+            let mut components = Map::new();
+            components.insert("schemas".to_string(), Value::Object(schemas));
+            let mut info = Map::new();
+            info.insert(
+                "version".to_string(),
+                Value::String(DOCUMENT_VERSION.to_string()),
+            );
+            info.insert(
+                "title".to_string(),
+                Value::String(ROOT_SCHEMA_NAME.to_string()),
+            );
+            let mut document = Map::new();
+            document.insert(
+                "openapi".to_string(),
+                Value::String(OPENAPI_VERSION.to_string()),
+            );
+            document.insert("info".to_string(), Value::Object(info));
+            document.insert("paths".to_string(), Value::Object(Map::new()));
+            document.insert("components".to_string(), Value::Object(components));
+            Value::Object(document)
+        }
+        // A JSON Schema document IS the schema: the dialect and the name go beside
+        // the inferred keywords rather than wrapping them.
+        Dialect::JsonSchemaDraft4 => {
+            let mut document = Map::new();
+            document.insert(
+                "$schema".to_string(),
+                Value::String(JSON_SCHEMA_DRAFT4.to_string()),
+            );
+            document.insert(
+                "title".to_string(),
+                Value::String(ROOT_SCHEMA_NAME.to_string()),
+            );
+            for (keyword, value) in schema {
+                document.insert(keyword, value);
+            }
+            Value::Object(document)
+        }
+    }
+}
+
+/// The JSON type of a sampled value, for the refusal of an event that is not an
+/// object. Names the type, never the value: the value is the caller's data.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -146,18 +517,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDiscoveredSchema` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDiscoveredSchemaErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDiscoveredSchema"))
+        // Discovery is a pure function of the sampled events: it names no resource,
+        // and a schema enters this service's store only through `CreateSchema`. So
+        // neither the store nor the request metadata is read — both stay bound for
+        // the same reason the generated scaffold bound them.
+        let _ = (ctx, &self.engine);
+
+        let dialect = Dialect::from_modeled(&input.r#type).ok_or_else(|| {
+            GetDiscoveredSchemaError::from(GetDiscoveredSchemaErrorModeled::BadRequestException(
+                crate::state::bad_request(format!(
+                    "Type must be one of {}.",
+                    TYPE_VALUES.join(", ")
+                )),
+            ))
+        })?;
+
+        // Unify the whole sample into one description, then render it once: the
+        // events describe the same position, so this is the same join the elements
+        // of an array go through.
+        let mut root = Observed::of(Kind::Unconstrained);
+        for (index, event) in input.events.iter().enumerate() {
+            // `serde_json` refuses an event that is not JSON — including one nested
+            // deeper than its own limit — so nothing unbounded reaches the walk.
+            let event: Value = serde_json::from_str(event).map_err(|error| {
+                GetDiscoveredSchemaError::from(
+                    GetDiscoveredSchemaErrorModeled::BadRequestException(
+                        crate::state::bad_request(format!(
+                            "Events[{index}] is not a JSON event: {error}."
+                        )),
+                    ),
+                )
+            })?;
+            // An event is a JSON object: it is the members of an event that a
+            // schema describes, and a bare scalar or array has none.
+            if !event.is_object() {
+                return Err(GetDiscoveredSchemaErrorModeled::BadRequestException(
+                    crate::state::bad_request(format!(
+                        "Events[{index}] must be a JSON object, but is {}.",
+                        json_type_name(&event)
+                    )),
+                )
+                .into());
+            }
+            root = root.merge(observe(&event));
+        }
+
+        Ok(GetDiscoveredSchemaOutput {
+            content: Some(document(&root, dialect).to_string()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unification does not depend on the order the events arrived in: the join is
+    /// commutative, so the same sample in either order describes one shape.
+    #[test]
+    fn unification_is_order_independent() {
+        let first = observe(&serde_json::json!({"a": 1, "b": "x"}));
+        let second = observe(&serde_json::json!({"a": 1.5, "c": null}));
+        assert_eq!(
+            first.clone().merge(second.clone()),
+            second.merge(first),
+            "the join of two observations must not depend on their order"
+        );
+    }
+
+    /// A position two events disagree about is rendered as the empty schema rather
+    /// than as one of the two types.
+    #[test]
+    fn a_disagreeing_position_constrains_nothing() {
+        let merged = observe(&Value::String("x".to_string()))
+            .merge(observe(&serde_json::json!({"a": 1})));
+        for dialect in [Dialect::OpenApi3, Dialect::JsonSchemaDraft4] {
+            let rendered = render(&merged, dialect);
+            assert!(
+                rendered.is_empty(),
+                "case {dialect:?}: a disagreeing position must constrain nothing, got {rendered:?}"
+            );
+        }
     }
 }

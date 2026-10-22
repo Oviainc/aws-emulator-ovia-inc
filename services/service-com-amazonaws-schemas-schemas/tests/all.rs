@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/code_binding_lifecycle.rs"]
 mod code_binding_lifecycle;
+#[path = "all/discovered_schema_inference.rs"]
+mod discovered_schema_inference;
 #[path = "all/registry_schema_lifecycle.rs"]
 mod registry_schema_lifecycle;
 #[path = "all/state_roundtrip.rs"]
