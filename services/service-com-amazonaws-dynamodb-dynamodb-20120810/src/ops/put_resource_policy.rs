@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: parses the `Policy` document and attaches it to the stored table
+//! named by `ResourceArn`, replacing whatever policy that table carried, and reports
+//! the revision id of what is now attached. A later `GetResourcePolicy` reports the
+//! same document and revision id, and the data plane
+//! ([`crate::ops::get_item`] and the other item operations) refuses a request the
+//! attached policy explicitly denies.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The revision id is DERIVED from the document, which is what makes the operation
+//! idempotent the way the doc below states: "running it multiple times on the same
+//! resource using the same policy document will return the same revision id".
+//! `ExpectedRevisionId` is honoured as documented, `NO_POLICY` included.
+//!
+//! The attach is ASYNCHRONOUS, as the doc below says ("PutResourcePolicy is an
+//! asynchronous operation", "the policy application is eventually consistent"): the
+//! data plane starts honouring the policy one [`crate::state::STATUS_TRANSITION`]
+//! after this call, so a request made straight afterwards is still authorized as it
+//! was. `GetResourcePolicy` reports it immediately — this store holds one copy of it.
+//!
+//! A document past the documented 20 KB is `LimitExceededException` and one that is
+//! not a policy document is `ValidationException`. A statement `Condition` is stored
+//! and reported back, but it is not evaluated — a condition is matched against a
+//! request context (network, identity, time) this emulator does not have — so a Deny
+//! that carries one is applied anyway, and its refusal says so: the emulator refuses
+//! rather than serves what the attached policy may deny.
+//! `ConfirmRemoveSelfResourceAccess` is accepted and not acted on: whether a policy
+//! removes the caller's own access depends on the identity-based policies this
+//! emulator does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +215,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // The ARN is the caller's whole selector: it names the region the table lives
+        // in as well as the table, exactly as it does for the tagging operations.
+        let resource =
+            crate::state::resolve_resource_arn(&input.resource_arn).map_err(lift)?;
+        // The document is parsed BEFORE any table is looked up: whether it is a policy
+        // at all does not depend on the resource it would be attached to. Its
+        // application is ASYNCHRONOUS — "PutResourcePolicy is an asynchronous
+        // operation" and "the policy application is eventually consistent" — so the
+        // data plane starts honouring it one [`crate::state::STATUS_TRANSITION`] from
+        // now, and a request made straight after this one is still authorized as it
+        // was. Nothing sleeps for that span: the instant is stored.
+        let policy = crate::state::AttachedPolicy::attach(
+            &input.policy,
+            now + crate::state::STATUS_TRANSITION,
+        )
+        .map_err(|fault| lift_policy_fault(&input.resource_arn, fault))?;
+
+        let mut store = state.lock();
+        store.apply_due_transitions(now);
+        let table = store
+            .table_mut(&resource.region, &resource.table)
+            .map_err(lift)?;
+        // No status requirement: `CreateTable$ResourcePolicy` attaches a policy to a
+        // table that is still `CREATING`, so a policy is not something only an ACTIVE
+        // table can carry. A table whose deletion is already due is gone by the time
+        // this lookup runs, and answers `ResourceNotFoundException` above.
+        // "When you provide an expected revision ID, if the revision ID of the existing
+        // policy on the resource doesn't match or if there's no policy attached to the
+        // resource, your request will be rejected with a PolicyNotFoundException. To
+        // conditionally attach a policy when no policy exists for the resource, specify
+        // NO_POLICY for the revision ID" (`PutResourcePolicy$ExpectedRevisionId`).
+        let attached = table.resource_policy.as_ref();
+        let matches_expectation = match input.expected_revision_id.as_deref() {
+            None => true,
+            Some("NO_POLICY") => attached.is_none(),
+            Some(expected) => attached.is_some_and(|policy| policy.revision_id == expected),
+        };
+        if !matches_expectation {
+            return Err(policy_not_found(&input.resource_arn));
+        }
+
+        let revision_id = policy.revision_id.clone();
+        table.resource_policy = Some(policy);
+
+        // The audit record for a state-changing call: who asked, what changed and that
+        // it succeeded. Never the document itself, and never a credential.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %resource.table,
+            revision_id = %revision_id,
+            outcome = "attached",
+            "resource-based policy attached"
+        );
+
+        Ok(PutResourcePolicyOutput {
+            revision_id: Some(revision_id),
+        })
+    }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> PutResourcePolicyError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            PutResourcePolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+    }
+}
+
+/// The modelled refusal for an `ExpectedRevisionId` the attached policy does not match.
+fn policy_not_found(resource_arn: &str) -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::PolicyNotFoundException(PolicyNotFoundException {
+        message: Some(format!(
+            "No resource-based policy with the expected revision id is attached to \
+             {resource_arn}"
+        )),
+    })
+    .into()
+}
+
+/// Lift a refusal of the policy document into this operation's error channel: the
+/// documented size limit is the modelled limit error, and a document that is not a
+/// policy is a bad request.
+fn lift_policy_fault(
+    resource_arn: &str,
+    fault: crate::state::PolicyFault,
+) -> PutResourcePolicyError {
+    match fault {
+        crate::state::PolicyFault::TooLarge(size) => {
+            PutResourcePolicyErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(format!(
+                    "Policy size exceeds the maximum supported size of {} bytes for resource \
+                     {resource_arn}: {size} bytes",
+                    crate::state::MAX_RESOURCE_POLICY_BYTES
+                )),
+            })
+            .into()
+        }
+        crate::state::PolicyFault::Invalid(detail) => {
+            crate::scaffolded::Scaffolded::validation(detail)
+        }
     }
 }

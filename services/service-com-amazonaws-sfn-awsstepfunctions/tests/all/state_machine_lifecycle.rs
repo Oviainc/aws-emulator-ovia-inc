@@ -332,15 +332,25 @@ async fn describe_state_machine_reports_the_created_record() {
             Some("ACTIVE"),
             "case {case:?}: a created state machine is ACTIVE, got {described:?}"
         );
-        assert_eq!(
-            described.get("loggingConfiguration"),
-            request.get("loggingConfiguration"),
-            "case {case:?}: expected the loggingConfiguration as supplied, got {described:?}"
+        // A configuration the create SUPPLIED is reported as supplied; one it did
+        // not is reported at its own modelled default, which
+        // `tests/all/state_machine_projection.rs` pins over the whole class.
+        let expected_logging = request.get("loggingConfiguration").cloned().unwrap_or(
+            json!({ "level": "OFF", "includeExecutionData": false }),
         );
         assert_eq!(
+            described.get("loggingConfiguration"),
+            Some(&expected_logging),
+            "case {case:?}: expected loggingConfiguration {expected_logging}, got {described:?}"
+        );
+        let expected_tracing = request
+            .get("tracingConfiguration")
+            .cloned()
+            .unwrap_or(json!({ "enabled": false }));
+        assert_eq!(
             described.get("tracingConfiguration"),
-            request.get("tracingConfiguration"),
-            "case {case:?}: expected the tracingConfiguration as supplied, got {described:?}"
+            Some(&expected_tracing),
+            "case {case:?}: expected tracingConfiguration {expected_tracing}, got {described:?}"
         );
     }
 }

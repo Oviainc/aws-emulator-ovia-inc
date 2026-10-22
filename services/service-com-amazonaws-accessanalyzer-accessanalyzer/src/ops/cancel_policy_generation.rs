@@ -132,7 +132,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CancelPolicyGeneration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CANCEL_POLICY_GENERATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CANCEL_POLICY_GENERATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // `CancelPolicyGenerationResponse` is a declared structure with NO members, so the
+    // success this operation will answer once it is implemented carries no content:
+    // 204, under the same rule as the tag mutations
+    // ([`crate::state::NO_CONTENT_SUCCESS_STATUS`]). The handler below still answers
+    // 501, so this status is what the implementer inherits rather than something a
+    // caller sees today.
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,

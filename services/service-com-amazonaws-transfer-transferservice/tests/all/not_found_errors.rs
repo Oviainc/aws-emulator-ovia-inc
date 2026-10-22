@@ -154,6 +154,17 @@ async fn operations_on_resources_that_were_never_created_answer_the_generic_400_
             ("DescribeServer", json!({"ServerId": absent})),
             ("DeleteServer", json!({"ServerId": absent})),
             ("ListUsers", json!({"ServerId": absent})),
+            ("ListHostKeys", json!({"ServerId": absent})),
+            // A malformed `NextToken` does not change WHICH refusal the caller gets:
+            // the named server is resolved first, by both listings of that server.
+            (
+                "ListUsers",
+                json!({"ServerId": absent, "NextToken": "not-a-token"}),
+            ),
+            (
+                "ListHostKeys",
+                json!({"ServerId": absent, "NextToken": "not-a-token"}),
+            ),
             (
                 "DescribeUser",
                 json!({"ServerId": absent, "UserName": "alice"}),
@@ -242,6 +253,7 @@ async fn operations_on_deleted_resources_answer_the_same_generic_400_not_found()
         for (op, request) in [
             ("DescribeServer", json!({"ServerId": &server_id})),
             ("ListUsers", json!({"ServerId": &server_id})),
+            ("ListHostKeys", json!({"ServerId": &server_id})),
             // A second delete: the idempotent-teardown path.
             ("DeleteServer", json!({"ServerId": &server_id})),
         ] {

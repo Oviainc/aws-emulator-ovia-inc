@@ -13,6 +13,11 @@
 //!
 //! An unknown pair is `NoSuchResourceException`.
 //!
+//! Its `QuotaArn` is the AWS-DEFAULT form, whose account segment is EMPTY
+//! (`arn:aws:servicequotas:<region>::<serviceCode>/<quotaCode>`): a default quota is
+//! AWS's published value and belongs to no account, while the applied quota
+//! `GetServiceQuota` reports is the account's and names it.
+//!
 //! ---
 //!
 //! # Modeled contract for `GetAWSDefaultServiceQuota`

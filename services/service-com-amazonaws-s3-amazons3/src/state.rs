@@ -305,6 +305,19 @@ pub struct Bucket {
     /// "an empty tag set" are the same state on AWS, which is why `PutBucketTagging` with
     /// an empty `TagSet` and `DeleteBucketTagging` leave a bucket in the same place.
     tags: Vec<BucketTag>,
+    /// The bucket's ownership controls: one entry per `OwnershipControlsRule`, holding that
+    /// rule's `ObjectOwnership` value in the order the request carried it, or `None` while
+    /// no ownership controls are associated with the bucket.
+    ///
+    /// `None` and an empty list are NOT the same state here, which is why this is an
+    /// `Option` where [`Self::tags`] is a plain `Vec`: `OwnershipControls$Rules` is a
+    /// REQUIRED member (`smithy_query(query="shape",shape="OwnershipControls")`), so a
+    /// bucket either has ownership controls that name at least one rule or has none at
+    /// all — and "none at all" is what makes `GetBucketOwnershipControls` answer
+    /// [`OWNERSHIP_CONTROLS_NOT_FOUND_CODE`] rather than report an empty container.
+    ///
+    /// Private, like `tags`, so the pair of accessors below is the only way in or out.
+    ownership_controls: Option<Vec<String>>,
     /// The objects the bucket holds, by key, as `PutObject` last recorded each.
     ///
     /// Private for the same reason as `tags`, and sorted by key because that is the order
@@ -354,6 +367,23 @@ impl Bucket {
     /// Remove the bucket's tag set, leaving no tags associated with it.
     pub fn clear_tags(&mut self) {
         self.tags.clear();
+    }
+
+    /// The bucket's ownership control rules — one `ObjectOwnership` value per rule, in the
+    /// order they were applied — or `None` when no ownership controls are associated with
+    /// the bucket.
+    pub fn ownership_controls(&self) -> Option<&[String]> {
+        self.ownership_controls.as_deref()
+    }
+
+    /// Associate `rules` with the bucket as its whole ownership controls.
+    ///
+    /// A replacement, not a merge: `PutBucketOwnershipControls` "creates or modifies
+    /// OwnershipControls for an Amazon S3 bucket" (that operation's own documentation) and
+    /// carries the complete `OwnershipControls` container as its payload, so what the
+    /// request names becomes the bucket's controls in full.
+    pub fn set_ownership_controls(&mut self, rules: Vec<String>) {
+        self.ownership_controls = Some(rules);
     }
 
     /// The object stored at `key`, or `None` when the bucket holds no such key.
@@ -641,9 +671,10 @@ impl ComAmazonawsS3Amazons3State {
                 // The creation instant is read here, where the bucket comes into being,
                 // so `CreationDate` is the moment the store accepted it.
                 created_at: Some(SystemTime::now()),
-                // A fresh bucket carries no policy and no tags and holds no objects;
-                // `PutBucketPolicy` and `PutBucketTagging` are what associate those
-                // subresources with it and `PutObject` what puts an object in it.
+                // A fresh bucket carries no policy, no tags and no ownership controls, and
+                // holds no objects; `PutBucketPolicy`, `PutBucketTagging` and
+                // `PutBucketOwnershipControls` are what associate those subresources with
+                // it and `PutObject` what puts an object in it.
                 ..Bucket::default()
             },
         );
@@ -697,6 +728,30 @@ pub const ENTITY_TOO_LARGE_CODE: &str = "EntityTooLarge";
 /// 412 (`PutObjectRequest$IfMatch`: "If the ETag values do not match, the operation
 /// returns a 412 Precondition Failed error").
 pub const PRECONDITION_FAILED_CODE: &str = "PreconditionFailed";
+/// The code S3 answers a read of a bucket that has no ownership controls associated with
+/// it, with HTTP 404 — the case `GetBucketOwnershipControls`'s own documentation describes
+/// ("A bucket doesn't have OwnershipControls settings in the following cases: … You've
+/// manually deleted the bucket ownership control value using the
+/// DeleteBucketOwnershipControls API operation").
+pub const OWNERSHIP_CONTROLS_NOT_FOUND_CODE: &str = "OwnershipControlsNotFoundError";
+/// See [`OWNERSHIP_CONTROLS_NOT_FOUND_CODE`].
+pub const OWNERSHIP_CONTROLS_NOT_FOUND_MESSAGE: &str =
+    "The bucket ownership controls were not found";
+/// The code S3 answers a request whose XML payload does not validate against the schema
+/// the API publishes for it: "MalformedXML - The XML provided does not match the schema"
+/// (`PutBucketTagging`'s own list of special errors), with HTTP 400.
+pub const MALFORMED_XML_CODE: &str = "MalformedXML";
+
+/// How many ownership control rules this emulator records for one bucket.
+///
+/// NOT a fidelity claim: `OwnershipControlsRules` carries no `@length` in the model
+/// (`smithy_query(query="shape",shape="OwnershipControlsRules")`), so nothing bounds the
+/// list a request may send, and a bucket's rules are kept in this process's memory — the
+/// same reason [`MAX_BUCKET_POLICY_BYTES`] bounds a policy. Each rule names one value of
+/// the three-value `ObjectOwnership` enum, so this ceiling is far above any list that says
+/// something new; a put past it is refused rather than recorded.
+pub const MAX_OWNERSHIP_CONTROLS_RULES: usize = 10;
+
 /// "The bucket policy does not exist."
 pub const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";
 /// See [`NO_SUCH_BUCKET_POLICY_CODE`].

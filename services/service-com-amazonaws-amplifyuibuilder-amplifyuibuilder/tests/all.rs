@@ -17,5 +17,8 @@ mod component_lifecycle;
 #[path = "all/component_wire_fidelity.rs"]
 mod component_wire_fidelity;
 
+#[path = "all/export_components.rs"]
+mod export_components;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

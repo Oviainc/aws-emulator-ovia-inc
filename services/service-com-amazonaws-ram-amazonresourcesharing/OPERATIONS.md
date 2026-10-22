@@ -265,14 +265,14 @@ contents — read that shape in the model above when you need its own members.
 
 - **Route:** `POST /tagresource -> 200`
 - **Input:** `resourceShareArn` (string), `tags` (list<Tag>, required), `resourceArn` (string)
-- **Output:** (no members)
+- **Output:** `tagsCreated` (list<Tag>) — added to this service's model from the recorded AWS responses; see `src/ops/tag_resource.rs`
 - **Errors:** `InvalidParameterException (HTTP 400)`, `MalformedArnException (HTTP 400)`, `ResourceArnNotFoundException (HTTP 400)`, `ServerInternalException (HTTP 500)`, `ServiceUnavailableException (HTTP 503)`, `TagLimitExceededException (HTTP 400)`, `TagPolicyViolationException (HTTP 400)`, `UnknownResourceException (HTTP 400)`
 
 ## UntagResource
 
 - **Route:** `POST /untagresource -> 200`
 - **Input:** `resourceShareArn` (string), `tagKeys` (list<string>, required), `resourceArn` (string)
-- **Output:** (no members)
+- **Output:** `deletedTags` (list<Tag>) — added to this service's model from the recorded AWS responses; see `src/ops/untag_resource.rs`
 - **Errors:** `InvalidParameterException (HTTP 400)`, `MalformedArnException (HTTP 400)`, `ServerInternalException (HTTP 500)`, `ServiceUnavailableException (HTTP 503)`, `UnknownResourceException (HTTP 400)`
 
 ## UpdateResourceShare

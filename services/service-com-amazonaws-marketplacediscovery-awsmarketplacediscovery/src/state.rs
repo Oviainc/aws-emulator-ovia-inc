@@ -30,7 +30,8 @@ use crate::ops::types::{
     CloudFormationFulfillmentOption, ContainerFulfillmentOption, ContainerOperatingSystem,
     DataArtifact, DataExchangeFulfillmentOption, DocumentItem,
     Ec2ImageBuilderComponentFulfillmentOption, EksAddOnFulfillmentOption,
-    EksAddOnOperatingSystem, FulfillmentOption, FulfillmentOptionSummary, HelmFulfillmentOption,
+    EksAddOnOperatingSystem, FreeTrialPricingTerm, FulfillmentOption, FulfillmentOptionSummary,
+    GrantItem, HelmFulfillmentOption,
     HelmOperatingSystem, LegalTerm, ListingBadge, ListingSummary,
     ListingSummaryAssociatedEntity, OfferInformation, OfferSetInformation, OfferTerm, PricingModel,
     PricingUnit, ProductInformation, ProfessionalServicesFulfillmentOption,
@@ -77,6 +78,21 @@ pub const VISIBILITY_PUBLIC: &str = "PUBLIC";
 
 /// Seconds in a day, for the seeded catalog's relative timestamps.
 const DAY: i64 = 24 * 60 * 60;
+
+/// The human-readable name of every listing badge, which is what `ListingBadge$displayName`
+/// carries.
+///
+/// Source: the `ListingBadgeType` enum
+/// (`smithy_query(query="shape",shape="ListingBadgeType")`), generated as
+/// `LISTING_BADGE_TYPE_VALUES`. The order is the order a listing reports its badges in, so
+/// two listings never disagree about where a badge appears.
+pub const LISTING_BADGE_DISPLAY_NAMES: &[(&str, &str)] = &[
+    ("AWS_FREE_TIER", "AWS Free Tier"),
+    ("DEPLOYED_ON_AWS", "Deployed on AWS"),
+    ("FREE_TRIAL", "Free trial"),
+    ("MULTI_PRODUCT", "Multiple products"),
+    ("QUICK_LAUNCH", "Quick Launch"),
+];
 
 /// The human-readable name of every fulfillment option type, which is what both
 /// `FulfillmentOptionSummary$displayName` ("The human-readable name of the fulfillment
@@ -243,6 +259,18 @@ impl FulfillmentOptionRecord {
         fulfillment_option_type(&self.default)
     }
 
+    /// Whether this option supports Quick Launch.
+    ///
+    /// Only a SaaS option can: `quickLaunch` ("Specifies whether the SaaS product supports
+    /// quick-launch deployment") is a member of `SaasFulfillmentOption` alone, and no other
+    /// member of the `FulfillmentOption` union models quick launch at all.
+    pub fn supports_quick_launch(&self) -> bool {
+        matches!(
+            &self.default,
+            FulfillmentOption::saasFulfillmentOption(option) if option.quick_launch == "ENABLED"
+        )
+    }
+
     /// The summary of this option's type, as `FulfillmentOptionSummary`.
     pub fn summary(&self) -> FulfillmentOptionSummary {
         FulfillmentOptionSummary {
@@ -309,7 +337,6 @@ pub struct Listing {
     pub integration_guide: Option<String>,
     pub categories: Vec<Category>,
     pub highlights: Vec<String>,
-    pub badges: Vec<ListingBadge>,
     pub pricing_models: Vec<PricingModel>,
     pub pricing_units: Vec<PricingUnit>,
     /// Products this listing is associated with; every one of them points back here
@@ -514,7 +541,7 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
             short_description: text.short_description.clone(),
             logo_thumbnail_url: listing.logo_thumbnail_url.clone(),
             categories: listing.categories.clone(),
-            badges: listing.badges.clone(),
+            badges: self.listing_badges(listing),
             review_summary: listing.review_summary.clone().unwrap_or_default(),
             pricing_models: listing.pricing_models.clone(),
             pricing_units: listing.pricing_units.clone(),
@@ -527,6 +554,77 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
                 })
                 .collect(),
         }
+    }
+
+    /// The badges a listing reports: one per special attribute the listing's OWN records
+    /// have, in [`LISTING_BADGE_DISPLAY_NAMES`] order.
+    ///
+    /// `GetListingOutput$badges` is "Badges indicating special attributes of the listing,
+    /// such as free tier eligibility, free trial availability, or Quick Launch support" —
+    /// each badge therefore RESTATES something the listing's products, offers and pricing
+    /// already say, and is derived from them rather than stored beside them, where it could
+    /// claim an attribute no record of the listing has (a Quick Launch badge on a listing
+    /// whose products offer no quick-launchable fulfillment, say).
+    ///
+    /// What each badge type restates:
+    ///
+    /// * `QUICK_LAUNCH` — a product of the listing has a fulfillment option that supports
+    ///   quick launch (`SaasFulfillmentOption$quickLaunch` is `ENABLED`).
+    /// * `DEPLOYED_ON_AWS` — a product of the listing is `DEPLOYED` on AWS
+    ///   (`Product$deployedOnAws`), which is what the `DEPLOYED_ON_AWS` search filter
+    ///   matches a listing by.
+    /// * `MULTI_PRODUCT` — the listing associates more than one product, the case
+    ///   `GetListingOutput$integrationGuide` calls "a multi-product listing".
+    /// * `FREE_TRIAL` — an offer the listing associates carries a free-trial pricing term
+    ///   (`FreeTrialPricingTerm`: "enables customers to try the product before
+    ///   purchasing").
+    /// * `AWS_FREE_TIER` — the listing has a `FREE` pricing model, i.e. an offer a buyer
+    ///   pays nothing for.
+    pub fn listing_badges(&self, listing: &Listing) -> Vec<ListingBadge> {
+        let products: Vec<&Product> = listing
+            .product_ids
+            .iter()
+            .filter_map(|product_id| self.products.get(product_id))
+            .collect();
+        let quick_launch = products.iter().any(|product| {
+            product
+                .fulfillment_options
+                .iter()
+                .any(FulfillmentOptionRecord::supports_quick_launch)
+        });
+        let deployed_on_aws = products
+            .iter()
+            .any(|product| product.deployed_on_aws == "DEPLOYED");
+        let multi_product = listing.product_ids.len() > 1;
+        let free_trial = listing.offer_ids.iter().any(|offer_id| {
+            self.offer_terms.get(offer_id).is_some_and(|terms| {
+                terms
+                    .iter()
+                    .any(|term| matches!(term, OfferTerm::freeTrialPricingTerm(_)))
+            })
+        });
+        let free_tier = listing
+            .pricing_models
+            .iter()
+            .any(|model| model.pricing_model_type == "FREE");
+
+        LISTING_BADGE_DISPLAY_NAMES
+            .iter()
+            .filter(|(badge_type, _)| match *badge_type {
+                "AWS_FREE_TIER" => free_tier,
+                "DEPLOYED_ON_AWS" => deployed_on_aws,
+                "FREE_TRIAL" => free_trial,
+                "MULTI_PRODUCT" => multi_product,
+                "QUICK_LAUNCH" => quick_launch,
+                // A badge type the model gains later is not claimed until its attribute is
+                // named here.
+                _ => false,
+            })
+            .map(|(badge_type, display_name)| ListingBadge {
+                badge_type: (*badge_type).to_string(),
+                display_name: (*display_name).to_string(),
+            })
+            .collect()
     }
 
     /// The fulfillment option summaries a LISTING reports: one per distinct fulfillment
@@ -1005,19 +1103,246 @@ fn rating_bound(filter_type: &str, values: &[String]) -> Result<f64, String> {
 }
 
 // ---------------------------------------------------------------------------
+// The catalog's category taxonomy.
+// ---------------------------------------------------------------------------
+
+/// The catalog's category tree: one row per category as
+/// `(categoryId, displayName, parent categoryId)`, the parent being `None` for a top-level
+/// category.
+///
+/// Why the catalog owns a TREE rather than a flat list: `ListingFacet$parent` is "The
+/// parent facet value for hierarchical facets, such as subcategories"
+/// (`smithy_query(query="shape",shape="ListingFacet")`), so the `CATEGORY` facet is
+/// hierarchical and a subcategory's facet value has to name the category it sits under.
+/// `Category` itself models no parent member, so the nesting is the CATALOG's knowledge and
+/// lives here, beside the records that carry the categories.
+///
+/// Source: the AWS Marketplace browse taxonomy — its top-level categories (Infrastructure
+/// Software, Business Applications, Data Products, Machine Learning, DevOps, IoT,
+/// Professional Services, Industries) and the subcategories published under each of them.
+/// The ids are this catalog's own slugs; the nesting and the display names are the
+/// taxonomy's.
+pub const CATEGORY_TAXONOMY: &[(&str, &str, Option<&str>)] = &[
+    // Infrastructure Software and its subcategories.
+    ("infrastructure-software", "Infrastructure Software", None),
+    (
+        "operating-systems",
+        "Operating Systems",
+        Some("infrastructure-software"),
+    ),
+    ("storage", "Storage", Some("infrastructure-software")),
+    (
+        "network-infrastructure",
+        "Network Infrastructure",
+        Some("infrastructure-software"),
+    ),
+    ("security", "Security", Some("infrastructure-software")),
+    (
+        "backup-recovery",
+        "Backup and Recovery",
+        Some("infrastructure-software"),
+    ),
+    (
+        "high-performance-computing",
+        "High Performance Computing",
+        Some("infrastructure-software"),
+    ),
+    ("migration", "Migration", Some("infrastructure-software")),
+    // Business Applications and its subcategories.
+    ("business-applications", "Business Applications", None),
+    ("crm", "CRM", Some("business-applications")),
+    (
+        "collaboration-productivity",
+        "Collaboration and Productivity",
+        Some("business-applications"),
+    ),
+    ("e-commerce", "eCommerce", Some("business-applications")),
+    (
+        "human-resources",
+        "Human Resources",
+        Some("business-applications"),
+    ),
+    (
+        "it-business-management",
+        "IT Business Management",
+        Some("business-applications"),
+    ),
+    // Data Products and its subcategories.
+    ("data-products", "Data Products", None),
+    (
+        "financial-services-data",
+        "Financial Services Data",
+        Some("data-products"),
+    ),
+    (
+        "healthcare-life-sciences-data",
+        "Healthcare and Life Sciences Data",
+        Some("data-products"),
+    ),
+    (
+        "environmental-data",
+        "Environmental Data",
+        Some("data-products"),
+    ),
+    (
+        "public-sector-data",
+        "Public Sector Data",
+        Some("data-products"),
+    ),
+    (
+        "telecommunications-data",
+        "Telecommunications Data",
+        Some("data-products"),
+    ),
+    // Machine Learning and its subcategories.
+    ("machine-learning", "Machine Learning", None),
+    ("computer-vision", "Computer Vision", Some("machine-learning")),
+    (
+        "natural-language-processing",
+        "Natural Language Processing",
+        Some("machine-learning"),
+    ),
+    (
+        "speech-recognition",
+        "Speech Recognition",
+        Some("machine-learning"),
+    ),
+    (
+        "structured-data-ml",
+        "Structured Data",
+        Some("machine-learning"),
+    ),
+    // DevOps and its subcategories.
+    ("devops", "DevOps", None),
+    (
+        "application-development",
+        "Application Development",
+        Some("devops"),
+    ),
+    (
+        "agile-lifecycle-management",
+        "Agile Lifecycle Management",
+        Some("devops"),
+    ),
+    ("monitoring", "Monitoring", Some("devops")),
+    ("source-control", "Source Control", Some("devops")),
+    ("testing", "Testing", Some("devops")),
+    (
+        "infrastructure-as-code",
+        "Infrastructure as Code",
+        Some("devops"),
+    ),
+    // Internet of Things and its subcategories.
+    ("iot", "Internet of Things", None),
+    ("iot-analytics", "IoT Analytics", Some("iot")),
+    (
+        "iot-device-management",
+        "IoT Device Management",
+        Some("iot"),
+    ),
+    ("iot-edge-computing", "IoT Edge Computing", Some("iot")),
+    // Professional Services and its subcategories.
+    ("professional-services", "Professional Services", None),
+    ("assessments", "Assessments", Some("professional-services")),
+    (
+        "implementation",
+        "Implementation",
+        Some("professional-services"),
+    ),
+    (
+        "managed-services",
+        "Managed Services",
+        Some("professional-services"),
+    ),
+    ("training", "Training", Some("professional-services")),
+    // Industries and its subcategories.
+    ("industries", "Industries", None),
+    ("financial-services", "Financial Services", Some("industries")),
+    ("healthcare", "Healthcare", Some("industries")),
+    (
+        "media-entertainment",
+        "Media and Entertainment",
+        Some("industries"),
+    ),
+    ("retail", "Retail", Some("industries")),
+    ("energy", "Energy", Some("industries")),
+    (
+        "telecommunications",
+        "Telecommunications",
+        Some("industries"),
+    ),
+    (
+        "education-research",
+        "Education and Research",
+        Some("industries"),
+    ),
+    ("public-sector", "Public Sector", Some("industries")),
+];
+
+/// The taxonomy row for `category_id`, or `None` for an id the taxonomy does not hold.
+fn taxonomy_row(category_id: &str) -> Option<&'static (&'static str, &'static str, Option<&'static str>)>
+{
+    CATEGORY_TAXONOMY.iter().find(|(id, _, _)| *id == category_id)
+}
+
+/// The category `category_id` sits under, or `None` when it is top-level (or unknown).
+///
+/// This is the value `ListingFacet$parent` carries for a `CATEGORY` facet value: the
+/// PARENT'S value, which is itself a `CATEGORY` filter value.
+pub fn category_parent(category_id: &str) -> Option<&'static str> {
+    taxonomy_row(category_id).and_then(|(_, _, parent)| *parent)
+}
+
+/// The category record for `category_id`, with the taxonomy's display name.
+///
+/// A `categoryId` the taxonomy does not hold is displayed by its own id, which keeps
+/// `Category$displayName` (required, non-blank) satisfiable for a record classified under a
+/// category added to the catalog before the taxonomy names it.
+pub fn taxonomy_category(category_id: &str) -> Category {
+    Category {
+        category_id: category_id.to_string(),
+        display_name: taxonomy_row(category_id)
+            .map_or_else(|| category_id.to_string(), |(_, name, _)| (*name).to_string()),
+    }
+}
+
+/// The categories a record classified under `leaves` carries: each leaf's taxonomy PATH,
+/// outermost ancestor first and the leaf last, with no category repeated.
+///
+/// A record classified under a subcategory is classified under that subcategory's parents
+/// too — browsing "Infrastructure Software" finds what is listed under "Storage" — so the
+/// path, not the leaf alone, is what a listing or product carries.
+pub fn classified_under(leaves: &[&str]) -> Vec<Category> {
+    let mut path: Vec<Category> = Vec::new();
+    for leaf in leaves {
+        // Ancestors of this leaf, outermost first.
+        let mut ancestors: Vec<&str> = Vec::new();
+        let mut cursor = category_parent(leaf);
+        while let Some(parent) = cursor {
+            if ancestors.contains(&parent) {
+                break;
+            }
+            ancestors.insert(0, parent);
+            cursor = category_parent(parent);
+        }
+        ancestors.push(leaf);
+        for category_id in ancestors {
+            if path.iter().any(|held| held.category_id == category_id) {
+                continue;
+            }
+            path.push(taxonomy_category(category_id));
+        }
+    }
+    path
+}
+
+// ---------------------------------------------------------------------------
 // The seeded catalog.
 // ---------------------------------------------------------------------------
 
 fn seller(profile_id: &str, display_name: &str) -> SellerInformation {
     SellerInformation {
         seller_profile_id: profile_id.to_string(),
-        display_name: display_name.to_string(),
-    }
-}
-
-fn category(category_id: &str, display_name: &str) -> Category {
-    Category {
-        category_id: category_id.to_string(),
         display_name: display_name.to_string(),
     }
 }
@@ -1367,13 +1692,6 @@ fn pricing_unit(unit_type: &str, display_name: &str) -> PricingUnit {
     }
 }
 
-fn listing_badge(badge_type: &str, display_name: &str) -> ListingBadge {
-    ListingBadge {
-        display_name: display_name.to_string(),
-        badge_type: badge_type.to_string(),
-    }
-}
-
 fn purchase_option_badge(badge_type: &str, display_name: &str) -> PurchaseOptionBadge {
     PurchaseOptionBadge {
         display_name: display_name.to_string(),
@@ -1501,6 +1819,24 @@ fn recurring_payment_term(id: &str, price: &str) -> OfferTerm {
     })
 }
 
+/// A free-trial pricing term: the term that lets a buyer try the product before paying,
+/// and the record the listing's `FREE_TRIAL` badge restates.
+fn free_trial_term(id: &str, duration: &str, dimension: &str, display_name: &str, unit: &str) -> OfferTerm {
+    OfferTerm::freeTrialPricingTerm(FreeTrialPricingTerm {
+        id: id.to_string(),
+        r#type: "FreeTrialPricingTerm".to_string(),
+        duration: Some(duration.to_string()),
+        grants: vec![GrantItem {
+            dimension_key: dimension.to_string(),
+            display_name: display_name.to_string(),
+            description: None,
+            dimension_labels: None,
+            unit: unit.to_string(),
+            max_quantity: None,
+        }],
+    })
+}
+
 fn usage_based_term(id: &str, dimension: &str, display_name: &str, unit: &str, price: &str) -> OfferTerm {
     OfferTerm::usageBasedPricingTerm(UsageBasedPricingTerm {
         id: id.to_string(),
@@ -1577,15 +1913,11 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             text: analytics_text,
             logo_thumbnail_url: "https://example.com/logos/acme-analytics.png".to_string(),
             integration_guide: Some("https://example.com/docs/acme-analytics/integrate".to_string()),
-            categories: vec![
-                category("business-applications", "Business Applications"),
-                category("data-products", "Data Products"),
-            ],
+            categories: classified_under(&["business-applications", "data-products"]),
             highlights: vec![
                 "Connects to 40 data sources".to_string(),
                 "Row-level access control".to_string(),
             ],
-            badges: vec![listing_badge("FREE_TRIAL", "Free trial")],
             pricing_models: vec![
                 pricing_model("CONTRACT", "Contract"),
                 pricing_model("USAGE", "Usage based"),
@@ -1641,7 +1973,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             manufacturer: acme.clone(),
             deployed_on_aws: "NOT_APPLICABLE".to_string(),
             logo_thumbnail_url: "https://example.com/logos/acme-analytics.png".to_string(),
-            categories: vec![category("business-applications", "Business Applications")],
+            categories: classified_under(&["business-applications"]),
             highlights: vec!["Hosted by the seller".to_string()],
             promotional_media: vec![promotional_image(
                 "Query engine",
@@ -1705,6 +2037,13 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
         "o-0001-analytics-annual".to_string(),
         vec![
             validity_term("t-0001-validity", "P365D", year_ago, next_year),
+            free_trial_term(
+                "t-0001-free-trial",
+                "P14D",
+                "ActiveUser",
+                "Active user",
+                "Users",
+            ),
             recurring_payment_term("t-0001-recurring", "1200.00"),
             legal_term(
                 "t-0001-legal",
@@ -1787,12 +2126,8 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             text: firewall_text,
             logo_thumbnail_url: "https://example.com/logos/nimbus-firewall.png".to_string(),
             integration_guide: None,
-            categories: vec![category("infrastructure-software", "Infrastructure Software")],
+            categories: classified_under(&["network-infrastructure"]),
             highlights: vec!["Deep packet inspection".to_string()],
-            badges: vec![
-                listing_badge("AWS_FREE_TIER", "AWS Free Tier"),
-                listing_badge("QUICK_LAUNCH", "Quick Launch"),
-            ],
             pricing_models: vec![pricing_model("USAGE", "Usage based")],
             pricing_units: vec![pricing_unit("HOSTS", "Hosts")],
             product_ids: vec!["p-0002-firewall-appliance".to_string()],
@@ -1829,7 +2164,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             manufacturer: nimbus.clone(),
             deployed_on_aws: "DEPLOYED".to_string(),
             logo_thumbnail_url: "https://example.com/logos/nimbus-firewall.png".to_string(),
-            categories: vec![category("infrastructure-software", "Infrastructure Software")],
+            categories: classified_under(&["network-infrastructure"]),
             highlights: vec!["Runs in your account".to_string()],
             promotional_media: Vec::new(),
             resources: support_resources(
@@ -1910,9 +2245,8 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             },
             logo_thumbnail_url: "https://example.com/logos/orion-feed.png".to_string(),
             integration_guide: None,
-            categories: vec![category("data-products", "Data Products")],
+            categories: classified_under(&["data-products"]),
             highlights: vec!["Covers 40 exchanges".to_string()],
-            badges: Vec::new(),
             pricing_models: vec![pricing_model("CONTRACT", "Contract")],
             pricing_units: vec![pricing_unit("DATA", "Data")],
             product_ids: vec!["p-0003-datafeed-equities".to_string()],
@@ -1949,7 +2283,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             manufacturer: orion.clone(),
             deployed_on_aws: "NOT_APPLICABLE".to_string(),
             logo_thumbnail_url: "https://example.com/logos/orion-feed.png".to_string(),
-            categories: vec![category("data-products", "Data Products")],
+            categories: classified_under(&["data-products"]),
             highlights: vec!["Parquet and CSV".to_string()],
             promotional_media: Vec::new(),
             resources: support_resources("data@example.com", "https://example.com/docs/orion-feed"),
@@ -2009,14 +2343,10 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             },
             logo_thumbnail_url: "https://example.com/logos/zephyr-mlkit.png".to_string(),
             integration_guide: Some("https://example.com/docs/zephyr/integrate".to_string()),
-            categories: vec![category("machine-learning", "Machine Learning")],
+            categories: classified_under(&["machine-learning"]),
             highlights: vec![
                 "12 pre-trained models".to_string(),
                 "Runs on SageMaker".to_string(),
-            ],
-            badges: vec![
-                listing_badge("DEPLOYED_ON_AWS", "Deployed on AWS"),
-                listing_badge("MULTI_PRODUCT", "Multiple products"),
             ],
             pricing_models: vec![
                 pricing_model("USAGE", "Usage based"),
@@ -2074,7 +2404,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             manufacturer: zephyr.clone(),
             deployed_on_aws: "DEPLOYED".to_string(),
             logo_thumbnail_url: "https://example.com/logos/zephyr-mlkit.png".to_string(),
-            categories: vec![category("machine-learning", "Machine Learning")],
+            categories: classified_under(&["machine-learning"]),
             highlights: vec!["GPU and CPU variants".to_string()],
             promotional_media: vec![promotional_video(
                 "Vision models in SageMaker",
@@ -2115,7 +2445,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             manufacturer: zephyr.clone(),
             deployed_on_aws: "DEPLOYED".to_string(),
             logo_thumbnail_url: "https://example.com/logos/zephyr-mlkit.png".to_string(),
-            categories: vec![category("machine-learning", "Machine Learning")],
+            categories: classified_under(&["machine-learning"]),
             highlights: vec!["Runs on EKS or ECS".to_string()],
             promotional_media: Vec::new(),
             resources: support_resources("ml@example.com", "https://example.com/docs/zephyr"),
@@ -2175,9 +2505,8 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             },
             logo_thumbnail_url: "https://example.com/logos/helios-devops.png".to_string(),
             integration_guide: None,
-            categories: vec![category("devops", "DevOps")],
+            categories: classified_under(&["devops"]),
             highlights: vec!["Bring your own licence".to_string()],
-            badges: Vec::new(),
             pricing_models: vec![pricing_model("BYOL", "Bring your own licence")],
             pricing_units: vec![pricing_unit("UNITS", "Units")],
             product_ids: vec!["p-0006-devtools-pipeline".to_string()],
@@ -2211,7 +2540,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             manufacturer: helios.clone(),
             deployed_on_aws: "NOT_DEPLOYED".to_string(),
             logo_thumbnail_url: "https://example.com/logos/helios-devops.png".to_string(),
-            categories: vec![category("devops", "DevOps")],
+            categories: classified_under(&["devops"]),
             highlights: vec!["Self hosted".to_string()],
             promotional_media: Vec::new(),
             resources: support_resources("dev@example.com", "https://example.com/docs/helios"),
@@ -2283,9 +2612,8 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             },
             logo_thumbnail_url: "https://example.com/logos/vertex-backup.png".to_string(),
             integration_guide: None,
-            categories: vec![category("storage", "Storage")],
+            categories: classified_under(&["storage"]),
             highlights: vec!["Coverage reporting".to_string()],
-            badges: vec![listing_badge("FREE_TRIAL", "Free trial")],
             pricing_models: vec![pricing_model("CONTRACT", "Contract")],
             pricing_units: vec![pricing_unit("TIERS", "Tiers")],
             product_ids: vec!["p-0007-backup-agent".to_string()],
@@ -2319,7 +2647,7 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             manufacturer: vertex.clone(),
             deployed_on_aws: "NOT_APPLICABLE".to_string(),
             logo_thumbnail_url: "https://example.com/logos/vertex-backup.png".to_string(),
-            categories: vec![category("storage", "Storage")],
+            categories: classified_under(&["storage"]),
             highlights: vec!["Read-only access".to_string()],
             promotional_media: Vec::new(),
             resources: support_resources("backup@example.com", "https://example.com/docs/vertex"),
@@ -2360,9 +2688,555 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
         "o-0007-backup-contract".to_string(),
         vec![
             validity_term("t-0007-validity", "P365D", month_ago, next_year),
+            free_trial_term(
+                "t-0007-free-trial",
+                "P30D",
+                "ProtectedTier",
+                "Protected tier",
+                "Tiers",
+            ),
             recurring_payment_term("t-0007-recurring", "450.00"),
         ],
     );
 
+    seed_breadth(&mut state, now);
+
     state
+}
+
+// ---------------------------------------------------------------------------
+// The catalog's breadth: the listings that make paging, the whole fulfillment
+// union and the category taxonomy reachable.
+// ---------------------------------------------------------------------------
+
+/// One row of the catalog's breadth: a single-product listing whose listing, product,
+/// offer, offer terms and (for every third row) offer set are all derived from this row.
+///
+/// Why the catalog holds more listings than the six written out above:
+///
+/// * `SearchListings` is `@paginated` with `maxResults` defaulting to **25** and returns
+///   `nextToken` "[i]f nextToken is returned, there are more results available"
+///   (`smithy_query(query="operation",operation="SearchListings")`), so a catalog of fewer
+///   than 26 listings can never truncate a default-sized page and a paginating client would
+///   never be handed the token that fetches a second page.
+/// * `FulfillmentOption` is a union with one member per `FulfillmentOptionType`, so every
+///   type the model declares has to be reachable from some product — otherwise a client
+///   following one fulfillment path finds no product that takes it.
+/// * The category taxonomy is a tree ([`CATEGORY_TAXONOMY`]), so listings have to sit at its
+///   subcategories for a `CATEGORY` facet value to have a `parent` to report.
+struct BreadthRow {
+    /// The slug every id of this row's records is built from.
+    slug: &'static str,
+    name: &'static str,
+    short_description: &'static str,
+    /// The taxonomy category the listing is classified under; its ancestors come with it
+    /// through [`classified_under`].
+    category: &'static str,
+    /// The `FulfillmentOptionType` its single product is fulfilled through.
+    fulfillment: &'static str,
+    /// `Product$deployedOnAws`: `DEPLOYED` when the buyer runs it in their own AWS account,
+    /// `NOT_DEPLOYED` when it is deployable but not deployed yet, and `NOT_APPLICABLE` when
+    /// the seller hosts it.
+    deployed_on_aws: &'static str,
+}
+
+/// The catalog's breadth rows, one listing each.
+///
+/// The set spans every top-level category of [`CATEGORY_TAXONOMY`], every
+/// `FulfillmentOptionType` the model declares and all three `DeployedOnAwsStatus` values;
+/// the records themselves are this emulator's own seed data.
+const BREADTH_ROWS: &[BreadthRow] = &[
+    BreadthRow {
+        slug: "aurora-linux-hardened",
+        name: "Aurora Hardened Linux",
+        short_description: "Hardened Linux images with CIS benchmark profiles applied.",
+        category: "operating-systems",
+        fulfillment: "AMAZON_MACHINE_IMAGE",
+        deployed_on_aws: "DEPLOYED",
+    },
+    BreadthRow {
+        slug: "borealis-market-data",
+        name: "Borealis Market Data Feed",
+        short_description: "End-of-day and intraday reference prices for listed equities.",
+        category: "financial-services-data",
+        fulfillment: "DATA_EXCHANGE",
+        deployed_on_aws: "NOT_APPLICABLE",
+    },
+    BreadthRow {
+        slug: "cirrus-waf",
+        name: "Cirrus Web Application Firewall",
+        short_description: "Managed web application firewall rules for edge and VPC traffic.",
+        category: "security",
+        fulfillment: "CLOUDFORMATION_TEMPLATE",
+        deployed_on_aws: "DEPLOYED",
+    },
+    BreadthRow {
+        slug: "delta-vision-labeler",
+        name: "Delta Vision Labeler",
+        short_description: "Image classification models for industrial inspection.",
+        category: "computer-vision",
+        fulfillment: "SAGEMAKER_MODEL",
+        deployed_on_aws: "NOT_DEPLOYED",
+    },
+    BreadthRow {
+        slug: "equinox-fleet-telemetry",
+        name: "Equinox Fleet Telemetry",
+        short_description: "Telemetry ingestion and alerting for connected equipment.",
+        category: "iot-analytics",
+        fulfillment: "SAAS",
+        deployed_on_aws: "NOT_APPLICABLE",
+    },
+    BreadthRow {
+        slug: "aurora-object-vault",
+        name: "Aurora Object Vault",
+        short_description: "Immutable object storage with compliance retention.",
+        category: "storage",
+        fulfillment: "CONTAINER",
+        deployed_on_aws: "DEPLOYED",
+    },
+    BreadthRow {
+        slug: "borealis-health-atlas",
+        name: "Borealis Health Atlas",
+        short_description: "De-identified claims and prescription records for research.",
+        category: "healthcare-life-sciences-data",
+        fulfillment: "DATA_EXCHANGE",
+        deployed_on_aws: "NOT_APPLICABLE",
+    },
+    BreadthRow {
+        slug: "cirrus-secrets-broker",
+        name: "Cirrus Secrets Broker",
+        short_description: "Short-lived credential brokering for cluster workloads.",
+        category: "security",
+        fulfillment: "HELM",
+        deployed_on_aws: "DEPLOYED",
+    },
+    BreadthRow {
+        slug: "delta-speech-studio",
+        name: "Delta Speech Studio",
+        short_description: "Speech transcription and diarisation for contact centres.",
+        category: "speech-recognition",
+        fulfillment: "SAGEMAKER_ALGORITHM",
+        deployed_on_aws: "NOT_DEPLOYED",
+    },
+    BreadthRow {
+        slug: "equinox-grid-forecast",
+        name: "Equinox Grid Forecast",
+        short_description: "Load and generation forecasting for energy networks.",
+        category: "energy",
+        fulfillment: "API",
+        deployed_on_aws: "NOT_APPLICABLE",
+    },
+    BreadthRow {
+        slug: "aurora-build-cache",
+        name: "Aurora Build Cache",
+        short_description: "Distributed build caching for large monorepos.",
+        category: "application-development",
+        fulfillment: "EKS_ADD_ON",
+        deployed_on_aws: "DEPLOYED",
+    },
+    BreadthRow {
+        slug: "borealis-climate-grid",
+        name: "Borealis Climate Grid",
+        short_description: "Gridded climate observations and reanalysis series.",
+        category: "environmental-data",
+        fulfillment: "DATA_EXCHANGE",
+        deployed_on_aws: "NOT_APPLICABLE",
+    },
+    BreadthRow {
+        slug: "cirrus-migration-studio",
+        name: "Cirrus Migration Studio",
+        short_description: "Assessment and replatforming services for legacy estates.",
+        category: "migration",
+        fulfillment: "PROFESSIONAL_SERVICES",
+        deployed_on_aws: "NOT_APPLICABLE",
+    },
+    BreadthRow {
+        slug: "delta-forms-reader",
+        name: "Delta Forms Reader",
+        short_description: "Document understanding for structured and semi-structured forms.",
+        category: "natural-language-processing",
+        fulfillment: "SAGEMAKER_MODEL",
+        deployed_on_aws: "NOT_DEPLOYED",
+    },
+    BreadthRow {
+        slug: "equinox-retail-planner",
+        name: "Equinox Retail Planner",
+        short_description: "Assortment and replenishment planning for retailers.",
+        category: "retail",
+        fulfillment: "SAAS",
+        deployed_on_aws: "NOT_APPLICABLE",
+    },
+    BreadthRow {
+        slug: "aurora-golden-images",
+        name: "Aurora Golden Images",
+        short_description: "Image pipeline components for compliant base images.",
+        category: "infrastructure-as-code",
+        fulfillment: "EC2_IMAGE_BUILDER_COMPONENT",
+        deployed_on_aws: "DEPLOYED",
+    },
+    BreadthRow {
+        slug: "borealis-spectrum-usage",
+        name: "Borealis Spectrum Usage",
+        short_description: "Mobile network coverage and spectrum usage records.",
+        category: "telecommunications-data",
+        fulfillment: "DATA_EXCHANGE",
+        deployed_on_aws: "NOT_APPLICABLE",
+    },
+    BreadthRow {
+        slug: "cirrus-observability",
+        name: "Cirrus Observability Stack",
+        short_description: "Metrics, traces and log correlation for microservices.",
+        category: "monitoring",
+        fulfillment: "HELM",
+        deployed_on_aws: "DEPLOYED",
+    },
+    BreadthRow {
+        slug: "delta-crm-sync",
+        name: "Delta CRM Sync",
+        short_description: "Two-way synchronisation between CRM and billing systems.",
+        category: "crm",
+        fulfillment: "SAAS",
+        deployed_on_aws: "NOT_APPLICABLE",
+    },
+    BreadthRow {
+        slug: "equinox-hpc-solver",
+        name: "Equinox HPC Solver",
+        short_description: "Finite element solver for structural simulation.",
+        category: "high-performance-computing",
+        fulfillment: "AMAZON_MACHINE_IMAGE",
+        deployed_on_aws: "DEPLOYED",
+    },
+    BreadthRow {
+        slug: "aurora-training-labs",
+        name: "Aurora Training Labs",
+        short_description: "Instructor-led enablement for platform engineering teams.",
+        category: "training",
+        fulfillment: "PROFESSIONAL_SERVICES",
+        deployed_on_aws: "NOT_APPLICABLE",
+    },
+];
+
+/// The sellers the breadth rows are published by, taken in turn.
+const BREADTH_SELLERS: &[(&str, &str)] = &[
+    ("sp-aurora", "Aurora Systems"),
+    ("sp-borealis", "Borealis Data"),
+    ("sp-cirrus", "Cirrus Security"),
+    ("sp-delta-labs", "Delta Labs"),
+    ("sp-equinox", "Equinox Industrial"),
+];
+
+/// Every pricing model with the name the catalog displays it by.
+///
+/// Source: the `PricingModelType` enum
+/// (`smithy_query(query="shape",shape="PricingModelType")`), generated as
+/// `PRICING_MODEL_TYPE_VALUES`; the display names are the catalog's own wording and are the
+/// same ones the hand-written records above use.
+const PRICING_MODEL_DISPLAY_NAMES: &[(&str, &str)] = &[
+    ("USAGE", "Usage based"),
+    ("CONTRACT", "Contract"),
+    ("BYOL", "Bring your own licence"),
+    ("FREE", "Free"),
+];
+
+/// Every pricing unit with the name the catalog displays it by.
+///
+/// Source: the `PricingUnitType` enum
+/// (`smithy_query(query="shape",shape="PricingUnitType")`), generated as
+/// `PRICING_UNIT_TYPE_VALUES`.
+const PRICING_UNIT_DISPLAY_NAMES: &[(&str, &str)] = &[
+    ("USERS", "Users"),
+    ("HOSTS", "Hosts"),
+    ("BANDWIDTH", "Bandwidth"),
+    ("DATA", "Data"),
+    ("TIERS", "Tiers"),
+    ("REQUESTS", "Requests"),
+    ("UNITS", "Units"),
+];
+
+/// The review summaries the breadth rows carry, taken in turn: `(averageRating,
+/// totalReviews)`. They span the whole 0.0–5.0 rating range the
+/// `MIN`/`MAX_AVERAGE_CUSTOMER_RATING` filters bound, so a rating filter and the
+/// `AVERAGE_CUSTOMER_RATING` facet select some listings and not others.
+const BREADTH_REVIEWS: &[(&str, i64)] = &[
+    ("4.8", 310),
+    ("4.5", 164),
+    ("4.1", 88),
+    ("3.7", 42),
+    ("3.2", 19),
+    ("2.6", 11),
+    ("4.9", 7),
+];
+
+/// A fulfillment option of `option_type` for a breadth row's product.
+///
+/// One arm per `FulfillmentOptionType`, each building the `FulfillmentOption` UNION MEMBER
+/// that type belongs to, so a client that reads a product's fulfillment option type and
+/// then deserialises that type's variant finds it.
+fn fulfillment_option_for_type(
+    option_type: &str,
+    id: &str,
+    name: &str,
+    slug: &str,
+    available_from: i64,
+) -> FulfillmentOptionRecord {
+    match option_type {
+        "SAAS" => saas_option(
+            id,
+            &format!("https://example.com/{slug}/register"),
+            &format!("https://example.com/{slug}/launch"),
+            "ENABLED",
+            &format!("Subscribe, then open the {name} console."),
+            available_from,
+        ),
+        "API" => api_option(
+            id,
+            &format!("Call the {name} API with the key issued at registration."),
+            vec![aws_service(
+                "APIGATEWAY",
+                "Amazon API Gateway",
+                &format!("Fronts the {name} API."),
+            )],
+        ),
+        "AMAZON_MACHINE_IMAGE" => ami_option(
+            id,
+            name,
+            "1.0.0",
+            "x86_64",
+            &format!("Launch the {name} image into a private subnet."),
+            "m6i.large",
+            available_from,
+        ),
+        "CLOUDFORMATION_TEMPLATE" => cloudformation_option(
+            id,
+            name,
+            "1.0.0",
+            &format!("Create the {name} stack from the template."),
+            &format!("{name}, as an AWS CloudFormation template."),
+            available_from,
+        ),
+        "CONTAINER" => container_option(
+            id,
+            name,
+            "1.0.0",
+            &format!("Run the {name} image on Amazon ECS or Amazon EKS."),
+        ),
+        "HELM" => helm_option(
+            id,
+            name,
+            "1.0.0",
+            &format!("helm install {slug} oci://example.com/charts/{slug} --version 1.0.0"),
+        ),
+        "EKS_ADD_ON" => eks_add_on_option(
+            id,
+            name,
+            "1.0.0",
+            &format!("Enable the {name} add-on on your cluster."),
+        ),
+        "EC2_IMAGE_BUILDER_COMPONENT" => ec2_image_builder_option(
+            id,
+            name,
+            "1.0.0",
+            &format!("Add the {name} component to an Image Builder recipe."),
+        ),
+        "DATA_EXCHANGE" => data_exchange_option(
+            id,
+            &format!("arn:aws:dataexchange:us-east-1::data-sets/{slug}"),
+            &format!("The {name} data set."),
+        ),
+        "SAGEMAKER_ALGORITHM" => sagemaker_algorithm_option(
+            id,
+            "1.0.0",
+            &format!("Train {name} from an Amazon SageMaker notebook."),
+        ),
+        "SAGEMAKER_MODEL" => sagemaker_model_option(
+            id,
+            "1.0.0",
+            &format!("Deploy {name} to an Amazon SageMaker endpoint."),
+            &["application/json", "image/png"],
+        ),
+        "PROFESSIONAL_SERVICES" => professional_services_option(id),
+        // A `FulfillmentOptionType` the model GAINS later has no builder here, and seeding
+        // it as another type's union member would make the catalog claim a fulfillment the
+        // row does not have — so it fails loudly at seed time instead.
+        other => unreachable!(
+            "fulfillment option type {other} has no seed builder; add an arm for its \
+             FulfillmentOption union member"
+        ),
+    }
+}
+
+/// Seed one listing, product, offer and set of offer terms per [`BREADTH_ROWS`] row.
+///
+/// Ids are built from the row's slug in their own `0101..` numeric block, so no generated id
+/// can collide with the hand-written records above, and the whole block is derived from the
+/// row rather than written out: what each row varies is what the catalog needs to span.
+fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState, now: i64) {
+    let month_ago = now - 30 * DAY;
+    let next_year = now + 365 * DAY;
+
+    for (index, row) in BREADTH_ROWS.iter().enumerate() {
+        let sequence = 101 + index;
+        let slug = row.slug;
+        let listing_id = format!("l-{sequence:04}-{slug}");
+        let product_id = format!("p-{sequence:04}-{slug}");
+        let offer_id = format!("o-{sequence:04}-{slug}");
+        let option_id = format!("fo-{sequence:04}-{slug}");
+
+        let (seller_profile_id, seller_name) = BREADTH_SELLERS[index % BREADTH_SELLERS.len()];
+        let publisher = seller(seller_profile_id, seller_name);
+        let (model_type, model_name) =
+            PRICING_MODEL_DISPLAY_NAMES[index % PRICING_MODEL_DISPLAY_NAMES.len()];
+        let (unit_type, unit_name) =
+            PRICING_UNIT_DISPLAY_NAMES[index % PRICING_UNIT_DISPLAY_NAMES.len()];
+        let (rating, total_reviews) = BREADTH_REVIEWS[index % BREADTH_REVIEWS.len()];
+
+        let categories = classified_under(&[row.category]);
+        let category_name = categories
+            .last()
+            .map_or_else(String::new, |category| category.display_name.clone());
+        let fulfillment_name = fulfillment_option_display_name(row.fulfillment);
+        let long_description = format!(
+            "{} {} is listed under {category_name} and fulfilled as {fulfillment_name}.",
+            row.short_description, row.name
+        );
+        let listing_text = Localized {
+            default: text(row.name, row.short_description, &long_description),
+            translations: BTreeMap::new(),
+        };
+        let logo = format!("https://example.com/logos/{slug}.png");
+        let docs = format!("https://example.com/docs/{slug}");
+        let support_email = format!("support@{slug}.example.com");
+        let contact = format!("https://example.com/{slug}/contact");
+
+        // A badge is not seeded: `listing_badges` derives each one from the records it
+        // restates, so this row's deployment status and pricing model decide them.
+
+        state.listings.insert(
+            listing_id.clone(),
+            Listing {
+                listing_id: listing_id.clone(),
+                text: listing_text.clone(),
+                logo_thumbnail_url: logo.clone(),
+                integration_guide: None,
+                categories: categories.clone(),
+                highlights: vec![
+                    format!("Fulfilled as {fulfillment_name}"),
+                    format!("Listed under {category_name}"),
+                ],
+                pricing_models: vec![pricing_model(model_type, model_name)],
+                pricing_units: vec![pricing_unit(unit_type, unit_name)],
+                product_ids: vec![product_id.clone()],
+                offer_ids: vec![offer_id.clone()],
+                publisher: publisher.clone(),
+                promotional_media: vec![promotional_image(
+                    row.name,
+                    &format!("https://example.com/media/{slug}/overview.png"),
+                    row.short_description,
+                )],
+                resources: support_resources(&support_email, &docs),
+                seller_engagements: engagements(&contact),
+                use_cases: vec![use_case(
+                    slug,
+                    row.name,
+                    &format!(
+                        "{} Listed under {category_name}.",
+                        row.short_description
+                    ),
+                )],
+                review_summary: reviews(rating, total_reviews),
+            },
+        );
+
+        state.products.insert(
+            product_id.clone(),
+            Product {
+                product_id: product_id.clone(),
+                listing_id: listing_id.clone(),
+                text: listing_text,
+                manufacturer: publisher.clone(),
+                deployed_on_aws: row.deployed_on_aws.to_string(),
+                logo_thumbnail_url: logo,
+                categories,
+                highlights: vec![format!("Fulfilled as {fulfillment_name}")],
+                promotional_media: Vec::new(),
+                resources: support_resources(&support_email, &docs),
+                seller_engagements: engagements(&contact),
+                fulfillment_options: vec![fulfillment_option_for_type(
+                    row.fulfillment,
+                    &option_id,
+                    row.name,
+                    slug,
+                    month_ago,
+                )],
+            },
+        );
+
+        // Every third row's offer belongs to an offer set, so `OFFERSET` purchase options
+        // are reachable for products across the catalog and not only for the one
+        // hand-written set above.
+        let offer_set_id = (index % 3 == 2).then(|| format!("os-{sequence:04}-{slug}"));
+        state.offers.insert(
+            offer_id.clone(),
+            Offer {
+                offer_id: offer_id.clone(),
+                offer_name: Some(format!("{} — {model_name}", row.name)),
+                name_translations: BTreeMap::new(),
+                expiration_time: Some(next_year),
+                available_from_time: Some(month_ago),
+                seller_of_record: publisher.clone(),
+                product_ids: vec![product_id],
+                offer_set_id: offer_set_id.clone(),
+                agreement_proposal_id: format!("ap-{sequence:04}-{slug}"),
+                replacement_agreement_id: None,
+                pricing_model: pricing_model(model_type, model_name),
+                badges: vec![purchase_option_badge("AUTO_RENEW", "Auto renew")],
+                visibility_scope: VISIBILITY_PUBLIC.to_string(),
+            },
+        );
+
+        let mut terms = vec![validity_term(
+            &format!("t-{sequence:04}-validity"),
+            "P365D",
+            month_ago,
+            next_year,
+        )];
+        match model_type {
+            "USAGE" => terms.push(usage_based_term(
+                &format!("t-{sequence:04}-usage"),
+                unit_type,
+                unit_name,
+                unit_name,
+                "0.05",
+            )),
+            "CONTRACT" => terms.push(recurring_payment_term(
+                &format!("t-{sequence:04}-recurring"),
+                "900.00",
+            )),
+            // BYOL and FREE carry no payment term: the buyer pays the seller directly, or
+            // nothing at all.
+            _ => {}
+        }
+        terms.push(legal_term(
+            &format!("t-{sequence:04}-legal"),
+            "StandardEula",
+            "https://example.com/legal/standard-eula",
+        ));
+        state.offer_terms.insert(offer_id.clone(), terms);
+
+        if let Some(offer_set_id) = offer_set_id {
+            state.offer_sets.insert(
+                offer_set_id.clone(),
+                OfferSet {
+                    offer_set_id,
+                    offer_set_name: Some(format!("{} purchase options", row.name)),
+                    available_from_time: Some(month_ago),
+                    expiration_time: Some(next_year),
+                    buyer_notes: None,
+                    seller_of_record: publisher,
+                    offer_ids: vec![offer_id],
+                    visibility_scope: VISIBILITY_PUBLIC.to_string(),
+                },
+            );
+        }
+    }
 }

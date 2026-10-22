@@ -129,14 +129,20 @@ impl From<&ApiKeyEntry> for CreateApiKeyOutput {
             enabled: entry.enabled,
             created_date: entry.created_date,
             last_updated_date: entry.last_updated_date,
-            stage_keys: (!entry.stage_keys.is_empty()).then(|| entry.stage_keys.clone()),
-            tags: (!entry.tags.is_empty()).then(|| {
+            // `stageKeys` and `tags` are collections the stored record itself owns, so
+            // an `ApiKey` body reports them from that record whatever they hold: a key
+            // with no stage associations reports `stageKeys: []` and an untagged key
+            // reports `tags: {}`. Presence is never decided by emptiness — a member the
+            // record owns is reported, an empty collection included, so a client can
+            // tell "no stages / no tags" from "not reported".
+            stage_keys: Some(entry.stage_keys.clone()),
+            tags: Some(
                 entry
                     .tags
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            }),
+                    .collect(),
+            ),
         }
     }
 }

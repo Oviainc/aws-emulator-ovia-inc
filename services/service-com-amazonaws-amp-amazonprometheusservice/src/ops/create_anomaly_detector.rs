@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAnomalyDetector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAnomalyDetector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints an anomaly detector inside its workspace, persists it, and
+//! answers from the PERSISTED record. The detector starts in `CREATING` and the clock
+//! owes its move to `ACTIVE` ([`crate::state::TRANSITION_DELAY`]); `clientToken` makes
+//! the call idempotent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAnomalyDetector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +172,217 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAnomalyDetector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAnomalyDetectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAnomalyDetector"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAnomalyDetectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
+        // its own tag keys, so it holds for the tags a detector is created with too.
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys()))
+        {
+            return Err(field_validation(
+                "tags",
+                format!(
+                    "keys must not begin with {}",
+                    crate::state::RESERVED_TAG_KEY_PREFIX
+                ),
+                format!(
+                    "tag key {reserved} is reserved: keys must not begin with {}",
+                    crate::state::RESERVED_TAG_KEY_PREFIX,
+                ),
+            ));
+        }
+
+        check_configuration(&input.configuration)?;
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // A detector is created INSIDE a workspace, so an unknown `workspaceId` is a
+        // request this service cannot satisfy. `CreateAnomalyDetector` models no
+        // `ResourceNotFoundException`, so the refusal is the modelled
+        // `ValidationException`, naming the member that does not resolve.
+        let detector_quota = crate::state::ANOMALY_DETECTORS_PER_WORKSPACE_QUOTA;
+        let Some(workspace) = store.workspaces.get(&input.workspace_id) else {
+            return Err(field_validation(
+                "workspaceId",
+                "no workspace with this id exists".to_string(),
+                format!("Workspace not found: {}", input.workspace_id),
+            ));
+        };
+
+        // Adding a child to a workspace whose deletion has already started would leave
+        // state that cannot hold together — which is what `ConflictException` (409) is
+        // modelled for ("The request would cause an inconsistent state").
+        if workspace.status_code == crate::state::STATUS_DELETING {
+            return Err(CreateAnomalyDetectorErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Workspace {} is {}; it cannot take new anomaly detectors",
+                        workspace.workspace_id,
+                        crate::state::STATUS_DELETING,
+                    ),
+                    resource_id: workspace.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `clientToken` carries `@idempotencyToken`: replaying a token that already
+        // created a detector answers with THAT detector instead of a second one.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| workspace.anomaly_detector_tokens.get(token))
+            .and_then(|detector_id| workspace.anomaly_detectors.get(detector_id))
+        {
+            return Ok(response_for(existing));
+        }
+
+        // The store is BOUNDED: past the per-workspace quota a create is refused rather
+        // than adding another record. `ServiceQuotaExceededException` is the modelled
+        // refusal for exactly this.
+        if workspace.anomaly_detectors.len() >= detector_quota {
+            let workspace_id = workspace.workspace_id.clone();
+            return Err(
+                CreateAnomalyDetectorErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "workspace {workspace_id} already holds the maximum of \
+                             {detector_quota} anomaly detectors"
+                        ),
+                        // The bound is per workspace, so the workspace is the resource
+                        // that reached it.
+                        resource_id: workspace_id,
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                        service_code: ctx.identity().signing_name().to_string(),
+                        // Named for what it bounds: a real quota code is an identifier
+                        // Service Quotas issues, which this emulator does not model and
+                        // so must not invent one of.
+                        quota_code: "AnomalyDetectorsPerWorkspace".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let anomaly_detector_id = crate::state::mint_anomaly_detector_id(&mut store.next_id);
+        let detector = crate::state::AnomalyDetector {
+            arn: crate::state::anomaly_detector_arn(
+                &region,
+                &input.workspace_id,
+                &anomaly_detector_id,
+            ),
+            anomaly_detector_id: anomaly_detector_id.clone(),
+            workspace_id: input.workspace_id.clone(),
+            alias: input.alias,
+            evaluation_interval_in_seconds: input.evaluation_interval_in_seconds,
+            missing_data_action: input.missing_data_action,
+            configuration: input.configuration,
+            labels: input.labels.unwrap_or_default().into_iter().collect(),
+            // A just-created detector is not evaluating yet, and the clock owes its
+            // move to ACTIVE at `transition_due`.
+            status_code: crate::state::STATUS_CREATING.to_string(),
+            created_at: now,
+            modified_at: now,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            transition_due: Some(now + crate::state::TRANSITION_DELAY),
+        };
+
+        let response = response_for(&detector);
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            return Err(CreateAnomalyDetectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        if let Some(token) = input.client_token {
+            workspace
+                .anomaly_detector_tokens
+                .insert(token, anomaly_detector_id.clone());
+        }
+        workspace
+            .anomaly_detectors
+            .insert(anomaly_detector_id, detector);
+        Ok(response)
+    }
+}
+
+/// The modelled `ValidationException` for one member of the request: `reason`
+/// `FIELD_VALIDATION_FAILED` and a `fieldList` entry naming the member, the way the
+/// boundary validator reports a refused member.
+fn field_validation(
+    field: &str,
+    field_message: String,
+    message: String,
+) -> CreateAnomalyDetectorError {
+    CreateAnomalyDetectorErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: field.to_string(),
+            message: field_message,
+        }]),
+    })
+    .into()
+}
+
+/// Refuse a configuration the model accepts but the service does not.
+///
+/// `AnomalyDetectorConfiguration` is a union whose only member is `randomCutForest`,
+/// and `RandomCutForestConfiguration$query` requires the query be "wrapped by a
+/// supported PromQL aggregation operator" — so the whole expression must be a call to
+/// one of [`crate::state::RANDOM_CUT_FOREST_AGGREGATION_OPERATORS`].
+fn check_configuration(
+    configuration: &AnomalyDetectorConfiguration,
+) -> Result<(), CreateAnomalyDetectorError> {
+    let AnomalyDetectorConfiguration::randomCutForest(random_cut_forest) = configuration;
+    let operators = crate::state::RANDOM_CUT_FOREST_AGGREGATION_OPERATORS;
+    let wrapping = crate::state::leading_call_operator(&random_cut_forest.query);
+    if wrapping.is_some_and(|operator| operators.contains(&operator)) {
+        return Ok(());
+    }
+    Err(field_validation(
+        "configuration.randomCutForest.query",
+        format!(
+            "a Random Cut Forest query must be wrapped by one of the supported PromQL \
+             aggregation operators ({})",
+            operators.join(", ")
+        ),
+        format!(
+            "query {:?} is not wrapped by a supported PromQL aggregation operator ({})",
+            random_cut_forest.query,
+            operators.join(", ")
+        ),
+    ))
+}
+
+/// The response for a stored detector.
+///
+/// Every member is read back off the persisted record — so `status` and `tags` report
+/// what the detector HOLDS, not what the request carried.
+fn response_for(detector: &crate::state::AnomalyDetector) -> CreateAnomalyDetectorOutput {
+    CreateAnomalyDetectorOutput {
+        anomaly_detector_id: detector.anomaly_detector_id.clone(),
+        arn: detector.arn.clone(),
+        status: AnomalyDetectorStatus {
+            status_code: detector.status_code.clone(),
+            status_reason: None,
+        },
+        tags: crate::state::tag_map(&detector.tags),
     }
 }

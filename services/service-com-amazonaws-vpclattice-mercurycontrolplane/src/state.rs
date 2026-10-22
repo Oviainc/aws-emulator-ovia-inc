@@ -28,6 +28,67 @@ pub const KIND_SERVICE_ASSOCIATION: &str = "servicenetworkserviceassociation";
 /// `…:service/svc-…/listener/listener-…` (`ListenerArn`'s modelled pattern).
 pub const KIND_LISTENER: &str = "listener";
 
+/// A resource kind this service's error bodies name.
+///
+/// One kind has more than one spelling and they are NOT interchangeable: the ARN segment
+/// (`servicenetwork`, used in an ARN and in the exceptions' `resourceType` member) is an
+/// internal, lowercase, delimiter-free key, while the token AWS's error MESSAGES name the
+/// kind by is its CamelCase resource name (`ServiceNetwork`). Keeping both on one type is
+/// what stops a handler reaching for the ARN segment where the message token belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// A service network (`sn-…`).
+    ServiceNetwork,
+    /// A service (`svc-…`).
+    Service,
+    /// A service-network/service association (`snsa-…`).
+    ServiceAssociation,
+    /// A listener of a service (`listener-…`).
+    Listener,
+}
+
+impl ResourceKind {
+    /// This kind's ARN resource segment, which is also the `resourceType` its error
+    /// bodies carry.
+    pub fn arn_kind(self) -> &'static str {
+        match self {
+            Self::ServiceNetwork => KIND_SERVICE_NETWORK,
+            Self::Service => KIND_SERVICE,
+            Self::ServiceAssociation => KIND_SERVICE_ASSOCIATION,
+            Self::Listener => KIND_LISTENER,
+        }
+    }
+
+    /// The token AWS's error messages name this kind by.
+    ///
+    /// Source: recorded vpc-lattice not-found bodies, which spell the kind as its
+    /// CamelCase resource name — `ServiceNetwork` for a service network, `Service` for a
+    /// service, and `Association` (not the full association shape name) for a
+    /// service-network/service association. No listener not-found body is recorded, so a
+    /// listener takes the same rule the other three follow: the Smithy resource name,
+    /// `com.amazonaws.vpclattice#Listener`.
+    pub fn error_label(self) -> &'static str {
+        match self {
+            Self::ServiceNetwork => "ServiceNetwork",
+            Self::Service => "Service",
+            Self::ServiceAssociation => "Association",
+            Self::Listener => "Listener",
+        }
+    }
+
+    /// AWS's `ResourceNotFoundException.message` construction:
+    /// `"<ResourceType> <identifier> cannot be found."`.
+    ///
+    /// `identifier` is the identifier the CALLER submitted — whichever modelled form it
+    /// sent (bare id or ARN) — so the message names back the thing the request named, and
+    /// is reportable even when nothing resolved. The model types `message` as a required
+    /// String and states no text, so the construction (kind token plus submitted
+    /// identifier plus "cannot be found.") is what the recordings fix, not one string.
+    pub fn not_found_message(self, identifier: &str) -> String {
+        format!("{} {identifier} cannot be found.", self.error_label())
+    }
+}
+
 /// The id prefix of a service network (`^sn-[0-9a-z]{17}$`).
 pub const PREFIX_SERVICE_NETWORK: &str = "sn-";
 /// The id prefix of a service (`^svc-[0-9a-z]{17}$`).

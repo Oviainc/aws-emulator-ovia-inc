@@ -40,6 +40,9 @@ const HISTORY: &str = "ListRequestedServiceQuotaChangeHistoryByQuota";
 const PAST_DECISION: Duration = Duration::from_millis(1_200);
 
 /// A caller pointed at one regional endpoint of one emulator.
+///
+/// `pub(crate)` so the other suites in this target share ONE harness instead of each
+/// growing its own copy.
 pub(crate) struct Client {
     router: MultiServiceRouter,
     region: String,
@@ -350,7 +353,15 @@ async fn a_single_quota_read_matches_the_entry_the_listing_returned() {
             );
 
             let default = client.ok("GetAWSDefaultServiceQuota", pair.clone()).await;
-            for member in ["QuotaName", "QuotaCode", "ServiceCode", "Unit"] {
+            for member in [
+                "QuotaName",
+                "QuotaCode",
+                "ServiceCode",
+                "Unit",
+                "Description",
+                "Period",
+                "UsageMetric",
+            ] {
                 assert_eq!(
                     default["Quota"][member], quota[member],
                     "case {case}: the default and the applied quota must agree on {member}, got \
@@ -359,7 +370,8 @@ async fn a_single_quota_read_matches_the_entry_the_listing_returned() {
             }
             // The ONE member they must NOT agree on: an AWS default is published by
             // the service and owned by no account, so its ARN's account segment is
-            // empty, while the applied quota's names the account.
+            // empty, while the applied quota's names the account (see
+            // `quotas_catalog::an_aws_default_quota_arn_carries_no_account_id`).
             assert_eq!(
                 default["Quota"]["QuotaArn"].as_str(),
                 Some(format!("arn:aws:servicequotas:{region}::{case}").as_str()),

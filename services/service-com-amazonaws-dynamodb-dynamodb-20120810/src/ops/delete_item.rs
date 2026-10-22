@@ -10,6 +10,11 @@
 //! Conditional deletes (`ConditionExpression`, the legacy `Expected`) are refused
 //! with the scaffold's 501 and filed as their own gap issue.
 //!
+//! The `Key` is held to the documented key-value limits
+//! ([`crate::state::Table::check_key_limits`]), and a table whose resource-based
+//! policy denies the caller `dynamodb:DeleteItem` is answered `AccessDeniedException`
+//! instead of deleted from.
+//!
 //! `ReturnConsumedCapacity=INDEXES` reports the capacity the delete consumed on the
 //! table AND on each secondary index the removed item reached, and
 //! `ReturnItemCollectionMetrics=SIZE` reports the item collection the delete touched —
@@ -316,6 +321,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.apply_due_transitions(now);
         let key = {
             let table = store.active_table(&region, &name, now).map_err(lift)?;
+            // A table whose resource-based policy denies the caller this action is not
+            // deleted from: authorization is decided before anything is removed.
+            if let Some(denial) = crate::state::policy_denial(table, "dynamodb:DeleteItem", now) {
+                return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+            }
             table.key_of_key_map(&input.key).map_err(lift)?
         };
         let removed = store

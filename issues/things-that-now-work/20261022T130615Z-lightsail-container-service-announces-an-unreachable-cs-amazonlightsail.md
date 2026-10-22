@@ -8,6 +8,18 @@ Issue-Commit: 6f82ed95aacdd57d8c8c0220ec6b50c75b2537e1
 
 # Lightsail container service announces an unreachable cs.amazonlightsail.com url and serves no container data plane
 
+> _Resolution note (issue fixer): the ADDRESS half of Cause 1 is fixed —
+> `ContainerService$url` is now built from the endpoint the request reached the
+> emulator on (`https://<host>/lightsail-container-service/<region>/<name>/<token>`),
+> and the service claims and serves that path: the modelled `404` where the current
+> deployment declares no `publicEndpoint`, and `501` where it declares one. The
+> second half of the expectation — serving the deployed image's own HTTP response
+> (the nginx default page in the recording) — is DECLINED and answered with that
+> `501`: this emulator runs no container runtime, so an arbitrary OCI image cannot be
+> run in process, and a body the image never served would be invented content.
+> Running deployed container images is the remaining gap; it needs a runtime the
+> emulator does not have, not a change to this field._
+
 > _Note: this issue was identified against the code base at commit `6f82ed95aacdd57d8c8c0220ec6b50c75b2537e1`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

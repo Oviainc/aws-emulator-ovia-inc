@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccountConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccountConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccountConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTS the account's encryption configuration from the store
+//! ([`crate::state::Store::encryption_kms_key_arn`]), which `UpdateAccountConfiguration`
+//! writes. The model marks this operation `@readonly`, so it only reads: nothing a later
+//! caller sees changes because the configuration was read.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +137,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccountConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccountConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccountConfiguration"))
+        // `GetAccountConfigurationRequest` models no members, and this operation is
+        // `@readonly`, so neither the input nor the request metadata can change what it
+        // reports.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAccountConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("state unavailable".to_string()),
+                    message: Some(
+                        "the CodeGuru Security store is not reachable from this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "By default, CodeGuru Security uses an AWS-managed key for encryption. To
+        // specify your own key, call UpdateAccountConfiguration. If you do not specify a
+        // customer-managed key, returns empty"
+        // (`GetAccountConfigurationResponse$encryptionConfig`): the stored key when one
+        // was configured, and an `EncryptionConfig` with no `kmsKeyArn` when none was.
+        // Read under the same guard every other handler of this service uses, so the
+        // value reported is the one the last UpdateAccountConfiguration committed.
+        let kms_key_arn = state.lock().encryption_kms_key_arn.clone();
+
+        Ok(GetAccountConfigurationOutput {
+            encryption_config: EncryptionConfig { kms_key_arn },
+        })
     }
 }

@@ -391,6 +391,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             key_usages: Vec::new(),
             extended_key_usages: Vec::new(),
             exported: false,
+            // Nothing is revoked: `RevokedAt` and `RevocationReason` "exist only when
+            // the certificate status is REVOKED" (`CertificateDetail` docs).
+            revoked_at: None,
+            revocation_reason: None,
             created_at: now,
             issued_at: None,
             not_before: None,

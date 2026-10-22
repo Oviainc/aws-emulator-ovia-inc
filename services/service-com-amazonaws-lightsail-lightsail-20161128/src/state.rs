@@ -2232,8 +2232,8 @@ const HEALTH_CHECK_TIMEOUT_SECONDS_RANGE: (i32, i32) = (2, 60);
 /// "You can specify between 5 and 300 seconds" (`intervalSeconds`).
 const HEALTH_CHECK_INTERVAL_SECONDS_RANGE: (i32, i32) = (5, 300);
 
-/// How many characters the per-service subdomain token of a container service's
-/// default domain carries, from the example in the modelled `serviceName`
+/// How many characters the per-service token of a container service's public
+/// address carries, from the example in the modelled `serviceName`
 /// documentation (`https://container-service-1.ur4EXAMPLE2uq.us-east-2.cs.amazonlightsail.com`).
 const DOMAIN_TOKEN_LEN: usize = 13;
 
@@ -2242,10 +2242,22 @@ const DOMAIN_TOKEN_LEN: usize = 13;
 const DOMAIN_TOKEN_ALPHABET: &[u8] =
     b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-/// The suffix of the default domain every container service is reachable on,
-/// from the modelled `serviceName` documentation: "The default domain of a
-/// container service is typically `https://...cs.amazonlightsail.com`."
-const CONTAINER_SERVICE_DOMAIN_SUFFIX: &str = "cs.amazonlightsail.com";
+/// The path space every container service's public address is published under,
+/// beneath the endpoint the emulator is reached on.
+///
+/// AWS publishes that address as a DNS name under its own
+/// `cs.amazonlightsail.com` zone, and the modelled `serviceName` documentation
+/// gives the textual form `https://<service>.<token>.<region>.cs.amazonlightsail.com`.
+/// The HOSTNAME is environment-specific — no caller may assume it — while the
+/// PROMISE the field makes is not: `ContainerService$url` is "The publicly
+/// accessible URL of the container service", so it has to be an address the
+/// caller can actually reach. This emulator owns no DNS zone, so the only
+/// address it can be reached on is the endpoint the request arrived at, and the
+/// three labels AWS puts in the hostname (region, service name, per-service
+/// token) are carried in the path instead. The prefix names this service and
+/// this resource type, so it cannot collide with another service's modelled URI
+/// space.
+pub const CONTAINER_SERVICE_PUBLIC_PATH_PREFIX: &str = "/lightsail-container-service";
 
 /// The suffix of a container service's private domain name, which the Lightsail
 /// container services guide gives as `<service name>.service.local` \u2014 resolvable
@@ -2262,13 +2274,54 @@ pub fn container_service_arn(region: &str, id: &str) -> String {
     )
 }
 
-/// The publicly accessible URL of the container service `name` whose default
-/// domain carries `token`, in `region`.
+/// The publicly accessible URL of the container service `name` in `region`,
+/// whose public address carries `token`, as announced to a caller that reached
+/// this emulator at `endpoint` (its `Host`/`:authority`).
 ///
-/// The form is the one the modelled `serviceName` documentation gives:
-/// `https://<service name>.<token>.<region>.cs.amazonlightsail.com`.
-pub fn container_service_url(name: &str, token: &str, region: &str) -> String {
-    format!("https://{name}.{token}.{region}.{CONTAINER_SERVICE_DOMAIN_SUFFIX}")
+/// `https`, because the emulator serves one TLS listener
+/// (`emulator_server::serve_emulator_until_shutdown`) and no plaintext one, so
+/// that is the scheme its own endpoint answers on. See
+/// [`CONTAINER_SERVICE_PUBLIC_PATH_PREFIX`] for why the address is a path under
+/// the request's own endpoint rather than an AWS hostname.
+pub fn container_service_url(endpoint: &str, region: &str, name: &str, token: &str) -> String {
+    format!("https://{endpoint}{CONTAINER_SERVICE_PUBLIC_PATH_PREFIX}/{region}/{name}/{token}")
+}
+
+/// Which container service a request to a published public URL addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerServicePublicTarget {
+    pub region: String,
+    pub name: String,
+    /// The per-service token the announced URL carried, which must be the one
+    /// that service was minted with: a URL is addressed to ONE service.
+    pub domain_token: String,
+}
+
+/// The container service a public-URL request path addresses, or `None` when the
+/// path is not one [`container_service_url`] publishes.
+///
+/// Anything the caller appended BENEATH those three segments is a path within the
+/// deployed container: it names no part of this service, and nothing here routes
+/// it (no container runs), so it identifies the same service as the announced URL
+/// itself and is not carried.
+pub fn parse_container_service_public_path(path: &str) -> Option<ContainerServicePublicTarget> {
+    let rest = path
+        .strip_prefix(CONTAINER_SERVICE_PUBLIC_PATH_PREFIX)?
+        .strip_prefix('/')?;
+    let mut segments = rest.splitn(4, '/');
+    let (Some(region), Some(name), Some(token)) =
+        (segments.next(), segments.next(), segments.next())
+    else {
+        return None;
+    };
+    if [region, name, token].iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    Some(ContainerServicePublicTarget {
+        region: region.to_string(),
+        name: name.to_string(),
+        domain_token: token.to_string(),
+    })
 }
 
 /// The private domain name of the container service `name`. See
@@ -2361,7 +2414,7 @@ pub struct StoredContainerService {
     pub scale: i32,
     pub state: &'static str,
     pub is_disabled: bool,
-    /// The per-service token in the service's default domain, minted once so
+    /// The per-service token in the service's public address, minted once so
     /// every read reports the same URL.
     pub domain_token: String,
     pub principal_arn: String,
@@ -2378,8 +2431,17 @@ pub struct StoredContainerService {
 }
 
 impl StoredContainerService {
-    /// This record as the modelled `ContainerService`.
-    pub fn view(&self) -> ContainerService {
+    /// This record as the modelled `ContainerService`, announced to a caller that
+    /// reached this emulator at `endpoint` (its `Host`/`:authority`, as
+    /// [`request_endpoint`] reads it).
+    ///
+    /// `url` is the one member that depends on the request: it is the address the
+    /// caller is told to reach this service's public endpoint on, so it has to be
+    /// the endpoint THIS request arrived at (see
+    /// [`CONTAINER_SERVICE_PUBLIC_PATH_PREFIX`]). A request that names no host at
+    /// all names no endpoint to announce, so `url` is omitted rather than filled
+    /// with an address nothing serves.
+    pub fn view(&self, endpoint: Option<&str>) -> ContainerService {
         ContainerService {
             container_service_name: Some(self.name.clone()),
             arn: Some(self.arn.clone()),
@@ -2403,11 +2465,14 @@ impl StoredContainerService {
                     .map(|(certificate, domains)| (certificate.clone(), domains.clone()))
                     .collect::<HashMap<String, Vec<String>>>(),
             ),
-            url: Some(container_service_url(
-                &self.name,
-                &self.domain_token,
-                &self.location.region_name,
-            )),
+            url: endpoint.map(|endpoint| {
+                container_service_url(
+                    endpoint,
+                    &self.location.region_name,
+                    &self.name,
+                    &self.domain_token,
+                )
+            }),
             private_registry_access: Some(PrivateRegistryAccess {
                 ecr_image_puller_role: Some(ContainerServiceECRImagePullerRole {
                     is_active: Some(self.ecr_image_puller_role_active),
@@ -3239,6 +3304,25 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .map(|scope| scope.region)
         .filter(|region| REGION_NAME_VALUES.contains(&region.as_str()))
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The endpoint this emulator was reached on for this request: its `Host`
+/// header, or the `:authority` an HTTP/2 request carries on the URI instead of a
+/// `Host` header.
+///
+/// This is what an operation announcing an address a caller must be able to
+/// reach has to build it from — never a literal AWS hostname, which would send
+/// the next client out of the emulator (and out of a sandboxed run) entirely.
+/// `None` when the request names no host at all, and then there is no endpoint
+/// to announce.
+pub fn request_endpoint(parts: &::http::request::Parts) -> Option<String> {
+    parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str))
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
 }
 
 // ---------------------------------------------------------------------------

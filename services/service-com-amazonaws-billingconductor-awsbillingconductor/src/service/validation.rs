@@ -1,0 +1,435 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The WORDS of this service's input-validation refusal: how a set of constraint
+//! violations becomes the `Message` the modelled `ValidationException` carries.
+//!
+//! [`crate::service`] owns the SEAM — which requests are validated and how the modelled
+//! shape is serialized — and this module owns the sentence, so the clause rules are in one
+//! place rather than spread through the seam that applies them. What the rules enforce is
+//! always the model's: every violation handed to [`refusal_message`] comes from the
+//! framework's own boundary walk.
+//!
+//! The rules, each holding for every member of every operation rather than for the members
+//! a report happened to cite:
+//!
+//! 1. the envelope is AWS's `<N> validation error(s) detected: ` over one clause per
+//!    failing member, joined with `; ` ([`refusal_message`]);
+//! 2. a clause states the submitted value, the member's dotted path and the requirement it
+//!    failed — except on a member the model marks `@sensitive`, whose value is never
+//!    echoed ([`SENSITIVE_MEMBERS`], [`subject`]);
+//! 3. a reported `@pattern` is the expression without the `^`/`$` anchors a model writes
+//!    to demand a whole-string match ([`unanchored`]);
+//! 4. a violation on the ELEMENTS of a list member is stated once, at that member, with
+//!    the element's requirement nested and the list itself as the value
+//!    ([`list_element_path`], [`list_values`]);
+//! 5. the clauses come out in the reverse of the order the walk found them — the order
+//!    this service's recorded multi-violation answers show (see [`refusal_message`]).
+//!
+//! NOTE on where this belongs: rules 1-4 are AWS's wording rather than this service's, and
+//! ~24 sibling service crates carry their own copies of parts of them
+//! (`grep -rln 'fn unanchored' services/*/src`). `services/common/src/validation.rs` is
+//! the staged home for exactly those clause rules; as its header asks, this is the note
+//! rather than a silent further copy — migrating them re-words services whose recorded
+//! behaviour their own suites pin, so it is one change of its own. What is genuinely this
+//! service's own and would stay here is [`SENSITIVE_MEMBERS`] and the clause order.
+
+use std::collections::{HashMap, HashSet};
+
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::constraints::{self, Violation, ViolationKind};
+use aws_smithy_types::{BigDecimal, BigInteger, DateTime, Document};
+
+/// The lowerCamel member names this service's model targets at a `@sensitive` shape, so
+/// a clause about one of them states the constraint WITHOUT echoing the value back.
+///
+/// Source (`smithy_query` query="shape"): `BillingGroupName`, `CustomLineItemName`,
+/// `PricingPlanName`, `PricingRuleName`, `BillingGroupDescription`,
+/// `CustomLineItemDescription`, `PricingPlanDescription` and `PricingRuleDescription`
+/// all carry `sensitive: true`, and every input member that targets one of them (or a
+/// list of one — `ListCustomLineItemsFilter$Names` targets `CustomLineItemNameList`) is
+/// named `Name`, `Names` or `Description`. The two `@sensitive` shapes that are NOT
+/// listed here, `AccountName` and `AccountEmail`, carry no constraint and appear only in
+/// output, so no violation can ever name them.
+///
+/// Matched on the deepest NAMED segment of the violation path, which is why
+/// `ListBillingGroupsFilter$Names` — a list of `StringSearch`, whose constrained member
+/// is the non-sensitive `SearchValue` — correctly keeps its value: that path ends at
+/// `searchValue`, not at `names`.
+const SENSITIVE_MEMBERS: &[&str] = &["name", "names", "description"];
+
+/// Ceiling on a value rendered INTO a message, in bytes.
+///
+/// The same reason the framework elides the value it stores on a [`Violation`]: a caller
+/// controls the length of what it sends, and a clause interpolates it, so an unelided
+/// list of 30 multi-kilobyte strings would amplify one request into an arbitrarily long
+/// 400 body.
+const MAX_ECHOED_VALUE: usize = 256;
+
+/// The `Message` for a set of constraint violations, as AWS builds it from the request:
+/// the count, then one clause per failing member.
+///
+/// `<N> validation error(s) detected: ` — singular for one — over
+/// `<subject> at '<member path>' failed to satisfy constraint: <requirement>` clauses
+/// joined with `; `. A violation found on a list ELEMENT is reported at the LIST member,
+/// with the element's requirement nested
+/// (`Member must satisfy constraint: [<requirement>]`) and the list rendered as the value
+/// that member holds, which is why two bad elements of one list are ONE error rather than
+/// two.
+///
+/// ORDER: the clauses come out in the REVERSE of the order the boundary walk finds them,
+/// which for the top-level members of an input is the reverse of the order the model
+/// declares them. That is what this service's recorded multi-violation answers show, in
+/// both fixtures that carry one: `AssociateAccounts` states `accountIds` (declared second)
+/// before `arn`, and `AssociatePricingRules` states `pricingRuleArns` (declared second)
+/// before `arn`. No ordering by member PATH explains both — ascending puts `arn` before
+/// `pricingRuleArns`, descending puts it before `accountIds` — so the order is read off the
+/// walk rather than off the names, which is one rule over every violation instead of a case
+/// keyed on a member's name or type. It is still a total, deterministic order: the walk
+/// visits a given input shape in one order.
+///
+/// `lists` carries the rendering of every list member of the request (see
+/// [`list_values`]); it may be empty, in which case the value the framework stored on
+/// the violation is used.
+///
+/// `None` declines the whole refusal — a violation class this service has no wording for
+/// ([`ViolationKind`] is `#[non_exhaustive]`) keeps the framework's own.
+pub(super) fn refusal_message(
+    violations: &[Violation],
+    lists: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    // One clause per (member path, requirement): the several element violations a list
+    // member can carry fold into the one clause stated at that member, while a member that
+    // broke two different rules still states both.
+    let mut stated: HashSet<(String, String)> = HashSet::new();
+    let mut clauses: Vec<String> = Vec::new();
+    for violation in violations {
+        let (path, element) = match list_element_path(&violation.path) {
+            Some(list) => (list.to_string(), true),
+            None => (violation.path.clone(), false),
+        };
+        let requirement = match requirement_of(&violation.kind) {
+            Some(requirement) if element => {
+                format!("Member must satisfy constraint: [{requirement}]")
+            }
+            Some(requirement) => requirement,
+            None => return None,
+        };
+        if !stated.insert((path.clone(), requirement.clone())) {
+            continue;
+        }
+        let subject = subject(&path, violation, lists);
+        clauses.push(format!(
+            "{subject} at '{path}' failed to satisfy constraint: {requirement}"
+        ));
+    }
+    clauses.reverse();
+    let count = clauses.len();
+    let joined = clauses.join("; ");
+    match count {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {joined}")),
+        n => Some(format!("{n} validation errors detected: {joined}")),
+    }
+}
+
+/// The rule half of a clause: what the member had to satisfy.
+///
+/// `None` for a violation class this service has no wording for.
+fn requirement_of(kind: &ViolationKind) -> Option<String> {
+    let requirement = match kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        // The requirement reported is the expression itself, without the `^` / `$` the
+        // model spells it with: the service states the pattern a value must satisfy, not
+        // the anchoring Smithy uses to make the match total, so a client that
+        // re-validates locally with the pattern it read out of the message uses the one
+        // AWS documents.
+        ViolationKind::Pattern(pattern) => format!(
+            "Member must satisfy regular expression pattern: {}",
+            unanchored(pattern)
+        ),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return None,
+    };
+    Some(requirement)
+}
+
+/// The value half of a clause: what the member held.
+///
+/// * an ABSENT member has no value at all and is reported as the null it was;
+/// * a `@sensitive` member names no value — the constraint it broke is the whole of what
+///   a caller needs, and the value belongs in nobody's logs;
+/// * a LIST member is reported as the list the caller sent, bracketed;
+/// * everything else echoes the value the framework stored, already elided.
+fn subject(path: &str, violation: &Violation, lists: &HashMap<String, Vec<String>>) -> String {
+    if violation.value.is_none() {
+        return "Value null".to_string();
+    }
+    if is_sensitive(path) {
+        return "Value".to_string();
+    }
+    if let Some(elements) = lists.get(path) {
+        return format!("Value '{}'", elided(&format!("[{}]", elements.join(", "))));
+    }
+    match &violation.value {
+        Some(shown) => format!("Value '{shown}'"),
+        None => "Value null".to_string(),
+    }
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with. A `$` escaped
+/// by a backslash is a literal dollar sign inside the expression, not the end anchor, so
+/// it stays.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// The list member a violation found on one of its ELEMENTS belongs to: the path with
+/// the trailing `<1-based index>.member` step the validating walk adds removed, or
+/// `None` when the path does not end in one (so it names the member itself).
+fn list_element_path(path: &str) -> Option<&str> {
+    let head = path.strip_suffix(".member")?;
+    let (list, index) = head.rsplit_once('.')?;
+    let indexed = !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit());
+    indexed.then_some(list)
+}
+
+/// Does `path` name a member this service's model targets at a `@sensitive` shape?
+///
+/// Read off the deepest NAMED segment — the index and collection steps a path carries
+/// (`1`, `member`) name a position, not a member.
+fn is_sensitive(path: &str) -> bool {
+    path.split('.')
+        .rfind(|segment| {
+            *segment != "member" && !segment.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .is_some_and(|segment| SENSITIVE_MEMBERS.contains(&segment))
+}
+
+/// `value` as it should appear in a message: itself when short, a character-boundary-safe
+/// prefix with an elision when not. See [`MAX_ECHOED_VALUE`].
+fn elided(value: &str) -> String {
+    if value.len() <= MAX_ECHOED_VALUE {
+        return value.to_string();
+    }
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
+}
+
+/// Every LIST member of a request, keyed by the lowerCamel member path the validating
+/// walk reports it under, and rendered element by element.
+///
+/// A constraint on a list's element shape is violated by ONE element, and the framework
+/// reports it at that element (`accountIds.1.member`); AWS reports it at the list member
+/// and states the value that member holds — the whole list, not the element. That value
+/// is not on the violation, so it is read off the request here, through the same
+/// `SerializableStruct` walk the validator uses.
+pub(super) fn list_values(
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+) -> HashMap<String, Vec<String>> {
+    let mut capture = ListValues::default();
+    // Rendering only: a walk that cannot be completed yields the paths it reached, and a
+    // path it did not reach simply falls back to the violation's own value.
+    let _ = capture.write_struct(schema, input);
+    capture.values
+}
+
+/// Where in the value tree [`ListValues`] currently is. Only a LIST collects: a struct
+/// or a map is opaque, so a leaf written inside one is not an element of the list that
+/// encloses it.
+#[derive(Debug)]
+enum Frame {
+    List(Vec<String>),
+    Opaque,
+}
+
+/// A [`ShapeSerializer`] that accumulates the rendering of each list member instead of
+/// producing output — the read half of [`list_values`].
+///
+/// It walks the same `serialize_members` tree the validator walks and spells a member
+/// path the same way (`constraints::path::member`), so the keys it produces are the
+/// paths a [`Violation`] carries.
+#[derive(Debug, Default)]
+struct ListValues {
+    /// Member-name segments from the root to the value being written.
+    path: Vec<String>,
+    /// Open frames, innermost last.
+    frames: Vec<Frame>,
+    /// The rendered elements of every list member reached so far.
+    values: HashMap<String, Vec<String>>,
+}
+
+impl ListValues {
+    /// Push `schema`'s member-name segment, if it has one. The root input struct and a
+    /// collection element carry no member name, so they contribute no segment.
+    fn push_segment(&mut self, schema: &Schema) -> bool {
+        match schema.member_name() {
+            Some(name) => {
+                self.path.push(constraints::path::member(name));
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn pop_segment(&mut self, pushed: bool) {
+        if pushed {
+            self.path.pop();
+        }
+    }
+
+    /// Record one rendered leaf, when it is an element of the innermost list.
+    fn record(&mut self, rendered: &str) {
+        if let Some(Frame::List(elements)) = self.frames.last_mut() {
+            elements.push(rendered.to_string());
+        }
+    }
+}
+
+impl ShapeSerializer for ListValues {
+    fn write_struct(
+        &mut self,
+        schema: &Schema,
+        value: &dyn SerializableStruct,
+    ) -> Result<(), SerdeError> {
+        let pushed = self.push_segment(schema);
+        self.frames.push(Frame::Opaque);
+        let out = value.serialize_members(self);
+        self.frames.pop();
+        self.pop_segment(pushed);
+        out
+    }
+
+    fn write_list(
+        &mut self,
+        schema: &Schema,
+        write_elements: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
+    ) -> Result<(), SerdeError> {
+        let pushed = self.push_segment(schema);
+        self.frames.push(Frame::List(Vec::new()));
+        let out = write_elements(self);
+        if let Some(Frame::List(elements)) = self.frames.pop() {
+            self.values.insert(self.path.join("."), elements);
+        }
+        self.pop_segment(pushed);
+        out
+    }
+
+    fn write_map(
+        &mut self,
+        schema: &Schema,
+        write_entries: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
+    ) -> Result<(), SerdeError> {
+        let pushed = self.push_segment(schema);
+        // A map's keys and values are not list elements, and AWS states a violation
+        // inside one at the entry rather than at the map, so nothing here collects.
+        self.frames.push(Frame::Opaque);
+        let out = write_entries(self);
+        self.frames.pop();
+        self.pop_segment(pushed);
+        out
+    }
+
+    fn write_boolean(&mut self, _schema: &Schema, value: bool) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_byte(&mut self, _schema: &Schema, value: i8) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_short(&mut self, _schema: &Schema, value: i16) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_integer(&mut self, _schema: &Schema, value: i32) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_long(&mut self, _schema: &Schema, value: i64) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_float(&mut self, _schema: &Schema, value: f32) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_double(&mut self, _schema: &Schema, value: f64) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_big_integer(&mut self, _schema: &Schema, value: &BigInteger) -> Result<(), SerdeError> {
+        let rendered: &str = value.as_ref();
+        self.record(rendered);
+        Ok(())
+    }
+
+    fn write_big_decimal(&mut self, _schema: &Schema, value: &BigDecimal) -> Result<(), SerdeError> {
+        let rendered: &str = value.as_ref();
+        self.record(rendered);
+        Ok(())
+    }
+
+    fn write_string(&mut self, _schema: &Schema, value: &str) -> Result<(), SerdeError> {
+        self.record(value);
+        Ok(())
+    }
+
+    fn write_blob(&mut self, _schema: &Schema, value: &[u8]) -> Result<(), SerdeError> {
+        // The bytes themselves are not a rendering a message can carry; the framework's
+        // own validator states a blob leaf the same way.
+        self.record(&format!("{} bytes", value.len()));
+        Ok(())
+    }
+
+    fn write_timestamp(&mut self, _schema: &Schema, value: &DateTime) -> Result<(), SerdeError> {
+        self.record(&value.to_string());
+        Ok(())
+    }
+
+    fn write_document(&mut self, _schema: &Schema, _value: &Document) -> Result<(), SerdeError> {
+        self.record("<document>");
+        Ok(())
+    }
+
+    fn write_null(&mut self, _schema: &Schema) -> Result<(), SerdeError> {
+        Ok(())
+    }
+}

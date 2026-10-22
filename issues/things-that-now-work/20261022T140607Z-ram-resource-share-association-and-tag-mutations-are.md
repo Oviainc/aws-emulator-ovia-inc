@@ -80,3 +80,78 @@ Causes 2 and 3: replay fixture ram-resource-share-tagging and inspect steps task
   3. POST /untagresource with resourceShareArn=<arn> and tagKeys=[team] (a key the share carries).
      Expected: 200 whose body reports the deleted tag key. Actual: 200 with body {}.
   The share's stored tags do change in both cases (a follow-up GetResourceShares shows the merge/removal), so the defect is purely in what the mutating responses report.
+
+## Resolution notes
+
+The RULE implemented, one level above the three recorded instances: **a call that mutates
+a resource share reports the mutation it performed, and every later read reports the
+state that mutation left.** For an association that means its status follows its whole
+lifecycle — in through `ASSOCIATING` to `ASSOCIATED`, out through `DISASSOCIATING` to
+`DISASSOCIATED` — with the record SURVIVING in its terminal status so a read still
+reports it; a record whose status is terminal is waiting for nothing and so reports no
+`statusMessage`. For a tag mutation it means the response lists the entries the call
+changed.
+
+- Cause 1 (`services/.../src/state.rs`, `src/ops/disassociate_resource_share.rs`): the
+  record's owed move is now `OwedMove { status, due_at }` instead of a bare `ready_at`
+  that could only mean "→ `ASSOCIATED`", so one settle step materialises either owed
+  move; `ASSOCIATION_STATUS_DISASSOCIATING` / `_DISASSOCIATED` and
+  `association_status_is_terminal` are written over the modelled
+  `ResourceShareAssociationStatus` enum. `state::disassociate` tears a record down: a
+  teardown that has access to revoke (the association had reached `ASSOCIATED`) is
+  answered in the non-terminal `DISASSOCIATING` and the clock owes `DISASSOCIATED`
+  `DISASSOCIATION_READY_AFTER_MILLIS` later, while a teardown with nothing to revoke
+  (the attach never completed — a principal that never answered its invitation) is
+  terminal at once. `AssociationRecord::view` drops `statusMessage` on a terminal
+  record, so the rule holds at the serializer and not only where the store writes.
+  `DisassociateResourceShare` is implemented (its `SCAFFOLDED` marker deleted), which
+  also closes the separately auto-filed stub finding: without a writer no sequence of
+  calls could produce a terminal association for the read half to report.
+  `GetResourceShareAssociations` needed no change — it already reported every stored
+  record and filtered on the requested `associationStatus`.
+- Causes 2 and 3 (`src/ops/tag_resource.rs`, `src/ops/untag_resource.rs`):
+  `TagResource` answers with `tagsCreated` — the pair now in effect for every distinct
+  key the request named — and `UntagResource` with `deletedTags` — the keys the share
+  actually carried and this call removed, so an untag that was a no-op is
+  distinguishable from one that detached a tag. `ShareRecord::remove_tags` now answers
+  the keys it removed rather than a bare "something changed".
+
+### Model change: `TagResourceResponse$tagsCreated`, `UntagResourceResponse$deletedTags`
+
+Both members were ADDED to this service's on-disk Smithy model (target
+`com.amazonaws.ram#TagList`), for the same reason and on the same evidence as
+`ResourceShareConfiguration$exclusiveAccountAccess` before them: the shipped model
+declares both response structures with no members, while the recorded AWS responses in
+corpus `simparity-wire-aws-v1` carry the tags the call created / deleted, and a
+schema-driven serializer cannot emit a member the model does not declare.
+
+### Declined
+
+- The recorded `tagsCreated` / `deletedTags` entries carry an extra member `__type`
+  beside `key`/`value`. `smithy_query(shape="Tag")` declares exactly two members, and
+  restJson1 emits `__type` only in an ERROR envelope, never inside a success body's
+  structure — and the same corpus's `ResourceShare.tags` entries carry no `__type` and
+  match this emulator byte for byte. A type discriminator inside a success structure is
+  a recording artifact, so it is not emitted.
+- The recorded `DisassociateResourceShare` response reports
+  `resourceShareAssociations[].external` with the opposite boolean to the one the SAME
+  recording reports for the SAME principal and share on `AssociateResourceShare` and
+  `GetResourceShareAssociations` (both of those steps replay clean). `external`
+  "indicates whether the principal belongs to the same organization in Organizations as
+  the Amazon Web Services account that owns the resource share" and is one member of
+  the one `ResourceShareAssociation` shape all three operations return, so no rule makes
+  its value depend on which operation reports it; the emulator reports the stored value.
+
+### Tests
+
+`services/.../tests/all/mutation_reports.rs` (declared in `tests/all.rs`) asserts each
+rule over a table: twelve tag-mutation rows (add to an empty set, add beside a key,
+replace a value, re-attach what is already carried, several at once, the same key twice
+in one call, an empty value, remove a present key, an absent one, a mix, every key, and
+twice), each row's expected report derived from the tag set the mutation meets; and
+eight association rows spanning the three association types and the entity forms
+(resource inside and outside the owning account, account id, role ARN, service
+principal, organizational unit, source) for the pending teardown, the settled teardown
+through `DISASSOCIATING`, the status-filtered reads, re-association after a teardown and
+nine refusal rows.
+

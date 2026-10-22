@@ -21,5 +21,7 @@ mod resource_tags;
 mod state_machine_create_options;
 #[path = "all/state_machine_lifecycle.rs"]
 mod state_machine_lifecycle;
+#[path = "all/state_machine_projection.rs"]
+mod state_machine_projection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

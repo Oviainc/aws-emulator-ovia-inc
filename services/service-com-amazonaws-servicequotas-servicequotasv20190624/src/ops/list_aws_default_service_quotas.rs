@@ -15,6 +15,10 @@
 //! code). A `NextToken` this service did not issue is
 //! `InvalidPaginationTokenException`.
 //!
+//! The quotas come back in the order the catalog publishes them, and each entry's
+//! `QuotaArn` is the AWS-DEFAULT form, whose account segment is empty: a default
+//! quota is AWS's published value and belongs to no account.
+//!
 //! The listing is the service's WHOLE published default-quota list (the catalog
 //! seeded in [`crate::state`]), which for a service such as EC2 runs well past the
 //! largest page the model allows, so a walk takes many `NextToken`-chained pages.

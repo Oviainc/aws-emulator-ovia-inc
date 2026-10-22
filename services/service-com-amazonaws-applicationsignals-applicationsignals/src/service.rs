@@ -76,6 +76,59 @@ use std::sync::Arc;
 /// here because `override_refusal` replaces the code and the message together.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
+/// The routes this service's generated table cannot name an operation for when a `@required`
+/// `@httpQuery` member is absent from the request, as `(method, path, operation)`.
+///
+/// The framework's REST router rejects a candidate route whose `@required` query bindings
+/// are not on the request. That rule is what lets an S3-class model tell four operations
+/// apart on one `PUT /{Bucket}/{Key+}` by the SHAPE of the request — but this service
+/// overloads no route, so for it the rule only misfires: a call that omits one of these
+/// members matches NO route, and the request is answered "unknown operation" (HTTP 501
+/// `NotImplemented`) instead of the modelled HTTP 400 `ValidationException` that names the
+/// absent member. An absent required input is a bad request, never an operation nobody
+/// wrote.
+///
+/// Every entry below is a route with a STATIC path that declares at least one `@required`
+/// `@httpQuery` member (`smithy_query(query="operation",operation="GetService,ListServices,
+/// ListServiceOperations,ListServiceDependencies,ListServiceDependents,ListAuditFindings,
+/// ListTagsForResource")`: `StartTime`/`EndTime` on the six time-ranged reads, `ResourceArn`
+/// on `ListTagsForResource`), so this is exactly the set of routes the rule can misfire on,
+/// and on each of them the method and path name the operation on their own.
+const REQUIRED_QUERY_ROUTES: &[(&str, &str, &str)] = &[
+    ("POST", "/service", "GetService"),
+    ("GET", "/services", "ListServices"),
+    ("POST", "/service-operations", "ListServiceOperations"),
+    ("POST", "/service-dependencies", "ListServiceDependencies"),
+    ("POST", "/service-dependents", "ListServiceDependents"),
+    ("POST", "/auditFindings", "ListAuditFindings"),
+    ("GET", "/tags", "ListTagsForResource"),
+];
+
+/// The path of a request URI: no scheme, no authority, no query string, and no trailing
+/// slash, which is how [`REQUIRED_QUERY_ROUTES`] spells a route. The router's own matcher
+/// ignores a trailing slash, so this one must too, or the two would disagree about which
+/// requests the table already resolves.
+fn request_path(uri: &str) -> &str {
+    let after_authority = match uri.find("://") {
+        None => uri,
+        Some(scheme_end) => {
+            let authority = &uri[scheme_end + 3..];
+            match authority.find('/') {
+                Some(path_start) => &authority[path_start..],
+                None => "/",
+            }
+        }
+    };
+    let path = after_authority
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after_authority);
+    match path.trim_end_matches('/') {
+        "" => "/",
+        trimmed => trimmed,
+    }
+}
+
 /// Render one constraint violation the way this service states it: the member path and the
 /// requirement it violated, and NOTHING of the value that was rejected.
 ///
@@ -362,19 +415,40 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         }
     }
 
+    /// Serve the request through the operation the generated table's own protocol names,
+    /// and serve a request whose method and path name one modelled route even when a
+    /// `@required` `@httpQuery` member it declares is ABSENT.
+    ///
+    /// The first branch is NOT a re-route: the key is the one the generated table's own
+    /// protocol resolves, and the operation it names is the one served — wrapped in
+    /// `EpochSecondsQueryTimestamps` for the operations that bind a timestamp to the query
+    /// string, so the epoch-seconds form their members document binds as well as the
+    /// protocol's default `date-time`. Every other key resolves to `None` there exactly as
+    /// it does for an unedited service, leaving the generated table to serve it.
+    ///
+    /// The second branch is reached only when the protocol can name NO operation at all,
+    /// which for this service happens when a required query member is missing (see
+    /// [`REQUIRED_QUERY_ROUTES`]). The operation then runs the centralized walk, whose
+    /// validation step refuses the absent member with the modelled HTTP 400
+    /// `ValidationException` naming it — the answer the real service gives, and the one a
+    /// 501 `NotImplemented` was standing in for. It is served through the same wrapper, so
+    /// a request that carries one timestamp in the epoch-seconds form and omits the other
+    /// is refused for the member it omitted rather than for the form it used.
     fn override_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // NOT a re-route: the key is the one the generated table's own protocol resolves,
-        // and the operation it names is the one served — wrapped in
-        // `EpochSecondsQueryTimestamps` for the operations that bind a timestamp to the
-        // query string, so the epoch-seconds form their members document binds as well as
-        // the protocol's default `date-time`. Every other key resolves to `None` here
-        // exactly as it does for an unedited service, leaving the generated table to serve
-        // it.
-        let key = self.entry.protocol().routing_key(req).ok()?;
-        self.epoch_seconds_query_timestamps.get(key)
+        if let Ok(key) = self.entry.protocol().routing_key(req) {
+            return self.epoch_seconds_query_timestamps.get(key);
+        }
+        let path = request_path(req.uri());
+        let operation = REQUIRED_QUERY_ROUTES
+            .iter()
+            .find(|(method, route, _)| *method == req.method() && *route == path)
+            .map(|(_, _, operation)| *operation)?;
+        self.epoch_seconds_query_timestamps
+            .get(operation)
+            .or_else(|| self.entry.routing_table().get(operation))
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

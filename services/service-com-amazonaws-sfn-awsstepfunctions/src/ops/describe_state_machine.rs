@@ -235,6 +235,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // `includedData` is `ALL_DATA | METADATA_ONLY`; the `definition` output
+        // member documents what the latter reports. A value outside the modelled
+        // enum is a bad request this operation models no error for, so it goes out
+        // through the one non-modelled channel the crate has rather than being read
+        // as either member.
+        let Some(included_data) = crate::state::IncludedData::from_wire(input.included_data.as_deref())
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "includedData must be one of [{}], got '{}'",
+                INCLUDED_DATA_VALUES.join(", "),
+                input.included_data.unwrap_or_default()
+            )));
+        };
+
         let mut store = state.lock();
         // Materialising a deletion the clock already owes is the one write a report
         // may make: it was due at the same instant whether or not anybody called.
@@ -262,23 +276,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(version) = store.state_machine_versions.get(&input.state_machine_arn) else {
                 return Err(not_found().into());
             };
+            // A version is a state machine too, so it is projected by exactly the
+            // rules the unqualified record below is: the three configuration
+            // structures at their effective values, the definition as
+            // `includedData` asks for it, and the variables its states reference.
+            let variable_references = if included_data.is_metadata_only() {
+                None
+            } else {
+                let references = crate::state::asl::variable_references(&version.definition);
+                (!references.is_empty()).then(|| references.into_iter().collect())
+            };
             return Ok(DescribeStateMachineOutput {
                 state_machine_arn: version.arn.clone(),
                 name: version.name.clone(),
                 // A published version is usable from the moment it exists, and
                 // `StateMachineStatus` is ACTIVE | DELETING.
                 status: Some(crate::state::STATE_MACHINE_STATUS_ACTIVE.to_string()),
-                definition: version.definition.clone(),
+                definition: crate::state::reported_definition(&version.definition, included_data),
                 role_arn: version.role_arn.clone(),
                 r#type: version.sm_type.clone(),
                 creation_date: crate::state::to_date_time(version.creation_date),
-                logging_configuration: version.logging_configuration.clone(),
-                tracing_configuration: version.tracing_configuration.clone(),
+                logging_configuration: Some(crate::state::reported_logging_configuration(
+                    version.logging_configuration.as_ref(),
+                )),
+                tracing_configuration: Some(crate::state::reported_tracing_configuration(
+                    version.tracing_configuration.as_ref(),
+                )),
                 label: None,
                 revision_id: version.revision_id.clone(),
                 description: version.description.clone(),
-                encryption_configuration: version.encryption_configuration.clone(),
-                variable_references: None,
+                encryption_configuration: Some(crate::state::reported_encryption_configuration(
+                    version.encryption_configuration.as_ref(),
+                )),
+                variable_references,
             });
         }
 
@@ -286,25 +316,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found().into());
         };
 
-        // `includedData` only changes what a KMS-ENCRYPTED definition reports ("you
-        // can call the API with includedData = METADATA_ONLY to get a successful
-        // response without the encrypted definition"). This emulator stores no
-        // encrypted definition, so the stored definition is reported either way.
+        // `variableReferences` is read OUT OF the definition, so a metadata-only
+        // read — which does not report the definition — reports nothing derived from
+        // it either. An empty map is no member at all: "states that do not use
+        // variable references will not be shown in the response".
+        let variable_references = if included_data.is_metadata_only() {
+            None
+        } else {
+            let references = crate::state::asl::variable_references(&machine.definition);
+            (!references.is_empty()).then(|| references.into_iter().collect())
+        };
+
         Ok(DescribeStateMachineOutput {
             state_machine_arn: machine.arn.clone(),
             name: machine.name.clone(),
             status: Some(machine.status.clone()),
-            definition: machine.definition.clone(),
+            definition: crate::state::reported_definition(&machine.definition, included_data),
             role_arn: machine.role_arn.clone(),
             r#type: machine.sm_type.clone(),
             creation_date: crate::state::to_date_time(machine.creation_date),
-            logging_configuration: machine.logging_configuration.clone(),
-            tracing_configuration: machine.tracing_configuration.clone(),
+            // The three configuration structures report what the state machine is
+            // EFFECTIVELY configured with: one no create or update set is reported
+            // at its own modelled default, not omitted.
+            logging_configuration: Some(crate::state::reported_logging_configuration(
+                machine.logging_configuration.as_ref(),
+            )),
+            tracing_configuration: Some(crate::state::reported_tracing_configuration(
+                machine.tracing_configuration.as_ref(),
+            )),
             label: None,
             revision_id: machine.revision_id.clone(),
             description: machine.description.clone(),
-            encryption_configuration: machine.encryption_configuration.clone(),
-            variable_references: None,
+            encryption_configuration: Some(crate::state::reported_encryption_configuration(
+                machine.encryption_configuration.as_ref(),
+            )),
+            variable_references,
         })
     }
 }

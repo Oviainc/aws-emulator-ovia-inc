@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPermissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPermissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPermissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +167,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPermissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPermissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPermissions"))
+        // Reporting only: the CA inspected is the one the request names by ARN, so
+        // nothing here is read off the request's metadata.
+        let _ = ctx;
+        let arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(ListPermissionsErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let resume_after = input
+            .next_token
+            .as_deref()
+            .map(decode_next_token)
+            .transpose()?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPermissionsErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // Reporting only: `certificate_authority_mut` materialises the CREATING ->
+        // PENDING_CERTIFICATE change the clock already owed, which came due at the same
+        // instant whether or not anybody listed the CA's permissions.
+        let Some(record) =
+            state.certificate_authority_mut(&arn, ::std::time::SystemTime::now())
+        else {
+            return Err(ListPermissionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("the certificate authority {arn} was not found")),
+                },
+            )
+            .into());
+        };
+
+        // Every grant the CA holds, in the one order a page is cut and resumed in.
+        let ordered = record.permissions_in_order();
+
+        // `NextToken` names the last grant the previous page emitted, so this page starts
+        // at the first grant that sorts strictly after it — whether or not that grant is
+        // still there. A caller paging while permissions are revoked therefore keeps the
+        // tail instead of losing it.
+        let start = match resume_after.as_ref() {
+            None => 0,
+            Some(cursor) => ordered
+                .iter()
+                .position(|permission| permission.key() > (cursor.0.as_str(), cursor.1.as_str()))
+                .unwrap_or(ordered.len()),
+        };
+        let page = &ordered[start.min(ordered.len())..];
+
+        // Page size: the caller's `MaxResults`, else the server-side default. Both are
+        // bounded by the model's own `MaxResults` maximum, so one request can never
+        // serialise more than that however many grants the CA holds.
+        let limit = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let emitted = page.len().min(limit);
+
+        let permissions: Vec<Permission> = page[..emitted]
+            .iter()
+            .map(|permission| permission.to_wire(&arn))
+            .collect();
+        // "When the list is truncated, this value is present"
+        // (`ListPermissionsResponse$NextToken`): a token is issued only when this page
+        // stopped short of the grants, and it names the last one the page emitted.
+        let next_token = if emitted < page.len() {
+            page[..emitted]
+                .last()
+                .map(|permission| encode_next_token(permission))
+        } else {
+            None
+        };
+
+        Ok(ListPermissionsOutput {
+            next_token,
+            permissions: Some(permissions),
+        })
     }
+}
+
+/// The most permissions one `ListPermissions` response carries, which is also the page
+/// size used when the caller names no `MaxResults`: the maximum the model allows for that
+/// member (`MaxResults`, `range 1..1000`).
+const MAX_PAGE_SIZE: usize = 1000;
+
+/// Where a page stopped: the (principal, source account) pair of the last grant it
+/// emitted, which is everything the next page needs to resume even if that grant has
+/// since been revoked.
+type Cursor = (String, String);
+
+/// The byte that separates a token's two keys. Outside `Principal`'s own pattern
+/// (`^[^*]+$` over printable text) in practice and never produced by `AccountId`
+/// (`^[0-9]+$`), so a pair is split back exactly as it was joined.
+const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// The opaque `NextToken` for the last grant a page emitted.
+///
+/// Hex-encoded so the token is opaque to the caller and satisfies the member's length
+/// bound whatever the principal contains.
+fn encode_next_token(permission: &crate::state::PermissionRecord) -> String {
+    let (principal, source_account) = permission.key();
+    ::hex::encode(format!("{principal}{CURSOR_SEPARATOR}{source_account}"))
+}
+
+/// The [`Cursor`] inside a `NextToken`, or `InvalidNextTokenException` when the token did
+/// not come from [`encode_next_token`].
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so no value read out
+/// of it may panic the handler.
+fn decode_next_token(token: &str) -> Result<Cursor, ListPermissionsError> {
+    let invalid = || {
+        ListPermissionsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+            message: Some("NextToken is not a token this service issued".to_string()),
+        })
+    };
+    let bytes = ::hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let (principal, source_account) = decoded.split_once(CURSOR_SEPARATOR).ok_or_else(invalid)?;
+    // A token this service issued always decodes to a grant's identifying pair: a
+    // principal is non-empty (`^[^*]+$`) and an account id is twelve digits
+    // (`AccountId`, len 12..12, `^[0-9]+$`), so a forged-but-well-encoded token is
+    // refused instead of silently answering an empty page.
+    if principal.is_empty()
+        || source_account.len() != 12
+        || !source_account.chars().all(|digit| digit.is_ascii_digit())
+    {
+        return Err(invalid().into());
+    }
+    Ok((principal.to_string(), source_account.to_string()))
 }

@@ -155,6 +155,18 @@ pub const EXECUTION_STATUS_FAILED: &str = "FAILED";
 /// An execution `StopExecution` stopped.
 pub const EXECUTION_STATUS_ABORTED: &str = "ABORTED";
 
+/// `IncludedData`'s metadata-only member: see [`reported_definition`].
+pub const INCLUDED_DATA_METADATA_ONLY: &str = "METADATA_ONLY";
+
+/// `IncludedData`'s every-member value, which reports the definition in full.
+pub const INCLUDED_DATA_ALL_DATA: &str = "ALL_DATA";
+
+/// What a metadata-only read reports for a state machine `definition`.
+///
+/// From the `definition` output member's own documentation: "If called with
+/// includedData = METADATA_ONLY, the returned definition will be {}."
+pub const METADATA_ONLY_DEFINITION: &str = "{}";
+
 // ---------------------------------------------------------------------------
 // Redrive
 //
@@ -787,8 +799,9 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// bound on the PRODUCT of the record counts and the caller-sized text each
     /// record carries, not on each factor alone. See [`MAX_STORE_BYTES`].
     retained_bytes: usize,
-    /// Mixed into each minted execution name so two mints in the same nanosecond
-    /// differ. See [`ComAmazonawsSfnAwsstepfunctionsState::fresh_execution_name`].
+    /// Mixed into each minted id so two mints in the same nanosecond differ. See
+    /// [`ComAmazonawsSfnAwsstepfunctionsState::fresh_execution_name`] and
+    /// [`ComAmazonawsSfnAwsstepfunctionsState::fresh_revision_id`].
     name_counter: u64,
 }
 
@@ -850,6 +863,12 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// 8-4-4-4-12 in lowercase hex. The counter is what makes two mints in the same
     /// nanosecond differ.
     pub fn fresh_execution_name(&mut self) -> String {
+        self.fresh_uuid()
+    }
+
+    /// One freshly drawn version-4 UUID: the single mint behind every id this store
+    /// hands out, so there is one implementation of the draw.
+    fn fresh_uuid(&mut self) -> String {
         self.name_counter = self.name_counter.wrapping_add(1);
         let mut seed = now_nanos() ^ self.name_counter.rotate_left(29);
         let high = splitmix64(&mut seed);
@@ -863,7 +882,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// it has to differ on every update so a client can order revisions, so it is
     /// minted from the same UUID generator as an execution name.
     pub fn fresh_revision_id(&mut self) -> String {
-        self.fresh_execution_name()
+        self.fresh_uuid()
     }
 
     /// Whether the store can still take a record of `bytes`.
@@ -1568,7 +1587,8 @@ pub enum RedriveRejection {
 /// Why a tag write was not applied; see
 /// [`ComAmazonawsSfnAwsstepfunctionsState::merge_state_machine_tags`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TagWriteRejection {    /// The store holds no resource under that ARN — the modelled `ResourceNotFound`.
+pub enum TagWriteRejection {
+    /// The store holds no resource under that ARN — the modelled `ResourceNotFound`.
     NotFound,
     /// The merged tag set would hold this many tags, past [`MAX_TAGS`] — the
     /// modelled `TooManyTags`.
@@ -1929,17 +1949,17 @@ pub fn configuration_fingerprint(
 /// The logging configuration a request carrying `configuration` effectively asks
 /// for, rendered deterministically.
 ///
-/// Defaults from the member's own documentation ("By default, the level is set to
-/// OFF") and the model (`includeExecutionData` defaults to false, `destinations` is
-/// absent by default).
+/// The defaults live in ONE place: this renders
+/// [`reported_logging_configuration`], the same effective structure a read
+/// reports, so the fingerprint and the response can never disagree about what a
+/// request configured.
 pub fn effective_logging_configuration(configuration: Option<&LoggingConfiguration>) -> String {
-    let level = configuration
-        .and_then(|configuration| configuration.level.as_deref())
-        .unwrap_or(LOG_LEVEL_OFF);
-    let include_execution_data =
-        configuration.is_some_and(|configuration| configuration.include_execution_data);
-    let destinations: Vec<&str> = configuration
-        .and_then(|configuration| configuration.destinations.as_deref())
+    let reported = reported_logging_configuration(configuration);
+    let level = reported.level.as_deref().unwrap_or(LOG_LEVEL_OFF);
+    let include_execution_data = reported.include_execution_data;
+    let destinations: Vec<&str> = reported
+        .destinations
+        .as_deref()
         .unwrap_or_default()
         .iter()
         .filter_map(|destination| destination.cloud_watch_logs_log_group.as_ref())
@@ -1949,34 +1969,29 @@ pub fn effective_logging_configuration(configuration: Option<&LoggingConfigurati
 }
 
 /// The tracing configuration a request carrying `configuration` effectively asks
-/// for: `enabled` defaults to false in the model, and no `tracingConfiguration` is
-/// the same as one that disables tracing.
+/// for, rendered from [`reported_tracing_configuration`] for the same reason.
 pub fn effective_tracing_configuration(configuration: Option<&TracingConfiguration>) -> String {
-    let enabled = configuration.is_some_and(|configuration| configuration.enabled);
+    let enabled = reported_tracing_configuration(configuration).enabled;
     format!("enabled={enabled}")
 }
 
 /// The encryption configuration a request carrying `configuration` effectively asks
-/// for.
+/// for, rendered from [`reported_encryption_configuration`] for the same reason.
 ///
-/// Absent any configuration the data is encrypted under the Amazon Web Services
-/// owned key, so no `encryptionConfiguration` is the same as
-/// `{"type": "AWS_OWNED_KEY"}`. Under that type the KMS members mean nothing
+/// Under [`ENCRYPTION_TYPE_AWS_OWNED_KEY`] the KMS members mean nothing
 /// (`kmsDataKeyReusePeriodSeconds`: "Only applies to customer managed keys") and
 /// [`invalid_encryption_reason`] refuses them, so they are not part of what it
 /// denotes.
 pub fn effective_encryption_configuration(configuration: Option<&EncryptionConfiguration>) -> String {
-    let Some(configuration) = configuration else {
-        return format!("type={ENCRYPTION_TYPE_AWS_OWNED_KEY}");
-    };
-    if configuration.r#type == ENCRYPTION_TYPE_AWS_OWNED_KEY {
+    let reported = reported_encryption_configuration(configuration);
+    if reported.r#type == ENCRYPTION_TYPE_AWS_OWNED_KEY {
         return format!("type={ENCRYPTION_TYPE_AWS_OWNED_KEY}");
     }
     format!(
         "type={},kmsKeyId={:?},kmsDataKeyReusePeriodSeconds={:?}",
-        configuration.r#type,
-        configuration.kms_key_id.as_deref(),
-        configuration.kms_data_key_reuse_period_seconds
+        reported.r#type,
+        reported.kms_key_id.as_deref(),
+        reported.kms_data_key_reuse_period_seconds
     )
 }
 
@@ -2173,6 +2188,108 @@ fn names_log_group(value: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// What a read reports
+//
+// A describe reports a state machine's EFFECTIVE configuration: a configuration
+// structure the create or the update did not set is still part of what the
+// resource is, so it is reported at the default its own model declares rather
+// than omitted. Omitting it tells a client nothing — it cannot tell "the default"
+// from "this emulator does not keep that" — while the default is exactly what the
+// service applies to the resource.
+// ---------------------------------------------------------------------------
+
+/// The `loggingConfiguration` a read REPORTS for a state machine.
+///
+/// `LoggingConfiguration` is `{level: LogLevel, includeExecutionData: boolean
+/// (default false), destinations: LogDestinationList}`. An absent `level` is
+/// [`LOG_LEVEL_OFF`] and an absent `includeExecutionData` is the member's own
+/// modelled default, which the generated `bool` already carries.
+/// [`effective_logging_configuration`] renders the same effective value for the
+/// create-idempotency fingerprint; this one is the shape a response carries.
+pub fn reported_logging_configuration(
+    stored: Option<&LoggingConfiguration>,
+) -> LoggingConfiguration {
+    let mut effective = stored.cloned().unwrap_or_default();
+    if effective.level.is_none() {
+        effective.level = Some(LOG_LEVEL_OFF.to_string());
+    }
+    effective
+}
+
+/// The `tracingConfiguration` a read REPORTS for a state machine.
+///
+/// `TracingConfiguration` is `{enabled: boolean (default false)}` — "Selects
+/// whether or not the state machine's X-Ray tracing is enabled. Default is false" —
+/// so the default structure IS the effective one when nothing configured tracing.
+pub fn reported_tracing_configuration(
+    stored: Option<&TracingConfiguration>,
+) -> TracingConfiguration {
+    stored.cloned().unwrap_or_default()
+}
+
+/// The `encryptionConfiguration` a read REPORTS for a state machine.
+///
+/// `EncryptionConfiguration.type` is REQUIRED (`AWS_OWNED_KEY` |
+/// `CUSTOMER_MANAGED_KMS_KEY`), and only the customer-managed type carries a
+/// `kmsKeyId` and a data-key reuse period ([`invalid_encryption_reason`] refuses
+/// them under the other), so a state machine created without an encryption
+/// configuration is encrypted under [`ENCRYPTION_TYPE_AWS_OWNED_KEY`] with neither.
+pub fn reported_encryption_configuration(
+    stored: Option<&EncryptionConfiguration>,
+) -> EncryptionConfiguration {
+    let mut effective = stored.cloned().unwrap_or_default();
+    if effective.r#type.is_empty() {
+        effective.r#type = ENCRYPTION_TYPE_AWS_OWNED_KEY.to_string();
+    }
+    effective
+}
+
+/// What a request's `includedData` asks a read to report.
+///
+/// `IncludedData` is `ALL_DATA | METADATA_ONLY`: an operation that reports a state
+/// machine `definition` reports it in full for the former and as
+/// [`METADATA_ONLY_DEFINITION`] for the latter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncludedData {
+    /// Report everything, which is also what an absent `includedData` asks for:
+    /// every reader that passed none before the member existed still sees the whole
+    /// definition.
+    AllData,
+    /// Report the metadata and none of the definition.
+    MetadataOnly,
+}
+
+impl IncludedData {
+    /// What `value` names, or `None` when it names nothing `IncludedData` declares.
+    pub fn from_wire(value: Option<&str>) -> Option<Self> {
+        match value {
+            None | Some(INCLUDED_DATA_ALL_DATA) => Some(Self::AllData),
+            Some(INCLUDED_DATA_METADATA_ONLY) => Some(Self::MetadataOnly),
+            Some(_) => None,
+        }
+    }
+
+    /// Whether this read reports the metadata only.
+    pub fn is_metadata_only(self) -> bool {
+        matches!(self, Self::MetadataOnly)
+    }
+}
+
+/// The `definition` a read reports, given its `includedData`.
+///
+/// From the `definition` output member: "If called with includedData =
+/// METADATA_ONLY, the returned definition will be {}." Everything DERIVED from the
+/// definition — `variableReferences` — is withheld for the same read, because the
+/// definition is what it is read from.
+pub fn reported_definition(definition: &str, included_data: IncludedData) -> String {
+    if included_data.is_metadata_only() {
+        METADATA_ONLY_DEFINITION.to_string()
+    } else {
+        definition.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pagination
 // ---------------------------------------------------------------------------
 
@@ -2345,6 +2462,7 @@ pub mod asl {
     //! JSON, and a `Pass` state's `Result` is a value of the parsed definition, so
     //! that one state puts out that value's own encoding.
 
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::{Duration, SystemTime};
 
     use serde_json::{Map, Value};
@@ -2551,6 +2669,178 @@ pub mod asl {
             }
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // What a state REFERENCES
+    // -----------------------------------------------------------------------
+
+    /// `$` terms that are not variables.
+    ///
+    /// `$states` is the reserved context object Step Functions exposes to an
+    /// expression (`$states.input`, `$states.context`, `$states.result`), not a
+    /// variable a state assigned.
+    const RESERVED_TERMS: &[&str] = &["states"];
+
+    /// The variables each state of `definition` references, keyed by state name.
+    ///
+    /// `DescribeStateMachine`'s `variableReferences` is "a map of state name to a
+    /// list of variables referenced by that state. States that do not use variable
+    /// references will not be shown in the response" — so a state that references
+    /// none is absent, and a definition whose states reference none answers an empty
+    /// map, which the caller sees as no member at all.
+    ///
+    /// A variable reference is a `$name` term of one of the state's own
+    /// EXPRESSIONS, which is where both of the service's query languages read one:
+    ///
+    /// * a JSONata expression, which the language delimits with `{%` and `%}` (the
+    ///   `Assign`, `Output`, `Arguments`, `Condition`, … members of a state whose
+    ///   `QueryLanguage` is JSONata);
+    /// * a JSONPath reference field, which the Amazon States Language spells as a
+    ///   member whose name ends in `.$` and whose value is a path or a reference.
+    ///
+    /// Nothing else in the state is scanned, so a literal `Result` that happens to
+    /// carry a `$` is not mistaken for a reference. A nested `States` map — a
+    /// `Parallel` branch or a `Map` processor — is walked as the states it declares,
+    /// so each state's references are reported under ITS own name and never folded
+    /// into its parent's.
+    ///
+    /// The definition is parsed with `serde_json`, whose own recursion limit bounds
+    /// how deep the walk below can go; the extraction of the `$name` terms from one
+    /// expression is lexical, which is why it needs no expression parser (and there
+    /// is no maintained Rust crate that parses JSONata).
+    pub fn variable_references(definition: &str) -> BTreeMap<String, Vec<String>> {
+        let mut references = BTreeMap::new();
+        let Ok(document) = serde_json::from_str::<Value>(definition) else {
+            return references;
+        };
+        if let Some(states) = document.get("States").and_then(Value::as_object) {
+            collect_state_references(states, &mut references);
+        }
+        references
+    }
+
+    /// Report the references of every state `states` declares, and of every state
+    /// nested inside one of them.
+    ///
+    /// The Amazon States Language scopes a state name to the machine it is declared
+    /// in, so a `Parallel` branch may declare a name a top-level state also uses.
+    /// The map is flat, as the wire shape is, so two states of one name are MERGED
+    /// rather than one silently replacing the other.
+    fn collect_state_references(
+        states: &Map<String, Value>,
+        into: &mut BTreeMap<String, Vec<String>>,
+    ) {
+        for (name, state) in states {
+            let mut own = BTreeSet::new();
+            scan_state(state, false, &mut own, into);
+            if own.is_empty() {
+                continue;
+            }
+            let entry = into.entry(name.clone()).or_default();
+            own.extend(entry.drain(..));
+            entry.extend(own);
+        }
+    }
+
+    /// Walk one state, collecting ITS references into `own` and the references of
+    /// any state nested inside it into `nested`.
+    ///
+    /// `reference_field` is whether the value being walked is the value of a `.$`
+    /// member, which is what makes a JSONPath string a reference rather than a
+    /// literal.
+    fn scan_state(
+        value: &Value,
+        reference_field: bool,
+        own: &mut BTreeSet<String>,
+        nested: &mut BTreeMap<String, Vec<String>>,
+    ) {
+        match value {
+            Value::String(text) => {
+                for expression in jsonata_expressions(text) {
+                    scan_expression(expression, own);
+                }
+                if reference_field {
+                    scan_expression(text, own);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    scan_state(item, reference_field, own, nested);
+                }
+            }
+            Value::Object(members) => {
+                // A nested state machine — a `Parallel` branch, a `Map`'s
+                // `ItemProcessor`/`Iterator` — is an object carrying BOTH a string
+                // `StartAt` and an object `States`, exactly as the top-level
+                // definition does. Requiring the pair is what keeps a literal
+                // payload member that happens to be called `States` from being
+                // walked as states and injecting names of its own.
+                let sub_machine = members
+                    .get("StartAt")
+                    .and_then(Value::as_str)
+                    .is_some_and(|start_at| !start_at.is_empty());
+                for (member, child) in members {
+                    match child.as_object() {
+                        Some(states) if member == "States" && sub_machine => {
+                            collect_state_references(states, nested);
+                        }
+                        _ => scan_state(child, member.ends_with(".$"), own, nested),
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every JSONata expression `text` carries: the language embeds one between
+    /// `{%` and `%}`.
+    fn jsonata_expressions(text: &str) -> Vec<&str> {
+        let mut expressions = Vec::new();
+        let mut rest = text;
+        while let Some(open) = rest.find("{%") {
+            let after = &rest[open + 2..];
+            let Some(close) = after.find("%}") else {
+                break;
+            };
+            expressions.push(&after[..close]);
+            rest = &after[close + 2..];
+        }
+        expressions
+    }
+
+    /// Every variable one expression references.
+    ///
+    /// A term is `$` followed by an identifier. `$$` names the context, `$` alone
+    /// the state's input, `$name(` is a function call and [`RESERVED_TERMS`] names
+    /// the context object — none of them is a variable.
+    fn scan_expression(expression: &str, into: &mut BTreeSet<String>) {
+        let bytes = expression.as_bytes();
+        let mut index = 0;
+        while let Some(offset) = expression[index..].find('$') {
+            let start = index + offset;
+            let mut end = start + 1;
+            while bytes
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                end += 1;
+            }
+            index = end.max(start + 1);
+            let name = &expression[start + 1..end];
+            let identifier = name
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_');
+            if !identifier
+                || (start > 0 && bytes[start - 1] == b'$')
+                || bytes.get(end) == Some(&b'(')
+                || RESERVED_TERMS.contains(&name)
+            {
+                continue;
+            }
+            into.insert(name.to_string());
+        }
     }
 
     /// Walk `definition` from its `StartAt` state with `input` as the first state's

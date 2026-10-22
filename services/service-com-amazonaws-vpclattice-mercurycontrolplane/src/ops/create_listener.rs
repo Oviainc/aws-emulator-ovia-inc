@@ -238,11 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .and_then(|id| store.services.get(&id))
         .cloned();
         let Some(service) = service else {
+            const KIND: crate::state::ResourceKind = crate::state::ResourceKind::Service;
             return Err(CreateListenerErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("service {} not found", input.service_identifier),
+                    message: KIND.not_found_message(&input.service_identifier),
                     resource_id: input.service_identifier.clone(),
-                    resource_type: crate::state::KIND_SERVICE.to_string(),
+                    resource_type: KIND.arn_kind().to_string(),
                 },
             )
             .into());

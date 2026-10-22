@@ -79,9 +79,24 @@ pub const MAX_PACKAGING_CONFIGURATIONS_PER_GROUP: usize = 100;
 /// [`MAX_PACKAGING_GROUPS`].
 pub const MAX_ASSETS: usize = 10_000;
 
-/// Length of the checksum prefix a `ListAssets` pagination cursor carries, so a
-/// cursor this service did not issue is detectable rather than merely malformed.
+/// Length of the checksum prefix a pagination cursor carries, so a cursor this
+/// service did not issue is detectable rather than merely malformed.
 const PAGE_TOKEN_CHECK_LEN: usize = 8;
+
+/// The listing name [`encode_page_token`] binds a `ListAssets` cursor to.
+pub const LISTING_ASSETS: &str = "assets";
+
+/// The listing name [`encode_page_token`] binds a `ListPackagingConfigurations`
+/// cursor to.
+pub const LISTING_PACKAGING_CONFIGURATIONS: &str = "packaging-configurations";
+
+/// The smallest page a listing returns: the minimum of the `MaxResults` `range`
+/// trait every paginated operation in this model shares (`min: 1, max: 1000`).
+pub const MIN_PAGE_SIZE: usize = 1;
+
+/// The largest page a listing returns, and the page size a request that names no
+/// `MaxResults` gets: the maximum of that same `range` trait.
+pub const MAX_PAGE_SIZE: usize = 1000;
 
 /// A stored PackagingGroup. `ApproximateAssetCount` is NOT a field: it is counted
 /// from [`ComAmazonawsMediapackagevodMediapackagevodState::assets`] on each read.
@@ -361,20 +376,29 @@ pub fn now_iso8601() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-/// Encode a pagination cursor: the id the page ended on, which the next page
-/// resumes strictly after.
+/// Encode a pagination cursor for `listing`: the id the page ended on, which the
+/// next page of THAT listing resumes strictly after.
 ///
-/// Opaque to the caller, and carrying a checksum over the id it names, so a cursor
-/// this service never issued is REFUSED rather than silently resumed from. Decoded
-/// only by [`decode_page_token`].
-pub fn encode_page_token(last_id: &str) -> String {
-    format!("{}{}", page_token_check(last_id), hex::encode(last_id.as_bytes()))
+/// Opaque to the caller, and carrying a checksum over both the listing and the id it
+/// names, so a cursor that is merely malformed — or one another listing of this
+/// service issued — is REFUSED rather than silently resumed from. The checksum is an
+/// unkeyed digest over public text, so it detects those two cases rather than
+/// resisting a deliberately forged cursor; a resume point only picks where in this
+/// same store the listing starts, so there is nothing a forged one reaches that the
+/// unpaged listing does not already report. Decoded only by [`decode_page_token`].
+pub fn encode_page_token(listing: &str, last_id: &str) -> String {
+    format!(
+        "{}{}",
+        page_token_check(listing, last_id),
+        hex::encode(last_id.as_bytes())
+    )
 }
 
-/// Decode a cursor produced by [`encode_page_token`]. `None` for anything this
-/// service did not issue — a malformed cursor or a forged one whose checksum does
-/// not match the id it carries — which the caller answers as an invalid parameter.
-pub fn decode_page_token(token: &str) -> Option<String> {
+/// Decode a cursor produced by [`encode_page_token`] for `listing`. `None` for
+/// anything that is not a cursor this service issued for that listing — a malformed
+/// one, one whose checksum does not match the id it carries, or one issued by a
+/// different listing — which the caller answers as an invalid parameter.
+pub fn decode_page_token(listing: &str, token: &str) -> Option<String> {
     // Both halves are ASCII hex when this service issued the token; the ASCII check
     // is also what makes the byte split below a safe char boundary.
     if !token.is_ascii() || token.len() < PAGE_TOKEN_CHECK_LEN {
@@ -382,12 +406,53 @@ pub fn decode_page_token(token: &str) -> Option<String> {
     }
     let (check, payload) = token.split_at(PAGE_TOKEN_CHECK_LEN);
     let last_id = String::from_utf8(hex::decode(payload).ok()?).ok()?;
-    (page_token_check(&last_id) == check).then_some(last_id)
+    (page_token_check(listing, &last_id) == check).then_some(last_id)
 }
 
-/// The checksum prefix a cursor over `last_id` carries.
-fn page_token_check(last_id: &str) -> String {
-    digest_hex(&format!("assets-cursor/{last_id}"), PAGE_TOKEN_CHECK_LEN)
+/// The checksum prefix a cursor over `last_id` in `listing` carries.
+fn page_token_check(listing: &str, last_id: &str) -> String {
+    digest_hex(&format!("{listing}-cursor/{last_id}"), PAGE_TOKEN_CHECK_LEN)
+}
+
+/// The id a `NextToken` names as the resume point of `listing`, or the refusal a
+/// cursor this listing did not issue gets.
+///
+/// `None` for a request that carries no `NextToken`: the listing starts at its
+/// first record.
+pub fn resume_after(
+    listing: &str,
+    next_token: Option<&str>,
+) -> Result<Option<String>, crate::scaffolded::UnprocessableEntity> {
+    match next_token {
+        None => Ok(None),
+        Some(token) => decode_page_token(listing, token).map(Some).ok_or_else(|| {
+            crate::scaffolded::UnprocessableEntity::member(
+                "nextToken",
+                "is not a cursor this service issued",
+            )
+        }),
+    }
+}
+
+/// How many records one page of a listing carries, from the request's `MaxResults`.
+///
+/// `MaxResults` is modelled `range(min: 1, max: 1000)`, so the boundary validator
+/// already refuses anything outside it; this enforces the same bound itself rather
+/// than depending on that, and a request that names no `MaxResults` gets the largest
+/// page the model allows.
+pub fn page_size(
+    max_results: Option<i32>,
+) -> Result<usize, crate::scaffolded::UnprocessableEntity> {
+    match max_results {
+        None => Ok(MAX_PAGE_SIZE),
+        Some(max) => match usize::try_from(max) {
+            Ok(max) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&max) => Ok(max),
+            _ => Err(crate::scaffolded::UnprocessableEntity::member(
+                "maxResults",
+                format!("must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"),
+            )),
+        },
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

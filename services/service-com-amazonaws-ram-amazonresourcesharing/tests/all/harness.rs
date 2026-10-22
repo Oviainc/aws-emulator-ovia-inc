@@ -139,6 +139,10 @@ pub async fn associate(router: &MultiServiceRouter, body: &Value) -> (u16, Value
     call(router, "POST", "/associateresourceshare", Some(body)).await
 }
 
+pub async fn disassociate(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "POST", "/disassociateresourceshare", Some(body)).await
+}
+
 pub async fn get_associations(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "POST", "/getresourceshareassociations", Some(body)).await
 }

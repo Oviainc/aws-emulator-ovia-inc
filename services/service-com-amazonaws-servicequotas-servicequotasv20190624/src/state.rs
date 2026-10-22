@@ -174,6 +174,12 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// regions it is charged against are bounded by [`KNOWN_REGIONS`].
 pub const MAX_REQUESTS_PER_REGION: usize = 1_000;
 
+/// The window a quota whose usage CloudWatch publishes as an `AWS/Usage`
+/// `ResourceCount` metric reports as its `Period`: that metric is published every
+/// five minutes, which is the period the recorded response for a measured quota
+/// carries.
+const RESOURCE_COUNT_PERIOD_MINUTES: i32 = 5;
+
 /// The most tags one applied quota can carry.
 ///
 /// Source: the "Tag restrictions" section of the Service Quotas User Guide — the page
@@ -199,6 +205,10 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// the default a caller reads after an increase is the same one it read before.
 #[derive(Debug, Clone)]
 pub struct DefaultQuota {
+    /// The `ServiceCode` the quota belongs to.
+    pub service_code: String,
+    /// The `QuotaCode` that identifies the quota within its service.
+    pub quota_code: String,
     /// `QuotaName`, as AWS spells it.
     pub quota_name: String,
     /// The AWS default `Value`.
@@ -215,10 +225,31 @@ pub struct DefaultQuota {
     pub adjustable_at_level: String,
     /// `UsageMetric`, for the quotas AWS publishes a CloudWatch usage metric for.
     pub usage_metric: Option<MetricInfo>,
-    /// `Period`, for a rate quota (requests per unit of time).
+    /// `Period`: the window the quota's value is measured over — the rate denominator
+    /// of a rate quota, or the publication interval of its usage metric.
     pub period: Option<QuotaPeriod>,
-    /// `Description`, when AWS publishes one.
+    /// `Description`: the quota's published description.
     pub description: Option<String>,
+}
+
+impl DefaultQuota {
+    /// The row of [`seed_quota_catalog`] for `service_code`, with the `QuotaCode`
+    /// AWS's catalog gives it.
+    fn from_row(service_code: &str, quota_code: String, row: QuotaRow) -> Self {
+        Self {
+            service_code: service_code.to_string(),
+            quota_code,
+            quota_name: row.name,
+            value: row.value,
+            unit: row.unit,
+            adjustable: row.adjustable,
+            global_quota: row.global_quota,
+            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
+            usage_metric: row.usage_metric,
+            period: row.period,
+            description: row.description,
+        }
+    }
 }
 
 /// The applied value of one quota: the overlay a decided increase writes over the
@@ -329,8 +360,11 @@ struct RegionState {
 pub struct ComAmazonawsServicequotasServicequotasv20190624State {
     /// `ServiceCode` -> `ServiceName`, in `ServiceCode` order.
     services: BTreeMap<String, String>,
-    /// `(ServiceCode, QuotaCode)` -> the AWS default quota. Never mutated.
-    default_quotas: BTreeMap<(String, String), DefaultQuota>,
+    /// The AWS default quotas, in the order Service Quotas PUBLISHES them for each
+    /// service: both listings report a service's quotas in this order, so the order
+    /// is part of the state rather than an artefact of how the rows are keyed.
+    /// Never mutated.
+    default_quotas: Vec<DefaultQuota>,
     /// The applied overlay of the quotas AWS counts ACCOUNT-WIDE (`GlobalQuota`).
     /// A global quota has one value for the whole account — which is why its ARN
     /// carries no region — so an approved increase on it is in force at every
@@ -432,18 +466,21 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         self.services.get(service_code).map(String::as_str)
     }
 
-    /// The AWS default quota for a `(ServiceCode, QuotaCode)` pair.
+    /// The AWS default quota for a `(ServiceCode, QuotaCode)` pair — the row for
+    /// EXACTLY that pair, so a read never answers with another quota's record.
     pub fn default_quota(&self, service_code: &str, quota_code: &str) -> Option<&DefaultQuota> {
         self.default_quotas
-            .get(&(service_code.to_string(), quota_code.to_string()))
+            .iter()
+            .find(|quota| quota.service_code == service_code && quota.quota_code == quota_code)
     }
 
-    /// Every `QuotaCode` the service has a default quota for, in `QuotaCode` order.
+    /// Every `QuotaCode` the service has a default quota for, in the order the
+    /// catalog publishes them.
     pub fn quota_codes(&self, service_code: &str) -> Vec<String> {
         self.default_quotas
-            .keys()
-            .filter(|(code, _)| code == service_code)
-            .map(|(_, quota)| quota.clone())
+            .iter()
+            .filter(|quota| quota.service_code == service_code)
+            .map(|quota| quota.quota_code.clone())
             .collect()
     }
 
@@ -468,7 +505,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     ) -> Option<ServiceQuota> {
         let default = self.default_quota(service_code, quota_code)?;
         let applied = self.applied_entry(region, service_code, quota_code);
-        let mut quota = self.quota_view(region, service_code, quota_code, default);
+        let mut quota = self.quota_view(region, default, true);
         quota.value = Some(applied.map_or(default.value, |entry| entry.value));
         quota.quota_applied_at_level = Some(applied.map_or_else(
             || LEVEL_ACCOUNT.to_string(),
@@ -488,14 +525,7 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         quota_code: &str,
     ) -> Option<ServiceQuota> {
         let default = self.default_quota(service_code, quota_code)?;
-        let mut quota = self.quota_view(region, service_code, quota_code, default);
-        quota.quota_arn = Some(default_quota_arn(
-            region,
-            service_code,
-            quota_code,
-            default.global_quota,
-        ));
-        Some(quota)
+        Some(self.quota_view(region, default, false))
     }
 
     /// Mint and store a quota increase request, and return the stored record —
@@ -828,17 +858,22 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     }
 
     /// The fields both quota views share.
-    fn quota_view(
-        &self,
-        region: &str,
-        service_code: &str,
-        quota_code: &str,
-        default: &DefaultQuota,
-    ) -> ServiceQuota {
+    ///
+    /// `applied` picks the ARN form: an APPLIED quota belongs to the account, so its
+    /// ARN names it, while an AWS DEFAULT quota belongs to no account and its ARN's
+    /// account segment is empty (see [`default_quota_arn`]).
+    fn quota_view(&self, region: &str, default: &DefaultQuota, applied: bool) -> ServiceQuota {
+        let service_code = default.service_code.as_str();
+        let quota_code = default.quota_code.as_str();
+        let arn = if applied {
+            quota_arn(region, service_code, quota_code, default.global_quota)
+        } else {
+            default_quota_arn(region, service_code, quota_code, default.global_quota)
+        };
         ServiceQuota {
             service_code: Some(service_code.to_string()),
             service_name: self.service_name(service_code).map(str::to_string),
-            quota_arn: Some(quota_arn(region, service_code, quota_code, default.global_quota)),
+            quota_arn: Some(arn),
             quota_code: Some(quota_code.to_string()),
             quota_name: Some(default.quota_name.clone()),
             value: Some(default.value),
@@ -1184,8 +1219,20 @@ impl QuotaRow {
     }
 
     /// The CloudWatch usage metric AWS publishes for this quota.
+    ///
+    /// A measured quota also publishes the `Period` its usage metric is published
+    /// over, unless the row already names a rate window: the `AWS/Usage`
+    /// `ResourceCount` metrics are published every
+    /// [`RESOURCE_COUNT_PERIOD_MINUTES`] minutes, which is the period the recorded
+    /// response for a measured quota carries.
     fn metric(mut self, metric: MetricInfo) -> Self {
         self.usage_metric = Some(metric);
+        if self.period.is_none() {
+            self.period = Some(QuotaPeriod {
+                period_value: Some(RESOURCE_COUNT_PERIOD_MINUTES),
+                period_unit: Some("MINUTE".to_string()),
+            });
+        }
         self
     }
 
@@ -1224,8 +1271,14 @@ fn service(code: &'static str, name: &'static str, quotas: Vec<QuotaRow>) -> Cat
     CatalogService { code, name, quotas }
 }
 
-/// The seeded AWS default quotas, keyed by `(ServiceCode, QuotaCode)`, built from
-/// [`seed_quota_catalog`].
+/// The seeded AWS default quotas, in the order [`seed_quota_catalog`] PUBLISHES
+/// them for each service.
+///
+/// Order is state: both listings report a service's quotas in this order, so the
+/// first element of a listing is the first quota the catalog publishes for that
+/// service rather than whichever `QuotaCode` happens to sort first. Lookups go
+/// through [`ComAmazonawsServicequotasServicequotasv20190624State::default_quota`],
+/// which finds the row for exactly the `(ServiceCode, QuotaCode)` pair asked for.
 ///
 /// Coverage is per PAIR, not per service: the table holds the published defaults
 /// this emulator carries. A service code in [`SEED_SERVICE_CATALOG`] with no pair
@@ -1236,37 +1289,27 @@ fn service(code: &'static str, name: &'static str, quotas: Vec<QuotaRow>) -> Cat
 ///
 /// The `QuotaCode` of a row is AWS's own where the table carries it, else the
 /// derived one ([`derived_quota_code`]).
-fn seed_default_quotas() -> BTreeMap<(String, String), DefaultQuota> {
-    let mut default_quotas = BTreeMap::new();
+fn seed_default_quotas() -> Vec<DefaultQuota> {
+    let mut default_quotas: Vec<DefaultQuota> = Vec::new();
     for entry in seed_quota_catalog() {
         for row in entry.quotas {
             let code = row
                 .code
                 .clone()
                 .unwrap_or_else(|| derived_quota_code(entry.code, &row.name));
-            let key = (entry.code.to_string(), code);
-            let displaced = default_quotas.insert(
-                key.clone(),
-                DefaultQuota {
-                    quota_name: row.name,
-                    value: row.value,
-                    unit: row.unit,
-                    adjustable: row.adjustable,
-                    global_quota: row.global_quota,
-                    adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-                    usage_metric: row.usage_metric,
-                    period: row.period,
-                    description: row.description,
-                },
-            );
-            // The map is keyed by the pair, so a repeated QuotaCode within one
-            // service would SILENTLY drop a quota. A new table row that collides —
-            // with another row's code or with a derived one — fails here, at the
-            // source, rather than in a listing far away.
+            // A pair identifies a quota, so a repeated QuotaCode within one service
+            // would make one of the two rows unreachable through
+            // `GetServiceQuota`. A new table row that collides — with another row's
+            // code or with a derived one — fails here, at the source, rather than in
+            // a listing far away.
             debug_assert!(
-                displaced.is_none(),
-                "two catalog rows share the QuotaCode {key:?}"
+                !default_quotas
+                    .iter()
+                    .any(|held| held.service_code == entry.code && held.quota_code == code),
+                "two catalog rows share the QuotaCode ({:?}, {code:?})",
+                entry.code
             );
+            default_quotas.push(DefaultQuota::from_row(entry.code, code, row));
         }
     }
     default_quotas
@@ -1828,21 +1871,15 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "lambda",
             "AWS Lambda",
             vec![
-                quota("Concurrent executions", 1000.0)
-                    .code("L-B99A9384")
-                    .metric(usage_metric(
-                        "Lambda",
-                        &[
-                            ("Class", "None"),
-                            ("Resource", "ConcurrentExecutions"),
-                            ("Type", "Resource"),
-                        ],
-                    )),
-                quota("Function and layer storage", 75.0)
-                    .code("L-2ACBD22F")
-                    .unit("Gigabytes"),
-                // A rate quota AWS publishes as not adjustable, with its own
-                // `Period`: so many requests per second.
+                // AWS's own `QuotaCode`s for nine of Lambda's published quotas, in
+                // the order the service reports them — the order a recorded
+                // `ListServiceQuotas("lambda")` page carries, which is why the rate
+                // quotas come first. Their names, values and units are the ones the
+                // AWS Lambda quotas page publishes; a code this table does not carry
+                // gets the derived one ([`derived_quota_code`]).
+                //
+                // The API request-rate quotas AWS publishes as not adjustable, each
+                // with its own `Period`: so many requests per second.
                 quota(
                     "Rate of control plane API requests (excludes invocation, GetFunction, \
                      and GetPolicy requests)",
@@ -1855,8 +1892,80 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                     "The maximum rate of control plane API requests, excluding invocation, \
                      GetFunction and GetPolicy requests.",
                 ),
-                quota("Elastic network interfaces per VPC", 250.0),
-                quota("Function timeout", 900.0).unit("Seconds").fixed(),
+                quota("Rate of GetFunction API requests", 100.0)
+                    .code("L-72E0D058")
+                    .fixed()
+                    .period(1, "SECOND")
+                    .describe("The maximum rate of GetFunction API requests."),
+                quota("Rate of GetPolicy API requests", 15.0)
+                    .code("L-F55076EC")
+                    .fixed()
+                    .period(1, "SECOND")
+                    .describe("The maximum rate of GetPolicy API requests."),
+                quota("Function timeout", 900.0)
+                    .code("L-B82A30EA")
+                    .unit("Seconds")
+                    .fixed()
+                    .describe(
+                        "The maximum amount of time that a function can run before Lambda \
+                         stops it.",
+                    ),
+                quota("Function layers", 5.0)
+                    .code("L-14320ECE")
+                    .fixed()
+                    .describe("The maximum number of layers that a function can use."),
+                quota("Environment variable size", 4.0)
+                    .code("L-25EEC0A4")
+                    .unit("Kilobytes")
+                    .fixed()
+                    .describe(
+                        "The maximum total size of the environment variables of a function.",
+                    ),
+                quota("Function resource-based policy", 20.0)
+                    .code("L-4273958C")
+                    .unit("Kilobytes")
+                    .fixed()
+                    .describe("The maximum size of the resource-based policy of a function."),
+                quota("Invocation payload (synchronous)", 6.0)
+                    .code("L-B430C318")
+                    .unit("Megabytes")
+                    .fixed()
+                    .describe(
+                        "The maximum size of the request and response payload of a \
+                         synchronous invocation.",
+                    ),
+                quota("Invocation payload (asynchronous)", 256.0)
+                    .code("L-BA29C22B")
+                    .unit("Kilobytes")
+                    .fixed()
+                    .describe(
+                        "The maximum size of the event payload of an asynchronous invocation.",
+                    ),
+                quota("Function and layer storage", 75.0)
+                    .code("L-2ACBD22F")
+                    .unit("Gigabytes")
+                    .describe(
+                        "The maximum total storage for the .zip deployment packages and layers \
+                         of this account in this Region.",
+                    ),
+                quota("Concurrent executions", 1000.0)
+                    .code("L-B99A9384")
+                    .describe(
+                        "The maximum number of function invocations that can run concurrently \
+                         in this Region.",
+                    )
+                    .metric(usage_metric(
+                        "Lambda",
+                        &[
+                            ("Class", "None"),
+                            ("Resource", "ConcurrentExecutions"),
+                            ("Type", "Resource"),
+                        ],
+                    )),
+                quota("Elastic network interfaces per VPC", 250.0).describe(
+                    "The maximum number of elastic network interfaces that the functions of \
+                     this account can attach to one VPC.",
+                ),
             ],
         ),
         service(
@@ -2698,8 +2807,11 @@ fn vpc_quotas() -> Vec<QuotaRow> {
         // metric, and a `Period`.
         quota("VPCs per Region", 5.0)
             .code("L-F678F1CE")
+            // The VPC resource counts CloudWatch publishes sit under the EC2 service
+            // dimension — VPC is served by the EC2 API — which is the dimension the
+            // recorded response for this quota carries.
             .metric(usage_metric(
-                "VPC",
+                "EC2",
                 &[("Class", "None"), ("Resource", "VPC"), ("Type", "Resource")],
             ))
             .period(5, "MINUTE")

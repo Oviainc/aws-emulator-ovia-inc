@@ -10,7 +10,8 @@
 
 use std::sync::Arc;
 
-use serde_json::Value;
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use serde_json::{json, Value};
 use service_com_amazonaws_accessanalyzer_accessanalyzer::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -29,6 +30,9 @@ pub struct Reply {
     /// `x-amzn-errortype`, falling back to the body's `__type`.
     pub error_code: Option<String>,
     pub body: Value,
+    /// How many bytes of body the response carried, so a suite can tell a response
+    /// with no body at all from one carrying an empty JSON object.
+    pub body_bytes: usize,
 }
 
 impl Reply {
@@ -40,6 +44,17 @@ impl Reply {
     /// omitted optional member is.
     pub fn member(&self, name: &str) -> Option<&Value> {
         self.body.get(name).filter(|value| !value.is_null())
+    }
+
+    /// Whether the response reported NO content: no body at all, or a body carrying no
+    /// members. This is what a 204 answer must satisfy — there is nothing for a client
+    /// to parse either way.
+    pub fn carries_no_content(&self) -> bool {
+        match &self.body {
+            Value::Null => self.body_bytes == 0,
+            Value::Object(members) => members.is_empty(),
+            _ => false,
+        }
     }
 }
 
@@ -113,6 +128,7 @@ impl Emulator {
             status,
             error_code,
             body,
+            body_bytes: response.body().len(),
         }
     }
 
@@ -186,6 +202,45 @@ impl Emulator {
         self.send("GET", &format!("/policy/generation{query}"), None)
             .await
     }
+
+    /// `POST /tags/{resourceArn}` with the given tag map.
+    pub async fn tag_resource(&self, resource_arn: &str, tags: &Value) -> Reply {
+        self.send(
+            "POST",
+            &format!("/tags/{}", label(resource_arn)),
+            Some(json!({ "tags": tags })),
+        )
+        .await
+    }
+
+    /// `GET /tags/{resourceArn}`.
+    pub async fn list_tags_for_resource(&self, resource_arn: &str) -> Reply {
+        self.send("GET", &format!("/tags/{}", label(resource_arn)), None)
+            .await
+    }
+
+    /// `DELETE /tags/{resourceArn}?tagKeys=…`, one query entry per key (`tagKeys` is an
+    /// `@httpQuery` list).
+    pub async fn untag_resource(&self, resource_arn: &str, tag_keys: &[&str]) -> Reply {
+        let query = tag_keys
+            .iter()
+            .map(|key| format!("tagKeys={}", label(key)))
+            .collect::<Vec<_>>()
+            .join("&");
+        self.send(
+            "DELETE",
+            &format!("/tags/{}?{query}", label(resource_arn)),
+            None,
+        )
+        .await
+    }
+}
+
+/// A value encoded for an `@httpLabel` or an `@httpQuery` entry the way an SDK encodes
+/// one: every character outside the unreserved set is percent-escaped, so an ARN's own
+/// `:` and `/` do not read as path structure.
+pub fn label(value: &str) -> String {
+    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
 }
 
 /// Every `ValidationExceptionReason` this service's model declares, as the pair the model
