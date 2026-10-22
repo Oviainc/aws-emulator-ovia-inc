@@ -21,3 +21,5 @@ mod lifecycle_configuration;
 mod state_roundtrip;
 #[path = "all/tags.rs"]
 mod tags;
+#[path = "all/update_file_system.rs"]
+mod update_file_system;

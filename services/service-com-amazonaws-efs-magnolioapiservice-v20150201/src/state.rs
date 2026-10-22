@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     CreateFileSystemOutput, CreateMountTargetOutput, FileSystemSize, LifecyclePolicy, Tag,
+    UpdateFileSystemOutput,
 };
 
 /// Values of the modelled `LifeCycleState` enum this slice produces
@@ -28,6 +29,9 @@ use crate::ops::types::{
 pub const LIFE_CYCLE_CREATING: &str = "creating";
 /// See [`LIFE_CYCLE_CREATING`].
 pub const LIFE_CYCLE_AVAILABLE: &str = "available";
+/// See [`LIFE_CYCLE_CREATING`]. The phase a file system is in while a change the
+/// service applies in the background — a throughput change — is still settling.
+pub const LIFE_CYCLE_UPDATING: &str = "updating";
 
 /// `PerformanceMode` value `generalPurpose`, the only one the Archive storage class is
 /// available for.
@@ -100,13 +104,20 @@ pub const DEFAULT_MOUNT_TARGET_PAGE_SIZE: usize = 10;
 /// request walk the whole store.
 pub const MAX_PAGE_SIZE: usize = 100;
 
-/// How long a resource this service creates stays in `creating` before the clock owes
-/// it `available`. AWS publishes no duration for the transition, so this span is the
+/// How long a resource this service creates stays in `creating`, and a file system a
+/// throughput change stays in `updating`, before the clock owes it `available`. AWS
+/// publishes no duration for either transition, so this span is the
 /// emulator's own choice inside the band the project fixes for a clock-owed
 /// transition (250-750 ms). It is never zero, so a caller that acts immediately after
 /// a create still observes `creating` and the state errors that go with it; the due
 /// instant is stored on the record and materialised on the next call, never slept for.
 pub const CREATING_FOR: Duration = Duration::from_millis(500);
+
+/// `UpdateFileSystem`'s `TooManyRequests` (HTTP 429): "Returned if you don't wait at
+/// least 24 hours before either changing the throughput mode, or decreasing the
+/// Provisioned Throughput value." The duration is the one that error documents, so it
+/// is kept as published rather than chosen by this emulator.
+pub const THROUGHPUT_CHANGE_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Availability Zone name suffixes. An Availability Zone name is the Region code
 /// followed by a letter identifier ("Regions and Zones", Amazon EC2 User Guide); every
@@ -170,12 +181,17 @@ pub struct FileSystem {
     pub owner_id: String,
     pub creation_token: String,
     pub creation_time: SystemTime,
-    /// When the clock owes this file system `available`; see [`CREATING_FOR`].
+    /// When the clock owes this file system `available` again, whether it is `creating`
+    /// or `updating`; see [`CREATING_FOR`].
     pub available_at: SystemTime,
     pub life_cycle_state: String,
     pub name: Option<String>,
     pub performance_mode: String,
     pub throughput_mode: String,
+    /// When a throughput change the 24-hour restriction covers — a throughput-mode
+    /// change, or a decrease of provisioned throughput — was last applied to this file
+    /// system, and `None` while none has been. See [`THROUGHPUT_CHANGE_COOLDOWN`].
+    pub last_restricted_throughput_change: Option<SystemTime>,
     pub provisioned_throughput_in_mibps: Option<f64>,
     pub encrypted: Option<bool>,
     pub kms_key_id: Option<String>,
@@ -226,6 +242,37 @@ impl FileSystem {
             availability_zone_id: self.availability_zone_id.clone(),
             tags: self.tags.clone(),
             file_system_protection: None,
+        }
+    }
+
+    /// This record as the modelled `FileSystemDescription`, in the per-operation shape
+    /// `UpdateFileSystem` answers with.
+    ///
+    /// The model binds `CreateFileSystem`, `DescribeFileSystems` and `UpdateFileSystem`
+    /// to the SAME `FileSystemDescription` output shape, but the generated types are
+    /// per operation, so this is a projection of [`Self::describe`] rather than a second
+    /// description: the two can never disagree.
+    pub fn describe_update(&self) -> UpdateFileSystemOutput {
+        let described = self.describe();
+        UpdateFileSystemOutput {
+            owner_id: described.owner_id,
+            creation_token: described.creation_token,
+            file_system_id: described.file_system_id,
+            file_system_arn: described.file_system_arn,
+            creation_time: described.creation_time,
+            life_cycle_state: described.life_cycle_state,
+            name: described.name,
+            number_of_mount_targets: described.number_of_mount_targets,
+            size_in_bytes: described.size_in_bytes,
+            performance_mode: described.performance_mode,
+            encrypted: described.encrypted,
+            kms_key_id: described.kms_key_id,
+            throughput_mode: described.throughput_mode,
+            provisioned_throughput_in_mibps: described.provisioned_throughput_in_mibps,
+            availability_zone_name: described.availability_zone_name,
+            availability_zone_id: described.availability_zone_id,
+            tags: described.tags,
+            file_system_protection: described.file_system_protection,
         }
     }
 }
@@ -378,11 +425,13 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
     }
 
     /// Materialise every lifecycle transition the clock has already made due: a
-    /// resource whose `creating` span has elapsed becomes `available`. Owed at the same
-    /// instant whether or not anybody called, so a reporting operation may apply it.
+    /// resource whose `creating` span has elapsed becomes `available`, as does a file
+    /// system whose `updating` span has. Owed at the same instant whether or not anybody
+    /// called, so a reporting operation may apply it.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
         for file_system in self.file_systems.values_mut() {
-            if file_system.life_cycle_state == LIFE_CYCLE_CREATING
+            if (file_system.life_cycle_state == LIFE_CYCLE_CREATING
+                || file_system.life_cycle_state == LIFE_CYCLE_UPDATING)
                 && file_system.available_at <= now
             {
                 file_system.life_cycle_state = LIFE_CYCLE_AVAILABLE.to_string();
