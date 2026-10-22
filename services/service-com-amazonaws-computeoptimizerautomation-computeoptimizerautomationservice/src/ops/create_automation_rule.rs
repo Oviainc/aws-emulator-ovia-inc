@@ -310,23 +310,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let rule_id = guard.mint_rule_id();
         let rule_arn = crate::state::rule_arn(&rule_id);
+        let created_at = crate::state::now();
         let stored = crate::state::StoredRule {
             rule_arn: rule_arn.clone(),
             rule_id,
             account_id,
             name: input.name,
-            description: input.description,
+            // Every member of a stored rule that the response shapes report is
+            // materialised here, so a create that named none of the optional
+            // ones still yields a rule every read path projects in full: a rule
+            // described by nothing is described by the empty string, a rule
+            // whose precedence was not named takes the service default, and a
+            // rule that has never been updated was last changed when it was
+            // created.
+            description: input
+                .description
+                .unwrap_or_else(|| crate::state::DEFAULT_RULE_DESCRIPTION.to_string()),
             rule_type: input.rule_type,
             rule_revision: crate::state::INITIAL_RULE_REVISION,
             organization_configuration: input.organization_configuration,
-            priority: input.priority,
+            priority: input
+                .priority
+                .unwrap_or_else(|| crate::state::DEFAULT_RULE_PRIORITY.to_string()),
             recommended_action_types: input.recommended_action_types,
             criteria: input.criteria,
             schedule: input.schedule,
             status: input.status,
             tags: input.tags.unwrap_or_default(),
-            created_timestamp: crate::state::now(),
-            last_updated_timestamp: None,
+            created_timestamp: created_at,
+            last_updated_timestamp: created_at,
         };
         guard.rules.insert(stored);
         guard.record_token(
@@ -356,11 +368,11 @@ fn output_for(rule: &crate::state::StoredRule) -> CreateAutomationRuleOutput {
         rule_arn: Some(rule.rule_arn.clone()),
         rule_id: Some(rule.rule_id.clone()),
         name: Some(rule.name.clone()),
-        description: rule.description.clone(),
+        description: Some(rule.description.clone()),
         rule_type: Some(rule.rule_type.clone()),
         rule_revision: Some(rule.rule_revision),
         organization_configuration: rule.organization_configuration.clone(),
-        priority: rule.priority.clone(),
+        priority: Some(rule.priority.clone()),
         recommended_action_types: Some(rule.recommended_action_types.clone()),
         criteria: rule.criteria.clone(),
         schedule: Some(rule.schedule.clone()),

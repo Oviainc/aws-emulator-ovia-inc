@@ -318,7 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rule.name = name;
         }
         if let Some(description) = input.description.clone() {
-            rule.description = Some(description);
+            rule.description = description;
         }
         if let Some(rule_type) = input.rule_type.clone() {
             rule.rule_type = rule_type;
@@ -327,7 +327,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rule.organization_configuration = Some(organization_configuration);
         }
         if let Some(priority) = input.priority.clone() {
-            rule.priority = Some(priority);
+            rule.priority = priority;
         }
         if let Some(recommended_action_types) = input.recommended_action_types.clone() {
             rule.recommended_action_types = recommended_action_types;
@@ -343,7 +343,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "The revision number ... is incremented each time the rule is updated."
         rule.rule_revision += 1;
-        rule.last_updated_timestamp = Some(updated_at);
+        rule.last_updated_timestamp = updated_at;
 
         guard.record_token(
             client_token,
@@ -369,16 +369,16 @@ fn output_for(rule: &crate::state::StoredRule) -> UpdateAutomationRuleOutput {
         rule_arn: Some(rule.rule_arn.clone()),
         rule_revision: Some(rule.rule_revision),
         name: Some(rule.name.clone()),
-        description: rule.description.clone(),
+        description: Some(rule.description.clone()),
         rule_type: Some(rule.rule_type.clone()),
         organization_configuration: rule.organization_configuration.clone(),
-        priority: rule.priority.clone(),
+        priority: Some(rule.priority.clone()),
         recommended_action_types: Some(rule.recommended_action_types.clone()),
         criteria: rule.criteria.clone(),
         schedule: Some(rule.schedule.clone()),
         status: Some(rule.status.clone()),
         created_timestamp: Some(rule.created_timestamp),
-        last_updated_timestamp: rule.last_updated_timestamp,
+        last_updated_timestamp: Some(rule.last_updated_timestamp),
     }
 }
 

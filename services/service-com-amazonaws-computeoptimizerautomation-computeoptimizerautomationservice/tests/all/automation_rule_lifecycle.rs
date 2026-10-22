@@ -434,9 +434,11 @@ async fn created_rules_round_trip_through_get() {
             member(&created, "createdTimestamp"),
             "case {case:?}: createdTimestamp is stable across reads, got {fetched}"
         );
-        assert!(
-            fetched.get("lastUpdatedTimestamp").is_none(),
-            "case {case:?}: a rule that was never updated has no lastUpdatedTimestamp: {fetched}"
+        assert_eq!(
+            member(&fetched, "lastUpdatedTimestamp"),
+            member(&fetched, "createdTimestamp"),
+            "case {case:?}: a rule that was never updated was last changed when it was created, \
+             got {fetched}"
         );
         // Tags are reported by Get whether or not the create carried any.
         if request.get("tags").is_none() {

@@ -274,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             for arn in arns {
                 if let Some(rule) = guard.rules.get_mut(&arn) {
                     rule.status = "Inactive".to_string();
-                    rule.last_updated_timestamp = Some(stored_at);
+                    rule.last_updated_timestamp = stored_at;
                 }
             }
         }

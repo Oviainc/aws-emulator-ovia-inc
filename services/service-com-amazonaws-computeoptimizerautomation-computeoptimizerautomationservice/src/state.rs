@@ -38,6 +38,28 @@ pub const INITIAL_RULE_REVISION: i64 = 1;
 /// `UpdateEnrollmentConfiguration` reports: it is not enrolled.
 pub const DEFAULT_ENROLLMENT_STATUS: &str = "Inactive";
 
+/// The `description` a rule created without one carries.
+///
+/// A rule's `description` is reported for every rule that exists — a create that
+/// supplied none leaves the rule described by nothing, which is the empty
+/// string, not an absent member. Stored at create time so every read path
+/// (`GetAutomationRule`, `ListAutomationRules`, `UpdateAutomationRule`) projects
+/// the same value out of the store.
+pub const DEFAULT_RULE_DESCRIPTION: &str = "";
+
+/// The `priority` a rule created without one carries.
+///
+/// `priority` is "a string representation of a decimal number between 0 and 1
+/// ... When multiple rules match the same recommended action, Compute Optimizer
+/// assigns the action to the rule with the lowest priority value (highest
+/// priority)" (`smithy_query(query="doc",shape="AutomationRule",member="priority")`),
+/// so every rule has a precedence whether or not the create named one.
+///
+/// CHOSEN value: neither the model nor the operation docs give the default. It is
+/// the TOP of the documented range, which is the LOWEST precedence, so a rule
+/// whose create named a priority always wins the tie against one that did not.
+pub const DEFAULT_RULE_PRIORITY: &str = "1";
+
 /// The page size `ListAutomationRules` uses when the caller sends no
 /// `maxResults`. The model bounds `maxResults` at `range(min: 1, max: 100)`, so
 /// the largest page a caller may ask for is also the default.
@@ -380,18 +402,25 @@ pub struct StoredRule {
     pub rule_id: String,
     pub account_id: String,
     pub name: String,
-    pub description: Option<String>,
+    /// Always a value: a create that supplied none stores
+    /// [`DEFAULT_RULE_DESCRIPTION`].
+    pub description: String,
     pub rule_type: String,
     pub rule_revision: i64,
     pub organization_configuration: Option<OrganizationConfiguration>,
-    pub priority: Option<String>,
+    /// Always a value: a create that supplied none stores
+    /// [`DEFAULT_RULE_PRIORITY`].
+    pub priority: String,
     pub recommended_action_types: Vec<String>,
     pub criteria: Option<Criteria>,
     pub schedule: Schedule,
     pub status: String,
     pub tags: Vec<Tag>,
     pub created_timestamp: ::aws_smithy_types::DateTime,
-    pub last_updated_timestamp: Option<::aws_smithy_types::DateTime>,
+    /// When this rule was last changed. Always a value: a rule that has never
+    /// been updated was last changed when it was created, so a create stores its
+    /// own creation instant here.
+    pub last_updated_timestamp: ::aws_smithy_types::DateTime,
 }
 
 impl StoredRule {
@@ -404,17 +433,17 @@ impl StoredRule {
             rule_arn: Some(self.rule_arn.clone()),
             rule_id: Some(self.rule_id.clone()),
             name: Some(self.name.clone()),
-            description: self.description.clone(),
+            description: Some(self.description.clone()),
             rule_type: Some(self.rule_type.clone()),
             rule_revision: Some(self.rule_revision),
             account_id: Some(self.account_id.clone()),
             organization_configuration: self.organization_configuration.clone(),
-            priority: self.priority.clone(),
+            priority: Some(self.priority.clone()),
             recommended_action_types: Some(self.recommended_action_types.clone()),
             schedule: Some(self.schedule.clone()),
             status: Some(self.status.clone()),
             created_timestamp: Some(self.created_timestamp),
-            last_updated_timestamp: self.last_updated_timestamp,
+            last_updated_timestamp: Some(self.last_updated_timestamp),
         }
     }
 }

@@ -23,5 +23,7 @@ mod error_payloads;
 mod recommended_actions;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/rule_projection.rs"]
+mod rule_projection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
