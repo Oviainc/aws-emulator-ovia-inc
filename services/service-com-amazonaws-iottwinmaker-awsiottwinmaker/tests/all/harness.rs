@@ -153,6 +153,35 @@ impl Emulator {
         self.call("DELETE", &format!("/workspaces/{workspace_id}"), None)
             .await
     }
+
+    /// `TagResource`: POST /tags with the ARN and the tag map in the body.
+    pub(crate) async fn tag_resource(&self, resource_arn: &str, tags: Value) -> Resp {
+        self.call(
+            "POST",
+            "/tags",
+            Some(json!({"resourceARN": resource_arn, "tags": tags})),
+        )
+        .await
+    }
+
+    /// `ListTagsForResource`: POST /tags-list, with any extra page members
+    /// (`maxResults`, `nextToken`) merged into the body.
+    pub(crate) async fn list_tags_for_resource(&self, resource_arn: &str, request: Value) -> Resp {
+        let mut body = request;
+        body["resourceARN"] = json!(resource_arn);
+        self.call("POST", "/tags-list", Some(body)).await
+    }
+
+    /// `UntagResource`: DELETE /tags, with the ARN and every key as repeated
+    /// `@httpQuery` parameters — the binding the model declares for them.
+    pub(crate) async fn untag_resource(&self, resource_arn: &str, tag_keys: &[&str]) -> Resp {
+        let mut query = format!("?resourceARN={}", encode_query(resource_arn));
+        for key in tag_keys {
+            query.push_str("&tagKeys=");
+            query.push_str(&encode_query(key));
+        }
+        self.call("DELETE", &format!("/tags{query}"), None).await
+    }
 }
 
 pub(crate) fn workspace_arn(workspace_id: &str) -> String {
@@ -161,6 +190,22 @@ pub(crate) fn workspace_arn(workspace_id: &str) -> String {
 
 pub(crate) fn entity_arn(workspace_id: &str, entity_id: &str) -> String {
     format!("arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}/entity/{entity_id}")
+}
+
+/// Percent-encode a value for use as a query-parameter value, the way an SDK
+/// does: everything outside RFC 3986's unreserved set is escaped, so a tag key
+/// carrying `:`, `/`, `=`, `+` or a space survives the round trip.
+pub(crate) fn encode_query(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
 }
 
 /// Percent-encode a value for use as a non-greedy `@httpLabel`, the way an SDK

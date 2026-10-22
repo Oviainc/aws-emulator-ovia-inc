@@ -65,6 +65,15 @@ pub const MAX_COMPONENTS_RETURNED: usize = 30;
 /// See [`MAX_COMPONENTS_RETURNED`].
 pub const MAX_PROPERTIES_RETURNED: usize = 800;
 
+/// The most tags one taggable resource of this service carries.
+///
+/// Taken from the model, not chosen here: `TagMap` is `@length(min: 0, max:
+/// 50)` (`smithy_query(query="shape",shape="TagMap")`), so fifty entries is the
+/// largest tag set any of this service's shapes can carry on a resource. A
+/// `TagResource` call that would leave a resource past it is refused with the
+/// `TooManyTagsException` (HTTP 400) that operation models.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// The most workspaces this emulator holds, and the most entities one workspace
 /// holds, before `CreateWorkspace` / `CreateEntity` answer the
 /// `ServiceQuotaExceededException` (HTTP 402) both operations model.
@@ -317,6 +326,68 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
             _ => None,
         }
     }
+
+    /// The stored tag map of the resource `resource_arn` names, or `None` when
+    /// this service holds no resource under that ARN.
+    ///
+    /// ONE resolution path for every taggable resource: the tags live on the
+    /// resource record itself (never in a second map beside it), and the ARN
+    /// index says which record an ARN points at, so a workspace and an entity
+    /// are reached the same way and a reader and a writer see one tag set.
+    pub fn tags_for_resource(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        match self.arn_index.get(resource_arn)? {
+            ResourceRef::Workspace { workspace_id } => {
+                Some(&self.workspaces.get(workspace_id)?.tags)
+            }
+            ResourceRef::Entity {
+                workspace_id,
+                entity_id,
+            } => Some(
+                &self
+                    .workspaces
+                    .get(workspace_id)?
+                    .entities
+                    .get(entity_id)?
+                    .tags,
+            ),
+        }
+    }
+
+    /// [`tags_for_resource`](Self::tags_for_resource), for a caller that writes.
+    pub fn tags_for_resource_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut BTreeMap<String, String>> {
+        // Cloned out of the index first: the index and the resource records are
+        // both fields of `self`, so holding a borrow of one would forbid the
+        // mutable borrow of the other.
+        let resource = self.arn_index.get(resource_arn)?.clone();
+        match resource {
+            ResourceRef::Workspace { workspace_id } => {
+                Some(&mut self.workspaces.get_mut(&workspace_id)?.tags)
+            }
+            ResourceRef::Entity {
+                workspace_id,
+                entity_id,
+            } => Some(
+                &mut self
+                    .workspaces
+                    .get_mut(&workspace_id)?
+                    .entities
+                    .get_mut(&entity_id)?
+                    .tags,
+            ),
+        }
+    }
+}
+
+/// The message for a resource no ARN in this service's index names.
+///
+/// Built from the request, naming the ARN that was looked for — the same
+/// construction as [`workspace_not_found_message`], one level up from an id to
+/// the ARN the tagging operations address a resource by.
+pub fn resource_not_found_message(resource_arn: &str) -> String {
+    format!("Resource {resource_arn} not found.")
 }
 
 /// The message for an entity the workspace the request named does not hold.

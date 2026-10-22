@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tag keys from the resource a `TwinMakerArn` names: a key the
+//! resource carries is dropped together with its value, and a key it does not
+//! carry is a no-op, so the call is IDEMPOTENT — repeating it leaves the same tag
+//! set and still answers 200. The keys come in as a repeated `tagKeys` query
+//! parameter, and the tags are the same set `TagResource` writes and
+//! `ListTagsForResource` reads.
+//!
+//! An ARN that names no stored resource is refused with `ResourceNotFoundException`
+//! (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -79,10 +80,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iottwinmaker-awsiottwin
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iottwinmaker#UntagResource")]
+// `InternalServerException` is widened in with `extra_errors`: this SERVICE models it
+// (every other operation of it declares it) but `UntagResource`'s own error list omits
+// it, and an unreachable shared store is a server fault this handler must be able to
+// report as one rather than as a client error it is not.
+#[smithy_macros::operation_error(
+    "com.amazonaws.iottwinmaker#UntagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -137,18 +146,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "UntagResource",
+            resource_arn = %input.resource_arn,
+            tag_key_count = input.tag_keys.len(),
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let resource_arn = input.resource_arn;
+        let Some(tags) = state.tags_for_resource_mut(&resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(&resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // A key the resource does not carry is removed vacuously rather than
+        // refused: untagging names the state to reach, so asking for a key that
+        // is already gone is the state the caller asked for.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }

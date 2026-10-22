@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the tags the resource a `TwinMakerArn` names carries — the same tag set
+//! `TagResource` writes and `UntagResource` removes from, read off the resource
+//! record the ARN index points at. A pure read: it never changes what a later
+//! caller sees.
+//!
+//! One page at a time, in tag-key order: `maxResults` entries (the documented
+//! default of 25 when the request names none, never more than
+//! [`crate::state::MAX_PAGE_SIZE`]), and a `nextToken` naming the key the next
+//! page resumes AT when entries are left over. An ARN that names no stored
+//! resource is refused with `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -86,10 +88,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iottwinmaker-awsiottwin
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iottwinmaker#ListTagsForResource")]
+// `InternalServerException` and `ValidationException` are widened in with
+// `extra_errors`: this SERVICE models both (every list operation of it declares them)
+// but `ListTagsForResource`'s own error list omits them, and this handler needs a
+// modelled server fault for an unreachable store and a modelled client refusal for a
+// page request the model's bounds cannot express (a `nextToken` this service did not
+// mint, a `maxResults` of zero).
+#[smithy_macros::operation_error(
+    "com.amazonaws.iottwinmaker#ListTagsForResource",
+    extra_errors = ["InternalServerException", "ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -144,18 +157,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and a page served is a read of tenant state.
+        ::tracing::info!(
+            operation = "ListTagsForResource",
+            resource_arn = %input.resource_arn,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        let invalid = |message: String| {
+            ListTagsForResourceErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        };
+
+        let resource_arn = &input.resource_arn;
+        let Some(tags) = state.tags_for_resource(resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` carries the tag key the page resumes AT (inclusive),
+        // not an offset, so a page boundary survives a tag being added or
+        // removed between two pages. It is bound to the resource it was minted
+        // for, so a token from another listing is refused rather than silently
+        // resumed.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                decode_next_token(token, resource_arn)
+                    .ok_or_else(|| invalid(format!("nextToken {token} is not a valid token")))?,
+            ),
+        };
+
+        // The page size served. `maxResults` documents a minimum of 1 and a
+        // default of 25, so an explicit zero is refused and a request that names
+        // none is served the documented default; whatever is asked for, the
+        // service serves at most `crate::state::MAX_PAGE_SIZE`.
+        let page_size = match input.max_results {
+            None => crate::state::DEFAULT_PAGE_SIZE,
+            Some(requested) if requested < 1 => {
+                return Err(invalid(
+                    "maxResults must be at least 1; omit it for the default of 25".to_string(),
+                )
+                .into())
+            }
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(crate::state::MAX_PAGE_SIZE)
+                .min(crate::state::MAX_PAGE_SIZE),
+        };
+
+        let mut remaining = tags.iter().skip_while(|(key, _)| {
+            resume_at
+                .as_deref()
+                .is_some_and(|from| key.as_str() < from)
+        });
+        let page: ::std::collections::HashMap<String, String> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        // The token the next call resumes at: the first tag this page left over.
+        let next_token = remaining
+            .next()
+            .map(|(key, _)| encode_next_token(resource_arn, key));
+
+        Ok(ListTagsForResourceOutput {
+            // Present, not omitted, for a resource carrying no tags: the member
+            // is how a caller reads the tag set, and an empty map says there is
+            // none where an absent member cannot be told from an unanswered read.
+            tags: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The envelope a `nextToken` of this listing carries, so a token minted
+/// elsewhere — for another resource, by another listing, or by hand — is
+/// recognisably not one of ours.
+const NEXT_TOKEN_PREFIX: &str = "iottwinmaker:tags:1:";
+
+/// The opaque `nextToken` for a page of `resource_arn`'s tags starting at
+/// `tag_key`.
+///
+/// Hex so the token is opaque to a caller and safe in a JSON body, over an
+/// envelope that names the listing it belongs to and the resume KEY rather than
+/// an offset.
+fn encode_next_token(resource_arn: &str, tag_key: &str) -> String {
+    ::hex::encode(format!("{NEXT_TOKEN_PREFIX}{resource_arn}\n{tag_key}"))
+}
+
+/// The tag key inside a `nextToken` minted for `resource_arn`, or `None` when
+/// the token is not one this listing minted for that resource.
+///
+/// The ARN and the key are separated by a newline, which the modelled
+/// `TwinMakerArn` and `TagKey` patterns both exclude, so the split cannot be
+/// confused by a value carrying the separator.
+fn decode_next_token(token: &str, resource_arn: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let body = decoded.strip_prefix(NEXT_TOKEN_PREFIX)?;
+    let (token_arn, tag_key) = body.split_once('\n')?;
+    (token_arn == resource_arn && !tag_key.is_empty()).then(|| tag_key.to_string())
 }
