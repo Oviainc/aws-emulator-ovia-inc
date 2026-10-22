@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GrantPermissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GrantPermissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GrantPermissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records one explicit grant in
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `permission_grants`,
+//! keyed by the (catalog, principal, resource, condition) tuple
+//! [`crate::state::grant_key`] renders — so granting again on the same resource to the
+//! same principal UNIONS the permissions into the one record it already has, and
+//! `ListPermissions` answers exactly one entry for it. `RevokePermissions` is what
+//! releases it.
+//!
+//! What this handler does NOT do: it does not check that the Data Catalog database or
+//! table named by `Resource` exists (the modelled `EntityNotFoundException`), because a
+//! Glue entity lives in another service's store; see the open issue
+//! `lakeformation-grantpermissions-stub` for that half.
 //!
 //! ## Shape of an operation
 //!
@@ -99,11 +103,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-lakeformation-awslakefo
 // here — hence the `GrantPermissionsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.lakeformation#GrantPermissions")]
+//
+// `InternalServiceException` is widened in through `extra_errors`: this SERVICE models it
+// ("An internal service error occurred", HTTP 500, and `ListPermissions` beside it
+// declares it) but this operation's own error list omits it, and it is the only honest
+// answer for "this service is mounted on an engine that holds no state" — a 400 would
+// blame the caller's request and a 501 would claim the operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.lakeformation#GrantPermissions",
+    extra_errors = ["InternalServiceException"]
+)]
 #[derive(Debug)]
 pub enum GrantPermissionsErrorModeled {
     ConcurrentModificationException(ConcurrentModificationException),
     EntityNotFoundException(EntityNotFoundException),
+    InternalServiceException(InternalServiceException),
     InvalidInputException(InvalidInputException),
 }
 
@@ -158,18 +172,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GrantPermissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GrantPermissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GrantPermissions"))
+        // The caller the audit record below attributes this state change to.
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GrantPermissionsErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        /// The modelled refusal for a request this handler will not record.
+        fn invalid(message: String) -> GrantPermissionsError {
+            GrantPermissionsErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_deref());
+
+        // `Principal` is modelled required, but its only member is not, so a request can
+        // still reach here naming no grantee.
+        let principal = input
+            .principal
+            .data_lake_principal_identifier
+            .as_deref()
+            .unwrap_or_default();
+        if principal.is_empty() {
+            return Err(invalid(
+                "Principal.DataLakePrincipalIdentifier must name a principal".to_string(),
+            ));
+        }
+
+        crate::state::validate_resource(&input.resource).map_err(invalid)?;
+
+        // `PermissionList` carries no length constraint, so the boundary validator admits
+        // an empty list. A grant of no permission at all would record a grantee with
+        // nothing granted, which no read could tell from no grant; refuse it instead.
+        let permissions = crate::state::dedup_values(&input.permissions);
+        let permissions_with_grant_option =
+            crate::state::dedup_values(input.permissions_with_grant_option.iter().flatten());
+        if permissions.is_empty() && permissions_with_grant_option.is_empty() {
+            return Err(invalid(
+                "Permissions must name at least one permission to grant".to_string(),
+            ));
+        }
+
+        let resource = crate::state::normalize_resource(&input.resource, &catalog_id);
+        let condition = input
+            .condition
+            .as_ref()
+            .and_then(|condition| condition.expression.clone())
+            .filter(|expression| !expression.is_empty());
+        let key = crate::state::grant_key(&catalog_id, principal, &resource, condition.as_deref());
+
+        let mut store = state.lock();
+        let outcome = match store.permission_grants.get_mut(&key) {
+            // The same principal, resource and condition: one record, whose permission
+            // sets grow by what this call adds. Granting the same permissions twice is
+            // therefore a no-op on state rather than a second entry.
+            Some(grant) => {
+                crate::state::merge_permissions(&mut grant.permissions, &permissions);
+                crate::state::merge_permissions(
+                    &mut grant.permissions_with_grant_option,
+                    &permissions_with_grant_option,
+                );
+                "updated"
+            }
+            None => {
+                // The single site that grows the grant store, so this is where its
+                // ceiling is enforced (see `crate::state::MAX_PERMISSION_GRANTS`).
+                if store.permission_grants.len() >= crate::state::MAX_PERMISSION_GRANTS {
+                    return Err(invalid(format!(
+                        "{} permission grants are already held, the maximum is {}",
+                        store.permission_grants.len(),
+                        crate::state::MAX_PERMISSION_GRANTS
+                    )));
+                }
+                store.permission_grants.insert(
+                    key,
+                    crate::state::PermissionGrant {
+                        catalog_id: catalog_id.clone(),
+                        principal: principal.to_string(),
+                        resource,
+                        permissions,
+                        permissions_with_grant_option,
+                        condition_expression: condition,
+                    },
+                );
+                "granted"
+            }
+        };
+
+        // The audit record for a state change: who, what, where, outcome. No secret and
+        // no credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        tracing::info!(
+            operation = "GrantPermissions",
+            akid = %akid,
+            catalog_id = %catalog_id,
+            principal = %principal,
+            outcome = outcome,
+            "Lake Formation permissions granted"
+        );
+
+        // `GrantPermissionsResponse` models no members: the proof of the grant is what
+        // `ListPermissions` reads back out of state.
+        Ok(GrantPermissionsOutput {})
     }
 }

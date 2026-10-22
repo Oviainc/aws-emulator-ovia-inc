@@ -24,6 +24,9 @@
 //! Rows differ along what the rules generalise over: the number of tags, the length and
 //! the character classes of the keys and values, the region the resource was created in,
 //! and which field of the ARN is wrong.
+//!
+//! The WRITE side of the same tag set — `TagResource` and `UntagResource` — is
+//! `resource_tag_writes.rs`.
 
 use std::sync::Arc;
 

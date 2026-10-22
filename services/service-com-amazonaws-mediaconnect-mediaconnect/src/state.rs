@@ -88,6 +88,54 @@ pub const MAX_FLOWS: usize = 5_000;
 /// describes as the error for "a semantic error" in the request.
 pub const MAX_FLOW_COLLECTION_ENTRIES: usize = 50;
 
+/// The most tags one resource carries, checked against the MERGED set a tag write would
+/// leave on the resource, so repeated tag writes cannot grow a resource's tag map past
+/// what a single create could set.
+///
+/// The number is [`MAX_FLOW_COLLECTION_ENTRIES`] — the bound CreateFlow applies to one
+/// request's `FlowTags`, and the tags-per-resource limit AWS applies service-wide — named
+/// once so the create side and the tagging side cannot drift apart. TagResource refuses
+/// past it with `BadRequestException`, which the model describes as the error for "a
+/// semantic error" in the request.
+pub const MAX_TAGS_PER_RESOURCE: usize = MAX_FLOW_COLLECTION_ENTRIES;
+
+/// The longest tag key this service stores: "Tag keys can have a maximum character length
+/// of 128 characters" (`smithy_query(query="doc",shape="TagResourceRequest",member="Tags")`).
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The longest tag value this service stores: "tag values can have a maximum length of 256
+/// characters" (same member doc as [`MAX_TAG_KEY_LENGTH`]).
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// Why `key` / `value` is not a tag pair this service stores, or `None` when it is.
+///
+/// The model declares `__mapOfString` without length bounds, so the boundary validator
+/// passes a pair the service itself would refuse: the lengths come from the member's own
+/// documentation ([`MAX_TAG_KEY_LENGTH`], [`MAX_TAG_VALUE_LENGTH`]) and a tag is addressed
+/// by its key, so an empty key names no tag. Both bounds count CHARACTERS, as the
+/// documentation does. Every operation that writes tags (CreateFlow's `FlowTags`,
+/// TagResource) refuses through this one function.
+pub fn tag_pair_rejection(key: &str, value: &str) -> Option<String> {
+    if key.is_empty() {
+        return Some("A tag key must not be empty.".to_string());
+    }
+    let key_length = key.chars().count();
+    let value_length = value.chars().count();
+    if key_length > MAX_TAG_KEY_LENGTH {
+        return Some(format!(
+            "Tag key {key:?} is {key_length} characters long; a tag key may have at most \
+             {MAX_TAG_KEY_LENGTH} characters."
+        ));
+    }
+    if value_length > MAX_TAG_VALUE_LENGTH {
+        return Some(format!(
+            "The value of tag {key:?} is {value_length} characters long; a tag value may have \
+             at most {MAX_TAG_VALUE_LENGTH} characters."
+        ));
+    }
+    None
+}
+
 /// The ceiling on how many outputs ONE FLOW holds, however many calls fill it: "You can
 /// create up to 50 outputs per flow"
 /// (`smithy_query(query="operation",operation="AddFlowOutputs")`), the one count AWS
@@ -265,10 +313,11 @@ pub struct StoredFlow {
     pub entitlements: Vec<Entitlement>,
     pub media_streams: Vec<MediaStream>,
     pub vpc_interfaces: Vec<VpcInterface>,
-    /// What CreateFlow's `FlowTags` put on the flow. No operation in this slice reports
-    /// tags back (`Flow` carries no tag member and the tagging operations are still
-    /// scaffolded), so this field is written and not yet read: it is here for
-    /// TagResource / ListTagsForResource to read when that slice lands.
+    /// The flow's tags: what CreateFlow's `FlowTags` put on it, as TagResource and
+    /// UntagResource have since changed it. ListTagsForResource reports this map, and
+    /// DeleteFlow drops it with the flow — "when a resource is deleted, the tags associated
+    /// with that resource are deleted as well". `Flow` itself carries no tag member, so no
+    /// flow response reports it.
     pub tags: BTreeMap<String, String>,
     /// When the flow was created. `Flow` models no creation timestamp either, so like
     /// [`StoredFlow::tags`] this is recorded now for the operations that will report it
@@ -386,6 +435,23 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     pub fn next_suffix(&mut self) -> u64 {
         self.next_arn_suffix += 1;
         self.next_arn_suffix
+    }
+
+    /// The tags of the resource `resource_arn` addresses, or `None` when this service
+    /// holds no such resource.
+    ///
+    /// A flow is the only resource this emulator persists — every other MediaConnect
+    /// create (bridge, gateway, router input/output, reservation) is still scaffolded — so
+    /// a tag call resolves its `ResourceArn` against the flow store, and any other ARN
+    /// addresses nothing that exists in the system.
+    pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        self.flows.get(resource_arn).map(|flow| &flow.tags)
+    }
+
+    /// The tags of the resource `resource_arn` addresses, for a tag write. See
+    /// [`ComAmazonawsMediaconnectMediaconnectState::tags_of`] for which ARNs resolve.
+    pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        self.flows.get_mut(resource_arn).map(|flow| &mut flow.tags)
     }
 
     /// Settle every flow whose status change the clock already made due.

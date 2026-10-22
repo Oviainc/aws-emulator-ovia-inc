@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPermissions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPermissions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPermissions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the explicit grants held in
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s `permission_grants`
+//! as `PrincipalResourcePermissions`, narrowed by the `Principal`, `Resource`,
+//! `ResourceType` and `CatalogId` filters and bounded by `MaxResults`, resuming from the
+//! grant key an opaque `NextToken` names. Reporting only — it writes nothing.
+//!
+//! Two things a client should know: only EXPLICIT grants are held, so no entry is
+//! synthesised for a permission that was never granted ("This operation returns only
+//! those permissions that have been explicitly granted"), and a listing with no matching
+//! grant answers an EMPTY `PrincipalResourcePermissions` list —
+//! `PrincipalResourcePermissionsList` carries no length constraint, so "no permissions"
+//! is a list of none rather than an absent member.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +174,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPermissions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPermissionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPermissions"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPermissionsErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        /// The modelled refusal for a request this handler cannot serve as asked.
+        fn invalid(message: String) -> ListPermissionsError {
+            ListPermissionsErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_deref());
+
+        // `IncludeRelated` is a `TrueFalseString`, which the model constrains only by
+        // length and character class, so the two values it admits are refused here
+        // rather than at the boundary. Absent is FALSE ("Default is FALSE").
+        let include_related = match input.include_related.as_deref() {
+            None => false,
+            Some(value) if value.eq_ignore_ascii_case("TRUE") => true,
+            Some(value) if value.eq_ignore_ascii_case("FALSE") => false,
+            Some(other) => {
+                return Err(invalid(format!(
+                    "IncludeRelated must be TRUE or FALSE, but was {other}"
+                )))
+            }
+        };
+
+        let principal_filter = input
+            .principal
+            .as_ref()
+            .and_then(|principal| principal.data_lake_principal_identifier.as_deref())
+            .filter(|identifier| !identifier.is_empty());
+
+        // "The Principal parameter must not be specified when requesting cell filter
+        // information." — `ListPermissions$IncludeRelated`.
+        if include_related && principal_filter.is_some() {
+            return Err(invalid(
+                "Principal must not be specified when IncludeRelated is TRUE".to_string(),
+            ));
+        }
+
+        // A filter is keyed exactly like a stored grant, so it is validated and
+        // normalised the same way: a `Resource` naming no member, or two, selects nothing
+        // and is a bad request rather than an empty page.
+        let resource_filter = match &input.resource {
+            Some(resource) => {
+                crate::state::validate_resource(resource).map_err(invalid)?;
+                Some(crate::state::normalize_resource(resource, &catalog_id))
+            }
+            None => None,
+        };
+
+        // `ResourceType` is the modelled `DataLakeResourceType` enum, so a value outside
+        // it is refused by the boundary validator before this handler runs.
+        let resource_type = input.resource_type.as_deref();
+
+        let start_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_permissions_page_token(token).ok_or_else(|| {
+                    invalid("NextToken is not a continuation token for ListPermissions".to_string())
+                })?,
+            ),
+            None => None,
+        };
+
+        // `MaxResults` is modelled `range 1..1000`, whose ceiling is also the page size
+        // when the caller names none (see `crate::state::MAX_PERMISSIONS_PAGE`).
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::MAX_PERMISSIONS_PAGE)
+            .clamp(1, crate::state::MAX_PERMISSIONS_PAGE) as usize;
+
+        let store = state.lock();
+        let mut selected: Vec<(&String, &crate::state::PermissionGrant)> = store
+            .permission_grants
+            .iter()
+            // "The identifier for the Data Catalog. By default, the account ID.": a
+            // listing reports the grants of the catalog it addresses.
+            .filter(|(_, grant)| grant.catalog_id == catalog_id)
+            // "Specifies a principal to filter the permissions returned."
+            .filter(|(_, grant)| principal_filter.is_none_or(|wanted| grant.principal == wanted))
+            // "Specifies a resource type to filter the permissions returned."
+            .filter(|(_, grant)| {
+                resource_type.is_none_or(|wanted| {
+                    crate::state::resource_types(&grant.resource).contains(&wanted)
+                })
+            })
+            // "A resource where you will get a list of the principal permissions."
+            .filter(|(_, grant)| {
+                resource_filter.as_ref().is_none_or(|filter| {
+                    crate::state::resource_filter_matches(filter, &grant.resource, include_related)
+                })
+            })
+            .filter(|(key, _)| {
+                start_after
+                    .as_deref()
+                    .is_none_or(|start| key.as_str() > start)
+            })
+            // One past the page: its presence is what says another page follows.
+            .take(page_size + 1)
+            .collect();
+
+        let has_more = selected.len() > page_size;
+        selected.truncate(page_size);
+
+        let next_token = if has_more {
+            selected
+                .last()
+                .map(|(key, _)| crate::state::encode_permissions_page_token(key))
+        } else {
+            None
+        };
+
+        let principal_resource_permissions: Vec<PrincipalResourcePermissions> =
+            selected.iter().map(|(_, grant)| grant.to_wire()).collect();
+
+        Ok(ListPermissionsOutput {
+            // `PrincipalResourcePermissionsList` carries no length constraint, so a
+            // listing that matches nothing answers the empty list a client can iterate,
+            // not an absent member.
+            principal_resource_permissions: Some(principal_resource_permissions),
+            next_token,
+        })
     }
 }

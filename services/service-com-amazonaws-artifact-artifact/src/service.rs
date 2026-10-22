@@ -293,11 +293,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// through the model-derived input schema, so nothing here is spelled out that the
     /// model already states.
     ///
-    /// The three tag operations are deliberately absent: their `resourceArn` is a
+    /// The three tag operations' `resourceArn` is deliberately not a [`Target`]: it is a
     /// `LongStringAttribute` the model gives no identifier syntax (any string without
-    /// `<>` is admissible), so there is no target the front door could judge
-    /// unauthorized without this service's state — and it persists no tagged resource
-    /// yet. `TagResource` is here for its `tags` BODY alone.
+    /// `<>` is admissible), so whether it names a resource at all is a question about
+    /// this service's STATE — which tag set the ARN addresses — and each tag handler
+    /// answers it with the same 401 through `crate::scaffolded::Scaffolded::unauthorized`.
+    /// `TagResource` is here for its `tags` BODY alone.
     fn front_door(
         &self,
         req: &aws_smithy_runtime_api::http::Request,

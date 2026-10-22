@@ -212,12 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(plan) = store.plans.get_mut(&input.id) else {
             return Err(
                 UpdateRescoreExecutionPlanErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Rescore execution plan {} was not found.",
-                            input.id
-                        )),
-                    },
+                    // The service's ONE not-found sentence (`crate::state::plan_not_found`),
+                    // the same one every other plan-lookup path states: it names the
+                    // resource class and never echoes the identifier it was asked for.
+                    crate::state::plan_not_found(),
                 )
                 .into(),
             );
