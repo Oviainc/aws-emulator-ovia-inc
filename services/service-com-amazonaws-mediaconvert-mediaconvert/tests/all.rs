@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_endpoints.rs"]
 mod account_endpoints;
+#[path = "all/error_envelope.rs"]
+mod error_envelope;
 #[path = "all/job_lifecycle.rs"]
 mod job_lifecycle;
 #[path = "all/job_template_crud.rs"]
