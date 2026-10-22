@@ -22,19 +22,47 @@ fn wait_for_the_clock() {
     std::thread::sleep(TRANSIENT_STATE_SPAN + Duration::from_millis(200));
 }
 
-/// `CreateInputSecurityGroup`, asserting the modelled 200 and returning the
-/// `SecurityGroup` it reports.
+/// `CreateInputSecurityGroup`, asserting the 201 the recorded wire response
+/// carries and returning the `SecurityGroup` it reports.
 async fn create_group(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
     let (status, response) = call(router, "POST", "/prod/inputSecurityGroups", Some(body)).await;
     assert_eq!(
-        status, 200,
-        "case {case:?}: CreateInputSecurityGroup: expected 200, got {status}: {response}"
+        status, 201,
+        "case {case:?}: CreateInputSecurityGroup: expected 201, got {status}: {response}"
     );
     response["securityGroup"].clone()
 }
 
 async fn describe_group(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("/prod/inputSecurityGroups/{id}"), None).await
+}
+
+/// `DeleteInputSecurityGroup` on one group, as a client calls it: DELETE on the
+/// group's own path (`smithy_query(query="operation",
+/// operation="DeleteInputSecurityGroup")`: DELETE
+/// /prod/inputSecurityGroups/{InputSecurityGroupId}).
+async fn delete_group(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+    call(
+        router,
+        "DELETE",
+        &format!("/prod/inputSecurityGroups/{id}"),
+        None,
+    )
+    .await
+}
+
+/// The `State` a group reports right now, read back through
+/// `DescribeInputSecurityGroup`.
+async fn state_of(router: &MultiServiceRouter, case: &str, id: &str) -> String {
+    let (status, described) = describe_group(router, id).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeInputSecurityGroup({id}): expected 200, got {status}: {described}"
+    );
+    described["state"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// `UpdateInputSecurityGroup` on one group, as a client calls it: PUT on the
@@ -1004,5 +1032,346 @@ async fn an_update_keeps_reporting_what_uses_the_group() {
         json!({ "phase": "released" }),
         "case \"the channel deleted\": expected the update's tags, got {:?}",
         updated["securityGroup"]["tags"]
+    );
+}
+
+/// Rule: a MediaLive operation that mints a new resource answers HTTP 201
+/// Created; every other operation answers the status its model declares.
+///
+/// The expected status of each row is the one the model declares for that
+/// operation (`smithy_query(query="operation", operation="…")`) — except
+/// `CreateInputSecurityGroup`, where the model says 200 and the recorded wire
+/// response says 201, and the wire is the authority. The rows span the service's
+/// implemented resource creates, because the rule is about minting a resource
+/// rather than about any one of them.
+#[tokio::test]
+async fn a_resource_create_answers_the_status_the_wire_carries() {
+    // (case, URI, request body, expected status, where that status comes from)
+    let table: [(&str, &str, Value, u16, &str); 4] = [
+        (
+            "input security group",
+            "/prod/inputSecurityGroups",
+            json!({ "whitelistRules": [{ "cidr": "10.0.0.0/8" }] }),
+            201,
+            "the recorded wire response (the model's 200 is stale)",
+        ),
+        (
+            "channel",
+            "/prod/channels",
+            json!({ "name": "created" }),
+            201,
+            "the model's declared code",
+        ),
+        (
+            "input",
+            "/prod/inputs",
+            json!({ "name": "created", "type": "URL_PULL" }),
+            201,
+            "the model's declared code",
+        ),
+        (
+            // The model declares 200 for this one too, and mainline's own fix
+            // put it at 201 on the same recorded-wire evidence.
+            "sdi source",
+            "/prod/sdiSources",
+            json!({ "name": "created", "type": "SINGLE" }),
+            201,
+            "the recorded wire response (the model's 200 is stale)",
+        ),
+    ];
+
+    for (case, uri, body, expected, source) in table {
+        let router = medialive();
+        let (status, response) = call(&router, "POST", uri, Some(body)).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected {expected} from {source}, got {status}: {response}"
+        );
+    }
+}
+
+/// Rule: a MediaLive delete answers with the resource's own representation, read
+/// out of the store and never assembled from the request, and the state the
+/// delete writes is what every read AFTER the call reports. A group has no
+/// transient deletion state of its own (`InputSecurityGroupState`: IDLE | IN_USE
+/// | UPDATING | DELETED), so `DeleteInputSecurityGroup` answers with the state
+/// the group's USERS imply — `IDLE` while nothing references it, `IN_USE` while
+/// something does, for a group this call deletes and for one an earlier call
+/// already deleted — while `DescribeInputSecurityGroup` reports the terminal
+/// `DELETED` from the delete onwards: a client polling for the terminal state
+/// sees it, and one that treats `IDLE` as "available" cannot attach a deleted
+/// group. The delete is idempotent and touches no other group.
+///
+/// The rows differ along what the rule generalises over: how many whitelist
+/// rules the group carries, whether it has tags, and WHAT CURRENTLY USES IT —
+/// nothing (so the group was `IDLE`), an input or a channel (so it was `IN_USE`)
+/// — because the terminal state takes precedence over the state derived from
+/// the group's users on a read, and the derived one is what the delete reports.
+#[tokio::test]
+async fn a_deleted_group_reaches_the_terminal_deleted_state() {
+    // Every member `DescribeInputSecurityGroupResponse` declares
+    // (`smithy_query(query="operation", operation="DescribeInputSecurityGroup")`),
+    // as the wire names them.
+    const ALWAYS_REPORTED: [&str; 7] = [
+        "arn",
+        "id",
+        "inputs",
+        "state",
+        "tags",
+        "whitelistRules",
+        "channels",
+    ];
+
+    // (case, the group's create body, what references it before the delete,
+    //  the state it reports before the delete)
+    let table: [(&str, Value, Option<&str>, &str); 5] = [
+        ("no rules, nothing uses it", json!({}), None, "IDLE"),
+        (
+            "one rule, nothing uses it",
+            json!({ "whitelistRules": [{ "cidr": "192.0.2.1/32" }] }),
+            None,
+            "IDLE",
+        ),
+        (
+            "several rules and tags, nothing uses it",
+            json!({
+                "whitelistRules": [{ "cidr": "0.0.0.0/0" }, { "cidr": "10.0.0.0/8" }],
+                "tags": { "env": "test" },
+            }),
+            None,
+            "IDLE",
+        ),
+        (
+            "an input uses it",
+            json!({ "whitelistRules": [{ "cidr": "198.51.100.0/24" }] }),
+            Some("input"),
+            "IN_USE",
+        ),
+        (
+            "a channel uses it",
+            json!({ "whitelistRules": [{ "cidr": "203.0.113.0/24" }] }),
+            Some("channel"),
+            "IN_USE",
+        ),
+    ];
+
+    for (case, create_with, referenced_by, state_before) in table {
+        let router = medialive();
+        // A second group nothing deletes, so the suite can tell one group's
+        // deletion from a store-wide change.
+        let bystander = create_group(
+            &router,
+            case,
+            json!({ "whitelistRules": [{ "cidr": "10.255.0.0/16" }] }),
+        )
+        .await;
+        let bystander_id = bystander["id"].as_str().unwrap_or_default().to_string();
+
+        let created = create_group(&router, case, create_with).await;
+        let id = created["id"].as_str().unwrap_or_default().to_string();
+
+        match referenced_by {
+            Some("input") => {
+                let (status, body) = call(
+                    &router,
+                    "POST",
+                    "/prod/inputs",
+                    Some(json!({
+                        "name": "uses-the-group",
+                        "type": "URL_PULL",
+                        "inputSecurityGroups": [id.clone()],
+                    })),
+                )
+                .await;
+                assert_eq!(
+                    status, 201,
+                    "case {case:?}: CreateInput: expected 201, got {status}: {body}"
+                );
+            }
+            Some("channel") => {
+                let (status, body) = call(
+                    &router,
+                    "POST",
+                    "/prod/channels",
+                    Some(json!({
+                        "name": "uses-the-group",
+                        "channelSecurityGroups": [id.clone()],
+                    })),
+                )
+                .await;
+                assert_eq!(
+                    status, 201,
+                    "case {case:?}: CreateChannel: expected 201, got {status}: {body}"
+                );
+            }
+            _ => {}
+        }
+
+        assert_eq!(
+            state_of(&router, case, &id).await,
+            state_before,
+            "case {case:?}: expected the group to report {state_before:?} before the delete"
+        );
+        let (_, before) = describe_group(&router, &id).await;
+
+        let (status, deleted) = delete_group(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteInputSecurityGroup: expected 200, got {status}: {deleted}"
+        );
+
+        // The body is the group, not an empty object, and its state is the one its
+        // users imply — the delete's own effect is what every later read reports.
+        assert!(
+            deleted.as_object().is_some_and(|members| !members.is_empty()),
+            "case {case:?}: expected the group's representation, got {deleted}"
+        );
+        assert_eq!(
+            deleted["state"],
+            json!(state_before),
+            "case {case:?}: expected the delete to report the state its users imply, got {:?}",
+            deleted["state"]
+        );
+        for member in ALWAYS_REPORTED {
+            assert!(
+                !deleted[member].is_null(),
+                "case {case:?}: expected the delete to report {member}, got {deleted}"
+            );
+            assert_eq!(
+                deleted[member], before[member],
+                "case {case:?}: expected the delete's {member} to be the group's own {:?}, got {:?}",
+                before[member], deleted[member]
+            );
+        }
+
+        // The terminal state is reported straight away: a deleted group owes the
+        // clock nothing.
+        assert_eq!(
+            state_of(&router, case, &id).await,
+            "DELETED",
+            "case {case:?}: expected the deleted group to report the terminal DELETED"
+        );
+
+        // The record stays in the account: everything it stored still reads back.
+        let (status, described) = describe_group(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the deleted group to stay readable, got {status}: {described}"
+        );
+        for member in ["arn", "id", "whitelistRules", "tags"] {
+            assert_eq!(
+                described[member], created[member],
+                "case {case:?}: expected the deleted group to keep its {member} {:?}, got {:?}",
+                created[member], described[member]
+            );
+        }
+
+        // Idempotent: a repeated delete neither fails nor revives the group, and
+        // answers with the same group and the same user-derived state.
+        let (status, again) = delete_group(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a repeated delete to succeed, got {status}: {again}"
+        );
+        assert_eq!(
+            again["state"],
+            json!(state_before),
+            "case {case:?}: expected a repeated delete to report the users' state too, got {:?}",
+            again["state"]
+        );
+        assert_eq!(
+            again["id"], deleted["id"],
+            "case {case:?}: expected a repeated delete to report the same group, got {:?}",
+            again["id"]
+        );
+        assert_eq!(
+            state_of(&router, case, &id).await,
+            "DELETED",
+            "case {case:?}: expected a repeated delete to leave the group DELETED"
+        );
+
+        // The group nothing deleted is untouched.
+        assert_eq!(
+            state_of(&router, case, &bystander_id).await,
+            "IDLE",
+            "case {case:?}: expected the group nothing deleted to stay IDLE"
+        );
+        let (_, other) = describe_group(&router, &bystander_id).await;
+        assert_eq!(
+            other["whitelistRules"],
+            whitelist(&["10.255.0.0/16"]),
+            "case {case:?}: expected the untouched group to keep its own rule, got {:?}",
+            other["whitelistRules"]
+        );
+    }
+}
+
+/// Rule: `DeleteInputSecurityGroup` on an id no group has answers the
+/// operation's modelled `NotFoundException` (404) and deletes nothing.
+///
+/// The table spans the kinds of id that name no group, including a channel's and
+/// an input's — the id spaces are separate, so neither is a group's id.
+#[tokio::test]
+async fn deleting_an_id_no_group_has_is_not_found() {
+    let router = medialive();
+    let (status, channel) = call(
+        &router,
+        "POST",
+        "/prod/channels",
+        Some(json!({ "name": "not-a-security-group" })),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateChannel: expected 201, got {status}: {channel}");
+    let channel_id = channel["channel"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (status, created_input) = call(
+        &router,
+        "POST",
+        "/prod/inputs",
+        Some(json!({ "name": "also-not-a-security-group", "type": "URL_PULL" })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "CreateInput: expected 201, got {status}: {created_input}"
+    );
+    let input_id = created_input["input"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // One group exists, so the refusals are about the id and not about an empty
+    // store.
+    let real = create_group(&router, "a real group", json!({})).await;
+    let real_id = real["id"].as_str().unwrap_or_default().to_string();
+
+    // (case, the id to delete)
+    let table: [(&str, String); 5] = [
+        ("zero", "0".to_string()),
+        ("a numeric id never minted", "9999999".to_string()),
+        ("a non-numeric id", "not-an-id".to_string()),
+        ("a channel's id", channel_id),
+        ("an input's id", input_id),
+    ];
+
+    for (case, id) in table {
+        let (status, body) = delete_group(&router, &id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(status, &body),
+            "NotFoundException",
+            "case {case:?}: expected NotFoundException, got {body}"
+        );
+    }
+
+    // The group that does exist was deleted by none of those refusals.
+    assert_eq!(
+        state_of(&router, "the group no refused delete named", &real_id).await,
+        "IDLE",
+        "expected the real group to be untouched by the refused deletes"
     );
 }

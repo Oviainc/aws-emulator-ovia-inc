@@ -144,6 +144,9 @@ const REFUSAL_CODES: &[(&str, Option<&str>, Option<&str>)] = &[
         None,
         Some("InvalidDeploymentStatusException"),
     ),
+    ("sortBy", None, Some("InvalidSortByException")),
+    ("sortOrder", None, Some("InvalidSortOrderException")),
+    ("deployed", None, Some("InvalidDeployedStateFilterException")),
 ];
 
 /// The code [`EmulatedService::override_refusal`] answers for `member` failing

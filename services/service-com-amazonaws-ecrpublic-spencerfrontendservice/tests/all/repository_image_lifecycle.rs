@@ -1480,7 +1480,6 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
     // The remaining operations are filed as their own gap issues; a stub must answer 501
     // `NotImplemented`, never an empty 200 that a client cannot tell from a real answer.
     for (operation, body) in [
-        ("GetAuthorizationToken", json!({})),
         (
             "DescribeImageTags",
             json!({"repositoryName": "team/app"}),

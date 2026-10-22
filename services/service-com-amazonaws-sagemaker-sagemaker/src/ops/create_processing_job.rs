@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProcessingJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProcessingJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: registers a processing job in `crate::state` under its
+//! `ProcessingJobName`, minting the `ProcessingJobArn` from the request's region, after
+//! refusing the request shapes the model's prose rules out and applying the defaults it
+//! documents. The job is accepted in `InProgress`; the move out of it is owed by the
+//! clock (`crate::state::ProcessingJob::settle_status`) and materialised by
+//! `DescribeProcessingJob`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProcessingJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The job's container image is NOT run: this emulator has no container runtime, so the
+//! run ends in the modelled `Failed` status with
+//! `crate::state::NO_CONTAINER_RUNTIME_REASON`; see that constant for why nothing else
+//! would be honest. Everything around the run — accepting, validating, minting the ARN,
+//! replaying the job — is real.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +182,292 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProcessingJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProcessingJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProcessingJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The rules the model states in prose rather than in a constraint trait, so the
+        // centralized validation walk cannot have refused them already.
+        validate_processing_inputs(input.processing_inputs.as_deref())?;
+        validate_output_config(input.processing_output_config.as_ref())?;
+        let processing_resources = resolve_resources(&input.processing_resources)?;
+
+        let region = crate::state::request_region(ctx);
+        let arn =
+            crate::state::resource_arn(&region, "processing-job", &input.processing_job_name);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // `ProcessingJobName`'s doc: "The name must be unique within an Amazon Web
+        // Services Region in the Amazon Web Services account." A name already in use is
+        // refused with the modelled `ResourceInUse`, never overwritten: otherwise the
+        // caller reads a 200 for a job it did not create and loses the one it did. Checked
+        // before the store's bound, so the per-name rule answers the same whatever the
+        // store holds.
+        if store.processing_jobs.contains_key(&input.processing_job_name) {
+            return Err(CreateProcessingJobErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "Processing job names must be unique within an Amazon Web Services \
+                     account and Region, and \"{}\" already exists.",
+                    input.processing_job_name
+                )),
+            })
+            .into());
+        }
+        // The store is bounded, so a caller varying `ProcessingJobName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.processing_jobs_below_quota() {
+            return Err(CreateProcessingJobErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for processing jobs is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::PROCESSING_JOB_QUOTA,
+                        store.processing_jobs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.processing_jobs.insert(
+            input.processing_job_name.clone(),
+            crate::state::ProcessingJob {
+                name: input.processing_job_name.clone(),
+                arn: arn.clone(),
+                role_arn: input.role_arn,
+                app_specification: input.app_specification,
+                processing_inputs: input.processing_inputs,
+                processing_output_config: input.processing_output_config,
+                processing_resources,
+                stopping_condition: input.stopping_condition,
+                environment: input.environment,
+                network_config: input.network_config,
+                experiment_config: input.experiment_config,
+                tags: input.tags.unwrap_or_default(),
+                // AWS returns an accepted processing job in `InProgress`, so the move out
+                // of it is owed by the clock rather than taken on this call.
+                status: crate::state::PROCESSING_STATUS_IN_PROGRESS.to_string(),
+                failure_reason: None,
+                creation_time: now,
+                last_modified_time: now,
+                processing_end_time: None,
+                ends_at: now + crate::state::PROCESSING_JOB_ENDS_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateProcessingJobOutput { processing_job_arn: arn })
     }
+}
+
+/// The directory a SageMaker-managed input must be mounted under, from
+/// `ProcessingS3Input$LocalPath`'s doc: "`LocalPath` is an absolute path to the input
+/// data and must begin with `/opt/ml/processing/`."
+const MANAGED_INPUT_LOCAL_PATH_PREFIX: &str = "/opt/ml/processing/";
+
+/// `ProcessingS3CompressionType` value that only `Pipe` input mode accepts, from
+/// `ProcessingS3Input$S3CompressionType`'s doc: "`Gzip` can only be used when `Pipe`
+/// mode is specified as the `S3InputMode`."
+const COMPRESSION_TYPE_GZIP: &str = "Gzip";
+/// See [`COMPRESSION_TYPE_GZIP`]: the one `ProcessingS3InputMode` that accepts it.
+const INPUT_MODE_PIPE: &str = "Pipe";
+
+/// A 400 `ValidationException` naming the member and the constraint it broke.
+fn refuse(message: impl Into<String>) -> CreateProcessingJobError {
+    crate::scaffolded::Scaffolded::validation(message.into())
+}
+
+/// Refuse an input list that breaks one of `ProcessingInput`'s documented rules.
+///
+/// * `ProcessingInput`: "The processing input must specify exactly one of either
+///   `S3Input` or `DatasetDefinition` types."
+/// * `ProcessingS3Input$LocalPath`: "an absolute path to the input data [that] must begin
+///   with `/opt/ml/processing/`. `LocalPath` is a required parameter when `AppManaged` is
+///   `False` (default)."
+/// * `ProcessingS3Input$S3CompressionType`: "`Gzip` can only be used when `Pipe` mode is
+///   specified as the `S3InputMode`."
+fn validate_processing_inputs(
+    inputs: Option<&[ProcessingInput]>,
+) -> Result<(), CreateProcessingJobError> {
+    for input in inputs.unwrap_or_default() {
+        let name = &input.input_name;
+        match (&input.s3_input, &input.dataset_definition) {
+            (Some(_), Some(_)) => {
+                return Err(refuse(format!(
+                    "ProcessingInputs[{name}] must specify exactly one of S3Input or \
+                     DatasetDefinition, but both were given."
+                )));
+            }
+            (None, None) => {
+                return Err(refuse(format!(
+                    "ProcessingInputs[{name}] must specify exactly one of S3Input or \
+                     DatasetDefinition, but neither was given."
+                )));
+            }
+            _ => {}
+        }
+
+        let Some(s3_input) = &input.s3_input else {
+            continue;
+        };
+        // SageMaker manages the download unless the application does, and the path it
+        // downloads to is only meaningful under the directory it mounts.
+        if !input.app_managed.unwrap_or(false) {
+            match &s3_input.local_path {
+                None => {
+                    return Err(refuse(format!(
+                        "ProcessingInputs[{name}].S3Input.LocalPath is required when \
+                         AppManaged is false."
+                    )));
+                }
+                Some(local_path) if !local_path.starts_with(MANAGED_INPUT_LOCAL_PATH_PREFIX) => {
+                    return Err(refuse(format!(
+                        "ProcessingInputs[{name}].S3Input.LocalPath must begin with \
+                         {MANAGED_INPUT_LOCAL_PATH_PREFIX}, but was \"{local_path}\"."
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+
+        if s3_input.s3_compression_type.as_deref() == Some(COMPRESSION_TYPE_GZIP)
+            && s3_input.s3_input_mode.as_deref() != Some(INPUT_MODE_PIPE)
+        {
+            return Err(refuse(format!(
+                "ProcessingInputs[{name}].S3Input.S3CompressionType {COMPRESSION_TYPE_GZIP} \
+                 requires S3InputMode {INPUT_MODE_PIPE}."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an output configuration that breaks one of `ProcessingOutput`'s documented
+/// rules.
+///
+/// * `ProcessingOutput`: "The processing output must specify exactly one of either
+///   `S3Output` or `FeatureStoreOutput` types."
+/// * `ProcessingOutput$FeatureStoreOutput`: "This processing output type is only
+///   supported when `AppManaged` is specified."
+fn validate_output_config(
+    config: Option<&ProcessingOutputConfig>,
+) -> Result<(), CreateProcessingJobError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    for output in &config.outputs {
+        let name = &output.output_name;
+        match (&output.s3_output, &output.feature_store_output) {
+            (Some(_), Some(_)) => {
+                return Err(refuse(format!(
+                    "ProcessingOutputConfig.Outputs[{name}] must specify exactly one of \
+                     S3Output or FeatureStoreOutput, but both were given."
+                )));
+            }
+            (None, None) => {
+                return Err(refuse(format!(
+                    "ProcessingOutputConfig.Outputs[{name}] must specify exactly one of \
+                     S3Output or FeatureStoreOutput, but neither was given."
+                )));
+            }
+            _ => {}
+        }
+        if output.feature_store_output.is_some() && !output.app_managed.unwrap_or(false) {
+            return Err(refuse(format!(
+                "ProcessingOutputConfig.Outputs[{name}].FeatureStoreOutput is supported \
+                 only when AppManaged is true."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The cluster configuration the job runs with: the request's, with the documented
+/// default applied and the instance type selected when the request named preferences.
+///
+/// * `ProcessingClusterConfig$InstanceType`: "`InstancePreferences` is mutually exclusive
+///   with `InstanceType`."
+/// * `ProcessingClusterConfig$SelectedInstanceType` / `$SelectedInstanceCount`: "This
+///   field is read-only and isn't accepted in `CreateProcessingJob` requests", and is
+///   "Returned by `DescribeProcessingJob` after an instance type is selected" — SageMaker
+///   "launches the job on the first instance type in the list that has available
+///   capacity", and this emulator constrains no capacity, so the first preference is the
+///   one selected.
+/// * `ProcessingInstancePreference$InstanceCount`: "either all five specify
+///   `InstanceCount` or none of them do. Amazon SageMaker rejects requests that set
+///   `InstanceCount` on only some preferences, that set it both per preference and in
+///   `ProcessingClusterConfig`, or that omit it in both places."
+/// * `ProcessingClusterConfig$InstanceCount`: "The default value is 1."
+fn resolve_resources(
+    requested: &ProcessingResources,
+) -> Result<ProcessingResources, CreateProcessingJobError> {
+    let mut cluster = requested.cluster_config.clone();
+
+    if cluster.selected_instance_type.is_some() || cluster.selected_instance_count.is_some() {
+        return Err(refuse(
+            "ProcessingResources.ClusterConfig.SelectedInstanceType and \
+             SelectedInstanceCount are read-only and are not accepted in a \
+             CreateProcessingJob request.",
+        ));
+    }
+
+    let preferences = cluster.instance_preferences.clone().unwrap_or_default();
+    if preferences.is_empty() {
+        // One instance type, so the job runs the requested count, or the documented
+        // default when the request named none.
+        cluster.instance_count = Some(
+            cluster
+                .instance_count
+                .unwrap_or(crate::state::DEFAULT_PROCESSING_INSTANCE_COUNT),
+        );
+        return Ok(ProcessingResources { cluster_config: cluster });
+    }
+
+    if cluster.instance_type.is_some() {
+        return Err(refuse(
+            "ProcessingResources.ClusterConfig.InstancePreferences is mutually exclusive \
+             with InstanceType.",
+        ));
+    }
+
+    let per_preference = preferences
+        .iter()
+        .filter(|preference| preference.instance_count.is_some())
+        .count();
+    if per_preference != 0 && per_preference != preferences.len() {
+        return Err(refuse(format!(
+            "ProcessingResources.ClusterConfig.InstancePreferences must set InstanceCount \
+             on every preference or on none of them, but {per_preference} of {} set it.",
+            preferences.len()
+        )));
+    }
+    match (per_preference, cluster.instance_count) {
+        (0, None) => {
+            return Err(refuse(
+                "ProcessingResources.ClusterConfig requires InstanceCount either on every \
+                 InstancePreferences entry or on the cluster configuration, but it was \
+                 omitted in both places.",
+            ));
+        }
+        (count, Some(_)) if count != 0 => {
+            return Err(refuse(
+                "ProcessingResources.ClusterConfig.InstanceCount must not be set both per \
+                 InstancePreferences entry and on the cluster configuration.",
+            ));
+        }
+        _ => {}
+    }
+
+    // Exactly one instance type is selected for the job, and with no capacity to run
+    // short of, it is the first preference.
+    let selected = &preferences[0];
+    cluster.selected_instance_type = Some(selected.instance_type.clone());
+    cluster.selected_instance_count = Some(
+        selected
+            .instance_count
+            .or(cluster.instance_count)
+            .unwrap_or(crate::state::DEFAULT_PROCESSING_INSTANCE_COUNT),
+    );
+    Ok(ProcessingResources { cluster_config: cluster })
 }

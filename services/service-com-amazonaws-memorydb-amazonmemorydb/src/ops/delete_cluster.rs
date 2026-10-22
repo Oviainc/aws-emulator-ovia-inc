@@ -196,10 +196,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(mut cluster) = state.clusters.remove(&input.cluster_name) else {
+        // A cluster name is a case-insensitive identifier, so the name this request
+        // deletes is folded exactly as the store is keyed.
+        let cluster_name = crate::state::fold_name(&input.cluster_name);
+        let Some(mut cluster) = state.clusters.remove(&cluster_name) else {
             return Err(DeleteClusterErrorModeled::ClusterNotFoundFault(
                 ClusterNotFoundFault {
-                    message: Some(format!("Cluster {} not found.", input.cluster_name)),
+                    message: Some(format!("Cluster {cluster_name} not found.")),
                 },
             )
             .into());

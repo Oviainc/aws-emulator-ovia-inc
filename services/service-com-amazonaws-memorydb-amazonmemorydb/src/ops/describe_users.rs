@@ -72,6 +72,10 @@
 //!
 //! * `InvalidParameterCombinationException` (HTTP 400) — The specified parameter combination
 //!   is not valid.
+//! * `InvalidParameterValueException` (HTTP 400) — The specified parameter value is not
+//!   valid. Widened in through `extra_errors` (see below): the service answers an
+//!   out-of-window `MaxResults` or a `NextToken` naming no position with it, and the
+//!   model's `errors` list for this operation omits it.
 //! * `UserNotFoundFault` (HTTP 404) — The specified user does not exist.
 
 #[allow(unused_imports)]
@@ -97,12 +101,17 @@ const FILTER_ACL_NAME: &str = "ACLName";
 /// exactly what the response reports.
 fn matches_filters(user: &StoredUser, acl_names: &[String], filters: &[Filter]) -> bool {
     filters.iter().all(|filter| {
-        filter.values.iter().any(|value| match filter.name.as_str() {
-            FILTER_USER_NAME => user.name == *value,
-            FILTER_ACL_NAME => acl_names.iter().any(|acl_name| acl_name == value),
-            // Unreachable: a filter naming any other property is refused before the
-            // listing is built, so no unknown name can silently match everything.
-            _ => false,
+        filter.values.iter().any(|value| {
+            // A filter value names a resource, and a MemoryDB resource name is a
+            // case-insensitive identifier, so it is folded the way the store is keyed.
+            let value = crate::state::fold_name(value);
+            match filter.name.as_str() {
+                FILTER_USER_NAME => user.name == value,
+                FILTER_ACL_NAME => acl_names.contains(&value),
+                // Unreachable: a filter naming any other property is refused before the
+                // listing is built, so no unknown name can silently match everything.
+                _ => false,
+            }
         })
     })
 }
@@ -118,10 +127,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-memorydb-amazonmemorydb
 // here — hence the `DescribeUsersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.memorydb#DescribeUsers")]
+//
+// `InvalidParameterValueException` — the shape this SERVICE models for a member whose
+// VALUE it cannot serve, and the error every other listing in this service answers a
+// bad page size with — is widened in through `extra_errors`: the model's own `errors`
+// list for this operation omits it, while the service refuses an out-of-window
+// `MaxResults` with exactly it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.memorydb#DescribeUsers",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum DescribeUsersErrorModeled {
     InvalidParameterCombinationException(InvalidParameterCombinationException),
+    InvalidParameterValueException(InvalidParameterValueException),
     UserNotFoundFault(UserNotFoundFault),
 }
 
@@ -184,13 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
-        if input.max_results.is_some_and(|max| max < 1) {
-            // The same refusal the other listings in this slice make for a page size
-            // below 1; this operation models no `InvalidParameterValueException`, so
-            // the framework's 400 `ValidationException` carries it.
-            return Err(crate::scaffolded::Scaffolded::validation(
-                "MaxResults must be at least 1.",
-            ));
+        if let Some(message) = crate::state::max_results_rejection(input.max_results) {
+            // A page size outside the window names no page: refused with the service's
+            // own modelled invalid-value error, the same one every other listing in
+            // this service answers with, rather than a generic validation failure.
+            return Err(DescribeUsersErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
         let filters = input.filters.unwrap_or_default();
         if let Some(unknown) = filters
@@ -214,21 +236,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
+        // A user name is a case-insensitive identifier, so the name this request asks
+        // about is folded exactly as the store is keyed — the mixed-case spelling finds
+        // the resource the lower-case one created.
+        let user_name = input.user_name.as_deref().map(crate::state::fold_name);
         let mut state = state.lock();
         // The writes a describe makes, neither of them asked for by this caller: the
-        // status transitions the clock already owed at this instant, and the users the
-        // account ALREADY HAD before any call (MemoryDB's built-in `default` user),
-        // which this store materialises on first touch because the engine hands every
-        // service an empty one.
+        // status transitions the clock already owed at this instant, and the resources
+        // the account ALREADY HAD before any call (MemoryDB's built-in `default` user
+        // and `open-access` ACL), which this store materialises on first touch because
+        // the engine hands every service an empty one.
         state.settle(std::time::Instant::now());
-        state.ensure_builtin_users(&region);
+        state.ensure_builtins(&region);
 
-        if input
-            .user_name
+        if user_name
             .as_deref()
             .is_some_and(|name| !state.users.contains_key(name))
         {
-            let name = input.user_name.unwrap_or_default();
+            let name = user_name.unwrap_or_default();
             return Err(DescribeUsersErrorModeled::UserNotFoundFault(UserNotFoundFault {
                 message: Some(format!("User {name} not found.")),
             })
@@ -240,11 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut membership = state.user_membership();
         let mut entries: Vec<(String, User)> = Vec::new();
         for user in state.users.values() {
-            if input
-                .user_name
-                .as_deref()
-                .is_some_and(|name| user.name != name)
-            {
+            if user_name.as_deref().is_some_and(|name| user.name != name) {
                 continue;
             }
             let acl_names = membership.remove(user.name.as_str()).unwrap_or_default();
@@ -260,9 +281,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.next_token.as_deref(),
         )
         .ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation(
-                "NextToken does not name a position in this listing.",
-            )
+            // A token that names no position in this listing was never minted for it:
+            // reported with the service's own modelled invalid-value error rather than
+            // served as a silently empty page.
+            DescribeUsersError::from(DescribeUsersErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(
+                        "NextToken does not name a position in this listing.".to_string(),
+                    ),
+                },
+            ))
         })?;
         Ok(DescribeUsersOutput {
             users: Some(users),

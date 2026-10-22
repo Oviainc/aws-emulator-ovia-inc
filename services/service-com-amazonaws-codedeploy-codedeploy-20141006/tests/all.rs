@@ -19,6 +19,8 @@ mod git_hub_account_token_names;
 mod github_account_tokens;
 #[path = "all/on_premises_instances.rs"]
 mod on_premises_instances;
+#[path = "all/on_premises_revisions_and_blue_green.rs"]
+mod on_premises_revisions_and_blue_green;
 #[path = "all/on_premises_tagging.rs"]
 mod on_premises_tagging;
 #[path = "all/state_roundtrip.rs"]

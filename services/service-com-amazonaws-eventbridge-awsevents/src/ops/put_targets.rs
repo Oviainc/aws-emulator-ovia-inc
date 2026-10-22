@@ -243,9 +243,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let failed_entry_count = i32::try_from(failed_entries.len()).unwrap_or(i32::MAX);
+        // The per-entry report is a member this call COMPUTED, so it is always
+        // serialized — an empty list when every entry landed. A `@length(min: 1)`
+        // on the list shape constrains what a request may send, not what a
+        // response reports, so "no failures" is `[]` and never an absent member:
+        // a client iterating `FailedEntries` must not have to tell an empty
+        // result from an unsupported one.
         Ok(PutTargetsOutput {
             failed_entry_count,
-            failed_entries: (!failed_entries.is_empty()).then_some(failed_entries),
+            failed_entries: Some(failed_entries),
         })
     }
 }

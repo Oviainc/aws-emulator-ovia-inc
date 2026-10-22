@@ -4,10 +4,12 @@
 //!
 //! The provisioned-cluster registry lives here, together with the renderings the
 //! reporting operations derive from it: `DescribeCluster` / `ListClusters` build a
-//! [`ClusterInfo`] with [`Cluster::to_cluster_info`], and `GetBootstrapBrokers`
-//! builds its endpoint strings with [`Cluster::broker_endpoints`] plus the access
-//! predicates beside it. Keeping them next to the record is what makes the two
-//! readers agree: they render the same stored cluster the same way.
+//! [`ClusterInfo`] with [`Cluster::to_cluster_info`], `DescribeClusterV2` /
+//! `ListClustersV2` build the v2 `Cluster` with [`Cluster::to_cluster_v2`], and
+//! `GetBootstrapBrokers` builds its endpoint strings with
+//! [`Cluster::broker_endpoints`] plus the access predicates beside it. Keeping them
+//! next to the record is what makes the readers agree: they render the same stored
+//! cluster the same way.
 //!
 //! A cluster's configuration also changes after creation: an update operation
 //! (`UpdateConnectivity`) records a [`PendingUpdate`] on the cluster, and

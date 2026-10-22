@@ -1118,13 +1118,14 @@ async fn targets_upsert_by_id_and_page_in_insertion_order() {
     .await;
     assert_eq!(status, 200, "PutRule answered {status} {body}");
 
-    // A rule with no targets yet reports none, not an empty list: `TargetList`
-    // is modelled `length 1..100`.
+    // A rule with no targets yet reports an EMPTY list, not an absent member:
+    // the listing's result is a member the call computed either way.
     let (status, body) = call(&emulator, "ListTargetsByRule", &json!({ "Rule": rule })).await;
     assert_eq!(status, 200, "ListTargetsByRule answered {status} {body}");
-    assert!(
-        body.get("Targets").is_none_or(Value::is_null),
-        "a rule with no targets reports no Targets member, got {body}"
+    assert_eq!(
+        body["Targets"],
+        json!([]),
+        "a rule with no targets reports Targets [], got {body}"
     );
 
     let (status, body) = call(

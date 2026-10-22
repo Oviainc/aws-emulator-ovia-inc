@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterOnPremisesInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterOnPremisesInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Retires an on-premises instance's registration, recording when it was retired.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterOnPremisesInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterOnPremisesInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterOnPremisesInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterOnPremisesInstance"))
+        let _ = ctx;
+        // `instanceName` is @required but carries NO modelled length or pattern
+        // (`smithy_query(query="shape",shape="InstanceName")`), so the name's
+        // form is decided here, by the same shared rule the registering and
+        // reporting operations use.
+        let name = input.instance_name;
+        match crate::state::check_instance_name(&name) {
+            Ok(()) => {}
+            Err(crate::state::NameRefusal::Missing) => {
+                return Err(
+                    DeregisterOnPremisesInstanceErrorModeled::InstanceNameRequiredException(
+                        InstanceNameRequiredException {
+                            message: Some(
+                                "An on-premises instance name was not specified".to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::NameRefusal::Malformed) => {
+                return Err(
+                    DeregisterOnPremisesInstanceErrorModeled::InvalidInstanceNameException(
+                        InvalidInstanceNameException {
+                            message: Some(format!(
+                                "The on-premises instance name {name} was specified in an invalid \
+                                 format"
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        }
+        // This operation models NO "not registered" error, so deregistering a
+        // name that holds no registration is not a failure: it is already in the
+        // state the caller asked for, and the call is idempotent.
+        crate::state::with_state(&*self.engine, |state| {
+            let now_ms = crate::state::now_ms();
+            // The IAM ARN the instance held backs no registered instance any
+            // more, so it is free for another registration. Released BEFORE the
+            // record is retired, while the record still names it.
+            if state
+                .on_premises_instances
+                .get(&name)
+                .is_some_and(crate::state::OnPremisesInstance::is_registered)
+            {
+                state.release_iam_arns_of(&name);
+            }
+            if let Some(instance) = state.on_premises_instances.get_mut(&name) {
+                // Retiring the record rather than dropping it is what lets
+                // `InstanceInfo.deregisterTime` and the `Deregistered`
+                // registration-status filter report on it afterwards. A record
+                // already retired keeps the instant it was retired at.
+                instance.deregister_time_ms = instance.deregister_time_ms.or(Some(now_ms));
+            }
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(DeregisterOnPremisesInstanceOutput)
     }
 }

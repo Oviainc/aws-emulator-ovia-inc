@@ -37,21 +37,24 @@ const PAST_TRANSITION: Duration = Duration::from_millis(750);
 
 /// One wire answer, reduced to what a client branches on: the status, and every
 /// text node in the XML body keyed by its element path.
+///
+/// `pub(crate)` because the other suites of this test target read their answers
+/// through it rather than keeping a second copy of the reader.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    body: String,
-    nodes: Vec<(String, String)>,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: String,
+    pub(crate) nodes: Vec<(String, String)>,
 }
 
 impl Reply {
     /// The first text node whose element path ends in `suffix`.
-    fn text(&self, suffix: &str) -> Option<&str> {
+    pub(crate) fn text(&self, suffix: &str) -> Option<&str> {
         self.all(suffix).into_iter().next()
     }
 
     /// Every text node whose element path ends in `suffix`, in document order.
-    fn all(&self, suffix: &str) -> Vec<&str> {
+    pub(crate) fn all(&self, suffix: &str) -> Vec<&str> {
         self.nodes
             .iter()
             .filter(|(path, _)| path == suffix || path.ends_with(&format!("/{suffix}")))
@@ -61,13 +64,13 @@ impl Reply {
 
     /// The `awsQuery` error code (`<ErrorResponse><Error><Code>`), or the empty
     /// string on a success.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.text("Error/Code").unwrap_or_default()
     }
 
     /// The pagination `Marker` a describe answered with, if any. `Marker` is the
     /// only element of that name in either describe's output.
-    fn marker(&self) -> Option<&str> {
+    pub(crate) fn marker(&self) -> Option<&str> {
         self.text("Marker")
     }
 }
@@ -146,12 +149,14 @@ fn form_encode(value: &str) -> String {
 
 /// An emulator with just this service mounted on a fresh engine, driven
 /// in-process through the production router.
-struct Emulator {
+///
+/// `pub(crate)` for the same reason as [`Reply`]: one harness per test target.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not what these tests are about; the router still routes
@@ -163,7 +168,12 @@ impl Emulator {
     }
 
     /// Send one `awsQuery` call: `Action`, `Version` and the given form pairs.
-    async fn call_in(&self, region: &str, action: &str, params: &[(String, String)]) -> Reply {
+    pub(crate) async fn call_in(
+        &self,
+        region: &str,
+        action: &str,
+        params: &[(String, String)],
+    ) -> Reply {
         let mut body = format!("Action={action}&Version={API_VERSION}");
         for (key, value) in params {
             body.push('&');
@@ -200,7 +210,7 @@ impl Emulator {
         }
     }
 
-    async fn call(&self, action: &str, params: &[(String, String)]) -> Reply {
+    pub(crate) async fn call(&self, action: &str, params: &[(String, String)]) -> Reply {
         self.call_in(REGION, action, params).await
     }
 }
@@ -225,7 +235,7 @@ type PlacementCase = (
 );
 
 /// `[("A", "b")]` as the owned pairs [`Emulator::call`] takes.
-fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))

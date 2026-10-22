@@ -17,7 +17,7 @@
 //! It also holds the access-entry slice, as part of the cluster record rather than
 //! beside it: an access entry belongs to exactly one cluster, so
 //! [`ClusterRecord::access_entries`] is where `CreateAccessEntry` writes and
-//! `DescribeAccessEntry`, `AssociateAccessPolicy` and
+//! `DescribeAccessEntry`, `ListAccessEntries`, `AssociateAccessPolicy` and
 //! `ListAssociatedAccessPolicies` read — and deleting the cluster takes its access
 //! entries with it, without a second map to keep in step.
 //!
@@ -1640,8 +1640,9 @@ fn digest_hex(seed: &str) -> String {
 }
 
 /// 16 bytes rendered in the hyphenated `8-4-4-4-12` lowercase-hex layout a UUID
-/// takes. The one renderer for both of this service's UUID-shaped identifiers
-/// ([`new_update_id`] and [`derive_activation_id`]).
+/// takes. The one renderer for every one of this service's UUID-shaped
+/// identifiers ([`new_update_id`], [`derive_activation_id`] and
+/// [`derive_access_entry_id`]).
 fn hyphenate_uuid(bytes: &[u8; 16]) -> String {
     let hex = hex::encode(bytes);
     format!(
@@ -1850,6 +1851,9 @@ pub const ACCESS_POLICIES_LISTING: &str = "access-policies";
 /// The scope `DescribeClusterVersions`'s tokens carry, over the calendar rows'
 /// [`ClusterVersionRecord::page_key`]s. See [`CLUSTERS_LISTING`].
 pub const CLUSTER_VERSIONS_LISTING: &str = "cluster-versions";
+/// The scope `ListAccessEntries`'s tokens carry, over one cluster's principal
+/// ARNs. See [`CLUSTERS_LISTING`].
+pub const ACCESS_ENTRIES_LISTING: &str = "access-entries";
 /// The scope `ListAssociatedAccessPolicies`'s tokens carry, over one access
 /// entry's associated policy ARNs. See [`CLUSTERS_LISTING`].
 pub const ASSOCIATED_ACCESS_POLICIES_LISTING: &str = "associated-access-policies";

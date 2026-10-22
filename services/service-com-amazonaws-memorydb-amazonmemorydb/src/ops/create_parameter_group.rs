@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateParameterGroup
-//! IMPLEMENTED: inserts the parameter group into [`crate::state`] keyed by
-//! `ParameterGroupName` and answers with the stored record, so `DescribeParameterGroups`
-//! reports exactly what was persisted.
+//! IMPLEMENTED: inserts the parameter group into [`crate::state`] keyed by its FOLDED
+//! `ParameterGroupName` (a MemoryDB resource name is a case-insensitive identifier,
+//! refused outright when it breaks the service's name rule) and answers with the stored
+//! record — including the default `Description` the service gives a group created
+//! without one — so `DescribeParameterGroups` reports exactly what was persisted.
 //!
 //! ## Shape of an operation
 //!
@@ -163,6 +165,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let region = crate::state::request_region(ctx);
+        // A parameter-group name is the same case-insensitive identifier a user or ACL
+        // name is, bounded by the same rule, so it is checked and folded before
+        // anything is persisted.
+        if let Some(message) =
+            crate::state::resource_name_rejection("ParameterGroupName", &input.parameter_group_name)
+        {
+            return Err(
+                CreateParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         // The request's tag keys are refused before the group is created: `Tag$Key` may
         // not be null, and the `aws:` prefix is reserved for AWS.
         if let Some(message) = crate::state::tags_rejection(input.tags.as_ref()) {
@@ -175,18 +192,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        let parameter_group_name = crate::state::fold_name(&input.parameter_group_name);
         let mut state = state.lock();
         // Besides this create's own insert, the only write: the status transitions the
         // clock already owed the stored clusters and ACLs at this instant.
         state.settle(std::time::Instant::now());
 
-        if state.parameter_groups.contains_key(&input.parameter_group_name) {
+        if state.parameter_groups.contains_key(&parameter_group_name) {
             return Err(
                 CreateParameterGroupErrorModeled::ParameterGroupAlreadyExistsFault(
                     ParameterGroupAlreadyExistsFault {
                         message: Some(format!(
-                            "Parameter group with name {} already exists.",
-                            input.parameter_group_name
+                            "Parameter group with name {parameter_group_name} already exists."
                         )),
                     },
                 )
@@ -208,13 +225,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let arn = crate::state::parameter_group_arn(&region, &input.parameter_group_name);
+        let arn = crate::state::parameter_group_arn(&region, &parameter_group_name);
         let group = crate::state::StoredParameterGroup {
-            name: input.parameter_group_name.clone(),
-            // `Family` is recorded as the caller gave it: the model publishes no
-            // catalog of families, so there is nothing here to resolve it against.
-            family: input.family,
-            description: input.description,
+            name: parameter_group_name.clone(),
+            // `Family` is recorded as the caller gave it, folded like every other name
+            // in this store: the model publishes no catalog of families, so there is
+            // nothing here to resolve it against.
+            family: crate::state::fold_name(&input.family),
+            // A group created without a description gets the service's own default
+            // rather than no description at all, so the create and every later describe
+            // report the member.
+            description: input
+                .description
+                .unwrap_or_else(|| crate::state::DEFAULT_PARAMETER_GROUP_DESCRIPTION.to_string()),
             arn: arn.clone(),
             // A fresh group overrides nothing: every parameter it reports is its
             // family's engine default until an `UpdateParameterGroup` changes one.
@@ -228,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let response = group.to_api();
         state
             .parameter_groups
-            .insert(input.parameter_group_name, group);
+            .insert(parameter_group_name, group);
         Ok(CreateParameterGroupOutput {
             parameter_group: Some(response),
         })
