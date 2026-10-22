@@ -113,16 +113,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The aggregation periods this service offers, as seconds, from the operation's own
-/// doc: "Aggregated profiles are available with aggregation periods of 5 minutes, 1
-/// hour, and 1 day, aligned to UTC" — the same three values the model's
-/// `AggregationPeriod` enum declares (PT5M, PT1H, P1D).
-const AGGREGATION_PERIODS: &[(&str, f64)] = &[
-    ("PT5M", 5.0 * 60.0),
-    ("PT1H", 60.0 * 60.0),
-    ("P1D", 24.0 * 60.0 * 60.0),
-];
-
 /// The time window a `GetProfile` request selects over, as (start, end) bounds either
 /// of which may be open.
 ///
@@ -143,21 +133,16 @@ fn requested_window(
 > {
     let period_seconds = match input.period.as_deref() {
         None => None,
+        // The aggregation periods this service offers live in `crate::state`, so
+        // `GetProfile` and `ListProfileTimes` read the same table, and both enumerate
+        // them in a refusal from the generated `AGGREGATION_PERIOD_VALUES`.
         Some(period) => Some(
-            AGGREGATION_PERIODS
-                .iter()
-                .find(|(name, _)| *name == period)
-                .map(|(_, seconds)| *seconds)
-                .ok_or_else(|| {
-                    crate::scaffolded::Scaffolded::validation(format!(
-                        "period must be one of {}, got {period}",
-                        AGGREGATION_PERIODS
-                            .iter()
-                            .map(|(name, _)| *name)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ))
-                })?,
+            crate::state::aggregation_period_seconds(period).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(format!(
+                    "period must be one of {}, got {period}",
+                    AGGREGATION_PERIOD_VALUES.join(", ")
+                ))
+            })?,
         ),
     };
 
@@ -165,21 +150,20 @@ fn requested_window(
         (Some(_), Some(_), Some(_)) => Err(crate::scaffolded::Scaffolded::validation(
             "specify 1 or 2 of startTime, endTime and period, not all 3",
         )),
-        (Some(start), None, Some(seconds)) => Ok((
-            Some(start),
-            Some(::aws_smithy_types::DateTime::from_secs_f64(
-                start.as_secs_f64() + seconds,
-            )),
-        )),
-        (None, Some(end), Some(seconds)) => Ok((
-            Some(::aws_smithy_types::DateTime::from_secs_f64(
-                end.as_secs_f64() - seconds,
-            )),
-            Some(end),
-        )),
+        (Some(start), None, Some(seconds)) => Ok((Some(start), Some(shifted(start, seconds)))),
+        (None, Some(end), Some(seconds)) => Ok((Some(shifted(end, -seconds)), Some(end))),
         // `period` alone (and no bound at all) selects the latest profile.
         (start, end, _) => Ok((start, end)),
     }
+}
+
+/// `at` moved by a whole number of seconds, keeping its sub-second part exactly — the
+/// aggregation periods are whole seconds, so a window bound needs no `f64` round trip.
+fn shifted(at: ::aws_smithy_types::DateTime, seconds: i64) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        at.secs().saturating_add(seconds),
+        at.subsec_nanos(),
+    )
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
