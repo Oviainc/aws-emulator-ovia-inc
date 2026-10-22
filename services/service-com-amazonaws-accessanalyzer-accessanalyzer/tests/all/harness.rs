@@ -17,6 +17,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region the tests sign for; it is the region every expected ARN carries.
 pub const REGION: &str = "us-east-1";
 
+/// The SigV4 access key id the tests sign with unless a suite names another; it is the
+/// identity a handler reports or records for the call.
+pub const ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
 /// One response, reduced to what the assertions read.
 #[derive(Debug)]
 pub struct Reply {
@@ -53,6 +57,21 @@ impl Emulator {
     }
 
     pub async fn send(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+        self.send_as(ACCESS_KEY_ID, method, path, body).await
+    }
+
+    /// The same call, signed with a named access key id.
+    ///
+    /// A suite that asserts on what a handler reports or records about the CALLER needs
+    /// its own identity, so its records can be told apart from the ones a sibling suite
+    /// writes in parallel.
+    pub async fn send_as(
+        &self,
+        access_key_id: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Reply {
         let payload = match body {
             Some(value) => serde_json::to_vec(&value).expect("the request body serializes"),
             None => Vec::new(),
@@ -66,7 +85,7 @@ impl Emulator {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/access-analyzer/aws4_request, SignedHeaders=host, Signature=0000"
+                    "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/access-analyzer/aws4_request, SignedHeaders=host, Signature=0000"
                 ),
             )
             .header("content-type", "application/json")
