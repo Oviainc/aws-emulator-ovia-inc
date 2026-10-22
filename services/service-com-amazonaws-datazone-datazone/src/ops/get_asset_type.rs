@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAssetType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAssetType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAssetType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the asset type `CreateAssetType` stored in the domain, addressed by its NAME
+//! (`AssetTypeIdentifier`). A REPORTING operation: it writes nothing but the domain
+//! lifecycle transitions the clock already owed (`crate::state::settle_clock`).
+//!
+//! Prerequisite from the model's own documentation: "The asset type with identifier must
+//! exist in the domain. ResourceNotFoundException." — so an unknown domain, an unknown
+//! type, or a `revision` the stored type is not at is refused with 404.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +174,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAssetType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAssetTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAssetType"))
+        let _ = ctx;
+        use crate::state::{date_time, now_ms};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAssetTypeErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        let asset_type = store
+            .live_domain(&input.domain_identifier)
+            .ok_or_else(|| {
+                GetAssetTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Domain {} was not found", input.domain_identifier),
+                })
+            })?
+            .asset_types
+            .get(&input.identifier)
+            .ok_or_else(|| {
+                GetAssetTypeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!("Asset type {} was not found", input.identifier),
+                })
+            })?;
+        // `revision` selects WHICH revision to report; the only one stored is the one the
+        // type was created at, so any other revision names a resource that is not there.
+        if let Some(requested) = input.revision.as_deref() {
+            if requested != asset_type.revision {
+                return Err(GetAssetTypeErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Asset type {} revision {requested} was not found",
+                            input.identifier
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        Ok(GetAssetTypeOutput {
+            domain_id: asset_type.domain_id.clone(),
+            name: asset_type.name.clone(),
+            revision: asset_type.revision.clone(),
+            description: asset_type.description.clone(),
+            forms_output: asset_type
+                .forms
+                .iter()
+                .map(|(form_name, form)| {
+                    (
+                        form_name.clone(),
+                        FormEntryOutput {
+                            type_name: form.type_name.clone(),
+                            type_revision: form.type_revision.clone(),
+                            required: form.required,
+                        },
+                    )
+                })
+                .collect(),
+            owning_project_id: asset_type.owning_project_id.clone(),
+            // The stored type was created in this domain and project, so it has no other
+            // domain or project it originated in.
+            origin_domain_id: None,
+            origin_project_id: None,
+            created_at: Some(date_time(asset_type.created_at_ms)),
+            created_by: Some(asset_type.created_by.clone()),
+            updated_at: Some(date_time(asset_type.updated_at_ms)),
+            updated_by: Some(asset_type.updated_by.clone()),
+        })
     }
 }

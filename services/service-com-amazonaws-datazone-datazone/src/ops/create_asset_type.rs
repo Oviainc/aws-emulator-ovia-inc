@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAssetType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAssetType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAssetType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a custom asset type under a PERSISTED, available domain and stores it there,
+//! so `GetAssetType` answers from the stored record and the type disappears with its
+//! domain.
+//!
+//! The documented prerequisites (`smithy_query(query="doc",shape="CreateAssetType")`)
+//! are what this handler enforces: the domain and the owning project must be valid and
+//! active, and the type's name must be unique within the domain — a duplicate name is
+//! refused with the `ConflictException` the operation models. The operation models NO
+//! `ResourceNotFoundException`, so an unknown domain or project is refused with
+//! `ValidationException`, naming the member that does not resolve.
+//!
+//! `createdBy`/`updatedBy` are the CALLER's principal (derived from the request's SigV4
+//! scope), never anything the request body carries, and a freshly created type carries
+//! revision `crate::state::FIRST_REVISION`. `originDomainId`/`originProjectId` report
+//! where a type was ORIGINALLY created, which for a type created here is this domain's
+//! own create call, so they stay absent (no cross-domain association is served).
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +187,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAssetType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAssetTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAssetType"))
+        use crate::state::{
+            caller_principal, date_time, now_ms, AssetType, AssetTypeForm,
+            DOMAIN_STATUS_AVAILABLE, FIRST_REVISION, PROJECT_STATUS_ACTIVE,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAssetTypeErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // Prerequisite: "The domain-identifier and owning-project-identifier must be
+        // valid and active." This operation models no `ResourceNotFoundException`, so an
+        // identifier that resolves to nothing fails the input constraints instead.
+        let domain = store
+            .domains
+            .get(&input.domain_identifier)
+            .ok_or_else(|| {
+                CreateAssetTypeErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "domainIdentifier {} does not identify a domain",
+                        input.domain_identifier
+                    ),
+                })
+            })?;
+        if domain.status != DOMAIN_STATUS_AVAILABLE {
+            return Err(CreateAssetTypeErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Domain {} is {}, so it cannot accept an asset type",
+                    input.domain_identifier, domain.status
+                ),
+            })
+            .into());
+        }
+        let project_status = domain
+            .projects
+            .get(&input.owning_project_identifier)
+            .map(|project| project.project_status.clone())
+            .ok_or_else(|| {
+                CreateAssetTypeErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "owningProjectIdentifier {} does not identify a project in domain {}",
+                        input.owning_project_identifier, input.domain_identifier
+                    ),
+                })
+            })?;
+        if project_status != PROJECT_STATUS_ACTIVE {
+            return Err(CreateAssetTypeErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Project {} is {project_status}, so it cannot own an asset type",
+                    input.owning_project_identifier
+                ),
+            })
+            .into());
+        }
+        // Prerequisite: "The name of the asset type must be unique within the domain —
+        // duplicate names will cause failure." The stored name is the identifier a later
+        // read addresses the type by, so a second type of that name would hide the first.
+        if domain.asset_types.contains_key(&input.name) {
+            return Err(CreateAssetTypeErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Asset type {} already exists in domain {}",
+                    input.name, input.domain_identifier
+                ),
+            })
+            .into());
+        }
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit; the refusal is the error the operation already models.
+        if domain.asset_types.len() >= crate::state::MAX_ASSET_TYPES_PER_DOMAIN {
+            return Err(CreateAssetTypeErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {} asset types in one domain",
+                        crate::state::MAX_ASSET_TYPES_PER_DOMAIN
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let principal = caller_principal(ctx);
+        let asset_type = AssetType {
+            name: input.name,
+            domain_id: input.domain_identifier.clone(),
+            // No update operation is modelled for an asset type, so the revision a
+            // created type carries is the first one.
+            revision: FIRST_REVISION.to_string(),
+            description: input.description,
+            forms: input
+                .forms_input
+                .into_iter()
+                .map(|(form_name, entry)| {
+                    (
+                        form_name,
+                        AssetTypeForm {
+                            type_name: form_type_name(&entry.type_identifier).to_string(),
+                            type_revision: entry.type_revision,
+                            required: entry.required,
+                        },
+                    )
+                })
+                .collect(),
+            owning_project_id: input.owning_project_identifier,
+            created_at_ms: now,
+            created_by: principal.clone(),
+            updated_at_ms: now,
+            updated_by: principal,
+        };
+
+        let output = CreateAssetTypeOutput {
+            domain_id: asset_type.domain_id.clone(),
+            name: asset_type.name.clone(),
+            revision: asset_type.revision.clone(),
+            description: asset_type.description.clone(),
+            forms_output: asset_type
+                .forms
+                .iter()
+                .map(|(form_name, form)| {
+                    (
+                        form_name.clone(),
+                        FormEntryOutput {
+                            type_name: form.type_name.clone(),
+                            type_revision: form.type_revision.clone(),
+                            required: form.required,
+                        },
+                    )
+                })
+                .collect(),
+            owning_project_id: Some(asset_type.owning_project_id.clone()),
+            // The type was created HERE, so there is no other domain or project it
+            // originated in.
+            origin_domain_id: None,
+            origin_project_id: None,
+            created_at: Some(date_time(asset_type.created_at_ms)),
+            created_by: Some(asset_type.created_by.clone()),
+            updated_at: Some(date_time(asset_type.updated_at_ms)),
+            updated_by: Some(asset_type.updated_by.clone()),
+        };
+
+        // The checks above proved the domain is there; store the asset type under it.
+        if let Some(domain) = store.domains.get_mut(&input.domain_identifier) {
+            domain
+                .asset_types
+                .insert(asset_type.name.clone(), asset_type);
+        }
+        Ok(output)
+    }
+}
+
+/// The form type NAME a form entry's `typeIdentifier` resolves to.
+///
+/// A DataZone form type is addressed by its name: `FormTypeIdentifier` (len 1..385,
+/// pattern `^(?!\.)[\w\.]*\w$`) carries that name, while `FormEntryOutput`'s `typeName`
+/// is a `FormTypeName` (len 1..128, pattern
+/// `^(amazon.datazone.)?(?![0-9_])\w+$|^_\w*[a-zA-Z0-9]\w*$`) — both from
+/// `smithy_query(query="shape",shape="FormEntryInput,FormEntryOutput")`. So an
+/// identifier that is already a well-formed name (including one in the service's own
+/// `amazon.datazone.` namespace) is reported unchanged, and a qualified identifier in any
+/// other namespace reports its unqualified last segment, which is the form type's own
+/// name.
+///
+/// Whether a form type of that name EXISTS is not checked here: form types are not
+/// served yet (`CreateFormType` is still a scaffold stub with its own issue), and the
+/// built-in `amazon.datazone.*` types are not stored at all, so there is nothing to
+/// resolve an identifier against.
+fn form_type_name(identifier: &str) -> &str {
+    if is_form_type_name(identifier) {
+        return identifier;
+    }
+    identifier.split('.').next_back().unwrap_or(identifier)
+}
+
+/// Whether `value` already satisfies the `FormTypeName` constraints quoted above, so it
+/// can be reported as a form type name unchanged.
+fn is_form_type_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 128 {
+        return false;
+    }
+    // The optional namespace prefix the pattern allows is part of the name.
+    let bare = value.strip_prefix("amazon.datazone.").unwrap_or(value);
+    if !bare
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return false;
+    }
+    match bare.bytes().next() {
+        // `(?![0-9_])\w+`: a name cannot start with a digit.
+        Some(byte) if byte.is_ascii_digit() => false,
+        // `_\w*[a-zA-Z0-9]\w*`: it may start with an underscore only when some
+        // alphanumeric character follows.
+        Some(b'_') => bare.bytes().any(|byte| byte.is_ascii_alphanumeric()),
+        Some(_) => true,
+        None => false,
     }
 }
