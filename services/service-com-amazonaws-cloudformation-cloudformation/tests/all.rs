@@ -21,6 +21,8 @@ mod stack_lifecycle;
 mod stack_outputs;
 #[path = "all/stack_reported_members.rs"]
 mod stack_reported_members;
+#[path = "all/stack_resources.rs"]
+mod stack_resources;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/unprovisioned_resources.rs"]
