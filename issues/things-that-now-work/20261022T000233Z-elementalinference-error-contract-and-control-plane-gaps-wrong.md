@@ -112,3 +112,32 @@ Cause 5: search_fixtures(sport='basketball', startDate=<today-10d>, endDate=<tod
 Cause 6: create_feed(...); from two threads concurrently call associate_feed(id=<same feed id>, associatedResourceName=<distinct names>, outputs=[]) -> observe both returning NotImplemented, so 0 winners instead of exactly 1 winner and 1 ValidationException loser.
 
 Replay: the check ids in trace_ids.
+
+## Known divergence left after the fix (cause 1)
+
+Cause 1's rule is implemented: a role ARN whose account is not the one the emulator
+serves is answered as a pass-role denial — error code `AccessDeniedException` with the
+message `Cross-account pass role is not allowed.` — rather than as a malformed request.
+The HTTP STATUS of that answer still diverges for one class of input, and that class is
+the recorded one:
+
+* a role ARN that satisfies `IamRoleArn`'s `@length`/`@pattern` reaches the handler,
+  which returns the modelled `AccessDeniedException` with its modelled **HTTP 403**;
+* a role ARN that does NOT satisfy them (the recorded
+  `arn:aws:iam::123456789012:notarole` has no `role/` resource) is refused BEFORE any
+  handler runs, by the framework's boundary validator. The emulator answers it with the
+  pass-role code and message, but at **HTTP 400**, because the status of a pre-handler
+  refusal is the protocol's: `aws-emulator-smithy-server-runtime`'s
+  `pre_dispatch::json` picks it from the `ProtocolError` variant, and the service hook
+  that rewords such a refusal (`Service::override_refusal` -> `Refused`) carries only a
+  code and a message.
+
+Closing that gap means giving `Refused` an optional modelled HTTP status that
+`protocol_error_response_with` honours — a change in the read-only `vendor/` tree, which
+cannot be made from inside the emulator. Until that lands, the emulator's answer for a
+cross-account role ARN that is also syntactically invalid is `AccessDeniedException` at
+HTTP 400 instead of HTTP 403. The integration test
+(`tests/all/error_contract.rs::a_role_in_another_account_is_denied_rather_than_called_malformed`)
+asserts the modelled 403 wherever the handler decides, and for this class asserts only
+the code, the message and that the status is a 4xx — so the divergence is recorded here
+rather than pinned as expected behaviour.

@@ -392,7 +392,14 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
                 // answers ResourceNotFoundException.
                 FeedStatus::Deleting => false,
                 FeedStatus::Creating | FeedStatus::Updating => {
-                    feed.status = FeedStatus::Available;
+                    // Where a transient lands depends on the feed's association, not
+                    // on which call started it: a feed claimed by AssociateFeed while
+                    // it was still settling becomes ACTIVE, an unclaimed one AVAILABLE.
+                    feed.status = if feed.association.is_some() {
+                        FeedStatus::Active
+                    } else {
+                        FeedStatus::Available
+                    };
                     feed.transition_due_at = None;
                     true
                 }
@@ -430,6 +437,31 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
 /// The ARN of a feed in `region`: `arn:aws:elemental-inference:<region>:<account>:feed/<id>`.
 pub fn feed_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(SERVICE_NAMESPACE, region, &format!("feed/{id}"))
+}
+
+/// The refusal a role ARN naming another account earns.
+///
+/// Elemental Inference does not resolve a passed role offline: it evaluates the role by
+/// attempting to pass it, and passing a role that lives in another account is denied.
+/// The account id is in the ARN the request supplied, so the refusal is derived from
+/// the request.
+pub const CROSS_ACCOUNT_PASS_ROLE_MESSAGE: &str = "Cross-account pass role is not allowed.";
+
+/// Whether `arn` names an IAM account id other than the one this emulator serves.
+///
+/// Reads the account segment of an ARN (`arn:<partition>:iam::<account>:<resource>`,
+/// field 5) and answers true only when it is a 12-digit account id that is not
+/// `engine::emulator_account_id()`. A value whose account segment is not an account id
+/// at all says nothing about WHOSE role it is, so it is not a pass-role denial and is
+/// left to the member's own syntax rules.
+pub fn names_another_account(arn: &str) -> bool {
+    let fields: Vec<&str> = arn.split(':').collect();
+    let Some(account) = fields.get(4) else {
+        return false;
+    };
+    let is_account_id =
+        account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit());
+    is_account_id && *account != ::engine::emulator_account_id()
 }
 
 /// The ARN of a dictionary in `region`:
