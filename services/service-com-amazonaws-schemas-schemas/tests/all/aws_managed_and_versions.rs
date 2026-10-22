@@ -18,11 +18,13 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::state::{
-    AWS_MANAGED_CATALOG, AWS_MANAGED_SCHEMA_TYPE,
+    aws_managed_schemas, ManagedSchema, AWS_MANAGED_REGISTRY, AWS_MANAGED_SCHEMA_TYPE,
+    AWS_SERVICE_EVENT_TYPES,
 };
 
 use crate::registry_schema_lifecycle::{
-    create_registry, registry_names, registry_uri, schema_names, schema_uri, Answer, Emulator,
+    create_registry, export_uri, registry_names, registry_uri, schema_names, schema_uri, walk,
+    Answer, Emulator,
 };
 
 /// A schema body `CreateSchema` accepts, distinct per `marker`.
@@ -35,13 +37,6 @@ fn schema_body(marker: &str) -> Value {
 
 fn versions_uri(registry: &str, schema: &str) -> String {
     format!("{}/versions", schema_uri(registry, schema))
-}
-
-fn export_uri(registry: &str, schema: &str, export_type: &str) -> String {
-    format!(
-        "{}/export?type={export_type}",
-        schema_uri(registry, schema)
-    )
 }
 
 /// The version labels `ListSchemaVersions` reports, as a set.
@@ -253,49 +248,81 @@ async fn the_aws_managed_catalogue_is_visible_to_every_account() {
     );
     let visible = registry_names(&listed);
     assert!(
-        !visible.is_empty(),
-        "an account must see AWS-managed schema registries, got {:?}",
-        listed.body
+        visible.contains(&AWS_MANAGED_REGISTRY.to_string()),
+        "an account must see the AWS-managed registry, got {visible:?}"
     );
 
-    // Source: `crate::state::AWS_MANAGED_CATALOG`.
-    for (registry, schemas) in AWS_MANAGED_CATALOG {
-        assert!(
-            visible.contains(&(*registry).to_string()),
-            "case {registry:?}: must be in the AWS-scoped listing, got {visible:?}"
-        );
-        let listed = emulator
-            .call("GET", &format!("{}/schemas", registry_uri(registry)), None)
-            .await;
-        let mut expected: Vec<String> = schemas.iter().map(|(n, _)| (*n).to_string()).collect();
-        expected.sort();
-        assert_eq!(
-            schema_names(&listed),
-            expected,
-            "case {registry:?}: ListSchemas must report the catalogue's schemas"
-        );
+    // Source: `crate::state::aws_managed_schemas`, the catalogue the store seeds.
+    let catalogue = aws_managed_schemas();
+    let mut expected: Vec<String> = catalogue.iter().map(|entry| entry.name.clone()).collect();
+    expected.sort();
+    let walked = walk(
+        &emulator,
+        &format!("{}/schemas", registry_uri(AWS_MANAGED_REGISTRY)),
+        None,
+        schema_names,
+    )
+    .await;
+    assert_eq!(
+        walked, expected,
+        "ListSchemas must page through exactly the catalogue's schemas"
+    );
 
-        for (schema, content) in *schemas {
-            let described = emulator
-                .call("GET", &schema_uri(registry, schema), None)
-                .await;
-            assert_eq!(
-                described.status, 200,
-                "case {schema:?}: expected 200, got {} {:?}",
-                described.status, described.body
-            );
-            assert_eq!(
-                described.str_at("Content"),
-                *content,
-                "case {schema:?}: DescribeSchema reports the catalogue document verbatim"
-            );
-            assert_eq!(
-                described.str_at("Type"),
-                AWS_MANAGED_SCHEMA_TYPE,
-                "case {schema:?}: AWS stores its event schemas as {AWS_MANAGED_SCHEMA_TYPE}"
-            );
-        }
+    // Rows: one entry per service-specific event type, plus the CloudTrail event type
+    // of a source that publishes nothing else — they differ in how many components
+    // the document carries and how deeply those reference each other.
+    for entry in sample_of(catalogue) {
+        let schema = &entry.name;
+        let described = emulator
+            .call("GET", &schema_uri(AWS_MANAGED_REGISTRY, schema), None)
+            .await;
+        assert_eq!(
+            described.status, 200,
+            "case {schema:?}: expected 200, got {} {:?}",
+            described.status, described.body
+        );
+        assert_eq!(
+            described.str_at("Content"),
+            entry.content,
+            "case {schema:?}: DescribeSchema reports the catalogue document verbatim"
+        );
+        assert_eq!(
+            described.str_at("Type"),
+            AWS_MANAGED_SCHEMA_TYPE,
+            "case {schema:?}: AWS stores its event schemas as {AWS_MANAGED_SCHEMA_TYPE}"
+        );
     }
+}
+
+/// The catalogue entries the cases below drive: every service-specific event type,
+/// plus the CloudTrail event type of two sources the issue did not cite.
+///
+/// The whole catalogue holds one schema per AWS event source, so a case that walks it
+/// end to end walks a few hundred requests; these rows are what the rule generalises
+/// over (the number of components a document carries, and whether the document was
+/// rendered for a service-specific event or for the API-call event every source
+/// publishes).
+fn sample_of(catalogue: &[ManagedSchema]) -> Vec<ManagedSchema> {
+    let sampled: Vec<String> = AWS_SERVICE_EVENT_TYPES
+        .iter()
+        .map(|event| event.schema_name())
+        .chain([
+            "aws.rds@AWSAPICallviaCloudTrail".to_string(),
+            "aws.sqs@AWSAPICallviaCloudTrail".to_string(),
+        ])
+        .collect();
+    let chosen: Vec<ManagedSchema> = catalogue
+        .iter()
+        .filter(|entry| sampled.contains(&entry.name))
+        .cloned()
+        .collect();
+    assert_eq!(
+        chosen.len(),
+        sampled.len(),
+        "every sampled name must be in the catalogue: wanted {sampled:?}, got {:?}",
+        chosen.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    chosen
 }
 
 /// RULE: `ExportSchema(Type='JSONSchemaDraft4')` renders an AWS-managed OpenAPI 3
@@ -306,72 +333,76 @@ async fn the_aws_managed_catalogue_is_visible_to_every_account() {
 async fn exporting_an_aws_managed_schema_converts_it_to_draft_4() {
     let emulator = Emulator::new();
 
-    // Rows: every schema the catalogue holds — they differ in how many components
-    // they carry and how deeply those reference each other.
-    for (registry, schemas) in AWS_MANAGED_CATALOG {
-        for (schema, source) in *schemas {
-            let exported = emulator
-                .call("GET", &export_uri(registry, schema, "JSONSchemaDraft4"), None)
-                .await;
-            assert_eq!(
-                exported.status, 200,
-                "case {schema:?}: expected 200, got {} {:?}",
-                exported.status, exported.body
-            );
-            assert_eq!(
-                exported.str_at("Type"),
-                "JSONSchemaDraft4",
-                "case {schema:?}: the export reports the type it produced"
-            );
-            assert_eq!(
-                exported.str_at("SchemaVersion"),
-                "1",
-                "case {schema:?}: the catalogue holds one version"
-            );
-            assert_eq!(
-                exported.str_at("SchemaName"),
-                *schema,
-                "case {schema:?}: the export names the schema"
-            );
+    // Rows: every service-specific schema the catalogue holds, plus two API-call
+    // schemas — they differ in how many components they carry and how deeply those
+    // reference each other.
+    for entry in sample_of(aws_managed_schemas()) {
+        let schema = &entry.name;
+        let exported = emulator
+            .call(
+                "GET",
+                &export_uri(AWS_MANAGED_REGISTRY, schema, "JSONSchemaDraft4"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            exported.status, 200,
+            "case {schema:?}: expected 200, got {} {:?}",
+            exported.status, exported.body
+        );
+        assert_eq!(
+            exported.str_at("Type"),
+            "JSONSchemaDraft4",
+            "case {schema:?}: the export reports the type it produced"
+        );
+        assert_eq!(
+            exported.str_at("SchemaVersion"),
+            "1",
+            "case {schema:?}: the catalogue holds one version"
+        );
+        assert_eq!(
+            exported.str_at("SchemaName"),
+            *schema,
+            "case {schema:?}: the export names the schema"
+        );
 
-            let content: Value = serde_json::from_str(&exported.str_at("Content"))
-                .unwrap_or_else(|e| panic!("case {schema:?}: Content must be JSON: {e}"));
-            let declared = content["$schema"].as_str().unwrap_or_default();
-            assert!(
-                declared.contains("draft-04"),
-                "case {schema:?}: $schema must name draft-04, got {declared:?}"
-            );
-            assert!(
-                !serde_json::to_string(&content)
-                    .unwrap_or_default()
-                    .contains("#/components/schemas/"),
-                "case {schema:?}: no OpenAPI component ref may survive the conversion: {content:?}"
-            );
+        let content: Value = serde_json::from_str(&exported.str_at("Content"))
+            .unwrap_or_else(|e| panic!("case {schema:?}: Content must be JSON: {e}"));
+        let declared = content["$schema"].as_str().unwrap_or_default();
+        assert!(
+            declared.contains("draft-04"),
+            "case {schema:?}: $schema must name draft-04, got {declared:?}"
+        );
+        assert!(
+            !serde_json::to_string(&content)
+                .unwrap_or_default()
+                .contains("#/components/schemas/"),
+            "case {schema:?}: no OpenAPI component ref may survive the conversion: {content:?}"
+        );
 
-            // Every component of the source document other than the promoted envelope
-            // is a definition of the export, and the envelope's own members are the
-            // export's root.
-            let source: Value = serde_json::from_str(source)
-                .unwrap_or_else(|e| panic!("case {schema:?}: the source must be JSON: {e}"));
-            let components = source["components"]["schemas"]
-                .as_object()
-                .unwrap_or_else(|| panic!("case {schema:?}: the source has components"));
-            for name in components.keys().filter(|name| *name != "AWSEvent") {
-                assert!(
-                    content["definitions"][name].is_object(),
-                    "case {schema:?}: component {name:?} must be a definition, got {content:?}"
-                );
-            }
-            assert_eq!(
-                content["properties"]["detail"]["$ref"],
-                json!(format!("#/definitions/{schema_detail}", schema_detail = source
-                    ["components"]["schemas"]["AWSEvent"]["properties"]["detail"]["$ref"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim_start_matches("#/components/schemas/"))),
-                "case {schema:?}: the envelope's detail ref must point into definitions"
+        // Every component of the source document other than the promoted envelope
+        // is a definition of the export, and the envelope's own members are the
+        // export's root.
+        let source: Value = serde_json::from_str(&entry.content)
+            .unwrap_or_else(|e| panic!("case {schema:?}: the source must be JSON: {e}"));
+        let components = source["components"]["schemas"]
+            .as_object()
+            .unwrap_or_else(|| panic!("case {schema:?}: the source has components"));
+        for name in components.keys().filter(|name| *name != "AWSEvent") {
+            assert!(
+                content["definitions"][name].is_object(),
+                "case {schema:?}: component {name:?} must be a definition, got {content:?}"
             );
         }
+        assert_eq!(
+            content["properties"]["detail"]["$ref"],
+            json!(format!("#/definitions/{schema_detail}", schema_detail = source
+                ["components"]["schemas"]["AWSEvent"]["properties"]["detail"]["$ref"]
+                .as_str()
+                .unwrap_or_default()
+                .trim_start_matches("#/components/schemas/"))),
+            "case {schema:?}: the envelope's detail ref must point into definitions"
+        );
     }
 }
 
@@ -390,8 +421,16 @@ async fn exporting_what_cannot_be_exported_is_refused() {
         "expected 201 from CreateSchema, got {} {:?}",
         created.status, created.body
     );
-    let (managed_registry, managed_schemas) = AWS_MANAGED_CATALOG[0];
-    let (managed_schema, _) = managed_schemas[0];
+    let managed_registry = AWS_MANAGED_REGISTRY;
+    // Any member of the catalogue serves: these refusals are about the request, not
+    // about which schema it names.
+    let catalogue = aws_managed_schemas();
+    let managed_schema_name = catalogue
+        .first()
+        .expect("the catalogue holds schemas")
+        .name
+        .clone();
+    let managed_schema = managed_schema_name.as_str();
 
     // Rows: a caller's own schema (403 whatever the type asked for), a `Type` outside
     // the modelled enum (400), and a resource that does not exist (404).
@@ -464,8 +503,12 @@ async fn exporting_what_cannot_be_exported_is_refused() {
 #[tokio::test]
 async fn a_caller_cannot_write_into_an_aws_managed_registry() {
     let emulator = Emulator::new();
-    let (registry, schemas) = AWS_MANAGED_CATALOG[0];
-    let (schema, content) = schemas[0];
+    let registry = AWS_MANAGED_REGISTRY;
+    let entry = aws_managed_schemas()
+        .first()
+        .expect("the catalogue holds schemas");
+    let schema = entry.name.as_str();
+    let content = entry.content.as_str();
 
     // Rows: every write this slice implements, against a service-owned registry.
     let cases: Vec<(&str, &str, String, Option<Value>)> = vec![
@@ -515,7 +558,11 @@ async fn a_caller_cannot_write_into_an_aws_managed_registry() {
     assert!(
         !schema_names(
             &emulator
-                .call("GET", &format!("{}/schemas", registry_uri(registry)), None)
+                .call(
+                    "GET",
+                    &format!("{}/schemas?schemaNamePrefix=mine", registry_uri(registry)),
+                    None
+                )
                 .await
         )
         .contains(&"mine".to_string()),

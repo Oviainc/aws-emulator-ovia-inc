@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCostEstimation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCostEstimation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts the account's single cost estimation ([`crate::state::CostEstimationRecord`]).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCostEstimation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A cost estimate prices the resources DevOps Guru analyses, so the collection is
+//! resolved against the analysis coverage `UpdateResourceCollection` maintains: a
+//! CloudFormation stack or an app-boundary tag value that coverage does not hold
+//! selects no resource this estimate could be made for, and is refused with
+//! `ResourceNotFoundException` naming it. The estimate is created asynchronously — it
+//! is due [`crate::state::COST_ESTIMATION_DURATION`] after this call, and
+//! `GetCostEstimation` reports `ONGOING` until then — so a second start while one is
+//! still running is a `ConflictException`, except for a retry under the same
+//! `ClientToken`, which names the estimation that token already started. A finished
+//! estimate names no work in flight, so the next start replaces it.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +153,238 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCostEstimation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCostEstimationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCostEstimation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartCostEstimationError::Modeled(
+                StartCostEstimationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru cost estimation store is unavailable"
+                            .to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // The collection as submitted, kept member for member: `GetCostEstimation`
+        // reports the collection this request named, not a normalised rewrite of it.
+        let stack_names: Option<Vec<String>> = input
+            .resource_collection
+            .cloud_formation
+            .as_ref()
+            .map(|filter| filter.stack_names.clone().unwrap_or_default());
+        let tags: Option<Vec<(String, Vec<String>)>> =
+            input.resource_collection.tags.as_ref().map(|filters| {
+                filters
+                    .iter()
+                    .map(|filter| (filter.app_boundary_key.clone(), filter.tag_values.clone()))
+                    .collect()
+            });
+
+        // "The maximum number of tags you can specify for a cost estimate is one"
+        // (`TagCostEstimationResourceCollectionFilter`'s documentation). The list
+        // carries no modelled length, so this is where a longer one is refused —
+        // before anything is stored.
+        if let Some(tags) = tags.as_ref() {
+            if tags.len() > crate::state::MAX_COST_ESTIMATION_TAG_FILTERS {
+                return Err(invalid_collection(
+                    "ResourceCollection.Tags",
+                    format!(
+                        "a cost estimate covers at most {} tag, got {}",
+                        crate::state::MAX_COST_ESTIMATION_TAG_FILTERS,
+                        tags.len()
+                    ),
+                ));
+            }
+        }
+
+        // An estimate is of the cost to analyse the resources a collection defines, so
+        // a collection that defines none names nothing to estimate.
+        let names_nothing = stack_names.as_ref().is_none_or(|names| names.is_empty())
+            && tags.as_ref().is_none_or(|tags| tags.is_empty());
+        if names_nothing {
+            return Err(invalid_collection(
+                "ResourceCollection",
+                "must name a CloudFormation stack or an Amazon Web Services tag".to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        if let Some(existing) = guard.cost_estimation.as_ref() {
+            // Only an estimation that is still being created holds the account: a
+            // finished one is replaced by a new start.
+            let ongoing = existing.status(now) == crate::state::COST_ESTIMATION_STATUS_ONGOING;
+            if existing.has_token(input.client_token.as_deref()) {
+                // `ClientToken` is an `@idempotencyToken`: a retry of the same request
+                // names the estimation that token already started, so it is answered
+                // from that estimation rather than starting a second one or restarting
+                // a finished one.
+                if existing.covers_same_collection(stack_names.as_ref(), tags.as_ref()) {
+                    return Ok(StartCostEstimationOutput::default());
+                }
+                // The same token with a DIFFERENT collection is two requests sharing
+                // one token, which is the conflict the token exists to detect — while
+                // the estimation it started is still running. Once that estimation has
+                // finished the token names no work in flight, so the request falls
+                // through and replaces it.
+                if ongoing {
+                    return Err(estimation_conflict(format!(
+                        "ClientToken '{}' already started a cost estimation for a different resource collection",
+                        input.client_token.as_deref().unwrap_or_default()
+                    )));
+                }
+            } else if ongoing {
+                // One estimation at a time: while the account's estimate is still being
+                // created there is nothing to replace it with.
+                return Err(estimation_conflict(
+                    "a cost estimation is already in progress for this account".to_string(),
+                ));
+            }
+        }
+
+        // What the estimate prices: the resources the account's analysis coverage holds
+        // for the collection this request names. This emulator performs none of AWS's
+        // own per-service resource discovery, so the coverage a client declared through
+        // `UpdateResourceCollection` is the whole inventory there is to count.
+        let coverage = &guard.resource_collection;
+        let mut costs: Vec<crate::state::ResourceCostRecord> = Vec::new();
+
+        // A stack is a named resource: an estimate for a stack the coverage does not
+        // contain is an estimate for a resource DevOps Guru does not analyse.
+        if let Some(stack_names) = stack_names.as_ref() {
+            if let Some(missing) = stack_names
+                .iter()
+                .find(|name| !coverage.cloudformation_stack_names.contains(*name))
+            {
+                return Err(uncovered_resource(
+                    format!(
+                        "no CloudFormation stack named '{missing}' is in the resource collection DevOps Guru analyzes"
+                    ),
+                    missing.clone(),
+                    crate::state::COST_ESTIMATION_STACK_TYPE,
+                ));
+            }
+            if let Some(count) = positive_count(stack_names.len()) {
+                costs.push(resource_cost(
+                    crate::state::COST_ESTIMATION_STACK_TYPE,
+                    count,
+                ));
+            }
+        }
+
+        // A tag identifies resources the same way: an app-boundary key and value no
+        // covered resource carries selects nothing DevOps Guru analyses, so there is no
+        // resource for the estimate to price.
+        if let Some(tags) = tags.as_ref() {
+            let named: usize = tags.iter().map(|(_, tag_values)| tag_values.len()).sum();
+            for (app_boundary_key, tag_values) in tags {
+                let covered = coverage.tag_collections.get(app_boundary_key);
+                if let Some(missing) = tag_values
+                    .iter()
+                    .find(|value| covered.is_none_or(|values| !values.contains(*value)))
+                {
+                    // `key`/`value` is the model's own notation for a tag.
+                    let tag = format!("{app_boundary_key}/{missing}");
+                    return Err(uncovered_resource(
+                        INVALID_TAG_MESSAGE.to_string(),
+                        tag,
+                        crate::state::COST_ESTIMATION_TAG_TYPE,
+                    ));
+                }
+            }
+            if let Some(count) = positive_count(named) {
+                costs.push(resource_cost(crate::state::COST_ESTIMATION_TAG_TYPE, count));
+            }
+        }
+
+        // The estimate is created asynchronously: the record is stored now, due at an
+        // instant this call fixes, and `GetCostEstimation` derives ONGOING/COMPLETED
+        // from the clock rather than this handler waiting for it.
+        guard.cost_estimation = Some(crate::state::CostEstimationRecord {
+            client_token: input.client_token.clone(),
+            stack_names,
+            tags,
+            started_at: now,
+            completes_at: now + crate::state::COST_ESTIMATION_DURATION,
+            costs,
+        });
+
+        Ok(StartCostEstimationOutput::default())
+    }
+}
+
+/// The message DevOps Guru answers a tag that selects no analysed resource with.
+///
+/// A FIXED string, not built from the request: the recorded AWS response for exactly
+/// this refusal carries this text and names no tag, so the identity of the tag travels
+/// in the error's `ResourceId` instead. The stack refusal keeps a message built from
+/// the request, which names the stack and the rule it broke, because no recorded AWS
+/// wording for that one is known.
+const INVALID_TAG_MESSAGE: &str = "Invalid tag in the request";
+
+/// A `ResourceNotFoundException` (HTTP 404) refusing a collection that names a
+/// resource the account's analysis coverage does not hold, naming that resource.
+fn uncovered_resource(
+    message: String,
+    resource_id: String,
+    resource_type: &str,
+) -> StartCostEstimationError {
+    StartCostEstimationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id,
+        resource_type: resource_type.to_string(),
+    })
+    .into()
+}
+
+/// A `ValidationException` (HTTP 400) refusing a resource collection no estimate can
+/// be made for, naming the member and the rule it broke.
+fn invalid_collection(member: &str, message: String) -> StartCostEstimationError {
+    StartCostEstimationErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }]),
+    })
+    .into()
+}
+
+/// A `ConflictException` (HTTP 409) about the account's cost estimation.
+///
+/// `ResourceId` is required and a cost estimation carries no id of its own — neither
+/// `StartCostEstimation` nor `GetCostEstimation` names one — so the resource it
+/// identifies is the account whose single estimation conflicts.
+fn estimation_conflict(message: String) -> StartCostEstimationError {
+    StartCostEstimationErrorModeled::ConflictException(ConflictException {
+        message,
+        resource_id: ::engine::emulator_account_id().to_string(),
+        resource_type: crate::state::COST_ESTIMATION_RESOURCE_TYPE.to_string(),
+    })
+    .into()
+}
+
+/// `count` as the modelled `CostEstimationServiceResourceCount`, or `None` when
+/// nothing of that type is analysed: a type with no resources is not a line of the
+/// estimate. A count past `i32` cannot arise — `CostEstimationStackNames` is fixed at
+/// one item by the model, which the boundary validator enforces, and the tag list is
+/// capped above by the documented one-tag maximum — but is reported as nothing rather
+/// than wrapping.
+fn positive_count(count: usize) -> Option<i32> {
+    i32::try_from(count).ok().filter(|count| *count > 0)
+}
+
+/// One line of the estimate: `count` active resources of `resource_type`, priced at
+/// DevOps Guru's published per-resource-hour rate over a billing month.
+fn resource_cost(resource_type: &str, count: i32) -> crate::state::ResourceCostRecord {
+    crate::state::ResourceCostRecord {
+        resource_type: resource_type.to_string(),
+        state: crate::state::COST_ESTIMATION_RESOURCE_ACTIVE.to_string(),
+        count,
+        unit_cost: crate::state::RESOURCE_HOUR_UNIT_COST,
+        cost: crate::state::monthly_cost(count),
     }
 }

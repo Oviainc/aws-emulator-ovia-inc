@@ -30,7 +30,7 @@ pub(crate) const REGION: &str = "us-west-2";
 /// Build the emulator the way the router does: one shared engine, this service
 /// mounted on it, request authentication off so the test signs nothing. The
 /// engine is returned too, so a test can read the store the handlers write.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -48,7 +48,11 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 
 /// Send one awsJson1_1 request: `POST /` with `X-Amz-Target:
 /// CodeCommit_20150413.<Operation>` (the crate's OPERATIONS.md "Wire protocol").
-pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("https://codecommit.us-west-2.amazonaws.com/")

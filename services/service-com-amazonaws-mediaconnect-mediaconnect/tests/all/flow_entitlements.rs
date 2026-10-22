@@ -343,9 +343,10 @@ struct RefusalCase {
     code: &'static str,
 }
 
-/// GrantFlowEntitlements refuses an unknown flow with `NotFoundException` (404), and a
-/// request that breaks a rule of the class with `BadRequestException` (400) — never with
-/// a 501, never with a success, and never storing anything.
+/// GrantFlowEntitlements refuses a flow it does not hold with `NotFoundException` (404),
+/// whether or not the label is an ARN, and a request that breaks a rule of the class with
+/// `BadRequestException` (400) — never with a 501, never with a success, and never storing
+/// anything.
 #[tokio::test]
 async fn grant_flow_entitlements_refusals_name_the_modelled_error() {
     let emulator = Emulator::new();
@@ -362,11 +363,11 @@ async fn grant_flow_entitlements_refusals_name_the_modelled_error() {
             code: "NotFoundException",
         },
         RefusalCase {
-            case: "grant on an ARN that fails the modelled pattern",
+            case: "grant on a label that is not an ARN",
             flow_arn: "not-an-arn".to_string(),
             body: many("ent", 1),
-            status: 400,
-            code: "BadRequestException",
+            status: 404,
+            code: "NotFoundException",
         },
         RefusalCase {
             case: "grant a name the flow already carries",

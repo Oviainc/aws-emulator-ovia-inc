@@ -1779,22 +1779,15 @@ async fn an_application_that_was_never_created_is_not_found() {
 
 /// The operations this slice does not implement still answer 501 — never an empty 200,
 /// which a client cannot tell from a real answer.
+///
+/// `PutApplicationPolicy` and `GetApplicationPolicy` are no longer among them: the
+/// sibling `application_policies` suite exercises the policy they now store and report.
 #[tokio::test]
 async fn the_operations_this_slice_leaves_alone_still_answer_501() {
     let repo = Repo::new();
     let application_id = created(&repo, "stub-app").await;
     let label = path_label(&application_id);
     let cases = [
-        (
-            "PutApplicationPolicy",
-            "PUT",
-            format!("/applications/{label}/policy"),
-        ),
-        (
-            "GetApplicationPolicy",
-            "GET",
-            format!("/applications/{label}/policy"),
-        ),
         (
             "UnshareApplication",
             "POST",
@@ -1818,7 +1811,6 @@ async fn the_operations_this_slice_leaves_alone_still_answer_501() {
     ];
     for (operation, method, path) in &cases {
         let body = match *operation {
-            "PutApplicationPolicy" => Some(json!({ "statements": [] })),
             "UnshareApplication" => Some(json!({ "organizationId": "o-abc123" })),
             "CreateCloudFormationChangeSet" => Some(json!({ "stackName": "a-stack" })),
             _ => Some(json!({})),
