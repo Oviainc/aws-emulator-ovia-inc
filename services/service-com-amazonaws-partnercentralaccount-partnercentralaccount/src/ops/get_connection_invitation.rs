@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConnectionInvitation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConnectionInvitation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConnectionInvitation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored invitation named by `Catalog` + `Identifier`, or
+//! `ResourceNotFoundException` when this service holds no such invitation in that
+//! catalog.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +179,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConnectionInvitation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConnectionInvitationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConnectionInvitation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetConnectionInvitationErrorModeled::InternalServerException(InternalServerException {
+                message: "the PartnerCentralAccount store is unavailable".to_string(),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The one write a report may perform: an invitation whose `ExpiresAt` has
+        // passed was already `EXPIRED` at that instant, whether or not anyone called.
+        state.materialise_due_transitions(::std::time::SystemTime::now());
+
+        // An invitation is addressed by catalog AND id: an id stored in another
+        // catalog names nothing here.
+        let record = state
+            .invitations
+            .get(&(input.catalog.clone(), input.identifier.clone()))
+            .ok_or_else(|| {
+                GetConnectionInvitationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Connection invitation {} was not found in catalog {}.",
+                            input.identifier, input.catalog
+                        ),
+                        reason: crate::state::REASON_CONNECTION_INVITATION_NOT_FOUND.to_string(),
+                    },
+                )
+            })?;
+
+        Ok(GetConnectionInvitationOutput {
+            catalog: record.catalog.clone(),
+            id: record.id.clone(),
+            arn: record.arn.clone(),
+            connection_id: record.connection_id.clone(),
+            connection_type: record.connection_type.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(record.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(record.updated_at),
+            expires_at: Some(::aws_smithy_types::DateTime::from(record.expires_at)),
+            other_participant_identifier: record.other_participant_identifier.clone(),
+            participant_type: record.participant_type.clone(),
+            status: record.status.clone(),
+            invitation_message: record.invitation_message.clone(),
+            inviter_email: record.inviter_email.clone(),
+            inviter_name: record.inviter_name.clone(),
+        })
     }
 }
