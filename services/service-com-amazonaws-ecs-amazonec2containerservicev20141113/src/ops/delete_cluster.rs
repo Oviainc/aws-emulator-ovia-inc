@@ -236,6 +236,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // A cluster whose capacity-provider attachments are mid-update is in a busy
+        // state: "Cluster attachments must be in UPDATE_COMPLETE or UPDATE_FAILED state
+        // before they can be updated." The delete is refused until the update lands,
+        // which is what `UpdateInProgressException` is modelled here for.
+        if guard
+            .clusters
+            .get(&cluster_name)
+            .is_some_and(crate::state::ClusterRecord::attachments_updating)
+        {
+            return Err(DeleteClusterErrorModeled::UpdateInProgressException(
+                UpdateInProgressException {
+                    message: Some(crate::state::CLUSTER_BUSY_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A service OWNS the tasks its scheduler placed, so it is the service that has
         // to go first: "You can't delete a cluster that contains services." Only a
         // service the caller has NOT deleted holds the cluster open; one that is draining

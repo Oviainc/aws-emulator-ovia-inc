@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the cluster.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +155,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCluster"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateClusterErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
+
+        // The settings and the configuration are checked the same way whichever
+        // operation carries them.
+        if let Err(message) =
+            crate::state::validate_cluster_settings(input.settings.as_deref().unwrap_or_default())
+        {
+            return Err(UpdateClusterErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        if let Some(configuration) = &input.configuration {
+            if let Err(message) = crate::state::validate_cluster_configuration(configuration) {
+                return Err(UpdateClusterErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        // A deleted cluster is not one this operation may act in ("The cluster has been
+        // deleted"), so a tombstone is refused exactly as a name that never existed is.
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(UpdateClusterErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        let cluster = guard
+            .clusters
+            .get_mut(&cluster_name)
+            .expect("the active cluster was just found in the store");
+
+        // Each member of the request is a field of the cluster this call SETS; a member
+        // the request omits leaves the stored value where it was.
+        if let Some(settings) = &input.settings {
+            cluster.apply_settings(settings);
+        }
+        if let Some(configuration) = &input.configuration {
+            cluster.configuration = Some(configuration.clone());
+        }
+        if let Some(defaults) = &input.service_connect_defaults {
+            cluster.service_connect_defaults =
+                crate::state::service_connect_defaults(&defaults.namespace);
+        }
+        let record = cluster.clone();
+        // `UpdateCluster` takes neither `tags` nor an `include`, so the response reports
+        // no tag set — only the cluster's own configured state.
+        let view = guard.cluster_mutation_view(&record, false);
+
+        Ok(UpdateClusterOutput {
+            cluster: Some(view),
+        })
     }
 }

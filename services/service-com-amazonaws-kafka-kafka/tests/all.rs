@@ -15,6 +15,8 @@
 mod channel_lifecycle;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/compatible_kafka_versions.rs"]
+mod compatible_kafka_versions;
 #[path = "all/connectivity_update.rs"]
 mod connectivity_update;
 #[path = "all/kafka_harness.rs"]

@@ -36,7 +36,7 @@
 //! * **Output** — [`MAX_REPORTED_EVALUATION_ERRORS`] caps the `errors` list the
 //!   response carries; `determiningPolicies` is bounded by the policy count.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
 use crate::ops::types::{
@@ -45,19 +45,28 @@ use crate::ops::types::{
 };
 use crate::ops::{paths, InvalidInput};
 
-use super::{Policy, ScopeEntity};
+use super::ScopeEntity;
 
 /// Why a Cedar operation refused to answer.
 ///
-/// The two arms are two different HTTP answers, and keeping them apart is what
-/// stops a fault in SERVICE-side state being reported as the caller's mistake: a
-/// store whose stored schema will not parse, or one holding more Cedar than a
-/// request evaluates, is nothing the caller can fix from the request it sent.
+/// The arms are different HTTP answers, and keeping them apart is what stops a
+/// fault in SERVICE-side state being reported as the caller's mistake: a store
+/// whose stored schema will not parse, or one holding more Cedar than a request
+/// evaluates, is nothing the caller can fix from the request it sent.
 #[derive(Debug, Clone)]
 pub enum Refusal {
     /// A member of the request is invalid — the modelled `ValidationException`,
     /// with this member in its `fieldList`.
     InvalidInput(InvalidInput),
+    /// The policy content the request carried was refused by the policy store's
+    /// SCHEMA: one entry per reason the Cedar validator raised, in the order it
+    /// raised them. It stays a list of reasons rather than an [`InvalidInput`]
+    /// because the member they are reported under is the CALLER's: it is the
+    /// request member whose content was validated (`/definition` for a policy,
+    /// `/statement` for a policy template), which the operation knows and this
+    /// module does not. [`crate::ops::schema_validation_exception`] turns the
+    /// pair into the modelled error.
+    SchemaValidation(Vec<String>),
     /// Service-side state cannot answer this request — the modelled
     /// `InternalServerException`, carrying this text.
     ServiceFault(String),
@@ -97,7 +106,8 @@ pub const MAX_COLLECTION_LEN: usize = 1_000;
 pub const MAX_REPORTED_EVALUATION_ERRORS: usize = 100;
 
 /// Parse one Cedar POLICY TEMPLATE, refusing text the parser rejects. `Err`
-/// carries the parser's diagnostics, for a `ValidationException`.
+/// names [`paths::TEMPLATE_STATEMENT`] and carries the parser's diagnostics, for
+/// a `ValidationException`.
 ///
 /// A template is Cedar's own notion, not a variant of a static policy:
 /// `?principal` and `?resource` are slots, which [`parse_static_policy`]'s
@@ -108,13 +118,23 @@ pub const MAX_REPORTED_EVALUATION_ERRORS: usize = 100;
 ///
 /// Refuses a statement past [`MAX_STATEMENT_BYTES`] BEFORE handing it to the
 /// parser, so an over-long payload costs a length check rather than a parse.
-pub fn parse_policy_template(statement: &str) -> Result<(), String> {
-    parse_template(statement).map(|_| ())
+pub fn parse_policy_template(statement: &str) -> Result<(), InvalidInput> {
+    parse_template(None, statement)
+        .map(|_| ())
+        .map_err(|reason| InvalidInput::new(paths::TEMPLATE_STATEMENT, reason))
 }
 
-/// The parsed Cedar template, for the two callers that need it: the parse check
-/// above and the schema validation below.
-fn parse_template(statement: &str) -> Result<cedar_policy::Template, String> {
+/// The parsed Cedar template, for the callers that need it: the parse check
+/// above, the schema validation below and the template LINK that instantiates it
+/// into a policy.
+///
+/// `id` is the Cedar policy id the template carries in a `PolicySet` — the
+/// linking caller needs a known one to link against; `None` takes Cedar's own
+/// generated id, which is what a diagnostic about the text then names.
+fn parse_template(
+    id: Option<cedar_policy::PolicyId>,
+    statement: &str,
+) -> Result<cedar_policy::Template, String> {
     if statement.len() > MAX_STATEMENT_BYTES {
         return Err(format!(
             "statement is {} bytes, more than the {MAX_STATEMENT_BYTES} bytes a policy \
@@ -122,7 +142,7 @@ fn parse_template(statement: &str) -> Result<cedar_policy::Template, String> {
             statement.len()
         ));
     }
-    cedar_policy::Template::parse(None, statement)
+    cedar_policy::Template::parse(id, statement)
         .map_err(|e| format!("the policy template statement is not valid Cedar: {e}"))
 }
 
@@ -133,35 +153,51 @@ fn parse_template(statement: &str) -> Result<cedar_policy::Template, String> {
 /// and policy templates").
 ///
 /// `schema_json` is the text the store holds (already accepted by
-/// [`parse_schema`]); `Err` carries the validator's diagnostics, for a
-/// `ValidationException`.
-pub fn validate_policy_template(schema_json: &str, statement: &str) -> Result<(), String> {
-    let parsed = parse_schema(schema_json)?;
-    let template = parse_template(statement)?;
+/// [`parse_schema`]); `Err` carries [`Refusal::SchemaValidation`] with ONE reason
+/// per validation error the validator raised.
+pub fn validate_policy_template(schema_json: &str, statement: &str) -> Result<(), Refusal> {
+    let parsed = parse_schema(schema_json).map_err(|e| {
+        // The store's own schema was accepted by `PutSchema`, so this is
+        // service-side state the caller cannot fix.
+        Refusal::ServiceFault(format!(
+            "the policy store's schema could not be parsed, so a policy template cannot be \
+             validated against it: {e}"
+        ))
+    })?;
+    let template = parse_template(None, statement)
+        .map_err(|reason| InvalidInput::new(paths::TEMPLATE_STATEMENT, reason))?;
     let mut set = cedar_policy::PolicySet::new();
-    set.add_template(template)
-        .map_err(|e| format!("the policy template statement could not be loaded: {e}"))?;
+    set.add_template(template).map_err(|e| {
+        InvalidInput::new(
+            paths::TEMPLATE_STATEMENT,
+            format!("the policy template statement could not be loaded: {e}"),
+        )
+    })?;
 
     let result = cedar_policy::Validator::new(parsed.schema)
         .validate(&set, cedar_policy::ValidationMode::Strict);
     if result.validation_passed() {
         return Ok(());
     }
-    let mut diagnostics: Vec<String> = result
+    Err(Refusal::SchemaValidation(validation_reasons(&result)))
+}
+
+/// One entry per reason the Cedar validator raised, in the order it raised them
+/// and capped at [`MAX_REPORTED_EVALUATION_ERRORS`] — the output bound on a
+/// refusal, which reports one `fieldList` entry per reason.
+fn validation_reasons(result: &cedar_policy::ValidationResult) -> Vec<String> {
+    let mut reasons: Vec<String> = result
         .validation_errors()
         .take(MAX_REPORTED_EVALUATION_ERRORS)
         .map(ToString::to_string)
         .collect();
-    if diagnostics.is_empty() {
+    if reasons.is_empty() {
         // Defensive: `validation_passed()` is false only when there is at least
         // one error, but a caller must still get a reason rather than an empty
-        // message.
-        diagnostics.push("the policy template does not validate against the schema".to_string());
+        // list.
+        reasons.push("it does not validate against the schema in this policy store".to_string());
     }
-    Err(format!(
-        "the policy template does not validate against the schema in this policy store: {}",
-        diagnostics.join("; ")
-    ))
+    reasons
 }
 
 /// How many authorization requests one batch call may carry, from
@@ -232,6 +268,14 @@ pub fn parse_static_policy(statement: &str) -> Result<StaticScope, InvalidInput>
         )
     })?;
 
+    Ok(scope_of(&policy))
+}
+
+/// The effect and scope of ONE parsed Cedar policy, however it was obtained:
+/// parsed from a static policy's text, or LINKED from a template
+/// ([`link_template`]). Both report the same members, so they read them off the
+/// parsed form through this one function.
+fn scope_of(policy: &cedar_policy::Policy) -> StaticScope {
     let effect = match policy.effect() {
         cedar_policy::Effect::Permit => "Permit",
         cedar_policy::Effect::Forbid => "Forbid",
@@ -256,12 +300,12 @@ pub fn parse_static_policy(statement: &str) -> Result<StaticScope, InvalidInput>
         cedar_policy::ActionConstraint::In(uids) => uids.iter().map(scope_entity).collect(),
     };
 
-    Ok(StaticScope {
+    StaticScope {
         effect,
         principal,
         resource,
         actions,
-    })
+    }
 }
 
 /// A parsed Cedar schema: the `cedar-policy` schema object every validation
@@ -310,8 +354,9 @@ pub fn parse_schema(text: &str) -> Result<ParsedSchema, String> {
 /// the schema gives it.
 ///
 /// `schema_json` is the text the store holds (already accepted by
-/// [`parse_schema`]); an `Err` carrying [`Refusal::InvalidInput`] names the
-/// statement, and one carrying [`Refusal::ServiceFault`] says the store's own
+/// [`parse_schema`]); an `Err` carrying [`Refusal::SchemaValidation`] has ONE
+/// reason per validation error the validator raised, [`Refusal::InvalidInput`]
+/// names the statement, and [`Refusal::ServiceFault`] says the store's own
 /// schema is what could not be read.
 pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), Refusal> {
     // The statement is bounded BEFORE the schema is parsed and before Cedar sees
@@ -346,25 +391,142 @@ pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), 
     if result.validation_passed() {
         return Ok(());
     }
-    let mut diagnostics: Vec<String> = result
-        .validation_errors()
-        .take(MAX_REPORTED_EVALUATION_ERRORS)
-        .map(ToString::to_string)
-        .collect();
-    if diagnostics.is_empty() {
-        // Defensive: `validation_passed()` is false only when there is at least
-        // one error, but a caller must still get a reason rather than an empty
-        // message.
-        diagnostics.push("the policy does not validate against the schema".to_string());
-    }
-    Err(InvalidInput::new(
-        paths::STATIC_STATEMENT,
-        format!(
-            "the policy does not validate against the schema in this policy store: {}",
-            diagnostics.join("; ")
+    Err(Refusal::SchemaValidation(validation_reasons(&result)))
+}
+
+/// The Cedar policy id a template carries while it is linked, and the id its
+/// link carries — both local to the one-template `PolicySet` [`link_template`]
+/// builds, so neither reaches a response.
+const LINK_TEMPLATE_ID: &str = "template";
+const LINK_POLICY_ID: &str = "link";
+
+/// INSTANTIATE a policy template into a policy: bind the template's
+/// `?principal` / `?resource` slots to the entities the request named and report
+/// the effect and scope of the policy that results.
+///
+/// This is Cedar's own template linking (`PolicySet::link`), not a text
+/// substitution: the scope comes back off the LINKED policy, so a slot the
+/// template does not use keeps whatever the template's own scope says and the
+/// effect and actions are the template's.
+///
+/// The slot rule is the template's: a slot the template USES must be bound by
+/// the link, and one it does not use must not be — each refusal naming the
+/// member that is missing or surplus. `template_statement` is the text the store
+/// holds, so text it cannot parse is service-side state, not a bad request.
+/// `schema_json`, when the store validates, is what the linked policy is
+/// validated against, exactly as a static policy's text would be.
+pub fn link_template(
+    template_statement: &str,
+    link: &super::TemplateLink,
+    schema_json: Option<&str>,
+) -> Result<StaticScope, Refusal> {
+    let template_id = cedar_policy::PolicyId::new(LINK_TEMPLATE_ID);
+    let link_id = cedar_policy::PolicyId::new(LINK_POLICY_ID);
+    let template = parse_template(Some(template_id.clone()), template_statement)
+        .map_err(|e| Refusal::ServiceFault(format!("the policy template cannot be linked: {e}")))?;
+
+    // Which slots the template uses is the TEMPLATE's property, read off the
+    // parsed form rather than searched for in the text.
+    let slots: BTreeSet<String> = template.slots().map(ToString::to_string).collect();
+    for (slot, bound, path) in [
+        (
+            cedar_policy::SlotId::principal(),
+            link.principal.as_ref(),
+            paths::TEMPLATE_LINKED_PRINCIPAL,
         ),
-    )
-    .into())
+        (
+            cedar_policy::SlotId::resource(),
+            link.resource.as_ref(),
+            paths::TEMPLATE_LINKED_RESOURCE,
+        ),
+    ] {
+        match (slots.contains(&slot.to_string()), bound) {
+            (true, None) => {
+                return Err(InvalidInput::new(
+                    path,
+                    "the policy template's scope uses this placeholder, so the policy that \
+                     instantiates it has to bind the placeholder to an entity",
+                )
+                .into());
+            }
+            (false, Some(_)) => {
+                return Err(InvalidInput::new(
+                    path,
+                    "the policy template's scope does not use this placeholder, so the policy \
+                     that instantiates it cannot bind it",
+                )
+                .into());
+            }
+            (true, Some(_)) | (false, None) => {}
+        }
+    }
+    let values = slot_values(link)?;
+
+    let mut set = cedar_policy::PolicySet::new();
+    set.add_template(template).map_err(|e| {
+        Refusal::ServiceFault(format!("the policy template could not be loaded: {e}"))
+    })?;
+    set.link(template_id, link_id.clone(), values).map_err(|e| {
+        // Linking fails on the VALUES the link bound (a slot Cedar will not
+        // accept the entity for), so it is the caller's placeholder binding that
+        // is named.
+        InvalidInput::new(
+            paths::TEMPLATE_LINKED_DEFINITION,
+            format!("the policy template could not be instantiated with these values: {e}"),
+        )
+    })?;
+
+    if let Some(schema_json) = schema_json {
+        let parsed = parse_schema(schema_json).map_err(|e| {
+            Refusal::ServiceFault(format!(
+                "the policy store's schema could not be parsed, so a template-linked policy \
+                 cannot be validated against it: {e}"
+            ))
+        })?;
+        let result = cedar_policy::Validator::new(parsed.schema)
+            .validate(&set, cedar_policy::ValidationMode::Strict);
+        if !result.validation_passed() {
+            return Err(Refusal::SchemaValidation(validation_reasons(&result)));
+        }
+    }
+
+    let linked = set.policy(&link_id).ok_or_else(|| {
+        Refusal::ServiceFault(
+            "the policy template was linked but the resulting policy could not be read"
+                .to_string(),
+        )
+    })?;
+    Ok(scope_of(linked))
+}
+
+/// The Cedar slot environment one template link binds: an entity per
+/// placeholder the link carries.
+///
+/// A link's bindings ARE the slots its template uses — [`link_template`] refuses
+/// a policy that binds a placeholder the template does not use, or leaves one it
+/// does use unbound — so this is a translation of what the link holds, not a
+/// decision about it. `Err` names the binding Cedar cannot read as an entity.
+fn slot_values(
+    link: &super::TemplateLink,
+) -> Result<HashMap<cedar_policy::SlotId, cedar_policy::EntityUid>, InvalidInput> {
+    let mut values: HashMap<cedar_policy::SlotId, cedar_policy::EntityUid> = HashMap::new();
+    for (slot, bound, path) in [
+        (
+            cedar_policy::SlotId::principal(),
+            link.principal.as_ref(),
+            paths::TEMPLATE_LINKED_PRINCIPAL,
+        ),
+        (
+            cedar_policy::SlotId::resource(),
+            link.resource.as_ref(),
+            paths::TEMPLATE_LINKED_RESOURCE,
+        ),
+    ] {
+        if let Some(entity) = bound {
+            values.insert(slot, entity_uid(entity, path)?);
+        }
+    }
+    Ok(values)
 }
 
 /// A Cedar `Type::"id"` as the API's `entityType`/`entityId` pair.
@@ -421,38 +583,76 @@ impl PreparedPolicies {
     }
 }
 
-/// Parse a store's static policies, and its schema when it holds one, into what
-/// an authorization request is evaluated against.
+/// Parse a store's policies, and its schema when it holds one, into what an
+/// authorization request is evaluated against.
 ///
-/// A policy that will not parse is reported as an evaluation error rather than
-/// silently skipped, so a store holding one is never reported as a clean deny.
+/// A STATIC policy contributes its own Cedar text. A TEMPLATE-LINKED one
+/// contributes its template's text, LINKED to the entities the policy bound:
+/// `CreatePolicyTemplate` documents that "if the template changes, then any
+/// policies that are linked to that template are immediately updated as well",
+/// so the template's text is re-read on every evaluation rather than snapshotted
+/// into the policy.
 ///
-/// `schema_json` is the store's schema, when it holds one. A schema is what gives
-/// the request's entity types, action and context their types, so when one is
-/// present the entity store and the request are parsed AGAINST it: an entity or a
-/// context attribute that does not type-check is refused rather than evaluated,
-/// which is the only way a `context` whose attribute has the wrong type can be
-/// told apart from a deny.
+/// A policy that will not parse or link is reported as an evaluation error rather
+/// than silently skipped, so a store holding one is never reported as a clean
+/// deny.
+///
+/// The store's schema, when it holds one, is what gives the request's entity
+/// types, action and context their types, so when one is present the entity
+/// store and the request are parsed AGAINST it: an entity or a context attribute
+/// that does not type-check is refused rather than evaluated, which is the only
+/// way a `context` whose attribute has the wrong type can be told apart from a
+/// deny.
 ///
 /// The per-call step budget is enforced here, at the point of work: the total
 /// Cedar text one call parses is capped at
 /// [`crate::state::MAX_POLICY_BYTES_PER_STORE`], and the policy count at
 /// [`crate::state::MAX_POLICIES_PER_STORE`].
-pub fn load_policies(
-    policies: &BTreeMap<String, Policy>,
-    schema_json: Option<&str>,
-) -> Result<PreparedPolicies, Refusal> {
+pub fn load_policies(store: &super::PolicyStore) -> Result<PreparedPolicies, Refusal> {
     let mut set = cedar_policy::PolicySet::new();
     let mut errors: Vec<String> = Vec::new();
     let mut parsed_bytes = 0usize;
     let mut parsed_count = 0usize;
-    for (policy_id, policy) in policies {
-        if policy.policy_type != "STATIC" {
-            // Template-linked policies are not part of this slice: `CreatePolicy`
-            // does not instantiate a template yet, so a store never holds one.
-            continue;
+    // Each template is added to the set at most once, however many policies link
+    // to it, so a store of links to one template costs one template parse.
+    let mut linked_templates: BTreeSet<String> = BTreeSet::new();
+    for (policy_id, policy) in &store.policies {
+        let statement = match (policy.statement.as_deref(), policy.template_link.as_ref()) {
+            (Some(statement), _) => statement,
+            (None, Some(link)) => {
+                match store.policy_templates.get(&link.policy_template_id) {
+                    Some(template) => template.statement.as_str(),
+                    None => {
+                        errors.push(format!(
+                            "policy {policy_id} is linked to policy template {}, which this \
+                             policy store no longer holds",
+                            link.policy_template_id
+                        ));
+                        continue;
+                    }
+                }
+            }
+            (None, None) => {
+                errors.push(format!(
+                    "policy {policy_id} holds neither a policy statement nor a policy \
+                     template to link"
+                ));
+                continue;
+            }
+        };
+        // The per-call step budget counts the Cedar text this call PARSES: a
+        // static policy's own statement, and each distinct template ONCE —
+        // however many policies link to it, it is parsed once, which is also how
+        // [`crate::state::PolicyStore::cedar_bytes`] charges the store for it.
+        // Charging every link for the whole template would refuse evaluation of
+        // a store the create path legitimately accepted.
+        let parses_new_text = match policy.template_link.as_ref() {
+            None => true,
+            Some(link) => linked_templates.insert(link.policy_template_id.clone()),
+        };
+        if parses_new_text {
+            parsed_bytes += statement.len();
         }
-        parsed_bytes += policy.statement.len();
         parsed_count += 1;
         if parsed_bytes > super::MAX_POLICY_BYTES_PER_STORE
             || parsed_count > super::MAX_POLICIES_PER_STORE
@@ -467,21 +667,68 @@ pub fn load_policies(
                 super::MAX_POLICIES_PER_STORE
             )));
         }
-        match cedar_policy::Policy::parse(
-            Some(cedar_policy::PolicyId::new(policy_id)),
-            &policy.statement,
-        ) {
-            Ok(parsed) => {
-                if let Err(e) = set.add(parsed) {
-                    errors.push(format!("policy {policy_id} could not be loaded: {e}"));
+        match policy.template_link.as_ref() {
+            // A static policy: its own Cedar text, under its own `policyId` as
+            // the Cedar policy id, so `determiningPolicies` names it.
+            None => match cedar_policy::Policy::parse(
+                Some(cedar_policy::PolicyId::new(policy_id)),
+                statement,
+            ) {
+                Ok(parsed) => {
+                    if let Err(e) = set.add(parsed) {
+                        errors.push(format!("policy {policy_id} could not be loaded: {e}"));
+                    }
+                }
+                Err(e) => errors.push(format!("policy {policy_id} could not be parsed: {e}")),
+            },
+            // A template-linked policy: Cedar's own LINK of the template this
+            // policy was instantiated from, bound to the entities the link
+            // carries. The link takes the policy's own id, so a decision it
+            // determines names the policy and not the template.
+            Some(link) => {
+                let template_id = link.policy_template_id.as_str();
+                let template_pid = cedar_policy::PolicyId::new(template_id);
+                if parses_new_text {
+                    match parse_template(Some(template_pid.clone()), statement) {
+                        Ok(template) => {
+                            if let Err(e) = set.add_template(template) {
+                                errors.push(format!(
+                                    "policy template {template_id} could not be loaded: {e}"
+                                ));
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            errors.push(format!(
+                                "policy template {template_id} could not be parsed: {e}"
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                let values = match slot_values(link) {
+                    Ok(values) => values,
+                    Err(reason) => {
+                        errors.push(format!(
+                            "policy {policy_id} could not be linked to policy template \
+                             {template_id}: {reason}"
+                        ));
+                        continue;
+                    }
+                };
+                let link_id = cedar_policy::PolicyId::new(policy_id);
+                if let Err(e) = set.link(template_pid, link_id, values) {
+                    errors.push(format!(
+                        "policy {policy_id} could not be linked to policy template \
+                         {template_id}: {e}"
+                    ));
                 }
             }
-            Err(e) => errors.push(format!("policy {policy_id} could not be parsed: {e}")),
         }
     }
-    let schema = match schema_json {
-        Some(text) => Some(
-            parse_schema(text)
+    let schema = match store.schema.as_ref() {
+        Some(schema) => Some(
+            parse_schema(&schema.cedar_json)
                 .map_err(|e| {
                     // The store's own schema was accepted by `PutSchema`, so this
                     // is service-side state the caller cannot fix.
@@ -601,23 +848,23 @@ pub fn evaluate(
     })
 }
 
-/// Evaluate `policies` for one authorization request: [`load_policies`] followed
-/// by [`build_entities`] and [`evaluate`], which is what a single-request
-/// operation needs.
+/// Evaluate one authorization request against a policy STORE:
+/// [`load_policies`] followed by [`build_entities`] and [`evaluate`], which is
+/// what a single-request operation needs.
 ///
 /// `context` and `entities` are Cedar JSON already built and already bounded by
-/// [`context_to_cedar_json`] / [`entities_to_cedar_json`]; `schema_json` is the
-/// store's schema, when it holds one.
+/// [`context_to_cedar_json`] / [`entities_to_cedar_json`]; the store's policies,
+/// its policy templates and its schema all come from the one `store`, so an
+/// evaluation can never see one of them without the others.
 pub fn authorize(
-    policies: &BTreeMap<String, Policy>,
+    store: &super::PolicyStore,
     principal: &ScopeEntity,
     action: &ScopeEntity,
     resource: &ScopeEntity,
     context: RequestContext<'_>,
     entities: serde_json::Value,
-    schema_json: Option<&str>,
 ) -> Result<Verdict, Refusal> {
-    let prepared = load_policies(policies, schema_json)?;
+    let prepared = load_policies(store)?;
     let entities = build_entities(entities, prepared.schema())?;
     Ok(evaluate(
         &prepared, principal, action, resource, context, &entities,

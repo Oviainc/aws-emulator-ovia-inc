@@ -382,7 +382,8 @@ async fn the_registry_catalog_is_not_a_repository_catalog() {
     );
 
     // And a registry display name is not a repository catalog: the repository-level
-    // reader is a separate operation, still its own gap issue.
+    // reader is a separate operation, keyed by repository name, so the repository
+    // deleted above has no record for it to report.
     let (status, parsed) = call(
         &router,
         "GetRepositoryCatalogData",
@@ -390,8 +391,39 @@ async fn the_registry_catalog_is_not_a_repository_catalog() {
     )
     .await;
     assert_eq!(
-        status, 501,
-        "case {case:?}: the repository-level reader is still a scaffold, got {status} \
-         with {parsed}"
+        status, 400,
+        "case {case:?}: expected the repository-level reader to answer 400 \
+         RepositoryNotFoundException for a deleted repository, got {status} with {parsed}"
+    );
+    assert!(
+        parsed["__type"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("RepositoryNotFoundException"),
+        "case {case:?}: expected RepositoryNotFoundException from the repository-level \
+         reader, got {parsed}"
+    );
+
+    // A repository recreated under that name reports its own, empty catalog record —
+    // with nothing of the registry's display name in it.
+    ok(
+        &router,
+        "CreateRepository",
+        json!({"repositoryName": "team/app"}),
+        case,
+    )
+    .await;
+    let repository_catalog = ok(
+        &router,
+        "GetRepositoryCatalogData",
+        json!({"repositoryName": "team/app"}),
+        case,
+    )
+    .await;
+    assert_eq!(
+        repository_catalog["catalogData"],
+        json!({}),
+        "case {case:?}: a repository's own catalog record carries no registry display \
+         name, got {repository_catalog}"
     );
 }

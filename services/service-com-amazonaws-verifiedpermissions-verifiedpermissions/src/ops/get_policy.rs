@@ -173,13 +173,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(policy_not_found)?;
 
         // A `PolicyDefinitionDetail` must agree with `policyType`, so the arm is
-        // chosen by the stored type rather than assumed. Only `CreatePolicy`'s
-        // `static` arm is served in this slice, so a stored policy is always
-        // STATIC; a template-linked one would need its template, which
-        // `CreatePolicyTemplate` does not create yet.
-        let definition = policy_definition_detail(policy).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::not_implemented("GetPolicy for a templateLinked policy")
-        })?;
+        // chosen by what the stored policy HOLDS rather than assumed.
+        let definition = policy_definition_detail(policy);
 
         Ok(GetPolicyOutput {
             policy_store_id: policy.policy_store_id.clone(),
@@ -211,19 +206,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// A persisted policy's `PolicyDefinitionDetail`.
 ///
-/// The union arm is chosen by the stored `policyType`, so the detail always
-/// agrees with the `policyType` reported beside it. `None` for a
-/// `TEMPLATE_LINKED` policy: its detail needs the `policyTemplateId` it was
-/// instantiated from, and `CreatePolicy`'s `templateLinked` arm — its own slice
-/// — does not instantiate a template yet, so no store holds such a policy.
-/// Shared with `BatchGetPolicy`, which reports
-/// the same union for the same stored policies.
-pub fn policy_definition_detail(policy: &crate::state::Policy) -> Option<PolicyDefinitionDetail> {
-    match policy.policy_type.as_str() {
-        "STATIC" => Some(PolicyDefinitionDetail::Static(StaticPolicyDefinitionDetail {
+/// The union arm is chosen by what the policy HOLDS — its own Cedar text, or the
+/// template it was instantiated from — so the detail always agrees with the
+/// `policyType` reported beside it. A template-linked policy's detail carries
+/// the `policyTemplateId` it follows and the entities it bound that template's
+/// placeholders to, and no statement: the Cedar text belongs to the template,
+/// which `GetPolicyTemplate` reports. Shared with `BatchGetPolicy`, which
+/// reports the same union for the same stored policies.
+pub fn policy_definition_detail(policy: &crate::state::Policy) -> PolicyDefinitionDetail {
+    match policy.template_link.as_ref() {
+        Some(link) => {
+            PolicyDefinitionDetail::templateLinked(TemplateLinkedPolicyDefinitionDetail {
+                policy_template_id: link.policy_template_id.clone(),
+                principal: link.principal.as_ref().map(super::create_policy::entity_identifier),
+                resource: link.resource.as_ref().map(super::create_policy::entity_identifier),
+            })
+        }
+        None => PolicyDefinitionDetail::Static(StaticPolicyDefinitionDetail {
             description: policy.description.clone(),
-            statement: policy.statement.clone(),
-        })),
-        _ => None,
+            // A static policy always holds its text; `unwrap_or_default` is the
+            // non-panicking reading of that invariant, never a fabricated value.
+            statement: policy.statement.clone().unwrap_or_default(),
+        }),
     }
 }

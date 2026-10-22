@@ -128,10 +128,15 @@ pub const CLUSTER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 pub const CONNECTOR_ACTIVATION_WINDOW: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 /// The Kubernetes version a cluster gets when `CreateCluster` is called without
-/// `version`. The model documents the member as "The desired Kubernetes version
-/// for your cluster. If you don't specify a value here, the default version
-/// available in Amazon EKS is used" without naming it, so this emulator pins one
-/// recent minor version instead of inventing a value per request.
+/// `version`: "If you don't specify a value here, the default version available
+/// in Amazon EKS is used" (`CreateCluster$version`), which the model does not
+/// name — so this emulator pins one recent minor version rather than inventing a
+/// value per request.
+///
+/// It is the row the version calendar marks `defaultVersion` (see
+/// [`seed_cluster_versions`]), so the version `DescribeClusterVersions` reports
+/// with `defaultVersion: true` is exactly the version a create without `version`
+/// uses. The unit tests at the bottom of this module pin the two together.
 pub const DEFAULT_KUBERNETES_VERSION: &str = "1.31";
 
 /// The platform version a freshly created cluster carries. EKS platform versions
@@ -1837,9 +1842,8 @@ pub const PAGE_TOKEN_TAG_LEN: usize = 4;
 /// The listing a page token belongs to, mixed into its provenance tag so a token
 /// one listing minted is not resumed from by another.
 ///
-/// `ListClusters` pages the cluster names and is the listing whose tokens are
-/// computed with the EMPTY scope, which is what [`encode_page_token`] passes — so
-/// its tokens are exactly what they were before the scope was introduced.
+/// `ListClusters` pages the cluster names and is the listing whose tokens carry the
+/// EMPTY scope, which is what [`encode_page_token`] passes.
 pub const CLUSTERS_LISTING: &str = "";
 /// The scope `ListAccessPolicies`'s tokens carry. See [`CLUSTERS_LISTING`].
 pub const ACCESS_POLICIES_LISTING: &str = "access-policies";
@@ -1872,8 +1876,28 @@ pub fn encode_scoped_page_token(listing: &str, last_returned: &str) -> String {
 
 /// The provenance tag a `listing`'s token carries for `last_returned`: the first
 /// [`PAGE_TOKEN_TAG_LEN`] bytes of the digest of the two together.
+///
+/// The scope is LENGTH-PREFIXED before it is digested, which is what makes the tag
+/// a function of the PAIR `(listing, last_returned)` rather than of their
+/// concatenation. Digesting the bare concatenation assigns the SAME tag to two
+/// different pairs whose concatenations are equal — `("", "cluster-versionsmy-cluster")`
+/// and `("cluster-versions", "my-cluster")`, and the empty [`CLUSTERS_LISTING`]
+/// makes such a pair exist for every scope — so one listing's tag could be spliced
+/// onto the other listing's payload. That is domain separation of the tag input,
+/// not a security boundary: the tag is unkeyed and public (see
+/// [`PAGE_TOKEN_TAG_LEN`]), and [`decode_scoped_page_token`] re-digests the
+/// payload it reads, so a token is never resumed under a scope that did not mint
+/// it either way.
 fn page_token_tag(listing: &str, last_returned: &str) -> [u8; PAGE_TOKEN_TAG_LEN] {
     let mut digest = Sha256::new();
+    // `usize` is at most 64 bits on every target this emulator builds for, so the
+    // conversion is total; the fixed 8-byte width is what keeps the prefix itself
+    // unambiguous.
+    digest.update(
+        u64::try_from(listing.len())
+            .expect("a listing scope shorter than 2^64 bytes")
+            .to_be_bytes(),
+    );
     digest.update(listing.as_bytes());
     digest.update(last_returned.as_bytes());
     let digest = digest.finalize();
@@ -2045,6 +2069,88 @@ mod tests {
                 "case {case}: the ClusterVersionStatus token must round-trip, got {}",
                 actual.cluster_version_status()
             );
+        }
+    }
+
+    /// The tag commits to the PAIR `(listing, last_returned)`, not to their
+    /// concatenation: two pairs whose concatenations are equal must still get
+    /// different tags, or one listing's tag could be spliced onto the other
+    /// listing's payload. This is the assertion the length prefix in
+    /// `page_token_tag` exists for — it fails on a digest of the bare
+    /// concatenation — and the rows are the colliding pairs the empty
+    /// [`CLUSTERS_LISTING`] creates for each of the other scopes.
+    #[test]
+    fn a_page_tag_separates_the_listing_from_the_key() {
+        let colliding_pairs = [
+            (
+                (CLUSTERS_LISTING, "cluster-versionsmy-cluster"),
+                (CLUSTER_VERSIONS_LISTING, "my-cluster"),
+            ),
+            (
+                (CLUSTERS_LISTING, "access-policiesAmazonEKSViewPolicy"),
+                (ACCESS_POLICIES_LISTING, "AmazonEKSViewPolicy"),
+            ),
+            (
+                (CLUSTERS_LISTING, "cluster-versions"),
+                (CLUSTER_VERSIONS_LISTING, ""),
+            ),
+        ];
+
+        for ((left_listing, left_key), (right_listing, right_key)) in colliding_pairs {
+            // The rows really are the ambiguous case: concatenating each pair gives
+            // the same bytes, which is what an unprefixed digest would hash.
+            assert_eq!(
+                format!("{left_listing}{left_key}"),
+                format!("{right_listing}{right_key}"),
+                "case {left_listing:?}/{left_key:?}: the row must be a concatenation collision"
+            );
+            let left = page_token_tag(left_listing, left_key);
+            let right = page_token_tag(right_listing, right_key);
+            assert_ne!(
+                left, right,
+                "case {left_listing:?}/{left_key:?} vs {right_listing:?}/{right_key:?}: the tag \
+                 must separate the listing from the key, got {left:?} for both"
+            );
+        }
+    }
+
+    /// A listing resumes from its own token and from no other listing's, over a
+    /// table that spans every scope this service mints tokens under.
+    #[test]
+    fn a_page_token_is_scoped_to_the_listing_that_minted_it() {
+        let cases = [
+            (CLUSTERS_LISTING, "my-cluster"),
+            (ACCESS_POLICIES_LISTING, "AmazonEKSViewPolicy"),
+            (CLUSTER_VERSIONS_LISTING, DEFAULT_KUBERNETES_VERSION),
+            // Keys that carry another scope's token as a prefix, so the payload a
+            // listing reads back is not confused with the scope it was minted
+            // under.
+            (CLUSTERS_LISTING, "cluster-versionsmy-cluster"),
+            (CLUSTERS_LISTING, "access-policiesAmazonEKSViewPolicy"),
+        ];
+
+        for (listing, key) in cases {
+            let token = encode_scoped_page_token(listing, key);
+            assert_eq!(
+                decode_scoped_page_token(listing, &token),
+                Some(key.to_string()),
+                "case {listing:?}/{key:?}: a listing must resume from its own token"
+            );
+            for other in [
+                CLUSTERS_LISTING,
+                ACCESS_POLICIES_LISTING,
+                CLUSTER_VERSIONS_LISTING,
+            ] {
+                if other == listing {
+                    continue;
+                }
+                let resumed = decode_scoped_page_token(other, &token);
+                assert_eq!(
+                    resumed, None,
+                    "case {listing:?}/{key:?}: expected listing {other:?} to refuse this token, \
+                     got {resumed:?}"
+                );
+            }
         }
     }
 }

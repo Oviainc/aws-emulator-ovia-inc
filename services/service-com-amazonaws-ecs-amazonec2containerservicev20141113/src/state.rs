@@ -33,17 +33,17 @@
 //! instance registers later — is not modelled: nothing runs between calls, and a
 //! reporting operation may not place a task nobody asked for.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    Attribute, CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterSetting,
-    Container, ContainerDefinition, ContainerInstance, Deployment, DeploymentCircuitBreaker,
-    DeploymentConfiguration, DeploymentController, EphemeralStorage, Failure, KeyValuePair,
-    LoadBalancer, NetworkConfiguration, PlacementConstraint, PlacementStrategy, PlatformDevice,
-    PortMapping,
+    Attachment, Attribute, CapacityProviderStrategyItem, Cluster, ClusterConfiguration,
+    ClusterServiceConnectDefaults, ClusterSetting, Container, ContainerDefinition,
+    ContainerInstance, Deployment, DeploymentCircuitBreaker, DeploymentConfiguration,
+    DeploymentController, EphemeralStorage, Failure, KeyValuePair, LoadBalancer,
+    NetworkConfiguration, PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping,
     ProxyConfiguration, Resource, RuntimePlatform, Service, ServiceConnectConfiguration,
     ServiceCurrentRevisionSummary, ServiceEvent, ServiceRegistry, ServiceVolumeConfiguration, Tag,
     Task, TaskDefinition, TaskDefinitionPlacementConstraint, TaskOverride, ThresholdConfiguration,
@@ -144,6 +144,47 @@ pub const STATUS_RUNNING: &str = "RUNNING";
 pub const STATUS_DEACTIVATING: &str = "DEACTIVATING";
 /// See [`STATUS_PENDING`].
 pub const STATUS_STOPPED: &str = "STOPPED";
+
+/// `Cluster$attachmentsStatus` while the cluster's capacity-provider association is
+/// being applied — the member's doc: "UPDATE_IN_PROGRESS: The available capacity
+/// providers for the cluster are updating."
+pub const ATTACHMENTS_UPDATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
+/// `Cluster$attachmentsStatus` once it has been applied — the same doc:
+/// "UPDATE_COMPLETE: The capacity providers have successfully updated."
+pub const ATTACHMENTS_UPDATE_COMPLETE: &str = "UPDATE_COMPLETE";
+
+/// The message of the `UpdateInProgressException` a cluster mutation is refused with
+/// while the cluster's attachments are updating. It states the precondition the
+/// `Cluster$attachmentsStatus` doc describes (`UPDATE_IN_PROGRESS` -> `UPDATE_COMPLETE`
+/// / `UPDATE_FAILED`), which is what the refusal is about; the HTTP status (400) and the
+/// error code are what a client matches on.
+pub const CLUSTER_BUSY_MESSAGE: &str = "The specified cluster is in a busy state. Cluster \
+                                        attachments must be in UPDATE_COMPLETE or \
+                                        UPDATE_FAILED state before they can be updated. \
+                                        Wait and try again.";
+
+/// How many capacity providers one cluster may hold, and so the longest
+/// `capacityProviders` list and `defaultCapacityProviderStrategy` one
+/// `PutClusterCapacityProviders` may carry (every strategy entry must name one of the
+/// providers the same request associates). The Amazon ECS service quota "Capacity
+/// providers per cluster" is 20, and the cap is also what bounds the work ONE request
+/// can ask for: the association is checked list-against-list and against the stored
+/// association, so an uncapped list would let one caller choose the cost of both
+/// factors.
+pub const MAX_CLUSTER_CAPACITY_PROVIDERS: usize = 20;
+
+/// The values `ClusterSetting$value` accepts, from that member's own doc: "The supported
+/// values are `enhanced`, `enabled`, and `disabled`." The setting NAME is a closed enum
+/// the boundary validator already refuses outside, but the value is a free string the
+/// service constrains itself — so every operation that accepts a `ClusterSetting`
+/// ([`crate::ops::create_cluster`], [`crate::ops::update_cluster`],
+/// [`crate::ops::update_cluster_settings`]) checks it through
+/// [`validate_cluster_settings`].
+pub const CLUSTER_SETTING_VALUES: [&str; 3] = ["enhanced", "enabled", "disabled"];
+
+/// `ExecuteCommandConfiguration$logging` value that carries its own destination — the
+/// member's doc: "OVERRIDE: Specify the logging details as a part of logConfiguration."
+pub const EXECUTE_COMMAND_LOGGING_OVERRIDE: &str = "OVERRIDE";
 
 /// `Cluster$status` for a live cluster.
 pub const CLUSTER_ACTIVE: &str = "ACTIVE";
@@ -439,10 +480,11 @@ pub const CLUSTER_CONTAINS_TASKS_MESSAGE: &str = "You can't delete a cluster tha
 pub const SERVICE_SCALED_ABOVE_ZERO_MESSAGE: &str =
     "The service cannot be stopped while it is scaled above 0.";
 
-/// A cluster, as `CreateCluster` left it. A DELETED cluster is still one of these, with
-/// `status` [`CLUSTER_INACTIVE`]: `DeleteCluster` tombstones the record rather than
-/// dropping it, because "Clusters with an INACTIVE status may remain discoverable in your
-/// account for a period of time."
+/// A cluster, as `CreateCluster` created it and every cluster-mutating operation
+/// (`UpdateCluster`, `UpdateClusterSettings`, `PutClusterCapacityProviders`) has left it.
+/// A DELETED cluster is still one of these, with `status` [`CLUSTER_INACTIVE`]:
+/// `DeleteCluster` tombstones the record rather than dropping it, because "Clusters with
+/// an INACTIVE status may remain discoverable in your account for a period of time."
 #[derive(Debug, Clone)]
 pub struct ClusterRecord {
     pub name: String,
@@ -453,6 +495,69 @@ pub struct ClusterRecord {
     pub configuration: Option<ClusterConfiguration>,
     pub capacity_providers: Vec<String>,
     pub default_capacity_provider_strategy: Vec<CapacityProviderStrategyItem>,
+    /// The default Service Connect namespace, as `CreateCluster` or `UpdateCluster` set
+    /// it. `None` once a request clears it with an empty namespace name.
+    pub service_connect_defaults: Option<ClusterServiceConnectDefaults>,
+    /// `Cluster$attachmentsStatus`: `None` until a capacity-provider association is
+    /// applied to this cluster, then [`ATTACHMENTS_UPDATE_IN_PROGRESS`] until the clock
+    /// makes [`ATTACHMENTS_UPDATE_COMPLETE`] due.
+    pub attachments_status: Option<String>,
+    /// When the attachments update this cluster is in the middle of falls due. Stored,
+    /// never slept on: [`ComAmazonawsEcsAmazonec2containerservicev20141113State::advance_clock`]
+    /// materialises it.
+    pub attachments_update_due_at: Option<SystemTime>,
+}
+
+impl ClusterRecord {
+    /// Apply the settings of a request to the stored cluster.
+    ///
+    /// `ClusterSettings` is keyed by `ClusterSetting$name`, so a request carries the
+    /// settings it wants to CHANGE: one the request names replaces the stored value of
+    /// that name, and one it does not name keeps it. Shared by `UpdateClusterSettings`
+    /// ("Modifies the settings to use for a cluster") and `UpdateCluster$settings` ("The
+    /// cluster settings for your cluster"), so both write the same way, and keyed per
+    /// cluster because the record is.
+    pub fn apply_settings(&mut self, settings: &[ClusterSetting]) {
+        for setting in settings {
+            match self
+                .settings
+                .iter_mut()
+                .find(|stored| stored.name == setting.name)
+            {
+                Some(stored) => stored.value = setting.value.clone(),
+                None => self.settings.push(setting.clone()),
+            }
+        }
+    }
+
+    /// Start the attachments update that associating capacity providers with this
+    /// cluster owes, due [`TRANSITION_SPAN`] from `now`.
+    ///
+    /// `Cluster$attachmentsStatus` reports `UPDATE_IN_PROGRESS` while "the available
+    /// capacity providers for the cluster are updating" and `UPDATE_COMPLETE` once "the
+    /// capacity providers have successfully updated" — a transition the CLOCK owes, so a
+    /// caller that reads straight back still sees the in-progress state.
+    pub fn start_attachments_update(&mut self, now: SystemTime) {
+        self.attachments_status = Some(ATTACHMENTS_UPDATE_IN_PROGRESS.to_string());
+        self.attachments_update_due_at = Some(now + TRANSITION_SPAN);
+    }
+
+    /// Whether this cluster's attachments are mid-update, which is what the busy-state
+    /// refusal of a cluster mutation is about: "Cluster attachments must be in
+    /// UPDATE_COMPLETE or UPDATE_FAILED state before they can be updated."
+    pub fn attachments_updating(&self) -> bool {
+        self.attachments_status.as_deref() == Some(ATTACHMENTS_UPDATE_IN_PROGRESS)
+    }
+
+    /// The resources attached to the cluster. `Cluster$attachments`: "When using a
+    /// capacity provider with a cluster, the capacity provider and associated resources
+    /// are returned as cluster attachments" — the Auto Scaling group and managed
+    /// instance infrastructure a capacity provider provisions. This emulator provisions
+    /// no such resource (`CreateCapacityProvider` mints none), so an associated capacity
+    /// provider attaches nothing and the list is empty rather than invented.
+    pub fn attachments(&self) -> Vec<Attachment> {
+        Vec::new()
+    }
 }
 
 impl ClusterRecord {
@@ -1187,6 +1292,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// `now`. Safe to call from a reporting operation: it only applies changes that
     /// were owed at this instant whether or not anybody called.
     pub fn advance_clock(&mut self, now: SystemTime) {
+        // The capacity-provider association a cluster mutation started: once the update
+        // is due the cluster's attachments have "successfully updated", whether or not
+        // anybody called to look.
+        for cluster in self.clusters.values_mut() {
+            if let Some(due) = cluster.attachments_update_due_at {
+                if due <= now {
+                    cluster.attachments_update_due_at = None;
+                    cluster.attachments_status = Some(ATTACHMENTS_UPDATE_COMPLETE.to_string());
+                }
+            }
+        }
         for task in self.tasks.values_mut() {
             if let Some(due) = task.running_due_at {
                 if due <= now {
@@ -1410,6 +1526,25 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .values()
             .filter(|instance| instance.cluster_name == cluster_name && instance.is_registered())
             .count()
+    }
+
+    /// The stored key of the container instance a `containerInstance` reference names,
+    /// if this store holds it in `cluster_name`.
+    ///
+    /// Every such member's doc: "The container instance ID or full ARN of the container
+    /// instance" — so a reference is either form — and the `cluster` member scopes the
+    /// request: "If you do not specify a cluster, the default cluster is assumed." An
+    /// instance registered into another cluster is not one this request names.
+    pub fn resolve_container_instance(
+        &self,
+        region: &str,
+        cluster_name: &str,
+        reference: &str,
+    ) -> Option<&ContainerInstanceRecord> {
+        let arn = container_instance_arn_from_reference(region, cluster_name, reference);
+        self.container_instances
+            .get(&arn)
+            .filter(|instance| instance.cluster_name == cluster_name)
     }
 
     /// The latest `ACTIVE` revision registered for `family`, if any.
@@ -1918,6 +2053,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         })
     }
 
+    /// The capacity providers that tasks of `cluster_name` which have not stopped were
+    /// placed with, collected in ONE pass over the task map.
+    ///
+    /// `PutClusterCapacityProviders`: "You can only disassociate an existing capacity
+    /// provider from a cluster if it's not being used by any existing tasks" — this is
+    /// that use, gathered once so a caller's provider list cannot multiply the scan.
+    pub fn capacity_providers_in_use(&self, cluster_name: &str) -> HashSet<String> {
+        self.tasks
+            .values()
+            .filter(|task| task.cluster_name == cluster_name && task.is_active())
+            .filter_map(|task| task.capacity_provider_name.clone())
+            .collect()
+    }
+
     /// The `Cluster` a cluster-returning operation reports.
     ///
     /// The counters are COMPUTED from the task, container-instance and service maps, so
@@ -1975,20 +2124,26 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             } else {
                 Vec::new()
             }),
-            // Capacity-provider attachments are created by
-            // PutClusterCapacityProviders, which is not part of this slice, so a
-            // cluster here has none to report.
+            // `Cluster$attachments` and `Cluster$attachmentsStatus` are what
+            // `DescribeClusters$include` `ATTACHMENTS` asks for, so they are reported
+            // only when it does. The list itself stays empty: attachments are the
+            // resources a capacity provider provisions, and this emulator provisions
+            // none (see [`ClusterRecord::attachments`]).
             attachments: if fields.attachments {
-                Some(Vec::new())
+                Some(cluster.attachments())
             } else {
                 None
             },
-            attachments_status: None,
-            service_connect_defaults: None,
+            attachments_status: if fields.attachments {
+                cluster.attachments_status.clone()
+            } else {
+                None
+            },
+            service_connect_defaults: cluster.service_connect_defaults.clone(),
         }
     }
 
-    /// The `Cluster` an operation that CREATES or DELETES a cluster reports.
+    /// The `Cluster` an operation that CREATES, UPDATES or DELETES a cluster reports.
     ///
     /// Such an operation carries no `include` member, and the halves of a `Cluster`
     /// answer that differently.
@@ -2171,6 +2326,60 @@ pub fn missing_failure(arn: &str) -> Failure {
         arn: Some(arn.to_string()),
         reason: Some(FAILURE_MISSING.to_string()),
         detail: None,
+    }
+}
+
+/// Check the `ClusterSettings` of a request against [`CLUSTER_SETTING_VALUES`],
+/// answering the message an `InvalidParameterException` carries when one is outside it.
+///
+/// Shared by every operation that accepts cluster settings, so the same value is
+/// accepted or refused whichever of them a client calls.
+pub fn validate_cluster_settings(settings: &[ClusterSetting]) -> Result<(), String> {
+    for setting in settings {
+        let value = setting.value.as_deref().unwrap_or_default();
+        if !CLUSTER_SETTING_VALUES.contains(&value) {
+            return Err(format!(
+                "settings value must be one of {}; got {value:?}",
+                CLUSTER_SETTING_VALUES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check a `ClusterConfiguration` a request carries, answering the message an
+/// `InvalidParameterException` carries when it is not usable.
+///
+/// `ExecuteCommandConfiguration$logConfiguration`: "When `logging=OVERRIDE` is
+/// specified, a `logConfiguration` must be provided." Shared by every operation that
+/// accepts a cluster configuration.
+pub fn validate_cluster_configuration(configuration: &ClusterConfiguration) -> Result<(), String> {
+    if let Some(execute_command) = &configuration.execute_command_configuration {
+        if execute_command.logging.as_deref() == Some(EXECUTE_COMMAND_LOGGING_OVERRIDE)
+            && execute_command.log_configuration.is_none()
+        {
+            return Err(format!(
+                "configuration.executeCommandConfiguration.logConfiguration is required \
+                 when logging is {EXECUTE_COMMAND_LOGGING_OVERRIDE}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The stored default Service Connect namespace a request's
+/// `ClusterServiceConnectDefaultsRequest` asks for.
+///
+/// The member's doc: "If you update the cluster with an empty string `\"\"` for the
+/// namespace name, the cluster configuration for Service Connect is removed" — so an
+/// empty namespace CLEARS the default rather than storing a nameless one.
+pub fn service_connect_defaults(namespace: &str) -> Option<ClusterServiceConnectDefaults> {
+    if namespace.is_empty() {
+        None
+    } else {
+        Some(ClusterServiceConnectDefaults {
+            namespace: Some(namespace.to_string()),
+        })
     }
 }
 

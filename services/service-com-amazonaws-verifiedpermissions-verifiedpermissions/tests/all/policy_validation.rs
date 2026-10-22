@@ -8,7 +8,9 @@
 //!    a `fieldList` whose entry names the offending member by its JSON-pointer
 //!    `path`. The table below spans the operations and the members that rule
 //!    covers, and the kinds of failure (absent, unparseable, over-long,
-//!    schema-violating, not-ours, out of this emulator's reach, past a bound).
+//!    not-ours, out of this emulator's reach, past a bound). A refusal by the
+//!    store's SCHEMA is its own rule, pinned in
+//!    [`a_schema_refusal_reports_every_reason_at_the_validated_member`].
 //! 2. A schema-conformant static policy submitted to a `STRICT` store is STORED,
 //!    and every member of the create response comes back out of state through
 //!    `GetPolicy` and `ListPolicies`.
@@ -124,27 +126,16 @@ async fn a_refused_request_names_the_offending_member_in_field_list() {
     let router = router();
     let off_store = store_with_mode(&router, "OFF").await;
     let strict_store = store_with_mode(&router, "STRICT").await;
-    let schema_store = store_with_mode(&router, "STRICT").await;
-    ok(
-        &router,
-        "PutSchema",
-        &json!({
-            "policyStoreId": schema_store,
-            "definition": { "cedarJson": photo_app_schema() },
-        }),
-    )
-    .await;
 
     let conformant = "permit(principal == PhotoApp::User::\"alice\", \
                       action == PhotoApp::Action::\"viewPhoto\", \
                       resource == PhotoApp::Photo::\"vacation.jpg\");";
-    let undeclared_action = "permit(principal == PhotoApp::User::\"alice\", \
-                             action == PhotoApp::Action::\"deletePhoto\", \
-                             resource == PhotoApp::Photo::\"vacation.jpg\");";
 
     // (case, operation, request, the path the refusal must name)
     let cases: Vec<(&str, &str, Value, &str)> = vec![
         (
+            // The member at fault is the statement's own CONTENT, which no
+            // schema was consulted about: the store's validation mode is OFF.
             "a statement that is not Cedar",
             "CreatePolicy",
             json!({
@@ -172,15 +163,6 @@ async fn a_refused_request_names_the_offending_member_in_field_list() {
             // Nothing is wrong with the statement here: the store named by
             // `policyStoreId` is the one holding no schema.
             "/policyStoreId",
-        ),
-        (
-            "a statement the store's schema does not sanction",
-            "CreatePolicy",
-            json!({
-                "policyStoreId": schema_store,
-                "definition": { "static": { "statement": undeclared_action } },
-            }),
-            "/definition/static/statement",
         ),
         (
             "a schema that is not JSON",
@@ -410,6 +392,207 @@ async fn a_refused_request_names_the_offending_member_in_field_list() {
             "case {case:?}: expected a non-empty fieldList message, got {body}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The schema refusal
+// ---------------------------------------------------------------------------
+
+/// Policy content the store's SCHEMA refuses answers with one `fieldList` entry
+/// per reason the Cedar validator raised, every entry naming the request member
+/// whose CONTENT was validated — `/definition` where the policy content arrives
+/// inside a definition, `/statement` where the operation carries it at the top
+/// level — and never one entry concatenating several reasons, nor an entry at a
+/// deeper member the schema said nothing about.
+///
+/// The rows differ along the operation that validates (create, update, template
+/// create), the arm the content arrives in, and HOW MANY distinct reasons the
+/// policy raises: a policy naming two undeclared entity types raises one reason
+/// per type, which is what pins "one entry per reason" rather than "one entry".
+#[tokio::test]
+async fn a_schema_refusal_reports_every_reason_at_the_validated_member() {
+    let router = router();
+    let store_id = store_with_mode(&router, "STRICT").await;
+    ok(
+        &router,
+        "PutSchema",
+        &json!({
+            "policyStoreId": store_id,
+            "definition": { "cedarJson": photo_app_schema() },
+        }),
+    )
+    .await;
+
+    // A policy the schema does sanction, so the UpdatePolicy row has something
+    // to replace and only its ACTION changes — the one scope element an update
+    // may change — leaving the schema as the only thing that can refuse it.
+    let created = ok(
+        &router,
+        "CreatePolicy",
+        &json!({
+            "policyStoreId": store_id,
+            "definition": { "static": { "statement":
+                "permit(principal == PhotoApp::User::\"alice\", \
+                 action == PhotoApp::Action::\"viewPhoto\", \
+                 resource == PhotoApp::Photo::\"vacation.jpg\");" } },
+        }),
+    )
+    .await;
+    let policy_id = created["policyId"].as_str().unwrap_or_default().to_string();
+
+    // (case, operation, request, the member whose content was validated, how
+    //  many reasons the policy raises at least)
+    let cases: Vec<(&str, &str, Value, &str, usize)> = vec![
+        (
+            // The recorded case: an action id the schema never declares.
+            "CreatePolicy naming an action the schema does not declare",
+            "CreatePolicy",
+            json!({
+                "policyStoreId": store_id,
+                "definition": { "static": { "statement":
+                    "permit(principal == PhotoApp::User::\"alice\", \
+                     action == PhotoApp::Action::\"deletePhoto\", \
+                     resource == PhotoApp::Photo::\"vacation.jpg\");" } },
+            }),
+            "/definition",
+            1,
+        ),
+        (
+            // TWO undeclared entity types: two independent reasons, so two
+            // entries. One concatenated entry would fail here.
+            "CreatePolicy naming two entity types the schema does not declare",
+            "CreatePolicy",
+            json!({
+                "policyStoreId": store_id,
+                "definition": { "static": { "statement":
+                    "permit(principal == PhotoApp::Ghost::\"g\", \
+                     action == PhotoApp::Action::\"viewPhoto\", \
+                     resource == PhotoApp::Album::\"a\");" } },
+            }),
+            "/definition",
+            2,
+        ),
+        (
+            // An attribute the schema's entity shape does not declare.
+            "CreatePolicy reading an attribute the schema does not declare",
+            "CreatePolicy",
+            json!({
+                "policyStoreId": store_id,
+                "definition": { "static": { "statement":
+                    "permit(principal == PhotoApp::User::\"alice\", \
+                     action == PhotoApp::Action::\"viewPhoto\", \
+                     resource == PhotoApp::Photo::\"vacation.jpg\") \
+                     when { principal.nickname == \"al\" };" } },
+            }),
+            "/definition",
+            1,
+        ),
+        (
+            // The same rule on the UPDATE path: the replacement changes only
+            // the action, so the schema is what refuses it.
+            "UpdatePolicy replacing the action with one the schema does not declare",
+            "UpdatePolicy",
+            json!({
+                "policyStoreId": store_id,
+                "policyId": policy_id,
+                "definition": { "static": { "statement":
+                    "permit(principal == PhotoApp::User::\"alice\", \
+                     action == PhotoApp::Action::\"deletePhoto\", \
+                     resource == PhotoApp::Photo::\"vacation.jpg\");" } },
+            }),
+            "/definition",
+            1,
+        ),
+        (
+            // A policy TEMPLATE carries its Cedar text at the top level, so the
+            // validated member is `/statement`.
+            "CreatePolicyTemplate naming an action the schema does not declare",
+            "CreatePolicyTemplate",
+            json!({
+                "policyStoreId": store_id,
+                "statement": "permit(principal == ?principal, \
+                              action == PhotoApp::Action::\"deletePhoto\", \
+                              resource == PhotoApp::Photo::\"vacation.jpg\");",
+            }),
+            "/statement",
+            1,
+        ),
+    ];
+
+    for (case, operation, request, path, least) in &cases {
+        let (status, body) = call(&router, operation, request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException, got {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(INVALID_INPUT_MESSAGE),
+            "case {case:?}: expected the fixed message {INVALID_INPUT_MESSAGE:?}, got {body}"
+        );
+        let fields = body["fieldList"].as_array().cloned().unwrap_or_default();
+        assert!(
+            fields.len() >= *least,
+            "case {case:?}: expected at least {least} fieldList entries, one per validation \
+             reason, got {body}"
+        );
+        for field in &fields {
+            assert_eq!(
+                field["path"].as_str(),
+                Some(*path),
+                "case {case:?}: every schema-validation entry names the validated member \
+                 {path:?}, got {body}"
+            );
+            let reason = field["message"].as_str().unwrap_or_default();
+            assert!(
+                !reason.is_empty(),
+                "case {case:?}: expected a non-empty fieldList message, got {body}"
+            );
+            // One entry per reason, so no entry carries several of them joined
+            // together — which is exactly what a concatenated message looks like.
+            assert!(
+                !reason.contains("; "),
+                "case {case:?}: each reason gets its own entry rather than being \
+                 concatenated, got {reason:?}"
+            );
+        }
+        let distinct: std::collections::BTreeSet<&str> = fields
+            .iter()
+            .map(|field| field["message"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            fields.len(),
+            "case {case:?}: each entry reports a DIFFERENT reason, got {body}"
+        );
+    }
+
+    // Nothing above was stored: the refused create and the refused update left
+    // the store holding exactly the one policy that validated, with its original
+    // statement.
+    let listed = ok(&router, "ListPolicies", &json!({ "policyStoreId": store_id })).await;
+    assert_eq!(
+        listed["policies"].as_array().map(Vec::len),
+        Some(1),
+        "a refused policy must not be stored, got {listed}"
+    );
+    let fetched = ok(
+        &router,
+        "GetPolicy",
+        &json!({ "policyStoreId": store_id, "policyId": policy_id }),
+    )
+    .await;
+    assert!(
+        fetched["definition"]["static"]["statement"]
+            .as_str()
+            .is_some_and(|statement| statement.contains("viewPhoto")),
+        "a refused update must leave the stored statement alone, got {fetched}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -8,15 +8,22 @@
 //! ([`crate::state::cedar::parse_static_policy`]), never pattern-matched out of
 //! the text, and every response field is read back out of what was persisted.
 //!
-//! The `templateLinked` arm instantiates a policy template, which is its own
-//! operation slice, so it answers the scaffold's 501 rather than a fabricated
-//! policy.
+//! The `templateLinked` arm INSTANTIATES a policy template: the policy records
+//! the template it links to and the entities it binds that template's
+//! `?principal` / `?resource` placeholders to, and its effect and scope come
+//! from Cedar's own template link ([`crate::state::cedar::link_template`]). The
+//! link holds no copy of the template's text, because a template-linked policy
+//! follows its template when the template changes.
 //!
-//! A statement this operation refuses — unparseable Cedar, longer than one policy
-//! may carry, or not sanctioned by the store's schema in `STRICT` mode — is
-//! refused with the model's own `ValidationException`, whose `fieldList` names
-//! `/definition/static/statement`, the member at fault. See
-//! [`crate::ops::validation_exception`].
+//! A definition this operation refuses is refused with the model's own
+//! `ValidationException`. A refusal of the request's own SHAPE names the member
+//! at fault — `/definition/static/statement` for Cedar text it cannot parse or
+//! that is longer than one policy may carry, `/definition/templateLinked/...`
+//! for a placeholder binding that disagrees with the template. A refusal by the
+//! store's SCHEMA in `STRICT` mode names `/definition`, the member whose content
+//! was validated, with one entry per validation reason Cedar raised. See
+//! [`crate::ops::validation_exception`] and
+//! [`crate::ops::schema_validation_exception`].
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -193,11 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the service state store is unavailable".to_string(),
             })
         };
-        // Every refusal of the caller's policy text answers with the model's own
-        // `ValidationException`, whose `fieldList` names the member at fault —
-        // here always `definition.static.statement`, the one member whose content
-        // this operation validates. A refusal the CALLER cannot fix (the store's
-        // own stored schema failing to parse) is a server fault instead.
+        // Every refusal of the caller's definition answers with the model's own
+        // `ValidationException`, whose `fieldList` names the member at fault. A
+        // refusal the CALLER cannot fix (the store's own stored schema or
+        // template failing to parse) is a server fault instead.
         let invalid = |invalid: crate::ops::InvalidInput| -> CreatePolicyError {
             CreatePolicyErrorModeled::ValidationException(crate::ops::validation_exception([
                 invalid,
@@ -207,6 +213,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let refused = |refusal: crate::state::cedar::Refusal| -> CreatePolicyError {
             match refusal {
                 crate::state::cedar::Refusal::InvalidInput(field) => invalid(field),
+                // The store's SCHEMA refused the policy this definition
+                // describes: one `fieldList` entry per validation reason, all of
+                // them naming `/definition`, the member whose content was
+                // validated.
+                crate::state::cedar::Refusal::SchemaValidation(reasons) => {
+                    CreatePolicyErrorModeled::ValidationException(
+                        crate::ops::schema_validation_exception(
+                            crate::ops::paths::DEFINITION,
+                            reasons,
+                        ),
+                    )
+                    .into()
+                }
                 crate::state::cedar::Refusal::ServiceFault(message) => {
                     CreatePolicyErrorModeled::InternalServerException(InternalServerException {
                         message,
@@ -216,26 +235,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // Only the `static` arm is served here: instantiating a template into a
-        // policy (resolving its `?principal`/`?resource` slots and linking the
-        // policy to the template) is its own slice, so there is nothing honest to
-        // return for `templateLinked` yet.
-        let definition = match &input.definition {
-            PolicyDefinition::Static(def) => def.clone(),
-            PolicyDefinition::templateLinked(_) => {
-                return Err(crate::scaffolded::Scaffolded::not_implemented(
-                    "CreatePolicy with a templateLinked definition",
-                ));
-            }
-        };
-
         // The SIZE BOUND on everything below: the cheap length check, before the
         // state lock and before any Cedar parse or schema validation, so no
-        // caller-sized statement reaches the parser or the validator. Only the
-        // length is checked here — the full parse stays where it was, after the
-        // store is resolved, so an unknown store is still a 404 and a client
+        // caller-sized statement reaches the parser or the validator. Only a
+        // `static` definition carries caller-sized Cedar text — a
+        // `templateLinked` one carries a template reference and two entity
+        // identifiers, each already bounded by the model — so only it has a size
+        // to check. Only the length is checked here; the full parse stays after
+        // the store is resolved, so an unknown store is still a 404 and a client
         // token still replays before the statement is parsed.
-        crate::state::cedar::check_statement_size(&definition.statement).map_err(invalid)?;
+        if let PolicyDefinition::Static(def) = &input.definition {
+            crate::state::cedar::check_statement_size(&def.statement).map_err(invalid)?;
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();
@@ -245,12 +256,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `@idempotencyToken` replay: the same token answers with the policy the
         // first call created; the same token with different parameters conflicts.
-        let parameters = crate::state::idempotency_parameters(&[
-            ("store", Some(store_id.as_str())),
-            ("name", input.name.as_deref()),
-            ("statement", Some(definition.statement.as_str())),
-            ("description", definition.description.as_deref()),
-        ]);
+        // The fingerprint names every member of the definition arm the request
+        // carried, so a retry that switches arms — or changes one placeholder
+        // binding — is a different request.
+        let parameters = match &input.definition {
+            PolicyDefinition::Static(def) => crate::state::idempotency_parameters(&[
+                ("store", Some(store_id.as_str())),
+                ("name", input.name.as_deref()),
+                ("statement", Some(def.statement.as_str())),
+                ("description", def.description.as_deref()),
+            ]),
+            PolicyDefinition::templateLinked(def) => crate::state::idempotency_parameters(&[
+                ("store", Some(store_id.as_str())),
+                ("name", input.name.as_deref()),
+                ("policyTemplateId", Some(def.policy_template_id.as_str())),
+                (
+                    "principalType",
+                    def.principal.as_ref().map(|e| e.entity_type.as_str()),
+                ),
+                (
+                    "principalId",
+                    def.principal.as_ref().map(|e| e.entity_id.as_str()),
+                ),
+                (
+                    "resourceType",
+                    def.resource.as_ref().map(|e| e.entity_type.as_str()),
+                ),
+                (
+                    "resourceId",
+                    def.resource.as_ref().map(|e| e.entity_id.as_str()),
+                ),
+            ]),
+        };
         if let Some(token) = input.client_token.as_deref() {
             if let Some(record) = state.idempotency_replay("CreatePolicy", token) {
                 if record.parameters != parameters {
@@ -287,31 +324,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store", and "If Mode=STRICT and the policy store doesn't contain a
         // schema, Verified Permissions rejects all static policies and policy
         // templates because there is no schema to validate against."
-        if store.validation_mode == "STRICT" {
-            match store.schema.as_ref() {
+        let schema_json = match store.validation_mode.as_str() {
+            "STRICT" => match store.schema.as_ref() {
                 None => {
-                    // Nothing is wrong with the statement here: the STORE the
+                    // Nothing is wrong with the definition here: the STORE the
                     // request named holds no schema, which is the member the
                     // caller can act on (put a schema in it, or name a store
                     // that has one).
                     return Err(invalid(crate::ops::InvalidInput::new(
                         crate::ops::paths::POLICY_STORE_ID,
                         "its validation mode is STRICT and it contains no schema, so there \
-                         is nothing to validate a static policy against",
+                         is nothing to validate a policy against",
                     )));
                 }
-                Some(schema) => {
-                    crate::state::cedar::validate_static_policy(
-                        &schema.cedar_json,
-                        &definition.statement,
+                Some(schema) => Some(schema.cedar_json.as_str()),
+            },
+            _ => None,
+        };
+
+        // The effect and the scope are properties of the Cedar this definition
+        // resolves to, so they come from Cedar: the parser for a `static`
+        // definition, and the real template LINK for a `templateLinked` one.
+        // What the policy persists differs by arm — a static policy holds its own
+        // text, a link holds the template it follows and the entities it bound —
+        // and nothing else below depends on which arm it was.
+        let (policy_type, statement, description, template_link, scope) =
+            match &input.definition {
+                PolicyDefinition::Static(def) => {
+                    if let Some(schema_json) = schema_json {
+                        crate::state::cedar::validate_static_policy(schema_json, &def.statement)
+                            .map_err(refused)?;
+                    }
+                    let scope = crate::state::cedar::parse_static_policy(&def.statement)
+                        .map_err(invalid)?;
+                    (
+                        "STATIC",
+                        Some(def.statement.clone()),
+                        def.description.clone(),
+                        None,
+                        scope,
+                    )
+                }
+                PolicyDefinition::templateLinked(def) => {
+                    let template_not_found = || {
+                        CreatePolicyErrorModeled::ResourceNotFoundException(
+                            crate::state::policy_template_reference(&def.policy_template_id)
+                                .not_found(),
+                        )
+                    };
+                    let template_id = store
+                        .resolve_policy_template_id(&def.policy_template_id)
+                        .ok_or_else(template_not_found)?;
+                    let template = store
+                        .policy_templates
+                        .get(&template_id)
+                        .ok_or_else(template_not_found)?;
+                    // What the policy would be: the template it follows and the
+                    // entities it binds that template's placeholders to. The
+                    // link is what `link_template` checks against the template's
+                    // own slots, so it is built before anything is persisted and
+                    // stored only if Cedar accepts it.
+                    let link = crate::state::TemplateLink {
+                        policy_template_id: template_id,
+                        principal: crate::state::cedar::request_entity(def.principal.as_ref()),
+                        resource: crate::state::cedar::request_entity(def.resource.as_ref()),
+                    };
+                    let scope = crate::state::cedar::link_template(
+                        &template.statement,
+                        &link,
+                        schema_json,
                     )
                     .map_err(refused)?;
+                    ("TEMPLATE_LINKED", None, None, Some(link), scope)
                 }
-            }
-        }
+            };
 
         if store.policies.len() >= crate::state::MAX_POLICIES_PER_STORE
-            || store.cedar_bytes() + definition.statement.len()
+            || store.cedar_bytes() + statement.as_ref().map_or(0, String::len)
                 > crate::state::MAX_POLICY_BYTES_PER_STORE
         {
             return Err(CreatePolicyErrorModeled::ServiceQuotaExceededException(
@@ -347,11 +436,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The effect and the scope are properties of the Cedar text, so they come
-        // from the Cedar parser. A statement it refuses is refused here too.
-        let scope = crate::state::cedar::parse_static_policy(&definition.statement)
-            .map_err(invalid)?;
-
         let store = state
             .policy_stores
             .get_mut(&store_id)
@@ -361,10 +445,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let policy = crate::state::Policy {
             policy_id: policy_id.clone(),
             policy_store_id: store_id.clone(),
-            policy_type: "STATIC".to_string(),
+            policy_type: policy_type.to_string(),
             name: input.name.clone(),
-            statement: definition.statement.clone(),
-            description: definition.description.clone(),
+            statement,
+            description,
+            template_link,
             effect: Some(scope.effect),
             principal: scope.principal,
             resource: scope.resource,

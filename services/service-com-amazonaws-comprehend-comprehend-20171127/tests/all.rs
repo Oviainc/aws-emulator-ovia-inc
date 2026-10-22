@@ -15,6 +15,8 @@
 mod comprehend_client;
 #[path = "all/document_classifiers.rs"]
 mod document_classifiers;
+#[path = "all/dominant_language_jobs.rs"]
+mod dominant_language_jobs;
 #[path = "all/key_phrases_jobs.rs"]
 mod key_phrases_jobs;
 #[path = "all/request_validation.rs"]

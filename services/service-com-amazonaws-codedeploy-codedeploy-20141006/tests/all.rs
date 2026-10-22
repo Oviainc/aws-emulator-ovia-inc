@@ -15,6 +15,8 @@
 mod codedeploy_lifecycle;
 #[path = "all/git_hub_account_token_names.rs"]
 mod git_hub_account_token_names;
+#[path = "all/github_account_tokens.rs"]
+mod github_account_tokens;
 #[path = "all/on_premises_instances.rs"]
 mod on_premises_instances;
 #[path = "all/on_premises_tagging.rs"]

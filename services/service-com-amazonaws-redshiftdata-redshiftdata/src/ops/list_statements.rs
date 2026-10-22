@@ -292,10 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn statement_data(statement: &Statement) -> StatementData {
     StatementData {
         id: statement.id.clone(),
-        query_string: Some(statement.sql.clone()),
-        // `QueryStrings` carries a batch request's statements;
+        query_string: statement.query_string(),
+        // `QueryStrings` carries a batch request's statements; a single
         // `ExecuteStatement` submits exactly one, reported as `QueryString`.
-        query_strings: None,
+        query_strings: statement.query_strings(),
         secret_arn: statement.secret_arn.clone(),
         status: Some(statement.status.as_str().to_string()),
         statement_name: statement.statement_name.clone(),
@@ -304,7 +304,7 @@ fn statement_data(statement: &Statement) -> StatementData {
         // `SqlParametersList` has a modelled minimum length of 1, so a statement
         // with no parameters reports the member absent.
         query_parameters: (!statement.parameters.is_empty()).then(|| statement.parameters.clone()),
-        is_batch_statement: Some(false),
+        is_batch_statement: Some(statement.is_batch),
         result_format: Some(statement.result_format.clone()),
         session_id: statement.session_id.clone(),
     }

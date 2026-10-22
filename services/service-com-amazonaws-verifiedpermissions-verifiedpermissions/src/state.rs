@@ -585,8 +585,15 @@ pub fn emulator_partition() -> String {
         .to_string()
 }
 
-/// One policy in a store. `statement` is the Cedar text exactly as it arrived;
-/// every derived field below is computed from it by [`cedar::parse_static_policy`].
+/// One policy in a store.
+///
+/// A STATIC policy holds its own Cedar text in `statement`; every derived field
+/// below is computed from it by [`cedar::parse_static_policy`]. A TEMPLATE_LINKED
+/// one holds no Cedar text of its own — it holds the [`TemplateLink`] it was
+/// instantiated from, and its derived fields come from LINKING that template to
+/// the link's bound entities ([`cedar::link_template`]). Exactly one of
+/// `statement` and `template_link` is ever set, which is what `policy_type`
+/// reports.
 #[derive(Debug, Clone)]
 pub struct Policy {
     pub policy_id: String,
@@ -594,19 +601,59 @@ pub struct Policy {
     /// `STATIC` or `TEMPLATE_LINKED`.
     pub policy_type: String,
     pub name: Option<String>,
-    /// The Cedar policy text, byte-identical to what `CreatePolicy` was given.
-    pub statement: String,
+    /// The Cedar policy text of a STATIC policy, byte-identical to what
+    /// `CreatePolicy` was given. `None` for a TEMPLATE_LINKED policy, whose text
+    /// is its TEMPLATE's: `CreatePolicyTemplate` documents that "if the template
+    /// changes, then any policies that are linked to that template are
+    /// immediately updated as well", so a link must never carry a copy of the
+    /// text it would then stop following.
+    pub statement: Option<String>,
     pub description: Option<String>,
+    /// The template instantiation a TEMPLATE_LINKED policy is; `None` for a
+    /// static policy.
+    pub template_link: Option<TemplateLink>,
     /// `Permit` or `Forbid`, from the parsed statement's effect.
     pub effect: Option<String>,
-    /// The principal the statement's scope names, when it names one.
+    /// The principal this policy's SCOPE names, when it names one — for a
+    /// template-linked policy the principal the link resolves to, which is the
+    /// bound entity where the template uses `?principal` and the template's own
+    /// scope entity where it does not.
     pub principal: Option<ScopeEntity>,
-    /// The resource the statement's scope names, when it names one.
+    /// Same rule as `principal`, for the resource position.
     pub resource: Option<ScopeEntity>,
     /// The actions the statement's scope names; empty when the scope is `action`.
     pub actions: Vec<ScopeEntity>,
     pub created_date: DateTime,
     pub last_updated_date: DateTime,
+}
+
+impl Policy {
+    /// The `policyTemplateId` this policy follows, for a template-linked one.
+    pub fn policy_template_id(&self) -> Option<&str> {
+        self.template_link
+            .as_ref()
+            .map(|link| link.policy_template_id.as_str())
+    }
+}
+
+/// What a TEMPLATE_LINKED policy is: the template it instantiates, and the
+/// entities it binds that template's placeholders to.
+///
+/// The bindings are kept SEPARATE from the policy's resolved scope above,
+/// because they are not the same thing and the API reports both:
+/// `TemplateLinkedPolicyDefinitionDetail$principal` is "the principal associated
+/// with this template-linked policy ... substitute[d] for the ?principal
+/// placeholder", so it is present only where the template has that placeholder,
+/// while the policy's `principal` is whatever its scope names once the link is
+/// resolved.
+#[derive(Debug, Clone)]
+pub struct TemplateLink {
+    pub policy_template_id: String,
+    /// The entity bound to `?principal`; `None` when the template's scope does
+    /// not use that placeholder.
+    pub principal: Option<ScopeEntity>,
+    /// The entity bound to `?resource`, under the same rule.
+    pub resource: Option<ScopeEntity>,
 }
 
 /// One policy template in a store. `statement` is the Cedar template text
@@ -841,11 +888,13 @@ impl PolicyStore {
     }
 
     /// The total bytes of Cedar text this store holds — its policies AND its
-    /// policy templates, the quantity [`MAX_POLICY_BYTES_PER_STORE`] bounds.
+    /// policy templates, the quantity [`MAX_POLICY_BYTES_PER_STORE`] bounds. A
+    /// template-linked policy adds nothing: its text is its template's, already
+    /// counted once however many policies link to it.
     pub fn cedar_bytes(&self) -> usize {
         self.policies
             .values()
-            .map(|policy| policy.statement.len())
+            .map(|policy| policy.statement.as_ref().map_or(0, String::len))
             .chain(
                 self.policy_templates
                     .values()
@@ -997,6 +1046,19 @@ pub fn policy_reference(reference: &str) -> ReferencedResource {
         POLICY_NAME_PREFIX,
         RESOURCE_TYPE_POLICY,
         RESOURCE_TYPE_POLICY,
+    )
+}
+
+/// What a `policyTemplateId` request member names: a policy template by id, or —
+/// when it carries [`POLICY_NAME_PREFIX`], the form
+/// [`PolicyStore::resolve_policy_template_id`] resolves — a policy template by
+/// name. Either way the resource is a policy template.
+pub fn policy_template_reference(reference: &str) -> ReferencedResource {
+    split_reference(
+        reference,
+        POLICY_NAME_PREFIX,
+        RESOURCE_TYPE_POLICY_TEMPLATE,
+        RESOURCE_TYPE_POLICY_TEMPLATE,
     )
 }
 
