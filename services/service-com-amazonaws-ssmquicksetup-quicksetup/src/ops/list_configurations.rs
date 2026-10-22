@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one `ConfigurationSummary` per stored configuration — the records
+//! `CreateConfigurationManager` created, one per configuration definition — narrowed
+//! by the `ManagerArn` and `ConfigurationDefinitionId` the request names, in id
+//! order, one page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting, not mutating: the only write it makes is materialising the status
+//! changes the clock already owes (see [`crate::state::ComAmazonawsSsmquicksetupQuicksetupState::settle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +153,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListConfigurationsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the configuration manager store is unavailable".to_string()),
+            })
+        })?;
+
+        if let Some(why) = crate::state::filter_key_rejection(
+            input.filters.as_deref(),
+            crate::state::CONFIGURATION_FILTER_KEYS,
+        ) {
+            return Err(ListConfigurationsErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
+
+        // A token this operation did not issue is refused rather than silently read as
+        // "start from the beginning", which would re-serve a page the caller already had.
+        let start = match input.starting_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_page_token(
+                    crate::state::CONFIGURATION_PAGE_TOKEN_KIND,
+                    token,
+                )
+                .ok_or_else(|| {
+                    ListConfigurationsErrorModeled::ValidationException(ValidationException {
+                        message: Some(
+                            "StartingToken is not a pagination token issued by ListConfigurations"
+                                .to_string(),
+                        ),
+                    })
+                })?,
+            ),
+            None => None,
+        };
+
+        let mut store = state.lock();
+        store.settle(::std::time::SystemTime::now());
+
+        // A manager the store does not hold is reported as absent, not as an empty
+        // page: the request named a resource that does not exist.
+        if let Some(manager_arn) = input.manager_arn.as_deref() {
+            if !store.managers.contains_key(manager_arn) {
+                return Err(ListConfigurationsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no configuration manager with ARN {manager_arn} exists"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The empty string sorts before every id, so an absent token starts at the
+        // first configuration.
+        let (page, next_token) = crate::state::paginate(
+            crate::state::CONFIGURATION_PAGE_TOKEN_KIND,
+            store.configurations.range(start.unwrap_or_default()..),
+            crate::state::page_size(input.max_items),
+            |configuration| {
+                input
+                    .manager_arn
+                    .as_ref()
+                    .is_none_or(|arn| *arn == configuration.manager_arn)
+                    && input
+                        .configuration_definition_id
+                        .as_ref()
+                        .is_none_or(|id| *id == configuration.configuration_definition_id)
+                    && crate::state::matches_filters(input.filters.as_deref(), |key| {
+                        configuration.filter_field(key)
+                    })
+            },
+        );
+
+        Ok(ListConfigurationsOutput {
+            configurations_list: Some(
+                page.into_iter()
+                    .map(crate::state::ConfigurationRecord::to_summary)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfigurationManager
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfigurationManager`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfigurationManager::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one configuration manager: an ARN, a service-assigned `Id` per supplied
+//! configuration definition, and one configuration record per definition, all
+//! persisted in [`crate::state`] so every later read answers from them.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +112,52 @@ impl From<CreateConfigurationManagerErrorModeled> for CreateConfigurationManager
     }
 }
 
+/// Why this create's configuration definitions are unacceptable, or `None` when the
+/// store can take them.
+///
+/// `ConfigurationDefinitionsInputList` is `@required` but carries no modelled length,
+/// so an EMPTY list reaches the handler: a configuration manager is the deployment of
+/// its definitions, so one with none to deploy is refused. The remaining checks are
+/// the store's own bounds on collections the model gives no length (see
+/// `crate::state`'s `MAX_*` constants).
+fn definitions_rejection(input: &CreateConfigurationManagerInput) -> Option<String> {
+    if input.configuration_definitions.is_empty() {
+        return Some(
+            "ConfigurationDefinitions must carry at least one configuration definition"
+                .to_string(),
+        );
+    }
+    let too_many = |member: &str, actual: usize, cap: usize| {
+        (actual > cap).then(|| {
+            format!("{member} carries {actual} entries, more than the {cap} this service accepts")
+        })
+    };
+    too_many(
+        "ConfigurationDefinitions",
+        input.configuration_definitions.len(),
+        crate::state::MAX_CONFIGURATION_DEFINITIONS,
+    )
+    .or_else(|| {
+        input
+            .configuration_definitions
+            .iter()
+            .find_map(|definition| {
+                too_many(
+                    "ConfigurationDefinitions.Parameters",
+                    definition.parameters.len(),
+                    crate::state::MAX_PARAMETERS,
+                )
+            })
+    })
+    .or_else(|| {
+        too_many(
+            "Tags",
+            input.tags.as_ref().map_or(0, std::collections::HashMap::len),
+            crate::state::MAX_TAGS,
+        )
+    })
+}
+
 /// The `CreateConfigurationManager` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +194,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfigurationManager` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfigurationManagerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfigurationManager"))
+        // `Name`'s and `Description`'s patterns, every definition's `Type` pattern and
+        // every parameter and tag key/value length are MODELLED constraints, so the
+        // centralized walk has already refused anything outside them with a 400
+        // `ValidationException` before this body runs. What is checked here is what the
+        // model cannot say: that the list carries at least one definition, and that no
+        // caller-sized collection the model gives no length may grow the store without
+        // bound.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConfigurationManagerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the configuration manager store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        if let Some(why) = definitions_rejection(&input) {
+            return Err(CreateConfigurationManagerErrorModeled::ValidationException(
+                ValidationException { message: Some(why) },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let account = ::engine::emulator_account_id().to_string();
+        let created_at = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // The store is finite: a create that would take it past its cap is refused
+        // rather than growing it, the way the service refuses one past its quota.
+        if store.managers.len() >= crate::state::MAX_CONFIGURATION_MANAGERS {
+            return Err(CreateConfigurationManagerErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} configuration managers",
+                        crate::state::MAX_CONFIGURATION_MANAGERS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The modelled `ManagerArn` pattern ends in a uuid, so that is what the
+        // resource segment carries; the account segment is the emulator's canonical one.
+        let manager_uuid = store.fresh_uuid();
+        let manager_arn = crate::state::manager_arn(&region, &manager_uuid);
+
+        let mut definitions = Vec::with_capacity(input.configuration_definitions.len());
+        for definition in input.configuration_definitions {
+            let definition_id = store.fresh_definition_id();
+            let configuration_id = store.fresh_uuid();
+            let parameters = crate::state::to_btree_map(Some(definition.parameters));
+            // One configuration per definition, because the service deploys one per
+            // definition. Its id is service-generated and distinct from the
+            // definition id it names.
+            let configuration = crate::state::ConfigurationRecord {
+                id: configuration_id,
+                manager_arn: manager_arn.clone(),
+                configuration_definition_id: definition_id.clone(),
+                type_: definition.r#type.clone(),
+                type_version: definition.type_version.clone(),
+                account: account.clone(),
+                region: region.clone(),
+                created_at,
+                last_modified_at: created_at,
+                parameters: parameters.clone(),
+                status_summaries: vec![crate::state::StatusSummaryRecord::deployment(created_at)],
+            };
+            store
+                .configurations
+                .insert(configuration.id.clone(), configuration);
+            definitions.push(crate::state::ConfigurationDefinitionRecord {
+                id: definition_id,
+                type_: definition.r#type,
+                type_version: definition.type_version,
+                parameters,
+                local_deployment_execution_role_name: definition
+                    .local_deployment_execution_role_name,
+                local_deployment_administration_role_arn: definition
+                    .local_deployment_administration_role_arn,
+            });
+        }
+
+        store.managers.insert(
+            manager_arn.clone(),
+            crate::state::ConfigurationManagerRecord {
+                manager_arn: manager_arn.clone(),
+                name: input.name,
+                description: input.description,
+                created_at,
+                last_modified_at: created_at,
+                tags: crate::state::to_btree_map(input.tags),
+                definitions,
+                status_summaries: vec![crate::state::StatusSummaryRecord::deployment(created_at)],
+            },
+        );
+
+        Ok(CreateConfigurationManagerOutput { manager_arn })
     }
 }
