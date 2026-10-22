@@ -45,6 +45,10 @@ pub(crate) const PAST_DUE: Duration = eb::state::STATUS_TRANSITION_SPAN.saturati
 
 /// The emulator under test: this one service, mounted in the router the
 /// production binary mounts it in, driven over HTTP.
+///
+/// `pub(crate)` on this harness and on [`Answer`] / [`elements`] below is what
+/// lets a sibling suite in `tests/all/` drive the same emulator the same way
+/// instead of writing a second copy of the encoder and the XML reader.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The one shared engine the mounted service's handlers reach their store
@@ -166,7 +170,7 @@ impl Answer {
 /// text; for a wrapper it is its inner XML, so a path descends by calling this
 /// once per segment. This service's serializer writes an empty member as
 /// `<Tag></Tag>`, never `<Tag/>`, so there is no self-closing form to count.
-fn elements<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+pub(crate) fn elements<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
     let close = format!("</{tag}>");
     let mut found = Vec::new();
     let mut from = 0usize;

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPlatformBranches
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPlatformBranches`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPlatformBranches::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the managed platform branch catalog held in this service's state
+//! (`platform_branches`), restricted by the request's `Filters` and paged by
+//! `MaxRecords`/`NextToken`. A pure report: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +153,361 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPlatformBranches` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPlatformBranchesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPlatformBranches"))
+        // The catalog is the same in every region this emulator answers for, so
+        // nothing here reads the request's credential scope.
+        let _ = ctx;
+        // Refuse a filter the service does not accept BEFORE reading the store,
+        // so a bad filter never comes back as a silently unfiltered page.
+        let terms = parse_filters(input.filters.as_deref())?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPlatformBranchesError::internal_failure("the Elastic Beanstalk store is unavailable")
+        })?;
+        let store = state.lock();
+
+        // The filter "is evaluated as a logical conjunction (AND) of the
+        // separate SearchFilter terms": a branch is reported only when every
+        // term holds for it.
+        let matching: Vec<&crate::state::PlatformBranch> = store
+            .ordered_platform_branches()
+            .into_iter()
+            .filter(|branch| terms.iter().all(|term| term.matches(branch)))
+            .collect();
+
+        // "Specify a token from a previous response page to retrieve the next
+        // response page." The token is the identity of the first branch of the
+        // next page, and the order above is total, so the boundary falls in the
+        // same place however the catalog is paged.
+        let offset = match input.next_token.as_deref() {
+            Some(token) => matching
+                .iter()
+                .position(|branch| branch.has_key(token))
+                .ok_or_else(|| {
+                    ListPlatformBranchesError::invalid_parameter_value(format!(
+                        "Invalid NextToken: {token}"
+                    ))
+                })?,
+            None => 0,
+        };
+        let page = &matching[offset..];
+        // `MaxRecords` is modelled `range 1..`, so the boundary validator has
+        // already refused anything below 1 before this handler runs; the filter
+        // keeps a future model widening that range from producing an empty page
+        // with a continuation token.
+        let max_records = input
+            .max_records
+            .and_then(|max_records| usize::try_from(max_records).ok())
+            .filter(|max_records| *max_records > 0);
+        let (page, next_token) = match max_records {
+            Some(max_records) if page.len() > max_records => {
+                (&page[..max_records], Some(page[max_records].key()))
+            }
+            _ => (page, None),
+        };
+
+        Ok(ListPlatformBranchesOutput {
+            platform_branch_summary_list: Some(
+                page.iter().map(|branch| branch.to_summary()).collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// A branch member a filter term compares a string against. `TierType` is NOT
+/// one of these: it reads the branch's `SupportedTierList`, so it is a term of
+/// its own (see [`Term`]).
+#[derive(Debug, Clone, Copy)]
+enum TextAttribute {
+    /// `BranchName`.
+    BranchName,
+    /// `LifecycleState`.
+    LifecycleState,
+    /// `PlatformName`.
+    PlatformName,
+}
+
+impl TextAttribute {
+    /// The member of `branch` this attribute reads.
+    fn of(self, branch: &crate::state::PlatformBranch) -> &str {
+        match self {
+            Self::BranchName => branch.branch_name.as_str(),
+            Self::LifecycleState => branch.lifecycle_state.as_str(),
+            Self::PlatformName => branch.platform_name.as_str(),
+        }
+    }
+}
+
+/// An operator a filter term applies, from
+/// `ListPlatformBranchesRequest$Filters`'s documentation. Parsing a filter
+/// yields one of these, so the set of operators the request walk ACCEPTS and
+/// the set it EVALUATES are the same set, checked by the compiler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Operator {
+    Equals,
+    NotEquals,
+    BeginsWith,
+    EndsWith,
+    Contains,
+    In,
+    NotIn,
+}
+
+impl Operator {
+    /// The wire spelling.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Equals => "=",
+            Self::NotEquals => "!=",
+            Self::BeginsWith => "begins_with",
+            Self::EndsWith => "ends_with",
+            Self::Contains => "contains",
+            Self::In => "in",
+            Self::NotIn => "not_in",
+        }
+    }
+
+    /// The operator `spelling` names, or `None` when it names none.
+    fn parse(spelling: &str) -> Option<Self> {
+        [
+            Self::Equals,
+            Self::NotEquals,
+            Self::BeginsWith,
+            Self::EndsWith,
+            Self::Contains,
+            Self::In,
+            Self::NotIn,
+        ]
+        .into_iter()
+        .find(|operator| operator.name() == spelling)
+    }
+
+    /// "The `in` and `not_in` operators can take multiple values"; "Most
+    /// operators take a single value".
+    const fn takes_multiple_values(self) -> bool {
+        matches!(self, Self::In | Self::NotIn)
+    }
+
+    /// Apply this operator to one branch member. "Some operators, e.g. `in`,
+    /// can apply multiple values. In this case, the filter is evaluated as a
+    /// logical union (OR) of applications of the operator to the attribute with
+    /// each one of the values"; every other operator is
+    /// `Attribute Operator Values[1]`.
+    fn applies(self, subject: &str, values: &[String]) -> bool {
+        // A parsed term always carries at least one value (see [`parse_filter`]).
+        let first = values.first().map(String::as_str).unwrap_or_default();
+        match self {
+            Self::Equals => subject == first,
+            Self::NotEquals => subject != first,
+            Self::BeginsWith => subject.starts_with(first),
+            Self::EndsWith => subject.ends_with(first),
+            Self::Contains => subject.contains(first),
+            Self::In => values.iter().any(|value| subject == value),
+            Self::NotIn => values.iter().all(|value| subject != value),
+        }
+    }
+}
+
+/// The operators valid for a name-valued attribute (`BranchName`,
+/// `PlatformName`): "`=` | `!=` | `begins_with` | `ends_with` | `contains` |
+/// `in` | `not_in`".
+const NAME_OPERATORS: &[Operator] = &[
+    Operator::Equals,
+    Operator::NotEquals,
+    Operator::BeginsWith,
+    Operator::EndsWith,
+    Operator::Contains,
+    Operator::In,
+    Operator::NotIn,
+];
+
+/// The operators valid for `LifecycleState`: "`=` | `!=` | `in` | `not_in`".
+const LIFECYCLE_STATE_OPERATORS: &[Operator] = &[
+    Operator::Equals,
+    Operator::NotEquals,
+    Operator::In,
+    Operator::NotIn,
+];
+
+/// The operators valid for `TierType`: "`=` | `!=`" — and nothing else, which
+/// is why a `TierType` term reduces to "membership, possibly negated".
+const TIER_TYPE_OPERATORS: &[Operator] = &[Operator::Equals, Operator::NotEquals];
+
+/// Every attribute the operation accepts, in the order a refusal lists them,
+/// from `ListPlatformBranchesRequest$Filters`'s documentation.
+const ATTRIBUTES: &[&str] = &["BranchName", "LifecycleState", "PlatformName", "TierType"];
+
+/// "Array size: limited to 10 SearchFilter objects."
+const MAX_FILTERS: usize = 10;
+
+/// "Within each SearchFilter item, the Values array is limited to 10 items."
+const MAX_FILTER_VALUES: usize = 10;
+
+/// One validated filter term.
+#[derive(Debug)]
+enum Term {
+    /// A string-valued attribute compared with one of the seven operators.
+    Text {
+        attribute: TextAttribute,
+        operator: Operator,
+        values: Vec<String>,
+    },
+    /// `TierType`: "The environment tiers that platform versions in this branch
+    /// support" is a LIST, so the comparison is membership in it — negated for
+    /// `!=`, the only other operator the attribute accepts.
+    Tier { negated: bool, values: Vec<String> },
+}
+
+impl Term {
+    /// Whether `branch` satisfies this term.
+    fn matches(&self, branch: &crate::state::PlatformBranch) -> bool {
+        match self {
+            Self::Text {
+                attribute,
+                operator,
+                values,
+            } => operator.applies(attribute.of(branch), values),
+            Self::Tier { negated, values } => {
+                let supported = values
+                    .iter()
+                    .any(|value| branch.supported_tiers.iter().any(|tier| tier == value));
+                supported != *negated
+            }
+        }
+    }
+}
+
+/// What one attribute spelling means: which kind of term it builds, the
+/// operators it accepts and the closed value set its values must come from.
+struct AttributeRule {
+    /// `Some` for a string-valued attribute, `None` for `TierType`.
+    text: Option<TextAttribute>,
+    operators: &'static [Operator],
+    /// `None` where the attribute's values are free text (a name).
+    values: Option<&'static [&'static str]>,
+}
+
+/// The rule for the attribute `spelling` names, or `None` when it names none.
+fn attribute_rule(spelling: &str) -> Option<AttributeRule> {
+    let rule = match spelling {
+        "BranchName" => AttributeRule {
+            text: Some(TextAttribute::BranchName),
+            operators: NAME_OPERATORS,
+            values: None,
+        },
+        "PlatformName" => AttributeRule {
+            text: Some(TextAttribute::PlatformName),
+            operators: NAME_OPERATORS,
+            values: None,
+        },
+        "LifecycleState" => AttributeRule {
+            text: Some(TextAttribute::LifecycleState),
+            operators: LIFECYCLE_STATE_OPERATORS,
+            values: Some(crate::state::PLATFORM_BRANCH_LIFECYCLE_STATES),
+        },
+        "TierType" => AttributeRule {
+            text: None,
+            operators: TIER_TYPE_OPERATORS,
+            values: Some(crate::state::SUPPORTED_TIERS),
+        },
+        _ => return None,
+    };
+    Some(rule)
+}
+
+/// The wire spellings of `operators`, for a refusal message.
+fn operator_names(operators: &[Operator]) -> String {
+    operators
+        .iter()
+        .map(|operator| operator.name())
+        .collect::<Vec<&str>>()
+        .join(" | ")
+}
+
+/// Validate the request's filter terms, refusing anything the operation's
+/// documented filter grammar does not allow: an unknown attribute, an operator
+/// the attribute does not accept, a value outside a closed value set, several
+/// values for a single-value operator, or more terms or values than the
+/// documented array limits.
+fn parse_filters(filters: Option<&[SearchFilter]>) -> Result<Vec<Term>, ListPlatformBranchesError> {
+    let filters = filters.unwrap_or_default();
+    if filters.len() > MAX_FILTERS {
+        return Err(ListPlatformBranchesError::invalid_parameter_value(format!(
+            "Filters is limited to {MAX_FILTERS} SearchFilter objects, got {}",
+            filters.len()
+        )));
+    }
+    filters.iter().map(parse_filter).collect()
+}
+
+/// One term of [`parse_filters`].
+fn parse_filter(filter: &SearchFilter) -> Result<Term, ListPlatformBranchesError> {
+    let attribute = filter.attribute.as_deref().ok_or_else(|| {
+        ListPlatformBranchesError::missing_required_parameter("SearchFilter requires an Attribute")
+    })?;
+    let rule = attribute_rule(attribute).ok_or_else(|| {
+        ListPlatformBranchesError::invalid_parameter_value(format!(
+            "Invalid SearchFilter Attribute: {attribute}. Valid values: {}",
+            ATTRIBUTES.join(" | ")
+        ))
+    })?;
+
+    let spelling = filter.operator.as_deref().ok_or_else(|| {
+        ListPlatformBranchesError::missing_required_parameter("SearchFilter requires an Operator")
+    })?;
+    let operator = Operator::parse(spelling)
+        .filter(|operator| rule.operators.contains(operator))
+        .ok_or_else(|| {
+            ListPlatformBranchesError::invalid_parameter_value(format!(
+                "Invalid SearchFilter Operator for Attribute {attribute}: {spelling}. \
+                 Valid values: {}",
+                operator_names(rule.operators)
+            ))
+        })?;
+
+    let values = filter.values.as_deref().unwrap_or_default();
+    if values.is_empty() {
+        return Err(ListPlatformBranchesError::missing_required_parameter(
+            format!("SearchFilter for Attribute {attribute} requires at least one value"),
+        ));
+    }
+    if values.len() > MAX_FILTER_VALUES {
+        return Err(ListPlatformBranchesError::invalid_parameter_value(format!(
+            "SearchFilter Values is limited to {MAX_FILTER_VALUES} items, got {}",
+            values.len()
+        )));
+    }
+    if !operator.takes_multiple_values() && values.len() > 1 {
+        return Err(ListPlatformBranchesError::invalid_parameter_value(format!(
+            "SearchFilter Operator {spelling} for Attribute {attribute} takes a single value, \
+             got {}",
+            values.len()
+        )));
+    }
+    if let Some(allowed_values) = rule.values {
+        for value in values {
+            if !allowed_values.contains(&value.as_str()) {
+                return Err(ListPlatformBranchesError::invalid_parameter_value(format!(
+                    "Invalid SearchFilter value for Attribute {attribute}: {value}. \
+                     Valid values: {}",
+                    allowed_values.join(" | ")
+                )));
+            }
+        }
+    }
+
+    let values = values.to_vec();
+    Ok(match rule.text {
+        Some(attribute) => Term::Text {
+            attribute,
+            operator,
+            values,
+        },
+        // `TIER_TYPE_OPERATORS` is `=` | `!=`, so the operator is fully
+        // captured by whether the membership test is negated.
+        None => Term::Tier {
+            negated: operator == Operator::NotEquals,
+            values,
+        },
+    })
 }
