@@ -22,6 +22,12 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
+# NO dependency is added by this service. Everything it needs — the `@pattern`
+# sub-checks, the `@idempotencyToken` mint and the test's audit capture — is built on
+# the standard library and on `tracing`, which the scaffold already declares. A new
+# entry here would also change the workspace `Cargo.lock`, the one file every other
+# service's change rewrites, which keeps the serialized squash-merge from resolving.
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
