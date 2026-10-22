@@ -23,6 +23,8 @@ mod channel_lifecycle;
 mod live_stream_reads;
 #[path = "all/playback_key_pair_import.rs"]
 mod playback_key_pair_import;
+#[path = "all/playback_key_pair_lifecycle.rs"]
+mod playback_key_pair_lifecycle;
 #[path = "all/recording_configuration_lifecycle.rs"]
 mod recording_configuration_lifecycle;
 #[path = "all/recording_configuration_list.rs"]

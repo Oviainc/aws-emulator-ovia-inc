@@ -41,7 +41,7 @@ const ENTRY_OPERATION_TYPE: &str = "UpdateDomainEntry";
 ///
 /// Used to sit a case on a published bound (253 characters for the whole name, 63
 /// for one label — RFC 1035 §2.3.4) and one character past it.
-fn entry_name_of_length(total: usize, zone: &str) -> String {
+pub(crate) fn entry_name_of_length(total: usize, zone: &str) -> String {
     let suffix = format!(".{zone}");
     let budget = total - suffix.len();
     let mut prefix = String::new();

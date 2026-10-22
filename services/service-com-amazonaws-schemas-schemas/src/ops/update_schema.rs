@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.schema_name)
             .ok_or_else(|| {
                 UpdateSchemaError::from(UpdateSchemaErrorModeled::NotFoundException(
-                    crate::state::schema_not_found(&input.registry_name, &input.schema_name),
+                    crate::state::schema_not_found(&input.schema_name),
                 ))
             })?;
 

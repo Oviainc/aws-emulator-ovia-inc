@@ -131,8 +131,9 @@ async fn content_that_is_not_a_json_schema_document_is_refused_and_stores_nothin
             );
             assert_eq!(
                 refused.str_at("Code"),
-                "BadRequestException",
-                "case {case:?}: the error's own Code member carries its code, got {:?}",
+                "MalformedRequest",
+                "case {case:?}: the error's own Code member carries the service's error \
+                 code for the condition, got {:?}",
                 refused.body
             );
             assert!(

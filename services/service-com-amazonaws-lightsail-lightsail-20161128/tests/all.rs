@@ -29,6 +29,8 @@ mod container_service_public_endpoint;
 mod disk_block_storage;
 #[path = "all/domain_entry_recordset.rs"]
 mod domain_entry_recordset;
+#[path = "all/domain_entry_update.rs"]
+mod domain_entry_update;
 #[path = "all/domain_zone.rs"]
 mod domain_zone;
 #[path = "all/instance_error_envelope.rs"]

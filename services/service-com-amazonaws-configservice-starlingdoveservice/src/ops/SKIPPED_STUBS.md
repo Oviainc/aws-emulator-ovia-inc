@@ -18,4 +18,6 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: GetComplianceSummaryByConfigRule — unsupported shape construct: operation 'GetComplianceSummaryByConfigRule' has a Unit/absent input, which the generator does not emit yet
+(No operation of this service is currently declined: `GetComplianceSummaryByConfigRule`
+was hand-authored in `ops/get_compliance_summary_by_config_rule.rs`, with its two
+shapes in `ops/types/get_compliance_summary_by_config_rule_types.rs`.)

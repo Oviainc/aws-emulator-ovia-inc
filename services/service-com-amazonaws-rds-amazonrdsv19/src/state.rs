@@ -26,9 +26,9 @@
 //! `MAX_REGIONS * DB_INSTANCE_QUOTA_PER_REGION` instances,
 //! `MAX_REGIONS * DB_SNAPSHOT_QUOTA_PER_REGION` snapshots,
 //! `MAX_REGIONS * OPTION_GROUP_QUOTA_PER_REGION` option groups and
-//! `MAX_REGIONS * DB_SUBNET_GROUP_QUOTA_PER_REGION` DB subnet groups, whatever
-//! sequence of requests arrives, and every per-request scan reads one region's ordered
-//! range rather than the whole map.
+//! `MAX_REGIONS * DB_SUBNET_GROUP_QUOTA_PER_REGION` DB subnet groups, and at most one
+//! CA certificate override per region, whatever sequence of requests arrives, and every
+//! per-request scan reads one region's ordered range rather than the whole map.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
@@ -334,6 +334,19 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// against, so a name no group was created under is a not-found rather than a
     /// silently accepted reference.
     pub db_subnet_groups: BTreeMap<RegionalKey, DbSubnetGroupRecord>,
+    /// The account's CA certificate OVERRIDE, by region: the `CertificateIdentifier`
+    /// `ModifyCertificates` pinned as the certificate new DB instances are created with,
+    /// for the regions where one is set.
+    ///
+    /// Keyed by region because that is the scope `ModifyCertificates` documents ("RDS has
+    /// already moved to a new default CA certificate for the specified Amazon Web Services
+    /// Region"), so an override set in one region leaves another region's default alone.
+    /// An absent entry is the published system default ([`DEFAULT_CA_CERTIFICATE_IDENTIFIER`]),
+    /// which is why this is an override map rather than a per-region copy of the default:
+    /// at most ONE entry per region, and a region that holds no record at all cannot get
+    /// one without passing [`ComAmazonawsRdsAmazonrdsv19State::has_room_for_region`], so
+    /// the map is bounded by [`MAX_REGIONS`] like every other store here.
+    pub certificate_overrides: BTreeMap<String, String>,
     /// Monotonic counter behind every server-assigned id this service mints, so
     /// resource ids and endpoint hosts are unique and reproducible.
     pub mint_counter: u64,
@@ -344,6 +357,22 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     pub fn next_mint(&mut self) -> u64 {
         self.mint_counter += 1;
         self.mint_counter
+    }
+
+    /// The `CertificateIdentifier` the account's override names in `region`, or `None`
+    /// where no `ModifyCertificates` call set one.
+    pub fn certificate_override(&self, region: &str) -> Option<&str> {
+        self.certificate_overrides.get(region).map(String::as_str)
+    }
+
+    /// The CA certificate a DB instance created in `region` without a
+    /// `CACertificateIdentifier` is issued under, which is also what
+    /// `DescribeCertificates` reports as `DefaultCertificateForNewLaunches`: "either the
+    /// root CA override set on your Amazon Web Services account or the system default CA
+    /// for the Region if no override exists".
+    pub fn default_ca_certificate(&self, region: &str) -> &str {
+        self.certificate_override(region)
+            .unwrap_or(DEFAULT_CA_CERTIFICATE_IDENTIFIER)
     }
 
     /// Materialise the status transitions the clock has already made due IN `region`.
@@ -458,9 +487,12 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// Whether a record may be stored for `region`: either it already holds records, or
     /// the store has room for one more region ([`MAX_REGIONS`]).
     ///
-    /// The count walks the keys of all three maps, which the bounds above already cap
-    /// in total, so the work is bounded by that total rather than by anything a caller
-    /// chooses.
+    /// The count walks the keys of every map that opens a region bucket, which the
+    /// bounds above already cap in total (and the override map holds at most one entry
+    /// per region), so the work is bounded by that total rather than by anything a
+    /// caller chooses. Every operation that would create a bucket for a region holding
+    /// no record yet gates on this, so a caller cannot open an unbounded number of them
+    /// by naming a fresh region on each request.
     pub fn has_room_for_region(&self, region: &str) -> bool {
         let known: BTreeSet<&str> = self
             .db_instances
@@ -469,6 +501,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.option_groups.keys())
             .chain(self.db_subnet_groups.keys())
             .map(|(stored, _)| stored.as_str())
+            .chain(self.certificate_overrides.keys().map(String::as_str))
             .collect();
         known.contains(region) || known.len() < MAX_REGIONS
     }
@@ -1530,13 +1563,19 @@ pub fn default_port(engine: &str) -> i32 {
 }
 
 /// The CA certificate an instance's server certificate is issued under when the
-/// request names none.
+/// request names none, and so the system default `DescribeCertificates` reports as
+/// `DefaultCertificateForNewLaunches` where no override is set.
 ///
 /// `CACertificateIdentifier` documents no default, so the value comes from what AWS
 /// publishes: `rds-ca-rsa2048-g1` is the default certificate authority for a new DB
 /// instance ("Using SSL/TLS to encrypt a connection to a DB instance", Amazon RDS User
 /// Guide). It is a value AWS allocated — nothing computes it — so a table of one is
 /// the only honest source; extend it when the published default moves.
+///
+/// An account can pin a different one per Region with `ModifyCertificates`, which is
+/// what [`ComAmazonawsRdsAmazonrdsv19State::default_ca_certificate`] answers from: reach
+/// for that where a request is being served, and for this constant only as the default
+/// it falls back to.
 pub const DEFAULT_CA_CERTIFICATE_IDENTIFIER: &str = "rds-ca-rsa2048-g1";
 
 /// How long the server certificate issued at creation stays valid, which is what
@@ -1979,25 +2018,59 @@ pub struct CaCertificate {
 
 impl CaCertificate {
     /// This catalog entry as the modelled `Certificate`, with the ARN scoped to the
-    /// region the request was signed for.
-    pub fn to_wire(&self, region: &str) -> Certificate {
+    /// region the request was signed for and the override members answered from
+    /// `override_identifier` — the `CertificateIdentifier` the account's
+    /// `ModifyCertificates` override names in that region, or `None` where it set none.
+    pub fn to_wire(&self, region: &str, override_identifier: Option<&str>) -> Certificate {
+        // "Indicates whether there is an override for the default certificate
+        // identifier": true for the ONE certificate the override pins, false for every
+        // other published certificate. The comparison is case-insensitive because
+        // `ModifyCertificates`/`DescribeCertificates` accept the identifier in any case.
+        let overridden =
+            override_identifier.is_some_and(|pinned| pinned.eq_ignore_ascii_case(self.identifier));
         Certificate {
             certificate_identifier: Some(self.identifier.to_string()),
             certificate_type: Some(self.certificate_type.to_string()),
             thumbprint: None,
             valid_from: catalog_instant(self.valid_from),
             valid_till: catalog_instant(self.valid_till),
-            certificate_arn: Some(emulator_server::emulator_arn(
-                ARN_NAMESPACE,
-                region,
-                &format!("cert:{}", self.identifier),
-            )),
-            // No account-level override is set: this emulator has no
-            // `ModifyCertificates` call behind it, so the default is the published one.
-            customer_override: Some(false),
-            customer_override_valid_till: None,
+            certificate_arn: Some(ca_certificate_arn(region, self.identifier)),
+            customer_override: Some(overridden),
+            // `CustomerOverrideValidTill`: "If there is an override for the default
+            // certificate identifier, when the override expires." The override pins THIS
+            // certificate, so it cannot outlive it: the override expires when the
+            // certificate it names does, and a certificate under no override reports no
+            // expiry at all.
+            customer_override_valid_till: overridden
+                .then(|| catalog_instant(self.valid_till))
+                .flatten(),
         }
     }
+}
+
+/// The ARN of a published CA certificate: `arn:aws:rds:<region>::cert:<identifier>`.
+///
+/// The account field is EMPTY, unlike every other ARN this service builds (through
+/// `emulator_server::emulator_arn`, which stamps the emulator's account id): a CA
+/// certificate is published BY Amazon RDS rather than created by an account, so there is
+/// no account that owns it to name — the same shape AWS gives the certificate ARNs
+/// `DescribeCertificates` reports. It is still region-scoped, because the certificate
+/// authority a DB instance is launched under is reported per Region.
+pub fn ca_certificate_arn(region: &str, identifier: &str) -> String {
+    format!("arn:aws:{ARN_NAMESPACE}:{region}::cert:{identifier}")
+}
+
+/// The published CA certificate `identifier` names, or `None` when no published
+/// certificate carries it.
+///
+/// `DescribeCertificates$CertificateIdentifier`: "This parameter isn't case-sensitive",
+/// so the match ignores case — and `ModifyCertificates` resolves the identifier it is
+/// given through this same lookup, so the two operations cannot disagree about which
+/// identifiers exist.
+pub fn ca_certificate(identifier: &str) -> Option<&'static CaCertificate> {
+    CA_CERTIFICATES
+        .iter()
+        .find(|certificate| certificate.identifier.eq_ignore_ascii_case(identifier))
 }
 
 /// Every CA certificate `DescribeCertificates` reports. See [`CaCertificate`] for the
@@ -2052,11 +2125,6 @@ pub fn supported_ca_certificate_identifiers() -> Vec<String> {
         .collect()
 }
 
-/// The certificate a DB instance created without one gets:
-/// `CertificateMessage$DefaultCertificateForNewLaunches` — "The default root CA for new
-/// DB instances", which Amazon RDS publishes as `rds-ca-rsa2048-g1`.
-pub const DEFAULT_CA_CERTIFICATE_FOR_NEW_LAUNCHES: &str = "rds-ca-rsa2048-g1";
-
 /// One of the catalogs' fixed ISO-8601 instants as the modelled timestamp shapes carry
 /// it.
 ///
@@ -2077,7 +2145,16 @@ fn catalog_instant(iso: &str) -> Option<::aws_smithy_types::DateTime> {
 /// `DescribeEventCategoriesMessage$SourceType` ("`db-instance` | `db-cluster` |
 /// `db-parameter-group` | `db-security-group` | `db-snapshot` | `db-cluster-snapshot` |
 /// `db-proxy`"), in that order; the categories of each are the ones published in "Amazon
-/// RDS event categories and event messages" (Amazon RDS User Guide).
+/// RDS event categories and event messages" (Amazon RDS User Guide), in the order that
+/// table lists them (alphabetical): the wire order of `EventCategories` is not documented
+/// anywhere in the model or the API reference, so the ONE order this catalog can state a
+/// source for is the published table's.
+///
+/// `db-instance` carries the two categories that table lists beyond the ones a DB
+/// instance shares with the other source types — `backtrack` (an Aurora MySQL backtrack
+/// event) and `security` — because a client builds a `CreateEventSubscription`
+/// `EventCategories` argument out of this map and AWS accepts both for that source type;
+/// `db-cluster-snapshot` carries `notification` beside `backup` for the same reason.
 ///
 /// The model's `SourceType` enum (`smithy_query(query="shape",shape="SourceType")`)
 /// carries four further values — `custom-engine-version`, `blue-green-deployment`,
@@ -2090,6 +2167,7 @@ pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
         "db-instance",
         &[
             "availability",
+            "backtrack",
             "backup",
             "configuration change",
             "creation",
@@ -2102,6 +2180,7 @@ pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
             "read replica",
             "recovery",
             "restoration",
+            "security",
             "security patching",
         ],
     ),
@@ -2124,7 +2203,7 @@ pub const EVENT_CATEGORIES: &[(&str, &[&str])] = &[
         "db-snapshot",
         &["creation", "deletion", "notification", "restoration"],
     ),
-    ("db-cluster-snapshot", &["backup"]),
+    ("db-cluster-snapshot", &["backup", "notification"]),
     (
         "db-proxy",
         &["configuration change", "creation", "deletion", "failure"],

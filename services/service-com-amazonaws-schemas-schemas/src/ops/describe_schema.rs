@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let schema = registry.schemas.get(&input.schema_name).ok_or_else(|| {
             DescribeSchemaError::from(DescribeSchemaErrorModeled::NotFoundException(
-                crate::state::schema_not_found(&input.registry_name, &input.schema_name),
+                crate::state::schema_not_found(&input.schema_name),
             ))
         })?;
         // `SchemaVersion` "limits the results to only this schema version"; absent, the

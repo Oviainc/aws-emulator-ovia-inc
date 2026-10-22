@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::cluster_lifecycle::{call, emulator, Answer};
+use crate::wire::{call, emulator, Answer};
 
 /// The access policies this emulator must report, in the order a sorted listing
 /// walks them.

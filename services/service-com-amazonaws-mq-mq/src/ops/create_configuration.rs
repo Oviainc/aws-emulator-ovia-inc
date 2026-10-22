@@ -11,6 +11,12 @@
 //! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
 //! so leaving it on an implemented operation under-reports progress.
 //!
+//! One thing this operation DOES assert: a request whose `engineType` or
+//! `authenticationStrategy` falls outside the enum the model declares is refused with
+//! Amazon MQ's modelled `BadRequestException` (HTTP 400) naming that member in
+//! `errorAttribute` — the refusal the real service makes, which does not depend on the
+//! unwritten behaviour. Everything a VALID request would need still answers 501.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -91,6 +97,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -165,16 +172,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
+        let _ = (ctx, &self.engine);
+
+        // A request Amazon MQ refuses is refused HERE, whatever this operation
+        // still cannot do: the refusal does not depend on the behaviour nobody
+        // has written yet, and answering 501 for it would tell a caller that a
+        // request the real service rejects might otherwise have worked. Both
+        // members below are modelled enums whose boundary check the input
+        // schema skips (`skip_validation` in
+        // `super::types::create_configuration_types`), so this is where a value
+        // outside the declared set becomes Amazon MQ's own
+        // `BadRequestException` with `errorAttribute` naming the member.
+        state::validate_enum("engineType", &input.engine_type, ENGINE_TYPE_VALUES)
+            .map_err(bad_request)?;
+        if let Some(strategy) = &input.authentication_strategy {
+            state::validate_enum(
+                "authenticationStrategy",
+                strategy,
+                AUTHENTICATION_STRATEGY_VALUES,
+            )
+            .map_err(bad_request)?;
+        }
+
+        // Everything past input validation — minting the configuration, its
+        // first revision and its default engine data — is still unwritten, so a
+        // VALID request keeps answering 501. Implement `CreateConfiguration`
+        // here, then delete the SCAFFOLDED marker at the top of this file.
+        // Return modeled failures as
         // `Err(CreateConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
         Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfiguration"))
     }
+}
+
+/// Lift a refused value into this operation's modelled `BadRequestException` (HTTP 400).
+fn bad_request(invalid: state::Invalid) -> CreateConfigurationError {
+    CreateConfigurationErrorModeled::BadRequestException(BadRequestException {
+        error_attribute: invalid.attribute,
+        message: Some(invalid.message),
+        resource_share_errors: None,
+    })
+    .into()
 }

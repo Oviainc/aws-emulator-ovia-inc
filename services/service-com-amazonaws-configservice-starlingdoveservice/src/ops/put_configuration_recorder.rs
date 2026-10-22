@@ -291,14 +291,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // An absent recording group means "record all supported resource types,
-        // excluding the global IAM resource types".
-        let recording_group = Some(
-            requested
-                .recording_group
-                .clone()
-                .unwrap_or_else(crate::state::default_recording_group),
-        );
+        // Config stores the recorder as the COMPLETE recording group it will record
+        // with, not as the subset the request carried: an absent group means "record
+        // all supported resource types, excluding the global IAM resource types", and
+        // the strategy and the exclusion list are materialised from the group itself.
+        let recording_group = Some(crate::state::materialised_recording_group(
+            requested.recording_group.clone(),
+        ));
+        // The same holds for the recording frequency and the billing scope: the
+        // recorder records continuously, in the PAID scope, unless the request asked
+        // for something else.
+        let recording_mode = Some(crate::state::materialised_recording_mode(
+            requested.recording_mode.clone(),
+        ));
+        let recording_scope = Some(crate::state::materialised_recording_scope(
+            requested.recording_scope.clone(),
+        ));
 
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
@@ -319,23 +327,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(existing) = store.recorders.get_mut(&name) {
-            // An update replaces the recorder's configuration but keeps the ARN it was
-            // created with; tags are added at creation and are not updated here.
+            // An update replaces the recorder's configuration but keeps the ARN and the
+            // id it was created with; tags are added at creation and are not updated
+            // here.
             existing.role_arn = role_arn.to_string();
             existing.recording_group = recording_group;
-            existing.recording_mode = requested.recording_mode.clone();
-            existing.recording_scope = requested.recording_scope.clone();
+            existing.recording_mode = recording_mode;
+            existing.recording_scope = recording_scope;
         } else {
-            let arn = crate::state::recorder_arn(&region, &name);
+            let sequence = store.next_recorder_seq;
+            // A u64 counter cannot be exhausted by API calls, so it never reissues an
+            // id; saturating rather than wrapping keeps that true by construction.
+            store.next_recorder_seq = sequence.saturating_add(1);
+            let id = crate::state::mint_recorder_id(sequence);
+            let arn = crate::state::recorder_arn(&region, &name, &id);
             store.recorders.insert(
                 name.clone(),
                 crate::state::RecorderEntry {
                     name: name.clone(),
+                    id,
                     arn: arn.clone(),
                     role_arn: role_arn.to_string(),
                     recording_group,
-                    recording_mode: requested.recording_mode.clone(),
-                    recording_scope: requested.recording_scope.clone(),
+                    recording_mode,
+                    recording_scope,
                     service_principal: None,
                     tags: input.tags.clone().unwrap_or_default(),
                 },

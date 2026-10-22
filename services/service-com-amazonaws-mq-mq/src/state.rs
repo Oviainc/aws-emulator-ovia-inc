@@ -56,6 +56,21 @@ pub const MAX_BROKERS: usize = 50;
 /// per ActiveMQ broker), and the bound on one broker record's `users` map.
 pub const MAX_USERS_PER_BROKER: usize = 250;
 
+/// A broker is created together with its initial user, so `CreateBroker` has to
+/// be given at least one.
+///
+/// `Users`' own documentation: "The list of broker users (persons or
+/// applications) who can access queues and topics. For Amazon MQ for RabbitMQ
+/// brokers, an administrative user is required if using simple authentication
+/// and authorization. For brokers using OAuth2, this user is optional."
+/// (`smithy_query(query="doc", shape="CreateBrokerRequest", member="Users")`).
+/// The OAuth2 exemption is not reachable through this model — its
+/// `AuthenticationStrategy` carries only CONFIG_MANAGED, LDAP and SIMPLE — so
+/// every broker this service can be asked for needs its first user named in the
+/// create. The model marks the member non-required, which is why the
+/// precondition lives in the handler.
+pub const MIN_USERS_PER_BROKER: usize = 1;
+
 /// `Groups`' own documented bound: "The list of groups (20 maximum) to which the
 /// ActiveMQ user belongs"
 /// (`smithy_query(query="doc", shape="CreateUserRequest", member="Groups")`).
@@ -340,8 +355,42 @@ pub fn fingerprint_of(parts: &[String]) -> String {
     parts.join("\u{1f}")
 }
 
+/// The subject Amazon MQ names when it refuses a value outside an enumerated
+/// member's value set.
+///
+/// MQ states such a refusal as one sentence built from the request and the
+/// model: the member's documented subject, the rejected value in brackets, then
+/// the values it does accept — for `engineType`, "Broker engine type
+/// [<value>] is invalid. Valid values are: [ACTIVEMQ, RABBITMQ]". The subject is
+/// the member's own documented description, so it is held per member here rather
+/// than derived from the wire name; a member with no row falls back to its wire
+/// name, which keeps the sentence well-formed for any member added later.
+fn enum_subject(attribute: &str) -> &str {
+    match attribute {
+        // "Required. The type of broker engine." (`CreateBrokerRequest$EngineType`)
+        "engineType" => "Broker engine type",
+        // "Required. The broker's deployment mode." (`CreateBrokerRequest$DeploymentMode`)
+        "deploymentMode" => "Broker deployment mode",
+        // "The broker's storage type." (`CreateBrokerRequest$StorageType`)
+        "storageType" => "Broker storage type",
+        // "Optional. The authentication strategy used to secure the broker."
+        // (`CreateBrokerRequest$AuthenticationStrategy`)
+        "authenticationStrategy" => "Broker authentication strategy",
+        // "Defines whether this broker is a part of a data replication pair."
+        // (`CreateBrokerRequest$DataReplicationMode`)
+        "dataReplicationMode" => "Broker data replication mode",
+        other => other,
+    }
+}
+
 /// Refuse a value the model declares as an enum but the request spelled
 /// otherwise. `allowed` is the generated `*_VALUES` constant for that enum.
+///
+/// This is the ONLY check an enum-typed member of this service goes through: the
+/// input schemas skip the framework's boundary check for them
+/// (`skip_validation`, see `ops::types`), because a boundary refusal is worded
+/// through `Refused { code, message }` and so cannot carry
+/// `BadRequestException$errorAttribute`.
 pub fn validate_enum(attribute: &str, value: &str, allowed: &[&str]) -> Result<(), Invalid> {
     if allowed.contains(&value) {
         return Ok(());
@@ -349,10 +398,45 @@ pub fn validate_enum(attribute: &str, value: &str, allowed: &[&str]) -> Result<(
     Err(Invalid::new(
         attribute,
         format!(
-            "{attribute} must be one of [{}], got {value:?}",
+            "{} [{value}] is invalid. Valid values are: [{}]",
+            enum_subject(attribute),
             allowed.join(", ")
         ),
     ))
+}
+
+/// Refuse an integer outside the `@range` its member declares. As with
+/// [`validate_enum`], the handler owns this refusal so that it can name the
+/// member in `BadRequestException$errorAttribute`.
+pub fn validate_range(attribute: &str, value: i32, min: i32, max: i32) -> Result<(), Invalid> {
+    if (min..=max).contains(&value) {
+        return Ok(());
+    }
+    Err(Invalid::new(
+        attribute,
+        format!("{attribute} must be between {min} and {max}, got {value}"),
+    ))
+}
+
+/// Refuse a `CreateBroker` that names no broker user, and one that names more
+/// than a broker record may hold. `count` is the number of users the request
+/// carried — an absent list counts as none, exactly like an empty one.
+/// See [`MIN_USERS_PER_BROKER`] for the rule and where it comes from.
+///
+/// The missing-user sentence is Amazon MQ's own, and names the input rather than
+/// any value from the request, so it reads the same for every request in the
+/// class.
+pub fn validate_users_requested(count: usize) -> Result<(), Invalid> {
+    const ATTRIBUTE: &str = "users";
+    if count < MIN_USERS_PER_BROKER {
+        return Err(Invalid::new(ATTRIBUTE, "Specify at least one user."));
+    }
+    validate_list_size(
+        ATTRIBUTE,
+        count,
+        MIN_USERS_PER_BROKER,
+        MAX_USERS_PER_BROKER,
+    )
 }
 
 /// Refuse an absent or blank required string member.
@@ -364,6 +448,17 @@ pub fn validate_present(attribute: &str, value: &str) -> Result<(), Invalid> {
         ));
     }
     Ok(())
+}
+
+/// The sentence Amazon MQ answers a `BrokerId` that resolves to no broker
+/// with, on every operation that resolves one. Only the requested id varies, so
+/// the four handlers that look a broker up share this one sentence rather than
+/// each wording the same failure differently.
+pub fn broker_not_found_message(broker_id: &str) -> String {
+    format!(
+        "Cannot find broker ID [{broker_id}]. Verify that your broker exists or check \
+         broker permissions."
+    )
 }
 
 /// `BrokerName`'s documented constraint: "1-50 characters long, must contain
@@ -527,6 +622,15 @@ pub fn validate_subnet_ids(deployment_mode: &str, subnet_ids: &[String]) -> Resu
 /// bounds an explicit `MaxResults`; it is not the default.
 pub const DEFAULT_MAX_RESULTS: usize = 20;
 
+/// `MaxResults`' modelled `@range`, from
+/// `smithy_query(query="operation", operation="ListBrokers")`:
+/// `MaxResults { range: { min: 1, max: 100 } }`. The handler enforces it (see
+/// [`validate_range`]) so that the refusal names the member.
+pub const MIN_MAX_RESULTS: i32 = 1;
+
+/// The upper end of `MaxResults`' modelled `@range` — see [`MIN_MAX_RESULTS`].
+pub const MAX_MAX_RESULTS: i32 = 100;
+
 /// Tags a page token as this listing's own, so a token from somewhere else
 /// decodes to `None` rather than to an offset it was never meant to name.
 const PAGE_TOKEN_PREFIX: &str = "mqb1";
@@ -570,15 +674,23 @@ pub fn decode_page_token(token: &str) -> Option<usize> {
     usize::from_str_radix(digits, 16).ok()
 }
 
+/// The sentence Amazon MQ answers a `NextToken` it did not issue with. Only the
+/// token the request sent varies; it lives beside the codec that decides which
+/// tokens are this service's.
+pub fn invalid_page_token_message(token: &str) -> String {
+    format!("Invalid next token [{token}]. Make sure you copied the token correctly.")
+}
+
 /// The page of `total` items `max_results` and `next_token` select.
 ///
 /// A token past the end yields an empty page rather than an error, and the last
 /// page carries no `NextToken`, so a paginating client terminates.
 ///
 /// `max_results` is already inside the member's modelled `range` (1..100) by the
-/// time a handler runs — the boundary validator refuses 0 and anything negative
-/// before that — so the `filter`/`unwrap_or` below is a total-function fallback,
-/// not a silent clamp of a value a caller could actually send.
+/// time a handler calls this — the handler refuses 0, anything negative and
+/// anything past 100 itself (`validate_range`), so the `filter`/`unwrap_or`
+/// below is a total-function fallback, not a silent clamp of a value a caller
+/// could actually send.
 pub fn page_of(total: usize, max_results: Option<i32>, offset: usize) -> Page {
     let size = max_results
         .and_then(|m| usize::try_from(m).ok())

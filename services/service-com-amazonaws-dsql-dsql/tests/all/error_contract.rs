@@ -15,7 +15,7 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    absent_identifier, expected_arn, is_cluster_id, wait_for_the_clock, Dsql,
+    absent_identifier, expected_arn, is_cluster_id, wait_for_the_clock, Dsql, TAG_MAP_MAX,
 };
 
 /// The sentence AWS answers a missing resource with. The ARN is the request's
@@ -24,9 +24,9 @@ fn arn_not_found_message(arn: &str) -> String {
     format!("The resource with ARN {arn} doesn't exist. Verify the ARN and try again.")
 }
 
-/// `TagMap`'s modelled maximum entry count. Source: `smithy_query(query="shape",
-/// shape="TagMap")` — `@length(min: 0, max: 200)`.
-const TAG_MAP_MAX_ENTRIES: usize = 200;
+/// `TagMap`'s modelled maximum entry count, from the one place the suites spell
+/// the modelled tag bounds ([`crate::harness::TAG_MAP_MAX`]).
+const TAG_MAP_MAX_ENTRIES: usize = TAG_MAP_MAX;
 
 /// The message a token reused for a different request is refused with.
 const CLIENT_TOKEN_MISMATCH: &str =

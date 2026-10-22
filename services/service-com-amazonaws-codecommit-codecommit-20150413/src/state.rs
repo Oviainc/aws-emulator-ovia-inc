@@ -142,6 +142,29 @@ pub struct FileEntry {
     pub size: i64,
 }
 
+impl Commit {
+    /// This commit as the modeled `Commit` shape — the one place that projection
+    /// is written, so every operation that reports a stored commit agrees about
+    /// it, exactly as [`Repository::metadata`] does for a repository.
+    ///
+    /// `parents` is always present, empty for a root commit, because the model's
+    /// `ParentList` is a list of the full ids of the commits this one was built
+    /// on. `additionalData` carries whatever a git host records beyond the
+    /// modelled members; this emulator's commit objects record none, so it is
+    /// absent rather than empty.
+    pub fn info(&self) -> crate::ops::types::Commit {
+        crate::ops::types::Commit {
+            commit_id: Some(self.commit_id.clone()),
+            tree_id: Some(self.tree_id.clone()),
+            parents: Some(self.parents.clone()),
+            message: self.message.clone(),
+            author: Some(self.author.clone()),
+            committer: Some(self.committer.clone()),
+            additional_data: None,
+        }
+    }
+}
+
 impl Repository {
     /// Build a repository, deriving every generated field from the name, the
     /// region and the creation instant.

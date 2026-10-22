@@ -900,7 +900,10 @@ async fn the_store_keeps_records_for_a_bounded_number_of_regions() {
 
 /// The `index`th distinct region id this test uses: two lowercase letters, then
 /// `-emu-1`, so it is of the published AWS region-id form and unique per index.
-fn emu_region(index: usize) -> String {
+///
+/// `pub(crate)` so the sibling suites that fill the store's region capacity use the
+/// same generator rather than a second one of their own.
+pub(crate) fn emu_region(index: usize) -> String {
     let first = (b'a' + (index / 8) as u8) as char;
     let second = (b'a' + (index % 8) as u8) as char;
     format!("{first}{second}-emu-1")

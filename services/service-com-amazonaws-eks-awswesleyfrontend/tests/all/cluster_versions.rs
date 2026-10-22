@@ -27,7 +27,8 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 use service_com_amazonaws_eks_awswesleyfrontend::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::cluster_lifecycle::{call, Answer, REGION};
+use crate::cluster_lifecycle::REGION;
+use crate::wire::{call, Answer};
 
 /// One day, the unit the version calendar is published in.
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);

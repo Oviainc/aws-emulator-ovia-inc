@@ -15,41 +15,19 @@
 //! tags, then listed — is one row.
 //!
 //! The client is the `Dsql` harness in `harness.rs`: one test client per crate,
-//! driving `MultiServiceRouter::dispatch` exactly as an SDK does.
+//! driving `MultiServiceRouter::dispatch` exactly as an SDK does, and one place
+//! where the modelled tag bounds are spelled.
 
 use serde_json::{json, Value};
 
-use crate::harness::{absent_identifier, expected_arn, wait_for_the_clock, Answer, Dsql};
-
-/// `TagKey` and `TagValue` bounds. Source: `smithy_query(query="shape",
-/// shape="TagKey,TagValue")` — key `@length(1..128)`, value `@length(0..256)`, both
-/// `@pattern("^[a-zA-Z0-9_.:/=+\\-@ ]*$")`.
-const TAG_KEY_MAX: usize = 128;
-const TAG_VALUE_MAX: usize = 256;
-/// `TagMap`'s own `@length(0..200)`, same source.
-const TAG_MAP_MAX: usize = 200;
-
-/// Percent-encode a value for ONE `@httpLabel` path segment, the way an SDK encodes
-/// a non-greedy label: `:` and `/` inside an ARN must not be read as segment
-/// separators, and the other characters `TagKey`'s pattern allows are encoded too.
-fn label(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| match c {
-            ':' => "%3A".to_string(),
-            '/' => "%2F".to_string(),
-            ' ' => "%20".to_string(),
-            '+' => "%2B".to_string(),
-            '=' => "%3D".to_string(),
-            '@' => "%40".to_string(),
-            other => other.to_string(),
-        })
-        .collect()
-}
+use crate::harness::{
+    absent_identifier, expected_arn, wait_for_the_clock, Answer, Dsql, TAG_KEY_MAX, TAG_MAP_MAX,
+    TAG_VALUE_MAX,
+};
 
 /// `GET /tags/{resourceArn}` for `arn`.
 async fn list_tags(dsql: &Dsql, arn: &str) -> Answer {
-    dsql.call("GET", &format!("/tags/{}", label(arn)), None).await
+    dsql.list_tags_for_resource(arn).await
 }
 
 /// One `CreateCluster` tag map and what `ListTagsForResource` must then report.

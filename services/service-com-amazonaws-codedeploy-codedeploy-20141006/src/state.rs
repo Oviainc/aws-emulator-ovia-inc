@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     AlarmConfiguration, AutoRollbackConfiguration, BlueGreenDeploymentConfiguration,
     DeploymentStyle, EC2DeploymentOptions, EC2TagFilter, EC2TagSet, ECSService, LoadBalancerInfo,
-    MinimumHealthyHosts, OnPremisesTagSet, RevisionLocation, Tag, TagFilter, TargetInstances,
-    TrafficRoutingConfig, TriggerConfig, ZonalConfig,
+    MinimumHealthyHosts, OnPremisesTagSet, RevisionLocation, RollbackInfo, Tag, TagFilter,
+    TargetInstances, TrafficRoutingConfig, TriggerConfig, ZonalConfig,
 };
 
 /// How long after `CreateDeployment` the emulator owes the deployment its start,
@@ -42,6 +42,25 @@ pub const DEPLOYMENT_STATUS_CREATED: &str = "Created";
 pub const DEPLOYMENT_STATUS_IN_PROGRESS: &str = "InProgress";
 /// See [`DEPLOYMENT_STATUS_CREATED`].
 pub const DEPLOYMENT_STATUS_SUCCEEDED: &str = "Succeeded";
+/// See [`DEPLOYMENT_STATUS_CREATED`]: the status a deployment a caller stopped
+/// holds.
+pub const DEPLOYMENT_STATUS_STOPPED: &str = "Stopped";
+
+/// Whether `status` is one a deployment never leaves.
+///
+/// The model's `DeploymentStatus` enum
+/// (`smithy_query(query="shape",shape="DeploymentStatus")`) is Created | Queued |
+/// InProgress | Baking | Succeeded | Failed | Stopped | Ready; the last three of
+/// those are outcomes, and the rest are stages a deployment is still working
+/// through. An operation that acts on a deployment in flight — stopping it,
+/// continuing it — is what the modelled `DeploymentAlreadyCompletedException`
+/// refuses once the deployment holds one of the outcomes.
+pub fn deployment_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        DEPLOYMENT_STATUS_SUCCEEDED | "Failed" | DEPLOYMENT_STATUS_STOPPED
+    )
+}
 
 /// What a handler answers when the engine it was constructed with is not the
 /// shared in-memory store.
@@ -58,6 +77,11 @@ pub const STATE_UNAVAILABLE: &str =
 /// to one an auto-scaling event or a rollback created
 /// (`smithy_query(query="shape",shape="DeploymentCreator")`).
 pub const DEPLOYMENT_CREATOR_USER: &str = "user";
+
+/// The `DeploymentCreator` value for the deployment CodeDeploy itself creates to
+/// roll a deployment back
+/// (`smithy_query(query="shape",shape="DeploymentCreator")`).
+pub const DEPLOYMENT_CREATOR_ROLLBACK: &str = "codeDeployRollback";
 
 /// The compute platform an application gets when `CreateApplication` omits one:
 /// CodeDeploy's own default (`smithy_query(query="shape",shape="ComputePlatform")`
@@ -154,6 +178,10 @@ pub struct Deployment {
     pub deployment_style: Option<DeploymentStyle>,
     pub compute_platform: String,
     pub external_id: Option<String>,
+    /// The rollback this deployment was given, once a caller stopped it asking
+    /// for one: the rollback deployment's id when one was created, and the
+    /// reason when there was nothing to roll back to.
+    pub rollback_info: Option<RollbackInfo>,
     pub create_time_ms: i64,
     pub start_time_ms: Option<i64>,
     pub complete_time_ms: Option<i64>,
@@ -306,6 +334,12 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                 // Dropped from the history; there is nothing left to settle.
                 return false;
             };
+            // A deployment that already reached an outcome — it completed, or a
+            // caller stopped it — is owed nothing further, so the clock never
+            // moves it again.
+            if deployment.complete_time_ms.is_some() {
+                return false;
+            }
             if deployment.start_time_ms.is_none() && deployment.starts_at_ms <= now_ms {
                 deployment.status = DEPLOYMENT_STATUS_IN_PROGRESS.to_string();
                 deployment.start_time_ms = Some(deployment.starts_at_ms);
@@ -554,7 +588,7 @@ pub fn deployment_info(deployment: &Deployment) -> crate::ops::types::Deployment
         ignore_application_stop_failures: deployment.ignore_application_stop_failures,
         auto_rollback_configuration: deployment.auto_rollback_configuration.clone(),
         update_outdated_instances_only: deployment.update_outdated_instances_only,
-        rollback_info: None,
+        rollback_info: deployment.rollback_info.clone(),
         deployment_style: deployment.deployment_style.clone(),
         target_instances: deployment.target_instances.clone(),
         instance_termination_wait_time_started: false,

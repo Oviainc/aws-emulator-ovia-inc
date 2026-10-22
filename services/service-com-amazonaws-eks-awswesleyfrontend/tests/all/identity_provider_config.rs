@@ -21,9 +21,8 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::cluster_lifecycle::{
-    call, create, emulator, encode_label, minimal_request, Answer, REGION,
-};
+use crate::cluster_lifecycle::{create, minimal_request, REGION};
+use crate::wire::{call, emulator, encode_label, Answer};
 
 /// The canonical account every ARN this emulator mints carries
 /// (`emulator_server::EMULATOR_ACCOUNT_ID`).

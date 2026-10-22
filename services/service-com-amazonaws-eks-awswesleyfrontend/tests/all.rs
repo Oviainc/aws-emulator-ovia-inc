@@ -21,5 +21,9 @@ mod cluster_versions;
 mod encryption_config_association;
 #[path = "all/identity_provider_config.rs"]
 mod identity_provider_config;
+#[path = "all/pod_identity_associations.rs"]
+mod pod_identity_associations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/wire.rs"]
+mod wire;
