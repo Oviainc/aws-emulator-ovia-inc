@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateThing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateThing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateThing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +154,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateThing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateThingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateThing"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateThingErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // Everything about the thing that is NOT its name, in the form the registry
+        // keeps it and compares it: an absent `attributePayload` (or one carrying no
+        // `attributes`) is the empty attribute map, which is what the thing then has.
+        let requested = crate::state::ThingConfiguration {
+            thing_type_name: input.thing_type_name,
+            attributes: input
+                .attribute_payload
+                .and_then(|payload| payload.attributes)
+                .map(|attributes| attributes.into_iter().collect())
+                .unwrap_or_default(),
+            billing_group_name: input.billing_group_name,
+        };
+
+        let mut store = state.lock();
+
+        // A thing may only reference a thing type or a billing group that EXISTS,
+        // and the registry is the only record of which do, so both are resolved
+        // against it. `ResourceNotFoundException` ("The specified resource does not
+        // exist", HTTP 404) is the modelled error for exactly this.
+        if let Some(thing_type_name) = &requested.thing_type_name {
+            if !store.thing_types.contains(thing_type_name) {
+                return Err(CreateThingErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Thing type {thing_type_name} does not exist")),
+                    },
+                )
+                .into());
+            }
+        }
+        if let Some(billing_group_name) = &requested.billing_group_name {
+            if !store.billing_groups.contains(billing_group_name) {
+                return Err(CreateThingErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Billing group {billing_group_name} does not exist"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // What is already registered under this name decides the call, per the
+        // operation's own documentation: "If this call is made multiple times using
+        // the same thing name and configuration, the call will succeed. If this call
+        // is made with the same thing name but different configuration a
+        // ResourceAlreadyExistsException is thrown."
+        if let Some(existing) = store.things.get(&input.thing_name) {
+            if existing.configuration != requested {
+                return Err(CreateThingErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "Thing {} already exists with a different configuration",
+                            existing.thing_name
+                        )),
+                        resource_id: Some(existing.thing_name.clone()),
+                        resource_arn: Some(existing.thing_arn.clone()),
+                    },
+                )
+                .into());
+            }
+            // The repeat create names the SAME thing: it mints no new identity and
+            // writes nothing, and answers from the stored record — so a client that
+            // retried a create keeps the id and ARN it was handed the first time.
+            return Ok(CreateThingOutput {
+                thing_name: Some(existing.thing_name.clone()),
+                thing_arn: Some(existing.thing_arn.clone()),
+                thing_id: Some(existing.thing_id.clone()),
+            });
+        }
+
+        let thing_arn = crate::state::thing_arn(&region, &input.thing_name);
+        let thing = crate::state::RegisteredThing::new(
+            input.thing_name,
+            store.mint_thing_id(),
+            thing_arn,
+            requested,
+        );
+
+        // The response is built from the record that is about to be persisted, so
+        // what this call reports and what the next `DescribeThing` reads are one
+        // value, not two that could drift.
+        let output = CreateThingOutput {
+            thing_name: Some(thing.thing_name.clone()),
+            thing_arn: Some(thing.thing_arn.clone()),
+            thing_id: Some(thing.thing_id.clone()),
+        };
+        store.things.insert(thing.thing_name.clone(), thing);
+        Ok(output)
     }
 }
