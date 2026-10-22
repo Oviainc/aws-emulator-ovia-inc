@@ -4,10 +4,11 @@
 //! IMPLEMENTED: records a table under its keyspace in [`crate::state`] and answers with
 //! the ARN it minted for it. This is the ONLY file to touch for `CreateTable`.
 //!
-//! Four input members are NOT served here and are refused with a 501 that says so rather
-//! than stored and forgotten: `autoScalingSpecification`, `replicaSpecifications`,
-//! `cdcSpecification` and `warmThroughputSpecification`, each of which is reported by an
-//! operation that is still scaffolded.
+//! Three input members are NOT served here and are refused with a 501 that says so rather
+//! than stored and forgotten: `replicaSpecifications`, `cdcSpecification` and
+//! `warmThroughputSpecification`, each of which is reported by an operation that is still
+//! scaffolded. `autoScalingSpecification` IS served: it is stored on the table and
+//! reported back by `GetTableAutoScalingSettings`.
 //!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
 //! how it reaches state; they still describe this file.
@@ -242,15 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
-        // Members this slice cannot serve faithfully yet. Each is reported by an
-        // operation that is still scaffolded — `autoScalingSpecification` by
-        // `GetTableAutoScalingSettings`, the other three by `GetTable`'s replica, CDC and
-        // warm-throughput summaries — so accepting them would mean storing a request and
-        // never answering for it. Answer the honest 501 instead, worded so it is not
-        // counted as "CreateTable is a stub": the operation IS implemented, this part of
-        // its surface is not.
+        // Members this slice cannot serve faithfully yet. Each is reported by `GetTable`'s
+        // replica, CDC and warm-throughput summaries, which are still scaffolded, so
+        // accepting them would mean storing a request and never answering for it. Answer
+        // the honest 501 instead, worded so it is not counted as "CreateTable is a stub":
+        // the operation IS implemented, this part of its surface is not.
         let unimplemented: Vec<&str> = [
-            ("autoScalingSpecification", input.auto_scaling_specification.is_some()),
             ("replicaSpecifications", input.replica_specifications.is_some()),
             ("cdcSpecification", input.cdc_specification.is_some()),
             (
@@ -284,6 +282,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_schema(&input.schema_definition).map_err(invalid)?;
         let capacity_specification =
             crate::state::resolve_capacity(input.capacity_specification).map_err(invalid)?;
+        let auto_scaling_specification = crate::state::resolve_auto_scaling(
+            input.auto_scaling_specification,
+            &capacity_specification,
+        )
+        .map_err(invalid)?;
         let encryption_specification =
             crate::state::resolve_encryption(input.encryption_specification).map_err(invalid)?;
         let point_in_time_recovery = input.point_in_time_recovery.unwrap_or(PointInTimeRecovery {
@@ -314,6 +317,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A column's type may name "other user-defined types that are contained in the
+        // same keyspace" (`FieldDefinition$type`, the same rule for a column), so a name
+        // in it that is neither a native type nor a type constructor must be a type of
+        // THIS keyspace, in status ACTIVE; any other is a type "that doesn't exist. The
+        // resource might not be specified correctly, or its status might not be ACTIVE"
+        // (`ResourceNotFoundException`), and nothing is stored. Checked after the keyspace
+        // is resolved, because its own types are what a reference resolves against, and
+        // exactly as `CreateType` checks a field's type.
+        for column in &input.schema_definition.all_columns {
+            for referenced in crate::state::referenced_type_names(&column.r#type) {
+                let usable = keyspace
+                    .types
+                    .get(&referenced)
+                    .is_some_and(|udt| udt.status == crate::state::TYPE_STATUS_ACTIVE);
+                if !usable {
+                    return Err(CreateTableErrorModeled::ResourceNotFoundException(
+                        crate::state::type_not_found(&region, &input.keyspace_name, &referenced),
+                    )
+                    .into());
+                }
+            }
+        }
 
         // "Within a keyspace, table names must be unique."
         if keyspace.tables.contains_key(&input.table_name) {
@@ -377,6 +403,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status_due_at: Some(settles_at),
                 schema_definition: input.schema_definition,
                 capacity_specification,
+                auto_scaling_specification,
                 // Only an `UpdateTable` that moves the table to PAY_PER_REQUEST sets
                 // this; a table created in a mode was never updated into it.
                 last_update_to_pay_per_request: None,

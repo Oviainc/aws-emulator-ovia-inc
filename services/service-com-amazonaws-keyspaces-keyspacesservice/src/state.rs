@@ -20,8 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CapacitySpecification, ClientSideTimestamps, Comment, EncryptionSpecification, FieldDefinition,
-    PointInTimeRecovery, ResourceNotFoundException, SchemaDefinition, Tag, TimeToLive,
+    AutoScalingSpecification, CapacitySpecification, ClientSideTimestamps, Comment,
+    EncryptionSpecification, FieldDefinition, PointInTimeRecovery, ResourceNotFoundException,
+    SchemaDefinition, Tag, TimeToLive,
 };
 
 /// The `cassandra` ARN namespace / SigV4 signing name of Amazon Keyspaces
@@ -111,6 +112,14 @@ pub const CUSTOMER_MANAGED_ENCRYPTION_TYPE: &str = "CUSTOMER_MANAGED_KMS_KEY";
 
 /// Point-in-time recovery is off unless `CreateTable` asks for it.
 pub const DEFAULT_POINT_IN_TIME_RECOVERY_STATUS: &str = "DISABLED";
+
+/// The lowest `targetValue` a target tracking auto scaling policy may be given:
+/// "You define `targetValue` as a percentage. A `double` between 20 and 90"
+/// (`TargetTrackingScalingPolicyConfiguration$targetValue`).
+pub const MIN_TARGET_VALUE: f64 = 20.0;
+
+/// The highest `targetValue` of the same published range. See [`MIN_TARGET_VALUE`].
+pub const MAX_TARGET_VALUE: f64 = 90.0;
 
 /// `PointInTimeRecoveryStatus` = `ENABLED`.
 pub const POINT_IN_TIME_RECOVERY_ENABLED: &str = "ENABLED";
@@ -468,6 +477,10 @@ pub struct Table {
     /// The supplied capacity specification, or the modelled default, as last set by
     /// `CreateTable` or `UpdateTable`.
     pub capacity_specification: CapacitySpecification,
+    /// The supplied auto scaling settings, if any — "The optional auto scaling settings
+    /// for a table in provisioned capacity mode" — reported back by
+    /// `GetTableAutoScalingSettings`.
+    pub auto_scaling_specification: Option<AutoScalingSpecification>,
     /// When an `UpdateTable` last moved this table's throughput mode to
     /// `PAY_PER_REQUEST`, or `None` while no update ever has
     /// (`CapacitySpecificationSummary$lastUpdateToPayPerRequestTimestamp`). An update
@@ -961,15 +974,18 @@ pub fn keyspace_not_found(region: &str, keyspace_name: &str) -> ResourceNotFound
 }
 
 /// The `ResourceNotFoundException` payload for a table that is not in state.
+///
+/// The message is the Cassandra-style form Amazon Keyspaces builds from the request for a
+/// table lookup — the bare `tableName`, unqualified and unquoted — which is what
+/// Cassandra-compatible tooling keys off. A keyspace lookup keeps its own form
+/// ([`keyspace_not_found`]).
 pub fn table_not_found(
     region: &str,
     keyspace_name: &str,
     table_name: &str,
 ) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            "Table '{keyspace_name}.{table_name}' was not found."
-        )),
+        message: Some(format!("unconfigured table {table_name}")),
         resource_arn: Some(table_arn(region, keyspace_name, table_name)),
     }
 }
@@ -1122,6 +1138,75 @@ pub fn validate_schema(schema: &SchemaDefinition) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The auto scaling settings a table is created with: the caller's, checked against what
+/// the service documents for them, or `None`.
+///
+/// Auto scaling is "The optional auto scaling settings for a table in provisioned capacity
+/// mode" (`CreateTableRequest$autoScalingSpecification`), so it belongs to
+/// `throughputMode:PROVISIONED` and to nothing else. For each capacity it is turned on for
+/// ("This optional parameter enables auto scaling for the table if set to `false`"),
+/// "you must specify the following parameters": `minimumUnits`, `maximumUnits` and
+/// `scalingPolicy`, whose target tracking configuration defines `targetValue` as "a
+/// percentage. A `double` between 20 and 90". The model states none of that, only that the
+/// unit members are `long`s with a minimum of 1.
+pub fn resolve_auto_scaling(
+    supplied: Option<AutoScalingSpecification>,
+    capacity: &CapacitySpecification,
+) -> Result<Option<AutoScalingSpecification>, String> {
+    let Some(specification) = supplied else {
+        return Ok(None);
+    };
+    if capacity.throughput_mode != PROVISIONED_THROUGHPUT_MODE {
+        return Err(format!(
+            "autoScalingSpecification is the auto scaling setting of a table in capacity mode '{PROVISIONED_THROUGHPUT_MODE}'; \
+             capacitySpecification.throughputMode is '{}'",
+            capacity.throughput_mode
+        ));
+    }
+    for (member, settings) in [
+        (
+            "autoScalingSpecification.readCapacityAutoScaling",
+            specification.read_capacity_auto_scaling.as_ref(),
+        ),
+        (
+            "autoScalingSpecification.writeCapacityAutoScaling",
+            specification.write_capacity_auto_scaling.as_ref(),
+        ),
+    ] {
+        let Some(settings) = settings else {
+            continue;
+        };
+        if settings.auto_scaling_disabled {
+            continue;
+        }
+        let target_value = settings
+            .scaling_policy
+            .as_ref()
+            .and_then(|policy| policy.target_tracking_scaling_policy_configuration.as_ref())
+            .map(|configuration| configuration.target_value);
+        let (Some(minimum), Some(maximum), Some(target_value)) =
+            (settings.minimum_units, settings.maximum_units, target_value)
+        else {
+            return Err(format!(
+                "{member} with autoScalingDisabled false requires minimumUnits, maximumUnits and \
+                 scalingPolicy.targetTrackingScalingPolicyConfiguration.targetValue"
+            ));
+        };
+        if minimum > maximum {
+            return Err(format!(
+                "{member}.minimumUnits ({minimum}) must not exceed maximumUnits ({maximum})"
+            ));
+        }
+        if !(MIN_TARGET_VALUE..=MAX_TARGET_VALUE).contains(&target_value) {
+            return Err(format!(
+                "{member}.scalingPolicy.targetTrackingScalingPolicyConfiguration.targetValue \
+                 ({target_value}) must be between {MIN_TARGET_VALUE} and {MAX_TARGET_VALUE}"
+            ));
+        }
+    }
+    Ok(Some(specification))
 }
 
 /// The replication strategy and region list a keyspace is created with.

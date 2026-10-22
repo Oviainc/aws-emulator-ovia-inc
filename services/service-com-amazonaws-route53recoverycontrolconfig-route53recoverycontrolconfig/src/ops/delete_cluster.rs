@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A parent is only removable once its children are gone. The default control
         // panel is part of the cluster, so it does not count as a child here.
         let user_panels = guard
-            .ordered_control_panels(&input.cluster_arn)
+            .ordered_control_panels(Some(&input.cluster_arn))
             .iter()
             .filter(|panel| !panel.default_control_panel)
             .count();
