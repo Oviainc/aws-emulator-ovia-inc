@@ -75,8 +75,8 @@ impl Emulator {
         router
     }
 
-    /// Dispatch one request and return `(http status, parsed body)`.
-    pub async fn call(&self, route: &str, body: &Value) -> (u16, Value) {
+    /// Dispatch one request and return the raw HTTP response, headers included.
+    async fn dispatch(&self, route: &str, body: &Value) -> ::http::Response<Bytes> {
         let request = ::http::Request::builder()
             .method("POST")
             .uri(format!("https://{HOST}{route}"))
@@ -85,10 +85,45 @@ impl Emulator {
             .header("authorization", SIGV4_HEADER)
             .body(Bytes::from(body.to_string()))
             .expect("the test request is well formed");
-        let response = self.router().dispatch(request).await;
+        self.router().dispatch(request).await
+    }
+
+    /// Dispatch one request and return `(http status, parsed body)`.
+    pub async fn call(&self, route: &str, body: &Value) -> (u16, Value) {
+        let response = self.dispatch(route, body).await;
         let status = response.status().as_u16();
         let parsed: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
         (status, parsed)
+    }
+
+    /// Dispatch one request that must be refused, and return everything a client keys
+    /// its error handling off: the status, the `x-amzn-errortype` header restJson1
+    /// resolves the error SHAPE from, the body's `__type` and its `message`.
+    pub async fn refusal(&self, route: &str, body: Value) -> Refusal {
+        let response = self.dispatch(route, &body).await;
+        let status = response.status().as_u16();
+        let errortype = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            // AWS appends a Coral namespace after a colon; a client reads the shape
+            // name in front of it.
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let parsed: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+        assert_ne!(
+            status, 200,
+            "case {route} {body}: expected a failure, got HTTP 200 with {parsed}"
+        );
+        Refusal {
+            status,
+            errortype,
+            code: error_code(&parsed),
+            message: error_message(&parsed),
+        }
     }
 
     /// Dispatch one request that must succeed, and return its body.
@@ -122,6 +157,29 @@ pub fn error_code(body: &Value) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+/// The `message` member of a restJson1 error body (the modelled member of every
+/// exception this service declares).
+pub fn error_message(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<no message>")
+        .to_string()
+}
+
+/// One refused request, as a client sees it.
+#[derive(Debug)]
+pub struct Refusal {
+    /// The HTTP status.
+    pub status: u16,
+    /// The error shape named by `x-amzn-errortype`, without any Coral namespace.
+    pub errortype: String,
+    /// The error shape named by the body's `__type`, without its namespace.
+    pub code: String,
+    /// The body's `message`.
+    pub message: String,
 }
 
 /// A deterministic Items catalog of `size` entries.

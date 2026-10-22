@@ -13,7 +13,11 @@
 // points it into `tests/all/`.
 #[path = "all/inference.rs"]
 mod inference;
+#[path = "all/refusal_wording.rs"]
+mod refusal_wording;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]
 mod support;
+#[path = "all/unresolved_resource_arns.rs"]
+mod unresolved_resource_arns;

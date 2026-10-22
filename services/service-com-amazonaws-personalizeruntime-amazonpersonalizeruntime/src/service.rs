@@ -41,9 +41,89 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code the framework answers an input-constraint violation with, and the
+/// one the recordings show this service answering: `ValidationException` (HTTP 400).
+/// Restated here because `override_refusal` replaces the code and the message
+/// together, and only the message changes below.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// A `@pattern` expression without the anchors the model spells it with. A `$` escaped
+/// by a backslash is a literal dollar sign inside the expression, not the end anchor,
+/// so it stays.
+///
+/// MIGRATION NOTE (the one `services/common/src/validation.rs` asks every new inliner
+/// to leave): the unanchored-pattern rule and the value-free subject below are the same
+/// in ~24 service crates (`grep -rln 'fn unanchored' services/*/src`). They are inlined
+/// here rather than called because `Violation::requirement` is private to the vendored
+/// framework and `vendor/` is read-only from inside the emulator, so there is no public
+/// seam to call; the fix that owns the migration declares the shared helper and replaces
+/// every copy, this one included, with a call to it.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// Whether `violation` is the class this service words itself: a violated `@pattern`.
+fn is_pattern(violation: &Violation) -> bool {
+    matches!(violation.kind, ViolationKind::Pattern(_))
+}
+
+/// One clause of this service's `ValidationException` message.
+///
+/// A violated `@pattern` is stated the way the Personalize data plane states it: the
+/// member path and the expression a value has to satisfy, WITHOUT the `^`/`$` anchors
+/// the model writes to make the match total, and WITHOUT echoing the rejected value —
+/// every patterned member of this service is a resource ARN, which the service does not
+/// quote back. Every other class keeps the framework's own clause, which already reads
+/// the way AWS words it.
+fn clause(violation: &Violation) -> String {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => format!(
+            "Value at '{}' failed to satisfy constraint: Member must satisfy regular expression \
+             pattern: {}",
+            violation.path,
+            unanchored(pattern)
+        ),
+        _ => violation.message(),
+    }
+}
+
+/// This service's `ValidationException` message: the AWS envelope
+/// (`N validation error(s) detected: `) over one clause per violation.
+///
+/// `None` declines the refusal — leaving the framework's wording untouched — for a
+/// request with no `@pattern` violation in it, since that is the only class this file
+/// words differently. A request that mixes one with another class IS reworded, so the
+/// pattern clause loses its anchors and its value echo while every other clause reads
+/// exactly as the framework would have stated it.
+fn pattern_envelope(violations: &[Violation]) -> Option<String> {
+    if !violations.iter().any(is_pattern) {
+        return None;
+    }
+    let clauses: Vec<String> = violations.iter().map(clause).collect();
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The first path segment of a URI, or `None` for the root path.
 fn first_path_segment(path: &str) -> Option<&str> {
@@ -141,15 +221,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // Amazon Personalize Runtime states a violated `@pattern` without the model's
+        // anchors and without echoing the rejected value; the code stays the
+        // `ValidationException` (HTTP 400) the framework would have answered, so only
+        // the wording changes, and only for that class — every other refusal,
+        // authentication included, keeps the framework's wording because
+        // `pattern_envelope` declines it.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: pattern_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

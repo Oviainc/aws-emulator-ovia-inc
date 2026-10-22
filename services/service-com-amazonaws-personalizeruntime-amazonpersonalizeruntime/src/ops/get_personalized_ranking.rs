@@ -9,20 +9,26 @@
 //! response is the REQUEST'S OWN `inputList`, re-ordered — never a list this handler
 //! chooses:
 //!
-//! 1. `campaignArn` is resolved against the registry in [`crate::state`] (404 when
-//!    unknown), and the campaign must deploy a `PERSONALIZED_RANKING` solution
+//! 1. `inputList`'s length is checked FIRST, because its bound is a fact about the
+//!    request alone: "If you are including metadata in recommendations, the maximum is
+//!    50. Otherwise, the maximum is 500." A longer list is 400 `Length of 'inputList'
+//!    cannot be greater than <max>` before anything is resolved.
+//! 2. `campaignArn` is resolved against the registry in [`crate::state`] (400 "does
+//!    not exist or is not active yet" when it resolves to nothing — see
+//!    [`crate::state::Denied::unresolvable`]), and the campaign must deploy a
+//!    `PERSONALIZED_RANKING` solution
 //!    version ("The solution backing the campaign must have been created using a
 //!    recipe of type PERSONALIZED_RANKING") — otherwise 400.
-//! 2. Each `inputList` entry is looked up in the campaign's STORED Items catalog. An
+//! 3. Each `inputList` entry is looked up in the campaign's STORED Items catalog. An
 //!    entry the catalog holds is scored by [`crate::state::scoring::relevance`] from
 //!    its stored `base_score` and the request's `userId`/`context`; an entry the
 //!    catalog does not hold "is appended to the end of the reranked list", with no
 //!    relevance score for the user.
-//! 3. With no `filterArn`, the result is therefore a PERMUTATION of `inputList`: same
+//! 4. With no `filterArn`, the result is therefore a PERMUTATION of `inputList`: same
 //!    cardinality, same item ids, ordered by score descending. With a `filterArn`
 //!    ("a filter you created to include items or exclude items from recommendations
 //!    for a given user") the entries the filter removes are not in the ranking.
-//! 4. `metadataColumns` is served from the stored item attributes; with no
+//! 5. `metadataColumns` is served from the stored item attributes; with no
 //!    `metadataColumns` the `metadata` member is omitted entirely.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
@@ -172,7 +178,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut guard = state.lock();
 
-        // 1. The campaign, and the recipe type this operation serves.
+        // 1. `inputList`'s length is a fact about the REQUEST — "If you are including
+        //    metadata in recommendations, the maximum is 50. Otherwise, the maximum is
+        //    500." — so it is checked BEFORE the campaign is resolved: a list past the
+        //    bound is refused whatever the campaign turns out to be.
+        let max_input_list = registry::metadata_bounded_max(registry::asks_for_metadata(
+            input.metadata_columns.as_ref(),
+        ));
+        if input.input_list.len() > max_input_list {
+            return Err(deny(registry::too_long("inputList", max_input_list)));
+        }
+
+        // 2. The campaign, and the recipe type this operation serves.
         let campaign = guard.campaign(&input.campaign_arn).map_err(deny)?.clone();
         if campaign.recipe_type != RecipeType::PersonalizedRanking {
             return Err(invalid(format!(
@@ -191,27 +208,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // 2. Metadata, which also bounds how long `inputList` may be: "If you are
-        //    including metadata in recommendations, the maximum is 50. Otherwise, the
-        //    maximum is 500."
+        // 3. Metadata, validated against the resolved campaign and its catalog. How
+        //    long `inputList` may be was already settled in step 1, from the request.
         let metadata_columns = registry::requested_metadata_columns(
             input.metadata_columns.as_ref(),
             campaign.metadata_enabled,
             &registry::catalog_columns(&campaign.items),
         )
         .map_err(deny)?;
-        let max_input_list = if metadata_columns.is_some() {
-            registry::MAX_NUM_RESULTS_WITH_METADATA
-        } else {
-            registry::MAX_NUM_RESULTS
-        };
-        if input.input_list.len() > max_input_list {
-            return Err(invalid(format!(
-                "Value '{}' at 'inputList' failed to satisfy constraint: Member must have length \
-                 less than or equal to {max_input_list}",
-                input.input_list.len()
-            )));
-        }
 
         let request_filter = guard
             .bind_filter(
@@ -315,19 +319,10 @@ fn invalid(message: impl Into<String>) -> GetPersonalizedRankingError {
     .into()
 }
 
-/// The modelled `ResourceNotFoundException` (HTTP 404): "The specified resource does
-/// not exist."
-fn not_found(message: impl Into<String>) -> GetPersonalizedRankingError {
-    GetPersonalizedRankingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(message.into()),
-    })
-    .into()
-}
-
 /// Lift a registry refusal into this operation's error channel.
+///
+/// Every refusal the registry produces is the invalid-input channel (see
+/// [`Denied`]), so this is where that channel's HTTP 400 is chosen for this operation.
 fn deny(denied: Denied) -> GetPersonalizedRankingError {
-    match denied {
-        Denied::NotFound(message) => not_found(message),
-        Denied::Invalid(message) => invalid(message),
-    }
+    invalid(denied.message())
 }
