@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCampaigns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCampaigns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCampaigns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of stored campaign summaries. `@readonly` and `@paginated`: the page
+//! is a window over the creation order the store keeps, and `nextToken` is the creation
+//! sequence number the page just returned ended at, so paging walks every campaign
+//! exactly once even if one is deleted mid-walk.
 //!
 //! ## Shape of an operation
 //!
@@ -144,20 +139,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCampaigns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCampaignsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCampaigns"))
+        /// The page size when the caller names none: the model's `maxResults`
+        /// upper bound (`range 1..50`), so an unpaged call sees as much as one
+        /// page can carry.
+        const DEFAULT_MAX_RESULTS: usize = 50;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCampaignsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the ConnectCampaignsV2 campaign store is unavailable".to_string(),
+                    x_amz_error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // `InstanceIdFilter` is the one filter the model declares, and `Eq` its one
+        // operator, so a filtered list is the campaigns of that Connect instance.
+        let instance_id = input
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.instance_id_filter.as_ref())
+            .map(|filter| filter.value.clone());
+
+        let store = state.lock();
+        let matching: Vec<(u64, &crate::state::StoredCampaign)> = store
+            .campaigns_in_order()
+            .filter(|(_, campaign)| {
+                instance_id
+                    .as_deref()
+                    .is_none_or(|wanted| campaign.connect_instance_id == wanted)
+            })
+            .collect();
+
+        // The cursor is the creation sequence number the previous page ended at,
+        // so this page is everything matching that was created after it. A
+        // campaign deleted between two pages therefore does not invalidate a token
+        // already handed out. A token this service did not mint is a bad request.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(after) = crate::state::decode_next_token(token) else {
+                    return Err(ListCampaignsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: "nextToken is not a cursor this service issued".to_string(),
+                            x_amz_error_type: None,
+                        },
+                    )
+                    .into());
+                };
+                matching
+                    .iter()
+                    .position(|(sequence, _)| *sequence > after)
+                    .unwrap_or(matching.len())
+            }
+        };
+
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        Ok(ListCampaignsOutput {
+            // Absent on the last page: a client stops paging when there is no token.
+            next_token: if end < matching.len() {
+                page.last()
+                    .map(|(sequence, _)| crate::state::encode_next_token(*sequence))
+            } else {
+                None
+            },
+            campaign_summary_list: Some(
+                page.iter()
+                    .map(|(_, campaign)| campaign.to_summary())
+                    .collect(),
+            ),
+        })
     }
 }
