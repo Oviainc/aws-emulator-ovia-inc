@@ -341,8 +341,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect::<BTreeMap<String, String>>(),
                 request_validator_id: input.request_validator_id,
                 authorization_scopes: input.authorization_scopes.unwrap_or_default(),
-                // `PutMethodResponse` and `PutIntegration` write these; both are still
-                // stubs, so a method is stored with neither.
+                // `PutMethodResponse` is still a stub and `PutIntegration` is the call
+                // that attaches an integration, so a method is stored with neither.
                 method_responses: BTreeMap::new(),
                 integration: None,
             },

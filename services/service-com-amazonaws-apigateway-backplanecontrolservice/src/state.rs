@@ -212,8 +212,8 @@ pub struct MethodEntry {
     /// Written by `PutMethodResponse`, which is still a stub, so this stays empty for
     /// now and a `Method` body reports no `methodResponses`.
     pub method_responses: BTreeMap<String, GetMethodResponseOutput>,
-    /// Written by `PutIntegration`, which is still a stub, so this stays absent for now
-    /// and a `Method` body reports no `methodIntegration`.
+    /// Written by `PutIntegration` and reported by `GetIntegration` and a `Method`
+    /// body's `methodIntegration`; absent until an integration is put on the method.
     pub integration: Option<GetIntegrationOutput>,
 }
 
@@ -996,6 +996,9 @@ pub const NO_SUCH_RESOURCE: &str = "Invalid Resource identifier specified";
 
 /// The `NotFoundException` message for an `httpMethod` with no method on the resource.
 pub const NO_SUCH_METHOD: &str = "Invalid Method identifier specified";
+
+/// The `NotFoundException` message for a method that carries no integration.
+pub const NO_SUCH_INTEGRATION: &str = "Invalid Integration identifier specified";
 
 /// The `NotFoundException` message for a `stageName` that names no stage of the API.
 pub const NO_SUCH_STAGE: &str = "Invalid stage identifier specified";

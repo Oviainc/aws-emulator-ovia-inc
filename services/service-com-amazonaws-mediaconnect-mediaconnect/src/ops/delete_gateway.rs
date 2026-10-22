@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(gateway) = store.gateways.remove(&input.gateway_arn) else {
             return Err(DeleteGatewayErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: format!("Gateway with ARN {} was not found.", input.gateway_arn),
+                    message: crate::state::not_found_message(&input.gateway_arn),
                 },
             )
             .into());

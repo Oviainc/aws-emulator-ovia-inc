@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSecurityRequirementPack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSecurityRequirementPack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSecurityRequirementPack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one stored security requirement pack back: resolves the record
+//! `CreateSecurityRequirementPack` persisted and projects it onto the modelled
+//! output. A read — the model marks it `@readonly` — so it writes nothing and a later
+//! caller sees exactly what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +161,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSecurityRequirementPack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSecurityRequirementPackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSecurityRequirementPack"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSecurityRequirementPackErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the security requirement pack store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // `packId` is `@required` but carries no `@length`, so an empty one reaches the
+        // handler. It names no pack and never could, so it is a bad request rather than
+        // a missing resource: refused with the modelled `ValidationException` (HTTP 400).
+        if input.pack_id.is_empty() {
+            return Err(GetSecurityRequirementPackErrorModeled::ValidationException(
+                ValidationException {
+                    message: "packId must not be empty".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "packId".to_string(),
+                        message: "must not be empty".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // A read (`@readonly`): it resolves the record and projects it, and writes
+        // nothing.
+        let state = state.lock();
+        let pack = state
+            .security_requirement_packs
+            .get(&input.pack_id)
+            .ok_or_else(|| {
+                GetSecurityRequirementPackErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No security requirement pack found with id {}",
+                            input.pack_id
+                        ),
+                    },
+                )
+            })?;
+
+        Ok(GetSecurityRequirementPackOutput {
+            pack_id: pack.pack_id.clone(),
+            name: pack.name.clone(),
+            description: pack.description.clone(),
+            vendor_name: pack.vendor_name.clone(),
+            management_type: pack.management_type.clone(),
+            status: pack.status.clone(),
+            import_status: pack.import_status.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(pack.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(pack.updated_at),
+            kms_key_id: pack.kms_key_id.clone(),
+        })
     }
 }

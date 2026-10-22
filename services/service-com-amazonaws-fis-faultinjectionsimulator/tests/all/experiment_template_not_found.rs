@@ -221,7 +221,9 @@ fn template_body(label: &str) -> Value {
         "description": format!("experiment template not-found suite: {label}"),
         "roleArn": ROLE_ARN,
         "stopConditions": [{ "source": "none" }],
-        "actions": { "wait": { "actionId": "aws:fis:wait" } }
+        // `aws:fis:wait` takes a required `duration` parameter (an ISO 8601 duration
+        // within the documented 1 to 720 minutes), which the create refuses without.
+        "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT5M" } } }
     })
 }
 

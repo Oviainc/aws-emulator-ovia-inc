@@ -176,19 +176,22 @@ fn is_maintenance_scheduled_date(date: &str) -> bool {
 }
 
 /// Refuse the request with the service's own client-input error, `BadRequestException`
-/// (HTTP 400): "thrown if the request contains a semantic error".
-fn bad_request(message: impl Into<String>) -> UpdateFlowError {
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> UpdateFlowError {
     UpdateFlowErrorModeled::BadRequestException(BadRequestException {
-        message: message.into(),
+        message: crate::state::validation_failed_message(&detail.into()),
     })
     .into()
 }
 
 /// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
-/// in the request does not exist in the system".
-fn not_found(message: impl Into<String>) -> UpdateFlowError {
+/// in the request does not exist in the system" — the flow `identifier` addressed, in this
+/// service's not-found envelope ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> UpdateFlowError {
     UpdateFlowErrorModeled::NotFoundException(NotFoundException {
-        message: message.into(),
+        message: crate::state::not_found_message(identifier),
     })
     .into()
 }
@@ -339,10 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions(now);
 
         let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
-            return Err(not_found(format!(
-                "Flow with ARN {} was not found.",
-                input.flow_arn
-            )));
+            return Err(not_found(&input.flow_arn));
         };
 
         // What each setting becomes once this request is applied: the request's value
