@@ -92,3 +92,5 @@ mod billing_access_denied_principal_agrees_with_sts;
 mod connectcampaigns_signing_name_routing;
 #[path = "all/pi_data_source_ownership.rs"]
 mod pi_data_source_ownership;
+#[path = "all/lex_signing_name_routing.rs"]
+mod lex_signing_name_routing;

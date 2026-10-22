@@ -74,13 +74,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `lex` — the signing name the WHOLE Lex family shares
+        // (this V2 model-building control plane, the V2 runtime, and the V1 model-building
+        // and runtime APIs), while AWS separates them by endpoint host (`models-v2-lex`
+        // here). The router keys on the SigV4 credential scope first, so all four resolve
+        // to `lex`: claiming on that name alone makes every one of them claim every Lex
+        // request and the router answers `500 AmbiguousService` — an error code no AWS
+        // model declares — instead of serving any of them.
+        //
+        // The claim is therefore this service's own modelled wire surface, through the one
+        // rule `service_common::lex` states for the family (which narrows
+        // `service_common::claims_request` with the family's shared-segment split): the
+        // first URI path segments this `restJson1` model binds, matched by EXACT segment
+        // equality, and — on a segment a sibling publishes too — the modelled route
+        // (method + URI pattern) its own model binds.
+        service_common::lex::claims_request(parts, self.definition(), crate::ROUTE_PATH_SEGMENTS)
     }
 
     fn override_operation(

@@ -13,7 +13,8 @@
 //!   services publishing the SAME path space — the segment their modelled URIs differ at,
 //!   or (where only the whole route tells them apart) whether a service's own model binds
 //!   a route for the request at all. [`bedrock`] states that split once for the six
-//!   services that share the signing name `bedrock`;
+//!   services that share the signing name `bedrock`, and [`lex`] for the four that share
+//!   `lex`;
 //! * [`shared_path`], the reader for the one case the path half of the claim rule
 //!   cannot settle on its own: two colliding models binding the same URI path space,
 //!   where the ARN in the path names the resource and so the service that owns it;
@@ -104,6 +105,7 @@ pub mod db_data_sources;
 pub mod front_door;
 pub mod iam_trust_policy;
 pub mod iot_job_executions;
+pub mod lex;
 pub mod network;
 pub mod shared_path;
 pub mod validation;
