@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints the random bytes behind the uuid in a generated AppInstanceArn, and hex-codes
+# both that uuid and the opaque NextToken a list operation pages with. Both crates are
+# already in this workspace's dependency set, so the service adds no new locked crate.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

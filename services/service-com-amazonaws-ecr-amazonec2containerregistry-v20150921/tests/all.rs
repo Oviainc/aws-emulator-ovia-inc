@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/repository_image_lifecycle.rs"]
 mod repository_image_lifecycle;
+#[path = "all/scanning_configuration.rs"]
+mod scanning_configuration;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

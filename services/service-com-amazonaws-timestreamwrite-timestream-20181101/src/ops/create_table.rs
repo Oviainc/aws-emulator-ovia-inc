@@ -174,7 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
+        let resource = crate::state::audit_resource(&input.database_name, &input.table_name);
+
         let Some(database) = store.databases.get_mut(&input.database_name) else {
+            crate::state::audit(ctx.parts(), Self::NAME, &resource, "refused_no_such_database");
             return Err(CreateTableErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -190,6 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // free and is where the new table goes.
         let slot = match database.tables.entry(input.table_name.clone()) {
             ::std::collections::btree_map::Entry::Occupied(_) => {
+                crate::state::audit(ctx.parts(), Self::NAME, &resource, "refused_already_exists");
                 return Err(CreateTableErrorModeled::ConflictException(ConflictException {
                     message: format!(
                         "Table '{}' already exists in database '{}'",
@@ -229,8 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             records_ingested: 0,
         });
 
+        let created = stored.to_wire();
+        crate::state::audit(ctx.parts(), Self::NAME, &resource, "created");
+
         Ok(CreateTableOutput {
-            table: Some(stored.to_wire()),
+            table: Some(created),
         })
     }
 }

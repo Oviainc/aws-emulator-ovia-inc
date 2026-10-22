@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUsageLimits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUsageLimits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: enumerates the stored usage limits in `usageLimitId` order, at most
+//! `maxResults` of them per page, narrowed by `resourceArn` and `usageType` when the
+//! request carries them — so a listing scoped to a workgroup's ARN reports exactly the
+//! limits `CreateUsageLimit` accepted for it, and none while it has accepted none.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUsageLimits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `nextToken` this service did not issue is the modelled 400
+//! `InvalidPaginationException`; see [`crate::state::page_matching`].
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +154,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUsageLimits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUsageLimitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUsageLimits"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListUsageLimitsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // Both filters NARROW the listing, and a limit is reported only when it satisfies
+        // both. An ARN that names no resource simply matches nothing: a listing reports
+        // the state there is, and refusing it would hide that there are no limits.
+        let page = crate::state::page_matching(
+            &state.usage_limits,
+            |limit| {
+                input
+                    .resource_arn
+                    .as_deref()
+                    .is_none_or(|arn| limit.resource_arn.as_deref() == Some(arn))
+                    && input
+                        .usage_type
+                        .as_deref()
+                        .is_none_or(|usage| limit.usage_type.as_deref() == Some(usage))
+            },
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|message| {
+            ListUsageLimitsErrorModeled::InvalidPaginationException(InvalidPaginationException {
+                message,
+            })
+        })?;
+
+        Ok(ListUsageLimitsOutput {
+            usage_limits: Some(page.items.into_iter().cloned().collect()),
+            next_token: page.next_token,
+        })
     }
 }

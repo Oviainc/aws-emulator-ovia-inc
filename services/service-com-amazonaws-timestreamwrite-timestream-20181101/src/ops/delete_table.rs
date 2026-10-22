@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteTableErrorModeled::InternalServerException(
@@ -176,12 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let mut store = state.lock();
+        let resource = crate::state::audit_resource(&input.database_name, &input.table_name);
 
         let removed = store
             .databases
             .get_mut(&input.database_name)
             .and_then(|database| database.tables.remove(&input.table_name));
         if removed.is_none() {
+            crate::state::audit(ctx.parts(), Self::NAME, &resource, "refused_no_such_table");
             return Err(DeleteTableErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -192,6 +194,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        crate::state::audit(ctx.parts(), Self::NAME, &resource, "deleted");
 
         Ok(DeleteTableOutput)
     }

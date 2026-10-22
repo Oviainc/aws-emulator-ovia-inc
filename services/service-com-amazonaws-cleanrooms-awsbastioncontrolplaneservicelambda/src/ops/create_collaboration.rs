@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCollaboration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCollaboration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCollaboration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a collaboration and persists it in [`crate::state`]; the response is the
+//! stored record projected for the calling account. The creator is NOT given a
+//! membership here: `Collaboration$membershipId`/`membershipArn` are the only
+//! optional members of an otherwise all-required shape, and `CreateMembership` is the
+//! documented way to join a collaboration, so those two members stay absent until the
+//! caller creates its membership.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +186,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCollaboration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCollaborationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCollaboration"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateCollaborationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let creator_account_id = st::caller_account_id().to_string();
+
+        // The model declares `members` as `MemberList, len 0..` — no maximum — so the
+        // only bound on the list the caller sends would be the transport body cap.
+        // Refuse an oversized list UP FRONT, with the `ServiceQuotaExceededException`
+        // (402) this operation declares for exactly that, so the work one request can
+        // ask of the handler is explicitly capped. See `st::MAX_COLLABORATION_MEMBERS`.
+        // NOTE: `quotaName`/`quotaValue` below are EMULATOR-CHOSEN identifiers for that
+        // emulator-enforced bound, not values AWS publishes — the model declares no
+        // maximum for `members` and names no quota for it.
+        if input.members.len() > st::MAX_COLLABORATION_MEMBERS {
+            return Err(CreateCollaborationErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "members carries {} entries, more than the {} allowed",
+                        input.members.len(),
+                        st::MAX_COLLABORATION_MEMBERS
+                    ),
+                    quota_name: "MembersPerCollaboration".to_string(),
+                    quota_value: st::MAX_COLLABORATION_MEMBERS as f64,
+                },
+            )
+            .into());
+        }
+
+        // `members` is documented as "A list of initial members, NOT INCLUDING THE
+        // CREATOR", and a collaboration's members are keyed by account id (one
+        // membership per (collaboration, account)), so neither the creator's own
+        // account nor a repeated account can appear in it. The seen-set is a hash set,
+        // so this scan is O(n) in the bounded member count, not O(n^2).
+        let mut seen: ::std::collections::HashSet<&str> =
+            ::std::collections::HashSet::with_capacity(input.members.len());
+        for member in &input.members {
+            if member.account_id == creator_account_id {
+                return Err(CreateCollaborationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "members must not include the collaboration creator's account {}",
+                            member.account_id
+                        )),
+                        reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "members".to_string(),
+                            message: "must not include the collaboration creator".to_string(),
+                        }]),
+                    },
+                )
+                .into());
+            }
+            if !seen.insert(member.account_id.as_str()) {
+                return Err(CreateCollaborationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "members must not list account {} more than once",
+                            member.account_id
+                        )),
+                        reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "members".to_string(),
+                            message: "account ids must be unique".to_string(),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = st::request_region(ctx.parts());
+        let id = st::new_uuid();
+        let arn = st::collaboration_arn(&region, &id);
+        let created_at = st::now();
+
+        let record = st::CollaborationRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            // `description` carries the model's `default ""`, so an absent one is
+            // stored as the empty string the shape declares rather than as null.
+            description: Some(input.description.unwrap_or_default()),
+            creator_account_id,
+            creator_display_name: input.creator_display_name,
+            creator_member_abilities: input.creator_member_abilities,
+            creator_ml_member_abilities: input.creator_ml_member_abilities,
+            creator_payment_configuration: input.creator_payment_configuration,
+            create_time: created_at,
+            update_time: created_at,
+            data_encryption_metadata: input.data_encryption_metadata,
+            query_log_status: input.query_log_status,
+            job_log_status: input.job_log_status,
+            analytics_engine: input.analytics_engine,
+            // The input member is `autoApprovedChangeRequestTypes`; the output member
+            // on `Collaboration` is `autoApprovedChangeTypes`.
+            auto_approved_change_types: input.auto_approved_change_request_types,
+            allowed_result_regions: input.allowed_result_regions,
+            is_metrics_enabled: input.is_metrics_enabled,
+            members: input.members,
+        };
+
+        let mut store = state.lock();
+        // The store grows by one collaboration per call and lives for the life of the
+        // process, so the growth is capped; past the cap the service answers the quota
+        // error it models rather than accepting another entry. See
+        // `st::MAX_COLLABORATIONS` — the cap and these quota identifiers are the
+        // emulator's own, not values AWS publishes.
+        if store.collaborations.len() >= st::MAX_COLLABORATIONS {
+            return Err(CreateCollaborationErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the number of collaborations would exceed the limit of {}",
+                        st::MAX_COLLABORATIONS
+                    ),
+                    quota_name: "Collaborations".to_string(),
+                    quota_value: st::MAX_COLLABORATIONS as f64,
+                },
+            )
+            .into());
+        }
+        if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
+            store.tags.insert(arn.clone(), tags);
+        }
+        store.collaborations.insert(id.clone(), record);
+        store.collaboration_order.push(id.clone());
+
+        let Some(collaboration) = store.collaboration_view_by_id(&id, st::caller_account_id())
+        else {
+            return Err(CreateCollaborationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("collaboration {id} was not persisted")),
+                },
+            )
+            .into());
+        };
+        Ok(CreateCollaborationOutput { collaboration })
     }
 }

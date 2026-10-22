@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMatchingWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMatchingWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMatchingWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read of the matching workflow `CreateMatchingWorkflow` persisted: every
+//! member, including the `createdAt`/`updatedAt` stamps and the tags, is cloned out of
+//! the stored record. An unknown name answers the modelled `ResourceNotFoundException`
+//! (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +161,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMatchingWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMatchingWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMatchingWorkflow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMatchingWorkflowErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        // A pure read: nothing about the store changes, and two consecutive calls
+        // answer identically.
+        let store = state.lock();
+        let stored = store
+            .matching_workflows
+            .get(&input.workflow_name)
+            .ok_or_else(|| {
+                GetMatchingWorkflowErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Matching workflow {} not found",
+                            input.workflow_name
+                        )),
+                    },
+                )
+            })?;
+
+        Ok(GetMatchingWorkflowOutput {
+            workflow_name: stored.workflow_name.clone(),
+            workflow_arn: stored.workflow_arn.clone(),
+            description: stored.description.clone(),
+            input_source_config: stored.input_source_config.clone(),
+            output_source_config: stored.output_source_config.clone(),
+            resolution_techniques: stored.resolution_techniques.clone(),
+            created_at: stored.created_at,
+            updated_at: stored.updated_at,
+            incremental_run_config: stored.incremental_run_config.clone(),
+            role_arn: stored.role_arn.clone(),
+            tags: stored.tags.clone(),
+        })
     }
 }

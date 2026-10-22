@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDataLake
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDataLake`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDataLake::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored data lake of every Region named in `regions`, together with the
+//! subscribers of those Regions.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +150,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDataLake` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDataLakeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDataLake"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteDataLakeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Security Lake state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // Refuse the whole request before removing anything, so a request naming one
+        // Region that has no data lake cannot half-apply. `regions` is `uniqueItems`, and
+        // every entry must name a stored data lake to get past this check, so the set
+        // below is bounded by the store's own `MAX_DATA_LAKES` cap.
+        let named: ::std::collections::HashSet<&str> =
+            input.regions.iter().map(String::as_str).collect();
+        let unknown: Vec<&str> = named
+            .iter()
+            .copied()
+            .filter(|region| store.data_lake(region).is_none())
+            .collect();
+        if let [first, ..] = unknown.as_slice() {
+            return Err(DeleteDataLakeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Security Lake is not enabled in Region {}",
+                        unknown.join(", ")
+                    )),
+                    resource_name: Some((*first).to_string()),
+                    resource_type: Some("DataLake".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Removing a Region's data lake removes Security Lake from that Region, so its
+        // subscribers go with it: a subscriber subscribes to a data lake, and leaving it
+        // behind would report an ACTIVE subscriber for a Region where CreateSubscriber now
+        // answers 404. ONE pass over each collection against the set of named Regions, so
+        // the work is linear in the stored counts rather than a pass per Region, and the
+        // creation order of what remains is preserved.
+        store.remove_data_lakes(&named);
+
+        Ok(DeleteDataLakeOutput {})
     }
 }

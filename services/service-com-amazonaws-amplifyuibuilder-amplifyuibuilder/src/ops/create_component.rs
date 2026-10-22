@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a component: the record is persisted in [`crate::state`] and every member of the
+//! returned `Component` is computed from it. A repeated call carrying the same
+//! `clientToken` answers with the component that token already created.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComponent"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateComponentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the amplifyuibuilder component store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let data = input.component_to_create;
+
+        // `Component$properties`, `$overrides`, `$bindingProperties` and
+        // `$collectionProperties` each document "You can't specify `tags` as a
+        // valid property" for that map — a rule the model itself cannot express —
+        // so a request naming it is refused rather than stored.
+        for (member, carries) in [
+            (
+                "properties",
+                crate::state::carries_reserved_name(&data.properties),
+            ),
+            (
+                "overrides",
+                crate::state::carries_reserved_name(&data.overrides),
+            ),
+            (
+                "bindingProperties",
+                crate::state::carries_reserved_name(&data.binding_properties),
+            ),
+            (
+                "collectionProperties",
+                data.collection_properties
+                    .as_ref()
+                    .is_some_and(crate::state::carries_reserved_name),
+            ),
+        ] {
+            if carries {
+                return Err(CreateComponentErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "componentToCreate.{member} cannot carry the reserved property \
+                             name {:?}",
+                            crate::state::RESERVED_PROPERTY_NAME
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let key = (input.app_id.clone(), input.environment_name.clone());
+        let mut store = state.lock();
+
+        // `clientToken` is an `@idempotencyToken`: the same token names the same
+        // component, so a retried create reports the first one rather than
+        // minting a second. The token is scoped to the (appId,
+        // environmentName) it was used in, so reusing one against another app
+        // environment creates that environment's own component instead of
+        // reporting one the request does not address.
+        if let Some(replayed) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.replayed_component(&key, token))
+        {
+            return Ok(CreateComponentOutput {
+                entity: Some(replayed.to_component()),
+            });
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record. `ServiceQuotaExceededException` is the modelled
+        // refusal for exactly this.
+        if store.total_components() >= crate::state::COMPONENT_QUOTA {
+            return Err(CreateComponentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} components across all \
+                         app environments",
+                        crate::state::COMPONENT_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_component_id(&key);
+        let cursor = store.next_cursor();
+        let component = crate::state::StoredComponent {
+            app_id: input.app_id,
+            environment_name: input.environment_name,
+            id: id.clone(),
+            name: data.name,
+            component_type: data.component_type,
+            properties: data.properties,
+            children: data.children,
+            variants: data.variants,
+            overrides: data.overrides,
+            binding_properties: data.binding_properties,
+            collection_properties: data.collection_properties,
+            events: data.events,
+            source_id: data.source_id,
+            schema_version: data.schema_version,
+            tags: data.tags,
+            created_at: now,
+            // `modifiedAt` reports the last call that changed the component, and
+            // nothing has changed it yet.
+            modified_at: None,
+            cursor,
+        };
+
+        let entity = component.to_component();
+        store.insert_component(component);
+        if let Some(token) = input.client_token {
+            store.remember_token(key, token, id);
+        }
+
+        Ok(CreateComponentOutput {
+            entity: Some(entity),
+        })
     }
 }

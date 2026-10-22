@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDataLake
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDataLake`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDataLake::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates, or updates, one data lake per entry in `configurations`, keyed by Region, and
+//! answers with the records as they are STORED.
 //!
 //! ## Shape of an operation
 //!
@@ -103,6 +97,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -174,20 +170,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDataLake` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDataLakeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDataLake"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDataLakeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Security Lake state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = SystemTime::now();
+
+        // BOUND the per-request work and the response BEFORE touching the store or
+        // allocating anything sized from the request. `CreateDataLakeRequest$configurations`
+        // carries `@length(min: 1)` and NO maximum, so the boundary validator does not cap
+        // it; a data lake is keyed by Region and this emulator holds at most
+        // `MAX_DATA_LAKES` of them, so a longer list can never usefully name more. Refused
+        // as a bad request rather than throttled: the limit is fixed, so a retry of the
+        // same request can never succeed.
+        if input.configurations.len() > crate::state::MAX_DATA_LAKES {
+            return Err(
+                CreateDataLakeErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(format!(
+                        "configurations carries {} entries; this emulator accepts at most {}, one per Region",
+                        input.configurations.len(),
+                        crate::state::MAX_DATA_LAKES
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The distinct Regions this request names, in first-appearance order. The response
+        // carries one entry per REGION, never one per request entry, so the reply cannot be
+        // amplified by repeating a Region. Bounded by the check above, so the linear
+        // `contains` is bounded too.
+        let mut regions: Vec<&str> = Vec::with_capacity(input.configurations.len());
+        for configuration in &input.configurations {
+            let region = configuration.region.as_str();
+            if !regions.contains(&region) {
+                regions.push(region);
+            }
+        }
+
+        let mut store = state.lock();
+        // Apply any INITIALIZED -> COMPLETED transition the clock already owed, so an
+        // earlier Region's status is current in this response too.
+        store.settle(now);
+
+        // BOUND the store: count the Regions this request would ADD (updating a Region the
+        // store already holds adds none) and refuse the whole request if that would pass
+        // the cap. Checked up front so a refused request cannot half-apply. The bound is
+        // fixed, so the message says a retry will not help.
+        let added = regions
+            .iter()
+            .filter(|region| store.data_lake(region).is_none())
+            .count();
+        if store.data_lake_count() + added > crate::state::MAX_DATA_LAKES {
+            return Err(CreateDataLakeErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(format!(
+                    "this emulator holds at most {} data lakes and already holds {}; the limit is fixed, so retrying will not help until a Region is deleted",
+                    crate::state::MAX_DATA_LAKES,
+                    store.data_lake_count()
+                )),
+                service_code: Some("securitylake".to_string()),
+                quota_code: None,
+                retry_after_seconds: None,
+            })
+            .into());
+        }
+
+        let tags = input.tags.unwrap_or_default();
+
+        for configuration in &input.configurations {
+            // The model documents this operation as an upsert: "If you have already
+            // enabled Security Lake in a Region when you call this command, the command
+            // will update the Region if you provide new configuration parameters. If you
+            // have not already enabled Security Lake in the Region when you call this
+            // API, it will set up the data lake in the Region with the specified
+            // configurations." So an existing Region is UPDATED in place — only by the
+            // sub-configurations this request actually carries — and never refused.
+            //
+            // Entries are applied in order, so a request naming one Region twice ends up
+            // with every sub-configuration it supplied, exactly as two sequential calls
+            // would leave it.
+            if let Some(lake) = store.data_lake_mut(&configuration.region) {
+                lake.meta_store_manager_role_arn = input.meta_store_manager_role_arn.clone();
+                if configuration.encryption_configuration.is_some() {
+                    lake.encryption_configuration = configuration.encryption_configuration.clone();
+                }
+                if configuration.lifecycle_configuration.is_some() {
+                    lake.lifecycle_configuration = configuration.lifecycle_configuration.clone();
+                }
+                if configuration.replication_configuration.is_some() {
+                    lake.replication_configuration =
+                        configuration.replication_configuration.clone();
+                }
+                if !tags.is_empty() {
+                    lake.tags = tags.clone();
+                }
+            } else {
+                store.insert_data_lake(
+                    configuration,
+                    &input.meta_store_manager_role_arn,
+                    &tags,
+                    now,
+                );
+            }
+        }
+
+        // Read the records back out of the store rather than echoing the request, so this
+        // response and every later ListDataLakes agree by construction. One entry per
+        // distinct Region, so the list is bounded by `MAX_DATA_LAKES`.
+        let mut data_lakes = Vec::with_capacity(regions.len());
+        for region in &regions {
+            let Some(lake) = store.data_lake(region) else {
+                return Err(CreateDataLakeErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "the data lake for Region {region} was not persisted"
+                        )),
+                    },
+                )
+                .into());
+            };
+            data_lakes.push(lake.to_resource());
+        }
+
+        Ok(CreateDataLakeOutput {
+            data_lakes: Some(data_lakes),
+        })
     }
 }

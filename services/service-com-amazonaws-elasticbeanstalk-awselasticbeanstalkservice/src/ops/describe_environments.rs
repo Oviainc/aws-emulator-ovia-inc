@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEnvironments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEnvironments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEnvironments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the environments the store holds, narrowed by the supplied
+//! filters and paginated by `MaxRecords`/`NextToken`. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEnvironments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEnvironmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEnvironments"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeEnvironmentsError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        // The only write a report performs: a status change the clock already
+        // made due (a launch that has finished, a termination that has
+        // completed) is owed whether or not anyone called, so it is settled
+        // before the store is read.
+        store.materialize_due_transitions();
+
+        let include_deleted = input.include_deleted.unwrap_or(false);
+        // "If specified when IncludeDeleted is set to true, then environments
+        // deleted after this date are displayed."
+        let deleted_back_to = input.included_deleted_back_to.map(|at| at.secs());
+
+        let matching: Vec<&crate::state::Environment> = store
+            .environments
+            .values()
+            .filter(|environment| {
+                input
+                    .application_name
+                    .as_ref()
+                    .is_none_or(|name| environment.application_name == *name)
+            })
+            .filter(|environment| {
+                input
+                    .version_label
+                    .as_ref()
+                    .is_none_or(|label| environment.version_label.as_ref() == Some(label))
+            })
+            .filter(|environment| {
+                input
+                    .environment_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&environment.environment_id))
+            })
+            .filter(|environment| {
+                input
+                    .environment_names
+                    .as_ref()
+                    .is_none_or(|names| names.contains(&environment.environment_name))
+            })
+            .filter(|environment| {
+                if !environment.is_terminated() {
+                    return true;
+                }
+                include_deleted
+                    && deleted_back_to.is_none_or(|back_to| {
+                        environment
+                            .date_terminated
+                            .is_some_and(|at| at.secs() >= back_to)
+                    })
+            })
+            .collect();
+
+        // "If no MaxRecords is specified, all available environments are
+        // retrieved in a single response." The page boundary is the id of the
+        // first environment of the next page: the store is keyed by
+        // `EnvironmentId`, so that order is stable across calls.
+        let offset = match input.next_token.as_deref() {
+            Some(token) => matching
+                .iter()
+                .position(|environment| environment.environment_id == token)
+                .ok_or_else(|| {
+                    DescribeEnvironmentsError::invalid_parameter_value(format!(
+                        "Invalid NextToken: {token}"
+                    ))
+                })?,
+            None => 0,
+        };
+        let page = &matching[offset..];
+        // `MaxRecords` is modelled `range 1..1000`, so the boundary validator has
+        // already refused anything outside that before this handler runs: the
+        // conversion below cannot see a non-positive page size, and the guard
+        // keeps it from inventing an empty page with a continuation token if a
+        // future model widens the range.
+        let max_records = input
+            .max_records
+            .and_then(|max_records| usize::try_from(max_records).ok())
+            .filter(|max_records| *max_records > 0);
+        let (page, next_token) = match max_records {
+            Some(max_records) if page.len() > max_records => (
+                &page[..max_records],
+                Some(page[max_records].environment_id.clone()),
+            ),
+            _ => (page, None),
+        };
+
+        // The model binds one `EnvironmentDescription` shape here; the scaffold
+        // emits a per-operation struct for it, and this is the name that shape
+        // carries in this crate.
+        type EnvironmentDescription = CreateEnvironmentOutput;
+        let environments = page
+            .iter()
+            .map(|environment| {
+                crate::state::environment_description!(EnvironmentDescription, environment)
+            })
+            .collect();
+
+        Ok(DescribeEnvironmentsOutput {
+            environments: Some(environments),
+            next_token,
+        })
     }
 }

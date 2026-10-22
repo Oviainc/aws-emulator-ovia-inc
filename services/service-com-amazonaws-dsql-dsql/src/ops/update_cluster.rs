@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the persisted cluster named by the `@httpLabel` `identifier`, applying
+//! only the members the request carries, and moves it to `UPDATING` with the clock
+//! owing it `ACTIVE` again. Unknown identifier -> `ResourceNotFoundException` (404);
+//! a cluster in a status that does not accept a mutation -> `ConflictException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -129,12 +125,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `UpdateClusterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#UpdateCluster")]
+// The operation's MODELED errors, plus the service-common `InternalServerException`
+// widened in with `extra_errors`: the service declares it for every operation (its
+// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
+// per-operation list the macro checks against does not repeat it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#UpdateCluster",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UpdateClusterErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -188,18 +192,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCluster"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        let Some(cluster) = state.clusters.get_mut(&input.identifier) else {
+            return Err(UpdateClusterErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&input.identifier),
+            )
+            .into());
+        };
+
+        // A cluster the clock still owes a transition, or one on its way out, cannot
+        // take a configuration change.
+        if !cluster.accepts_mutation() {
+            return Err(UpdateClusterErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "cluster {} cannot be updated while its status is {}",
+                    cluster.identifier, cluster.status
+                ),
+                resource_id: Some(cluster.identifier.clone()),
+                resource_type: Some("cluster".to_string()),
+            })
+            .into());
+        }
+
+        // Only the members the request carries are applied; an absent member leaves
+        // the stored value alone.
+        if let Some(deletion_protection_enabled) = input.deletion_protection_enabled {
+            cluster.deletion_protection_enabled = deletion_protection_enabled;
+        }
+        if let Some(kms_encryption_key) = input.kms_encryption_key {
+            cluster.encryption_details = Some(crate::state::encryption_details(
+                &region,
+                Some(kms_encryption_key.as_str()),
+            ));
+            cluster.kms_encryption_key = Some(kms_encryption_key);
+        }
+        if let Some(multi_region_properties) = input.multi_region_properties {
+            cluster.multi_region_properties = Some(multi_region_properties);
+        }
+
+        // The reconfiguration is asynchronous: the cluster reports `UPDATING` and the
+        // clock owes it `ACTIVE` again.
+        cluster.status = crate::state::STATUS_UPDATING.to_string();
+        cluster.pending = Some(crate::state::PendingTransition {
+            due_at: now + crate::state::SETTLE_AFTER,
+            next_status: crate::state::STATUS_ACTIVE,
+        });
+
+        Ok(UpdateClusterOutput {
+            identifier: cluster.identifier.clone(),
+            arn: cluster.arn.clone(),
+            status: cluster.status.clone(),
+            creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
+        })
     }
 }

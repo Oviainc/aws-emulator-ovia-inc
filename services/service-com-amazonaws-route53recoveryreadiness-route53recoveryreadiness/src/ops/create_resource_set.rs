@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResourceSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResourceSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResourceSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a new resource set in this service's store, keyed by `ResourceSetName`, and
+//! answers with the record it just wrote — including the `ResourceSetArn` it minted.
+//! That record is the only thing `GetResourceSet` and `ListResourceSets` read, so
+//! nothing here is echoed back to the caller without being persisted first.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +171,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResourceSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResourceSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResourceSet"))
+        let _ = ctx;
+        // `ResourceSetType` targets a shape that carries the `@pattern` the API
+        // documents, so the boundary validator has already refused a bad type; the
+        // NAME's input shape carries no constraint, so this is where the rule the
+        // output shape states is applied.
+        crate::state::validate_name("ResourceSetName", &input.resource_set_name)
+            .map_err(|message| {
+                CreateResourceSetErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+            })?;
+        // CC-02 growth bound: one accepted record must not be arbitrarily large.
+        crate::state::validate_resources(&input.resources)
+            .and_then(|()| crate::state::validate_tags(input.tags.as_ref()))
+            .map_err(|message| {
+                CreateResourceSetErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+            })?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateResourceSetErrorModeled::InternalServerException(InternalServerException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        if state.resource_sets.contains_key(&input.resource_set_name) {
+            return Err(CreateResourceSetErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "A resource set named {} already exists.",
+                        input.resource_set_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // CC-02 growth bound: the store must not grow per request without a ceiling.
+        if state.resource_sets.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreateResourceSetErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::store_full_message("resource sets")),
+                },
+            )
+            .into());
+        }
+
+        let arn = crate::state::resource_set_arn(&input.resource_set_name);
+        let record = crate::state::ResourceSetRecord {
+            arn: arn.clone(),
+            name: input.resource_set_name.clone(),
+            resource_set_type: input.resource_set_type,
+            resources: input.resources,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+        state.arn_index.insert(
+            arn,
+            crate::state::ResourceKey::ResourceSet(input.resource_set_name.clone()),
+        );
+        state
+            .resource_sets
+            .insert(input.resource_set_name.clone(), record);
+
+        // Read the response back out of the store: what the caller sees is what a
+        // later `GetResourceSet` will see, by construction.
+        let stored = &state.resource_sets[&input.resource_set_name];
+        Ok(CreateResourceSetOutput {
+            resource_set_arn: Some(stored.arn.clone()),
+            resource_set_name: Some(stored.name.clone()),
+            resource_set_type: Some(stored.resource_set_type.clone()),
+            resources: Some(stored.resources.clone()),
+            tags: stored.modeled_tags(),
+        })
     }
 }

@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCacheSubnetGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCacheSubnetGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DescribeCacheSubnetGroups::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -148,18 +144,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCacheSubnetGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCacheSubnetGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCacheSubnetGroups"))
+        // A pure read: a subnet group has no lifecycle the clock drives, so this
+        // handler writes nothing at all.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // This operation models only `CacheSubnetGroupNotFoundFault`, so a
+        // `MaxRecords` outside the documented 20..100 or a `Marker` this service
+        // did not mint is refused through the synthetic `ValidationException` —
+        // the channel for a rule the service enforces but the model does not
+        // give it an error for.
+        let page_size = match crate::state::page_size(input.max_records) {
+            Ok(size) => size,
+            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+        };
+        let resume_from = match input.marker.as_deref() {
+            Some(marker) => match crate::state::decode_marker(marker) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "Invalid value {marker} for Marker."
+                    )))
+                }
+            },
+            None => None,
+        };
+
+        let store = state.lock();
+
+        // With `CacheSubnetGroupName` the answer is that one group, or the
+        // modelled not-found; pagination does not apply to a single-resource
+        // lookup.
+        if let Some(name) = input.cache_subnet_group_name.as_deref() {
+            let key = name.to_ascii_lowercase();
+            let Some(group) = store.cache_subnet_groups.get(&key) else {
+                return Err(
+                    DescribeCacheSubnetGroupsErrorModeled::CacheSubnetGroupNotFoundFault(
+                        CacheSubnetGroupNotFoundFault {
+                            message: Some(format!("Cache subnet group {name} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            return Ok(DescribeCacheSubnetGroupsOutput {
+                marker: None,
+                cache_subnet_groups: Some(vec![group.to_modeled()]),
+            });
+        }
+
+        let mut page: Vec<CacheSubnetGroup> = Vec::new();
+        let mut marker = None;
+        for (key, group) in store
+            .cache_subnet_groups
+            .iter()
+            .filter(|(key, _)| resume_from.as_ref().is_none_or(|from| *key >= from))
+        {
+            if page.len() == page_size {
+                // More records exist than `MaxRecords`, so the response carries
+                // the marker the next call resumes from.
+                marker = Some(crate::state::encode_marker(key));
+                break;
+            }
+            page.push(group.to_modeled());
+        }
+
+        Ok(DescribeCacheSubnetGroupsOutput {
+            marker,
+            cache_subnet_groups: Some(page),
+        })
     }
 }

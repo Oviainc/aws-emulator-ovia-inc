@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContactChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContactChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContactChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a contact channel under the contact its `ContactId` names and returns the
+//! `ContactChannelArn` it minted. A new channel is `NOT_ACTIVATED`: the model's own
+//! `ActivationStatus` doc says an unactivated channel is one "Incident Manager can't
+//! engage the contact through", and `SendActivationCode`/`ActivateContactChannel` are
+//! what move it — so the create never activates one.
 //!
 //! ## Shape of an operation
 //!
@@ -107,13 +104,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssmcontacts-ssmcontacts
 // here — hence the `CreateContactChannelError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssmcontacts#CreateContactChannel")]
+// `ResourceNotFoundException` is widened in with `extra_errors`: `ContactId` names a
+// contact that must already exist, and the SERVICE models that shape (every other
+// contact-addressed operation — `GetContact`, `ListContactChannels`, `DeleteContact` —
+// declares it) even though this operation's own error list omits it. Without the widening
+// an unknown contact would have no 404 to answer with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssmcontacts#CreateContactChannel",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CreateContactChannelErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     DataEncryptionException(DataEncryptionException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -169,18 +175,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContactChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContactChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContactChannel"))
+        use crate::state::{check_enum, contact_channel_arn, ContactChannelRecord};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateContactChannelErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        // An enum SHAPE reaches a handler as a plain string, so the permitted set is
+        // checked here against the model-derived value list.
+        check_enum("type", &input.r#type, CHANNEL_TYPE_VALUES).map_err(validation)?;
+
+        // `DeliveryAddress` is required and is "the details that Incident Manager uses
+        // when trying to engage the contact channel", so an address carrying no
+        // `SimpleAddress` names nothing to engage.
+        let delivery_address = match input.delivery_address.simple_address.as_deref() {
+            Some(address) if !address.is_empty() => address.to_string(),
+            _ => {
+                return Err(validation(
+                    "Value at 'deliveryAddress.simpleAddress' failed to satisfy constraint: \
+                     Member must not be empty",
+                ))
+            }
+        };
+
+        let mut state = state.lock();
+
+        // The referenced contact is resolved BEFORE any replay: a token does not excuse a
+        // `ContactId` that names nothing, so a retry pointed at a different or absent
+        // contact is still a 404 rather than the first call's answer.
+        let Some(contact) = state.contacts.get(&input.contact_id) else {
+            return Err(CreateContactChannelErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Contact {} not found", input.contact_id),
+                    resource_id: input.contact_id.clone(),
+                    resource_type: "contact".to_string(),
+                },
+            )
+            .into());
+        };
+        let contact_arn = contact.arn.clone();
+        let alias = contact.alias.clone();
+
+        // A retried create carrying the token its first call carried is the SAME call —
+        // but only while it still names the SAME contact. A token reused against another
+        // contact is a different request, so it creates rather than replaying.
+        if let Some(arn) = state.idempotent_replay(Self::NAME, input.idempotency_token.as_deref()) {
+            let replayed_contact = state
+                .contact_channels
+                .get(&arn)
+                .map(|channel| channel.contact_arn.clone());
+            if replayed_contact.as_deref() == Some(contact_arn.as_str()) {
+                return Ok(CreateContactChannelOutput {
+                    contact_channel_arn: arn,
+                });
+            }
+        }
+
+        if state.contact_channels.len() >= crate::state::MAX_CONTACT_CHANNELS {
+            return Err(validation(format!(
+                "This emulator holds at most {} contact channels; delete one before creating \
+                 another",
+                crate::state::MAX_CONTACT_CHANNELS
+            )));
+        }
+
+        let sequence = state.channels_created;
+        state.channels_created += 1;
+        let arn = contact_channel_arn(
+            &crate::state::request_region(ctx.parts()),
+            &alias,
+            &input.name,
+            sequence,
+        );
+        let record = ContactChannelRecord {
+            arn: arn.clone(),
+            contact_arn,
+            name: input.name.clone(),
+            channel_type: input.r#type.clone(),
+            delivery_address: ContactChannelAddress {
+                simple_address: Some(delivery_address),
+            },
+            // Whether activation is deferred changes only whether an activation code is
+            // sent; either way the channel starts unactivated.
+            activation_status: NOT_ACTIVATED.to_string(),
+            sequence,
+            created_at: ::std::time::SystemTime::now(),
+        };
+        state.contact_channels.insert(arn.clone(), record);
+        state.remember_idempotency_token(Self::NAME, input.idempotency_token.as_deref(), &arn);
+
+        Ok(CreateContactChannelOutput {
+            contact_channel_arn: arn,
+        })
     }
+}
+
+/// The `ActivationStatus` a newly created channel carries, from the model's own
+/// `ActivationStatus` value set.
+const NOT_ACTIVATED: &str = "NOT_ACTIVATED";
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> CreateContactChannelError {
+    CreateContactChannelErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
 }

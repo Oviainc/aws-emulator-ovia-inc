@@ -18,6 +18,15 @@
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
+use smithy_server_runtime::{Violation, ViolationKind};
+
+/// The minimum every one of this service's `MaxList*Results` shapes declares with
+/// `@range` (`min: 1`); only the maximum differs between operations.
+const MIN_MAX_RESULTS: i32 = 1;
+
+/// The validation path of the page-size member, as every list operation's input
+/// spells it (`MaxResults`, lowerCamel in a message path).
+const MAX_RESULTS_MEMBER: &str = "maxResults";
 
 /// A catalog domain — the top of the catalog hierarchy.
 #[derive(Debug, Clone)]
@@ -366,6 +375,11 @@ fn decode_page_token(
 /// `ValidationException`: each message names the input member at fault, the way the
 /// boundary validator's own refusals do, and is built the same way for all five list
 /// operations.
+///
+/// A `MaxResults` outside the modeled range is a violation of that `@range`, so it is
+/// worded by the one renderer this service words every constraint violation with
+/// ([`crate::service::constraint_envelope`]) rather than by a sentence of its own —
+/// member and constraint, with no rendering of the rejected value.
 pub fn page_refusal(operation: &str, error: PageError) -> String {
     match error {
         PageError::InvalidToken => format!(
@@ -375,7 +389,34 @@ pub fn page_refusal(operation: &str, error: PageError) -> String {
         PageError::MaxResultsOutOfRange {
             requested,
             modeled_max,
-        } => format!("maxResults must be between 1 and {modeled_max}; {requested} was supplied"),
+        } => {
+            // The modeled range is `MIN_MAX_RESULTS..=modeled_max`, so a refused value
+            // is either below the minimum or above the maximum.
+            let kind = if requested < MIN_MAX_RESULTS {
+                ViolationKind::MinValue(MIN_MAX_RESULTS.to_string())
+            } else {
+                ViolationKind::MaxValue(modeled_max.to_string())
+            };
+            // `value` is `None` because this service's renderer never states the
+            // rejected value: the member WAS present, it is simply not rendered.
+            let violation = Violation {
+                path: MAX_RESULTS_MEMBER.to_string(),
+                kind,
+                value: None,
+            };
+            crate::service::constraint_envelope(std::slice::from_ref(&violation)).unwrap_or_else(
+                || {
+                    // The renderer words every numeric bound, so this is unreachable;
+                    // wording it here too keeps a refusal from ever being answered with
+                    // no message at all.
+                    format!(
+                        "1 validation error detected: Value at '{MAX_RESULTS_MEMBER}' failed to \
+                         satisfy constraint: Member must have value between \
+                         {MIN_MAX_RESULTS} and {modeled_max}"
+                    )
+                },
+            )
+        }
     }
 }
 
@@ -394,7 +435,7 @@ pub fn page<T>(
     modeled_max: i32,
 ) -> Result<Page<T>, PageError> {
     if let Some(requested) = max_results {
-        if !(1..=modeled_max).contains(&requested) {
+        if !(MIN_MAX_RESULTS..=modeled_max).contains(&requested) {
             return Err(PageError::MaxResultsOutOfRange {
                 requested,
                 modeled_max,

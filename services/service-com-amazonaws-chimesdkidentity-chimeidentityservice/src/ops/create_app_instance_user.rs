@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAppInstanceUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAppInstanceUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAppInstanceUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -167,20 +158,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAppInstanceUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAppInstanceUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAppInstanceUser"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAppInstanceUserErrorModeled::ServiceFailureException(ServiceFailureException {
+                code: Some("ServiceFailure".to_string()),
+                message: Some("the AppInstance store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The user ARN is the parent's ARN plus the caller's id, so it is fully
+        // determined by the request.
+        let arn =
+            crate::state::app_instance_user_arn(&input.app_instance_arn, &input.app_instance_user_id);
+
+        // Idempotency (`@idempotencyToken` on `ClientRequestToken`): a retry with the
+        // same token answers with the user ARN the first call minted. Because that ARN
+        // is derived from the request, a token replayed for a DIFFERENT user is a
+        // mismatched reuse rather than a retry, and is refused with the modelled
+        // conflict instead of answering about a resource the caller did not ask for.
+        if let Some(existing) = state.idempotent_arn(Self::NAME, &input.client_request_token) {
+            if existing == arn {
+                return Ok(CreateAppInstanceUserOutput {
+                    app_instance_user_arn: Some(existing),
+                });
+            }
+            return Err(CreateAppInstanceUserErrorModeled::ConflictException(
+                ConflictException {
+                    code: Some("Conflict".to_string()),
+                    message: Some(format!(
+                        "ClientRequestToken was already used to create AppInstanceUser {existing}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A user only exists under an AppInstance, its id is unique within that
+        // instance, and the store is bounded — `insert_user` does the ONE parent
+        // lookup and reports which of the three modelled refusals applies. In every
+        // refusal nothing is written.
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::AppInstanceUserRecord {
+            arn: arn.clone(),
+            app_instance_arn: input.app_instance_arn.clone(),
+            user_id: input.app_instance_user_id.clone(),
+            name: input.name,
+            metadata: input.metadata,
+            created_timestamp: now,
+            last_updated_timestamp: now,
+            expiration_settings: input.expiration_settings,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect(),
+        };
+
+        match state.insert_user(record) {
+            crate::state::InsertUser::Stored => {}
+            // This operation models no 404 shape, so an unknown parent is refused with
+            // the modelled `BadRequestException` carrying the `NotFound` error code.
+            crate::state::InsertUser::NoSuchAppInstance => {
+                return Err(CreateAppInstanceUserErrorModeled::BadRequestException(
+                    BadRequestException {
+                        code: Some("NotFound".to_string()),
+                        message: Some(format!(
+                            "AppInstance {} does not exist",
+                            input.app_instance_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+            // The id is the caller's choice and is unique within its instance, so a
+            // second create of the same id under a NEW token is a conflict, not a
+            // replay: the stored user is left exactly as it was.
+            crate::state::InsertUser::AlreadyExists => {
+                return Err(CreateAppInstanceUserErrorModeled::ConflictException(
+                    ConflictException {
+                        code: Some("Conflict".to_string()),
+                        message: Some(format!(
+                            "AppInstanceUserId {} already exists in AppInstance {}",
+                            input.app_instance_user_id, input.app_instance_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::InsertUser::AtCapacity => {
+                return Err(
+                    CreateAppInstanceUserErrorModeled::ResourceLimitExceededException(
+                        ResourceLimitExceededException {
+                            code: Some("ResourceLimitExceeded".to_string()),
+                            message: Some(format!(
+                                "AppInstance {} already holds the maximum of {} AppInstanceUsers",
+                                input.app_instance_arn,
+                                crate::state::MAX_APP_INSTANCE_USERS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The user is stored either way; at the structural token ceiling the token is
+        // simply not recorded, so the map cannot grow past it.
+        let _recorded = state.record_idempotency(Self::NAME, &input.client_request_token, &arn);
+
+        Ok(CreateAppInstanceUserOutput {
+            app_instance_user_arn: Some(arn),
+        })
     }
 }

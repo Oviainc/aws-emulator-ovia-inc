@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/dictionary_lifecycle.rs"]
 mod dictionary_lifecycle;
+#[path = "all/feed_association.rs"]
+mod feed_association;
 #[path = "all/feed_lifecycle.rs"]
 mod feed_lifecycle;
 #[path = "all/state_roundtrip.rs"]

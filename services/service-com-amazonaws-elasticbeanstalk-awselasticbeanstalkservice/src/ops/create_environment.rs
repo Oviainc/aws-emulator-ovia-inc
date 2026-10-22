@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores the environment the request asks for, in the `Launching` status a
+//! newly created environment reports, and answers with the `EnvironmentDescription` built
+//! from what was stored. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -241,18 +235,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironment"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEnvironmentError::internal_failure("the Elastic Beanstalk store is unavailable")
+        })?;
+        let mut store = state.lock();
+        // A name freed by an environment whose termination the clock has already
+        // completed is available again, so settle those first.
+        store.materialize_due_transitions();
+
+        if !store.applications.contains_key(&input.application_name) {
+            return Err(CreateEnvironmentError::invalid_parameter_value(format!(
+                "No Application named '{}' found.",
+                input.application_name
+            )));
+        }
+
+        // `GroupName` names an environment through an environment manifest
+        // (env.yaml) in the source bundle, which this emulator never reads, so an
+        // environment it cannot name is refused rather than invented.
+        let Some(environment_name) = input.environment_name.clone() else {
+            return Err(CreateEnvironmentError::missing_required_parameter(
+                "Must specify an EnvironmentName.",
+            ));
+        };
+
+        // "This name must be unique within a region in your account. If the
+        // specified name already exists in the region, Elastic Beanstalk returns
+        // an InvalidParameterValue error." A terminated environment no longer
+        // holds its name.
+        let name_taken = store
+            .environment_name_index
+            .get(&environment_name)
+            .and_then(|id| store.environments.get(id))
+            .is_some_and(|existing| !existing.is_terminated());
+        if name_taken {
+            return Err(CreateEnvironmentError::invalid_parameter_value(format!(
+                "Environment {environment_name} already exists."
+            )));
+        }
+
+        // "The name of the application version to deploy" — a label this
+        // application has no version for cannot be deployed.
+        if let Some(version_label) = input.version_label.as_ref() {
+            let key = (input.application_name.clone(), version_label.clone());
+            if !store.application_versions.contains_key(&key) {
+                return Err(CreateEnvironmentError::invalid_parameter_value(format!(
+                    "No Application Version named '{version_label}' found."
+                )));
+            }
+        }
+
+        // "TooManyEnvironmentsException: The specified account has reached its
+        // limit of environments." Enforcing the quota is also what bounds the
+        // store: the number of live records a caller can create is capped, and
+        // terminated ones are retained only up to their own bound.
+        if store.running_environment_count() >= crate::state::MAX_ENVIRONMENTS {
+            return Err(CreateEnvironmentErrorModeled::TooManyEnvironmentsException(
+                TooManyEnvironmentsException {
+                    message: Some(format!(
+                        "The number of environments in this account has reached the limit of {}.",
+                        crate::state::MAX_ENVIRONMENTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let environment_id = store.next_environment_id();
+        // "If not specified, the CNAME is generated automatically by appending a
+        // random alphanumeric string to the environment name" — the appended
+        // string is this environment's own unique id body, so every environment
+        // gets a distinct CNAME.
+        let cname_prefix = input.cname_prefix.clone().unwrap_or_else(|| {
+            format!(
+                "{environment_name}-{}",
+                environment_id.trim_start_matches("e-")
+            )
+        });
+        let created = crate::state::now();
+        let environment = crate::state::Environment {
+            environment_id: environment_id.clone(),
+            environment_name: environment_name.clone(),
+            arn: crate::state::environment_arn(
+                &region,
+                &input.application_name,
+                &environment_name,
+            ),
+            application_name: input.application_name.clone(),
+            version_label: input.version_label.clone(),
+            solution_stack_name: input.solution_stack_name.clone(),
+            platform_arn: input.platform_arn.clone(),
+            template_name: input.template_name.clone(),
+            description: input.description.clone(),
+            cname: crate::state::environment_cname(&cname_prefix, &region),
+            // `EndpointURL` is "the URL to the LoadBalancer" or "the IP address
+            // of the instance". This emulator provisions neither, so there is no
+            // endpoint to report and none is invented.
+            endpoint_url: None,
+            // The default tier: a Standard-mode EC2-based web server, the two
+            // values the model documents for that tier. `Version` is the
+            // deprecated member, left to whatever the caller sent.
+            tier: Some(input.tier.clone().unwrap_or(EnvironmentTier {
+                name: Some("WebServer".to_string()),
+                r#type: Some("Standard".to_string()),
+                version: None,
+            })),
+            option_settings: input.option_settings.clone().unwrap_or_default(),
+            operations_role: input.operations_role.clone(),
+            // "Launching: Environment is in the process of initial deployment."
+            status: crate::state::STATUS_LAUNCHING.to_string(),
+            // "Grey: Default health for a new environment."
+            health: crate::state::HEALTH_GREY.to_string(),
+            health_status: Some(crate::state::HEALTH_STATUS_PENDING.to_string()),
+            abortable_operation_in_progress: false,
+            date_created: created,
+            date_updated: created,
+            date_terminated: None,
+            tags: input.tags.clone().unwrap_or_default(),
+            // The launch the clock owes: `Launching` -> `Ready`.
+            pending_status: Some(crate::state::PendingStatus::launch_completion()),
+        };
+
+        let output = crate::state::environment_description!(CreateEnvironmentOutput, &environment);
+        store
+            .environment_name_index
+            .insert(environment_name, environment_id.clone());
+        store.environments.insert(environment_id, environment);
+
+        Ok(output)
     }
 }

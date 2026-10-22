@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListContacts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListContacts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListContacts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted contacts, filtered by `AliasPrefix` and `Type` when the
+//! request names them, one `MaxResults`-sized page at a time. A read: it writes nothing.
+//!
+//! The store keys contacts by `ContactArn` in a `BTreeMap`, and a contact's ARN ends in
+//! its alias, so enumeration order is stable and alias-ordered and a `NextToken` only has
+//! to carry the ARN the previous page ended on.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +151,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListContacts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListContactsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListContacts"))
+        use crate::state::{
+            check_enum, contact_summary, decode_next_token, invalid_next_token_message, page_size,
+            take_page, TOKEN_SCOPE_CONTACTS,
+        };
+
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListContactsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        if let Some(contact_type) = input.r#type.as_deref() {
+            check_enum("type", contact_type, CONTACT_TYPE_VALUES).map_err(validation)?;
+        }
+
+        // The resume point: every contact strictly after the ARN the last page ended on.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                decode_next_token(TOKEN_SCOPE_CONTACTS, token)
+                    .ok_or_else(|| validation(invalid_next_token_message(token)))?,
+            ),
+            None => None,
+        };
+
+        let state = state.lock();
+        let matching: Vec<Contact> = state
+            .contacts
+            .iter()
+            .filter(|(arn, _)| after.as_deref().is_none_or(|last| arn.as_str() > last))
+            .map(|(_, record)| record)
+            .filter(|record| {
+                input
+                    .alias_prefix
+                    .as_deref()
+                    .is_none_or(|prefix| record.alias.starts_with(prefix))
+            })
+            .filter(|record| {
+                input
+                    .r#type
+                    .as_deref()
+                    .is_none_or(|wanted| record.contact_type == wanted)
+            })
+            .map(contact_summary)
+            .collect();
+
+        let (page, next_token) = take_page(
+            matching,
+            page_size(input.max_results),
+            TOKEN_SCOPE_CONTACTS,
+            |contact| contact.contact_arn.clone(),
+        );
+
+        Ok(ListContactsOutput {
+            next_token,
+            contacts: Some(page),
+        })
     }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> ListContactsError {
+    ListContactsErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
 }

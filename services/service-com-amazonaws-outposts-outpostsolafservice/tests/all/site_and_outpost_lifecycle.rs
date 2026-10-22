@@ -21,6 +21,10 @@
 //!    refused while another resource still references it.
 //! 5. An identifier that names nothing is 404 `NotFoundException`; one that is not an
 //!    identifier at all is 400 `ValidationException`.
+//!
+//! What a projection REPORTS — the tag map, the two Availability Zone identities and
+//! the lifecycle status — is stated and exercised in
+//! [`crate::site_and_outpost_projection`], which reuses this suite's harness.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -54,20 +58,35 @@ const ABSENT_SITE_ID: &str = "os-00000000000000000";
 const ABSENT_OUTPOST_ID: &str = "op-00000000000000000";
 
 /// One Outposts emulator over one shared engine, reached the way the router reaches it.
-struct Outposts {
+pub(crate) struct Outposts {
     router: MultiServiceRouter,
 }
 
 /// One answer from the emulator: the status, the wire error code (the restJson1
 /// `__type` discriminator) and the parsed body.
-struct Reply {
-    status: u16,
-    error_code: String,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
+}
+
+/// Wait until a clock-owed Outpost lifecycle transition has fallen due.
+///
+/// `CreateOutpost` answers with a provisioning Outpost and the service materialises
+/// its `PENDING` -> `ACTIVE` transition at the instant it stored, so a case that
+/// wants settled Outposts waits past that span (plus a margin, so the case is not
+/// racing it). Blocking with `std::thread::sleep` rather than `tokio::time::sleep`:
+/// the workspace's `tokio` carries only the `macros`/`rt` features, so the timer
+/// driver `tokio::time` needs is not compiled in.
+pub(crate) fn settle() {
+    std::thread::sleep(
+        service_com_amazonaws_outposts_outpostsolafservice::state::OUTPOST_PROVISIONING
+            + std::time::Duration::from_millis(400),
+    );
 }
 
 impl Outposts {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
@@ -77,7 +96,7 @@ impl Outposts {
     /// Dispatch one restJson1 request at `method path`, with `body` as the JSON
     /// payload (absent for the GET and DELETE routes, which bind every member to
     /// the URI).
-    async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
         let payload = body.map(Value::to_string).unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
@@ -106,7 +125,7 @@ impl Outposts {
     }
 
     /// Dispatch `method path` and require HTTP 200, returning the body.
-    async fn ok(&self, method: &str, path: &str, body: Option<&Value>) -> Value {
+    pub(crate) async fn ok(&self, method: &str, path: &str, body: Option<&Value>) -> Value {
         let reply = self.call(method, path, body).await;
         assert_eq!(
             reply.status, 200,
@@ -117,36 +136,36 @@ impl Outposts {
     }
 
     /// `CreateSite`, returning the `Site` it answered with.
-    async fn create_site(&self, request: &Value) -> Value {
+    pub(crate) async fn create_site(&self, request: &Value) -> Value {
         self.ok("POST", "/sites", Some(request)).await["Site"].clone()
     }
 
     /// `CreateOutpost`, returning the `Outpost` it answered with.
-    async fn create_outpost(&self, request: &Value) -> Value {
+    pub(crate) async fn create_outpost(&self, request: &Value) -> Value {
         self.ok("POST", "/outposts", Some(request)).await["Outpost"].clone()
     }
 
     /// `GetSite`, returning the `Site` it answered with.
-    async fn get_site(&self, identifier: &str) -> Value {
+    pub(crate) async fn get_site(&self, identifier: &str) -> Value {
         self.ok("GET", &format!("/sites/{}", segment(identifier)), None)
             .await["Site"]
             .clone()
     }
 
     /// `GetOutpost`, returning the `Outpost` it answered with.
-    async fn get_outpost(&self, identifier: &str) -> Value {
+    pub(crate) async fn get_outpost(&self, identifier: &str) -> Value {
         self.ok("GET", &format!("/outposts/{}", segment(identifier)), None)
             .await["Outpost"]
             .clone()
     }
 
     /// `ListOutposts` with the given query string, returning the whole output.
-    async fn list_outposts(&self, query: &str) -> Value {
+    pub(crate) async fn list_outposts(&self, query: &str) -> Value {
         self.ok("GET", &format!("/outposts{query}"), None).await
     }
 
     /// `ListSites` with the given query string, returning the whole output.
-    async fn list_sites(&self, query: &str) -> Value {
+    pub(crate) async fn list_sites(&self, query: &str) -> Value {
         self.ok("GET", &format!("/sites{query}"), None).await
     }
 }
@@ -156,7 +175,7 @@ impl Outposts {
 /// A non-greedy Smithy label is encoded including `/`, which is what lets the full
 /// ARN form of `SiteId` / `OutpostId` travel in a single-segment route — exactly what
 /// an AWS SDK puts on the wire.
-fn segment(value: &str) -> String {
+pub(crate) fn segment(value: &str) -> String {
     value
         .bytes()
         .map(|b| match b {
@@ -169,13 +188,13 @@ fn segment(value: &str) -> String {
 }
 
 /// Percent-encode a value for use as ONE query-string parameter value.
-fn query_value(value: &str) -> String {
+pub(crate) fn query_value(value: &str) -> String {
     segment(value)
 }
 
 /// A string member, read as the empty string when absent — which is what a client
 /// sees for a member the wire omits.
-fn text(value: &Value, key: &str) -> String {
+pub(crate) fn text(value: &Value, key: &str) -> String {
     value
         .get(key)
         .and_then(Value::as_str)
@@ -200,7 +219,7 @@ fn is_minted_id(id: &str, prefix: &str) -> bool {
 /// Every member the modelled `Address` marks `@required` is present, including the
 /// two the API requires but `Site` does not project (`ContactName`,
 /// `ContactPhoneNumber`), so the boundary accepts the address.
-fn address(country: &str, state: &str, city: &str) -> Value {
+pub(crate) fn address(country: &str, state: &str, city: &str) -> Value {
     json!({
         "ContactName": "Sam Site",
         "ContactPhoneNumber": "+12065550100",
@@ -295,9 +314,11 @@ async fn create_site_persists_and_both_identifier_forms_read_it_back() {
                 "case {case:?}: {member} must come back as it was stored, got {site:?}"
             );
         }
+        // Every projection of a taggable resource reports its tag map, empty when
+        // the caller supplied none (see `tags_projection` in `site_and_outpost_projection`).
         assert_eq!(
             site.get("Tags"),
-            request.get("Tags"),
+            Some(request.get("Tags").cloned().unwrap_or_else(|| json!({}))).as_ref(),
             "case {case:?}: Tags must come back as they were stored, got {site:?}"
         );
         assert_eq!(
@@ -429,15 +450,14 @@ async fn create_outpost_persists_against_its_site_and_reads_back() {
         );
         assert_eq!(
             text(&outpost, "LifeCycleStatus"),
-            "ACTIVE",
-            "case {case:?}: a created Outpost is ACTIVE, got {outpost:?}"
+            "PENDING",
+            "case {case:?}: a just-created Outpost is still provisioning, got {outpost:?}"
         );
         for member in [
             "Name",
             "Description",
             "AvailabilityZone",
             "AvailabilityZoneId",
-            "Tags",
             "SupportedHardwareType",
         ] {
             assert_eq!(
@@ -446,19 +466,40 @@ async fn create_outpost_persists_against_its_site_and_reads_back() {
                 "case {case:?}: {member} must come back as it was stored, got {outpost:?}"
             );
         }
+        assert_eq!(
+            outpost.get("Tags"),
+            Some(request.get("Tags").cloned().unwrap_or_else(|| json!({}))).as_ref(),
+            "case {case:?}: Tags must come back as they were stored, got {outpost:?}"
+        );
 
-        // Rule 2: both identifier forms name the one stored record.
-        assert_eq!(
-            outposts.get_outpost(&outpost_id).await,
-            outpost,
-            "case {case:?}: GetOutpost by id must answer the stored Outpost"
-        );
-        assert_eq!(
-            outposts.get_outpost(&text(&outpost, "OutpostArn")).await,
-            outpost,
-            "case {case:?}: GetOutpost by ARN must answer the same stored Outpost"
-        );
+        // Rule 2: both identifier forms name the one stored record. The read is
+        // compared without `LifeCycleStatus`, which the clock moves on its own
+        // schedule (see `site_and_outpost_projection`).
+        for identifier in [outpost_id.clone(), text(&outpost, "OutpostArn")] {
+            let read = outposts.get_outpost(&identifier).await;
+            assert_eq!(
+                without(&read, "LifeCycleStatus"),
+                without(&outpost, "LifeCycleStatus"),
+                "case {case:?}: GetOutpost on {identifier:?} must answer the stored Outpost"
+            );
+            let status = text(&read, "LifeCycleStatus");
+            assert!(
+                ["PENDING", "ACTIVE"].contains(&status.as_str()),
+                "case {case:?}: GetOutpost on {identifier:?} reports a provisioning or a \
+                 settled Outpost, got {status:?}"
+            );
+        }
     }
+}
+
+/// The same value with one member removed, for a comparison that must not depend on
+/// a member the clock owns.
+pub(crate) fn without(value: &Value, member: &str) -> Value {
+    let mut copy = value.clone();
+    if let Some(object) = copy.as_object_mut() {
+        object.remove(member);
+    }
+    copy
 }
 
 /// Rule 3: for EVERY page size, paging a list from the first `NextToken` to the last
@@ -602,6 +643,10 @@ async fn listing_filters_select_only_matching_stored_records() {
             .map(|(_, _, id)| id.clone())
             .collect()
     };
+    // Every Outpost above was created provisioning, so the cases below first let the
+    // clock-owed transition fall due: once it has, every Outpost has settled, which
+    // is what makes the status filter's two cases exact rather than racy.
+    settle();
 
     let outpost_cases: Vec<(&str, String, Vec<String>)> = vec![
         (
@@ -625,9 +670,14 @@ async fn listing_filters_select_only_matching_stored_records() {
             expect(&["us-east-1b"]),
         ),
         (
-            "the status every Outpost carries",
+            "the status every Outpost carries once it has settled",
             "?LifeCycleStatusFilter=ACTIVE".to_string(),
             expect(&["us-east-1a", "us-east-1b", "eu-west-1a"]),
+        ),
+        (
+            "a status no settled Outpost carries",
+            "?LifeCycleStatusFilter=PENDING".to_string(),
+            Vec::new(),
         ),
         (
             "a status no Outpost carries",
@@ -960,7 +1010,7 @@ async fn absent_identifiers_are_not_found_and_malformed_ones_are_refused() {
 }
 
 /// The identifiers a list page reports, in the order it reported them.
-fn ids(output: &Value, member: &str) -> Vec<String> {
+pub(crate) fn ids(output: &Value, member: &str) -> Vec<String> {
     output
         .get(member)
         .and_then(Value::as_array)

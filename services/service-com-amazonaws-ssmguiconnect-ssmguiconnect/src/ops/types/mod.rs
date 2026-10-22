@@ -15,11 +15,14 @@
 //! ambiguous inside `ops` (`E0659`).
 
 pub mod delete_connection_recording_preferences_types;
+pub mod get_connection_recording_preferences_types;
 pub mod shared_types;
 pub mod update_connection_recording_preferences_types;
 
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_connection_recording_preferences_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_connection_recording_preferences_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

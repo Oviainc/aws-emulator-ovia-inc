@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSubscriber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSubscriber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSubscriber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a subscriber against the data lake of the Region this request was signed for,
+//! persists it, and answers with the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +89,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +164,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSubscriber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSubscriberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSubscriber"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSubscriberErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Security Lake state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::caller_region(ctx.parts());
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // A subscriber subscribes to a data lake, so one must already exist in this
+        // Region: without it there is no resource to subscribe to.
+        let Some(lake) = store.data_lake(&region) else {
+            return Err(CreateSubscriberErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Security Lake is not enabled in Region {region}; call CreateDataLake for that Region first"
+                    )),
+                    resource_name: Some(region.clone()),
+                    resource_type: Some("DataLake".to_string()),
+                },
+            )
+            .into());
+        };
+        let lake_bucket_arn = lake.s3_bucket_arn.clone();
+
+        // BOUND the store: every call mints a new record, so refuse past the cap rather
+        // than growing without limit. The cap is per Region, and deleting a subscriber
+        // frees its slot.
+        let held = store.subscribers_in(&region).count();
+        if held >= crate::state::MAX_SUBSCRIBERS_PER_REGION {
+            return Err(
+                CreateSubscriberErrorModeled::ThrottlingException(ThrottlingException {
+                    message: Some(format!(
+                        "this emulator holds at most {} subscribers per Region and Region {region} already holds {held}; the limit is fixed, so retrying will not help until a subscriber is deleted",
+                        crate::state::MAX_SUBSCRIBERS_PER_REGION
+                    )),
+                    service_code: Some("securitylake".to_string()),
+                    quota_code: None,
+                    retry_after_seconds: None,
+                })
+                .into(),
+            );
+        }
+
+        let subscriber_id = store.new_subscriber_id(now, &region);
+        let access_types = input.access_types.unwrap_or_default();
+        let grants_s3 = access_types
+            .iter()
+            .any(|access| access == crate::state::ACCESS_TYPE_S3);
+        let grants_lake_formation = access_types
+            .iter()
+            .any(|access| access == crate::state::ACCESS_TYPE_LAKEFORMATION);
+
+        let subscriber = crate::state::Subscriber {
+            subscriber_arn: crate::state::subscriber_arn(&region, &subscriber_id),
+            subscriber_identity: input.subscriber_identity,
+            subscriber_description: input.subscriber_description,
+            sources: input.sources,
+            region: region.clone(),
+            // An `S3` subscriber reads the data lake's bucket through a role Security
+            // Lake creates for it; a `LAKEFORMATION` subscriber queries the tables
+            // through a RAM resource share instead.
+            role_arn: grants_s3.then(|| crate::state::subscriber_role_arn(&subscriber_id)),
+            s3_bucket_arn: grants_s3.then_some(lake_bucket_arn),
+            // Set by CreateSubscriberNotification, which is not implemented yet.
+            subscriber_endpoint: None,
+            subscriber_status: crate::state::SUBSCRIBER_STATUS_ACTIVE.to_string(),
+            resource_share_arn: grants_lake_formation
+                .then(|| crate::state::resource_share_arn(&region, &subscriber_id)),
+            resource_share_name: grants_lake_formation
+                .then(|| crate::state::resource_share_name(&input.subscriber_name)),
+            subscriber_name: input.subscriber_name,
+            access_types,
+            created_at: now,
+            updated_at: now,
+            tags: input.tags.unwrap_or_default(),
+            subscriber_id: subscriber_id.clone(),
+        };
+        store.insert_subscriber(subscriber);
+
+        // Answer from the store, so CreateSubscriber and GetSubscriber cannot disagree.
+        let Some(stored) = store.subscriber_in(&region, &subscriber_id) else {
+            return Err(CreateSubscriberErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("subscriber {subscriber_id} was not persisted")),
+                },
+            )
+            .into());
+        };
+        Ok(CreateSubscriberOutput {
+            subscriber: Some(stored.to_resource()),
+        })
     }
 }

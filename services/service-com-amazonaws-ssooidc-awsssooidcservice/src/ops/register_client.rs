@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterClient
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterClient`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterClient::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and persists a client registration: a fresh `clientId`/`clientSecret` pair the
+//! device-authorization and refresh-token grants then authenticate against.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +102,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as st;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,6 +143,11 @@ impl From<RegisterClientErrorModeled> for RegisterClientError {
     }
 }
 
+/// Lifts one of this operation's modeled failures into its error channel.
+fn modeled(error: RegisterClientErrorModeled) -> RegisterClientError {
+    error.into()
+}
+
 /// The `RegisterClient` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -184,18 +184,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterClient` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterClientErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterClient"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            modeled(RegisterClientErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("server_error".to_string()),
+                    error_description: Some(
+                        "the service state for AWS SSO OIDC is unavailable".to_string(),
+                    ),
+                },
+            ))
+        })?;
+
+        // "The service supports only public as a client type. Anything other than
+        // public will be rejected by the service." Compared exactly, as written.
+        if input.client_type != st::CLIENT_TYPE_PUBLIC {
+            return Err(modeled(
+                RegisterClientErrorModeled::InvalidClientMetadataException(
+                    InvalidClientMetadataException {
+                        error: Some("invalid_client_metadata".to_string()),
+                        error_description: Some(format!(
+                            "clientType must be '{}', not '{}'",
+                            st::CLIENT_TYPE_PUBLIC, input.client_type
+                        )),
+                    },
+                ),
+            ));
+        }
+        // The friendly name identifies the registration to a human, so an empty
+        // one is metadata the service cannot use.
+        if input.client_name.trim().is_empty() {
+            return Err(modeled(
+                RegisterClientErrorModeled::InvalidClientMetadataException(
+                    InvalidClientMetadataException {
+                        error: Some("invalid_client_metadata".to_string()),
+                        error_description: Some("clientName must not be empty".to_string()),
+                    },
+                ),
+            ));
+        }
+
+        let grant_types = input.grant_types.clone().unwrap_or_default();
+        // `grantTypes` restricts the flows available to the client, so every entry
+        // must be a grant this service actually serves.
+        if let Some(unsupported) = grant_types
+            .iter()
+            .find(|grant| !st::SUPPORTED_GRANT_TYPES.contains(&grant.as_str()))
+        {
+            return Err(modeled(
+                RegisterClientErrorModeled::UnsupportedGrantTypeException(
+                    UnsupportedGrantTypeException {
+                        error: Some("unsupported_grant_type".to_string()),
+                        error_description: Some(format!(
+                            "grantTypes entry '{unsupported}' is not supported; supported grant types are {}",
+                            st::SUPPORTED_GRANT_TYPES.join(", ")
+                        )),
+                    },
+                ),
+            ));
+        }
+
+        let redirect_uris = input.redirect_uris.clone().unwrap_or_default();
+        if let Some(invalid) = redirect_uris
+            .iter()
+            .find(|uri| !st::is_absolute_uri(uri.as_str()))
+        {
+            return Err(modeled(
+                RegisterClientErrorModeled::InvalidRedirectUriException(
+                    InvalidRedirectUriException {
+                        error: Some("invalid_redirect_uri".to_string()),
+                        error_description: Some(format!(
+                            "redirectUris entry '{invalid}' is not an absolute URI"
+                        )),
+                    },
+                ),
+            ));
+        }
+
+        let scopes = input.scopes.clone().unwrap_or_default();
+        if let Some(invalid) = scopes.iter().find(|scope| !st::is_scope_token(scope)) {
+            return Err(modeled(RegisterClientErrorModeled::InvalidScopeException(
+                InvalidScopeException {
+                    error: Some("invalid_scope".to_string()),
+                    error_description: Some(format!(
+                        "scopes entry '{invalid}' is not a scope token: a scope is non-empty and carries no whitespace"
+                    )),
+                },
+            )));
+        }
+
+        if let Some(issuer_url) = input.issuer_url.as_deref() {
+            if !st::is_absolute_uri(issuer_url) {
+                return Err(modeled(
+                    RegisterClientErrorModeled::InvalidRequestException(InvalidRequestException {
+                        error: Some("invalid_request".to_string()),
+                        reason: None,
+                        error_description: Some(format!(
+                            "issuerUrl '{issuer_url}' is not an absolute URI"
+                        )),
+                    }),
+                ));
+            }
+        }
+
+        let now = SystemTime::now();
+        let client_id_issued_at = st::epoch_seconds(now);
+        let client_secret_expires_at = st::epoch_seconds(now + st::CLIENT_SECRET_LIFETIME);
+        let client = st::OidcClient {
+            client_id: st::mint_opaque_value(),
+            client_secret: st::mint_opaque_value(),
+            client_name: input.client_name.clone(),
+            client_type: input.client_type.clone(),
+            scopes,
+            redirect_uris,
+            grant_types,
+            issuer_url: input.issuer_url.clone(),
+            client_id_issued_at,
+            client_secret_expires_at,
+        };
+
+        // The endpoints the registration is told to use: the client's own issuer
+        // when it named one, else this service's endpoint in the request's region.
+        let base = client
+            .issuer_url
+            .clone()
+            .unwrap_or_else(|| st::oidc_endpoint(&st::request_region(ctx.parts())));
+        let base = base.trim_end_matches('/').to_string();
+
+        let output = RegisterClientOutput {
+            client_id: Some(client.client_id.clone()),
+            client_secret: Some(client.client_secret.clone()),
+            client_id_issued_at,
+            client_secret_expires_at,
+            authorization_endpoint: Some(format!("{base}/authorize")),
+            token_endpoint: Some(format!("{base}/token")),
+        };
+
+        let mut store = state.lock();
+        // Reclaim the registrations whose secret has expired, then refuse rather
+        // than grow the store past its bound.
+        store.purge_expired_clients(now);
+        if !store.has_room_for_client() {
+            return Err(modeled(RegisterClientErrorModeled::SlowDownException(
+                SlowDownException {
+                    error: Some("slow_down".to_string()),
+                    error_description: Some(format!(
+                        "the service is holding its maximum of {} client registrations; retry later",
+                        st::MAX_CLIENTS
+                    )),
+                },
+            )));
+        }
+        store.insert_client(client);
+        Ok(output)
     }
 }

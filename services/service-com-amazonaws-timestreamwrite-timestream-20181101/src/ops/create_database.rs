@@ -169,6 +169,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // free and is where the new database goes.
         let slot = match store.databases.entry(input.database_name.clone()) {
             ::std::collections::btree_map::Entry::Occupied(_) => {
+                crate::state::audit(
+                    ctx.parts(),
+                    Self::NAME,
+                    &input.database_name,
+                    "refused_already_exists",
+                );
                 return Err(CreateDatabaseErrorModeled::ConflictException(ConflictException {
                     message: format!("Database '{}' already exists", input.database_name),
                 })
@@ -190,8 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tables: ::std::collections::BTreeMap::new(),
         });
 
+        let created = stored.to_wire();
+        crate::state::audit(ctx.parts(), Self::NAME, &input.database_name, "created");
+
         Ok(CreateDatabaseOutput {
-            database: Some(stored.to_wire()),
+            database: Some(created),
         })
     }
 }

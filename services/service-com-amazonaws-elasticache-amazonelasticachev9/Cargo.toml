@@ -21,6 +21,8 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hex is the codec the opaque pagination `Marker` is built with (src/state.rs).
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -171,7 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let size = crate::state::page_size(input.max_results);
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // See `GetOutpost`: the page reports each Outpost's status as of now, and
+        // `LifeCycleStatusFilter` therefore selects on that same settled status.
+        store.settle_outposts();
         let (outposts, next_token) = crate::state::page(
             crate::state::OUTPOST_PAGE,
             store

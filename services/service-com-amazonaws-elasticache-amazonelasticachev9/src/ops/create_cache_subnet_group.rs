@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCacheSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCacheSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateCacheSubnetGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -162,18 +158,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCacheSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCacheSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCacheSubnetGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `CacheSubnetGroupName`: "This value is stored as a lowercase string",
+        // so that is the identity a cluster's `CacheSubnetGroupName` and a later
+        // Describe resolve against.
+        let name = input.cache_subnet_group_name.to_ascii_lowercase();
+        // The name carries no modelled `@length` or `@pattern`, so the
+        // documented rule is enforced here. This operation models no
+        // invalid-parameter error, so the refusal goes through the synthetic
+        // `ValidationException`.
+        if !crate::state::is_valid_subnet_group_name(&name) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value {} for CacheSubnetGroupName: must contain no more than 255 \
+                 alphanumeric characters or hyphens.",
+                input.cache_subnet_group_name
+            )));
+        }
+
+        // A subnet group has to name subnets: the modelled `SubnetIds` carries
+        // no length constraint, so an empty list reaches the handler.
+        if input.subnet_ids.is_empty() {
+            return Err(CreateCacheSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                message: Some(
+                    "SubnetIds must name at least one subnet for the cache subnet group."
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+        if let Some(bad) = input
+            .subnet_ids
+            .iter()
+            .find(|id| !crate::state::is_subnet_id(id))
+        {
+            return Err(CreateCacheSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                message: Some(format!("Invalid value {bad} for SubnetIds: not a subnet id.")),
+            })
+            .into());
+        }
+        // One subnet cannot be in the group twice.
+        let mut seen = ::std::collections::BTreeSet::new();
+        if let Some(repeated) = input.subnet_ids.iter().find(|id| !seen.insert((*id).clone())) {
+            return Err(CreateCacheSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                message: Some(format!(
+                    "Invalid value {repeated} for SubnetIds: a subnet may appear only once in a \
+                     cache subnet group."
+                )),
+            })
+            .into());
+        }
+        // The group is bounded; see `crate::state::SUBNETS_PER_GROUP`.
+        if input.subnet_ids.len() > crate::state::SUBNETS_PER_GROUP {
+            return Err(
+                CreateCacheSubnetGroupErrorModeled::CacheSubnetQuotaExceededFault(
+                    CacheSubnetQuotaExceededFault {
+                        message: Some(format!(
+                            "{} subnets were supplied; a cache subnet group holds at most {}.",
+                            input.subnet_ids.len(),
+                            crate::state::SUBNETS_PER_GROUP
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(
+                    CreateCacheSubnetGroupErrorModeled::TagQuotaPerResourceExceeded(
+                        TagQuotaPerResourceExceeded {
+                            message: Some(format!(
+                                "{count} tags were supplied; the maximum number of tags permitted \
+                                 on a resource is {}.",
+                                crate::state::MAX_TAGS_PER_RESOURCE
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::TagRefusal::MissingKey) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "Invalid value for Tags: a tag's Key may not be null.",
+                ))
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        if store.cache_subnet_groups.contains_key(&name) {
+            return Err(
+                CreateCacheSubnetGroupErrorModeled::CacheSubnetGroupAlreadyExistsFault(
+                    CacheSubnetGroupAlreadyExistsFault {
+                        message: Some(format!("Cache subnet group {name} already exists.")),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The store is bounded; see `crate::state::SUBNET_GROUP_QUOTA`.
+        if store.cache_subnet_groups.len() >= crate::state::SUBNET_GROUP_QUOTA {
+            return Err(
+                CreateCacheSubnetGroupErrorModeled::CacheSubnetGroupQuotaExceededFault(
+                    CacheSubnetGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "This account already holds the maximum of {} cache subnet groups.",
+                            crate::state::SUBNET_GROUP_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let vpc_id = store.mint_vpc_id();
+        let record = crate::state::CacheSubnetGroupRecord {
+            arn: crate::state::subnet_group_arn(&region, &name),
+            subnets: input
+                .subnet_ids
+                .into_iter()
+                .enumerate()
+                .map(|(index, subnet_identifier)| crate::state::SubnetRecord {
+                    subnet_identifier,
+                    availability_zone: crate::state::availability_zone(&region, index),
+                })
+                .collect(),
+            name: name.clone(),
+            description: input.cache_subnet_group_description,
+            vpc_id,
+            tags,
+        };
+        store.cache_subnet_groups.insert(name.clone(), record);
+
+        // Read back out of the store, so the response is the persisted group
+        // rather than the request echoed.
+        Ok(CreateCacheSubnetGroupOutput {
+            cache_subnet_group: store
+                .cache_subnet_groups
+                .get(&name)
+                .map(crate::state::CacheSubnetGroupRecord::to_modeled),
+        })
     }
 }
