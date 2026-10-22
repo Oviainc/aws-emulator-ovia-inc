@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags persisted on the resource the `@httpLabel` `resourceArn` names:
+//! the ARN is resolved to a stored resource of this service, and that resource's own
+//! tag map is the answer. A well-formed Aurora DSQL ARN naming a resource this
+//! service does not hold answers the modelled `ResourceNotFoundException` (404); an
+//! ARN that names no Aurora DSQL resource at all is refused as invalid input (400).
+//! Reporting only: the sole write it performs is settling a status change the clock
+//! already owed at this instant, so a cluster whose deletion has come due is no
+//! longer there to list tags for.
 //!
 //! ## Shape of an operation
 //!
@@ -79,10 +79,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#ListTagsForResource")]
+// The operation's MODELED errors, plus the service-common `InternalServerException`
+// widened in with `extra_errors`: the service declares it for every operation (its
+// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
+// per-operation list the macro checks against does not repeat it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#ListTagsForResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -136,18 +144,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `Arn`'s modelled pattern is only `^arn:.+$`, so an ARN naming another
+        // service's resource reaches this handler. That is a bad request rather than
+        // a missing resource: no Aurora DSQL resource can carry such an ARN.
+        let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "resourceArn must be the ARN of an Aurora DSQL resource \
+                 (arn:<partition>:{}:<region>:<account>:<type>/<id>), got {}",
+                crate::state::ARN_SERVICE, input.resource_arn,
+            )));
+        };
+
+        let mut state = state.lock();
+        state.settle(std::time::SystemTime::now());
+
+        let tags = match resource.resource_type.as_str() {
+            crate::state::RESOURCE_TYPE_CLUSTER => state
+                .clusters
+                .get(&resource.resource_id)
+                .map(|cluster| cluster.tags.clone()),
+            // Any other Aurora DSQL resource type: this store holds none of them, so
+            // the ARN resolves to nothing and the answer is the modelled 404.
+            _ => None,
+        };
+
+        let Some(tags) = tags else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&resource.resource_type, &resource.resource_id),
+            )
+            .into());
+        };
+
+        Ok(ListTagsForResourceOutput {
+            // `TagMap`'s length is 0..200, so the empty map is a modelled answer: a
+            // resource that exists and carries no tags reports no tags, which is a
+            // different answer from the 404 above.
+            tags: Some(tags.into_iter().collect()),
+        })
     }
 }
