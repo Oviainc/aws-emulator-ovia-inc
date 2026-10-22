@@ -314,12 +314,28 @@ fn snake_case(member: &str) -> String {
     out
 }
 
+/// The resource-type label a NOT-FOUND message about a PackagingConfiguration names
+/// it by.
+///
+/// NOT the modelled resource name, and NOT a service-wide label: the recorded AWS
+/// not-found message for a PackagingConfiguration is `PackagingConfig with id=<id> not
+/// found` (behavioral unit
+/// `mediapackage-vod.delete-packaging-configuration-state-transition`), so the
+/// abbreviated label is what [`not_found_message`] is called with. It covers that
+/// message form ONLY: no recording shows how the service words a CONFLICT about a
+/// configuration, so `CreatePackagingConfiguration` keeps the modelled resource name in
+/// [`already_exists_message`] until one does. It lives here because both operations
+/// that address a configuration by id — the delete and the describe — must word the
+/// same failure the same way.
+pub const PACKAGING_CONFIGURATION_LABEL: &str = "PackagingConfig";
+
 /// The message a `NotFoundException` carries for a resource the request named and
 /// this service holds none of: `<ResourceType> with id=<requested id> not found`.
 ///
 /// Built from the id the REQUEST asked for, never from a stored record — there is no
-/// stored record to read. `resource` is the modelled resource type (`Asset`,
-/// `PackagingGroup`, `PackagingConfiguration`).
+/// stored record to read. `resource` is the label this service names that resource
+/// type by in a message (`Asset`, `PackagingGroup`, and
+/// [`PACKAGING_CONFIGURATION_LABEL`] for a PackagingConfiguration).
 pub fn not_found_message(resource: &str, id: &str) -> String {
     format!("{resource} with id={id} not found")
 }

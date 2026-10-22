@@ -57,3 +57,31 @@ Point a botocore client at the emulator's managedblockchain-query endpoint (regi
 1. `get_token_balance(tokenIdentifier={"network":"ETHEREUM_MAINNET","tokenId":"eth"}, ownerIdentifier={"address":"0x28c6c06298d514db089934071355e5743bf21d60"})` -> observe HTTP 404 ResourceNotFoundException instead of HTTP 200 with a balance. Repeat with `atBlockchainInstant={"time": 2023-01-01T00:00:00Z}` — same 404.
 2. `list_token_balances(tokenFilter={"network":"ETHEREUM_MAINNET","contractAddress":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"}, maxResults=10)` -> observe `tokenBalances: []`. Then `list_token_balances(tokenFilter={"network":"ETHEREUM_MAINNET"}, ownerFilter={"address":"0x28c6c06298d514db089934071355e5743bf21d60"}, maxResults=50)` -> observe no contract rows and no native row.
 3. `list_transactions(address="0x28c6c06298d514db089934071355e5743bf21d60", network="ETHEREUM_MAINNET", maxResults=5)` -> observe `transactions: []` and no `nextToken`. Repeat with `fromBlockchainInstant={"time":2023-01-01Z}`/`toBlockchainInstant={"time":2023-02-01Z}`, with `sort={"sortBy":"TRANSACTION_TIMESTAMP","sortOrder":"DESCENDING"}`, and with `confirmationStatusFilter={"include":["FINAL"]}` — all empty. Repeat step 3 with `address="1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", network="BITCOIN_MAINNET"` -> also empty, so no hash/transactionId is available to feed get_transaction / list_transaction_events.
+
+## Resolution
+
+FIXED — the fixture ledger of every network now spans that network's life instead of one
+half hour: `src/state/chain.rs` builds it once, when the service's state is constructed,
+from fixed labels and each chain's published genesis block — 160 transactions, two to a
+block, one block every 28 days, back more than six years, with its busiest wallet in
+every transaction and the Ethereum mainnet's well-known token contracts held and moved by
+its wallets. So, for every identifier this index holds: a listing pages (a page of five
+carries a `nextToken`), a month-long window anywhere in the span is non-empty (the
+2023-01-01..2023-02-01 one included), `DESCENDING` reverses it, a balance pinned years
+back resolves, a contract-scoped listing returns holders, an owner-scoped network-only
+filter returns the native row beside token-contract rows, and a listed summary resolves
+through `GetTransaction` (by `transactionId` too, on the Bitcoin networks) and
+`ListTransactionEvents`. `ConfirmationStatusFilter` is additive, as
+`ConfirmationStatusFilter$include` documents ("Transactions that have reached finality are
+always part of the response"). `GetTokenBalance` already resolved an unpinned request to a
+live instant rather than a fixed epoch. The same additive rule is applied to
+`ListFilteredTransactionEvents`, which filters on the same shape.
+
+DECLINED — the half of all three causes that asks for data about REAL, publicly-known
+mainnet identifiers (the recorded exchange wallet, the Bitcoin genesis address, a real
+holder set). The emulator holds no index of the public chains: those transactions and
+balances are facts it cannot compute, and a history derived from the read key would be
+fabricated output carrying a success status. A read keyed by an identifier the fixture
+ledger does not hold therefore still answers with the modelled empty page or
+`ResourceNotFoundException` — so the traces that query those identifiers still see a 404
+or an empty list, by design and not by defect.

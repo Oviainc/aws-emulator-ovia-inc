@@ -24,6 +24,16 @@
 //! user or a key is added or removed. Every other member a reader reports is RESOLVED
 //! once, when the resource is created or updated, so no reader has to re-apply a
 //! default.
+//!
+//! The `Message` of a not-found, an already-exists or a documented state refusal is
+//! built here, as a FIXED text per condition that carries no request data: the
+//! identifier a caller needs to see travels in the error's own `Resource`/
+//! `ResourceType` members, so an id can never reach a message a client logs or asserts
+//! on, and a text can never be derived from an internal name. A handler still words
+//! its own refusals for conditions this module holds no text for (a store-capacity
+//! refusal, say); the one message built from the request is the framework's
+//! `ValidationException`, whose template (member path + modelled constraint, no value)
+//! lives in `crate::service`.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -32,9 +42,8 @@ use crate::ops::types::{
     As2ConnectorConfig, ConnectorEgressConfig, ConnectorVpcLatticeEgressConfig,
     DescribedWebAppEndpointDetails, DescribedWebAppIdentityProviderDetails, EndpointDetails,
     HomeDirectoryMapEntry, IdentityProviderDetails, PosixProfile, ProtocolDetails, ProxyConfig,
-    ResourceNotFoundException, S3StorageOptions, SftpConnectorConfig, SftpPortWithOptions, Tag,
-    WebAppUnits,
-    WorkflowDetails, WorkflowStep,
+    ResourceExistsException, ResourceNotFoundException, S3StorageOptions, SftpConnectorConfig,
+    SftpPortWithOptions, Tag, WebAppUnits, WorkflowDetails, WorkflowStep,
 };
 
 /// The region used for an ARN when the request carries no SigV4 credential scope to
@@ -304,9 +313,23 @@ pub const RESOURCE_TYPE_SSH_PUBLIC_KEY: &str = "SshPublicKey";
 /// convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_CONNECTOR: &str = "Connector";
 
+/// A `ConnectorId` nothing in the store answers to. Its own entry in the not-found
+/// table, like every other kind.
+pub const NOT_FOUND_CONNECTOR: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_CONNECTOR,
+    message: "Unknown connector",
+};
+
 /// `ResourceType` for the web app resource. Same convention as
 /// [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_WEB_APP: &str = "WebApp";
+
+/// A `WebAppId` nothing in the store answers to. Its own entry in the not-found
+/// table, like every other kind.
+pub const NOT_FOUND_WEB_APP: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_WEB_APP,
+    message: "Unknown web app",
+};
 
 /// `ResourceType` for the AS2 profile resource, addressed by its `ProfileId`. Same
 /// convention as [`RESOURCE_TYPE_SERVER`].
@@ -315,6 +338,78 @@ pub const RESOURCE_TYPE_PROFILE: &str = "Profile";
 /// `ResourceType` for the workflow resource, addressed by its `WorkflowId`. Same
 /// convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_WORKFLOW: &str = "Workflow";
+
+/// `ResourceType` as the duplicate-`UserName` `ResourceExistsException` carries it:
+/// the resource name in lower case, which is the value this service has answered that
+/// one condition with since its duplicate check was written. Nothing recorded
+/// contradicts either spelling, so both are left exactly as they were; only the
+/// `Message` of that error is this module's concern.
+pub const RESOURCE_TYPE_USER_LOWERCASE: &str = "user";
+
+/// One kind of Transfer resource as a not-found error REPORTS it: the `ResourceType`
+/// the error body carries, and the fixed `Message` the service answers for a
+/// reference to that kind it cannot resolve.
+///
+/// The two travel together, in a table of named constants, because the `Message` is
+/// the only thing in the body that says WHICH reference was bad: deriving it from the
+/// `ResourceType` token (or from any other internal name) would make the
+/// caller-visible wording follow this crate's internals. A resource kind is added by
+/// adding a constant below, with the text the service answers for it.
+#[derive(Debug, Clone, Copy)]
+pub struct NotFoundResource {
+    /// The `ResourceType` member of the error body.
+    pub resource_type: &'static str,
+    /// The `Message` member: fixed for this kind, carrying no request data.
+    pub message: &'static str,
+}
+
+/// A `ServerId` nothing in the store answers to.
+pub const NOT_FOUND_SERVER: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_SERVER,
+    message: "Unknown server",
+};
+
+/// A `UserName` the resolved server does not hold.
+pub const NOT_FOUND_USER: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_USER,
+    message: "Unknown user",
+};
+
+/// An `SshPublicKeyId` the resolved user does not hold. The service names this
+/// resource by its ID in the text, which is what distinguishes it from a user that
+/// could not be resolved.
+pub const NOT_FOUND_SSH_PUBLIC_KEY: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_SSH_PUBLIC_KEY,
+    message: "Unknown public key ID",
+};
+
+/// A `ProfileId` nothing in the store answers to.
+pub const NOT_FOUND_PROFILE: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_PROFILE,
+    message: "Unknown profile",
+};
+
+/// A `WorkflowId` nothing in the store answers to.
+pub const NOT_FOUND_WORKFLOW: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_WORKFLOW,
+    message: "Unknown workflow",
+};
+
+/// The fixed `Message` for a `CreateUser` whose `UserName` the server already holds.
+pub const USER_ALREADY_EXISTS: &str = "User already exists";
+
+/// The fixed `Message` for an `ImportSshPublicKey` whose body the user already holds.
+pub const SSH_PUBLIC_KEY_ALREADY_EXISTS: &str = "Public key already exists";
+
+/// The fixed `Message` for an `UpdateServer` that would change `IpAddressType` on a
+/// server that is not [`SERVER_STATE_OFFLINE`].
+///
+/// The model states the rule on `IpAddressType` itself: "It cannot be changed while
+/// the server is online. You must stop the server before modifying this parameter."
+/// The text states that requirement, so it is the same whichever non-`OFFLINE` state
+/// the server is in.
+pub const IP_ADDRESS_TYPE_NEEDS_OFFLINE_SERVER: &str =
+    "Server must be OFFLINE to change IpAddressType";
 
 /// The `WorkflowStepType` enum's values (`[COPY, CUSTOM, TAG, DELETE, DECRYPT]`).
 /// Each one names the ONE `WorkflowStep.*StepDetails` member that configures it, which
@@ -351,6 +446,13 @@ pub const MAX_STORED_WORKFLOWS: usize = 200;
 /// `ResourceType` for one of a server's host keys, addressed by its `HostKeyId`.
 /// Same convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_HOST_KEY: &str = "HostKey";
+
+/// A `HostKeyId` the resolved server does not hold — never imported, or already
+/// deleted. Its own entry in the not-found table, like every other kind.
+pub const NOT_FOUND_HOST_KEY: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_HOST_KEY,
+    message: "Unknown host key",
+};
 
 /// `HostKeyStorageType`'s value for a key the service itself stores (the enum is
 /// `[SERVICE_MANAGED, SECRETS_MANAGER]`).
@@ -433,53 +535,84 @@ pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: i32 = 1;
 /// documentation, so it is checked by the create handler.
 pub const MAX_CONCURRENT_CONNECTIONS: i32 = 5;
 
-/// The not-found payload for the `resource_type` resource identified by `resource`.
+/// The not-found payload for a reference of `kind` the store could not resolve.
 ///
-/// The identifier travels in `Resource` ALONE: `Message` is a fixed generic string
-/// derived from the resource type, so one caller's id never reaches the message a
-/// client logs or asserts on. Every operation in this service that cannot find a
-/// resource builds its error here, so the construction cannot drift between them.
-pub fn resource_not_found(resource_type: &str, resource: &str) -> ResourceNotFoundException {
+/// The identifier travels in `Resource` ALONE: `Message` is the fixed text the
+/// service answers for that KIND of reference ([`NotFoundResource::message`]), so one
+/// caller's id never reaches the message a client logs or asserts on, and the text
+/// does not change when an internal name does. Every operation in this service that
+/// cannot find a resource builds its error here, so the construction cannot drift
+/// between them.
+pub fn resource_not_found(kind: &NotFoundResource, resource: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!("Unknown {}", resource_type.to_lowercase()),
+        message: kind.message.to_string(),
         resource: resource.to_string(),
-        resource_type: resource_type.to_string(),
+        resource_type: kind.resource_type.to_string(),
     }
 }
 
 /// The not-found payload for a `ServerId` the store does not hold — never created, or
 /// already deleted.
 pub fn unknown_server(server_id: &str) -> ResourceNotFoundException {
-    resource_not_found(RESOURCE_TYPE_SERVER, server_id)
+    resource_not_found(&NOT_FOUND_SERVER, server_id)
 }
 
 /// The not-found payload for a `UserName` the named server does not hold.
 pub fn unknown_user(user_name: &str) -> ResourceNotFoundException {
-    resource_not_found(RESOURCE_TYPE_USER, user_name)
+    resource_not_found(&NOT_FOUND_USER, user_name)
+}
+
+/// The not-found payload for an `SshPublicKeyId` the named user does not hold —
+/// never imported, or already deleted.
+pub fn unknown_ssh_public_key(ssh_public_key_id: &str) -> ResourceNotFoundException {
+    resource_not_found(&NOT_FOUND_SSH_PUBLIC_KEY, ssh_public_key_id)
 }
 
 /// The not-found payload for a `ConnectorId` the store does not hold — never created,
 /// or already deleted.
 pub fn unknown_connector(connector_id: &str) -> ResourceNotFoundException {
-    resource_not_found(RESOURCE_TYPE_CONNECTOR, connector_id)
+    resource_not_found(&NOT_FOUND_CONNECTOR, connector_id)
 }
 
 /// The not-found payload for a `WebAppId` the store does not hold — never created, or
 /// already deleted.
 pub fn unknown_web_app(web_app_id: &str) -> ResourceNotFoundException {
-    resource_not_found(RESOURCE_TYPE_WEB_APP, web_app_id)
+    resource_not_found(&NOT_FOUND_WEB_APP, web_app_id)
 }
 
-/// The not-found payload for a `ProfileId` the store does not hold — never created, or
-/// already deleted.
+/// The not-found payload for a `ProfileId` the store does not hold — never created,
+/// or already deleted.
 pub fn unknown_profile(profile_id: &str) -> ResourceNotFoundException {
-    resource_not_found(RESOURCE_TYPE_PROFILE, profile_id)
+    resource_not_found(&NOT_FOUND_PROFILE, profile_id)
+}
+
+/// The already-exists payload for a `UserName` the named server already holds.
+///
+/// `Message` is the service's fixed text for the condition; the name travels in
+/// `Resource`, which is where a caller reads which reference collided.
+pub fn user_already_exists(user_name: &str) -> ResourceExistsException {
+    ResourceExistsException {
+        message: USER_ALREADY_EXISTS.to_string(),
+        resource: user_name.to_string(),
+        resource_type: RESOURCE_TYPE_USER_LOWERCASE.to_string(),
+    }
+}
+
+/// The already-exists payload for an SSH public key body the named user already
+/// holds. Same construction as [`user_already_exists`]: fixed text, identifier in
+/// `Resource`.
+pub fn ssh_public_key_already_exists(user_name: &str) -> ResourceExistsException {
+    ResourceExistsException {
+        message: SSH_PUBLIC_KEY_ALREADY_EXISTS.to_string(),
+        resource: user_name.to_string(),
+        resource_type: RESOURCE_TYPE_USER.to_string(),
+    }
 }
 
 /// The not-found payload for a `WorkflowId` the store does not hold — never created,
 /// or already deleted.
 pub fn unknown_workflow(workflow_id: &str) -> ResourceNotFoundException {
-    resource_not_found(RESOURCE_TYPE_WORKFLOW, workflow_id)
+    resource_not_found(&NOT_FOUND_WORKFLOW, workflow_id)
 }
 
 /// Lift an operation's modelled not-found variant into its error channel, answered
@@ -1021,12 +1154,20 @@ pub fn policy_options(options: &[&str]) -> Option<Vec<String>> {
 /// beside the per-account resource types because a policy is published, not created.
 pub const RESOURCE_TYPE_SECURITY_POLICY: &str = "SecurityPolicy";
 
+/// A `SecurityPolicyName` the service publishes no policy for. The text names the
+/// policy resource as the service's own wording does, like every other entry in the
+/// not-found table.
+pub const NOT_FOUND_SECURITY_POLICY: NotFoundResource = NotFoundResource {
+    resource_type: RESOURCE_TYPE_SECURITY_POLICY,
+    message: "Unknown SecurityPolicy",
+};
+
 /// The not-found payload for a `SecurityPolicyName` the service publishes no policy
 /// for. Built through [`resource_not_found`] like every other not-found in this
 /// service, so the body cannot drift from them; "not found" here means "not in
 /// [`SECURITY_POLICIES`]", never "not created yet".
 pub fn unknown_security_policy(security_policy_name: &str) -> ResourceNotFoundException {
-    resource_not_found(RESOURCE_TYPE_SECURITY_POLICY, security_policy_name)
+    resource_not_found(&NOT_FOUND_SECURITY_POLICY, security_policy_name)
 }
 
 /// One stored SSH public key of a user.
@@ -1586,9 +1727,20 @@ pub fn supplied_host_key_fingerprint(material: &str) -> Option<String> {
 // refused with the modelled `InvalidRequestException` (HTTP 400), which the model
 // documents as "thrown when the client submits a malformed request".
 //
-// The wording below names the member and the condition it was submitted under, which
-// is built entirely from the request; no recorded message text is reproduced.
+// The wording below names the member and, where the violated requirement is one the
+// MODEL states about that member alone (a list's non-empty minimum, say), that
+// requirement; otherwise the condition the member was submitted under. Both are built
+// from the model's own names and its own closed value sets — never from a value the
+// caller chose.
 // =============================================================================
+
+/// "`<member>` must not be empty" — a collection member the model gives a non-empty
+/// minimum (`@length` min 1), required by a documented condition and sent empty or
+/// absent. The requirement stated is the LIST's own minimum, which is the modelled
+/// violation, rather than the other member whose value made the list required.
+fn must_not_be_empty(member: &str) -> String {
+    format!("{member} must not be empty")
+}
 
 /// "`<member>` must be specified when `<condition>`" — a member the model documents as
 /// required under a condition the request meets, and did not send.
@@ -1900,16 +2052,23 @@ impl ConnectorConfig<'_> {
 /// mappings, using the `HomeDirectoryMappings` parameter", and
 /// `HomeDirectoryMappings` states "This value can be set only when
 /// `HomeDirectoryType` is set to `LOGICAL`" — one requirement in each direction.
+///
+/// The missing-mappings direction states `HomeDirectoryMappings`' OWN modelled
+/// minimum (`@length` min 1, max 50000), because that is the constraint an absent or
+/// empty list violates; the opposite direction has no modelled constraint of its own
+/// to state, so it names the condition the value was sent under.
 pub fn home_directory_violation(
     home_directory_type: Option<&str>,
     home_directory_mappings: Option<&[HomeDirectoryMapEntry]>,
 ) -> Option<String> {
-    let condition = format!("HomeDirectoryType is {HOME_DIRECTORY_TYPE_LOGICAL}");
     let logical = home_directory_type == Some(HOME_DIRECTORY_TYPE_LOGICAL);
     let mapped = home_directory_mappings.is_some_and(|mappings| !mappings.is_empty());
     match (logical, mapped) {
-        (true, false) => Some(required_when("HomeDirectoryMappings", &condition)),
-        (false, true) => Some(settable_only_when("HomeDirectoryMappings", &condition)),
+        (true, false) => Some(must_not_be_empty("HomeDirectoryMappings")),
+        (false, true) => Some(settable_only_when(
+            "HomeDirectoryMappings",
+            &format!("HomeDirectoryType is {HOME_DIRECTORY_TYPE_LOGICAL}"),
+        )),
         _ => None,
     }
 }

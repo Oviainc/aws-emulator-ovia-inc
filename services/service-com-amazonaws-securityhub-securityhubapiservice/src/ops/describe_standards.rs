@@ -139,23 +139,21 @@ impl<Eng> DescribeStandards<Eng> {
 
 /// `MaxResults`' upper bound (`@range(min: 1, max: 100)` on `MaxResults`), which is
 /// also the page size used when the caller names none.
-pub const MAX_RESULTS_LIMIT: usize = 100;
+const MAX_RESULTS_LIMIT: usize = 100;
 
-/// Marker the opaque `NextToken` carries, so a token minted for another list — or a
-/// value a caller invented — is rejected rather than read as an offset.
+/// Marker this list's opaque `NextToken` carries, so a token minted for another
+/// list — or a value a caller invented — is rejected rather than read as an offset.
 const NEXT_TOKEN_PREFIX: &str = "securityhub:standards:";
 
-/// A `NextToken` resuming at `offset` in the catalog. Opaque to the caller: the
-/// cursor is hex-encoded, so nothing in the response invites arithmetic on it.
+/// A `NextToken` resuming at `offset` in the catalog.
 fn encode_next_token(offset: usize) -> String {
-    ::hex::encode(format!("{NEXT_TOKEN_PREFIX}{offset}"))
+    crate::state::encode_list_token(NEXT_TOKEN_PREFIX, offset)
 }
 
 /// The offset a `NextToken` resumes at, or `None` when it is not one this operation
 /// minted.
 fn decode_next_token(token: &str) -> Option<usize> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    decoded.strip_prefix(NEXT_TOKEN_PREFIX)?.parse().ok()
+    crate::state::decode_list_token(NEXT_TOKEN_PREFIX, token)
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation

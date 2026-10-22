@@ -285,11 +285,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_default()
         {
             let instant = transaction.transaction_timestamp;
+            // `ConfirmationStatusFilter$include`: "Transactions that have reached
+            // finality are always part of the response", so the filter decides only
+            // whether the ones that have NOT reached it are included too.
+            let refused_status = transaction.confirmation_status != crate::state::CONFIRMATION_FINAL
+                && wanted_statuses
+                    .as_ref()
+                    .is_some_and(|wanted| !wanted.contains(&transaction.confirmation_status));
             if from.is_some_and(|earliest| instant < earliest)
                 || to.is_some_and(|latest| instant > latest)
-                || wanted_statuses
-                    .as_ref()
-                    .is_some_and(|wanted| !wanted.contains(&transaction.confirmation_status))
+                || refused_status
             {
                 continue;
             }

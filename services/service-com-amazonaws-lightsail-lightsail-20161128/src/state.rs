@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AddOn, AddOnRequest, AvailabilityZone, BucketBundle, Container, ContainerImage,
+    AddOn, AddOnRequest, AvailabilityZone, Blueprint, BucketBundle, Container, ContainerImage,
     ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
     ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
     ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, Domain, DomainEntry, Instance,
@@ -826,6 +826,235 @@ pub fn blueprint_spec(blueprint_id: &str) -> Option<BlueprintSpec> {
 /// it AND the entry is still active.
 pub fn blueprint_is_creatable(blueprint_id: &str) -> bool {
     blueprint_spec(blueprint_id).is_some_and(|spec| spec.is_active)
+}
+
+/// One value of the modelled `InstancePlatform` enum
+/// (`smithy_query(query="shape",shape="InstancePlatform")`): a Linux/Unix image.
+pub const PLATFORM_LINUX_UNIX: &str = "LINUX_UNIX";
+
+/// The other value of the modelled `InstancePlatform` enum: a Windows
+/// Server-based image.
+pub const PLATFORM_WINDOWS: &str = "WINDOWS";
+
+/// The Lightsail for Research virtual-computer blueprints this service publishes.
+///
+/// A SEPARATE catalog from [`BLUEPRINTS`]: `GetBlueprints$appCategory` is
+/// documented as "Returns a list of blueprints that are specific to Lightsail for
+/// Research. You must use this parameter to view Lightsail for Research
+/// blueprints", so the two catalogs are disjoint and the request's category is
+/// what selects between them (see [`blueprint_catalog`]).
+///
+/// This emulator publishes no Lightsail for Research blueprint, so the catalog is
+/// EMPTY and a request naming a category reports no blueprint. An entry here
+/// would have to name a real Research image; inventing one would make
+/// `GetBlueprints` report a blueprint `CreateInstances` cannot create from.
+pub const LFR_BLUEPRINTS: &[BlueprintSpec] = &[];
+
+/// How many blueprints one `GetBlueprints` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more blueprints remain. It is above the
+/// published catalog's size, so the whole catalog is answered in one page — as AWS
+/// answers it — and the paging walk still holds for a catalog that outgrows it.
+pub const BLUEPRINT_PAGE_SIZE: usize = 50;
+
+/// Whether a word of a blueprint id names a version rather than the blueprint
+/// family: a version word begins with a digit (`ubuntu_22_04` -> `22`, `04`;
+/// `amazon_linux_2023` -> `2023`).
+fn is_version_word(word: &str) -> bool {
+    word.starts_with(|first: char| first.is_ascii_digit())
+}
+
+impl BlueprintSpec {
+    /// `Blueprint$group` — "The group name of the blueprint (`amazon-linux`)".
+    ///
+    /// The group is the blueprint FAMILY: the id with its version words removed
+    /// and its underscores written as hyphens, which is exactly the derivation
+    /// that documented example shows (`amazon_linux_2023` -> `amazon-linux`).
+    pub fn group(&self) -> String {
+        self.blueprint_id
+            .split('_')
+            .filter(|word| !word.is_empty() && !is_version_word(word))
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    /// `Blueprint$version` — "The version number of the operating system,
+    /// application, or stack (`2016.03.0`)".
+    ///
+    /// A Lightsail blueprint id spells that version in its own version words, so
+    /// the version is those words joined with dots (`ubuntu_22_04` -> `22.04`,
+    /// `plesk_ubuntu_18_0_35` -> `18.0.35`). A blueprint whose id names no
+    /// version reports NONE: the member is optional, and an invented version
+    /// number would say something the catalog does not know.
+    pub fn version(&self) -> Option<String> {
+        let version = self
+            .blueprint_id
+            .split('_')
+            .filter(|word| is_version_word(word))
+            .collect::<Vec<_>>()
+            .join(".");
+        (!version.is_empty()).then_some(version)
+    }
+
+    /// `Blueprint$platform` — "The operating system platform (either
+    /// Linux/Unix-based or Windows Server-based) of the blueprint", one of the
+    /// modelled `InstancePlatform` enum's two values. Windows is the platform of
+    /// exactly the Windows blueprints ([`blueprint_is_windows`]), the same
+    /// classification that decides which management port a new instance opens.
+    pub fn platform(&self) -> &'static str {
+        if blueprint_is_windows(self.blueprint_id) {
+            PLATFORM_WINDOWS
+        } else {
+            PLATFORM_LINUX_UNIX
+        }
+    }
+
+    /// `Blueprint$description` — "The description of the blueprint".
+    ///
+    /// DERIVED from the two facts the catalog holds about the entry: its friendly
+    /// name and its `type`, which says whether the image is an operating system
+    /// or an application stack preinstalled on one. A per-entry marketing
+    /// paragraph is not something this catalog knows.
+    pub fn description(&self) -> String {
+        let name = blueprint_name(self.blueprint_id);
+        if self.blueprint_type == BLUEPRINT_TYPE_APP {
+            format!("{name} application stack, preinstalled on a Lightsail instance.")
+        } else {
+            format!("{name} operating system image for a Lightsail instance.")
+        }
+    }
+
+    /// This entry as the modelled `Blueprint`.
+    ///
+    /// `name` is [`blueprint_name`], the same derivation `Instance$blueprintName`
+    /// reports, so the catalog's name for a blueprint is the name an instance
+    /// created from it carries.
+    pub fn view(&self) -> Blueprint {
+        Blueprint {
+            blueprint_id: Some(self.blueprint_id.to_string()),
+            name: Some(blueprint_name(self.blueprint_id)),
+            group: Some(self.group()),
+            r#type: Some(self.blueprint_type.to_string()),
+            description: Some(self.description()),
+            is_active: Some(self.is_active),
+            // `minPower` is "The minimum bundle power required to run this
+            // blueprint ... `0` indicates that the blueprint runs on all instance
+            // sizes". Every blueprint this catalog publishes runs on every plan
+            // [`BUNDLE_SPECS`] serves, which is what that 0 states.
+            min_power: Some(0),
+            version: self.version(),
+            // `versionCode` is Lightsail's own revision counter for an image, and
+            // `productUrl`/`licenseUrl` are per-image links. This catalog
+            // publishes none of the three and all three members are optional, so
+            // they are left ABSENT rather than carrying an invented value.
+            version_code: None,
+            product_url: None,
+            license_url: None,
+            platform: Some(self.platform().to_string()),
+            // Only a Lightsail for Research blueprint carries a category, and it
+            // is the category of the catalog the entry came from, so
+            // [`blueprints_from`] stamps it rather than the entry.
+            app_category: None,
+        }
+    }
+}
+
+/// The catalog a `GetBlueprints` request naming `app_category` reports from: the
+/// Lightsail for Research blueprints when it names a category, the instance
+/// blueprints when it names none.
+///
+/// From `GetBlueprints$appCategory`: "You must use this parameter to view
+/// Lightsail for Research blueprints" — so the standard catalog answers a request
+/// that names no category, and only a request that names one sees the Research
+/// blueprints.
+///
+/// The VALUE is not re-checked here: `appCategory` targets the modelled
+/// `AppCategory` enum, whose value set the centralized constraint walk enforces
+/// before any handler runs (a category the model does not name is already a 400
+/// `ValidationException`), so every category that reaches this function is one the
+/// model admits.
+pub fn blueprint_catalog(app_category: Option<&str>) -> &'static [BlueprintSpec] {
+    match app_category {
+        Some(_) => LFR_BLUEPRINTS,
+        None => BLUEPRINTS,
+    }
+}
+
+/// The blueprints a `GetBlueprints` call reports out of `specs`: every active
+/// entry, plus the inactive (retired) ones when `include_inactive` is set, each
+/// stamped with `app_category` — the category of the catalog it came from.
+///
+/// The order is `specs`' own, so two reads answer identically. Taking the catalog
+/// as an argument is what lets the slice rule be exercised against a catalog
+/// whose shape the published one does not have yet.
+pub fn blueprints_from(
+    specs: &[BlueprintSpec],
+    include_inactive: bool,
+    app_category: Option<&str>,
+) -> Vec<Blueprint> {
+    specs
+        .iter()
+        .filter(|spec| include_inactive || spec.is_active)
+        .map(|spec| Blueprint {
+            app_category: app_category.map(str::to_string),
+            ..spec.view()
+        })
+        .collect()
+}
+
+/// The blueprints a `GetBlueprints` call reports: [`blueprints_from`] over the
+/// catalog [`blueprint_catalog`] selects.
+pub fn blueprints(include_inactive: bool, app_category: Option<&str>) -> Vec<Blueprint> {
+    blueprints_from(
+        blueprint_catalog(app_category),
+        include_inactive,
+        app_category,
+    )
+}
+
+/// One page of `reported`: at most `page_size` blueprints from the entry
+/// `page_token` names onward, and the id of the first entry of the page after it
+/// — present only while entries remain.
+///
+/// A page token NAMES a blueprint rather than carrying an index, so a catalog that
+/// gained or lost an entry between two pages cannot make the walk skip or repeat
+/// another one. `None` is the answer when the token names no blueprint of
+/// `reported`: there is no page to report, which the caller turns into a refusal.
+/// An absent token asks for the first page.
+pub fn blueprint_page(
+    reported: &[Blueprint],
+    page_size: usize,
+    page_token: Option<&str>,
+) -> Option<(Vec<Blueprint>, Option<String>)> {
+    // A page carries at least one entry, so a walk over a non-empty catalog
+    // always advances.
+    let page_size = page_size.max(1);
+    let start = match page_token {
+        None => 0,
+        Some(token) => reported
+            .iter()
+            .position(|blueprint| blueprint.blueprint_id.as_deref() == Some(token))?,
+    };
+    let page = reported[start..]
+        .iter()
+        .take(page_size)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_page_token = reported
+        .get(start + page_size)
+        .and_then(|blueprint| blueprint.blueprint_id.clone());
+    Some((page, next_page_token))
+}
+
+/// The blueprint ids `reported` holds, for a refusal that has to tell the caller
+/// what a page token may name.
+pub fn reported_blueprint_ids(reported: &[Blueprint]) -> String {
+    reported
+        .iter()
+        .filter_map(|blueprint| blueprint.blueprint_id.clone())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ---------------------------------------------------------------------------

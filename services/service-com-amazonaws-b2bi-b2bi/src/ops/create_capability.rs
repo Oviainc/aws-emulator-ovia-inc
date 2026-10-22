@@ -4,6 +4,10 @@
 //! Mints a capability, persists its configuration verbatim, and answers with the
 //! STORED record so a later `GetCapability` returns exactly what was created.
 //!
+//! The configuration's `transformerId` is RESOLVED in this service's store first: a
+//! capability that names a transformer which does not exist is refused with the modelled
+//! `ResourceNotFoundException`, so no capability is minted around a dangling reference.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -169,6 +173,19 @@ fn store_full() -> CreateCapabilityError {
     .into()
 }
 
+/// Every transformer id a capability's `configuration` names.
+///
+/// The modelled `CapabilityConfiguration` is a union whose only member today is `edi`,
+/// and an `EdiConfiguration` carries exactly one required `transformerId`. Walking the
+/// union (rather than reaching straight into `edi`) means the day the model adds another
+/// configuration variant, its references are resolved too — the match stops compiling
+/// until they are.
+fn referenced_transformers(configuration: &CapabilityConfiguration) -> Vec<&str> {
+    match configuration {
+        CapabilityConfiguration::Edi(edi) => vec![edi.transformer_id.as_str()],
+    }
+}
+
 /// The response for a stored capability — every member read back off the record, so a
 /// create and a later `GetCapability` cannot disagree.
 fn stored_capability_response(capability: &crate::state::Capability) -> CreateCapabilityOutput {
@@ -243,6 +260,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|id| state.capabilities.get(id))
             {
                 return Ok(stored_capability_response(existing));
+            }
+        }
+
+        // A capability's configuration REFERENCES a transformer by id, so that id has
+        // to resolve in this service's store before anything is minted: a capability
+        // that permanently names a transformer which does not exist is the modelled
+        // 404, never a success.
+        for transformer_id in referenced_transformers(&input.configuration) {
+            if !state.transformers.contains_key(transformer_id) {
+                return Err(CreateCapabilityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::transformer_not_found(transformer_id),
+                    },
+                )
+                .into());
             }
         }
 

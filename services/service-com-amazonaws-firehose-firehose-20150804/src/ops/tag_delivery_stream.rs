@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagDeliveryStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagDeliveryStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagDeliveryStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or replaces tags on the named stream's tag register in [`crate::state`]: a key the
+//! stream already carries takes the value this request gives it, every other tag it holds
+//! is left alone, and a request that would push the stream past the documented ceiling of
+//! fifty tags is refused as `LimitExceededException` without writing anything.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagDeliveryStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagDeliveryStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagDeliveryStream"))
+        // Mounted on an engine that holds no state this service can reach. Unreachable
+        // through the router, which mounts every service on one shared `InMemoryEngine`,
+        // and this operation models no server-side error to report it with.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "TagDeliveryStream",
+            ));
+        };
+        let _ = ctx;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Applies only the transitions the clock had ALREADY made due, so this call sees
+        // the register the same way every other operation does.
+        store.materialise_due(now);
+
+        let Some(stream) = store.streams.get_mut(&input.delivery_stream_name) else {
+            return Err(TagDeliveryStreamErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // Scoped to the account, and NOT to the name that was probed — see
+                    // `crate::service::not_found_message`.
+                    message: Some(crate::service::not_found_message()),
+                },
+            )
+            .into());
+        };
+
+        // "Each Firehose stream can have up to 50 tags", so what this request may add is
+        // judged against the tags the stream ALREADY holds: a key it carries is replaced
+        // rather than added, and a key this request repeats is one key.
+        let added: ::std::collections::BTreeSet<&str> = input
+            .tags
+            .iter()
+            .map(|tag| tag.key.as_str())
+            .filter(|key| !stream.tags.contains_key(*key))
+            .collect();
+        if stream.tags.len() + added.len() > crate::state::MAX_TAGS_PER_STREAM {
+            // Nothing is written: the whole request is refused, so a caller that retries
+            // after removing a tag sees the tags it had.
+            return Err(TagDeliveryStreamErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the limit of {} tags per Firehose stream has been reached",
+                        crate::state::MAX_TAGS_PER_STREAM
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Adds or updates tags ... If you specify a tag that already exists, the tag
+        // value is replaced with the value that you specify in the request." `Tag$Value`
+        // is optional, so a tag given no value carries the empty string — the same
+        // reading `CreateDeliveryStream` gives the tags it is created with.
+        for tag in input.tags {
+            stream
+                .tags
+                .insert(tag.key, tag.value.unwrap_or_default());
+        }
+        // A tag change is not part of the stream's described configuration
+        // (`DescribeDeliveryStream` reports no tags and the model gives tagging no
+        // version), so neither `VersionId` nor `LastUpdateTimestamp` moves here.
+
+        Ok(TagDeliveryStreamOutput {})
     }
 }

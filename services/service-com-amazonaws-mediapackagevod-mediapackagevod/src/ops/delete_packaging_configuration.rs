@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePackagingConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePackagingConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the stored PackagingConfiguration, so a second
+//! `DeletePackagingConfiguration` on the same `Id` answers 404, every asset in that
+//! configuration's PackagingGroup stops deriving an egress endpoint for it, and the
+//! tags stored under its ARN are forgotten. `NotFoundException` (404) for an `Id` no
+//! configuration is stored under.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePackagingConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers `204 No Content` — the RECORDED success status of a MediaPackage VOD
+//! delete, which the model's `@http` code 202 disagrees with; see `SUCCESS_STATUS`
+//! below.
 //!
 //! ## Shape of an operation
 //!
@@ -137,25 +137,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeletePackagingConfiguration";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_PACKAGING_CONFIGURATION_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_PACKAGING_CONFIGURATION_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 202u16;
+    // The RECORDED success status of a MediaPackage VOD delete, which CONFLICTS with
+    // this model's `@http` code for the operation (202): the recorded AWS response to a
+    // successful delete on this service is `204 No Content`, and the status a client
+    // branches on is wire behaviour, so the recording wins over the modelled code.
+    //
+    // Recording: behavioral unit `mediapackage-vod.delete-packaging-configuration-
+    // state-transition`, whose assertion on the delete reads
+    // `assert status_code == 204, f"expected 204 No Content, got {status_code}"`.
+    // `DeleteAsset` carries the same reconciliation, from its own unit.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePackagingConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePackagingConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePackagingConfiguration"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeletePackagingConfigurationErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some(
+                            "the MediaPackage VOD state store is unavailable".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+        // The `Id` addresses the resource (it is an `@httpLabel`), so one this service
+        // holds nothing under is the addressed resource missing — 404 — rather than an
+        // invalid parameter.
+        let Some(removed) = state.packaging_configurations.remove(&input.id) else {
+            return Err(DeletePackagingConfigurationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::scaffolded::not_found_message(
+                        crate::scaffolded::PACKAGING_CONFIGURATION_LABEL,
+                        &input.id,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The tag store is keyed by ARN, so a deleted configuration must not leave its
+        // tags behind for a later resource that happens to reuse the id.
+        state.forget_tags(&removed.arn);
+        // `EgressEndpoints` is derived from the configurations stored on an asset's
+        // group, so removing the record is all it takes for the endpoint this
+        // configuration published to disappear from the next read of every asset in it.
+        Ok(DeletePackagingConfigurationOutput {})
     }
 }

@@ -542,7 +542,9 @@ async fn home_directory_mappings_are_required_exactly_for_a_logical_home_directo
             "LOGICAL with no mappings",
             "u-logical-0",
             json!({"HomeDirectoryType": "LOGICAL"}),
-            Some(vec!["HomeDirectoryMappings", "HomeDirectoryType is LOGICAL"]),
+            // The violated requirement is the LIST's own modelled minimum, so that is
+            // what the refusal states. See `error_message_rules.rs` for the whole text.
+            Some(vec!["HomeDirectoryMappings", "must not be empty"]),
         ),
         (
             "PATH with mappings",
@@ -635,7 +637,7 @@ async fn a_cross_member_refusal_precedes_the_resource_lookup() {
     assert_cross_member_refusal(
         "LOGICAL with no mappings on an unminted server",
         &answer,
-        &["HomeDirectoryMappings", "HomeDirectoryType is LOGICAL"],
+        &["HomeDirectoryMappings", "must not be empty"],
     );
 }
 
@@ -789,12 +791,15 @@ async fn an_enum_refusal_names_the_member_and_the_value_set_but_not_the_value() 
     }
 }
 
-/// RULE (the same refusal, the classes this service does not reword): a violation of a
-/// single-member constraint that is NOT an enum value set is still answered as HTTP
-/// 400 `ValidationException` naming the member and the constraint it failed.
+/// RULE (the same refusal, every other constraint class): a violation of a
+/// single-member constraint that is not an enum value set is answered as HTTP 400
+/// `ValidationException` naming the member and the constraint it failed, and still
+/// never the submitted value.
 ///
 /// The rows differ along the constraint class — an absent required member, a pattern,
 /// a length and a range — so the enum rewording above cannot silently swallow them.
+/// `error_message_rules.rs` pins each class's whole message; this keeps the
+/// member-naming assertion beside the enum rows it belongs with.
 #[tokio::test]
 async fn the_other_constraint_classes_are_still_refused_naming_member_and_constraint() {
     let emulator = Emulator::new();

@@ -197,10 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .position(|stored| stored.ssh_public_key_id == input.ssh_public_key_id);
         let Some(position) = held else {
             return Err(st::not_found(
-                DeleteSshPublicKeyErrorModeled::ResourceNotFoundException(st::resource_not_found(
-                    st::RESOURCE_TYPE_SSH_PUBLIC_KEY,
-                    &input.ssh_public_key_id,
-                )),
+                DeleteSshPublicKeyErrorModeled::ResourceNotFoundException(
+                    st::unknown_ssh_public_key(&input.ssh_public_key_id),
+                ),
             ));
         };
         user.ssh_public_keys.remove(position);

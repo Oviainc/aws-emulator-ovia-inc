@@ -7,8 +7,11 @@
 //! later Get/List/Delete. Each collection keeps BOTH a `HashMap` keyed by the resource's
 //! generated id (the lookup every Get/Delete does) and a `Vec` of ids in insertion
 //! order (the stable enumeration the `@paginated` List operations page through).
+//!
+//! It also owns the wording of the `ResourceNotFoundException` each resource type is
+//! reported absent with, so every handler that resolves an id states it the same way.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::ops::types::{
     CapabilityConfiguration, CapabilityOptions, EdiType, InputConversion, Mapping,
@@ -25,6 +28,26 @@ pub const STATE_UNAVAILABLE: &str = "the b2bi service store is unavailable";
 
 /// The value of the modelled `Logging` enum that turns a profile's logging on.
 pub const LOGGING_ENABLED: &str = "ENABLED";
+
+/// This service's own code, as the modelled `ServiceQuotaExceededException$serviceCode`
+/// reports it and as Service Quotas publishes this service's quotas under
+/// (`smithy_query(query="service_info")` -> `sdkId: b2bi`).
+pub const SERVICE_CODE: &str = "b2bi";
+
+/// The quota the profile count is charged against, as
+/// `ServiceQuotaExceededException$quotaCode` names it and as the Service Quotas
+/// emulator publishes it for [`SERVICE_CODE`].
+pub const PROFILE_QUOTA_CODE: &str = "ProfilesPerAccount";
+
+/// AWS's DOCUMENTED profile limit, from `CreateProfile`: "You can have up to five
+/// customer profiles, each representing a distinct private network."
+///
+/// A create past it is the modelled `ServiceQuotaExceededException` (HTTP 402), and
+/// deleting a profile releases a slot — so the limit is a live count of stored
+/// profiles, never a high-water mark. AWS publishes this limit in Service Quotas
+/// (ServiceCode `b2bi`) as adjustable; this emulator enforces the documented default,
+/// and does not apply an approved increase to it.
+pub const MAX_PROFILES_PER_ACCOUNT: usize = 5;
 
 /// The `TransformerStatus` a freshly created transformer carries.
 ///
@@ -47,7 +70,9 @@ const ID_HEX_DIGITS: usize = 17;
 /// the modelled `MaxResults` range (`range 1..100`).
 pub const MAX_PAGE_SIZE: usize = 100;
 
-/// The most records one of this service's three stores holds.
+/// The most records a store this service keeps no AWS-published limit for holds — the
+/// capability and partnership stores. The profile store's ceiling is AWS's own
+/// [`MAX_PROFILES_PER_ACCOUNT`], which is far below this one.
 ///
 /// Bounds the memory one emulator process can be made to hold through repeated creates:
 /// a create is reachable without a verified caller, so without a ceiling every call
@@ -146,13 +171,22 @@ pub struct ComAmazonawsB2biB2biState {
     pub profiles: HashMap<String, Profile>,
     /// `profiles` in creation order, so `ListProfiles` paging is stable across calls.
     pub profile_order: Vec<String>,
+    /// `profileId`s minted but not yet stored.
+    ///
+    /// `CreateProfile` provisions a logging-ENABLED profile's log group with no lock
+    /// held, so it reserves its id here first: while the reservation stands no
+    /// concurrent create can mint the same id, and the reservation counts against
+    /// [`MAX_PROFILES_PER_ACCOUNT`] so it cannot take the account's last slot either.
+    /// An entry lives for one in-flight create and is removed whichever way it ends.
+    pub reserved_profile_ids: HashSet<String>,
     pub capabilities: HashMap<String, Capability>,
     /// `capabilities` in creation order, for `ListCapabilities` paging.
     pub capability_order: Vec<String>,
     pub partnerships: HashMap<String, Partnership>,
     /// `partnerships` in creation order, for `ListPartnerships` paging.
     pub partnership_order: Vec<String>,
-    /// The transformers this service holds, keyed by `transformerId`.
+    /// The transformers this service holds, keyed by `transformerId`: the set an `edi`
+    /// capability's `transformerId` is resolved against. See [`Transformer`].
     pub transformers: HashMap<String, Transformer>,
     /// `transformers` in creation order, for `ListTransformers` paging.
     pub transformer_order: Vec<String>,
@@ -165,9 +199,12 @@ pub struct ComAmazonawsB2biB2biState {
 }
 
 impl ComAmazonawsB2biB2biState {
-    /// Whether the profile store is below [`MAX_RECORDS_PER_STORE`].
+    /// Whether another profile fits inside AWS's documented
+    /// [`MAX_PROFILES_PER_ACCOUNT`] limit, counting the ids in-flight creates have
+    /// reserved ([`reserved_profile_ids`](Self::reserved_profile_ids)). That limit is far
+    /// below [`MAX_RECORDS_PER_STORE`], so it is also what bounds this store's residency.
     pub fn accepts_another_profile(&self) -> bool {
-        self.profiles.len() < MAX_RECORDS_PER_STORE
+        self.profiles.len() + self.reserved_profile_ids.len() < MAX_PROFILES_PER_ACCOUNT
     }
 
     /// Whether the capability store is below [`MAX_RECORDS_PER_STORE`].
@@ -257,6 +294,43 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsB2biB2biState>)
+}
+
+/// The `ResourceNotFoundException` message for a `profileId` the store does not hold.
+///
+/// Every one of these four is built from the request's own identifier, in the form this
+/// service states for that resource type (the forms recorded from AWS): a client parses
+/// the id back out of the message, so the template is part of the contract and must not
+/// be an emulator-local phrase.
+pub fn profile_not_found(profile_id: &str) -> String {
+    format!("Profile ID {profile_id} not found.")
+}
+
+/// The `ResourceNotFoundException` message for an unknown `capabilityId`.
+pub fn capability_not_found(capability_id: &str) -> String {
+    format!("Capability ID {capability_id} not found.")
+}
+
+/// The `ResourceNotFoundException` message for an unknown `partnershipId`.
+pub fn partnership_not_found(partnership_id: &str) -> String {
+    format!("Partnership with partnershipId {partnership_id} not found.")
+}
+
+/// The `ResourceNotFoundException` message for an unknown `transformerId`.
+///
+/// The recorded form for a transformer carries no trailing period, unlike the three
+/// above; each template is the one recorded for that resource type.
+pub fn transformer_not_found(transformer_id: &str) -> String {
+    format!("Transformer with transformerId {transformer_id} not found")
+}
+
+/// The CloudWatch Logs log group a logging-ENABLED profile reports as `logGroupName`,
+/// in the `b2bi/<profileId>-Logs` form this service's own model example carries.
+///
+/// The group with this name is PROVISIONED in CloudWatch Logs when the profile is
+/// created (`CreateProfile`), so the name a caller reads back resolves there.
+pub fn log_group_name(profile_id: &str) -> String {
+    format!("b2bi/{profile_id}-Logs")
 }
 
 /// The key a `clientToken` is remembered under, scoped by resource type.

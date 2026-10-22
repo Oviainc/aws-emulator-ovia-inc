@@ -186,10 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.partnerships.remove(&input.partnership_id).is_none() {
             return Err(DeletePartnershipErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Could not find partnership with ID {}",
-                        input.partnership_id
-                    ),
+                    message: crate::state::partnership_not_found(&input.partnership_id),
                 },
             )
             .into());

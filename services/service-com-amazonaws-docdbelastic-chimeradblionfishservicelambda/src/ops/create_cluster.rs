@@ -249,16 +249,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state::ensure_cluster_capacity(guard.clusters.len())
             .map_err(CreateClusterErrorModeled::ServiceQuotaExceededException)?;
         if let Some(existing_arn) = guard.cluster_names.get(&cluster_name) {
-            return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
-                message: format!("An elastic cluster named {cluster_name} already exists"),
-                resource_id: existing_arn.clone(),
-                resource_type: "cluster".to_string(),
-            })
+            return Err(CreateClusterErrorModeled::ConflictException(state::conflict(
+                state::ResourceKind::Cluster,
+                existing_arn,
+                format!("An elastic cluster named {cluster_name} already exists"),
+            ))
             .into());
         }
 
         let cluster_id = state::new_resource_id();
-        let cluster_arn = state::docdb_elastic_arn(&region, &format!("cluster/{cluster_id}"));
+        let cluster_arn = state::ResourceKind::Cluster.arn(&region, &cluster_id);
         let create_time = state::now_utc();
         let mut record = state::ClusterRecord {
             cluster_name: cluster_name.clone(),

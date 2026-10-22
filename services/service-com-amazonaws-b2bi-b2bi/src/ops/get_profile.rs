@@ -181,10 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(profile) = state.profiles.get(&input.profile_id) else {
             return Err(GetProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Could not find profile with ID {}",
-                        input.profile_id
-                    ),
+                    message: crate::state::profile_not_found(&input.profile_id),
                 },
             )
             .into());

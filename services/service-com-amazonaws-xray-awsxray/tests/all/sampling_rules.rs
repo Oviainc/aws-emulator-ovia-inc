@@ -15,9 +15,11 @@
 //!   `RuleName`, mints the `RuleARN` from the name, stamps `CreatedAt` equal to
 //!   `ModifiedAt`, and answers from that stored record — so `GetSamplingRules`
 //!   lists exactly what was stored, value for value, including the full
-//!   precision of `FixedRate`;
-//! * `GetSamplingRules` lists every stored record — whatever order the listing
-//!   operation defines, which its own suite pins — and a repeated read answers
+//!   precision of `FixedRate` and the modelled `Attributes` map, which is `{}`
+//!   for a rule that matches on no attribute;
+//! * `GetSamplingRules` lists every stored record plus the account's
+//!   service-managed `Default` rule — whatever order the listing operation
+//!   defines, which its own suite pins — and a repeated read answers
 //!   identically: reading changes nothing;
 //! * a `RuleName` is unique: a second create of a taken name is REFUSED and
 //!   leaves the stored record alone, so N concurrent creates of one name have
@@ -292,13 +294,12 @@ fn assert_record_matches(label: &str, where_from: &str, record: &Value, case: &C
         case.fixed_rate
     );
 
-    let expected_attributes: Option<BTreeMap<String, String>> = (!case.attributes.is_empty())
-        .then(|| {
-            case.attributes
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                .collect()
-        });
+    let expected_attributes: Option<BTreeMap<String, String>> = Some(
+        case.attributes
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+    );
     let actual_attributes = attributes_of(rule);
     assert_eq!(
         actual_attributes, expected_attributes,
@@ -366,26 +367,33 @@ async fn a_created_sampling_rule_is_answered_and_listed_from_its_stored_record()
         listed.status, 200,
         "GetSamplingRules must succeed, got {listed:?}"
     );
-    assert!(
-        listed.get("NextToken").is_null(),
-        "a listing within one page emits no NextToken, got {:?}",
-        listed.get("NextToken")
-    );
-    let listed_records = records(&listed);
+    // The created rules plus the account's service-managed `Default` rule, which
+    // takes the listing one record past a page here.
+    let mut listed_records: Vec<Value> = records(&listed).to_vec();
+    let mut token = listed.get("NextToken").as_str().map(str::to_string);
+    while let Some(next) = token {
+        let page = list_rules(&xray, Some(&next)).await;
+        assert_eq!(page.status, 200, "a resumed page must succeed, got {page:?}");
+        listed_records.extend(records(&page).iter().cloned());
+        token = page.get("NextToken").as_str().map(str::to_string);
+    }
     assert_eq!(
         listed_records.len(),
-        cases.len(),
-        "every created rule must be listed, got {listed_records:?}"
+        cases.len() + 1,
+        "every created rule must be listed, beside the service-managed Default rule, got {listed_records:?}"
     );
     let mut listed_names: Vec<&str> = listed_records
         .iter()
         .filter_map(|record| rule_of(record).get("RuleName").and_then(Value::as_str))
         .collect();
     listed_names.sort_unstable();
-    let expected_names: Vec<&str> = expected_order.iter().map(|case| case.name.as_str()).collect();
+    let mut expected_names: Vec<&str> =
+        expected_order.iter().map(|case| case.name.as_str()).collect();
+    expected_names.push("Default");
+    expected_names.sort_unstable();
     assert_eq!(
         listed_names, expected_names,
-        "GetSamplingRules must list exactly the created rules, got {listed_names:?}"
+        "GetSamplingRules must list exactly the created rules and the Default rule, got {listed_names:?}"
     );
     for case in &expected_order {
         let record = listed_records
@@ -695,11 +703,16 @@ async fn a_next_token_appears_only_when_truncated_and_resumes_exactly_once() {
             }
         }
 
+        // The created rules, in name order, then the service-managed `Default`
+        // rule the listing always carries.
+        expected.push("Default".to_string());
         assert_eq!(
             seen, expected,
             "count {count}: pagination must yield every rule exactly once"
         );
-        let truncated = count > SAMPLING_RULES_PAGE_SIZE;
+        // The listing carries the Default rule too, so it is one record longer
+        // than the number of rules created.
+        let truncated = count + 1 > SAMPLING_RULES_PAGE_SIZE;
         assert_eq!(
             pages > 1,
             truncated,

@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: writes the stored cluster's network type and the five Regional
+//! data-plane endpoints that network type decides, then answers with the SAME stored
+//! record `DescribeCluster` projects.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Everything else about the cluster (its ARN, name, owner and tags) is untouched: the
+//! model's `UpdateClusterRequest` carries no other member, and the operation's own
+//! documentation says you can only update a cluster's network type.
+//!
+//! A change of network type re-deploys the cluster's endpoints, so the record's
+//! deployment becomes due again and the cluster reads `PENDING` right after this call
+//! and `DEPLOYED` once that instant has passed.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +156,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCluster"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `NetworkType` is a modelled enum, so only a value the model declares names a
+        // network a cluster can be moved to.
+        if !NETWORK_TYPE_VALUES.contains(&input.network_type.as_str()) {
+            return Err(UpdateClusterErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "NetworkType must be one of {}, got \"{}\"",
+                    NETWORK_TYPE_VALUES.join(", "),
+                    input.network_type
+                ),
+            })
+            .into());
+        }
+
+        let mut guard = state.lock();
+        let Some(record) = guard.clusters.get_mut(&input.cluster_arn) else {
+            return Err(UpdateClusterErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no cluster is stored under {}", input.cluster_arn),
+                },
+            )
+            .into());
+        };
+
+        // A request naming the network the cluster is already on changes nothing, so it
+        // does not restart a deployment either: `set_network_type` owns both halves of
+        // that transition.
+        record.set_network_type(input.network_type);
+
+        // Answer from the STORED record, so this body is what `DescribeCluster` answers
+        // with afterwards.
+        Ok(UpdateClusterOutput {
+            cluster: Some(record.to_cluster()),
+        })
     }
 }

@@ -161,15 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // served as page one, which would make a paging client loop over page one.
         let start = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                ListOriginEndpointsErrorModeled::UnprocessableEntityException(
-                    UnprocessableEntityException {
-                        message: Some(
-                            "The value of nextToken is not a valid pagination token.".into(),
-                        ),
-                    },
-                )
-            })?),
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_page_token)?,
+            ),
         };
         let page_size = crate::state::page_size(input.max_results);
 

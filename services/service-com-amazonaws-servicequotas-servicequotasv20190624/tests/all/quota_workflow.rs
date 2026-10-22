@@ -411,6 +411,132 @@ async fn a_single_quota_read_matches_the_entry_the_listing_returned() {
     );
 }
 
+/// RULE: a service whose published quotas this emulator seeds is discoverable by its
+/// `ServiceCode` and every quota it reports reads back identically through
+/// `GetServiceQuota` and `GetAWSDefaultServiceQuota`, with a `Value` and a `QuotaName`.
+///
+/// The rows are the catalogue's `ServiceCode`s themselves, taken from `ListServices`,
+/// so a service added to the seed is covered without touching this test; `b2bi` is
+/// named explicitly because a client discovers that quota before planning against it.
+///
+/// Coverage is per PAIR, not per service (see `seed_default_quotas`): a catalogued code
+/// whose published defaults are not seeded resolves with an EMPTY list, which is the
+/// rule `default_quota_catalog.rs` asserts. What this suite adds is that wherever a
+/// quota IS reported, the three reads of it agree.
+#[tokio::test]
+async fn every_seeded_service_code_resolves_to_readable_quotas() {
+    let engine = emulator();
+    let client = client(&engine, "us-east-1");
+
+    let services = walk_pages(&client, "ListServices", &json!({}), "Services", None).await;
+    let codes: Vec<String> = services
+        .iter()
+        .filter_map(|service| service["ServiceCode"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        codes.iter().any(|code| code == "b2bi"),
+        "case catalog: AWS B2B Data Interchange publishes quotas, so ServiceCode 'b2bi' \
+         must be in the catalogue, got {} entries",
+        codes.len()
+    );
+
+    // How many (service, quota) pairs the sweep below actually read back, so an empty
+    // catalogue cannot pass this test vacuously.
+    let mut read_pairs = 0_usize;
+    for service_code in &codes {
+        let listed = walk_pages(
+            &client,
+            "ListServiceQuotas",
+            &json!({"ServiceCode": service_code}),
+            "Quotas",
+            None,
+        )
+        .await;
+        if service_code == "b2bi" {
+            assert!(
+                !listed.is_empty(),
+                "case b2bi: the seeded profile quota must be reported, got {listed:?}"
+            );
+        }
+        for quota in listed {
+            read_pairs += 1;
+            let quota_code = quota["QuotaCode"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {service_code}: a quota without a code: {quota}"))
+                .to_string();
+            let case = format!("{service_code}/{quota_code}");
+            assert!(
+                quota["Value"].as_f64().is_some(),
+                "case {case}: a quota must report a Value, got {quota}"
+            );
+            assert!(
+                quota["QuotaName"].as_str().is_some_and(|n| !n.is_empty()),
+                "case {case}: a quota must report a QuotaName, got {quota}"
+            );
+            let pair = json!({"ServiceCode": service_code, "QuotaCode": quota_code});
+            let read = client.ok("GetServiceQuota", pair.clone()).await["Quota"].clone();
+            assert_eq!(
+                read, quota,
+                "case {case}: GetServiceQuota must answer the entry the listing returned"
+            );
+            let default = client.ok("GetAWSDefaultServiceQuota", pair).await["Quota"].clone();
+            assert_eq!(
+                default["Value"], quota["Value"],
+                "case {case}: with no increase applied, the default value is the applied one, \
+                 got {default}"
+            );
+        }
+    }
+
+    assert!(
+        read_pairs >= 5,
+        "case catalog: the sweep must have read several seeded quota pairs back, read \
+         {read_pairs}"
+    );
+}
+
+/// RULE: the quota a client plans against for AWS B2B Data Interchange profiles is the
+/// documented five, published under ServiceCode `b2bi` with the `quotaCode` the b2bi
+/// service's own `ServiceQuotaExceededException` names.
+#[tokio::test]
+async fn the_b2bi_profile_quota_publishes_the_documented_limit() {
+    let engine = emulator();
+    let client = client(&engine, "us-east-1");
+
+    let quotas = walk_pages(
+        &client,
+        "ListServiceQuotas",
+        &json!({"ServiceCode": "b2bi"}),
+        "Quotas",
+        None,
+    )
+    .await;
+
+    // `CreateProfile` in the b2bi model: "You can have up to five customer profiles".
+    let profiles = quotas
+        .iter()
+        .find(|quota| quota["QuotaCode"] == json!("ProfilesPerAccount"))
+        .unwrap_or_else(|| panic!("case b2bi: expected a profiles quota, got {quotas:?}"));
+    assert_eq!(
+        profiles["Value"].as_f64(),
+        Some(5.0),
+        "case b2bi/ProfilesPerAccount: expected the documented limit of five profiles, \
+         got {profiles}"
+    );
+    assert_eq!(
+        profiles["ServiceName"],
+        json!("AWS B2B Data Interchange"),
+        "case b2bi: the catalogue must name the service, got {profiles}"
+    );
+    assert_eq!(
+        profiles["QuotaArn"],
+        json!(format!(
+            "arn:aws:servicequotas:us-east-1:{ACCOUNT}:b2bi/ProfilesPerAccount"
+        )),
+        "case b2bi/ProfilesPerAccount: the ARN must name the pair, got {profiles}"
+    );
+}
+
 /// `QuotaAppliedAtLevel` keeps the quotas applied at that level, and `ALL` keeps
 /// every one.
 #[tokio::test]

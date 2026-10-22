@@ -15,6 +15,8 @@ use crate::ops::types::{
     EgressAccessLogs, HlsIngest, HlsManifest, HlsPackage, IngestEndpoint, IngressAccessLogs,
     MssPackage, OriginEndpoint,
 };
+use crate::scaffolded::ServiceError;
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use std::collections::BTreeMap;
 
 /// This service's SigV4 signing name and ARN namespace (`OPERATIONS.md`, "Wire protocol").
@@ -46,9 +48,25 @@ pub const INGEST_ENDPOINT_COUNT: usize = 2;
 /// the same generator and width.
 pub const INGEST_GENERATED_BYTES: usize = 16;
 
-/// Page size used when `MaxResults` is absent: the maximum the model allows
-/// (`MaxResults` range 1..1000), so an unpaged caller sees everything it can.
-pub const MAX_PAGE_SIZE: usize = 1000;
+/// The largest page MediaPackage serves, and the largest `MaxResults` it accepts.
+///
+/// NARROWER than the modelled `MaxResults` range (`@range` min 1 max 1000 — see
+/// `smithy_query(query="shape",shape="MaxResults",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`),
+/// because the service enforces its own page cap on top of the modelled range: a
+/// recorded `ListChannels` refuses an out-of-range `maxResults` with
+/// "maxResults must be an integer between 1 and 50". The modelled range is what a
+/// client-side validator checks; THIS is what the service applies, so it is the bound
+/// [`page_size_violation`] refuses past and the page an absent `MaxResults` takes.
+pub const MAX_PAGE_SIZE: usize = 50;
+
+/// The smallest `MaxResults` MediaPackage accepts — the modelled `@range` minimum, which
+/// the service's own bound shares.
+pub const MIN_PAGE_SIZE: usize = 1;
+
+/// The query parameter the paginated operations bind their page size to: `MaxResults` is
+/// `@httpQuery("maxResults")` and the `@paginated` trait's `pageSize` on every `List*`
+/// operation (`smithy_query(query="operation",operation="ListChannels",…)`).
+pub const PAGE_SIZE_QUERY: &str = "maxResults";
 
 // ---------------------------------------------------------------------------
 // Caller-driven growth bounds
@@ -100,25 +118,233 @@ pub const MAX_CMAF_HLS_MANIFESTS: usize = 50;
 /// service stores for a member whose length the model publishes no limit for.
 pub const MAX_STRING_CHARS: usize = 1024;
 
+// ---------------------------------------------------------------------------
+// How MediaPackage states a refusal
+//
+// Every MediaPackage error body carries `message` AND an `errors` object keyed by the
+// thing that was wrong — a RESOURCE TYPE when the request addressed a resource that is
+// missing or in the way, a REQUEST MEMBER when a value is one the service will not
+// accept — reporting that key's reasons (`crate::scaffolded::Reasons` describes the two
+// shapes a recorded body uses). The sentence is built from the same reasons
+// (`<key> <reason>`), so it is derived from the request rather than written twice; see
+// [`crate::scaffolded::ServiceError`], which owns the envelope.
+//
+// Every constructor below returns one of those envelopes, so this is the one home of
+// this service's refusal text: a handler names the rule, never the sentence.
+// ---------------------------------------------------------------------------
+
+/// How a MediaPackage error names a Channel in `errors` — the resource type, lowerCamel,
+/// as the wire names a member.
+pub const CHANNEL_KIND: &str = "channel";
+
+/// How a MediaPackage error names an OriginEndpoint in `errors`.
+pub const ORIGIN_ENDPOINT_KIND: &str = "originEndpoint";
+
+/// The Smithy shape name of the resource an OriginEndpoint is, as the dependency refusal
+/// below names the children blocking a delete.
+pub const ORIGIN_ENDPOINT_SHAPE: &str = "OriginEndpoint";
+
+/// `NotFoundException` (404) for a resource the request addressed BY ID that this service
+/// does not hold: keyed by the resource type, because what is missing is the resource and
+/// not a value in the request.
+pub fn resource_not_found(kind: &str, id: &str) -> ServiceError {
+    ServiceError::not_found(kind, format!("with id={id} not found"))
+}
+
+/// [`resource_not_found`] for a Channel.
+pub fn channel_not_found(id: &str) -> ServiceError {
+    resource_not_found(CHANNEL_KIND, id)
+}
+
+/// [`resource_not_found`] for an OriginEndpoint.
+pub fn origin_endpoint_not_found(id: &str) -> ServiceError {
+    resource_not_found(ORIGIN_ENDPOINT_KIND, id)
+}
+
+/// `UnprocessableEntityException` (422) for a create whose id is already in use: the
+/// request cannot be processed against the state this service holds, and the resource
+/// type is what is in the way.
+pub fn resource_already_exists(kind: &str, id: &str) -> ServiceError {
+    ServiceError::unprocessable_state(kind, format!("with id={id} already exists"))
+}
+
+/// `UnprocessableEntityException` (422) for a REQUEST MEMBER naming a resource this
+/// service does not hold.
+///
+/// Keyed by the member, not by the resource type: on a create the unresolvable reference
+/// is a value in the request the caller has to fix, which is a different answer from
+/// "the resource you addressed is gone" ([`resource_not_found`], 404). The reason is
+/// reported the way everything decided against STATE is, because resolving the reference
+/// is what failed — not reading it.
+pub fn member_not_found(member: &str) -> ServiceError {
+    ServiceError::unprocessable_state(member, "not found")
+}
+
+/// `UnprocessableEntityException` (422) for a rule about the resource AS A WHOLE — a
+/// combination of members no single member can be keyed by — reported like every other
+/// reason the service decides for that resource.
+pub fn resource_invalid(kind: &str, reason: impl Into<String>) -> ServiceError {
+    ServiceError::unprocessable_state(kind, reason)
+}
+
+/// `UnprocessableEntityException` (422) from the request validator: the requirement
+/// `member` failed, reported as that member's single requirement.
+pub fn member_invalid(member: &str, requirement: impl Into<String>) -> ServiceError {
+    ServiceError::unprocessable_member(member, requirement)
+}
+
+/// [`member_invalid`] for one constraint the model declares and the request violated, as
+/// the framework's own constraint walk reported it: keyed by the member PATH the walk
+/// names (lowerCamel, as the wire names it), stating the requirement that member failed.
+///
+/// This is how a violation of a declared constraint reaches the same envelope as a rule
+/// the service enforces itself, so one service does not answer its two input-failure paths
+/// in two different bodies.
+pub fn member_violation(violation: &Violation) -> ServiceError {
+    member_invalid(&violation.path, constraint_requirement(&violation.kind))
+}
+
+/// The requirement a violated constraint states, worded the way every other refused
+/// member here is worded: the rule, with the member supplied by the envelope's key.
+pub fn constraint_requirement(kind: &ViolationKind) -> String {
+    match kind {
+        ViolationKind::MissingRequiredMember => "is required".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => format!("must have length less than or equal to {max}"),
+        ViolationKind::MinValue(min) => format!("must be greater than or equal to {min}"),
+        ViolationKind::MaxValue(max) => format!("must be less than or equal to {max}"),
+        ViolationKind::Pattern(pattern) => {
+            format!("must satisfy the pattern {pattern}")
+        }
+        ViolationKind::EnumValue(values) => {
+            format!("must be one of {}", values.join(", "))
+        }
+        ViolationKind::UniqueItems => "must not carry a repeated entry".to_string(),
+        // `ViolationKind` is `#[non_exhaustive]`: a constraint class added to the
+        // framework later says what little the envelope can say about it, rather than
+        // failing to report the refusal at all.
+        _ => "is not valid".to_string(),
+    }
+}
+
+/// `UnprocessableEntityException` (422) for a delete refused because children are still
+/// attached: the blocked resource type, how many children hold it, and what they are.
+pub fn has_attached_children(kind: &str, child_shape: &str, count: usize) -> ServiceError {
+    let children = if count == 1 {
+        format!("{count} {child_shape} is")
+    } else {
+        format!("{count} {child_shape}s are")
+    };
+    ServiceError::unprocessable_state(
+        kind,
+        format!("cannot be deleted because {children} attached to it"),
+    )
+}
+
+/// `TooManyRequestsException` (429) for a store that has reached its entry cap.
+pub fn resource_limit_reached(kind: &str, max: usize) -> ServiceError {
+    ServiceError::too_many_requests(
+        kind,
+        format!("limit of {max} for this account has been reached"),
+    )
+}
+
+/// `UnprocessableEntityException` (422) for a `nextToken` this service did not issue.
+pub fn invalid_page_token() -> ServiceError {
+    member_invalid(
+        "nextToken",
+        "is not a pagination token this service issued",
+    )
+}
+
+/// The requirement an out-of-bound page size failed, worded as the service words it.
+///
+/// One sentence for every rejected value — too small, too large, or not a number at all —
+/// because all three fail the same requirement.
+pub fn page_size_requirement() -> String {
+    format!("must be an integer between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}")
+}
+
+/// `Some(error)` when `query` carries a page size outside the bound this service enforces
+/// ([`MIN_PAGE_SIZE`]..=[`MAX_PAGE_SIZE`]), `None` when it carries an acceptable one or
+/// none at all.
+///
+/// Reads the parameter AS SENT (decoded), so a value the modelled `@range` would never
+/// admit — and a value that is not a number at all — is refused with the bound the service
+/// applies rather than with the wider modelled one. The decoded value is read exactly as
+/// the framework's HTTP binding reads it afterwards, so the gate refuses precisely what
+/// the operation could not have read as a page size.
+pub fn page_size_violation(query: &str) -> Option<ServiceError> {
+    let sent = query_value(query, PAGE_SIZE_QUERY)?;
+    let accepted = sent
+        .parse::<usize>()
+        .is_ok_and(|size| (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size));
+    (!accepted).then(|| member_invalid(PAGE_SIZE_QUERY, page_size_requirement()))
+}
+
+/// The query string of `uri` — everything after the first `?`, empty when it has none.
+pub fn request_query(uri: &str) -> &str {
+    uri.split_once('?').map_or("", |(_, query)| query)
+}
+
+/// The value `query` carries for the parameter `name`, read the way the framework's HTTP
+/// binding reads one, so a rule applied here and the value the handler later sees cannot
+/// disagree:
+///
+/// * the value is percent-decoded (`smithy_server_runtime::percent_decode`), so the rule
+///   is applied to what the caller sent rather than to its encoding;
+/// * a parameter sent with no `=` carries the EMPTY value, exactly as the binding's pair
+///   reader does (`aws_smithy_schema_server::http_binding`), rather than being read as
+///   absent;
+/// * a parameter sent more than once answers with the FIRST value, which is the one the
+///   binding hands a non-list member.
+pub fn query_value(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (!key.is_empty() && ::smithy_server_runtime::percent_decode(key) == name)
+            .then(|| ::smithy_server_runtime::percent_decode(value))
+    })
+}
+
 /// Refuse a caller-sized collection that would grow a record past `max` entries.
 ///
-/// `Err` carries the message, naming the member and the bound it broke, so the caller can
-/// fix the request from the text alone.
-pub fn bound_entries(member: &str, count: usize, max: usize) -> Result<(), String> {
+/// `Err` is the service's own envelope, keyed by the member and stating the bound it
+/// broke, so the caller can fix the request from the error alone.
+pub fn bound_entries(member: &str, count: usize, max: usize) -> Result<(), ServiceError> {
     if count > max {
-        return Err(format!(
-            "{member} may carry at most {max} entries, got {count}"
+        return Err(member_invalid(
+            member,
+            format!("may carry at most {max} entries, got {count}"),
         ));
     }
     Ok(())
 }
 
 /// Refuse a caller-supplied string longer than `max` characters; see [`bound_entries`].
-pub fn bound_chars(member: &str, value: &str, max: usize) -> Result<(), String> {
+pub fn bound_chars(member: &str, value: &str, max: usize) -> Result<(), ServiceError> {
+    bound_part_chars(member, "", value, max)
+}
+
+/// [`bound_chars`] for a string INSIDE a member — one entry of a list, one tag key — where
+/// `part` names which part of the member the bound is about.
+pub fn bound_part_chars(
+    member: &str,
+    part: &str,
+    value: &str,
+    max: usize,
+) -> Result<(), ServiceError> {
     let length = value.chars().count();
     if length > max {
-        return Err(format!(
-            "{member} may be at most {max} characters, got {length}"
+        let subject = if part.is_empty() {
+            String::new()
+        } else {
+            format!("{part} ")
+        };
+        return Err(member_invalid(
+            member,
+            format!("{subject}may be at most {max} characters, got {length}"),
         ));
     }
     Ok(())
@@ -129,24 +355,31 @@ pub fn bound_chars(member: &str, value: &str, max: usize) -> Result<(), String> 
 ///
 /// This is the one place those limits are decided, so a create's request-shaped tag map
 /// and a `TagResource`'s merged result cannot be judged differently. Entries are sorted
-/// first, so the member named in the refusal does not depend on map ordering.
-pub fn bound_tag_entries<'a, I>(tags: I) -> Result<(), String>
+/// first, so the part named in the refusal does not depend on map ordering.
+pub fn bound_tag_entries<'a, I>(tags: I) -> Result<(), ServiceError>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
     let mut entries: Vec<(&str, &str)> = tags.into_iter().collect();
     entries.sort_unstable();
-    bound_entries("Tags", entries.len(), MAX_TAGS)?;
+    bound_entries("tags", entries.len(), MAX_TAGS)?;
     for (key, value) in entries {
-        bound_chars(&format!("the Tags key {key:?}"), key, MAX_TAG_KEY_CHARS)?;
-        bound_chars(&format!("the Tags value of {key:?}"), value, MAX_TAG_VALUE_CHARS)?;
+        bound_part_chars("tags", &format!("key {key:?}"), key, MAX_TAG_KEY_CHARS)?;
+        bound_part_chars(
+            "tags",
+            &format!("the value of {key:?}"),
+            value,
+            MAX_TAG_VALUE_CHARS,
+        )?;
     }
     Ok(())
 }
 
 /// Refuse a tag map on an input that breaks AWS's tagging limits; see
 /// [`bound_tag_entries`].
-pub fn bound_tags(tags: &Option<std::collections::HashMap<String, String>>) -> Result<(), String> {
+pub fn bound_tags(
+    tags: &Option<std::collections::HashMap<String, String>>,
+) -> Result<(), ServiceError> {
     let Some(tags) = tags else { return Ok(()) };
     bound_tag_entries(tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
 }
@@ -154,42 +387,45 @@ pub fn bound_tags(tags: &Option<std::collections::HashMap<String, String>>) -> R
 /// Refuse the caller-sized members an OriginEndpoint create and update share.
 ///
 /// Both handlers call this, so the bounds one enforces cannot drift from the other's: an
-/// update must not be able to grow a record past what the create would have refused.
+/// update must not be able to grow a record past what the create would have refused. Each
+/// refusal is keyed by the member path the wire names, as every other refused member is.
 pub fn bound_origin_endpoint_members(
     description: Option<&str>,
     manifest_name: Option<&str>,
     whitelist: Option<&[String]>,
     cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
-) -> Result<(), String> {
+) -> Result<(), ServiceError> {
     for (member, value) in [
-        ("Description", description),
-        ("ManifestName", manifest_name),
+        ("description", description),
+        ("manifestName", manifest_name),
     ] {
         if let Some(value) = value {
             bound_chars(member, value, MAX_STRING_CHARS)?;
         }
     }
     if let Some(whitelist) = whitelist {
-        bound_entries("Whitelist", whitelist.len(), MAX_WHITELIST_ENTRIES)?;
+        bound_entries("whitelist", whitelist.len(), MAX_WHITELIST_ENTRIES)?;
         for entry in whitelist {
-            bound_chars("a Whitelist entry", entry, MAX_STRING_CHARS)?;
+            bound_part_chars("whitelist", "an entry", entry, MAX_STRING_CHARS)?;
         }
     }
     if let Some(manifests) = cmaf_package.and_then(|package| package.hls_manifests.as_ref()) {
         bound_entries(
-            "CmafPackage.HlsManifests",
+            "cmafPackage.hlsManifests",
             manifests.len(),
             MAX_CMAF_HLS_MANIFESTS,
         )?;
         for manifest in manifests {
-            bound_chars(
-                "a CmafPackage.HlsManifests id",
+            bound_part_chars(
+                "cmafPackage.hlsManifests",
+                "an id",
                 &manifest.id,
                 MAX_STRING_CHARS,
             )?;
             if let Some(name) = &manifest.manifest_name {
-                bound_chars(
-                    "a CmafPackage.HlsManifests ManifestName",
+                bound_part_chars(
+                    "cmafPackage.hlsManifests",
+                    "a manifestName",
                     name,
                     MAX_STRING_CHARS,
                 )?;
@@ -676,6 +912,15 @@ impl TaggedResource {
             Self::OriginEndpoint(_) => "OriginEndpoint",
         }
     }
+
+    /// How an error body's `errors` map keys this resource — the resource type, as
+    /// [`CHANNEL_KIND`] and [`ORIGIN_ENDPOINT_KIND`] name it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Channel(_) => CHANNEL_KIND,
+            Self::OriginEndpoint(_) => ORIGIN_ENDPOINT_KIND,
+        }
+    }
 }
 
 /// The resource `arn` names, for a `ResourceArn` this service can tag.
@@ -785,10 +1030,10 @@ pub fn sole_packaging_kind(
     mss: bool,
 ) -> Result<Option<PackagingKind>, Vec<&'static str>> {
     let supplied: Vec<(PackagingKind, &'static str)> = [
-        (PackagingKind::Hls, "HlsPackage", hls),
-        (PackagingKind::Dash, "DashPackage", dash),
-        (PackagingKind::Cmaf, "CmafPackage", cmaf),
-        (PackagingKind::Mss, "MssPackage", mss),
+        (PackagingKind::Hls, "hlsPackage", hls),
+        (PackagingKind::Dash, "dashPackage", dash),
+        (PackagingKind::Cmaf, "cmafPackage", cmaf),
+        (PackagingKind::Mss, "mssPackage", mss),
     ]
     .into_iter()
     .filter_map(|(kind, name, present)| present.then_some((kind, name)))
@@ -800,17 +1045,22 @@ pub fn sole_packaging_kind(
     }
 }
 
-/// The refusal message for a request that does not name exactly one packaging
-/// configuration, naming the ones it did supply so the caller can fix the request from
-/// the text alone.
-pub fn packaging_refusal(supplied: &[&str]) -> String {
-    format!(
-        "Exactly one of HlsPackage, DashPackage, CmafPackage or MssPackage is required; got {}.",
-        if supplied.is_empty() {
-            "none".to_string()
-        } else {
-            supplied.join(", ")
-        }
+/// The refusal for a request that does not name exactly one packaging configuration,
+/// naming the ones it did supply so the caller can fix the request from the error alone.
+///
+/// A rule about a COMBINATION of members, so it is keyed by the resource the request is
+/// about rather than by one member ([`resource_invalid`]).
+pub fn packaging_refusal(supplied: &[&str]) -> ServiceError {
+    resource_invalid(
+        ORIGIN_ENDPOINT_KIND,
+        format!(
+            "requires exactly one of hlsPackage, dashPackage, cmafPackage or mssPackage; got {}",
+            if supplied.is_empty() {
+                "none".to_string()
+            } else {
+                supplied.join(", ")
+            }
+        ),
     )
 }
 
@@ -925,14 +1175,17 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 
 /// How many items one `List*` call serves, for the `MaxResults` it was given.
 ///
-/// `MaxResults`' modelled range is 1..1000 and the schema server enforces it BEFORE this
-/// handler runs, so a value reaching here is already inside the range; the clamp states
-/// that invariant locally instead of leaving it implicit, and an absent `MaxResults`
-/// takes the modelled maximum so an unpaged caller sees everything it can.
+/// A `MaxResults` outside the bound this service enforces is refused before the handler
+/// runs ([`page_size_violation`]), so a value reaching here is already inside
+/// [`MIN_PAGE_SIZE`]..=[`MAX_PAGE_SIZE`]; the clamp states that invariant locally instead
+/// of leaving it implicit, and an absent `MaxResults` takes the service's page cap, which
+/// is the most it would serve for any value the caller could send.
 pub fn page_size(max_results: Option<i32>) -> usize {
     match max_results {
         None => MAX_PAGE_SIZE,
-        Some(max) => usize::try_from(max).unwrap_or(1).clamp(1, MAX_PAGE_SIZE),
+        Some(max) => usize::try_from(max)
+            .unwrap_or(MIN_PAGE_SIZE)
+            .clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
     }
 }
 

@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetComponentType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetComponentType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the component type the workspace holds under the requested id, from
+//! [`crate::state`] — exactly what `CreateComponentType` persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetComponentType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A workspace or a component type this service does not hold is the modelled
+//! `ResourceNotFoundException` (HTTP 404).
+//!
+//! The one write a read performs: a component type's create answers the
+//! non-terminal `CREATING`, so the record carries the instant its transition to
+//! `ACTIVE` falls due, and this reader MATERIALISES that transition when the
+//! clock has already made it due (`ComponentType::settle`) — the change was
+//! owed at that instant whether or not anybody called, so no caller's read
+//! causes it. Nothing else here mutates state.
+//!
+//! Inheritance is not resolved: `extendsFrom` is reported as stored, and the
+//! property definitions, functions and property groups reported are the
+//! component type's OWN (`isInherited` false throughout), because this emulator
+//! holds no registry of the service's built-in parent component types to
+//! flatten a definition out of.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +189,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetComponentType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetComponentTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetComponentType"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one reads tenant state.
+        ::tracing::info!(
+            operation = "GetComponentType",
+            workspace_id = %input.workspace_id,
+            component_type_id = %input.component_type_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetComponentTypeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(GetComponentTypeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some(component_type) = workspace.component_types.get_mut(&input.component_type_id)
+        else {
+            return Err(GetComponentTypeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::component_type_not_found_message(
+                        &input.workspace_id,
+                        &input.component_type_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The clock, not this call, is what moves the component type on: the
+        // transition was due at `settles_at`, so reporting the state without
+        // materialising it would report a state that stopped being true before
+        // the request arrived.
+        component_type.settle(::std::time::SystemTime::now());
+
+        Ok(GetComponentTypeOutput {
+            workspace_id: component_type.workspace_id.clone(),
+            component_type_id: component_type.component_type_id.clone(),
+            arn: component_type.arn.clone(),
+            component_type_name: component_type.component_type_name.clone(),
+            description: component_type.description.clone(),
+            is_singleton: Some(component_type.is_singleton),
+            // Collections are materialised, not omitted when empty: the same
+            // choice `GetEntity` makes for an entity's components, so a client
+            // that walks `propertyDefinitions` needs no null guard.
+            extends_from: Some(component_type.extends_from.clone()),
+            property_definitions: Some(
+                component_type
+                    .property_definitions
+                    .iter()
+                    .filter_map(|(property_name, definition)| {
+                        crate::state::property_definition_response(definition)
+                            .map(|response| (property_name.clone(), response))
+                    })
+                    .collect(),
+            ),
+            functions: Some(
+                component_type
+                    .functions
+                    .iter()
+                    .map(|(function_name, function)| {
+                        (function_name.clone(), function_response(function))
+                    })
+                    .collect(),
+            ),
+            property_groups: Some(
+                component_type
+                    .property_groups
+                    .iter()
+                    .map(|(group_name, group)| {
+                        (group_name.clone(), property_group_response(group))
+                    })
+                    .collect(),
+            ),
+            composite_component_types: Some(
+                component_type
+                    .composite_component_types
+                    .iter()
+                    .map(|(name, composite)| {
+                        (
+                            name.clone(),
+                            CompositeComponentTypeResponse {
+                                component_type_id: composite.component_type_id.clone(),
+                                is_inherited: Some(false),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            creation_date_time: crate::state::timestamp(component_type.creation_date_time),
+            update_date_time: crate::state::timestamp(component_type.update_date_time),
+            // `isAbstract` is not a member of `CreateComponentTypeRequest` and
+            // not derivable from one that is: the API offers no way to declare
+            // a component type abstract, and the service's own abstract base
+            // types are built in, none of which this emulator holds. Every
+            // component type it stores was created through this API, so every
+            // one of them is concrete.
+            is_abstract: Some(false),
+            // "Whether the component type has a schema initializer and that the
+            // schema initializer has run" — see
+            // `ComponentType::is_schema_initialized`.
+            is_schema_initialized: Some(component_type.is_schema_initialized()),
+            // Carries BOTH its modelled members: the stored state (settled
+            // above) and the `error` structure every reported status carries.
+            status: Some(component_type.status()),
+            // No sync source: a component type this service created is not
+            // projected from a linked service. The sync-job slice sets it.
+            sync_source: None,
+        })
+    }
+}
+
+/// One stored function as the modelled `FunctionResponse`.
+///
+/// `isInherited` is false: inheritance from a parent component type is not
+/// resolved here, so every function reported is the component type's own.
+fn function_response(function: &FunctionRequest) -> FunctionResponse {
+    FunctionResponse {
+        required_properties: function.required_properties.clone(),
+        scope: function.scope.clone(),
+        implemented_by: function.implemented_by.clone(),
+        is_inherited: Some(false),
+    }
+}
+
+/// One stored property group as the modelled `PropertyGroupResponse`.
+///
+/// `groupType` is required on the response but optional on the request; the
+/// model's `GroupType` enum admits exactly one value
+/// ([`crate::state::TABULAR_GROUP_TYPE`]), so a group stored without one
+/// reports that value.
+fn property_group_response(group: &crate::state::PropertyGroupRecord) -> PropertyGroupResponse {
+    PropertyGroupResponse {
+        group_type: group
+            .group_type
+            .clone()
+            .unwrap_or_else(|| crate::state::TABULAR_GROUP_TYPE.to_string()),
+        property_names: group.property_names.clone(),
+        is_inherited: false,
     }
 }

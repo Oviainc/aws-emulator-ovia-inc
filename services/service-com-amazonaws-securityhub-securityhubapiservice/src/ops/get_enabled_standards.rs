@@ -120,10 +120,10 @@ impl From<GetEnabledStandardsErrorModeled> for GetEnabledStandardsError {
 
 /// `MaxResults`' upper bound (`@range(min: 1, max: 100)` on `MaxResults`), which is
 /// also the page size used when the caller names none.
-pub const MAX_RESULTS_LIMIT: usize = 100;
+const MAX_RESULTS_LIMIT: usize = 100;
 
-/// Marker the opaque `NextToken` carries, so a token minted for another list — or a
-/// value a caller invented — is rejected rather than read as an offset.
+/// Marker this list's opaque `NextToken` carries, so a token minted for another
+/// list — or a value a caller invented — is rejected rather than read as an offset.
 const NEXT_TOKEN_PREFIX: &str = "securityhub:enabled-standards:";
 
 /// A `NextToken` resuming at `offset` in the sorted result.

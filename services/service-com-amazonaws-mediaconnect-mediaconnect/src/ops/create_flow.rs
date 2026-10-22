@@ -104,10 +104,6 @@ use crate::state::{StoredFlow, StoredMediaStream, StoredOutput, StoredSource};
 /// minting side and the ARN-recognising side name it once.
 use crate::state::SERVICE_NAMESPACE;
 
-/// The `ENABLED` default for a status the request omits, from [`crate::state`] so this
-/// operation and AddFlowOutputs resolve it the same way.
-use crate::state::STATUS_ENABLED;
-
 /// `NetworkInterfaceType` (`ena | efa`) applied when a VPC interface request omits one;
 /// `ena` is the standard elastic network adapter.
 const NETWORK_INTERFACE_TYPE_ENA: &str = "ena";
@@ -192,38 +188,6 @@ fn materialise_source(
             ndi_source_settings: request.ndi_source_settings.clone(),
             ..Transport::default()
         }),
-    }
-}
-
-/// Materialise one `GrantEntitlementRequest` into the entitlement the flow carries.
-fn materialise_entitlement(
-    request: &GrantEntitlementRequest,
-    index: usize,
-    region: &str,
-    suffix: u64,
-) -> Entitlement {
-    let name = request
-        .name
-        .clone()
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| format!("entitlement-{}", index + 1));
-    Entitlement {
-        entitlement_arn: ::engine::emulator_arn(
-            SERVICE_NAMESPACE,
-            region,
-            &format!("entitlement:1-{suffix:08x}:{name}"),
-        ),
-        name,
-        description: request.description.clone(),
-        encryption: request.encryption.clone(),
-        entitlement_status: Some(
-            request
-                .entitlement_status
-                .clone()
-                .unwrap_or_else(|| STATUS_ENABLED.to_string()),
-        ),
-        data_transfer_subscriber_fee_percent: request.data_transfer_subscriber_fee_percent,
-        subscribers: request.subscribers.clone(),
     }
 }
 
@@ -441,10 +405,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // An entitlement's name is unique within its flow too, so the entitlements this
+        // request grants are named against each other as well as against the flow's
+        // (empty, for a flow being created) set, and minted through `crate::state` so a
+        // create grants an entitlement exactly as GrantFlowEntitlements does.
         let mut entitlements = Vec::new();
-        for (index, request) in input.entitlements.iter().flatten().enumerate() {
+        let mut entitlement_names: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        for request in input.entitlements.iter().flatten() {
+            let Some(name) =
+                crate::state::resolve_entitlement_name(request.name.as_deref(), &entitlement_names)
+            else {
+                return Err(bad_request(format!(
+                    "This request grants more than one entitlement named {:?}. An \
+                     entitlement name must be unique within its flow.",
+                    request.name.clone().unwrap_or_default()
+                )));
+            };
             let suffix = store.next_suffix();
-            entitlements.push(materialise_entitlement(request, index, &region, suffix));
+            entitlement_names.insert(name.clone());
+            entitlements.push(crate::state::mint_entitlement(
+                request, name, &region, suffix,
+            ));
         }
 
         // Every media stream carries the payload type the service assigns it, unique

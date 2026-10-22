@@ -1,15 +1,37 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComponentType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComponentType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a component type in a workspace and persists it in [`crate::state`]
+//! under that workspace, so `GetComponentType` reads back what was created.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComponentType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Unlike `CreateEntity`, this create does NOT complete within the call: the
+//! `state` it answers is the non-terminal `CREATING`, and the component type
+//! settles in `ACTIVE` once [`crate::state::COMPONENT_TYPE_SETTLE_SPAN`] has
+//! elapsed — an instant stored on the record and materialised by the next
+//! reader, never slept for.
+//!
+//! The refusals this handler owns:
+//!
+//! * the workspace does not exist — a `ValidationException`, because the model
+//!   declares no `ResourceNotFoundException` for this operation (the same
+//!   choice `CreateEntity` makes);
+//! * `componentTypeId` is already taken in the workspace — a
+//!   `ConflictException`;
+//! * the workspace already holds
+//!   [`crate::state::MAX_COMPONENT_TYPES_PER_WORKSPACE`] component types — the
+//!   modelled `ServiceQuotaExceededException`;
+//! * a property definition of a component type that extends nothing carries no
+//!   `dataType` — a `ValidationException`, because `dataType` is required on
+//!   the `PropertyDefinitionResponse` a read reports and there is no parent
+//!   definition to inherit it from.
+//!
+//! Two deliberate gaps. `extendsFrom` is stored WITHOUT checking that the
+//! parent component types exist: every real workspace carries the service's
+//! built-in component types, and this emulator holds no registry of them, so
+//! refusing an id it cannot resolve would refuse legitimate parents (the same
+//! gap `CreateEntity` documents for a component's `componentTypeId`).
+//! Authorization is not emulated, so the modelled `AccessDeniedException` is
+//! never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +192,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComponentType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComponentTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComponentType"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "CreateComponentType",
+            workspace_id = %input.workspace_id,
+            component_type_id = %input.component_type_id,
+            "serving a request"
+        );
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateComponentTypeErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iottwinmaker store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+            return Err(CreateComponentTypeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The id is the caller's: `componentTypeId` is required and carried in
+        // the URI, so there is nothing to mint and a taken id is a conflict.
+        if workspace.component_types.contains_key(&input.component_type_id) {
+            return Err(CreateComponentTypeErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "component type {} already exists in workspace {}",
+                        input.component_type_id, input.workspace_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The emulator's declared ceiling on the store, checked AFTER the
+        // identity conflict above so re-creating a taken id in a full workspace
+        // is still the ConflictException the id deserves.
+        if workspace.component_types.len() >= crate::state::MAX_COMPONENT_TYPES_PER_WORKSPACE {
+            return Err(
+                CreateComponentTypeErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "workspace {} has reached the limit of {} component types",
+                            input.workspace_id,
+                            crate::state::MAX_COMPONENT_TYPES_PER_WORKSPACE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let extends_from = input.extends_from.clone().unwrap_or_default();
+        let property_definitions = input.property_definitions.clone().unwrap_or_default();
+        // `dataType` is optional on `PropertyDefinitionRequest` but REQUIRED on
+        // the `PropertyDefinitionResponse` a read reports, so a definition may
+        // omit it only where it refines one it inherits. A component type that
+        // extends nothing inherits nothing, so each of its own definitions must
+        // carry a `dataType`.
+        if extends_from.is_empty() {
+            for (property_name, definition) in &property_definitions {
+                if definition.data_type.is_none() {
+                    return Err(CreateComponentTypeErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(format!(
+                                "propertyDefinitions.{property_name}.dataType is required for a \
+                                 component type that extends nothing"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::component_type_arn(
+            &region,
+            &input.workspace_id,
+            &input.component_type_id,
+        );
+        let now = ::std::time::SystemTime::now();
+        let component_type = crate::state::ComponentType {
+            component_type_id: input.component_type_id.clone(),
+            arn: arn.clone(),
+            workspace_id: input.workspace_id.clone(),
+            component_type_name: input.component_type_name,
+            description: input.description,
+            // Resolved rather than carried as an absent member: the flag reads
+            // "whether an entity can have more than one component of this
+            // type", which is a question with an answer for every component
+            // type, and `false` is the answer for one created without it.
+            is_singleton: input.is_singleton.unwrap_or(false),
+            extends_from,
+            property_definitions: property_definitions.into_iter().collect(),
+            functions: input.functions.unwrap_or_default().into_iter().collect(),
+            property_groups: input
+                .property_groups
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(group_name, group)| {
+                    (
+                        group_name,
+                        crate::state::PropertyGroupRecord {
+                            group_type: group.group_type,
+                            property_names: group.property_names.unwrap_or_default(),
+                        },
+                    )
+                })
+                .collect(),
+            composite_component_types: input
+                .composite_component_types
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            creation_date_time: now,
+            update_date_time: now,
+            // The create does not complete here: the component type is stored,
+            // and reported, in the non-terminal CREATING state, and the instant
+            // its transition to ACTIVE falls due is stored beside it.
+            state: crate::state::STATE_CREATING.to_string(),
+            settles_at: now + crate::state::COMPONENT_TYPE_SETTLE_SPAN,
+        };
+        let created_state = component_type.state.clone();
+
+        // Store the record BEFORE indexing its ARN, so the index can never name
+        // a component type that was not stored: the workspace is re-borrowed
+        // mutably here (the lookup that validated the request held it
+        // immutably) and that re-borrow is the last fallible step.
+        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+            return Err(CreateComponentTypeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("workspace {} vanished", input.workspace_id)),
+                },
+            )
+            .into());
+        };
+        workspace
+            .component_types
+            .insert(input.component_type_id.clone(), component_type);
+        state.arn_index.insert(
+            arn.clone(),
+            crate::state::ResourceRef::ComponentType {
+                workspace_id: input.workspace_id.clone(),
+                component_type_id: input.component_type_id.clone(),
+            },
+        );
+
+        Ok(CreateComponentTypeOutput {
+            arn,
+            creation_date_time: crate::state::timestamp(now),
+            state: created_state,
+        })
     }
 }

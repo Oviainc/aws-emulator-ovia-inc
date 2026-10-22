@@ -41,9 +41,86 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers an input-constraint violation with: its own
+/// modelled `ValidationException`, which the model declares service-wide with
+/// `@httpError 400` (`smithy_query(query="shape",shape="ValidationException")`). It is
+/// also the code the framework would have chosen, restated here because
+/// `override_refusal` replaces the code and the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// Render one violation the way b2bi states it.
+///
+/// A violated numeric `@range` bound names the member path and the bound it failed, and
+/// NOTHING of the value that was rejected. Every other class keeps the framework's own
+/// sentence (`Violation::message`, value and all): b2bi is only known to drop the value
+/// for a numeric range bound, and a class this service has no recorded wording for is
+/// better left as the framework states it than reworded on a guess.
+///
+/// The two requirement sentences and the envelope below mirror the framework's own
+/// (`vendor/smithy-schema-server/src/constraints.rs`: `Violation::requirement` and
+/// `envelope`) and must stay in step with them. They are restated here rather than
+/// reused because that crate renders a clause only through `Violation::message`, which
+/// always prefixes the rejected value — the one thing this service must not report for a
+/// range bound.
+///
+/// MIGRATION NOTE (the one `services/common/src/validation.rs` asks every new inliner to
+/// leave): this is the same value-free clause rendering that
+/// `services/service-com-amazonaws-emrserverless-awstoledowebservice/src/service.rs`
+/// already inlines, over the same `N validation error(s) detected: …` envelope. It is
+/// inlined again here because `Violation::requirement` is private to the vendored
+/// framework and `vendor/` is read-only from inside the emulator, so there is no public
+/// seam to call; the fix that owns the migration declares that shared module (or a public
+/// `Violation::message_without_value()`) and replaces both copies with a call to it.
+fn clause(violation: &Violation) -> String {
+    let requirement = match &violation.kind {
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        _ => return violation.message(),
+    };
+    format!(
+        "Value at '{}' failed to satisfy constraint: {requirement}",
+        violation.path
+    )
+}
+
+/// Whether `violation` is the class this service rewords: a violated numeric `@range`
+/// bound.
+fn is_range(violation: &Violation) -> bool {
+    matches!(
+        violation.kind,
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
+    )
+}
+
+/// The `ValidationException` message for a refused request: the AWS validation envelope
+/// (`N validation error(s) detected: `) over one clause per violation.
+///
+/// `None` declines the refusal, leaving the framework's wording, for a request with no
+/// range violation at all — there is nothing to reword there. A request that mixes a
+/// range violation with another class IS reworded, so the range clause drops its value
+/// while every other clause reads exactly as the framework would have stated it.
+fn range_envelope(violations: &[Violation]) -> Option<String> {
+    if !violations.iter().any(is_range) {
+        return None;
+    }
+    let clauses: Vec<String> = violations.iter().map(clause).collect();
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
 
 /// The `com-amazonaws-b2bi-b2bi` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +175,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // b2bi states a violated numeric `@range` bound WITHOUT the value that violated
+        // it: the message names the member path and the bound only. The code stays the
+        // modelled `ValidationException` (HTTP 400) — what the framework would have
+        // answered — so only the wording changes, and only for that class: every other
+        // refusal, authentication included, keeps the framework's wording because
+        // `range_envelope` declines it.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: range_envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

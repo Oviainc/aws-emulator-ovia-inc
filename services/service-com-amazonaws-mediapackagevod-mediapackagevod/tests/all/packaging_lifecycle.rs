@@ -310,9 +310,12 @@ async fn the_packaging_group_asset_lifecycle_round_trips_through_state() {
         described["approximateAssetCount"]
     );
 
-    // DeleteAsset removes it from state: 202, then 404, and gone from the listing.
+    // DeleteAsset removes it from state: 204, then 404, and gone from the listing.
     let (status, body) = call(&router, "DELETE", "/assets/asset-1", None).await;
-    assert_eq!(status, 202, "DeleteAsset: expected the modelled 202, body {body}");
+    assert_eq!(
+        status, 204,
+        "DeleteAsset: expected the recorded 204 No Content, body {body}"
+    );
     let (status, body) = call(&router, "GET", "/assets/asset-1", None).await;
     assert_eq!(status, 404, "DescribeAsset after delete: body {body}");
     assert_eq!(

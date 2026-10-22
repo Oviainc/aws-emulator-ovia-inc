@@ -207,15 +207,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let at_capacity = stored.ssh_public_keys.len() >= st::MAX_SSH_KEYS_PER_USER;
 
         if already_held {
+            // The service's fixed text for this condition; the user travels in
+            // `Resource`, so nothing of the request reaches the message.
             return Err(ImportSshPublicKeyErrorModeled::ResourceExistsException(
-                ResourceExistsException {
-                    message: format!(
-                        "User {} on server {} already holds this SSH public key",
-                        input.user_name, input.server_id
-                    ),
-                    resource: input.user_name.clone(),
-                    resource_type: st::RESOURCE_TYPE_USER.to_string(),
-                },
+                st::ssh_public_key_already_exists(&input.user_name),
             )
             .into());
         }
@@ -223,9 +218,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ImportSshPublicKeyErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     message: format!(
-                        "user {} already holds the maximum of {} SSH public keys; \
+                        "a user already holds the maximum of {} SSH public keys; \
                          delete one before importing another",
-                        input.user_name,
                         st::MAX_SSH_KEYS_PER_USER
                     ),
                 },

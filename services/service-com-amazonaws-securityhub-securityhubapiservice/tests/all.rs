@@ -21,6 +21,8 @@ mod action_targets;
 mod describe_standards;
 #[path = "all/enabled_standards.rs"]
 mod enabled_standards;
+#[path = "all/finding_aggregator_lifecycle.rs"]
+mod finding_aggregator_lifecycle;
 #[path = "all/finding_history.rs"]
 mod finding_history;
 #[path = "all/finding_ingest_lifecycle.rs"]

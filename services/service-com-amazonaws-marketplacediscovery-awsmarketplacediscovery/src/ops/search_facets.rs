@@ -149,6 +149,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The model declares no error for this operation (`OPERATIONS.md`: "Errors:
         // (none)"), so the scaffold's 400 `ValidationException` is the only refusal channel
         // this handler has — the same one `search_listings.rs` uses.
+        //
+        // `searchText` is checked FIRST, before any state is read: a value outside the
+        // member's modelled `@pattern` is refused as a property of the REQUEST. That check
+        // lives in `state` because the framework's boundary walk reads `@pattern` as a find
+        // and so cannot enforce an unanchored expression over the whole value; `locale` and
+        // `nextToken` need nothing here, their patterns being anchored.
+        crate::state::validate_search_text(input.search_text.as_deref())
+            .map_err(SearchFacetsError::validation)?;
+
         let store = crate::state::service_state(&*self.engine)
             .ok_or_else(|| SearchFacetsError::validation("the catalog store is unavailable"))?;
         let state = store.lock();

@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if guard.host_keys.remove(&key).is_none() {
             return Err(st::not_found(
                 DeleteHostKeyErrorModeled::ResourceNotFoundException(st::resource_not_found(
-                    st::RESOURCE_TYPE_HOST_KEY,
+                    &st::NOT_FOUND_HOST_KEY,
                     &input.host_key_id,
                 )),
             ));

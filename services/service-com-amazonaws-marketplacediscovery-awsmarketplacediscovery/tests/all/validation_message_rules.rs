@@ -30,8 +30,8 @@ use crate::catalog_drilldown::{router, AUTHORIZATION, PREFIX};
 /// The error code and HTTP status every constraint refusal keeps, whatever the clause
 /// says: `ValidationException` (Smithy `errorKind` client, `@httpError 400`) is declared
 /// by every operation of this service.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
-const VALIDATION_STATUS: u16 = 400;
+pub(crate) const VALIDATION_EXCEPTION: &str = "ValidationException";
+pub(crate) const VALIDATION_STATUS: u16 = 400;
 
 /// Call one operation and return its HTTP status, its `x-amzn-errortype` header and its
 /// JSON body.
@@ -39,7 +39,7 @@ const VALIDATION_STATUS: u16 = 400;
 /// `catalog_drilldown::call` answers status and body; this suite asserts on the
 /// `x-amzn-errortype` header too (restJson1 resolves the error SHAPE from it), which is
 /// why it dispatches the request itself.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     operation: &str,
     input: &Value,
@@ -70,7 +70,7 @@ async fn call(
 /// Call one operation expecting a refused request, and return the `message` the report
 /// carries. Checks the parts of the answer no clause rule may change: HTTP 400, the
 /// `ValidationException` code in the body's `__type` and in `x-amzn-errortype`.
-async fn refused(
+pub(crate) async fn refused(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,

@@ -179,10 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(capability) = state.capabilities.get(&input.capability_id) else {
             return Err(GetCapabilityErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Could not find capability with ID {}",
-                        input.capability_id
-                    ),
+                    message: crate::state::capability_not_found(&input.capability_id),
                 },
             )
             .into());

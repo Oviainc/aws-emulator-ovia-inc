@@ -31,12 +31,20 @@ pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// `p-<17 hex>` ids in this service's own Smithy model examples.
 pub(crate) const ID_HEX_DIGITS: usize = 17;
 
-/// A router with one b2bi service on one shared engine — what `build_router` assembles,
-/// narrowed to the service under test.
+/// A router with the b2bi service and the CloudWatch Logs service on one shared
+/// engine — what `build_router` assembles, narrowed to the services under test.
+///
+/// CloudWatch Logs is mounted because `CreateProfile` provisions a logging-ENABLED
+/// profile's log group by calling it in process, exactly as the assembled emulator does.
 pub(crate) fn b2bi_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
-    router.register_service(service_com_amazonaws_b2bi_b2bi::EmulatedService::new(engine));
+    router.register_service(service_com_amazonaws_b2bi_b2bi::EmulatedService::new(Arc::clone(
+        &engine,
+    )));
+    router.register_service(
+        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
+    );
     router
 }
 
@@ -107,21 +115,61 @@ pub(crate) fn is_generated_id(id: &str, prefix: &str) -> bool {
 /// the optional `capabilityDirection`, and the optional `instructionsDocuments`.
 type CapabilityCase<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, Option<Value>);
 
-/// A valid `CapabilityConfiguration` for tests that only need capabilities to exist.
-/// Member names are the union/structure members of `com.amazonaws.b2bi#CapabilityConfiguration`.
-pub(crate) fn capability_configuration(transaction_set: &str, version: &str) -> Value {
+/// A valid `CapabilityConfiguration` naming `transformer_id`, for tests that only need
+/// capabilities to exist. Member names are the union/structure members of
+/// `com.amazonaws.b2bi#CapabilityConfiguration`.
+pub(crate) fn capability_configuration(
+    transformer_id: &str,
+    transaction_set: &str,
+    version: &str,
+) -> Value {
     json!({
         "edi": {
             "type": { "x12Details": { "transactionSet": transaction_set, "version": version } },
             "inputLocation": { "bucketName": "inbound-bucket", "key": "in/" },
             "outputLocation": { "bucketName": "outbound-bucket", "key": "out/" },
-            "transformerId": "t-0123456789abcdef0"
+            "transformerId": transformer_id
         }
     })
 }
 
+/// Create a transformer and return its system-assigned `transformerId`.
+///
+/// A capability RESOLVES `configuration.edi.transformerId` in this service's store, so a
+/// capability needs a transformer that really exists; this is the call a client makes to
+/// get one. `name` is reduced to the characters the modelled `TransformerName`
+/// (`^[a-zA-Z0-9_-]{1,512}$`) accepts, so a case label can be handed straight in.
+pub(crate) async fn given_transformer(router: &MultiServiceRouter, name: &str) -> String {
+    let modelled_name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let (status, body) = call(
+        router,
+        "CreateTransformer",
+        json!({
+            "name": modelled_name,
+            "inputConversion": {
+                "fromFormat": "X12",
+                "formatOptions": {
+                    "x12": { "transactionSet": "X12_850", "version": "VERSION_4010" }
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "CreateTransformer({name}) failed: {body}");
+    text(&body, "transformerId")
+}
+
 /// Create a profile and return its `profileId`.
-async fn given_profile(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn given_profile(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = call(
         router,
         "CreateProfile",
@@ -137,15 +185,16 @@ async fn given_profile(router: &MultiServiceRouter, name: &str) -> String {
     text(&body, "profileId")
 }
 
-/// Create a capability and return its `capabilityId`.
-async fn given_capability(router: &MultiServiceRouter, name: &str) -> String {
+/// Create a capability — and the transformer it names — and return its `capabilityId`.
+pub(crate) async fn given_capability(router: &MultiServiceRouter, name: &str) -> String {
+    let transformer_id = given_transformer(router, &format!("{name}-transformer")).await;
     let (status, body) = call(
         router,
         "CreateCapability",
         json!({
             "name": name,
             "type": "edi",
-            "configuration": capability_configuration("X12_850", "VERSION_4010")
+            "configuration": capability_configuration(&transformer_id, "X12_850", "VERSION_4010")
         }),
     )
     .await;
@@ -154,7 +203,7 @@ async fn given_capability(router: &MultiServiceRouter, name: &str) -> String {
 }
 
 /// Create a partnership under `profile_id` and return its `partnershipId`.
-async fn given_partnership(
+pub(crate) async fn given_partnership(
     router: &MultiServiceRouter,
     profile_id: &str,
     capability_id: &str,
@@ -352,10 +401,11 @@ async fn a_created_capability_round_trips_its_configuration_and_instructions_doc
     ];
 
     let router = b2bi_router();
+    let transformer_id = given_transformer(&router, "edi-850-to-json").await;
     let mut minted = HashSet::new();
 
     for (case, transaction_set, version, direction, instructions) in cases {
-        let mut configuration = capability_configuration(transaction_set, version);
+        let mut configuration = capability_configuration(&transformer_id, transaction_set, version);
         if let Some(direction) = direction {
             configuration["edi"]["capabilityDirection"] = json!(direction);
         }
@@ -930,6 +980,7 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_resource
     let router = b2bi_router();
     let profile_id = given_profile(&router, "acme").await;
     let capability_id = given_capability(&router, "edi-850").await;
+    let transformer_id = given_transformer(&router, "idempotent-transformer").await;
 
     let profile_request = |token: &str| {
         json!({
@@ -940,11 +991,11 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_resource
             "clientToken": token
         })
     };
-    let capability_request = |token: &str| {
+    let capability_request = move |token: &str| {
         json!({
             "name": "idempotent capability",
             "type": "edi",
-            "configuration": capability_configuration("X12_850", "VERSION_4010"),
+            "configuration": capability_configuration(&transformer_id, "X12_850", "VERSION_4010"),
             "clientToken": token
         })
     };
@@ -1022,20 +1073,29 @@ async fn repeating_a_create_with_the_same_client_token_returns_the_same_resource
     }
 }
 
-/// RULE: a create refuses once its store is at the emulator's residency bound
-/// (`MAX_RECORDS_PER_STORE`), with the modelled `ServiceQuotaExceededException`
-/// (HTTP 402) naming that bound — so repeated unauthenticated creates cannot grow the
-/// process's memory without limit. Rows span all three stores, each on its own engine.
+/// RULE: a create refuses once its store is full, with the modelled
+/// `ServiceQuotaExceededException` (HTTP 402) naming the limit that was reached — AWS's
+/// documented five-profile limit for profiles, and the emulator's own residency bound
+/// (`MAX_RECORDS_PER_STORE`) for the stores AWS publishes no limit for, so repeated
+/// unauthenticated creates cannot grow the process's memory without limit. Rows span all
+/// three stores, each on its own engine.
 #[tokio::test]
-async fn a_create_is_refused_once_its_store_is_at_the_residency_bound() {
-    let bound = service_com_amazonaws_b2bi_b2bi::state::MAX_RECORDS_PER_STORE;
+async fn a_create_is_refused_once_its_store_is_full() {
+    use service_com_amazonaws_b2bi_b2bi::state::{
+        MAX_PROFILES_PER_ACCOUNT, MAX_RECORDS_PER_STORE,
+    };
 
-    // (case, resource type, how to fill one slot, how to try one more)
-    for case in ["profile", "capability", "partnership"] {
+    // (case, resource type, how many fit)
+    for (case, bound) in [
+        ("profile", MAX_PROFILES_PER_ACCOUNT),
+        ("capability", MAX_RECORDS_PER_STORE),
+        ("partnership", MAX_RECORDS_PER_STORE),
+    ] {
         let router = b2bi_router();
 
-        // The partnership store needs one profile and one capability to point at; they
-        // live in their own stores, so they do not consume partnership slots.
+        // The partnership store needs one profile and one capability to point at, and the
+        // capability store needs one transformer; they live in their own stores, so they
+        // do not consume slots of the store being filled.
         let (profile_id, capability_id) = if case == "partnership" {
             (
                 given_profile(&router, "acme").await,
@@ -1043,6 +1103,11 @@ async fn a_create_is_refused_once_its_store_is_at_the_residency_bound() {
             )
         } else {
             (String::new(), String::new())
+        };
+        let transformer_id = if case == "capability" {
+            given_transformer(&router, "bound-transformer").await
+        } else {
+            String::new()
         };
 
         let request = |index: usize| match case {
@@ -1060,7 +1125,11 @@ async fn a_create_is_refused_once_its_store_is_at_the_residency_bound() {
                 json!({
                     "name": format!("capability-{index}"),
                     "type": "edi",
-                    "configuration": capability_configuration("X12_850", "VERSION_4010")
+                    "configuration": capability_configuration(
+                        &transformer_id,
+                        "X12_850",
+                        "VERSION_4010"
+                    )
                 }),
             ),
             _ => (
@@ -1099,8 +1168,12 @@ async fn a_create_is_refused_once_its_store_is_at_the_residency_bound() {
         );
         assert!(
             text(&response, "message").contains(&bound.to_string()),
-            "case {case:?}: the refusal must name the emulator's own bound, got {:?}",
+            "case {case:?}: the refusal must name the limit it reached, got {:?}",
             text(&response, "message")
+        );
+        assert!(
+            response["quotaCode"].as_str().is_some(),
+            "case {case:?}: the refusal must name the quota that was exceeded, got {response}"
         );
     }
 }

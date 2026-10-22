@@ -21,8 +21,9 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. THIS service uses it: it puts the input-validation gate described
+//!   below in front of every modelled operation and lets the generated routing table
+//!   serve the request from there.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -39,11 +40,56 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Why this service refuses a bad request itself
+//!
+//! MediaPackage models no `ValidationException` at all: its client-input error is
+//! `UnprocessableEntityException`, HTTP **422**, "The parameters sent in the request are
+//! not valid" (`smithy_query(query="operation",operation="ListChannels",…)` lists
+//! `ForbiddenException` 403, `NotFoundException` 404, `TooManyRequestsException` 429 and
+//! `UnprocessableEntityException` 422 and nothing else). The framework's own request
+//! boundary refuses a value outside a declared constraint BEFORE any handler runs, and it
+//! answers that refusal as a generic **400 `ValidationException`** — a status and a code
+//! this service never produces, so an SDK cannot even deserialize it into a modelled
+//! type. The seam that rewords such a refusal (`Service::override_refusal` ->
+//! `Refused`) carries only a code and a message, never a status or a body member, so it
+//! cannot state this one.
+//!
+//! So this service refuses a bad request itself, through [`ModeledInputValidation`]: a
+//! gate [`Service::override_operation`] puts in front of every modelled operation. For
+//! each request it asks, in order:
+//!
+//! 1. the bound this SERVICE enforces on the page size, which is narrower than the
+//!    modelled `MaxResults` range (see [`crate::state::page_size_violation`]) and applies
+//!    to exactly the operations whose input SCHEMA binds that query parameter;
+//! 2. the framework's OWN constraint walk
+//!    (`aws_smithy_schema_server::constraints::validate`, the same call the centralized
+//!    sequence makes), so the declared rules enforced are exactly the model's and nothing
+//!    about a constraint is restated here.
+//!
+//! Either way the answer is this service's own envelope — 422
+//! `UnprocessableEntityException` with `message` and the per-member `errors` map, built by
+//! [`crate::state`] — and every request the service accepts is handed straight to the
+//! generated operation, which the routing table still owns.
+//!
+//! Two things the gate deliberately does not touch: authentication, which the router
+//! settles before any operation runs and reads off the MODELLED operation the routing key
+//! names (so a gate cannot weaken an operation's auth schemes), and the per-operation
+//! telemetry the centralized sequence records — a request the gate refuses never enters
+//! that sequence, so it is counted nowhere, exactly as a request refused before dispatch
+//! is.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
+
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::constraints::{validate, Violation};
+use aws_smithy_schema_server::ProtocolError;
+use smithy_server_runtime::{
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
+    Refused, ServerHttpProtocol, Service,
+};
 
 /// The `com-amazonaws-mediapackage-mediapackage` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +98,9 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The input-validation gate for each modelled operation, keyed by the routing key
+    /// the protocol resolves for it (the operation's own `NAME`). Built once, in `new`.
+    input_validation: HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,7 +110,210 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            input_validation: input_validation_gates::<Eng>(),
         }
+    }
+}
+
+/// One [`ModeledInputValidation`] gate per modelled operation.
+///
+/// Each gate is zero-sized: it carries only the operation TYPE, which is what names the
+/// input shape and its schema. The key is the operation's own `NAME`, so it is the
+/// model's routing key rather than a literal written here.
+fn input_validation_gates<Eng: Send + Sync + 'static>(
+) -> HashMap<&'static str, Box<dyn ErasedOperation>> {
+    let mut gates: HashMap<&'static str, Box<dyn ErasedOperation>> = HashMap::new();
+    macro_rules! gate {
+        ($map:ident; $($module:ident :: $operation:ident),+ $(,)?) => {
+            $(
+                $map.insert(
+                    <crate::ops::$module::$operation<Eng> as Operation>::NAME,
+                    Box::new(
+                        ModeledInputValidation::<crate::ops::$module::$operation<Eng>>::new(),
+                    ) as Box<dyn ErasedOperation>,
+                );
+            )+
+        };
+    }
+    // Every operation the model binds. What a request must satisfy is a property of its
+    // INPUT SHAPE, so the gate goes in front of all of them, implemented or still
+    // scaffolded: a request this service will not accept is refused the same way
+    // whoever serves it.
+    gate!(
+        gates;
+        configure_logs::ConfigureLogs,
+        create_channel::CreateChannel,
+        create_harvest_job::CreateHarvestJob,
+        create_origin_endpoint::CreateOriginEndpoint,
+        delete_channel::DeleteChannel,
+        delete_origin_endpoint::DeleteOriginEndpoint,
+        describe_channel::DescribeChannel,
+        describe_harvest_job::DescribeHarvestJob,
+        describe_origin_endpoint::DescribeOriginEndpoint,
+        list_channels::ListChannels,
+        list_harvest_jobs::ListHarvestJobs,
+        list_origin_endpoints::ListOriginEndpoints,
+        list_tags_for_resource::ListTagsForResource,
+        rotate_channel_credentials::RotateChannelCredentials,
+        rotate_ingest_endpoint_credentials::RotateIngestEndpointCredentials,
+        tag_resource::TagResource,
+        untag_resource::UntagResource,
+        update_channel::UpdateChannel,
+        update_origin_endpoint::UpdateOriginEndpoint,
+    );
+    gates
+}
+
+/// This service's input-validation gate in front of one operation `Op`.
+///
+/// Zero-sized: `Op` is a type parameter only, naming the input shape and the schema the
+/// constraint walk runs against. It holds no engine and no state, so the operation it
+/// guards stays the single owner of the request's behaviour.
+struct ModeledInputValidation<Op> {
+    operation: PhantomData<fn() -> Op>,
+}
+
+impl<Op> ModeledInputValidation<Op> {
+    const fn new() -> Self {
+        Self {
+            operation: PhantomData,
+        }
+    }
+}
+
+impl<Op: Operation + 'static> ErasedOperation for ModeledInputValidation<Op> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            if let Some(refused) = refuse_invalid_input::<Op>(svc, req) {
+                return refused;
+            }
+            // Accepted: the generated operation serves it, through the framework's own
+            // deserialize -> validate -> handle -> serialize sequence (which finds
+            // nothing left to refuse).
+            match modeled_operation(svc, req) {
+                Some(op) => op.run(svc, req, ctx).await,
+                // Unreachable: this gate is only reached through `override_operation`,
+                // which resolved its key from that same routing table.
+                None => svc.definition().routing_error_response(req),
+            }
+        })
+    }
+}
+
+/// The operation the model's routing table names for this request.
+fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
+    let key = svc.definition().protocol().routing_key(req).ok()?;
+    svc.definition().routing_table().get(key)
+}
+
+/// `Some(response)` when this service will not accept `Op`'s input: its modelled
+/// `UnprocessableEntityException`, HTTP 422, with both body members — the sentence and the
+/// per-member `errors` map.
+///
+/// `None` when the request is one the service accepts, or when it failed to READ for a
+/// reason that is not an input failure — an unparseable body is a protocol failure, and
+/// the framework words those per protocol.
+fn refuse_invalid_input<Op: Operation>(svc: &dyn Service, req: &RtRequest) -> Option<RtResponse> {
+    let protocol = svc.definition().protocol();
+    // The service's own page-size bound first: it is narrower than the modelled range, so
+    // the wider modelled one would otherwise answer for the values between them with a
+    // bound this service does not apply.
+    let error = page_size_violation::<Op>(req).or_else(|| {
+        first_violation::<Op>(protocol, req).map(|violation| crate::state::member_violation(&violation))
+    })?;
+    protocol
+        .serialize_error(
+            &error,
+            &crate::scaffolded::SERVICE_ERROR_SCHEMA,
+            error.code(),
+            error.status(),
+        )
+        // A modelled error that will not serialize leaves the request to the framework,
+        // which refuses it in the generic envelope — the very divergence this gate
+        // removes, so it is logged rather than passed over silently.
+        .inspect_err(|error| {
+            tracing::warn!(
+                operation = Op::NAME,
+                %error,
+                "this service's UnprocessableEntityException would not serialize; this \
+                 refusal falls back to the framework's generic envelope"
+            );
+        })
+        .ok()
+}
+
+/// `Some(error)` when `Op` is a paginated operation and the request's page size is outside
+/// the bound this service enforces.
+///
+/// Whether the operation HAS a page size is read off its input schema — the member bound
+/// to [`crate::state::PAGE_SIZE_QUERY`] — so it is the model that decides which operations
+/// this applies to, and a request to one that binds no such member is never refused for
+/// carrying that parameter.
+fn page_size_violation<Op: Operation>(req: &RtRequest) -> Option<crate::scaffolded::ServiceError> {
+    if !binds_page_size::<Op>() {
+        return None;
+    }
+    crate::state::page_size_violation(crate::state::request_query(req.uri()))
+}
+
+/// `true` when `Op`'s input binds the page-size query parameter.
+fn binds_page_size<Op: Operation>() -> bool {
+    for member in Op::INPUT_SCHEMA.members() {
+        if member
+            .http_query()
+            .is_some_and(|query| query.value() == crate::state::PAGE_SIZE_QUERY)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The first constraint `Op`'s input violates, as the framework's own walk reports it.
+///
+/// Both validation classes are classified by the framework's own
+/// [`smithy_server_runtime::refusal_of`], so this carries no second copy of "what counts
+/// as a constraint refusal": a value outside a declared bound is found by walking what
+/// was read, and a required member absent from the request is found while READING it, and
+/// `refusal_of` already states that they are one refusal. Anything it does not recognise
+/// (an unreadable body, a missing header) is not a constraint refusal and is left to the
+/// framework, which words it per protocol.
+///
+/// The walk visits members in schema order, so "the first" is a property of the input
+/// shape rather than of the request.
+fn first_violation<Op: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<Violation> {
+    let error = match protocol.deserialize_input(req, Op::INPUT_SCHEMA) {
+        Err(unreadable) => unreadable,
+        Ok(mut deserializer) => {
+            match <Op::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
+                Err(absent_or_malformed) => ProtocolError::Serde(absent_or_malformed),
+                // The request was read: the model's own constraint traits decide. This
+                // is the same call the centralized sequence makes, so no rule is
+                // restated here.
+                Ok(input) => {
+                    let violations = validate(&input, Op::INPUT_SCHEMA);
+                    if violations.is_empty() {
+                        return None;
+                    }
+                    ProtocolError::Invalid(violations)
+                }
+            }
+        }
+    };
+    match smithy_server_runtime::refusal_of(&error)? {
+        Refusal::Invalid(violations) => violations.into_iter().next(),
+        // Authentication is settled by the router before any operation runs, so an
+        // `Unauthenticated` refusal cannot arrive here — and it is not an input
+        // failure in any case.
+        _ => None,
     }
 }
 
@@ -87,24 +339,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Put this service's input-validation gate in front of the modelled operation
+        // the request names, so a request it will not accept is refused with the
+        // MODELLED `UnprocessableEntityException` (422, both body members) instead of the
+        // framework's generic 400 `ValidationException` envelope — see the module docs.
+        // The gate then hands every request the service accepts to the generated
+        // operation, which the routing table still owns; a request that names no
+        // modelled operation resolves as it always did.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        let gate = self.input_validation.get(key)?;
+        Some(gate.as_ref())
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
+        // Left to the framework DELIBERATELY. Every input failure this service states is
+        // answered by the gate above, before the centralized sequence reaches this seam,
+        // and `Refused` carries only a code and a message: rewording a refusal here would
+        // name `UnprocessableEntityException` on a response the protocol still sends as
+        // 400 with no `errors` member, which is a worse answer than the framework's own —
+        // a code that does not match its status. The only refusals that reach here are
+        // the ones the gate leaves alone (authentication, an unreadable body), which are
+        // the emulator's and the protocol's rather than this service's.
         let _ = refusal;
         None
     }
@@ -135,5 +390,120 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// This crate's shipped Smithy model, parsed.
+    ///
+    /// The tests below read the MODEL rather than a copy of it, so a value this file or
+    /// `crate::scaffolded` states about the service's errors cannot drift from what the
+    /// model declares.
+    fn model() -> serde_json::Value {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/smithy-model/com-amazonaws-mediapackage-mediapackage.json"
+        );
+        let model = std::fs::read_to_string(path).expect("this crate ships its Smithy model");
+        serde_json::from_str(&model).expect("the Smithy model is JSON")
+    }
+
+    /// Every error the envelope answers with carries the code and the status the model
+    /// declares for that shape.
+    ///
+    /// `crate::scaffolded` states each pair as a constant, because the envelope is not a
+    /// modelled shape and so cannot read them off one; this is what keeps those constants
+    /// in step with the model, so an `httpError` change cannot leave the envelope
+    /// answering a stale status under a name no shape carries.
+    #[test]
+    fn every_envelope_code_and_status_is_the_models() {
+        let model = model();
+        let shapes = model
+            .get("shapes")
+            .and_then(serde_json::Value::as_object)
+            .expect("a Smithy model has shapes");
+        let pairs = [
+            (
+                crate::scaffolded::NOT_FOUND_CODE,
+                crate::scaffolded::NOT_FOUND_STATUS,
+            ),
+            (
+                crate::scaffolded::UNPROCESSABLE_ENTITY_CODE,
+                crate::scaffolded::UNPROCESSABLE_ENTITY_STATUS,
+            ),
+            (
+                crate::scaffolded::TOO_MANY_REQUESTS_CODE,
+                crate::scaffolded::TOO_MANY_REQUESTS_STATUS,
+            ),
+        ];
+        for (code, status) in pairs {
+            let id = format!("com.amazonaws.mediapackage#{code}");
+            let shape = shapes
+                .get(&id)
+                .unwrap_or_else(|| panic!("the model declares no error shape named {code}"));
+            assert_eq!(
+                shape.get("type").and_then(serde_json::Value::as_str),
+                Some("structure"),
+                "{code} must be the error STRUCTURE the envelope names, got {shape:?}"
+            );
+            let traits = shape.get("traits").expect("an error shape carries traits");
+            assert!(
+                traits.get("smithy.api#error").is_some(),
+                "{code} must be an @error shape, got {traits:?}"
+            );
+            let declared = traits
+                .get("smithy.api#httpError")
+                .and_then(serde_json::Value::as_u64);
+            assert_eq!(
+                declared,
+                Some(u64::from(status)),
+                "{code}'s modelled httpError must be the status the envelope answers \
+                 ({status}), got {declared:?}"
+            );
+        }
+    }
+
+    /// Every operation the model declares has an input-validation gate.
+    ///
+    /// The gate set is written out by name in [`super::input_validation_gates`] — the
+    /// operation TYPE is what names the input shape and its schema, and the erased
+    /// routing table cannot hand that back — so this is what keeps the two in step: an
+    /// operation added to the model (and so to `src/ops/`) without a gate would quietly
+    /// go back to answering a refusal in the framework's generic 400 envelope, and this
+    /// test fails naming it.
+    #[test]
+    fn every_modeled_operation_has_an_input_validation_gate() {
+        let model = model();
+        let shapes = model
+            .get("shapes")
+            .and_then(serde_json::Value::as_object)
+            .expect("a Smithy model has shapes");
+        let operations: Vec<&str> = shapes
+            .iter()
+            .filter(|(_, shape)| shape.get("type").is_some_and(|kind| kind == "operation"))
+            .filter_map(|(id, _)| id.rsplit('#').next())
+            .collect();
+        assert!(
+            !operations.is_empty(),
+            "the model declares no operations, so this test proves nothing"
+        );
+        let gates = super::input_validation_gates::<engine::InMemoryEngine>();
+        for operation in &operations {
+            assert!(
+                gates.contains_key(*operation),
+                "operation {operation} has no input-validation gate, so a request this \
+                 service will not accept would be refused without the modelled status, \
+                 code and members"
+            );
+        }
+        assert_eq!(
+            gates.len(),
+            operations.len(),
+            "the gate set and the model's operations must match exactly, got {} gates for \
+             {} operations",
+            gates.len(),
+            operations.len()
+        );
     }
 }

@@ -160,27 +160,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An update changes a channel this service holds; there is nothing to update for
         // an id it does not, so the target is resolved before the request is judged.
-        let Some(record) = state.channels.get_mut(&input.id) else {
-            return Err(UpdateChannelErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Channel with ID \"{}\" not found.", input.id)),
-            })
-            .into());
-        };
+        if !state.channels.contains_key(&input.id) {
+            return Err(crate::state::channel_not_found(&input.id).into());
+        }
 
         // Bound the caller-supplied string before it is stored, exactly as the create
         // bounds it: an update must not be able to grow a record past what a create of
-        // the same record would have refused.
-        let refuse = |message: String| {
-            UpdateChannelError::from(UpdateChannelErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(message),
-                },
-            ))
-        };
+        // the same record would have refused. The refusal is this service's own envelope,
+        // keyed by the member it is about.
         if let Some(description) = &input.description {
-            crate::state::bound_chars("Description", description, crate::state::MAX_STRING_CHARS)
-                .map_err(refuse)?;
+            crate::state::bound_chars("description", description, crate::state::MAX_STRING_CHARS)?;
         }
+
+        let record = state
+            .channels
+            .get_mut(&input.id)
+            .expect("the channel resolved above, under this one hold of the lock");
 
         // `PUT /channels/{Id}` carries the channel's updatable configuration, and
         // `Description` is the only member it binds: the stored description becomes the

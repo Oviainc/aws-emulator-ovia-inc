@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members a request names to one stored input and answers that input
+//! read back out of state.
+//!
+//! `InputId` is the `@httpLabel` that picks the record; every other member of this
+//! operation's input is optional, so a member the request names replaces the stored
+//! one and a member it leaves out leaves the stored one alone. The response is
+//! projected from the record this call just wrote by `input_description`, never
+//! from the request in flight.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +175,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInput"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let mut state = state.lock();
+        // The channel transitions the clock had already made due decide both the
+        // input's reported `State` and whether a channel using it has stopped, so
+        // materialise them first: each was owed at that instant whether or not
+        // this update ran.
+        state.settle(::std::time::SystemTime::now());
+
+        if !state.inputs.contains_key(&input.input_id) {
+            return Err(UpdateInputErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Input", &input.input_id)),
+            })
+            .into());
+        }
+
+        // An attached channel that has not stopped ingests through exactly the
+        // settings this call would replace, so the edit waits until that channel
+        // has stopped. That is what this operation's modelled `ConflictException`
+        // answers — the same "in use" refusal `DeleteSdiSource` makes for a
+        // source an input holds.
+        if let Some((channel_id, channel_state)) =
+            state.channel_blocking_input_edit(&input.input_id)
+        {
+            return Err(UpdateInputErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Input {} is attached to channel {channel_id}, which is in state \
+                     {channel_state} and must have stopped before the input can be updated",
+                    input.input_id
+                )),
+            })
+            .into());
+        }
+
+        let record = state
+            .inputs
+            .get_mut(&input.input_id)
+            .ok_or_else(unavailable)?;
+
+        // Each member the request named is stored; each one it omitted keeps the
+        // value the input already had.
+        if let Some(name) = input.name {
+            record.name = Some(name);
+        }
+        if let Some(role_arn) = input.role_arn {
+            record.role_arn = Some(role_arn);
+        }
+        if let Some(security_groups) = input.input_security_groups {
+            record.security_groups = security_groups;
+        }
+        if let Some(sources) = input.sources {
+            record.sources = sources;
+        }
+        if let Some(destinations) = input.destinations {
+            record.destinations = destinations;
+        }
+        if let Some(flows) = input.media_connect_flows {
+            record.media_connect_flows = flows;
+        }
+        if let Some(devices) = input.input_devices {
+            record.input_devices = devices.iter().map(stored_input_device).collect();
+        }
+        if let Some(sdi_sources) = input.sdi_sources {
+            record.sdi_sources = sdi_sources;
+        }
+        if let Some(srt_settings) = input.srt_settings {
+            record.srt_settings = Some(srt_settings);
+        }
+        if let Some(multicast_settings) = input.multicast_settings {
+            record.multicast_settings = Some(stored_multicast_settings(&multicast_settings));
+        }
+        if let Some(receiver_groups) = input.smpte2110_receiver_group_settings {
+            record.smpte2110_receiver_group_settings = Some(receiver_groups);
+        }
+        if let Some(router_settings) = input.special_router_settings {
+            record.special_router_settings = Some(router_settings);
+        }
+
+        // Read back out of the store, so the response reports the input that was
+        // written rather than one this handler assembled from the request.
+        let updated = state
+            .input_description(&input.input_id)
+            .ok_or_else(unavailable)?;
+
+        Ok(UpdateInputOutput {
+            input: Some(updated),
+        })
     }
+}
+
+/// `InputDeviceRequest` -> the `InputDeviceSettings` the record stores: the same
+/// single `Id` member, which is what lets an updated device list read back through
+/// `Input`'s `InputDevices`.
+fn stored_input_device(device: &InputDeviceRequest) -> InputDeviceSettings {
+    InputDeviceSettings {
+        id: device.id.clone(),
+    }
+}
+
+/// `MulticastSettingsUpdateRequest` -> the `MulticastSettingsCreateRequest` the
+/// record stores. The two shapes carry the same members (`Sources`, each a
+/// `SourceIp` and a required `Url`), so an updated multicast source list is stored
+/// and reported exactly like a created one.
+fn stored_multicast_settings(
+    settings: &MulticastSettingsUpdateRequest,
+) -> MulticastSettingsCreateRequest {
+    MulticastSettingsCreateRequest {
+        sources: settings.sources.as_ref().map(|sources| {
+            sources
+                .iter()
+                .map(|source| MulticastSourceCreateRequest {
+                    source_ip: source.source_ip.clone(),
+                    url: source.url.clone(),
+                })
+                .collect()
+        }),
+    }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine, so
+/// there is no input store to update. A modelled server error, never a fresh engine
+/// (which would drop the write when this request returns).
+fn unavailable() -> UpdateInputError {
+    UpdateInputErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

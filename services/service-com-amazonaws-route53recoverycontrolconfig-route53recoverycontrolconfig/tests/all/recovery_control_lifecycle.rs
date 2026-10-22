@@ -24,20 +24,20 @@ use super::common::{
 };
 
 /// The account id every emulated ARN carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The ARN prefix AWS documents for recovery-control resources:
 /// `arn:aws:route53-recovery-control::<account>:...`.
-const ARN_PREFIX: &str = "arn:aws:route53-recovery-control::000000000000:";
+pub(crate) const ARN_PREFIX: &str = "arn:aws:route53-recovery-control::000000000000:";
 
 /// The `Status` values the model declares, via
 /// `smithy_query(query="shape",shape="Status")`: `DEPLOYED | PENDING | PENDING_DELETION`.
-const STATUS_PENDING: &str = "PENDING";
-const STATUS_DEPLOYED: &str = "DEPLOYED";
+pub(crate) const STATUS_PENDING: &str = "PENDING";
+pub(crate) const STATUS_DEPLOYED: &str = "DEPLOYED";
 
 /// The Regions a cluster publishes a data-plane endpoint in — five, "one for each
 /// supported Amazon Web Services Region" (`CreateCluster`'s own documentation).
-const ENDPOINT_REGIONS: &[&str] = &[
+pub(crate) const ENDPOINT_REGIONS: &[&str] = &[
     "ap-northeast-1",
     "ap-southeast-2",
     "eu-west-1",
@@ -47,7 +47,10 @@ const ENDPOINT_REGIONS: &[&str] = &[
 
 /// Longer than the span the service gives a `PENDING` -> `DEPLOYED` transition, so a
 /// read after it must observe the deployed resource.
-const PAST_DEPLOYMENT: Duration = Duration::from_millis(900);
+pub(crate) const PAST_DEPLOYMENT: Duration = Duration::from_millis(900);
+
+// The constants above are `pub(crate)` because sibling suites in this same test target
+// reuse them rather than keeping a second copy: see `tests/all/update_cluster.rs`.
 
 /// A cluster is answered from the record the create call stored: `DescribeCluster`
 /// returns the same name, endpoints, network type and owner, for every `NetworkType`

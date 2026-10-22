@@ -154,6 +154,33 @@ impl Emulator {
             .await
     }
 
+    pub(crate) async fn create_component_type(
+        &self,
+        workspace_id: &str,
+        component_type_id: &str,
+        body: Value,
+    ) -> Resp {
+        self.call(
+            "POST",
+            &format!("/workspaces/{workspace_id}/component-types/{component_type_id}"),
+            Some(body),
+        )
+        .await
+    }
+
+    pub(crate) async fn get_component_type(
+        &self,
+        workspace_id: &str,
+        component_type_id: &str,
+    ) -> Resp {
+        self.call(
+            "GET",
+            &format!("/workspaces/{workspace_id}/component-types/{component_type_id}"),
+            None,
+        )
+        .await
+    }
+
     /// `TagResource`: POST /tags with the ARN and the tag map in the body.
     pub(crate) async fn tag_resource(&self, resource_arn: &str, tags: Value) -> Resp {
         self.call(
@@ -190,6 +217,13 @@ pub(crate) fn workspace_arn(workspace_id: &str) -> String {
 
 pub(crate) fn entity_arn(workspace_id: &str, entity_id: &str) -> String {
     format!("arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}/entity/{entity_id}")
+}
+
+pub(crate) fn component_type_arn(workspace_id: &str, component_type_id: &str) -> String {
+    format!(
+        "arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}/componentType/\
+         {component_type_id}"
+    )
 }
 
 /// Percent-encode a value for use as a query-parameter value, the way an SDK
