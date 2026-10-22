@@ -15,8 +15,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ContactFlow, Instance, InstanceSummary, OutboundCallerConfig, OutboundEmailConfig, Queue,
-    QueueSummary,
+    ContactFlow, ContactFlowSummary, Instance, InstanceSummary, OutboundCallerConfig,
+    OutboundEmailConfig, Queue, QueueSummary,
 };
 
 /// The region an unsigned request is served in. The emulator's own shared AWS config
@@ -53,6 +53,11 @@ pub const LIST_INSTANCES_DEFAULT_PAGE_SIZE: usize = 10;
 /// See [`LIST_INSTANCES_DEFAULT_PAGE_SIZE`].
 pub const LIST_QUEUES_DEFAULT_PAGE_SIZE: usize = 1000;
 
+/// The page size `ListContactFlows` uses when the caller sends no `MaxResults`: the
+/// value its `MaxResults` member documents — "The maximum number of results to return
+/// per page. The default MaxResult size is 100."
+pub const LIST_CONTACT_FLOWS_DEFAULT_PAGE_SIZE: usize = 100;
+
 /// How many instances the registry holds before `CreateInstance` refuses with the
 /// modelled `ServiceQuotaExceededException`.
 ///
@@ -83,6 +88,7 @@ pub const CONTACT_FLOW_STATE_ACTIVE: &str = "ACTIVE";
 /// The alias `DescribeContactFlow` documents for "the saved, not-yet-published
 /// content of this flow": `arn:aws:.../contact-flow/{id}:$SAVED`.
 pub const CONTACT_FLOW_SAVED_ALIAS: &str = "$SAVED";
+
 
 /// How many flows one instance holds before `CreateContactFlow` refuses with the
 /// modelled `LimitExceededException`. The emulator's own bound on the store, for the
@@ -150,7 +156,8 @@ pub struct InstanceRecord {
     pub tags: BTreeMap<String, String>,
     /// This instance's queues, keyed by queue id.
     pub queues: BTreeMap<String, QueueRecord>,
-    /// This instance's flows, keyed by flow id.
+    /// This instance's flows, keyed by flow id. Bounded by
+    /// [`CONTACT_FLOWS_PER_INSTANCE_QUOTA`].
     pub contact_flows: BTreeMap<String, ContactFlowRecord>,
 }
 
@@ -300,9 +307,13 @@ pub struct ContactFlowRecord {
     pub arn: String,
     pub name: String,
     pub description: Option<String>,
+    /// The modelled `ContactFlowType` the flow was created with.
     pub flow_type: String,
+    /// The modelled `ContactFlowState`; see [`CONTACT_FLOW_STATE_ACTIVE`].
     pub state: String,
+    /// The modelled `ContactFlowStatus`; see [`CONTACT_FLOW_STATUS_PUBLISHED`].
     pub status: String,
+    /// The flow language document the caller sent, kept verbatim.
     pub content: String,
     pub tags: BTreeMap<String, String>,
     pub last_modified_time: SystemTime,
@@ -310,6 +321,18 @@ pub struct ContactFlowRecord {
 }
 
 impl ContactFlowRecord {
+    /// The modelled `ContactFlowSummary` shape `ListContactFlows` returns.
+    pub fn to_summary(&self) -> ContactFlowSummary {
+        ContactFlowSummary {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            contact_flow_type: Some(self.flow_type.clone()),
+            contact_flow_state: Some(self.state.clone()),
+            contact_flow_status: Some(self.status.clone()),
+        }
+    }
+
     /// The modelled `ContactFlow` shape `DescribeContactFlow` returns.
     ///
     /// `Version`/`VersionDescription` stay absent: a flow version is only minted by

@@ -208,10 +208,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // TOP_LEVEL keeps only the assets that are nobody's child; ALL keeps every
             // asset of the named model.
             //
-            // `asset_hierarchy_children`, the store this reads, is written by
-            // `AssociateAssets` and pruned by `DeleteAsset`, so TOP_LEVEL and ALL now
-            // select different sets once an association has been recorded.
-            .filter(|asset| filter != "TOP_LEVEL" || !is_child(&store, &asset.id))
+            // `asset_hierarchy_children`, the index this reads through
+            // `hierarchy_parent`, is written by `AssociateAssets` and pruned by
+            // `DeleteAsset`, so TOP_LEVEL and ALL now select different sets once an
+            // association has been recorded.
+            .filter(|asset| filter != "TOP_LEVEL" || store.hierarchy_parent(&asset.id).is_none())
             .collect();
         // A stable order is what makes `nextToken` resumable: oldest first, ties broken
         // by id so two assets created in the same instant still order deterministically.
@@ -260,17 +261,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The page size AWS documents for this operation when the caller gives no
 /// `maxResults`.
 const DEFAULT_MAX_RESULTS: i32 = 50;
-
-/// Whether `asset_id` appears as a child in any stored asset's hierarchies.
-fn is_child(
-    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
-    asset_id: &str,
-) -> bool {
-    store
-        .asset_hierarchy_children
-        .values()
-        .any(|children| children.iter().any(|child| child == asset_id))
-}
 
 /// Decode a `nextToken` back into the asset id it resumes from.
 fn decode_token(token: &str) -> Result<String, ListAssetsError> {

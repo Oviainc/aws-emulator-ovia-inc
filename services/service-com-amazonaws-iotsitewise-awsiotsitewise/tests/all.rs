@@ -26,6 +26,14 @@ mod property_aggregates;
 #[path = "all/interpolated_property_values.rs"]
 mod interpolated_property_values;
 
+// Same reasoning again, and the reason this one is NOT in the sorted list: its
+// alphabetical place is between `asset_property_update` and `associated_assets`,
+// the stretch of the list every concurrent asset-side suite lands in, and a
+// declaration there conflicted with each mainline tip this fix was rebased onto.
+// Fold it into the list once the churn settles.
+#[path = "all/asset_relationships.rs"]
+mod asset_relationships;
+
 #[path = "all/asset_hierarchies.rs"]
 mod asset_hierarchies;
 #[path = "all/asset_lifecycle.rs"]

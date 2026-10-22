@@ -17,6 +17,8 @@ mod api_key_collection_members;
 mod api_key_lifecycle;
 #[path = "all/patch_updates.rs"]
 mod patch_updates;
+#[path = "all/rest_api_defaults.rs"]
+mod rest_api_defaults;
 #[path = "all/rest_api_lifecycle.rs"]
 mod rest_api_lifecycle;
 #[path = "all/service_claim.rs"]

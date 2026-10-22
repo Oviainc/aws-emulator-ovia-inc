@@ -42,9 +42,16 @@ pub struct RestApiEntry {
     pub created_date: Option<::aws_smithy_types::DateTime>,
     pub binary_media_types: Vec<String>,
     pub minimum_compression_size: Option<i32>,
+    /// What the request set, or [`DEFAULT_API_KEY_SOURCE`] when it set nothing: the
+    /// service picks a value at create time, so a stored API always has one.
     pub api_key_source: Option<String>,
+    /// What the request set, completed by [`defaulted_endpoint_configuration`], so the
+    /// stored configuration always names its endpoint types and its IP address type.
     pub endpoint_configuration: Option<EndpointConfiguration>,
     pub policy: Option<String>,
+    /// What the request set, or [`DEFAULT_SECURITY_POLICY`]; see [`api_key_source`].
+    ///
+    /// [`api_key_source`]: RestApiEntry::api_key_source
     pub security_policy: Option<String>,
     pub endpoint_access_mode: Option<String>,
     pub api_status: Option<String>,
@@ -147,6 +154,72 @@ pub struct ApiKeyEntry {
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
     /// listing can report creation order rather than id order.
     pub sequence: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Service-side defaults for a created `RestApi`
+//
+// Several `RestApi` members are optional on input and yet never absent on a created
+// API: the service picks a value when the request sets none, stores it, and reports it
+// from every read. The constants below are those values, and
+// [`defaulted_endpoint_configuration`] is the one place the nested
+// `EndpointConfiguration` is completed, so a record can never be stored half-defaulted.
+// ---------------------------------------------------------------------------
+
+/// The `apiKeySource` a created API carries when the request sets none: from the
+/// member's own documentation, `HEADER` reads the key from the `X-API-Key` header, which
+/// is where API Gateway looks unless a custom authorizer is named instead.
+pub const DEFAULT_API_KEY_SOURCE: &str = "HEADER";
+
+/// The `endpointConfiguration.types` entry a created API carries when the request sets
+/// none: an edge-optimized API, which is API Gateway's default endpoint type (the
+/// `types` member documents `EDGE` as "an edge-optimized API").
+pub const DEFAULT_ENDPOINT_TYPE: &str = "EDGE";
+
+/// The endpoint type whose only supported IP address type is [`DUALSTACK_ADDRESS_TYPE`];
+/// from `EndpointConfiguration$ipAddressType`: "For the `PRIVATE` endpoint type, only
+/// `dualstack` is supported."
+pub const PRIVATE_ENDPOINT_TYPE: &str = "PRIVATE";
+
+/// The `endpointConfiguration.ipAddressType` a created API carries when the request
+/// sets none and the API is not private: `ipv4`, the first of the two documented values
+/// ("Use `ipv4` to allow only IPv4 addresses to invoke an API").
+pub const IPV4_ADDRESS_TYPE: &str = "ipv4";
+
+/// The `ipAddressType` a private API carries when the request sets none; see
+/// [`PRIVATE_ENDPOINT_TYPE`].
+pub const DUALSTACK_ADDRESS_TYPE: &str = "dualstack";
+
+/// The `securityPolicy` a created API carries when the request sets none: `TLS_1_0`, the
+/// TLS version API Gateway starts an API on (and the first value of the modelled
+/// `SecurityPolicy` enum).
+pub const DEFAULT_SECURITY_POLICY: &str = "TLS_1_0";
+
+/// Complete a request's (possibly absent) `endpointConfiguration` with the values the
+/// service fills in, so what is stored is what every read of the API must report.
+///
+/// An absent or empty `types` becomes [`DEFAULT_ENDPOINT_TYPE`]; an absent
+/// `ipAddressType` becomes [`DUALSTACK_ADDRESS_TYPE`] for a private API, which supports
+/// no other, and [`IPV4_ADDRESS_TYPE`] otherwise. Whatever the request DID set — its
+/// endpoint types, its address type, its `vpcEndpointIds` — is kept as given.
+pub fn defaulted_endpoint_configuration(
+    requested: Option<EndpointConfiguration>,
+) -> EndpointConfiguration {
+    let mut configuration = requested.unwrap_or_default();
+    let types = match configuration.types {
+        Some(types) if !types.is_empty() => types,
+        _ => vec![DEFAULT_ENDPOINT_TYPE.to_string()],
+    };
+    let private = types.iter().any(|kind| kind == PRIVATE_ENDPOINT_TYPE);
+    configuration.ip_address_type.get_or_insert_with(|| {
+        if private {
+            DUALSTACK_ADDRESS_TYPE.to_string()
+        } else {
+            IPV4_ADDRESS_TYPE.to_string()
+        }
+    });
+    configuration.types = Some(types);
+    configuration
 }
 
 /// The characters an API Gateway id is built from: lowercase alphanumerics.

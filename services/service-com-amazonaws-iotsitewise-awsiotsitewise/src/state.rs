@@ -1270,6 +1270,23 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// The association `child_asset_id` is a child through, as
+    /// `(parentAssetId, hierarchyId)`, or `None` when the asset is nobody's child.
+    ///
+    /// The inverse of [`Self::hierarchy_children`], and single-valued because
+    /// `AssociateAssets` refuses an association for a child that already has a
+    /// parent: the asset hierarchies form a TREE, so an asset appears as a child at
+    /// most once in [`Self::asset_hierarchy_children`]. It lives here, beside the
+    /// index it reads, because it is the one step every upward walk of that tree
+    /// takes — `AssociateAssets`'s cycle check, `ListAssets`'s `TOP_LEVEL` filter
+    /// and `ListAssetRelationships`'s `PATH_TO_ROOT` traversal all take it.
+    pub fn hierarchy_parent(&self, child_asset_id: &str) -> Option<(&str, &str)> {
+        self.asset_hierarchy_children
+            .iter()
+            .find(|(_, children)| children.iter().any(|child| child == child_asset_id))
+            .map(|((parent, hierarchy), _)| (parent.as_str(), hierarchy.as_str()))
+    }
+
     /// Resolve a `(parent, hierarchyId, childAssetId)` triple of `CustomID` labels
     /// to the stored ids it names.
     ///

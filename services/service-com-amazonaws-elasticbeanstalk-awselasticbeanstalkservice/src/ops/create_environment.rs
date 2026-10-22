@@ -354,7 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             date_terminated: None,
             tags: input.tags.clone().unwrap_or_default(),
             // The launch the clock owes: `Launching` -> `Ready`.
-            pending_status: Some(crate::state::PendingStatus::launch_completion()),
+            pending_status: Some(crate::state::PendingStatus::completion_to_ready()),
         };
 
         let output = crate::state::environment_description!(CreateEnvironmentOutput, &environment);
