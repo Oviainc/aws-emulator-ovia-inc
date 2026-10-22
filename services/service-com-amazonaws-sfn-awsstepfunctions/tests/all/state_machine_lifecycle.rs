@@ -41,13 +41,13 @@ const TARGET_PREFIX: &str = "AWSStepFunctions";
 const SIGNING_NAME: &str = "states";
 
 /// The account segment every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The region every request below signs for; every ARN must carry exactly this one.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// A role ARN inside the modelled `Arn` length (1..256).
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/StepFunctionsRole";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/StepFunctionsRole";
 
 /// Long enough that any outcome the clock owed has become due.
 ///
@@ -59,23 +59,27 @@ const PAST_THE_EXECUTION_DELAY: Duration =
     EXECUTION_SETTLE_DELAY.saturating_add(Duration::from_millis(300));
 
 /// Long enough that a started deletion has removed its state machine.
-const PAST_THE_DELETE_DELAY: Duration =
+pub(crate) const PAST_THE_DELETE_DELAY: Duration =
     DELETE_SETTLE_DELAY.saturating_add(Duration::from_millis(300));
 
 /// A definition that succeeds immediately with a static result.
-const HELLO_DEFINITION: &str =
+pub(crate) const HELLO_DEFINITION: &str =
     r#"{"StartAt":"Hello","States":{"Hello":{"Type":"Pass","Result":{"msg":"hi"},"End":true}}}"#;
 
 /// One emulator: a router that claims `states` requests, a view of the store it
 /// serves, and the region its requests are signed for.
-struct Emulator {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this test binary's crate root, so a
+/// sibling suite drives the same emulator through `crate::state_machine_lifecycle`
+/// rather than carrying a second copy of this harness.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
     region: String,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::in_region(REGION)
     }
 
@@ -101,7 +105,7 @@ impl Emulator {
 
     /// Call one operation and return `(status, body)`. The `Authorization` header is
     /// what routes the request to this service and names the region its ARNs carry.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{}/{SIGNING_NAME}/aws4_request, \
              SignedHeaders=host;x-amz-target, Signature=0123456789abcdef",
@@ -135,7 +139,7 @@ impl Emulator {
     }
 
     /// Call one operation, requiring a 200, and return the body.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -145,7 +149,7 @@ impl Emulator {
     }
 
     /// Call one operation, requiring a failure, and return `(status, errorCode)`.
-    async fn err(&self, operation: &str, body: &Value) -> (u16, String) {
+    pub(crate) async fn err(&self, operation: &str, body: &Value) -> (u16, String) {
         let (status, parsed) = self.call(operation, body).await;
         assert_ne!(
             status, 200,
@@ -167,7 +171,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// The string member `name` of `body`, which must be present.
-fn string(body: &Value, name: &str) -> String {
+pub(crate) fn string(body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected a string '{name}' in {body:?}"))
@@ -175,7 +179,7 @@ fn string(body: &Value, name: &str) -> String {
 }
 
 /// Create a state machine that must succeed, and return its ARN.
-async fn create_machine(emulator: &Emulator, name: &str, definition: &str) -> String {
+pub(crate) async fn create_machine(emulator: &Emulator, name: &str, definition: &str) -> String {
     let created = emulator
         .ok(
             "CreateStateMachine",

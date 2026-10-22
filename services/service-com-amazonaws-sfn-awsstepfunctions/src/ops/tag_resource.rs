@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds a tag list to a Step Functions state machine or activity, keyed by tag key,
+//! and answers an empty 200.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +99,24 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
+/// The modelled failure for a taggable ARN the store holds no resource under.
+fn not_found(resource_arn: &str) -> TagResourceError {
+    TagResourceErrorModeled::ResourceNotFound(ResourceNotFound {
+        message: Some(crate::state::resource_not_found_message(resource_arn)),
+        resource_name: Some(resource_arn.to_string()),
+    })
+    .into()
+}
+
+/// The modelled failure for a tag write a resource cannot take.
+fn too_many_tags(resource_arn: &str, message: String) -> TagResourceError {
+    TagResourceErrorModeled::TooManyTags(TooManyTags {
+        message: Some(message),
+        resource_name: Some(resource_arn.to_string()),
+    })
+    .into()
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -141,18 +153,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // `resourceArn` is "the ARN for the Step Functions state machine or
+        // activity", so an ARN of another service — or of another Step Functions
+        // resource type, such as an execution — is an ARN this operation cannot
+        // read, which is what `InvalidArn` reports.
+        let Some(target) = crate::state::parse_taggable_arn(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::InvalidArn(InvalidArn {
+                message: Some(crate::state::untaggable_arn_message(&input.resource_arn)),
+            })
+            .into());
+        };
+
+        // `tags` carries no modelled length bound, so the REQUEST chooses how many
+        // pairs arrive. A request carrying more than one resource may hold can only
+        // be refused, so it is refused HERE, in O(1), before any per-tag work and
+        // before the store is touched: every loop below then runs over at most
+        // `MAX_TAGS` entries, whatever the request's length.
+        if input.tags.len() > crate::state::MAX_TAGS {
+            return Err(too_many_tags(
+                &input.resource_arn,
+                format!(
+                    "a Step Functions resource accepts at most {} tags, got {} in one request",
+                    crate::state::MAX_TAGS,
+                    input.tags.len()
+                ),
+            ));
+        }
+
+        // A tag is a key-value PAIR and the key is what the write is keyed by, so an
+        // entry carrying no key names nothing to write. The model does not mark `key`
+        // required, so the centralized walk passes it through and it is refused here,
+        // on the one channel this operation has for a request its model declares no
+        // error for. The documented character guideline on a tag's key and value
+        // ("Tags may only contain Unicode letters, digits, white space, or these
+        // symbols: _ . : / = + - @") is NOT enforced: neither member carries a
+        // modelled pattern and this operation models no error for the content of a
+        // tag, so a tag outside the guideline is stored as sent rather than refused
+        // on a channel the service does not use for it.
+        if let Some(position) = input.tags.iter().position(|tag| tag.key.is_none()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "tags[{position}] carries no key: every tag must have a key"
+            )));
+        }
+
+        let mut store = state.lock();
+        // This write must see the store a report sees: materialising a deletion the
+        // clock already owes is what keeps a state machine whose removal came due
+        // from being tagged back into existence.
+        store.settle(crate::state::now());
+
+        // Only a state machine can be in the store: `CreateActivity` is still
+        // scaffolded, so no activity exists for an activity ARN to name, and the
+        // honest answer for one is that the resource could not be found.
+        match target {
+            crate::state::TaggableResource::Activity(_) => Err(not_found(&input.resource_arn)),
+            crate::state::TaggableResource::StateMachine(_) => {
+                match store.merge_state_machine_tags(&input.resource_arn, &input.tags) {
+                    Ok(()) => Ok(TagResourceOutput {}),
+                    Err(crate::state::TagWriteRejection::NotFound) => {
+                        Err(not_found(&input.resource_arn))
+                    }
+                    Err(crate::state::TagWriteRejection::TooManyTags(would_hold)) => {
+                        Err(too_many_tags(
+                            &input.resource_arn,
+                            format!(
+                                "a Step Functions resource accepts at most {} tags; this request \
+                                 would leave it holding {would_hold}",
+                                crate::state::MAX_TAGS
+                            ),
+                        ))
+                    }
+                    Err(crate::state::TagWriteRejection::NoRoom) => Err(too_many_tags(
+                        &input.resource_arn,
+                        format!(
+                            "these tags would take the store past the {} bytes this emulator \
+                             retains",
+                            crate::state::MAX_STORE_BYTES
+                        ),
+                    )),
+                }
+            }
+        }
     }
 }
