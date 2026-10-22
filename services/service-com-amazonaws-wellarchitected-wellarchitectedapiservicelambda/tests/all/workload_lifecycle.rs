@@ -943,9 +943,11 @@ async fn invalid_requests_are_refused_with_400() {
     }
 }
 
-/// A profile or review template ARN names a resource that has to exist; neither can be
-/// created in this emulator yet, so the association is refused with 404 rather than
-/// silently dropped.
+/// A profile or review template ARN names a resource that has to exist: an ARN that
+/// resolves to no stored resource is refused with 404 rather than silently dropped. (No
+/// profile can be created in this emulator yet — `CreateProfile` is still a stub — so no
+/// profile ARN resolves at all; a review template ARN resolves once the template has
+/// been created, which `review_template_lifecycle` covers.)
 #[tokio::test]
 async fn associating_a_resource_that_does_not_exist_is_not_found() {
     let client = Client::new();

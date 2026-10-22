@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReviewTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReviewTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReviewTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a review template and stores the whole record in
+//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::review_templates`],
+//! so `GetReviewTemplate` and a `CreateWorkload` that applies the template both see it.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +167,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReviewTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReviewTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReviewTemplate"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateReviewTemplateErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool review template store is unavailable"
+                    .to_string(),
+            })
+        })?;
+
+        // How many lenses one review template may apply is a QUOTA this emulator sets,
+        // not a modelled constraint: `ReviewTemplateLenses` publishes no `@length`, so the
+        // boundary validator does not bound the list, and the number this emulator holds
+        // to is the one the service publishes for a review-template lens list elsewhere
+        // (`ReviewTemplateLensAliases`, `@length(1, 10)`). It is answered with the modelled
+        // `ServiceQuotaExceededException` — "The user has reached their resource quota" —
+        // rather than a `ValidationException`, so a caller is not told the model refused a
+        // list the model allows. It is what keeps a STORED template's lens list, and the
+        // work of applying that template to a workload, bounded by something other than
+        // the request body size.
+        if input.lenses.len() > crate::state::MAX_LENSES_PER_REVIEW_TEMPLATE {
+            return Err(CreateReviewTemplateErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The quota of {} lenses per review template has been reached",
+                        crate::state::MAX_LENSES_PER_REVIEW_TEMPLATE
+                    ),
+                    resource_id: None,
+                    resource_type: Some(crate::state::REVIEW_TEMPLATE_RESOURCE_TYPE.to_string()),
+                    quota_code: "LensesPerReviewTemplate".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "Description": &input.description,
+            "Lenses": &input.lenses,
+            "Notes": &input.notes,
+            "Tags": &tags,
+            "TemplateName": &input.template_name,
+        }));
+        let region = crate::state::request_region(ctx.parts());
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters returns the
+        // result of the original request instead of creating a second template.
+        if let Some(token) = store
+            .create_review_template_tokens
+            .get(&input.client_request_token)
+        {
+            if token.fingerprint != fingerprint {
+                let template_arn = token.template_arn.clone();
+                return Err(CreateReviewTemplateErrorModeled::ConflictException(
+                    crate::state::idempotency_token_conflict(
+                        crate::state::REVIEW_TEMPLATE_RESOURCE_TYPE,
+                        template_arn,
+                        &input.client_request_token,
+                    ),
+                )
+                .into());
+            }
+            if let Some(existing) = store.review_templates.get(&token.template_arn) {
+                return Ok(CreateReviewTemplateOutput {
+                    template_arn: Some(existing.template_arn.clone()),
+                });
+            }
+            // The token names a template that is no longer stored, so there is no original
+            // result to return: forget the token and let this request create afresh, which
+            // is what the caller asked for. (Unreachable while `DeleteReviewTemplate` is a
+            // stub; handled here so the create stays well defined once it lands.)
+            store
+                .create_review_template_tokens
+                .remove(&input.client_request_token);
+        }
+
+        // Review templates are metered, and this operation models
+        // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
+        // the store bounded: the create tokens are 1:1 with a live template. The ceiling
+        // is store-wide, which for this single-account emulator also bounds every
+        // account-and-Region pair in it.
+        if store.review_templates.len() >= crate::state::MAX_REVIEW_TEMPLATES {
+            return Err(CreateReviewTemplateErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The review template quota of {} has been reached",
+                        crate::state::MAX_REVIEW_TEMPLATES
+                    ),
+                    resource_id: None,
+                    resource_type: Some(crate::state::REVIEW_TEMPLATE_RESOURCE_TYPE.to_string()),
+                    // `QuotaCode` and `ServiceCode` are modelled `@required`. The service
+                    // code is this service's own (`OPERATIONS.md`: signing name
+                    // `wellarchitected`); the model publishes no numeric Service Quotas
+                    // code for the template quota, so the quota is named by what it
+                    // meters.
+                    quota_code: "ReviewTemplates".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let template_arn = store.mint_review_template_arn(&region);
+        let record = crate::state::ReviewTemplateRecord {
+            template_arn: template_arn.clone(),
+            template_name: input.template_name,
+            description: input.description,
+            notes: input.notes,
+            lenses: input.lenses,
+            // The account that created the template owns it (`ReviewTemplate$Owner` is an
+            // `AwsAccountId`), and this emulator serves one account.
+            owner: ::engine::emulator_account_id().to_string(),
+            updated_at: std::time::SystemTime::now(),
+            tags,
+        };
+
+        store.review_templates.insert(template_arn.clone(), record);
+        store.create_review_template_tokens.insert(
+            input.client_request_token,
+            crate::state::CreateReviewTemplateToken {
+                template_arn: template_arn.clone(),
+                fingerprint,
+            },
+        );
+
+        Ok(CreateReviewTemplateOutput {
+            template_arn: Some(template_arn),
+        })
     }
 }

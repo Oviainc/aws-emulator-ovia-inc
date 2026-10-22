@@ -139,7 +139,7 @@ async fn out_of_range_page_size_names_the_member_and_its_bounds() {
 /// `Message` names the member and what it violated, and nothing is classified — no
 /// `Reason`, no `Fields`.
 ///
-/// Rows differ along the constraint class, the operation (three of the four are still
+/// Rows differ along the constraint class, the operation (one of the four is still
 /// scaffolded, so the envelope cannot come from a handler), and the member's binding.
 #[tokio::test]
 async fn string_constraint_refusals_carry_the_message_alone() {
@@ -585,15 +585,10 @@ async fn a_scaffolded_operation_still_answers_501_for_a_valid_request() {
             None,
         ),
         (
-            "CreateReviewTemplate",
-            "POST",
-            "/reviewTemplates".to_string(),
-            Some(json!({
-                "TemplateName": "a valid template name",
-                "Description": "a description the pattern accepts",
-                "Lenses": ["wellarchitected"],
-                "ClientRequestToken": "tok-tpl",
-            })),
+            "ListReviewTemplates",
+            "GET",
+            "/reviewTemplates?MaxResults=10".to_string(),
+            None,
         ),
     ] {
         let answer = client.send(method, &path, body).await;

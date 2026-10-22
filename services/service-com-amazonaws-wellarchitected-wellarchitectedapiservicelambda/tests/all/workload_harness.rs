@@ -214,6 +214,18 @@ impl Client {
         self.send("POST", "/workloadsSummaries", Some(body)).await
     }
 
+    pub(crate) async fn create_review_template(&self, body: Value) -> Answer {
+        self.send("POST", "/reviewTemplates", Some(body)).await
+    }
+
+    /// `GET /reviewTemplates/{TemplateArn}`: the ARN is a non-greedy `@httpLabel`, so it
+    /// travels percent-encoded in one path segment, exactly as an SDK sends it.
+    pub(crate) async fn get_review_template(&self, template_arn: &str) -> Answer {
+        let encoded = encode_path_segment(template_arn);
+        self.send("GET", &format!("/reviewTemplates/{encoded}"), None)
+            .await
+    }
+
     /// `CreateWorkloadShare`: `POST /workloads/{WorkloadId}/shares`.
     pub(crate) async fn create_share(&self, workload_id: &str, body: Value) -> Answer {
         self.send(

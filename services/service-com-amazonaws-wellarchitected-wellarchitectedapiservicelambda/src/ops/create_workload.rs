@@ -4,6 +4,8 @@
 //! IMPLEMENTED: mints a workload and stores the whole record in
 //! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::workloads`],
 //! so `GetWorkload`, `ListWorkloads`, `UpdateWorkload` and `DeleteWorkload` all see it.
+//! A `ReviewTemplateArns` entry is resolved against the stored review templates, and the
+//! lenses (and notes) of an applied template carry over to the new workload.
 //!
 //! ## Shape of an operation
 //!
@@ -263,32 +265,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateWorkloadErrorModeled::ValidationException(exception).into());
         }
 
-        // A profile or review template named here has to exist to be associated. Neither
-        // resource can be created in this emulator yet (CreateProfile / CreateReviewTemplate
-        // are still stubs), so no ARN a caller passes resolves.
-        for (resource_type, subject, arns) in [
-            (
-                "PROFILE",
-                "profile",
-                input.profile_arns.unwrap_or_default(),
-            ),
-            (
-                "REVIEW_TEMPLATE",
-                "review template",
-                input.review_template_arns.unwrap_or_default(),
-            ),
-        ] {
-            if let Some(arn) = arns.first() {
-                return Err(CreateWorkloadErrorModeled::ResourceNotFoundException(
-                    crate::state::resource_not_found(
-                        resource_type,
-                        arn.clone(),
-                        &format!("{subject} with ARN {arn}"),
-                    ),
-                )
-                .into());
-            }
+        // A profile named here has to exist to be associated, and no profile can be
+        // created in this emulator yet (`CreateProfile` is still a stub), so no profile
+        // ARN a caller passes resolves. A review template ARN is resolved against the
+        // store below, once the lock is held.
+        if let Some(arn) = input.profile_arns.unwrap_or_default().first() {
+            return Err(CreateWorkloadErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::PROFILE_RESOURCE_TYPE,
+                    arn.clone(),
+                    &format!("profile with ARN {arn}"),
+                ),
+            )
+            .into());
         }
+        let review_template_arns = input.review_template_arns.unwrap_or_default();
 
         let tags: std::collections::BTreeMap<String, String> =
             input.tags.unwrap_or_default().into_iter().collect();
@@ -316,6 +307,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "Notes": &input.notes,
             "PillarPriorities": &pillar_priorities,
             "ReviewOwner": &review_owner,
+            // The review templates applied to the workload are part of what a request
+            // asks for — their lenses and notes land in the stored workload below — so
+            // two requests that name different templates are DIFFERENT requests, even
+            // under one `ClientRequestToken`.
+            "ReviewTemplateArns": &review_template_arns,
             "Tags": &tags,
             "WorkloadName": &input.workload_name,
         }));
@@ -383,6 +379,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "If a review template that specifies lenses is applied to the workload, those
+        // lenses are applied to the workload in addition to these lenses"
+        // (`CreateWorkloadInput$Lenses` doc). A template has to exist to be applied, so
+        // an ARN that names no stored template is not found.
+        //
+        // The merge is LINEAR in the two lens lists: the aliases already attached go into
+        // a set once, so the work is |workload lenses| + |template lenses| rather than
+        // their product, and neither caller-chosen list length multiplies the other.
+        let mut lenses = input.lenses;
+        let mut notes = input.notes;
+        if !review_template_arns.is_empty() {
+            let mut attached: std::collections::HashSet<String> = lenses
+                .iter()
+                .map(|lens| crate::state::lens_alias(lens).to_string())
+                .collect();
+            for arn in &review_template_arns {
+                let template = store.review_templates.get(arn).ok_or_else(|| {
+                    CreateWorkloadErrorModeled::ResourceNotFoundException(
+                        crate::state::review_template_not_found(arn),
+                    )
+                })?;
+                for lens in &template.lenses {
+                    if attached.insert(crate::state::lens_alias(lens).to_string()) {
+                        lenses.push(lens.clone());
+                    }
+                }
+                // "For a review template, these are the notes that will be associated
+                // with the workload when the template is applied" (`Notes` doc), so the
+                // template's notes carry over to the workload — unless the request
+                // brought notes of its own, which are what the caller asked the workload
+                // to carry.
+                if notes.is_none() {
+                    notes = template.notes.clone();
+                }
+            }
+        }
+
         let workload_id = store.mint_workload_id();
         let record = crate::state::WorkloadRecord {
             workload_arn: ::engine::emulator_arn(
@@ -411,9 +444,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             is_review_owner_update_acknowledged: true,
             industry_type: input.industry_type,
             industry: input.industry,
-            notes: input.notes,
+            notes,
             improvement_status: crate::state::DEFAULT_IMPROVEMENT_STATUS.to_string(),
-            lenses: input.lenses,
+            lenses,
             owner: ::engine::emulator_account_id().to_string(),
             tags,
             applications,

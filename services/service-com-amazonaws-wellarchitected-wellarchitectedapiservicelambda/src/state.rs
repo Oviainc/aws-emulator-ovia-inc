@@ -4,10 +4,11 @@
 //!
 //! The workload lifecycle (`CreateWorkload`, `GetWorkload`, `ListWorkloads`,
 //! `UpdateWorkload`, `DeleteWorkload`), the milestones recorded against a workload
-//! (`CreateMilestone`, `GetMilestone`, `ListMilestones`) and the answers of a workload's
-//! lens reviews (`ListAnswers`) are backed entirely by the maps below, so a create is
-//! visible to the next request on the same engine. The custom lenses `ImportLens` imports
-//! and `ExportLens` reads back are backed the same way. The record types and their
+//! (`CreateMilestone`, `GetMilestone`, `ListMilestones`), the review templates
+//! (`CreateReviewTemplate`, `GetReviewTemplate`) and the answers of a workload's lens
+//! reviews (`ListAnswers`) are backed entirely by the maps below, so a create is visible
+//! to the next request on the same engine. The custom lenses `ImportLens` imports and
+//! `ExportLens` reads back are backed the same way. The record types and their
 //! projections live here rather than in a handler because several operations reach them.
 //!
 //! The one lens definition this emulator ships itself — the AWS-official Well-Architected
@@ -26,9 +27,10 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ConflictException, Milestone, MilestoneSummary, ResourceNotFoundException, Workload,
-    WorkloadDiscoveryConfig, WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput,
-    WorkloadShareSummary, WorkloadSummary, RISK_VALUES,
+    ConflictException, Milestone, MilestoneSummary, ResourceNotFoundException, ReviewTemplate,
+    Workload, WorkloadDiscoveryConfig, WorkloadJiraConfigurationInput,
+    WorkloadJiraConfigurationOutput, WorkloadShareSummary, WorkloadSummary, QUESTION_VALUES,
+    RISK_VALUES,
 };
 
 /// `Workload$ImprovementStatus` before any lens review has been answered. The
@@ -213,6 +215,14 @@ pub const WORKLOAD_RESOURCE_TYPE: &str = "WORKLOAD";
 /// milestone.
 pub const MILESTONE_RESOURCE_TYPE: &str = "MILESTONE";
 
+/// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
+/// review template.
+pub const REVIEW_TEMPLATE_RESOURCE_TYPE: &str = "REVIEW_TEMPLATE";
+
+/// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
+/// profile.
+pub const PROFILE_RESOURCE_TYPE: &str = "PROFILE";
+
 /// `ConflictException$ResourceType` for a share of a workload. The share is a resource
 /// of its own — it has its own `ShareId` — and `ShareResourceType`
 /// (`smithy_query(query="shape", shape="ShareResourceType")`) names the shared resource
@@ -295,6 +305,46 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// maps are bounded by this one count. It sits far above any realistic client workflow,
 /// so a caller never meets it by accident.
 pub const MAX_WORKLOADS_PER_ACCOUNT_REGION: usize = 10_000;
+
+/// The most review templates this emulator's store holds.
+///
+/// `CreateReviewTemplate` models `ServiceQuotaExceededException` (HTTP 402, "The user
+/// has reached their resource quota") for the metered case, and the real quota is
+/// adjustable through Service Quotas, so this is this emulator's own ceiling rather than
+/// a value read off a doc page — the same reasoning as
+/// [`MAX_WORKLOADS_PER_ACCOUNT_REGION`], and what bounds the template map and the create
+/// tokens keyed to it. The count is store-wide rather than per Region: the emulator
+/// serves ONE account, so a store-wide ceiling also holds for every account-and-Region
+/// pair inside it, and no scan of the stored ARNs is needed to enforce it.
+pub const MAX_REVIEW_TEMPLATES: usize = 10_000;
+
+/// The most lenses one review template carries — a quota this emulator sets.
+///
+/// `CreateReviewTemplateInput$Lenses` targets `ReviewTemplateLenses`, which publishes no
+/// `@length`, so nothing in the model bounds the list a create applies. The number here
+/// is the one the service publishes for a review-template lens list elsewhere:
+/// `UpdateReviewTemplate`'s `LensesToAssociate` / `LensesToDisassociate` are
+/// `ReviewTemplateLensAliases`, `@length(min: 1, max: 10)`
+/// (`smithy_query(query="shape", shape="ReviewTemplateLensAliases")`). Because it is an
+/// emulator quota rather than a modelled constraint, `CreateReviewTemplate` answers a
+/// longer list with the modelled `ServiceQuotaExceededException`, not a
+/// `ValidationException`. It is what bounds a STORED template's lens list, and with it
+/// the work of applying that template to a workload.
+pub const MAX_LENSES_PER_REVIEW_TEMPLATE: usize = 10;
+
+/// `ReviewTemplateUpdateStatus$CURRENT`: what a review template reports while every lens
+/// applied to it is at its current version. The enum publishes exactly `CURRENT` and
+/// `LENS_NOT_CURRENT` (`smithy_query(query="shape",
+/// shape="ReviewTemplateUpdateStatus")`), and a template whose lenses have not been
+/// superseded is current. No operation in this emulator publishes a new lens version
+/// (`CreateLensVersion` and `ImportLens` are stubs), so a stored template stays current.
+pub const REVIEW_TEMPLATE_UPDATE_STATUS_CURRENT: &str = "CURRENT";
+
+/// The `Question` bucket a question with no answer counts under —
+/// `smithy_query(query="shape", shape="Question")` publishes exactly `UNANSWERED` and
+/// `ANSWERED`. Named here because the `QuestionCounts` roll-up below fills it from the
+/// lens question set rather than from an answer.
+pub const QUESTION_UNANSWERED: &str = "UNANSWERED";
 
 /// The most milestones one workload holds: "A workload can have a maximum of 100
 /// milestones" (`MilestoneNumber` doc), which is also why `MilestoneNumber` is
@@ -643,6 +693,78 @@ impl MilestoneRecord {
             milestone_name: Some(self.milestone_name.clone()),
             recorded_at: Some(::aws_smithy_types::DateTime::from(self.recorded_at)),
             workload_summary: Some(self.workload.to_summary()),
+        }
+    }
+}
+
+/// One stored review template: "A review template" (`ReviewTemplate` shape doc).
+///
+/// Every member of the modelled `ReviewTemplate` a request can set is persisted here;
+/// the members the SERVICE computes — the question roll-up, the owning account and the
+/// update status — are derived by [`ReviewTemplateRecord::to_review_template`], the only
+/// place a response is built from this record.
+#[derive(Debug, Clone)]
+pub struct ReviewTemplateRecord {
+    pub template_arn: String,
+    pub template_name: String,
+    pub description: String,
+    pub notes: Option<String>,
+    pub lenses: Vec<String>,
+    pub owner: String,
+    pub updated_at: SystemTime,
+    pub tags: BTreeMap<String, String>,
+}
+
+impl ReviewTemplateRecord {
+    /// This template's question roll-up: one entry for every `Question` the enum
+    /// publishes, so a caller reading a bucket to report review progress always finds
+    /// it.
+    ///
+    /// `UNANSWERED` counts the questions of every lens applied to the template; a lens
+    /// is applied once however many ways the request named it. No operation in this
+    /// emulator can answer a review-template question (`UpdateReviewTemplateAnswer`,
+    /// `GetReviewTemplateAnswer` and `ListReviewTemplateAnswers` are still stubs, each
+    /// with its own issue), so `ANSWERED` is 0. The map is DERIVED from the applied
+    /// lenses on every read and never stored, so it moves when the lenses do.
+    pub fn question_counts(&self) -> BTreeMap<String, i32> {
+        let mut counts: BTreeMap<String, i32> = QUESTION_VALUES
+            .iter()
+            .map(|bucket| ((*bucket).to_string(), 0))
+            .collect();
+        let applied: std::collections::BTreeSet<&str> =
+            self.lenses.iter().map(|lens| lens_alias(lens)).collect();
+        let unanswered: usize = applied.iter().map(|lens| lens_question_count(lens)).sum();
+        counts.insert(
+            QUESTION_UNANSWERED.to_string(),
+            i32::try_from(unanswered).unwrap_or(i32::MAX),
+        );
+        counts
+    }
+
+    /// The `ReviewTemplate` shape `GetReviewTemplate` returns.
+    pub fn to_review_template(&self) -> ReviewTemplate {
+        ReviewTemplate {
+            description: Some(self.description.clone()),
+            lenses: Some(self.lenses.clone()),
+            notes: self.notes.clone(),
+            question_counts: Some(
+                self.question_counts()
+                    .into_iter()
+                    .collect::<HashMap<String, i32>>(),
+            ),
+            owner: Some(self.owner.clone()),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            template_arn: Some(self.template_arn.clone()),
+            template_name: Some(self.template_name.clone()),
+            // The tag map the template carries, empty when it carries none: the
+            // `@length(min: 1)` on `TagMap` constrains the tags a REQUEST supplies, not
+            // what a projection of the stored template reports.
+            tags: Some(self.tags.clone().into_iter().collect()),
+            update_status: Some(REVIEW_TEMPLATE_UPDATE_STATUS_CURRENT.to_string()),
+            // "The ID assigned to the template share invitation": only a template reached
+            // through a share invitation carries one, and template shares are still a
+            // stub.
+            share_invitation_id: None,
         }
     }
 }
@@ -1224,6 +1346,14 @@ pub struct CreateWorkloadShareToken {
     pub fingerprint: String,
 }
 
+/// What a `CreateReviewTemplate` idempotency token resolves to: the review template the
+/// original request created, plus that request's parameter fingerprint.
+#[derive(Debug, Clone)]
+pub struct CreateReviewTemplateToken {
+    pub template_arn: String,
+    pub fingerprint: String,
+}
+
 /// Per-service state for com-amazonaws-wellarchitected-wellarchitectedapiservicelambda. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
@@ -1246,6 +1376,14 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     pub workload_name_index: HashMap<String, String>,
     /// `CreateWorkload`'s `ClientRequestToken` -> what the original request created.
     pub create_workload_tokens: HashMap<String, CreateWorkloadToken>,
+    /// Every stored review template, keyed by its `TemplateArn` — the only identifier
+    /// the modelled operations take for one (`GetReviewTemplate`,
+    /// `UpdateReviewTemplate` and `DeleteReviewTemplate` all bind `TemplateArn` as the
+    /// URI label).
+    pub review_templates: HashMap<String, ReviewTemplateRecord>,
+    /// `CreateReviewTemplate`'s `ClientRequestToken` -> what the original request
+    /// created.
+    pub create_review_template_tokens: HashMap<String, CreateReviewTemplateToken>,
     /// Every stored custom lens, keyed by its 32-lowercase-hex lens id — the resource
     /// part of its ARN, which is how a `LensAlias` names it.
     pub lenses: HashMap<String, LensRecord>,
@@ -1272,6 +1410,22 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             let id = self.next_hex_id();
             if !self.workloads.contains_key(&id) {
                 return id;
+            }
+        }
+    }
+
+    /// A fresh review-template ARN: `review-template/<32 lowercase hex>` in `region`, the
+    /// form the modelled `TemplateArn` pattern requires, and unused by any stored
+    /// template. The ARN is what [`Self::review_templates`] is keyed by, so the collision
+    /// check is ONE lookup — and exact, where a suffix match over the stored ARNs could
+    /// also collide across Regions.
+    pub fn mint_review_template_arn(&mut self, region: &str) -> String {
+        loop {
+            let id = self.next_hex_id();
+            let arn =
+                ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("review-template/{id}"));
+            if !self.review_templates.contains_key(&arn) {
+                return arn;
             }
         }
     }
@@ -1691,6 +1845,17 @@ pub fn workload_not_found(workload_id: &str) -> ResourceNotFoundException {
         WORKLOAD_RESOURCE_TYPE,
         workload_id.to_string(),
         &format!("workload with ID {workload_id}"),
+    )
+}
+
+/// [`resource_not_found`] for a template ARN that names no stored review template.
+/// Shared by every operation that resolves a `TemplateArn`, so they cannot word it
+/// differently.
+pub fn review_template_not_found(template_arn: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        REVIEW_TEMPLATE_RESOURCE_TYPE,
+        template_arn.to_string(),
+        &format!("review template with ARN {template_arn}"),
     )
 }
 
