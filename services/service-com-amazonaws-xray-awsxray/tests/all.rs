@@ -20,5 +20,8 @@ mod state_roundtrip;
 #[path = "all/trace_ingest_and_groups.rs"]
 mod trace_ingest_and_groups;
 
+#[path = "all/trace_segment_destination.rs"]
+mod trace_segment_destination;
+
 #[path = "all/update_group.rs"]
 mod update_group;

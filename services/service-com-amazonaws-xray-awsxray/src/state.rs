@@ -19,6 +19,7 @@
 //! `parent_id` and `annotations` are optional.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     Group, GroupSummary, IndexingRule, IndexingRuleValue, InsightsConfiguration,
@@ -83,6 +84,42 @@ pub const MAX_TRACES: usize = 1_000;
 /// The most groups the store keeps; `CreateGroup` past this is refused.
 pub const MAX_GROUPS: usize = 250;
 
+// ---------------------------------------------------------------------------
+// Trace segment destination (Transaction Search)
+// ---------------------------------------------------------------------------
+
+/// The destination an account sends `PutTraceSegments` and OTLP data to before
+/// `UpdateTraceSegmentDestination` ever ran: `TraceSegmentDestination$XRay`.
+///
+/// The `CloudWatchLogs` destination is what Transaction Search requires
+/// (`smithy_query(query="doc",shape="UpdateTraceSegmentDestination")`), and
+/// Transaction Search is opt-in, so an account that never asked for it reports
+/// the X-Ray destination.
+pub const DEFAULT_TRACE_SEGMENT_DESTINATION: &str = "XRay";
+
+/// `TraceSegmentDestination$CloudWatchLogs`: the destination Transaction Search
+/// requires, and the only one a `CloudWatchLogsConfiguration` applies to (that
+/// member's documentation: "Specify this only when `Destination` is
+/// `CloudWatchLogs`").
+pub const CLOUD_WATCH_LOGS_DESTINATION: &str = "CloudWatchLogs";
+
+/// `TraceSegmentDestinationStatus$ACTIVE`: the configured destination is in
+/// effect.
+pub const DESTINATION_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `TraceSegmentDestinationStatus$PENDING`: a destination change was accepted
+/// and is not in effect yet.
+pub const DESTINATION_STATUS_PENDING: &str = "PENDING";
+
+/// How long a destination change reports `PENDING` before the clock owes it
+/// `ACTIVE`.
+///
+/// Neither the model nor the AWS documentation states a duration for the
+/// switch, so this span is chosen: non-zero, so a caller reading straight back
+/// still observes the `PENDING` the real service reports, and short enough that
+/// nothing has to wait long for `ACTIVE`.
+pub const DESTINATION_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
+
 /// The indexing rule every account already holds, before any call.
 ///
 /// Transaction Search ships one rule, named `Default`, and this service's model
@@ -131,9 +168,58 @@ pub struct ComAmazonawsXrayAwsxrayState {
     pub group_seq: u64,
     /// Ingest counter, stamped on a trace so the oldest can be evicted.
     pub ingest_seq: u64,
+    /// Where `PutTraceSegments` and OTLP data go, as last set by
+    /// `UpdateTraceSegmentDestination`; its [`Default`] is the account default
+    /// every reader answers until something changes it.
+    pub trace_segment_destination: TraceSegmentDestinationRecord,
     /// The account's indexing rules, which `GetIndexingRules` reports and
     /// `UpdateIndexingRule` rewrites.
     pub indexing_rules: IndexingRuleStore,
+}
+
+/// The account's trace segment destination, as stored.
+///
+/// `GetTraceSegmentDestination` answers from this record and
+/// `UpdateTraceSegmentDestination` is the only thing that changes it, so the
+/// reported destination is always the one that was last configured — never a
+/// value echoed from the request being answered.
+#[derive(Debug, Clone)]
+pub struct TraceSegmentDestinationRecord {
+    /// The configured destination: one of
+    /// [`TRACE_SEGMENT_DESTINATION_VALUES`](crate::ops::types::TRACE_SEGMENT_DESTINATION_VALUES).
+    pub destination: String,
+    /// When the accepted change becomes effective, i.e. when the clock owes the
+    /// `PENDING` -> `ACTIVE` move. `None` once the destination is in effect.
+    pub active_at: Option<Instant>,
+    /// `CloudWatchLogsConfiguration$SpansLogGroupKmsKeyId`, as last supplied
+    /// with a `CloudWatchLogs` destination, and dropped when the service is
+    /// pointed anywhere else. Kept so the configuration survives the call that
+    /// set it; no modelled output returns it, so
+    /// [`ComAmazonawsXrayAwsxrayState::set_trace_segment_destination`]'s own
+    /// test is what pins it.
+    pub spans_log_group_kms_key_id: Option<String>,
+}
+
+impl Default for TraceSegmentDestinationRecord {
+    fn default() -> Self {
+        Self {
+            destination: DEFAULT_TRACE_SEGMENT_DESTINATION.to_string(),
+            active_at: None,
+            spans_log_group_kms_key_id: None,
+        }
+    }
+}
+
+impl TraceSegmentDestinationRecord {
+    /// The `TraceSegmentDestinationStatus` this record reports: `PENDING` while
+    /// an accepted change is still owed, `ACTIVE` once it is in effect.
+    pub fn status(&self) -> &'static str {
+        if self.active_at.is_some() {
+            DESTINATION_STATUS_PENDING
+        } else {
+            DESTINATION_STATUS_ACTIVE
+        }
+    }
 }
 
 /// The indexing rules this service holds, keyed by rule name.
@@ -898,6 +984,52 @@ impl ComAmazonawsXrayAwsxrayState {
         let record = self.groups.remove(group_name)?;
         self.group_arn_to_name.remove(&record.group_arn);
         Some(record)
+    }
+
+    /// Materialise the destination change the clock already owes at `now`.
+    ///
+    /// Called by the reporting operation as well as the mutating one: the move
+    /// to `ACTIVE` was due at a fixed instant whether or not anybody called, so
+    /// applying it on a read shows nothing a later caller would not have seen.
+    pub fn settle_trace_segment_destination(&mut self, now: Instant) {
+        if self
+            .trace_segment_destination
+            .active_at
+            .is_some_and(|due| now >= due)
+        {
+            self.trace_segment_destination.active_at = None;
+        }
+    }
+
+    /// Point the service at `destination`, and record `spans_log_group_kms_key_id`
+    /// when one was supplied.
+    ///
+    /// A change becomes effective [`DESTINATION_ACTIVATION_SPAN`] after `now`, so
+    /// it reports `PENDING` until then. A request that names the destination
+    /// already configured changes nothing — there is no switch to apply — and so
+    /// leaves the reported status as it stands. A destination other than
+    /// [`CLOUD_WATCH_LOGS_DESTINATION`] takes no `CloudWatchLogsConfiguration`,
+    /// so pointing the service there drops the stored key rather than keeping a
+    /// key for a log group nothing writes to.
+    pub fn set_trace_segment_destination(
+        &mut self,
+        destination: &str,
+        spans_log_group_kms_key_id: Option<&str>,
+        now: Instant,
+    ) -> TraceSegmentDestinationRecord {
+        let current = &mut self.trace_segment_destination;
+        if current.destination != destination {
+            current.destination = destination.to_string();
+            current.active_at = Some(now + DESTINATION_ACTIVATION_SPAN);
+        }
+        if destination == CLOUD_WATCH_LOGS_DESTINATION {
+            if let Some(key_id) = spans_log_group_kms_key_id {
+                current.spans_log_group_kms_key_id = Some(key_id.to_string());
+            }
+        } else {
+            current.spans_log_group_kms_key_id = None;
+        }
+        current.clone()
     }
 }
 

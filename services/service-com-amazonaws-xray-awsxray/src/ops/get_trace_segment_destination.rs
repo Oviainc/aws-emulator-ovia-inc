@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTraceSegmentDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTraceSegmentDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTraceSegmentDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's trace segment destination from this service's state:
+//! the destination `UpdateTraceSegmentDestination` last configured, or the
+//! account default ([`crate::state::DEFAULT_TRACE_SEGMENT_DESTINATION`]) until
+//! something configures one, plus the `PENDING`/`ACTIVE` status of that
+//! configuration. Nothing here is echoed from the request: this operation's
+//! input carries no members at all.
+//!
+//! Reporting, not mutating — the only write is
+//! [`crate::state::ComAmazonawsXrayAwsxrayState::settle_trace_segment_destination`],
+//! which materialises the `PENDING` -> `ACTIVE` move the clock already owed at
+//! this instant.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +142,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTraceSegmentDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTraceSegmentDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTraceSegmentDestination"))
+        // `GetTraceSegmentDestinationRequest` models no members, so there is
+        // nothing in the request to read.
+        let _ = (&input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTraceSegmentDestinationErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray trace segment destination store is unavailable on this emulator engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The `PENDING` -> `ACTIVE` move was due at an instant the configuring
+        // call fixed, so settling it here reports the clock, not this read.
+        store.settle_trace_segment_destination(::std::time::Instant::now());
+        let record = store.trace_segment_destination.clone();
+
+        Ok(GetTraceSegmentDestinationOutput {
+            status: Some(record.status().to_string()),
+            destination: Some(record.destination),
+        })
     }
 }
