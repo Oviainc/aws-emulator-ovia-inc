@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! `TagResource` merges the request's `tags` onto the tag set of the resource its
+//! `resourceArn` names and persists them, so a later `ListTagsForResource` reports
+//! exactly the merged set: a key the request carries takes its value ("adds or updates
+//! tags"), every other key the resource already had keeps its own. The operation is
+//! `@idempotent`, so replaying the same call is a no-op.
+//!
+//! The tag set lives on the stored resource itself (`BenefitApplication::tags`, which
+//! `CreateBenefitApplication` already fills from `CreateBenefitApplicationInput$Tags`),
+//! so there is no second copy of a resource's tags.
+//!
+//! A `resourceArn` that names no resource this service holds is refused with the modelled
+//! `ResourceNotFoundException` (HTTP 404). Its message is the service's catalog-lookup
+//! form ``Catalog `<name>` not found`` built from the `Catalog` the request named; the
+//! tagging operations bind no `Catalog` member, so it reports the absent one
+//! ([`crate::state::CATALOG_ABSENT`]) — which is what AWS answers for a well-formed
+//! tagging call whose resource does not exist.
+//!
+//! The service's partner-entitlement gate ([`crate::state::entitlement_refusal`]), which
+//! fronts every benefit operation, does NOT front the tagging path: the recorded
+//! `TagResource` call is answered by the resource lookup from the same account whose
+//! benefit calls record the gate's 403 (see the citation in [`TagResource::handle`]).
 //!
 //! ## Shape of an operation
 //!
@@ -153,26 +168,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The entitlement gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account holds no active AWS partner
-        // benefit is refused with the modelled `AccessDeniedException`, which is the
-        // WHOLE answer the service gives such a request — no unimplemented behaviour is
-        // involved. An entitled caller still gets the 501 below.
-        if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
-            return Err(TagResourceErrorModeled::AccessDeniedException(denied).into());
-        }
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `resourceArn`'s pattern and length, and every tag key and value constraint,
+        // are modelled, so the centralized walk has already refused anything outside
+        // them; `ctx` carries nothing this operation needs (the resource is named by
+        // ARN, not by region).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The partner-entitlement gate (`crate::state::entitlement_refusal`, applied by
+        // every benefit operation) is NOT applied here: the tagging path is not behind
+        // it. Recorded behaviour, corpus `simparity-behavioral-aws-v1`, unit
+        // `partnercentral-benefits.tag-resource-malformed-arn-rejected`: a well-formed
+        // `TagResource` naming a resource that does not exist is answered
+        // ``("ResourceNotFoundException", "Catalog `null` not found")`` — the resource
+        // lookup's own answer — from the same account whose `ListBenefits` and
+        // `CreateBenefitApplication` calls record the 403 entitlement refusal.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(resource) = store.taggable_resource_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // This operation binds no `Catalog` member, so the lookup reports
+                    // the catalog the request named: none.
+                    message: crate::state::catalog_not_found_message(None),
+                },
+            )
+            .into());
+        };
+
+        // The merged set is computed first so the quota is checked against what the
+        // resource WOULD carry: re-tagging a key already present adds nothing to the
+        // count, and nothing is persisted when the merge is refused.
+        let merged = crate::state::merged_tags(&resource.tags, &input.tags);
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            let resource_arn = resource.arn.clone();
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the request would give {resource_arn} {} tags, more than the maximum of {}",
+                        merged.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                    resource_id: resource_arn,
+                    resource_type: crate::state::QUOTA_RESOURCE_TYPE_APPLICATION.to_string(),
+                    quota_code: crate::state::QUOTA_CODE_TAGS_PER_RESOURCE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `Revision` and `UpdatedAt` describe the application's own content, which the
+        // update operations move; a tag set is resource metadata the model binds on no
+        // application output, so tagging leaves both as they were and is observed
+        // through `ListTagsForResource`.
+        resource.tags = merged;
+
+        Ok(TagResourceOutput {})
     }
 }

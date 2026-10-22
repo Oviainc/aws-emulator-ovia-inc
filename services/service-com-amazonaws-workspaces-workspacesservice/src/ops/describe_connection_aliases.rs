@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConnectionAliases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConnectionAliases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConnectionAliases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the connection aliases this service has persisted, filtered by
+//! the identifiers the request names and paginated over creation order.
 //!
 //! ## Shape of an operation
 //!
@@ -90,12 +84,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `DescribeConnectionAliasesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#DescribeConnectionAliases")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#DescribeConnectionAliases",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DescribeConnectionAliasesErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InvalidParameterValuesException(InvalidParameterValuesException),
     OperationNotSupportedException(OperationNotSupportedException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -149,18 +151,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConnectionAliases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConnectionAliasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConnectionAliases"))
+        let _ = ctx;
+
+        // The token names the last alias the previous page reported, by its
+        // creation sequence; this page resumes strictly after it.
+        let after_seq = match input.next_token.as_deref() {
+            Some(token) => crate::state::decode_page_token(token).ok_or_else(|| {
+                DescribeConnectionAliasesErrorModeled::InvalidParameterValuesException(
+                    InvalidParameterValuesException {
+                        message: Some("The NextToken value is not valid.".to_string()),
+                    },
+                )
+            })?,
+            None => 0,
+        };
+        // `Limit` is `range 1..25`, so request validation refuses anything outside
+        // that; a value that still does not convert is refused here rather than
+        // silently answered with a default-sized page.
+        let limit = match input.limit {
+            Some(limit) => usize::try_from(limit).map_err(|_| {
+                DescribeConnectionAliasesErrorModeled::InvalidParameterValuesException(
+                    InvalidParameterValuesException {
+                        message: Some(format!(
+                            "The Limit value {limit} is not valid; Limit must be between 1 and 25."
+                        )),
+                    },
+                )
+            })?,
+            None => crate::state::DEFAULT_DESCRIBE_PAGE_SIZE,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeConnectionAliasesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the WorkSpaces state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+        // Reporting only: this materialises the transitions the clock already owes
+        // (CREATING -> CREATED, a completed deletion), each of which was due at this
+        // instant whether or not anybody called.
+        state.settle();
+
+        let matched: Vec<&crate::state::ConnectionAliasRecord> = state
+            .ordered_connection_aliases()
+            .into_iter()
+            .filter(|record| {
+                input
+                    .alias_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&record.alias_id))
+                    // `ResourceId` is "the identifier of the directory associated
+                    // with the connection alias". An association is created only by
+                    // `AssociateConnectionAlias`, which is still a scaffold stub, so
+                    // no stored alias is associated with any directory and this
+                    // filter matches nothing.
+                    && input.resource_id.is_none()
+            })
+            .collect();
+
+        // Resume strictly after the alias the token names, and report a token only
+        // when a matching alias is left beyond this page.
+        let mut remaining = matched.into_iter().filter(|record| record.seq > after_seq);
+        let page_records: Vec<&crate::state::ConnectionAliasRecord> =
+            remaining.by_ref().take(limit).collect();
+        let more_to_come = remaining.next().is_some();
+        let next_token = page_records
+            .last()
+            .filter(|_| more_to_come)
+            .map(|record| crate::state::encode_page_token(record.seq));
+        let page: Vec<ConnectionAlias> = page_records
+            .iter()
+            .map(|record| record.to_connection_alias())
+            .collect();
+
+        Ok(DescribeConnectionAliasesOutput {
+            connection_aliases: Some(page),
+            next_token,
+        })
     }
 }

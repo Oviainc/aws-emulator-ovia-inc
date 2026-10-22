@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a function record in [`crate::state`] and answers with the stored
+//! `FunctionConfiguration`. A freshly created function is `Pending` — see
+//! [`crate::state::FunctionRecord::materialize`] for the clock-owed move to `Active`.
 //!
 //! ## Shape of an operation
 //!
@@ -349,18 +344,321 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFunction"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFunctionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        let reference = crate::state::parse_function_reference(&input.function_name)
+            .ok_or_else(|| invalid_parameter(format!(
+                "1 validation error detected: Value '{}' at 'functionName' failed to satisfy \
+                 constraint: Member must satisfy one of the documented name formats \
+                 (name, name:qualifier, partial ARN or function ARN)",
+                input.function_name
+            )))?;
+
+        // A function is created unpublished, so a request that qualifies the name with
+        // anything but the unpublished version names a resource creation cannot make.
+        if let Some(qualifier) = reference
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| *qualifier != crate::state::VERSION_LATEST)
+        {
+            return Err(invalid_parameter(format!(
+                "CreateFunction cannot create a qualified function: the qualifier \
+                 '{qualifier}' in 'functionName' names a version or alias, and a new \
+                 function has only its unpublished {latest} version",
+                latest = crate::state::VERSION_LATEST
+            )));
+        }
+
+        // "The length constraint applies only to the full ARN. If you specify only the
+        // function name, it is limited to 64 characters in length." (the model's own
+        // `FunctionName` documentation).
+        if !reference.was_arn && reference.name.len() > crate::state::MAX_BARE_FUNCTION_NAME_LEN {
+            return Err(invalid_parameter(format!(
+                "1 validation error detected: Value '{}' at 'functionName' failed to satisfy \
+                 constraint: Member must have length less than or equal to {}",
+                reference.name,
+                crate::state::MAX_BARE_FUNCTION_NAME_LEN
+            )));
+        }
+
+        let package_type = input
+            .package_type
+            .clone()
+            .unwrap_or_else(|| crate::state::PACKAGE_TYPE_ZIP.to_string());
+        let code = package_code(&package_type, &input)?;
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        if store.functions.contains_key(&reference.name) {
+            return Err(CreateFunctionErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    r#type: None,
+                    message: Some(format!("Function already exist: {}", reference.name)),
+                },
+            )
+            .into());
+        }
+
+        // The store is in memory, so the slice answers the modelled code-storage error
+        // past its own ceiling rather than growing without bound.
+        if store.functions.len() >= crate::state::MAX_FUNCTIONS {
+            return Err(CreateFunctionErrorModeled::CodeStorageExceededException(
+                CodeStorageExceededException {
+                    r#type: None,
+                    message: Some(format!(
+                        "Code storage limit exceeded: this account already holds the maximum \
+                         of {} functions.",
+                        crate::state::MAX_FUNCTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (code_size, code_sha256) = match &code.zip_bytes {
+            // The only bytes this emulator holds are the ones the caller uploaded
+            // inline, so they are the only ones a size and a digest can come from.
+            Some(bytes) => (
+                i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+                Some(crate::state::code_sha256(bytes)),
+            ),
+            // An S3 object or a container image is a reference this emulator does not
+            // resolve: it reports no size it did not measure and no digest it did not
+            // compute.
+            None => (0, None),
+        };
+
+        let config = crate::state::FunctionConfig {
+            name: reference.name.clone(),
+            role: input.role.clone(),
+            runtime: input.runtime.clone(),
+            handler: input.handler.clone(),
+            description: input.description.clone(),
+            timeout: input.timeout.unwrap_or(crate::state::DEFAULT_TIMEOUT_SECONDS),
+            memory_size: input
+                .memory_size
+                .unwrap_or(crate::state::DEFAULT_MEMORY_SIZE_MB),
+            package_type: package_type.clone(),
+            architectures: input.architectures.clone().unwrap_or_else(|| {
+                vec![crate::state::DEFAULT_ARCHITECTURE.to_string()]
+            }),
+            environment: environment_variables(&input)?,
+            ephemeral_storage_mb: input
+                .ephemeral_storage
+                .as_ref()
+                .map_or(crate::state::DEFAULT_EPHEMERAL_STORAGE_MB, |storage| {
+                    storage.size
+                }),
+            tracing_mode: input
+                .tracing_config
+                .as_ref()
+                .and_then(|tracing| tracing.mode.clone())
+                .unwrap_or_else(|| crate::state::DEFAULT_TRACING_MODE.to_string()),
+            kms_key_arn: input.kms_key_arn.clone(),
+            code_size,
+            code_sha256,
+            last_modified: crate::state::iso8601(now),
+            revision_id: crate::state::mint_revision_id(),
+        };
+
+        let mut record = crate::state::FunctionRecord {
+            arn: crate::state::function_arn(&region, &reference.name),
+            region,
+            config,
+            code,
+            // "When you create a function, Lambda provisions an instance of the
+            // function and its supporting resources. [...] During this time, you can't
+            // invoke or modify the function." The move to `Active` is owed by the clock
+            // at `active_due`, and nothing waits for it here.
+            state: crate::state::STATE_PENDING.to_string(),
+            state_reason: Some(crate::state::STATE_REASON_CREATING.to_string()),
+            state_reason_code: Some(crate::state::STATE_REASON_CODE_CREATING.to_string()),
+            last_update_status: None,
+            active_due: now + crate::state::ACTIVATION_DELAY,
+            tags: input
+                .tags
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            reserved_concurrent_executions: None,
+            latest_version: 0,
+            versions: ::std::collections::BTreeMap::new(),
+        };
+
+        // "Use the Publish parameter to create version 1 of your function from its
+        // initial configuration." A published version is a snapshot of the
+        // configuration this call stored.
+        let reported_version = if input.publish {
+            record.latest_version = 1;
+            record.versions.insert(
+                1,
+                crate::state::FunctionVersionRecord {
+                    version: 1,
+                    config: record.config.clone(),
+                    created: record.config.last_modified.clone(),
+                },
+            );
+            "1".to_string()
+        } else {
+            crate::state::VERSION_LATEST.to_string()
+        };
+
+        let stored_name = reference.name.clone();
+        store.functions.insert(stored_name.clone(), record);
+
+        // Answered by reading the record back out of the store, so GetFunction reports
+        // exactly what this call persisted.
+        let Some(stored) = store.functions.get(&stored_name) else {
+            return Err(CreateFunctionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("The created function could not be read back".to_string()),
+            })
+            .into());
+        };
+        let config = stored
+            .config_of(&reported_version)
+            .unwrap_or(&stored.config)
+            .clone();
+        Ok(stored.configuration(&reported_version, &config))
     }
+}
+
+/// The modelled 400 this operation answers a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> CreateFunctionError {
+    CreateFunctionErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The code of the function being created, refused when the package type and the
+/// `Code` member do not agree.
+///
+/// The model's own `CreateFunction` documentation states both rules: "If the deployment
+/// package is a container image, then you set the package type to Image. For a
+/// container image, the code property must include the URI of a container image in the
+/// Amazon ECR registry. You do not need to specify the handler and runtime properties.
+/// If the deployment package is a .zip file archive, then you set the package type to
+/// Zip. For a .zip file archive, the code property specifies the location of the .zip
+/// file. You must also specify the handler and runtime properties."
+fn package_code(
+    package_type: &str,
+    input: &CreateFunctionInput,
+) -> Result<crate::state::CodeRecord, CreateFunctionError> {
+    let code = &input.code;
+    if package_type == crate::state::PACKAGE_TYPE_IMAGE {
+        let Some(image_uri) = code.image_uri.clone() else {
+            return Err(invalid_parameter(
+                "Code.ImageUri is required for a function whose PackageType is Image"
+                    .to_string(),
+            ));
+        };
+        if code.zip_file.is_some() || code.s3_bucket.is_some() || code.s3_key.is_some() {
+            return Err(invalid_parameter(
+                "Code must name only ImageUri for a function whose PackageType is Image"
+                    .to_string(),
+            ));
+        }
+        if input.runtime.is_some() {
+            return Err(invalid_parameter(
+                "Runtime cannot be set for a function whose PackageType is Image".to_string(),
+            ));
+        }
+        if input.handler.is_some() {
+            return Err(invalid_parameter(
+                "Handler cannot be set for a function whose PackageType is Image".to_string(),
+            ));
+        }
+        return Ok(crate::state::CodeRecord {
+            image_uri: Some(image_uri),
+            ..crate::state::CodeRecord::default()
+        });
+    }
+
+    if code.image_uri.is_some() {
+        return Err(invalid_parameter(
+            "Code.ImageUri can only be set for a function whose PackageType is Image"
+                .to_string(),
+        ));
+    }
+    if input.runtime.is_none() {
+        return Err(invalid_parameter(
+            "Runtime is required if the deployment package is a .zip file archive".to_string(),
+        ));
+    }
+    if input.handler.is_none() {
+        return Err(invalid_parameter(
+            "Handler is required if the deployment package is a .zip file archive".to_string(),
+        ));
+    }
+    match (&code.zip_file, &code.s3_bucket, &code.s3_key) {
+        (Some(zip_file), None, None) => {
+            // AWS's published Lambda quota for a package uploaded inline: "Deployment
+            // package (.zip file archive) size: 50 MB (zipped, for direct upload)".
+            // The bytes are held in memory here, so the ceiling bounds the store too.
+            if zip_file.len() > MAX_INLINE_ZIP_BYTES {
+                return Err(invalid_parameter(format!(
+                    "Code.ZipFile must be smaller than {MAX_INLINE_ZIP_BYTES} bytes for a \
+                     direct upload; use S3Bucket and S3Key for a larger deployment package"
+                )));
+            }
+            Ok(crate::state::CodeRecord {
+                zip_bytes: Some(zip_file.clone()),
+                ..crate::state::CodeRecord::default()
+            })
+        }
+        (None, Some(bucket), Some(key)) => Ok(crate::state::CodeRecord {
+            s3_bucket: Some(bucket.clone()),
+            s3_key: Some(key.clone()),
+            s3_object_version: code.s3_object_version.clone(),
+            ..crate::state::CodeRecord::default()
+        }),
+        _ => Err(invalid_parameter(
+            "Code must name either ZipFile or both S3Bucket and S3Key for a function whose \
+             PackageType is Zip"
+                .to_string(),
+        )),
+    }
+}
+
+/// AWS's published Lambda quota for a deployment package uploaded inline: "Deployment
+/// package (.zip file archive) size: 50 MB (zipped, for direct upload)".
+const MAX_INLINE_ZIP_BYTES: usize = 50 * 1024 * 1024;
+
+/// AWS's published Lambda quota for environment variables: 4 KB for all of a
+/// function's environment variables combined.
+const MAX_ENVIRONMENT_BYTES: usize = 4 * 1024;
+
+/// The environment variables of the function being created, refused when the set is
+/// larger than the documented quota.
+fn environment_variables(
+    input: &CreateFunctionInput,
+) -> Result<::std::collections::BTreeMap<String, String>, CreateFunctionError> {
+    let variables: ::std::collections::BTreeMap<String, String> = input
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.variables.clone())
+        .map(|variables| variables.into_iter().collect())
+        .unwrap_or_default();
+    let size: usize = variables
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    if size > MAX_ENVIRONMENT_BYTES {
+        return Err(invalid_parameter(format!(
+            "Environment.Variables must be smaller than {MAX_ENVIRONMENT_BYTES} bytes for all \
+             environment variables combined, and this request's are {size} bytes"
+        )));
+    }
+    Ok(variables)
 }
