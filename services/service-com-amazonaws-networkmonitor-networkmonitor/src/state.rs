@@ -117,6 +117,17 @@ pub const MAX_CLIENT_TOKENS: usize = 1_000;
 /// count.
 pub const CLIENT_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The most tags one monitor or probe keeps: an EMULATOR-CHOSEN ceiling, for
+/// the reason given on [`MAX_MONITORS`] — every tagging write can add to the
+/// store, so it is bounded rather than left to grow with the request count.
+///
+/// Its VALUE is the modelled `TagMap`'s own `@length(min: 0, max: 200)`, which
+/// is the most pairs any response can carry: a resource holding more could not
+/// be reported. AWS enforces a tag quota of its own, which may differ; a write
+/// past this ceiling is refused with the modelled `ValidationException` naming
+/// the bound, since `TagResource` models no quota error.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// The AWS service namespace a probe's `sourceArn` must name.
 ///
 /// The model documents `ProbeInput$sourceArn` as "The ARN of the subnet", and a
