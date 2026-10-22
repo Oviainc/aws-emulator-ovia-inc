@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRescoreExecutionPlans
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRescoreExecutionPlans`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRescoreExecutionPlans::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one summary per plan currently in this service's store, in the store's
+//! stable id order, honouring `MaxResults` and round-tripping `NextToken` so a paged
+//! walk visits every plan exactly once. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +150,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRescoreExecutionPlans` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRescoreExecutionPlansErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRescoreExecutionPlans"))
+        // `MaxResults`'s 1..50 range and `NextToken`'s length and pattern are modelled,
+        // so a value outside them is already refused with a 400 `ValidationException`
+        // before this handler runs. What is NOT modelled is whether an in-range token is
+        // one this service issued — that is checked below.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListRescoreExecutionPlansErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the rescore execution plan store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let start_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(resume_after(token).ok_or_else(|| {
+                ListRescoreExecutionPlansErrorModeled::ValidationException(ValidationException {
+                    message: Some(
+                        "NextToken is not a pagination token this service issued.".to_string(),
+                    ),
+                })
+            })?),
+        };
+
+        // Absent `MaxResults` means no page limit was asked for, so the page holds every
+        // remaining plan; `MaxResults` is modelled 1..50, so the cast cannot be negative.
+        let limit = input
+            .max_results
+            .map_or(usize::MAX, |requested| requested.max(0) as usize);
+
+        let store = state.lock();
+        // `plans` is a BTreeMap, so this walk is in ascending id order: paging from the
+        // last id returned visits every plan exactly once, and a deleted plan is simply
+        // no longer there.
+        let mut page: Vec<RescoreExecutionPlanSummary> = store
+            .plans
+            .values()
+            .filter(|plan| {
+                start_after
+                    .as_deref()
+                    .is_none_or(|after| plan.id.as_str() > after)
+            })
+            .take(limit.saturating_add(1))
+            .map(|plan| RescoreExecutionPlanSummary {
+                name: Some(plan.name.clone()),
+                id: Some(plan.id.clone()),
+                created_at: Some(crate::state::timestamp(plan.created_at_millis)),
+                updated_at: Some(crate::state::timestamp(plan.updated_at_millis)),
+                status: Some(plan.status.clone()),
+            })
+            .collect();
+
+        // One plan more than the page holds was read: that is what says a further page
+        // exists, so `NextToken` is omitted on the final page.
+        let has_more = page.len() > limit;
+        if has_more {
+            page.truncate(limit);
+        }
+        let next_token = page
+            .last()
+            .filter(|_| has_more)
+            .and_then(|last| last.id.clone());
+
+        Ok(ListRescoreExecutionPlansOutput {
+            summary_items: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The id a `NextToken` resumes after, or `None` when the token is not one this service
+/// could have issued.
+///
+/// The token this operation hands out is the last plan id of the page a caller received,
+/// which satisfies `NextToken`'s modelled `^\P{C}*$` pattern and 1..800 length. A token
+/// must therefore be shaped like a `RescoreExecutionPlanId` — 36 characters over its
+/// modelled character set — so a caller-invented string is refused rather than taken as
+/// an arbitrary cursor. A token naming an id the store no longer holds is NOT refused:
+/// paging resumes past it, which is how a listing survives a plan deleted mid-walk.
+fn resume_after(token: &str) -> Option<String> {
+    let plan_id_shaped = token.len() == 36
+        && token.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    plan_id_shaped.then(|| token.to_string())
 }

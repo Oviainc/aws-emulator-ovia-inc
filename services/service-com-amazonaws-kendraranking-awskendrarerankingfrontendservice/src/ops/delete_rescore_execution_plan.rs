@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRescoreExecutionPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRescoreExecutionPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRescoreExecutionPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REMOVES the plan from this service's store, so a later Describe, Rescore or Delete
+//! of the same id answers `ResourceNotFoundException` and the plan no longer appears in
+//! `ListRescoreExecutionPlans`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +170,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRescoreExecutionPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRescoreExecutionPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRescoreExecutionPlan"))
+        // `Id`'s 36-character length and pattern are modelled, so a malformed id is
+        // already refused with a 400 `ValidationException` before this handler runs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRescoreExecutionPlanErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the rescore execution plan store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(plan) = store.plans.remove(&input.id) else {
+            return Err(
+                DeleteRescoreExecutionPlanErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Rescore execution plan {} was not found.",
+                            input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        store.arn_index.remove(&plan.arn);
+        // The idempotency tokens that created this plan must go with it, or a repeated
+        // create would answer with the id of a plan that no longer exists.
+        store.client_tokens.retain(|_, id| *id != plan.id);
+
+        Ok(DeleteRescoreExecutionPlanOutput)
     }
 }

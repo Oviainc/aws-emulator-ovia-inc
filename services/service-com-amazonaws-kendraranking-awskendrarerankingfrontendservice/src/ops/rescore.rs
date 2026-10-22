@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Rescore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `Rescore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`Rescore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Ranks the SUBMITTED documents for the submitted query under the named rescore
+//! execution plan, which must exist in this service's store. Every result item names a
+//! document the request carried, with a score computed from that document's own text
+//! and original score, and the list is ordered by descending score.
+//!
+//! WHAT IS AND IS NOT FAITHFUL HERE: the real service scores with a semantic model
+//! this emulator does not have, so the MAGNITUDE of a `Score` is an emulator-chosen
+//! lexical heuristic (query-term overlap blended with `OriginalScore`, see
+//! [`rescored_score`]) and no caller should depend on the numbers. What is faithful is
+//! everything around it, and that is what the tests pin: one result item per submitted
+//! document, every `DocumentId` drawn from the request, a descending order, scores
+//! inside the range the model gives `Score`, a deterministic answer for one input, and
+//! a plan that must exist.
 //!
 //! ## Shape of an operation
 //!
@@ -94,6 +99,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeSet;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -167,18 +174,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `Rescore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RescoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("Rescore"))
+        // `RescoreExecutionPlanId`'s length and pattern, `SearchQuery`'s length, a
+        // non-empty `Documents` list and each document's required `Id` / in-range
+        // `OriginalScore` are modelled, so a request violating one of THOSE is already
+        // refused with a 400 `ValidationException` before this handler runs. The model
+        // puts no UPPER bound on `Documents`, so that one is enforced below.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RescoreErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the rescore execution plan store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `Documents` is modelled with a minimum of 1 and NO maximum, so the batch size
+        // is caller-chosen: refuse a batch past this emulator's ceiling with the modelled
+        // 400 before any scoring runs, so one request cannot multiply work without bound.
+        if input.documents.len() > crate::state::MAX_DOCUMENTS_PER_RESCORE {
+            return Err(RescoreErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "Documents carries {} documents; at most {} may be rescored in one request.",
+                    input.documents.len(),
+                    crate::state::MAX_DOCUMENTS_PER_RESCORE
+                )),
+            })
+            .into());
+        }
+
+        // Documented on `Document$TokenizedTitle` / `$TokenizedBody`: "You must choose
+        // to provide Title or TokenizedTitle. You cannot provide both." — a rule the
+        // model cannot express, so it is refused here with the modelled 400.
+        for document in &input.documents {
+            if document.title.is_some() && document.tokenized_title.is_some() {
+                return Err(RescoreErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "Document {} provides both Title and TokenizedTitle; provide one.",
+                        document.id
+                    )),
+                })
+                .into());
+            }
+            if document.body.is_some() && document.tokenized_body.is_some() {
+                return Err(RescoreErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "Document {} provides both Body and TokenizedBody; provide one.",
+                        document.id
+                    )),
+                })
+                .into());
+            }
+        }
+
+        // The store is consulted only to answer whether the plan exists and to mint this
+        // ranking's identifier; the guard is dropped before any caller-sized scoring, so
+        // one request's batch never runs under the shared-state lock.
+        let rescore_id = {
+            let mut store = state.lock();
+            if store.plans.contains_key(&input.rescore_execution_plan_id) {
+                Some(store.next_id(crate::state::now_millis()))
+            } else {
+                None
+            }
+        };
+        let Some(rescore_id) = rescore_id else {
+            return Err(RescoreErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Rescore execution plan {} was not found.",
+                        input.rescore_execution_plan_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let query_terms = distinct_query_terms(&input.search_query);
+        let mut ranked: Vec<(String, f32)> = input
+            .documents
+            .iter()
+            .map(|document| {
+                (
+                    document.id.clone(),
+                    rescored_score(&query_terms, document),
+                )
+            })
+            .collect();
+        // "The results are in descending order." Ties fall back to the document id, so
+        // one request's ranking is one total order rather than an input-order accident.
+        ranked.sort_by(|(left_id, left_score), (right_id, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| left_id.cmp(right_id))
+        });
+
+        Ok(RescoreOutput {
+            // The identifier of this ranking, minted by the store above. Nothing in this
+            // service's surface reads a ranking back by it, so none is retained.
+            rescore_id: Some(rescore_id),
+            result_items: Some(
+                ranked
+                    .into_iter()
+                    .map(|(document_id, score)| RescoreResultItem {
+                        document_id: Some(document_id),
+                        score: Some(score),
+                    })
+                    .collect(),
+            ),
+        })
     }
+}
+
+/// How much of the blended score the document's own original score contributes.
+/// Emulator-chosen: see the caveat in this module's documentation.
+const ORIGINAL_SCORE_WEIGHT: f32 = 0.5;
+/// How much of the blended score the query/document term overlap contributes.
+/// Emulator-chosen.
+const RELEVANCE_WEIGHT: f32 = 0.5;
+/// Share of the overlap measured against the document's title. Emulator-chosen.
+const TITLE_WEIGHT: f32 = 0.7;
+/// Share of the overlap measured against the document's body. Emulator-chosen.
+const BODY_WEIGHT: f32 = 0.3;
+/// The range `RescoreResultItem$Score` models (`Float`, range -100000..100000).
+const SCORE_MIN: f32 = -100_000.0;
+/// See [`SCORE_MIN`].
+const SCORE_MAX: f32 = 100_000.0;
+
+/// The score this service gives `document` for a query carrying `query_terms`.
+///
+/// It blends the document's own `OriginalScore` with the share of the query's distinct
+/// terms the document's text carries, weighting the title above the body, and stays
+/// inside the range the model gives `Score`.
+///
+/// The weights are the EMULATOR's, not the service's: Amazon Kendra Intelligent Ranking
+/// re-ranks with a semantic model, which this emulator cannot run, so this is a
+/// deterministic lexical stand-in. Its guarantees are ordinal, not absolute — a document
+/// whose text carries more of the query outranks one that carries less at the same
+/// original score, and the same input always yields the same ranking.
+fn rescored_score(query_terms: &[String], document: &Document) -> f32 {
+    let title_terms = field_terms(
+        document.title.as_deref(),
+        document.tokenized_title.as_deref(),
+    );
+    let body_terms = field_terms(document.body.as_deref(), document.tokenized_body.as_deref());
+    let relevance = TITLE_WEIGHT * coverage(query_terms, &title_terms)
+        + BODY_WEIGHT * coverage(query_terms, &body_terms);
+    (ORIGINAL_SCORE_WEIGHT * document.original_score + RELEVANCE_WEIGHT * relevance)
+        .clamp(SCORE_MIN, SCORE_MAX)
+}
+
+/// The terms of one document field, from its text form or its pre-tokenized form
+/// (`Title`/`TokenizedTitle`, `Body`/`TokenizedBody`): exactly one of the two is set.
+fn field_terms(text: Option<&str>, tokens: Option<&[String]>) -> BTreeSet<String> {
+    match (text, tokens) {
+        (_, Some(tokens)) => tokens.iter().flat_map(|token| terms_of(token)).collect(),
+        (Some(text), None) => terms_of(text).into_iter().collect(),
+        (None, None) => BTreeSet::new(),
+    }
+}
+
+/// The share of `query_terms` that `document_terms` carries, in `0.0..=1.0`. A query
+/// with no terms, or a document field with none, covers nothing.
+fn coverage(query_terms: &[String], document_terms: &BTreeSet<String>) -> f32 {
+    if query_terms.is_empty() || document_terms.is_empty() {
+        return 0.0;
+    }
+    let matched = query_terms
+        .iter()
+        .filter(|term| document_terms.contains(*term))
+        .count();
+    matched as f32 / query_terms.len() as f32
+}
+
+/// The query's distinct terms, in first-seen order.
+fn distinct_query_terms(search_query: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    terms_of(search_query)
+        .into_iter()
+        .filter(|term| seen.insert(term.clone()))
+        .collect()
+}
+
+/// Fold text into comparable terms: lowercase runs of alphanumeric characters.
+fn terms_of(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .collect()
 }

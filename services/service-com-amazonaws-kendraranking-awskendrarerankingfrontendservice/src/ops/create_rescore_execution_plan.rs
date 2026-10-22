@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRescoreExecutionPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRescoreExecutionPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRescoreExecutionPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a rescore execution plan and INSERTS it into this service's store: a fresh
+//! 36-character id, the ARN built from the request's region, and the submitted
+//! `Name`/`Description`/`CapacityUnits`/`Tags`, all read back by
+//! `DescribeRescoreExecutionPlan` and `ListRescoreExecutionPlans`. A repeated
+//! `ClientToken` returns the plan that token already created.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +176,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRescoreExecutionPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRescoreExecutionPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRescoreExecutionPlan"))
+        // Every modelled constraint on the input (`Name`'s length and pattern,
+        // `Description`, `CapacityUnits.RescoreCapacityUnits >= 0`, `Tags`'s bounds and
+        // `ClientToken`'s) is already refused with a 400 `ValidationException` before
+        // this handler runs.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRescoreExecutionPlanErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the rescore execution plan store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // "Multiple calls to the CreateRescoreExecutionPlanRequest API with the same
+        // client token will create only one rescore execution plan."
+        let client_token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        if let Some(token) = client_token.as_deref() {
+            if let Some(plan) = store
+                .client_tokens
+                .get(token)
+                .and_then(|id| store.plans.get(id))
+            {
+                return Ok(CreateRescoreExecutionPlanOutput {
+                    id: plan.id.clone(),
+                    arn: plan.arn.clone(),
+                });
+            }
+        }
+
+        // A plan this account has no room for is refused with the modelled quota error
+        // rather than stored — which is also what keeps this store finite. Checked after
+        // the idempotency lookup above, so a repeated token still gets its plan back.
+        if store.plans.len() >= crate::state::MAX_RESCORE_EXECUTION_PLANS {
+            return Err(
+                CreateRescoreExecutionPlanErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "The number of rescore execution plans has reached the quota of {}.",
+                            crate::state::MAX_RESCORE_EXECUTION_PLANS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A 36-character id in the shape `RescoreExecutionPlanId` models
+        // (`length 36..36`, pattern `^[a-zA-Z0-9][a-zA-Z0-9-]*$`), minted by the store so
+        // no two plans can share one.
+        let now = crate::state::now_millis();
+        let id = store.next_id(now);
+        let arn = crate::state::plan_arn(&region, &id);
+
+        store.arn_index.insert(arn.clone(), id.clone());
+        if let Some(token) = client_token {
+            store.client_tokens.insert(token, id.clone());
+        }
+        store.plans.insert(
+            id.clone(),
+            crate::state::RescoreExecutionPlan {
+                id: id.clone(),
+                arn: arn.clone(),
+                name: input.name,
+                description: input.description,
+                capacity_units: input.capacity_units,
+                created_at_millis: now,
+                updated_at_millis: now,
+                status: crate::state::STATUS_ACTIVE.to_string(),
+                error_message: None,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateRescoreExecutionPlanOutput { id, arn })
     }
 }
