@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStateMachine
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStateMachine`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a state machine and PERSISTS it in [`crate::state`], so every
+//! later `DescribeStateMachine`, `ListStateMachines` and `StartExecution` answers from
+//! the record this call stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStateMachine::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -229,18 +226,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStateMachine` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStateMachineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStateMachine"))
+        // `name` (1..80), `definition` (1..1048576), `roleArn` (1..256) and
+        // `versionDescription` (0..256) are modelled constraints, so the centralized
+        // walk has already refused anything outside them. The character rule on
+        // `name`, the Amazon States Language structure of `definition` and the tag
+        // count are NOT modelled, so they are checked here.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        if let Some(why) = crate::state::invalid_name_reason(&input.name) {
+            return Err(
+                CreateStateMachineErrorModeled::InvalidName(InvalidName { message: Some(why) })
+                    .into(),
+            );
+        }
+
+        // `type`'s own documentation: "Determines whether a Standard or Express state
+        // machine is created. The default is STANDARD."
+        let sm_type = input
+            .r#type
+            .clone()
+            .unwrap_or_else(|| crate::state::STATE_MACHINE_TYPE_STANDARD.to_string());
+        if !STATE_MACHINE_TYPE_VALUES.contains(&sm_type.as_str()) {
+            return Err(CreateStateMachineErrorModeled::StateMachineTypeNotSupported(
+                StateMachineTypeNotSupported {
+                    message: Some(format!(
+                        "type must be one of [{}], got '{sm_type}'",
+                        STATE_MACHINE_TYPE_VALUES.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if let Err(why) = crate::state::asl::validate(&input.definition) {
+            return Err(CreateStateMachineErrorModeled::InvalidDefinition(
+                InvalidDefinition { message: Some(why) },
+            )
+            .into());
+        }
+
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(CreateStateMachineErrorModeled::TooManyTags(TooManyTags {
+                message: Some(format!(
+                    "a state machine accepts at most {} tags, got {}",
+                    crate::state::MAX_TAGS,
+                    tags.len()
+                )),
+                resource_name: Some(input.name.clone()),
+            })
+            .into());
+        }
+
+        // `versionDescription`'s own documentation: "You can only set the description
+        // if the publish parameter is set to true. Otherwise, if you set
+        // versionDescription, but publish to false, this API action throws
+        // ValidationException."
+        if input.version_description.is_some() && !input.publish {
+            return Err(CreateStateMachineErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "versionDescription can only be set when publish is true".to_string(),
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // State machine VERSIONS are not implemented in this emulator —
+        // `PublishStateMachineVersion`, `ListStateMachineVersions` and
+        // `DeleteStateMachineVersion` all still answer 501 — so a request that asks
+        // for one is refused with this operation's own modelled error rather than
+        // handed a `stateMachineVersionArn` with no version behind it.
+        if input.publish {
+            return Err(CreateStateMachineErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "publish is not supported by this emulator: state machine versions are \
+                         not implemented"
+                            .to_string(),
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::state_machine_arn(&region, &input.name);
+        let created = crate::state::now();
+        let fingerprint = crate::state::configuration_fingerprint(
+            &input.definition,
+            &sm_type,
+            input.logging_configuration.as_ref(),
+            input.tracing_configuration.as_ref(),
+            input.encryption_configuration.as_ref(),
+            input.publish,
+            input.version_description.as_deref(),
+        );
+
+        let mut store = state.lock();
+        store.settle(created);
+
+        // A state machine's ARN is a total function of the region and the name, so
+        // the ARN this request would mint IS the name lookup: a name is in use only
+        // within the same region and account, the way the service scopes it.
+        let existing = store.state_machines.get(&arn).map(|machine| {
+            (
+                machine.arn.clone(),
+                machine.creation_date,
+                machine.is_deleting(),
+                machine.fingerprint.clone(),
+            )
+        });
+        if let Some((existing_arn, creation_date, deleting, existing_fingerprint)) = existing {
+            if deleting {
+                return Err(CreateStateMachineErrorModeled::StateMachineDeleting(
+                    StateMachineDeleting {
+                        message: Some(format!("state machine {existing_arn} is being deleted")),
+                    },
+                )
+                .into());
+            }
+            // "CreateStateMachine is an idempotent API. Subsequent requests won't
+            // create a duplicate resource if it was already created." The check reads
+            // the name plus the members in the fingerprint, so a repeat that differs
+            // only in `roleArn` or `tags` is the same request and neither member is
+            // updated.
+            if existing_fingerprint == fingerprint {
+                return Ok(CreateStateMachineOutput {
+                    state_machine_arn: existing_arn,
+                    creation_date: crate::state::to_date_time(creation_date),
+                    state_machine_version_arn: None,
+                });
+            }
+            return Err(CreateStateMachineErrorModeled::StateMachineAlreadyExists(
+                StateMachineAlreadyExists {
+                    message: Some(format!(
+                        "a state machine named '{}' already exists with a different definition or \
+                         configuration",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let candidate = crate::state::StateMachine {
+            arn: arn.clone(),
+            name: input.name,
+            definition: input.definition,
+            role_arn: input.role_arn,
+            sm_type,
+            // `StateMachineStatus` is ACTIVE | DELETING: the service reports a newly
+            // created state machine ready, so it is stored ready.
+            status: crate::state::STATE_MACHINE_STATUS_ACTIVE.to_string(),
+            creation_date: created,
+            update_date: created,
+            logging_configuration: input.logging_configuration,
+            tracing_configuration: input.tracing_configuration,
+            encryption_configuration: input.encryption_configuration,
+            revision_id: None,
+            description: input.version_description,
+            tags,
+            fingerprint,
+            delete_due_at: None,
+            // Measured and counted by `insert_state_machine`.
+            retained_bytes: 0,
+        };
+
+        // The store's caps are on the WHOLE store, in records AND in bytes: the
+        // definition is caller-sized (up to the modelled 1 MiB), so a record count
+        // alone would not bound the memory, and keying a cap on the signed region
+        // would let a caller mint a fresh quota per region it signs for.
+        if let Some(why) = store.state_machine_rejection(candidate.measure()) {
+            return Err(CreateStateMachineErrorModeled::StateMachineLimitExceeded(
+                StateMachineLimitExceeded { message: Some(why) },
+            )
+            .into());
+        }
+
+        store.insert_state_machine(candidate);
+
+        Ok(CreateStateMachineOutput {
+            state_machine_arn: arn,
+            creation_date: crate::state::to_date_time(created),
+            state_machine_version_arn: None,
+        })
     }
 }

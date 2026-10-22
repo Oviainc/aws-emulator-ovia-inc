@@ -7,6 +7,13 @@
 //! the persisted record is the operation's only effect — and the only thing
 //! `ListSlackChannelConfigurations` and `UpdateSlackChannelConfiguration` read.
 //!
+//! A channel configuration lives inside a Slack workspace that is registered to the
+//! account, so the request's `teamId` must be in the account's workspace registry
+//! (`state::slack_workspace_configurations`, written by
+//! `RegisterSlackWorkspaceForOrganization`); a create for an unregistered workspace is
+//! refused with the modelled `ConflictException` (409), the condition
+//! `ConflictException`'s own documentation names first.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -215,6 +222,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // The precondition `ConflictException` documents: "Add, update, or delete a
+        // Slack channel configuration before you add a Slack workspace to your Amazon
+        // Web Services account." A channel configuration lives inside a Slack
+        // workspace registered to this account, so a `teamId` that is not in the
+        // account's workspace registry has nothing to configure a channel in. Checked
+        // after the input rules above, because a request that does not satisfy the
+        // model's own constraints is refused before any account state is consulted.
+        if !store
+            .slack_workspace_configurations
+            .contains_key(&input.team_id)
+        {
+            return Err(CreateSlackChannelConfigurationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::workspace_not_registered_message(
+                        &input.team_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
         let key = (input.team_id.clone(), input.channel_id.clone());
         // A channel configuration is identified by its `(teamId, channelId)` pair:
         // configuring a channel that is already configured is a conflict, not a

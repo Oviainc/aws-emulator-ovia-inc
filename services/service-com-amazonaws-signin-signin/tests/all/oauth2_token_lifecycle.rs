@@ -700,54 +700,58 @@ async fn revoking_a_refresh_token_is_idempotent_and_revokes_its_chain() {
     }
 }
 
-/// A token value the model's patterns do not admit is refused at the boundary — 400
-/// `ValidationException` — rather than answered: `IntrospectionToken` takes either token
-/// family (`^ASO[AR]…`) while `RevocationToken` takes only the refresh one (`^ASOR…`),
-/// since "access_tokens are not accepted for revocation".
+/// A token value outside the shape an operation accepts is answered by THAT operation,
+/// and the two operations answer it differently:
+///
+/// * `IntrospectOAuth2TokenWithIAM` refuses it — 400 `ValidationException` — since it
+///   can report nothing about a value no token could have;
+/// * `RevokeOAuth2TokenWithIAM` ACCEPTS it as a 200 no-op. Revocation is
+///   idempotent-safe: the model documents that "revoking an already-revoked, expired, or
+///   otherwise invalid token still returns 200 OK with an empty body", so a value
+///   outside `RevocationToken`'s `^ASOR…` — the empty string, or a perfectly valid
+///   access token, which "access_tokens are not accepted for revocation" excludes —
+///   revokes nothing and is still a success. An access token presented for revocation
+///   therefore stays active, which the last rows check.
 #[tokio::test]
-async fn a_token_outside_the_modelled_pattern_is_refused() {
+async fn a_token_outside_the_modelled_pattern_is_judged_by_the_operation() {
     let em = emulator();
     let minted = create_token(&em, "aws-mcp.amazonaws.com")
         .await
         .string("access_token")
         .to_string();
 
-    // (case, token, refused by introspect, refused by revoke)
-    let cases: Vec<(&str, String, bool, bool)> = vec![
-        ("not a sign-in token at all", "nope".to_string(), true, true),
-        ("empty", String::new(), true, true),
+    // (case, token, refused by introspect)
+    let cases: Vec<(&str, String, bool)> = vec![
+        ("not a sign-in token at all", "nope".to_string(), true),
+        ("empty", String::new(), true),
         (
             "an access key id, not a token",
             "ASIAEXAMPLE1234567890".to_string(),
             true,
-            true,
         ),
-        ("the access prefix alone", "ASOA".to_string(), true, true),
-        ("the refresh prefix alone", "ASOR".to_string(), true, true),
+        ("the access prefix alone", "ASOA".to_string(), true),
+        ("the refresh prefix alone", "ASOR".to_string(), true),
         (
             "a third token family the pattern does not admit",
             format!("ASOB{}", "a".repeat(64)),
-            true,
             true,
         ),
         (
             "a character outside the alphabet",
             format!("ASOR{}!", "a".repeat(63)),
             true,
-            true,
         ),
         (
             "one character past the 4096 ceiling",
             format!("ASOR{}", "a".repeat(4093)),
             true,
-            true,
         ),
-        // An access token is a valid `IntrospectionToken` and not a valid
-        // `RevocationToken`: introspection serves it, revocation refuses it.
-        ("a minted access token", minted, false, true),
+        // An access token is a valid `IntrospectionToken`, so introspection serves it;
+        // revocation takes only a refresh token, so it is a no-op there.
+        ("a minted access token", minted.clone(), false),
     ];
 
-    for (case, token, introspect_refused, revoke_refused) in &cases {
+    for (case, token, introspect_refused) in &cases {
         let answer = introspect(&em, json!({"token": token})).await;
         let expected = if *introspect_refused { 400 } else { 200 };
         assert_eq!(
@@ -765,20 +769,24 @@ async fn a_token_outside_the_modelled_pattern_is_refused() {
         }
 
         let answer = revoke(&em, token).await;
-        let expected = if *revoke_refused { 400 } else { 200 };
         assert_eq!(
-            answer.status, expected,
-            "case {case:?}: revocation must answer HTTP {expected}, got {} with {:?}",
+            answer.status, 200,
+            "case {case:?}: revocation is idempotent-safe and must answer 200, got {} \
+             with {:?}",
             answer.status, answer.body
         );
-        if *revoke_refused {
-            assert_eq!(
-                answer.error_code(),
-                "ValidationException",
-                "case {case:?}: expected ValidationException from revocation, got {:?}",
-                answer.body
-            );
-        }
+
+        // Nothing was revoked: the access token minted above is still active after
+        // every one of these values — its own included — was presented for revocation.
+        let still = introspect(&em, json!({"token": &minted})).await;
+        assert_eq!(
+            (still.status, still.body["active"].as_bool()),
+            (200, Some(true)),
+            "case {case:?}: revoking that value must leave the minted access token \
+             active, got {} with {:?}",
+            still.status,
+            still.body
+        );
     }
 }
 

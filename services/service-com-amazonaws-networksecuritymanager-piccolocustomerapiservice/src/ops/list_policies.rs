@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through the policies persisted in [`crate::state`], in `policyId` order, with an
+//! opaque `nextToken` that resumes exactly where the previous page stopped. A pure read:
+//! it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +147,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPolicies"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPoliciesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the policy store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` this service did not mint names no page, and the model expresses
+        // only its character set, so the boundary validator cannot refuse it.
+        let start_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_next_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    let message =
+                        "nextToken is not a token this service issued; restart the listing \
+                         without it"
+                            .to_string();
+                    return Err(ListPoliciesErrorModeled::ValidationException(
+                        ValidationException {
+                            reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: message.clone(),
+                            }]),
+                            message,
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // `PolicySummaryList` is modelled `@length(max: 100)`, so an unbounded request
+        // still pages at 100 rather than returning a list it could not serialize.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_POLICY_PAGE, |requested| {
+                (requested as usize).clamp(1, crate::state::MAX_POLICY_PAGE)
+            });
+
+        let store = state.lock();
+        // `policies` is keyed by `policyId`, so this walk is in a stable order and the
+        // token below resumes immediately after the last summary returned.
+        let mut matching = store
+            .policies
+            .values()
+            .filter(|policy| {
+                start_after
+                    .as_deref()
+                    .is_none_or(|after| policy.policy_id.as_str() > after)
+            })
+            .filter(|policy| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| policy.status == wanted)
+            });
+
+        let policies: Vec<PolicySummary> = matching
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::Policy::summary)
+            .collect();
+        // A `nextToken` is emitted only when a further summary really exists, so a caller
+        // that follows it never gets an empty final page.
+        let next_token = matching.next().and_then(|_| {
+            policies
+                .last()
+                .map(|last| crate::state::encode_next_token(&last.policy_id))
+        });
+
+        Ok(ListPoliciesOutput {
+            next_token,
+            policies,
+        })
     }
 }

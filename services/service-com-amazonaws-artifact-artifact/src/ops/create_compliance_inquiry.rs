@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComplianceInquiry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComplianceInquiry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a compliance inquiry: mints its `InquiryId`, enumerates the queries its
+//! content carries, and persists the record in [`crate::state`], so every later read of
+//! it — `GetComplianceInquiryMetadata` here, `ListComplianceInquiries` and the tag
+//! operations once they are implemented — answers from the one stored resource.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComplianceInquiry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules shape the handler:
+//!
+//! * The inquiry is created NON-TERMINAL. AWS answers this operation with HTTP 202 and
+//!   an inquiry whose `status` is `PROCESSING`, so the terminal status is owed by the
+//!   CLOCK, not by any later call: the due instant is stored
+//!   (`crate::state::INQUIRY_PROCESSING_SPAN`) and
+//!   [`crate::state::ComplianceInquiry::materialise`] applies the transition when a
+//!   reader arrives after it. Nothing sleeps, and a caller polling straight after the
+//!   create still observes `PROCESSING`.
+//! * `clientToken` is this operation's `@idempotencyToken`: a repeat carrying the same
+//!   token answers with the inquiry the first call created rather than creating a second,
+//!   and the same token on DIFFERENT content is refused with the modelled
+//!   `ConflictException` — an idempotency token identifies one call, so honouring it on
+//!   other content would hide the second submission.
+//! * The inquiry's RESPONSES are model-generated compliance answers, and no such engine
+//!   runs in this emulator. Nothing is synthesised to look generated: every query ends in
+//!   its modelled failure status with no `response`, and the inquiry ends in the modelled
+//!   status that says so (see `materialise`).
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +96,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use sha2::{Digest, Sha256};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -155,18 +170,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComplianceInquiry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComplianceInquiryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComplianceInquiry"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateComplianceInquiryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact compliance inquiry store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "Defaults to AI_ONLY if not specified" (`CreateComplianceInquiryRequest$supportMode`).
+        let support_mode = input
+            .support_mode
+            .unwrap_or_else(|| crate::state::SUPPORT_MODE_AI_ONLY.to_string());
+        let content = content_record(input.inquiry_content);
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        let fingerprint = request_fingerprint(&input.name, &support_mode, &content, &tags);
+
+        let mut store = state.lock();
+
+        // `clientToken` is this operation's `@idempotencyToken`. Checked BEFORE the
+        // capacity bound below, so a retry of a call that already succeeded still
+        // replays from a full store.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(record) = store.inquiry_create_tokens.get(token).cloned() {
+                if record.fingerprint != fingerprint {
+                    return Err(CreateComplianceInquiryErrorModeled::ConflictException(
+                        crate::state::inquiry_token_mismatch(&record.inquiry_id),
+                    )
+                    .into());
+                }
+                if let Some(inquiry) = store.inquiries.get_mut(&record.inquiry_id) {
+                    // A replay reports the inquiry as it stands now, including any
+                    // transition the clock owed it since the first call.
+                    inquiry.materialise(now);
+                    return Ok(created(inquiry));
+                }
+            }
+        }
+
+        // Residency bound: this store holds at most `INQUIRY_CAPACITY` inquiries, so
+        // repeated creates cannot grow the emulator's memory without end.
+        if !store.accepts_another_inquiry() {
+            return Err(CreateComplianceInquiryErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: format!(
+                        "this emulator stores at most {} compliance inquiries",
+                        crate::state::INQUIRY_CAPACITY
+                    ),
+                    service_code: Some("artifact".to_string()),
+                    quota_code: Some("ComplianceInquiriesPerAccount".to_string()),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_inquiry_id();
+        let inquiry = crate::state::ComplianceInquiry {
+            arn: crate::state::inquiry_arn(&region, &id),
+            name: input.name,
+            status: crate::state::INQUIRY_STATUS_PROCESSING.to_string(),
+            status_message: crate::state::INQUIRY_MESSAGE_IN_PROGRESS.to_string(),
+            support_mode,
+            queries: enumerate_queries(&content, now),
+            content,
+            created_at: now,
+            updated_at: now,
+            // The transition the clock owes this inquiry. The span is never zero, so the
+            // caller of this very call sees the non-terminal status it just returned.
+            processing_due_at: Some(now + crate::state::INQUIRY_PROCESSING_SPAN),
+            tags,
+            id: id.clone(),
+        };
+
+        let response = created(&inquiry);
+        let input_source = inquiry.content.input_source();
+        store.inquiries.insert(id.clone(), inquiry);
+        if let Some(token) = input.client_token {
+            store.record_inquiry_create(token, &id, &fingerprint);
+        }
+
+        // Attributable: the resource created and how it was submitted. NEVER the
+        // inquiry's content or name — both are `@sensitive` in the model.
+        ::tracing::info!(
+            operation = "CreateComplianceInquiry",
+            compliance_inquiry_id = %id,
+            input_source,
+            outcome = "created",
+            "created a compliance inquiry"
+        );
+
+        Ok(response)
     }
+}
+
+/// The 202 response for a stored inquiry — every member read back off the record, so the
+/// create and a later `GetComplianceInquiryMetadata` cannot disagree.
+fn created(inquiry: &crate::state::ComplianceInquiry) -> CreateComplianceInquiryOutput {
+    CreateComplianceInquiryOutput {
+        compliance_inquiry_summary: Some(inquiry.to_summary()),
+        // An untagged resource reports no `tags` member at all, rather than an empty map.
+        tags: (!inquiry.tags.is_empty()).then(|| inquiry.tags_map()),
+    }
+}
+
+/// The submitted content, as the state persists it.
+fn content_record(content: InquiryContent) -> crate::state::InquiryContentRecord {
+    match content {
+        InquiryContent::Query(query) => crate::state::InquiryContentRecord::Text(query),
+        InquiryContent::fileContent(file) => crate::state::InquiryContentRecord::File {
+            sections: file.file_sections.unwrap_or_default(),
+            content: file.content,
+        },
+    }
+}
+
+/// The queries the inquiry owns at creation.
+///
+/// A TEXT inquiry carries exactly one: the submitted query itself, so its text is known
+/// without parsing anything. A FILE inquiry's queries are the ones written in the
+/// uploaded document — reading them out means parsing that document, which this emulator
+/// does not do, so it owns none and `materialise` reports its processing as failed rather
+/// than inventing queries nothing read.
+fn enumerate_queries(
+    content: &crate::state::InquiryContentRecord,
+    now: ::std::time::SystemTime,
+) -> Vec<crate::state::InquiryQuery> {
+    match content {
+        crate::state::InquiryContentRecord::Text(query) => {
+            vec![crate::state::InquiryQuery {
+                // "Sequential identifier of the query within the inquiry" — the first.
+                identifier: 1,
+                query: query.clone(),
+                response: None,
+                // `supportMode`'s `FULL_SUPPORT` is "only supported for file upload
+                // mode", so a query read off submitted text is AI-reviewed whatever the
+                // request asked for.
+                review_type: Some(crate::state::REVIEW_TYPE_AI.to_string()),
+                status: crate::state::QUERY_STATUS_PROCESSING.to_string(),
+                status_message: crate::state::QUERY_MESSAGE_IN_PROGRESS.to_string(),
+                created_at: now,
+            }]
+        }
+        crate::state::InquiryContentRecord::File { .. } => Vec::new(),
+    }
+}
+
+/// A fingerprint of the request this create was made from, so a replayed `clientToken`
+/// can be told from a token reused on different content.
+///
+/// Every member that shapes the created inquiry is absorbed, each prefixed with its
+/// length, so no two different requests can produce the same digest by splitting their
+/// fields differently. The tags are absorbed in key order (`BTreeMap`), because a map's
+/// wire order is not part of the request.
+fn request_fingerprint(
+    name: &str,
+    support_mode: &str,
+    content: &crate::state::InquiryContentRecord,
+    tags: &::std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut hasher = Sha256::new();
+    absorb(&mut hasher, "name", name.as_bytes());
+    absorb(&mut hasher, "supportMode", support_mode.as_bytes());
+    match content {
+        crate::state::InquiryContentRecord::Text(query) => {
+            absorb(&mut hasher, "query", query.as_bytes());
+        }
+        crate::state::InquiryContentRecord::File { sections, content } => {
+            for section in sections {
+                absorb(&mut hasher, "fileSection", section.as_bytes());
+            }
+            absorb(&mut hasher, "fileContent", content);
+        }
+    }
+    for (key, value) in tags {
+        absorb(&mut hasher, "tagKey", key.as_bytes());
+        absorb(&mut hasher, "tagValue", value.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Absorb one length-prefixed, labelled field into `hasher`.
+fn absorb(hasher: &mut Sha256, label: &str, value: &[u8]) {
+    hasher.update(u64::try_from(label.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(value);
 }

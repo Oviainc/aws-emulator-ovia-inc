@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWirelessDevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWirelessDevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWirelessDevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a wireless device against an existing destination, minting
+//! its `Id` and ARN. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +164,226 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWirelessDevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWirelessDeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWirelessDevice"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWirelessDeviceError::from(
+                CreateWirelessDeviceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        if !crate::state::WIRELESS_DEVICE_TYPES.contains(&input.r#type.as_str()) {
+            return Err(CreateWirelessDeviceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Type must be one of {:?}, got {:?}",
+                        crate::state::WIRELESS_DEVICE_TYPES, input.r#type
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(positioning) = input.positioning.as_deref() {
+            if !crate::state::POSITIONING_CONFIG_STATUSES.contains(&positioning) {
+                return Err(CreateWirelessDeviceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "Positioning must be one of {:?}, got {positioning:?}",
+                            crate::state::POSITIONING_CONFIG_STATUSES
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let fingerprint = fingerprint(&input);
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is an `@idempotencyToken`: replaying it with the same
+        // parameters completes successfully and returns the id the first call minted;
+        // replaying it with different parameters is an HTTP 409.
+        if let Some(token) = input.client_request_token.as_deref() {
+            if let Some(prior) = store.wireless_device_token(token) {
+                if prior.fingerprint != fingerprint {
+                    return Err(CreateWirelessDeviceErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(format!(
+                                "ClientRequestToken {token} was already used with different \
+                                 parameters"
+                            )),
+                            resource_id: Some(prior.resource_key.clone()),
+                            resource_type: Some("WirelessDevice".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                if let Some(existing) = store.wireless_devices.get(&prior.resource_key) {
+                    return Ok(CreateWirelessDeviceOutput {
+                        arn: Some(existing.arn.clone()),
+                        id: Some(existing.id.clone()),
+                    });
+                }
+                // The device this token minted has since been deleted, so there is
+                // nothing to replay: fall through and create a new one.
+            }
+        }
+
+        // EVERY destination this request references is checked against real state, not
+        // just the top-level one: a device cannot route uplinks, positioning fixes or an
+        // application's frames to a destination that does not exist.
+        for referenced in referenced_destinations(&input) {
+            if !store.destinations.contains_key(referenced) {
+                return Err(
+                    CreateWirelessDeviceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("Destination {referenced} not found")),
+                            resource_id: Some(referenced.to_string()),
+                            resource_type: Some("Destination".to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A `DevEui` identifies exactly one device on the network, and
+        // `GetWirelessDevice?identifierType=DevEui` resolves by it, so a second device
+        // claiming one already registered is the inconsistent state `ConflictException`
+        // names rather than a silent re-point of the existing identifier.
+        let dev_eui = input
+            .lo_ra_wan
+            .as_ref()
+            .and_then(|lorawan| lorawan.dev_eui.clone());
+        if let Some(dev_eui) = dev_eui.as_deref() {
+            if let Some(owner) = store.dev_eui_index.get(dev_eui) {
+                return Err(
+                    CreateWirelessDeviceErrorModeled::ConflictException(ConflictException {
+                        message: Some(format!(
+                            "DevEui {dev_eui} is already registered to wireless device {owner}"
+                        )),
+                        resource_id: Some(owner.clone()),
+                        resource_type: Some("WirelessDevice".to_string()),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without bound. This operation models no quota error, so a full store is a
+        // `ValidationException` naming the ceiling it hit.
+        if store.wireless_devices.len() >= crate::state::MAX_WIRELESS_DEVICES {
+            return Err(CreateWirelessDeviceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "this emulator stores at most {} wireless devices; delete one \
+                         before creating another",
+                        crate::state::MAX_WIRELESS_DEVICES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_wireless_device_id();
+        let device = crate::state::WirelessDevice {
+            arn: crate::state::wireless_device_arn(&region, &id),
+            id: id.clone(),
+            device_type: input.r#type.clone(),
+            name: input.name.clone(),
+            description: input.description.clone(),
+            destination_name: input.destination_name.clone(),
+            lorawan: input.lo_ra_wan.clone(),
+            sidewalk: input.sidewalk.as_ref().map(|requested| SidewalkDevice {
+                device_profile_id: requested.device_profile_id.clone(),
+                sidewalk_manufacturing_sn: requested.sidewalk_manufacturing_sn.clone(),
+                positioning: requested.positioning.clone(),
+                ..SidewalkDevice::default()
+            }),
+            positioning: input.positioning.clone(),
+            thing_name: None,
+            thing_arn: None,
+            fuota_task_id: None,
+            multicast_group_id: None,
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at: ::std::time::SystemTime::now(),
+            last_uplink_received_at: None,
+        };
+        let output = CreateWirelessDeviceOutput {
+            arn: Some(device.arn.clone()),
+            id: Some(device.id.clone()),
+        };
+        store.wireless_devices.insert(id.clone(), device);
+        if let Some(dev_eui) = dev_eui {
+            store.dev_eui_index.insert(dev_eui, id.clone());
+        }
+        if let Some(token) = input.client_request_token.clone() {
+            store.record_wireless_device_token(
+                token,
+                crate::state::IdempotentCreate {
+                    resource_key: id,
+                    fingerprint,
+                },
+            );
+        }
+        Ok(output)
     }
+}
+
+/// Every `DestinationName` this request names, in the order a refusal should report
+/// them: the device's own destination, the one a Sidewalk positioning configuration
+/// routes fixes to, and the one each LoRaWAN application `FPort` routes frames to.
+///
+/// They are all the same kind of reference to the same resource, so they are all
+/// resolved against the destination store rather than only the top-level member.
+fn referenced_destinations(input: &CreateWirelessDeviceInput) -> Vec<&str> {
+    let mut names = vec![input.destination_name.as_str()];
+    if let Some(name) = input
+        .sidewalk
+        .as_ref()
+        .and_then(|sidewalk| sidewalk.positioning.as_ref())
+        .and_then(|positioning| positioning.destination_name.as_deref())
+    {
+        names.push(name);
+    }
+    let applications = input
+        .lo_ra_wan
+        .as_ref()
+        .and_then(|lorawan| lorawan.f_ports.as_ref())
+        .and_then(|f_ports| f_ports.applications.as_ref());
+    for application in applications.into_iter().flatten() {
+        if let Some(name) = application.destination_name.as_deref() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The create parameters, the token excluded, as one comparable string — what decides
+/// whether a replayed `ClientRequestToken` carries "the same parameters".
+///
+/// Tags are sorted because a tag set is unordered on the wire, so two requests that
+/// differ only in tag order carry the same parameters.
+fn fingerprint(input: &CreateWirelessDeviceInput) -> String {
+    let mut tags: Vec<(&str, &str)> = input
+        .tags
+        .iter()
+        .flatten()
+        .map(|tag| (tag.key.as_str(), tag.value.as_str()))
+        .collect();
+    tags.sort_unstable();
+    format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{tags:?}",
+        input.r#type,
+        input.name,
+        input.description,
+        input.destination_name,
+        input.positioning,
+        input.lo_ra_wan,
+        input.sidewalk,
+    )
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores an Execution record and RUNS the state machine's Amazon
+//! States Language definition through [`crate::state::asl`], parking the terminal
+//! outcome the walk computed until the clock makes it due.//!
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -212,18 +208,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        // `stateMachineArn` (1..256), `name` (1..80), `input` (0..262144) and
+        // `traceHeader`'s ASCII pattern are modelled, so the centralized walk has
+        // already refused anything outside them. The character rule on `name` and the
+        // requirement that `input` be JSON are not modelled, so they are checked here.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        if crate::state::parse_state_machine_arn(&input.state_machine_arn).is_none() {
+            return Err(StartExecutionErrorModeled::InvalidArn(InvalidArn {
+                message: Some(format!(
+                    "'{}' is not a state machine ARN of this service",
+                    input.state_machine_arn
+                )),
+            })
+            .into());
+        }
+
+        if let Some(name) = input.name.as_deref() {
+            if let Some(why) = crate::state::invalid_name_reason(name) {
+                return Err(
+                    StartExecutionErrorModeled::InvalidName(InvalidName { message: Some(why) })
+                        .into(),
+                );
+            }
+        }
+
+        // `input`'s own documentation: "The string that contains the JSON input data
+        // for the execution" — an execution with no input data is still the empty JSON
+        // object, which is what the interpreter receives.
+        let execution_input = input.input.clone().unwrap_or_else(|| "{}".to_string());
+        if let Err(error) = serde_json::from_str::<serde_json::Value>(&execution_input) {
+            return Err(StartExecutionErrorModeled::InvalidExecutionInput(
+                InvalidExecutionInput {
+                    message: Some(format!("input is not valid JSON: {error}")),
+                },
+            )
+            .into());
+        }
+
+        let started = crate::state::now();
+
+        // Phase 1, under the lock: resolve the state machine and read what the run
+        // needs. The lock is released before the walk, so no other request waits on
+        // an interpretation.
+        let (machine_arn, machine_name, machine_type, definition, execution_name) = {
+            let mut store = state.lock();
+            store.settle(started);
+            let Some(machine) = store.state_machines.get(&input.state_machine_arn) else {
+                return Err(StartExecutionErrorModeled::StateMachineDoesNotExist(
+                    StateMachineDoesNotExist {
+                        message: Some(format!(
+                            "state machine {} does not exist",
+                            input.state_machine_arn
+                        )),
+                    },
+                )
+                .into());
+            };
+            if machine.is_deleting() {
+                return Err(StartExecutionErrorModeled::StateMachineDeleting(
+                    StateMachineDeleting {
+                        message: Some(format!(
+                            "state machine {} is being deleted",
+                            input.state_machine_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+            let (arn, name, sm_type, definition) = (
+                machine.arn.clone(),
+                machine.name.clone(),
+                machine.sm_type.clone(),
+                machine.definition.clone(),
+            );
+            // "If you don't provide a name for the execution, Step Functions
+            // automatically generates a universally unique identifier (UUID) as the
+            // execution name." The store mints it, so its counter keeps two mints in
+            // the same nanosecond apart.
+            let execution_name = match input.name.clone() {
+                Some(name) => name,
+                None => store.fresh_execution_name(),
+            };
+            (arn, name, sm_type, definition, execution_name)
+        };
+
+        // The execution ARN is built in the state machine's OWN region, so the two
+        // ARNs always agree however the request was signed.
+        let region = crate::state::arn_region(&machine_arn);
+        let arn = crate::state::execution_arn(&region, &machine_name, &execution_name);
+
+        // Phase 2, OUTSIDE the lock: the definition is INTERPRETED here. The walk is
+        // bounded by its own step budget, but it is the expensive part of this call,
+        // so it does not hold the shared store. The outcome it computes is owed to
+        // the clock, so the execution reports RUNNING until then.
+        let (history, pending) = crate::state::plan_run(&definition, &execution_input, started);
+        let candidate = crate::state::Execution {
+            arn: arn.clone(),
+            state_machine_arn: machine_arn.clone(),
+            name: execution_name,
+            status: crate::state::EXECUTION_STATUS_RUNNING.to_string(),
+            start_date: started,
+            stop_date: None,
+            input: execution_input.clone(),
+            output: None,
+            error: None,
+            cause: None,
+            trace_header: input.trace_header,
+            redrive_count: 0,
+            history,
+            pending: Some(pending),
+            // Measured and counted by `insert_execution`.
+            retained_bytes: 0,
+        };
+
+        // Phase 3, under the lock again: admit it. Every check is re-made, because
+        // the state machine could have been deleted and the name could have been
+        // taken while the walk ran.
+        let mut store = state.lock();
+        store.settle(started);
+        let Some(machine) = store.state_machines.get(&machine_arn) else {
+            return Err(StartExecutionErrorModeled::StateMachineDoesNotExist(
+                StateMachineDoesNotExist {
+                    message: Some(format!("state machine {machine_arn} does not exist")),
+                },
+            )
+            .into());
+        };
+        if machine.is_deleting() {
+            return Err(StartExecutionErrorModeled::StateMachineDeleting(
+                StateMachineDeleting {
+                    message: Some(format!("state machine {machine_arn} is being deleted")),
+                },
+            )
+            .into());
+        }
+
+        // "StartExecution is idempotent for STANDARD workflows. [...] if you call
+        // StartExecution with the same name and input as a running execution, the call
+        // succeeds and return the same response as the original request. If the
+        // execution is closed or if the input is different, it returns a 400
+        // ExecutionAlreadyExists error." It "isn't idempotent for EXPRESS workflows".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartExecution"))
+        // An execution record is keyed by its own ARN, which its name determines, so
+        // a name already in use names a STORED execution either way. For STANDARD the
+        // documented same-name-and-input hit answers the first response; for EXPRESS
+        // there is no such hit, and serving a second run under a reused name needs the
+        // Express execution ARN's own unique id, which this model does not describe —
+        // so rather than overwrite the stored execution, the reused name is refused
+        // with this operation's modelled error.
+        let standard = machine_type != crate::state::STATE_MACHINE_TYPE_EXPRESS;
+        if let Some(existing) = store.executions.get(&arn) {
+            if !standard || existing.is_terminal() || existing.input != execution_input {
+                return Err(StartExecutionErrorModeled::ExecutionAlreadyExists(
+                    ExecutionAlreadyExists {
+                        message: Some(format!("execution {arn} already exists")),
+                    },
+                )
+                .into());
+            }
+            return Ok(StartExecutionOutput {
+                execution_arn: existing.arn.clone(),
+                start_date: crate::state::to_date_time(existing.start_date),
+            });
+        }
+
+        // The store's caps are in records AND in bytes: an execution retains its
+        // `input` (caller-sized up to the modelled 256 KiB), the outcome the walk
+        // computed and that run's history, so a record count alone would not bound
+        // the memory.
+        if let Some(why) = store.execution_rejection(&machine_arn, candidate.measure()) {
+            return Err(
+                StartExecutionErrorModeled::ExecutionLimitExceeded(ExecutionLimitExceeded {
+                    message: Some(why),
+                })
+                .into(),
+            );
+        }
+
+        store.insert_execution(candidate);
+
+        Ok(StartExecutionOutput {
+            execution_arn: arn,
+            start_date: crate::state::to_date_time(started),
+        })
     }
 }

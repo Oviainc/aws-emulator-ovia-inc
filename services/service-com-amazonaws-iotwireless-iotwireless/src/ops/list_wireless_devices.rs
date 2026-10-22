@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWirelessDevices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWirelessDevices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWirelessDevices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the persisted wireless devices, filtered and paginated.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,20 +150,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWirelessDevices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWirelessDevicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWirelessDevices"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWirelessDevicesError::from(
+                ListWirelessDevicesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the iotwireless store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        if let Some(device_type) = input.wireless_device_type.as_deref() {
+            if !crate::state::WIRELESS_DEVICE_TYPES.contains(&device_type) {
+                return Err(ListWirelessDevicesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "WirelessDeviceType must be one of {:?}, got {device_type:?}",
+                            crate::state::WIRELESS_DEVICE_TYPES
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // An empty `nextToken` query parameter is "no token", the same as omitting it;
+        // a non-empty one must be a token this service minted.
+        let resume_after = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListWirelessDevicesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "NextToken is not a token this service issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // `MaxResults` is modelled with a default of 0 and a range of 0..250; 0 is "no
+        // caller-supplied page size", so the whole remaining list is returned.
+        let limit = (input.max_results > 0).then_some(input.max_results as usize);
+
+        let store = state.lock();
+        // `wireless_devices` is a `BTreeMap`, so this walks the devices in one stable
+        // id order — which is what lets the resume key below name an exact position.
+        // One more than the page size is taken, so whether a next page exists is known
+        // without materialising the whole remaining list.
+        let mut page: Vec<WirelessDeviceStatistics> = store
+            .wireless_devices
+            .values()
+            .filter(|device| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|last| device.id.as_str() > last)
+            })
+            .filter(|device| matches(device, &input))
+            .take(limit.map_or(usize::MAX, |limit| limit.saturating_add(1)))
+            .map(statistics)
+            .collect();
+
+        let mut next_token = None;
+        if let Some(limit) = limit {
+            if page.len() > limit {
+                page.truncate(limit);
+                // Resume AFTER the last id this page returned, so the next page starts
+                // at the very next device with neither a repeat nor an omission.
+                next_token = page
+                    .last()
+                    .and_then(|last| last.id.as_deref())
+                    .map(crate::state::encode_page_token);
+            }
+        }
+
+        Ok(ListWirelessDevicesOutput {
+            next_token,
+            wireless_device_list: Some(page),
+        })
+    }
+}
+
+/// Whether a stored device satisfies every filter the request supplied.
+///
+/// Each filter is answered from the device's own persisted record — including the FUOTA
+/// task and multicast group, which only the (still scaffolded)
+/// `Associate*WithFuotaTask` / `*WithMulticastGroup` operations set, so no stored device
+/// carries one today and those two filters select nothing until they do.
+fn matches(device: &crate::state::WirelessDevice, input: &ListWirelessDevicesInput) -> bool {
+    if let Some(destination_name) = input.destination_name.as_deref() {
+        if device.destination_name != destination_name {
+            return false;
+        }
+    }
+    if let Some(device_type) = input.wireless_device_type.as_deref() {
+        if device.device_type != device_type {
+            return false;
+        }
+    }
+    if let Some(device_profile_id) = input.device_profile_id.as_deref() {
+        let lorawan = device
+            .lorawan
+            .as_ref()
+            .and_then(|l| l.device_profile_id.as_deref());
+        let sidewalk = device
+            .sidewalk
+            .as_ref()
+            .and_then(|s| s.device_profile_id.as_deref());
+        if lorawan != Some(device_profile_id) && sidewalk != Some(device_profile_id) {
+            return false;
+        }
+    }
+    if let Some(service_profile_id) = input.service_profile_id.as_deref() {
+        if device
+            .lorawan
+            .as_ref()
+            .and_then(|l| l.service_profile_id.as_deref())
+            != Some(service_profile_id)
+        {
+            return false;
+        }
+    }
+    if let Some(fuota_task_id) = input.fuota_task_id.as_deref() {
+        if device.fuota_task_id.as_deref() != Some(fuota_task_id) {
+            return false;
+        }
+    }
+    if let Some(multicast_group_id) = input.multicast_group_id.as_deref() {
+        if device.multicast_group_id.as_deref() != Some(multicast_group_id) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The `WirelessDeviceStatistics` view of a stored device: the list's projection of the
+/// same record `GetWirelessDevice` returns in full.
+fn statistics(device: &crate::state::WirelessDevice) -> WirelessDeviceStatistics {
+    WirelessDeviceStatistics {
+        arn: Some(device.arn.clone()),
+        id: Some(device.id.clone()),
+        r#type: Some(device.device_type.clone()),
+        name: device.name.clone(),
+        destination_name: Some(device.destination_name.clone()),
+        last_uplink_received_at: device.last_uplink_received_at.clone(),
+        lo_ra_wan: device.lorawan.as_ref().map(|lorawan| LoRaWANListDevice {
+            dev_eui: lorawan.dev_eui.clone(),
+        }),
+        sidewalk: device.sidewalk.as_ref().map(|sidewalk| SidewalkListDevice {
+            amazon_id: sidewalk.amazon_id.clone(),
+            sidewalk_id: sidewalk.sidewalk_id.clone(),
+            sidewalk_manufacturing_sn: sidewalk.sidewalk_manufacturing_sn.clone(),
+            device_certificates: sidewalk.device_certificates.clone(),
+            device_profile_id: sidewalk.device_profile_id.clone(),
+            status: sidewalk.status.clone(),
+            positioning: sidewalk.positioning.clone(),
+        }),
+        // A FUOTA / multicast status and group id exist only for a device that belongs
+        // to one, and nothing can join a device to either yet.
+        fuota_device_status: None,
+        multicast_device_status: None,
+        mc_group_id: None,
+        positioning: device.positioning.clone(),
     }
 }
