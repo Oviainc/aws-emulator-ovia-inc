@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Gets information about the active (live) stream on a specified channel — a pure
+//! read of this service's state: the channel must exist, and it must be
+//! broadcasting, or the operation answers the modelled 404 for whichever of those
+//! two is false.
 //!
 //! ## Shape of an operation
 //!
@@ -86,11 +81,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivs-amazoninteractivevi
 // here — hence the `GetStreamError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#GetStream")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#GetStream",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetStreamErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ChannelNotBroadcasting(ChannelNotBroadcasting),
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
@@ -141,23 +140,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GET_STREAM_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the channel's active stream.
+    ///
+    /// A REPORTING operation (the model marks it `@readonly`): it resolves the
+    /// channel and the stream from the store and writes nothing, so polling it
+    /// while a broadcast runs cannot itself change what a later caller sees.
+    ///
+    /// Three answers, in the order the two resources are resolved:
+    ///
+    /// * the channel is not in the store -> `ResourceNotFoundException` (404),
+    ///   naming the ARN the request asked for;
+    /// * the channel holds no stream in the `LIVE` state -> the operation's own
+    ///   `ChannelNotBroadcasting` (404), which is the answer for a channel that
+    ///   has never gone live and for one whose broadcast has ended alike;
+    /// * otherwise the persisted stream, exactly as the ingest that started it
+    ///   minted it.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStream"))
+        // Nothing here reads request metadata: `GetStream` is identified entirely by
+        // its `channelArn` member. A malformed ARN never reaches here either —
+        // `GetStreamRequest$channelArn` carries the modelled `ChannelArn` length and
+        // pattern, which the framework's constraint walk refuses with a 400
+        // `ValidationException` before `handle` runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetStreamErrorModeled::InternalServerException(InternalServerException {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        let store = state.lock();
+        if !store.channels.contains_key(&input.channel_arn) {
+            return Err(GetStreamErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    exception_message: Some(format!("Resource: {} not found", input.channel_arn)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+        let stream = crate::state::live_stream(&store, &input.channel_arn).ok_or_else(|| {
+            GetStreamErrorModeled::ChannelNotBroadcasting(ChannelNotBroadcasting {
+                exception_message: Some(format!(
+                    "Channel: {} is not currently online",
+                    input.channel_arn
+                )),
+                ..Default::default()
+            })
+        })?;
+
+        Ok(GetStreamOutput {
+            stream: Some(stream),
+        })
     }
 }
