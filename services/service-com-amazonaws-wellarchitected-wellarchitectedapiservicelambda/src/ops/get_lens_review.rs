@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLensReview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLensReview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLensReview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE lens review of ONE workload: the lens's own metadata, the pillar-by-pillar
+//! and whole-review risk roll-ups derived from the answers the reviewed workload stores,
+//! and the notes recorded against the review.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLensReview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLensReviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLensReview"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLensReviewErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        let store = state.lock();
+        let live = store.workloads.get(&input.workload_id).ok_or_else(|| {
+            GetLensReviewErrorModeled::ResourceNotFoundException(crate::state::workload_not_found(
+                &input.workload_id,
+            ))
+        })?;
+
+        // "A milestone records the state of a workload at a particular point in time"
+        // (`CreateMilestone` doc): a request that names one reads the review the RECORDED
+        // workload carried, not the live one.
+        let workload = match input.milestone_number {
+            None => live,
+            Some(number) => {
+                &store
+                    .milestone(&input.workload_id, number)
+                    .ok_or_else(|| {
+                        GetLensReviewErrorModeled::ResourceNotFoundException(
+                            crate::state::milestone_not_found(&input.workload_id, number),
+                        )
+                    })?
+                    .workload
+            }
+        };
+
+        // A lens review exists only while that lens is associated with the workload.
+        if !workload.reviews_lens(&input.lens_alias) {
+            return Err(GetLensReviewErrorModeled::ResourceNotFoundException(
+                crate::state::lens_review_not_found(&input.workload_id, &input.lens_alias),
+            )
+            .into());
+        }
+
+        let lens = input.lens_alias.as_str();
+        // One summary per pillar the lens is organized into, in the lens's own order,
+        // each counting only the questions THAT pillar asks. A lens this emulator holds
+        // no content for is organized into no pillars, so it reports none.
+        let pillar_review_summaries: Vec<PillarReviewSummary> = crate::state::lens_pillars(lens)
+            .iter()
+            .map(|(pillar_id, pillar_name, _)| PillarReviewSummary {
+                pillar_id: Some((*pillar_id).to_string()),
+                pillar_name: Some((*pillar_name).to_string()),
+                // A pillar's notes are what `UpdateLensReview$PillarNotes` records; that
+                // operation is still a stub with its own issue, so no pillar of a review
+                // here carries any.
+                notes: None,
+                risk_counts: Some(crate::state::risk_counts_to_map(
+                    &workload.pillar_risk_counts(lens, pillar_id),
+                )),
+                // The risk counts restricted to the questions a PROFILE prioritises exist
+                // only once a profile is associated with the workload; profiles are still
+                // a stub, so there is nothing to project.
+                prioritized_risk_counts: None,
+            })
+            .collect();
+
+        let metadata = crate::state::lens_metadata(lens);
+
+        Ok(GetLensReviewOutput {
+            workload_id: Some(workload.workload_id.clone()),
+            // Echoed only when the request scoped the read to a milestone: a read of the
+            // live review is not a read of any milestone.
+            milestone_number: input.milestone_number,
+            lens_review: Some(LensReview {
+                // The lens as the request named it, beside the ARN it resolves to.
+                lens_alias: Some(input.lens_alias.clone()),
+                lens_arn: Some(store.lens_arn_of(lens, &crate::state::request_region(ctx.parts()))),
+                lens_version: metadata.map(|content| content.version.to_string()),
+                lens_name: metadata.map(|content| content.name.to_string()),
+                lens_status: metadata.map(|content| content.status.to_string()),
+                pillar_review_summaries: Some(pillar_review_summaries),
+                // The review's Jira configuration is what `UpdateLensReview` /
+                // `UpdateIntegration` record; both are still stubs, so nothing is
+                // configured here.
+                jira_configuration: None,
+                // "The date and time when the lens review was last updated": a review's
+                // content — the answers recorded against it and its notes — is part of
+                // the workload record, so the instant the workload last changed is the
+                // instant its reviews last changed. A milestone read reports the instant
+                // the RECORDED workload carried, which is what that milestone froze.
+                updated_at: Some(::aws_smithy_types::DateTime::from(workload.updated_at)),
+                // The lens notes `UpdateLensReview$LensNotes` records; that operation is
+                // still a stub with its own issue.
+                notes: None,
+                // The roll-up over THIS lens's questions alone, derived from the stored
+                // answers on every read: it moves when an answer does.
+                risk_counts: Some(crate::state::risk_counts_to_map(
+                    &workload.lens_risk_counts(lens),
+                )),
+                // `GetLensReview` is not `@paginated` and reports every pillar of the
+                // lens in one answer, so there is never a further page to fetch.
+                next_token: None,
+                // As on the workload itself: a review carries profiles, and risk counts
+                // restricted to the questions they prioritise, only once a profile is
+                // associated, and profiles are still a stub.
+                profiles: None,
+                prioritized_risk_counts: None,
+            }),
+        })
     }
 }

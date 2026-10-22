@@ -218,11 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The answers of a lens review exist only while that lens is associated with the
         // workload, so a lens the workload does not carry has no review to report.
-        if !workload
-            .lenses
-            .iter()
-            .any(|lens| crate::state::lens_alias(lens) == crate::state::lens_alias(&input.lens_alias))
-        {
+        if !workload.reviews_lens(&input.lens_alias) {
             return Err(ListAnswersErrorModeled::ResourceNotFoundException(
                 crate::state::lens_review_not_found(&input.workload_id, &input.lens_alias),
             )
@@ -267,23 +263,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Echoed only when the request scoped the read to a milestone: a read of the
             // live review is not a read of any milestone.
             milestone_number: input.milestone_number,
-            // The lens as the request named it, beside the ARN it resolves to: an
-            // AWS-official lens's ARN carries no owner account and is built from the
-            // alias, while a custom lens's is the one its import minted and the lens
-            // store holds. (A custom lens cannot be reviewed until `CreateLensVersion`
-            // publishes it — its own stub — so a custom lens named in a workload's
-            // `Lenses` is reported by the ARN the caller named it with.)
+            // The lens as the request named it, beside the ARN it resolves to
+            // (`crate::state::...::lens_arn_of`, the one place this service resolves a
+            // lens's ARN).
             lens_alias: Some(input.lens_alias.clone()),
-            lens_arn: Some(if crate::state::is_aws_official_lens(&input.lens_alias) {
-                crate::state::official_lens_arn(
-                    &crate::state::request_region(ctx.parts()),
-                    &input.lens_alias,
-                )
-            } else {
-                store
-                    .lens_by_alias(&input.lens_alias)
-                    .map_or_else(|| input.lens_alias.clone(), |lens| lens.lens_arn.clone())
-            }),
+            lens_arn: Some(store.lens_arn_of(
+                &input.lens_alias,
+                &crate::state::request_region(ctx.parts()),
+            )),
             answer_summaries: Some(answer_summaries),
             next_token: page.next_token,
         })
