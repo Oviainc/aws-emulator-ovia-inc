@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation creates a DB instance in this service's store and
+//! answers from the stored record. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records and their projection onto the modelled wire shapes live in
+//! [`crate::state`], shared with the other implemented DB-instance operations.
 //!
 //! ## Shape of an operation
 //!
@@ -361,18 +357,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBInstance"))
+        let region = crate::state::request_region(ctx)
+            .map_err(CreateDBInstanceError::validation)?;
+
+        // "This parameter is stored as a lowercase string" — so the identifier is
+        // folded before it is validated, stored or echoed, and every later lookup
+        // folds the same way.
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+        crate::state::check_identifier("DBInstanceIdentifier", &identifier, 63)
+            .map_err(CreateDBInstanceError::validation)?;
+
+        // Documented constraints this operation models no error for: refused as a
+        // 400 `ValidationException` naming the member and its bound, never a 501.
+        if input.multi_az == Some(true) && input.availability_zone.is_some() {
+            return Err(CreateDBInstanceError::validation(
+                "AvailabilityZone can't be specified when MultiAZ is enabled",
+            ));
+        }
+        if let Some(port) = input.port {
+            if !crate::state::PORT_RANGE.contains(&port) {
+                return Err(CreateDBInstanceError::validation(format!(
+                    "invalid value {port} for Port: must be a value from {} to {}",
+                    crate::state::PORT_RANGE.start(),
+                    crate::state::PORT_RANGE.end()
+                )));
+            }
+        }
+        if let Some(period) = input.backup_retention_period {
+            if !crate::state::BACKUP_RETENTION_RANGE.contains(&period) {
+                return Err(CreateDBInstanceError::validation(format!(
+                    "invalid value {period} for BackupRetentionPeriod: must be a value from {} to {}",
+                    crate::state::BACKUP_RETENTION_RANGE.start(),
+                    crate::state::BACKUP_RETENTION_RANGE.end()
+                )));
+            }
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        let key = (region.clone(), identifier.clone());
+        if store.db_instances.contains_key(&key) {
+            return Err(CreateDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
+                DBInstanceAlreadyExistsFault {
+                    message: Some(format!("DB instance already exists: {identifier}")),
+                },
+            )
+            .into());
+        }
+        // The region's DB instance quota, and the number of regions this store keeps
+        // records for at all: a store that grows without bound is not what the real
+        // service does, and the modelled fault says exactly this.
+        if store.instances_in(&region).len() >= crate::state::DB_INSTANCE_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(CreateDBInstanceErrorModeled::InstanceQuotaExceededFault(
+                InstanceQuotaExceededFault {
+                    message: Some(format!(
+                        "the request would exceed the allowed number of DB instances ({} per \
+                         region, in at most {} regions)",
+                        crate::state::DB_INSTANCE_QUOTA_PER_REGION,
+                        crate::state::MAX_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mint = store.next_mint();
+        let storage_type = input
+            .storage_type
+            .unwrap_or_else(|| crate::state::default_storage_type(input.iops).to_string());
+        let endpoint_port = input
+            .port
+            .unwrap_or_else(|| crate::state::default_port(&input.engine));
+        let publicly_accessible = input.publicly_accessible.unwrap_or_else(|| {
+            crate::state::default_publicly_accessible(
+                &input.engine,
+                input.db_subnet_group_name.as_deref(),
+            )
+        });
+        // RDS picks "a random, system-chosen Availability Zone in the endpoint's
+        // Amazon Web Services Region" when the request names none; this emulator
+        // picks the region's first zone, stores it, and reports it from the store.
+        let availability_zone = input
+            .availability_zone
+            .unwrap_or_else(|| format!("{region}a"));
+
+        let record = crate::state::DbInstanceRecord {
+            identifier: identifier.clone(),
+            region: region.clone(),
+            dbi_resource_id: crate::state::mint_dbi_resource_id(mint),
+            endpoint_host: crate::state::mint_endpoint_host(mint),
+            db_instance_class: input.db_instance_class,
+            engine: input.engine,
+            engine_version: input.engine_version,
+            // A newly created DB instance is not yet usable: RDS answers `creating`,
+            // and the instance reaches `available` on its own. The due instant is
+            // stored on the record, so nothing sleeps on this thread.
+            status: "creating".to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment("available")),
+            db_name: input.db_name,
+            allocated_storage: input.allocated_storage,
+            max_allocated_storage: input.max_allocated_storage,
+            // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying
+            // it, so it is accepted and never stored or returned. The username is.
+            master_username: input.master_username,
+            endpoint_port,
+            multi_az: input.multi_az.unwrap_or(false),
+            storage_type,
+            // `StorageEncrypted`: "By default, it isn't encrypted."
+            storage_encrypted: input.storage_encrypted.unwrap_or(false),
+            kms_key_id: input.kms_key_id,
+            iops: input.iops,
+            license_model: input.license_model,
+            availability_zone,
+            // `BackupRetentionPeriod`: "Default: 1".
+            backup_retention_period: input.backup_retention_period.unwrap_or(1),
+            preferred_backup_window: input.preferred_backup_window,
+            preferred_maintenance_window: input.preferred_maintenance_window,
+            publicly_accessible,
+            // `AutoMinorVersionUpgrade`: "By default, minor engine upgrades are
+            // applied automatically."
+            auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or(true),
+            // `CopyTagsToSnapshot`: "By default, tags are not copied."
+            copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+            // `DeletionProtection`: "By default, deletion protection isn't enabled."
+            deletion_protection: input.deletion_protection.unwrap_or(false),
+            db_subnet_group_name: input.db_subnet_group_name,
+            db_parameter_group_name: input.db_parameter_group_name,
+            vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
+            db_cluster_identifier: input.db_cluster_identifier,
+            domain: input.domain,
+            instance_create_time: crate::state::now_as_wire_timestamp(),
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        let db_instance = record.to_wire();
+        store.db_instances.insert(key, record);
+
+        Ok(CreateDBInstanceOutput {
+            db_instance: Some(db_instance),
+        })
     }
 }
