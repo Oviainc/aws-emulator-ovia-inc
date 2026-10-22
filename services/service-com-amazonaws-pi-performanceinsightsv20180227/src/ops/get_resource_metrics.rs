@@ -295,7 +295,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(max) if max > 0 => max as usize,
             _ => input.metric_queries.len(),
         };
-        let scope = page_scope(&input, period, aligned_start, aligned_end);
+        // The result set a cursor is handed out for: the resource, the effective
+        // period, the aligned window and the metric queries, through the
+        // service's one cursor-scope digest.
+        let period_text = period.to_string();
+        let aligned_start_text = aligned_start.to_string();
+        let aligned_end_text = aligned_end.to_string();
+        let mut scope_parts: Vec<&str> = vec![
+            &input.service_type,
+            &input.identifier,
+            &period_text,
+            &aligned_start_text,
+            &aligned_end_text,
+        ];
+        scope_parts.extend(
+            input
+                .metric_queries
+                .iter()
+                .map(|query| query.metric.as_str()),
+        );
+        let scope = crate::state::page_scope(&scope_parts);
         let offset = match input.next_token.as_deref() {
             None => 0,
             Some(token) => match crate::state::decode_page_token(token, &scope) {
@@ -423,31 +442,4 @@ fn choose_period(span_seconds: i64) -> i64 {
             points <= PERIOD_CHOICE_MAX_POINTS
         })
         .unwrap_or(coarsest)
-}
-
-/// The result set a `NextToken` was handed out for, as a digest: the resource,
-/// the aligned window, the period and the metric queries. Hashed so the token
-/// stays far inside the modelled `NextToken` length bound however long the
-/// metric list is.
-fn page_scope(
-    input: &GetResourceMetricsInput,
-    period: i64,
-    aligned_start: i64,
-    aligned_end: i64,
-) -> String {
-    use sha2::Digest as _;
-
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(input.service_type.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(input.identifier.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(period.to_be_bytes());
-    hasher.update(aligned_start.to_be_bytes());
-    hasher.update(aligned_end.to_be_bytes());
-    for query in &input.metric_queries {
-        hasher.update(query.metric.as_bytes());
-        hasher.update([0u8]);
-    }
-    hex::encode(hasher.finalize())
 }
