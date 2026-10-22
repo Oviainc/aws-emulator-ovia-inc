@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/namespace_workgroup_lifecycle.rs"]
 mod namespace_workgroup_lifecycle;
+#[path = "all/snapshot_and_usage_limit.rs"]
+mod snapshot_and_usage_limit;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/usage_limit_lifecycle.rs"]

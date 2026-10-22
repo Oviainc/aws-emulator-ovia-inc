@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a contact from the store, so a later `GetContact` answers 404 and
+//! `ListContacts` no longer reports it.
+//!
+//! A contact that still has contact channels is NOT removed: the model's own
+//! `ConflictException` doc says "Updating or deleting a resource causes an inconsistent
+//! state", and a channel's `ContactArn` is required, so deleting the contact under it
+//! would leave a channel pointing at nothing. The refusal names the dependent channels in
+//! the error's `DependentEntities`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +151,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteContact"))
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteContactErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        let Some(contact) = state.contacts.get(&input.contact_id) else {
+            return Err(DeleteContactErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Contact {} not found", input.contact_id),
+                    resource_id: input.contact_id.clone(),
+                    resource_type: "contact".to_string(),
+                },
+            )
+            .into());
+        };
+        let alias = contact.alias.clone();
+
+        let dependent_channels = state.channel_arns_of(&input.contact_id);
+        if !dependent_channels.is_empty() {
+            return Err(DeleteContactErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Contact {} still has {} contact channel(s); delete them before deleting \
+                     the contact",
+                    input.contact_id,
+                    dependent_channels.len()
+                ),
+                resource_id: input.contact_id.clone(),
+                resource_type: "contact".to_string(),
+                dependent_entities: Some(vec![DependentEntity {
+                    relation_type: "contact-channel".to_string(),
+                    dependent_resource_ids: dependent_channels,
+                }]),
+            })
+            .into());
+        }
+
+        state.contacts.remove(&input.contact_id);
+        state.alias_index.remove(&alias);
+        // The contact is gone, so no idempotency token can ever replay it: drop the
+        // ledger entries that named it rather than leaving them resident.
+        state.forget_idempotency_tokens_for(&input.contact_id);
+
+        Ok(DeleteContactOutput {})
     }
 }

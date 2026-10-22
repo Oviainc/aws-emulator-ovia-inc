@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Retires the persisted cluster named by the `@httpLabel` `identifier`: it reports
+//! `DELETING` and the clock removes it, so a later `GetCluster` answers
+//! `ResourceNotFoundException` and `ListClusters` stops listing it. A cluster with
+//! deletion protection enabled is refused with `ConflictException` (409); an unknown
+//! identifier with `ResourceNotFoundException` (404). `@idempotent`: a retry carrying
+//! the same `client-token` answers from the retired cluster rather than 404.
 //!
 //! ## Shape of an operation
 //!
@@ -95,11 +93,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `DeleteClusterError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#DeleteCluster")]
+// The operation's MODELED errors, plus the service-common `InternalServerException`
+// widened in with `extra_errors`: the service declares it for every operation (its
+// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
+// per-operation list the macro checks against does not repeat it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#DeleteCluster",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteClusterErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -153,18 +159,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCluster"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        let Some(cluster) = state.clusters.get_mut(&input.identifier) else {
+            // `@idempotent`: a retry of the same delete, carrying the same
+            // `client-token`, answers from the retired cluster instead of 404.
+            if let Some(retired) = state
+                .retired_clusters
+                .get(&input.identifier)
+                .filter(|retired| {
+                    input.client_token.is_some()
+                        && retired.delete_client_token == input.client_token
+                })
+            {
+                return Ok(delete_cluster_output(retired));
+            }
+            return Err(DeleteClusterErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&input.identifier),
+            )
+            .into());
+        };
+
+        // Deletion protection is exactly what it says: the cluster cannot be deleted
+        // until the property is disabled.
+        if cluster.deletion_protection_enabled {
+            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "cluster {} cannot be deleted while deletion protection is enabled",
+                    cluster.identifier
+                ),
+                resource_id: Some(cluster.identifier.clone()),
+                resource_type: Some("cluster".to_string()),
+            })
+            .into());
+        }
+
+        // A cluster the clock still owes a transition cannot start deleting; one that
+        // is already deleting answers with the delete in flight.
+        if cluster.status != crate::state::STATUS_DELETING && !cluster.accepts_mutation() {
+            return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "cluster {} cannot be deleted while its status is {}",
+                    cluster.identifier, cluster.status
+                ),
+                resource_id: Some(cluster.identifier.clone()),
+                resource_type: Some("cluster".to_string()),
+            })
+            .into());
+        }
+
+        if cluster.status != crate::state::STATUS_DELETING {
+            cluster.status = crate::state::STATUS_DELETING.to_string();
+            cluster.delete_client_token = input.client_token.clone();
+            // The clock, not a later caller, finishes the deletion.
+            cluster.pending = Some(crate::state::PendingTransition {
+                due_at: now + crate::state::SETTLE_AFTER,
+                next_status: crate::state::STATUS_DELETED,
+            });
+        }
+
+        Ok(delete_cluster_output(cluster))
+    }
+}
+
+/// `DeleteClusterOutput` read off the stored cluster the call retired.
+fn delete_cluster_output(cluster: &crate::state::Cluster) -> DeleteClusterOutput {
+    DeleteClusterOutput {
+        identifier: cluster.identifier.clone(),
+        arn: cluster.arn.clone(),
+        status: cluster.status.clone(),
+        creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
     }
 }

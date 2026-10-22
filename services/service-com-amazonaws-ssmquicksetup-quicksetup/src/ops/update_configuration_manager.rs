@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfigurationManager
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfigurationManager`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfigurationManager::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the ONE stored configuration manager the ARN names: the `Name` and
+//! `Description` the request carries replace the stored ones and `LastModifiedAt` is
+//! bumped, so a later `GetConfigurationManager` reports the new values. The modelled
+//! 404 when no manager has that ARN; an empty body on success.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +166,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfigurationManager` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfigurationManagerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfigurationManager"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateConfigurationManagerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the configuration manager store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(manager) = store.managers.get_mut(&input.manager_arn) else {
+            return Err(
+                UpdateConfigurationManagerErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no configuration manager with ARN {} exists",
+                            input.manager_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Each member is optional and only what the request carries is replaced, so an
+        // update naming one member leaves the other as it was stored.
+        if input.name.is_some() {
+            manager.name = input.name;
+        }
+        if input.description.is_some() {
+            manager.description = input.description;
+        }
+        // Monotonic: the stamp never moves backwards, whatever the host clock does.
+        manager.last_modified_at = now.max(manager.last_modified_at);
+
+        Ok(UpdateConfigurationManagerOutput)
     }
 }

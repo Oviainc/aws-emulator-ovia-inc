@@ -1,11 +1,223 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-entityresolution-awsveniceservice service.
+//!
+//! Two control-plane resources are persisted here, and every member of each record
+//! is the MODELLED type of the member it is returned on, so a reader clones what the
+//! writer stored and the two cannot drift: `CreateSchemaMapping` followed by
+//! `GetSchemaMapping` returns the created record field-for-field.
+//!
+//! `hasWorkflows` is deliberately NOT a stored field. It is a property of the
+//! relationship between the two maps — "is this schema mapping referenced by some
+//! matching workflow's `inputSourceConfig`" — so storing it would let a workflow
+//! create or delete leave a stale flag behind. It is derived on read by
+//! [`ComAmazonawsEntityresolutionAwsveniceserviceState::schema_has_workflows`].
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::ops::types::{
+    IncrementalRunConfig, InputSource, OutputSource, ResolutionTechniques, SchemaInputAttribute,
+};
+
+/// One schema mapping as this service persists it.
+///
+/// `description` is `Option<String>` because the member is optional on the create
+/// request and on `GetSchemaMapping`'s output; `CreateSchemaMapping`'s output models
+/// it @required, which is served as the empty string when the create carried none.
+#[derive(Debug, Clone)]
+pub struct SchemaMapping {
+    /// The name the schema mapping is keyed by, as the caller supplied it.
+    pub schema_name: String,
+    /// The ARN minted when the schema mapping was created.
+    pub schema_arn: String,
+    pub description: Option<String>,
+    pub mapped_input_fields: Vec<SchemaInputAttribute>,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub updated_at: ::aws_smithy_types::DateTime,
+    pub tags: Option<HashMap<String, String>>,
+}
+
+/// One matching workflow as this service persists it.
+#[derive(Debug, Clone)]
+pub struct MatchingWorkflow {
+    /// The name the workflow is keyed by, as the caller supplied it.
+    pub workflow_name: String,
+    /// The ARN minted when the workflow was created.
+    pub workflow_arn: String,
+    pub description: Option<String>,
+    pub input_source_config: Vec<InputSource>,
+    pub output_source_config: Vec<OutputSource>,
+    pub resolution_techniques: ResolutionTechniques,
+    pub incremental_run_config: Option<IncrementalRunConfig>,
+    pub role_arn: String,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub updated_at: ::aws_smithy_types::DateTime,
+    pub tags: Option<HashMap<String, String>>,
+}
 
 /// Per-service state for com-amazonaws-entityresolution-awsveniceservice. A handler reaches it through [`service_state`].
+///
+/// Both maps are `BTreeMap`s, not `HashMap`s, because both list operations are
+/// `@paginated` and a page boundary is only meaningful over a stable order: the
+/// `nextToken` a page returns is the key of the first record it did NOT return, so
+/// the next call resumes at that key.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEntityresolutionAwsveniceserviceState {
-    // TODO: add service-specific state fields
+    /// Every schema mapping that exists, keyed by `schemaName`.
+    pub schema_mappings: BTreeMap<String, SchemaMapping>,
+    /// Every matching workflow that exists, keyed by `workflowName`.
+    pub matching_workflows: BTreeMap<String, MatchingWorkflow>,
+}
+
+/// How many schema mappings this emulator lets exist at once, past which
+/// `CreateSchemaMapping` answers the modelled `ExceedsLimitException` (HTTP 402, "The
+/// request was rejected because it attempted to create resources beyond the current
+/// Entity Resolution account limits").
+///
+/// AWS Entity Resolution publishes an adjustable per-account, per-Region quota named
+/// "Schema mappings"; this is the default this emulator enforces for it. The bound is
+/// what keeps the store from growing without limit on repeated creates, and it is
+/// self-healing: `DeleteSchemaMapping` releases an entry, so room comes back.
+pub const MAX_SCHEMA_MAPPINGS: usize = 100;
+
+/// The name of the quota [`MAX_SCHEMA_MAPPINGS`] enforces, reported on
+/// `ExceedsLimitException$quotaName`.
+pub const SCHEMA_MAPPINGS_QUOTA_NAME: &str = "Schema mappings";
+
+/// How many matching workflows this emulator lets exist at once, past which
+/// `CreateMatchingWorkflow` answers the modelled `ExceedsLimitException` (HTTP 402).
+///
+/// AWS Entity Resolution publishes an adjustable per-account, per-Region quota named
+/// "Matching workflows"; this is the default this emulator enforces for it. As with
+/// the schema-mapping bound, `DeleteMatchingWorkflow` releases an entry, so the bound
+/// needs no TTL or eviction.
+pub const MAX_MATCHING_WORKFLOWS: usize = 100;
+
+/// The name of the quota [`MAX_MATCHING_WORKFLOWS`] enforces, reported on
+/// `ExceedsLimitException$quotaName`.
+pub const MATCHING_WORKFLOWS_QUOTA_NAME: &str = "Matching workflows";
+
+/// A quota value as `ExceedsLimitException$quotaValue` models it (an `Integer`).
+///
+/// Both maxima are small constants, so the conversion cannot fail; it is written
+/// without a panic so a handler stays total.
+pub fn quota_value(maximum: usize) -> Option<i32> {
+    i32::try_from(maximum).ok()
+}
+
+impl ComAmazonawsEntityresolutionAwsveniceserviceState {
+    /// Is `schema_name` referenced by the `inputSourceConfig` of any stored matching
+    /// workflow?
+    ///
+    /// `InputSource$schemaName` is the modelled reference from a workflow to a schema
+    /// mapping ("The name of the schema to be retrieved",
+    /// `smithy_query(query="shape",shape="InputSource")`), so this is what both
+    /// `hasWorkflows` and `DeleteSchemaMapping`'s conflict check read.
+    pub fn schema_has_workflows(&self, schema_name: &str) -> bool {
+        self.matching_workflows.values().any(|workflow| {
+            workflow
+                .input_source_config
+                .iter()
+                .any(|source| source.schema_name == schema_name)
+        })
+    }
+}
+
+/// The region every ARN this service mints is scoped to when the request carries no
+/// SigV4 credential scope to read it from. It is the region the emulator's own shared
+/// AWS config names, so an unsigned call and a default-configured client agree.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region this request was signed for, defaulting to [`DEFAULT_REGION`].
+///
+/// A resource ARN is region-scoped, and the only region a request carries is the one
+/// in its SigV4 credential scope, so that is what an ARN minted while serving it uses.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// Now, truncated to milliseconds.
+///
+/// restJson1 writes a timestamp as epoch seconds with a fractional part, i.e. as a
+/// JSON number: an `f64` holds today's epoch seconds to about a quarter of a
+/// microsecond, so a nanosecond-precision instant would not survive the round trip
+/// and `createdAt` would differ between the create response and a later read.
+/// Milliseconds round-trip exactly, which keeps a stored timestamp stable across reads.
+pub fn now() -> ::aws_smithy_types::DateTime {
+    let millis = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        });
+    ::aws_smithy_types::DateTime::from_millis(millis)
+}
+
+/// The page size to serve for a `@paginated` operation whose `maxResults` member is
+/// `max_results` and whose modelled `range` maximum is `modelled_max`.
+///
+/// `maxResults` is optional on both list operations, so an absent member is "the
+/// caller set no bound", which is served with the modelled maximum rather than with
+/// an empty page. The modelled `range` declares only a maximum, so zero and negative
+/// values reach a handler too; they are read the same way, because a page size of
+/// zero would answer an empty page with a continuation token forever. A positive
+/// caller-supplied bound is already inside the modelled range by the time a handler
+/// runs (the boundary validator refuses anything else); clamping again costs nothing
+/// and keeps this total.
+pub fn page_size(max_results: Option<i32>, modelled_max: usize) -> usize {
+    match max_results.map(usize::try_from) {
+        None | Some(Ok(0)) | Some(Err(_)) => modelled_max,
+        Some(Ok(bound)) => bound.min(modelled_max),
+    }
+}
+
+/// One page of an ordered `(key, record)` sequence, plus the `nextToken` to continue
+/// from — `None` when the page reached the end.
+///
+/// The token is the KEY OF THE FIRST RECORD NOT RETURNED, and a resumed call starts
+/// at the first key at or after the token. Resuming is therefore well defined even
+/// when the record the token names was deleted between the two calls: the scan simply
+/// continues at the next key.
+///
+/// A key is an `EntityName` (`^[a-zA-Z_0-9-]*$`, 1..255 characters), which is a strict
+/// subset of the modelled `NextToken` (`^[a-zA-Z_0-9-=+/]*$`, 1..1024), so the token
+/// this returns always satisfies the token member's own constraints.
+pub fn page<T>(
+    ordered: impl IntoIterator<Item = (String, T)>,
+    next_token: Option<&str>,
+    page_size: usize,
+) -> (Vec<T>, Option<String>) {
+    let mut records = Vec::new();
+    for (key, record) in ordered {
+        if next_token.is_some_and(|token| key.as_str() < token) {
+            continue;
+        }
+        if records.len() == page_size {
+            return (records, Some(key));
+        }
+        records.push(record);
+    }
+    (records, None)
+}
+
+/// Could `value` be a `nextToken` this service issued?
+///
+/// Every token either list operation issues is a resource name, i.e. an `EntityName`:
+/// `length 1..255, pattern ^[a-zA-Z_0-9-]*$`
+/// (`smithy_query(query="operation",operation="ListMatchingWorkflows")`). The modelled
+/// `NextToken` is wider (it also admits `=`, `+` and `/`), so a token the boundary
+/// validator accepted can still be one this service never minted — refuse that rather
+/// than serve an arbitrary suffix of the collection for it.
+///
+/// A token naming a record that has since been DELETED still satisfies this and is
+/// still honoured — the scan resumes at the next name — so a page boundary survives a
+/// concurrent delete, which is the behaviour a paging client depends on.
+pub fn is_issued_page_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 255
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

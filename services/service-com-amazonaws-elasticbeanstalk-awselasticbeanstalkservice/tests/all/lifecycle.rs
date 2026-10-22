@@ -1,0 +1,1400 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The Elastic Beanstalk application / application-version / environment lifecycle,
+//! driven end to end over the service's awsQuery HTTP surface.
+//!
+//! Every test here mounts this one service in the same `MultiServiceRouter` the
+//! production binary uses and speaks to it the way an AWS client does: a
+//! form-urlencoded `Action=…` body in, an XML envelope out. Nothing reaches into
+//! the store directly, so a create that does not persist, or a describe that
+//! answers from anything other than the store, fails these tests.
+//!
+//! The two helpers at the bottom — the form-value encoder and the element reader
+//! — are written here rather than taken from a crate ON PURPOSE: a dependency
+//! would have to be recorded in `Cargo.lock`, the one file this branch shares
+//! with every other fix landing on mainline, and that shared hunk is what kept
+//! this change's squash merge colliding. Both are a few lines over the
+//! emulator's OWN output: the encoder is SigV4's unreserved-set rule, and the
+//! reader slices the text between the opening and closing tag of an element in
+//! a document this service generated (no CDATA, no comments), allowing the
+//! `xmlns` attribute the first member of a list repeats and counting nested
+//! tags of the same name so a `<member>` inside a `<member>` is read whole.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The service's API version, as the model declares it (`version: 2010-12-01`).
+const API_VERSION: &str = "2010-12-01";
+
+/// The region the tests sign with, so every region-derived value (ARNs, CNAMEs)
+/// is asserted against something that is not the default.
+const TEST_REGION: &str = "us-west-2";
+
+/// Long enough that a status change the clock owed is due. Derived from the
+/// service's own span so the two cannot drift apart.
+const PAST_DUE: Duration = eb::state::STATUS_TRANSITION_SPAN.saturating_add(Duration::from_millis(250));
+
+/// The emulator under test: this one service, mounted in the router the
+/// production binary mounts it in, driven over HTTP.
+struct Emulator {
+    router: MultiServiceRouter,
+}
+
+impl Emulator {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.register_service(eb::EmulatedService::new(engine));
+        Self { router }
+    }
+
+    /// Call `action` with `params`, signed for [`TEST_REGION`].
+    async fn call(&self, action: &str, params: &[(&str, &str)]) -> Answer {
+        self.call_in_region(TEST_REGION, action, params).await
+    }
+
+    async fn call_in_region(&self, region: &str, action: &str, params: &[(&str, &str)]) -> Answer {
+        let mut form = vec![
+            format!("Action={}", form_encoded(action)),
+            format!("Version={}", form_encoded(API_VERSION)),
+        ];
+        for (name, value) in params {
+            form.push(format!("{}={}", form_encoded(name), form_encoded(value)));
+        }
+        // The router resolves both the service and the region from the SigV4
+        // credential scope, exactly as it does for a real signed request.
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDTESTEXAMPLE/20261021/{region}/elasticbeanstalk/aws4_request, \
+             SignedHeaders=host;x-amz-date, Signature=0123456789abcdef"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://elasticbeanstalk.amazonaws.com/")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("authorization", authorization)
+            .body(bytes::Bytes::from(form.join("&")))
+            .expect("a well-formed request");
+        Answer::of(self.router.dispatch(request).await)
+    }
+}
+
+/// One answer from the emulator: its status and its XML body.
+struct Answer {
+    status: u16,
+    body: String,
+}
+
+impl Answer {
+    fn of(response: http::Response<bytes::Bytes>) -> Self {
+        let status = response.status().as_u16();
+        let body = String::from_utf8_lossy(response.body().as_ref()).into_owned();
+        Self { status, body }
+    }
+
+    /// Every value at `path` — a `/`-separated element path whose last segment
+    /// is the element read and whose earlier segments are the enclosing
+    /// elements, e.g. `Environments/member/EnvironmentId` — in document order.
+    fn values_at(&self, path: &str) -> Vec<&str> {
+        let mut segments = path.split('/').collect::<Vec<&str>>();
+        let tag = segments.pop().expect("a path names at least one element");
+        let mut scopes = vec![self.body.as_str()];
+        for parent in segments {
+            scopes = scopes
+                .iter()
+                .flat_map(|scope| elements(scope, parent))
+                .collect();
+        }
+        scopes
+            .iter()
+            .flat_map(|scope| elements(scope, tag))
+            .filter(|value| !value.trim().is_empty())
+            .collect()
+    }
+
+    /// The first value at `path` (see [`Answer::values_at`]).
+    fn value(&self, path: &str) -> Option<&str> {
+        self.values_at(path).into_iter().next()
+    }
+
+    /// As [`Answer::value`], failing the named case when the element is absent.
+    fn expect(&self, path: &str, case: &str) -> &str {
+        self.value(path).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a {path} element, got status {} and body {}",
+                self.status, self.body
+            )
+        })
+    }
+
+    /// The awsQuery error envelope's `<Code>`, or `""` on a success envelope.
+    fn error_code(&self) -> &str {
+        self.value("Error/Code").unwrap_or_default()
+    }
+}
+
+/// The content of every `<tag>…</tag>` in `xml`, in document order.
+///
+/// Reads the slice between an opening `<tag>` — which may carry attributes, as
+/// the first member of a list repeats the envelope's `xmlns` — and that
+/// element's OWN `</tag>`, counting nested opens so a `<member>` that itself
+/// contains a `<member>` (an application's `Versions` list inside an
+/// application member) is read whole. For a leaf element that slice is its
+/// text; for a wrapper it is its inner XML, so a path descends by calling this
+/// once per segment. This service's serializer writes an empty member as
+/// `<Tag></Tag>`, never `<Tag/>`, so there is no self-closing form to count.
+fn elements<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let close = format!("</{tag}>");
+    let mut found = Vec::new();
+    let mut from = 0usize;
+    while let Some((_, content)) = opening_tag(xml, tag, from) {
+        let mut cursor = content;
+        let mut depth = 1usize;
+        let mut end = None;
+        while depth > 0 {
+            let next_open = opening_tag(xml, tag, cursor);
+            let next_close = xml[cursor..].find(&close).map(|at| cursor + at);
+            match (next_open, next_close) {
+                (Some((opened, after)), Some(closed)) if opened < closed => {
+                    depth += 1;
+                    cursor = after;
+                }
+                (_, Some(closed)) => {
+                    depth -= 1;
+                    cursor = closed + close.len();
+                    if depth == 0 {
+                        end = Some(closed);
+                    }
+                }
+                // An element that opened and never closed: not a document this
+                // service emits, so stop rather than guess.
+                (_, None) => break,
+            }
+        }
+        let Some(end) = end else {
+            break;
+        };
+        found.push(&xml[content..end]);
+        from = cursor;
+    }
+    found
+}
+
+/// The next opening tag for `tag` at or after `from`, as
+/// `(start of '<', start of the content)`. Accepts attributes on the element and
+/// skips a longer element name that merely starts with `tag`.
+fn opening_tag(xml: &str, tag: &str, from: usize) -> Option<(usize, usize)> {
+    let needle = format!("<{tag}");
+    let mut at = from;
+    loop {
+        let start = at + xml[at..].find(&needle)?;
+        let after = start + needle.len();
+        match xml[after..].chars().next() {
+            Some('>') => return Some((start, after + 1)),
+            Some(character) if character.is_whitespace() => {
+                let closed = after + xml[after..].find('>')?;
+                return Some((start, closed + 1));
+            }
+            Some(_) => at = after,
+            None => return None,
+        }
+    }
+}
+
+/// Percent-encode a form value: everything outside SigV4's unreserved set
+/// (`A-Z a-z 0-9 - _ . ~`) becomes `%XX`, which is how an AWS SDK encodes an
+/// awsQuery parameter and what this service's query deserializer decodes.
+fn form_encoded(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+/// `e-` followed by exactly 8 lowercase alphanumerics, the form the real service
+/// issues an `EnvironmentId` in.
+fn is_environment_id(id: &str) -> bool {
+    id.strip_prefix("e-").is_some_and(|body| {
+        body.len() == 8
+            && body
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    })
+}
+
+fn account() -> &'static str {
+    engine::emulator_account_id()
+}
+
+// ---------------------------------------------------------------------------
+// The lifecycle, end to end
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_application_and_environment_lifecycle_runs_end_to_end() {
+    let emulator = Emulator::new();
+    let case = "lifecycle";
+
+    // 1. CreateApplication answers with what it stored.
+    let created = emulator
+        .call(
+            "CreateApplication",
+            &[("ApplicationName", "my-app"), ("Description", "demo")],
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: expected 200 from CreateApplication, got {} and body {}",
+        created.status, created.body
+    );
+    assert_eq!(
+        created.expect("Application/ApplicationName", case),
+        "my-app",
+        "case {case:?}: CreateApplication must answer with the stored name, got {}",
+        created.body
+    );
+    assert_eq!(
+        created.expect("Application/ApplicationArn", case),
+        format!(
+            "arn:aws:elasticbeanstalk:{TEST_REGION}:{}:application/my-app",
+            account()
+        ),
+        "case {case:?}: unexpected ApplicationArn in {}",
+        created.body
+    );
+    assert_eq!(
+        created.expect("Application/Description", case),
+        "demo",
+        "case {case:?}: unexpected Description in {}",
+        created.body
+    );
+    assert!(
+        created.value("Application/DateCreated").is_some(),
+        "case {case:?}: expected a DateCreated, got {}",
+        created.body
+    );
+
+    // 2. CreateApplicationVersion stores the version under that application.
+    let version = emulator
+        .call(
+            "CreateApplicationVersion",
+            &[
+                ("ApplicationName", "my-app"),
+                ("VersionLabel", "v1"),
+                ("SourceBundle.S3Bucket", "my-bucket"),
+                ("SourceBundle.S3Key", "app.zip"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        version.status, 200,
+        "case {case:?}: expected 200 from CreateApplicationVersion, got {} and body {}",
+        version.status, version.body
+    );
+    assert_eq!(
+        version.expect("ApplicationVersion/VersionLabel", case),
+        "v1",
+        "case {case:?}: unexpected VersionLabel in {}",
+        version.body
+    );
+    assert_eq!(
+        version.expect("ApplicationVersion/Status", case),
+        "Unprocessed",
+        "case {case:?}: a version nothing processed must be Unprocessed, got {}",
+        version.body
+    );
+    assert_eq!(
+        version.expect("ApplicationVersion/ApplicationVersionArn", case),
+        format!(
+            "arn:aws:elasticbeanstalk:{TEST_REGION}:{}:applicationversion/my-app/v1",
+            account()
+        ),
+        "case {case:?}: unexpected ApplicationVersionArn in {}",
+        version.body
+    );
+    assert_eq!(
+        version.expect("SourceBundle/S3Key", case),
+        "app.zip",
+        "case {case:?}: SourceBundle must come back from storage, got {}",
+        version.body
+    );
+
+    // 3. DescribeApplications reports the application with its version.
+    let applications = emulator.call("DescribeApplications", &[]).await;
+    assert_eq!(
+        applications.values_at("Applications/member/ApplicationName"),
+        vec!["my-app"],
+        "case {case:?}: unexpected applications in {}",
+        applications.body
+    );
+    assert_eq!(
+        applications.values_at("Versions/member"),
+        vec!["v1"],
+        "case {case:?}: the new version must appear in the application's Versions, got {}",
+        applications.body
+    );
+
+    // 4. CreateEnvironment mints and persists the environment.
+    let environment = emulator
+        .call(
+            "CreateEnvironment",
+            &[
+                ("ApplicationName", "my-app"),
+                ("EnvironmentName", "my-env-1"),
+                ("VersionLabel", "v1"),
+                (
+                    "SolutionStackName",
+                    "64bit Amazon Linux 2 v5.8.0 running Node.js 18",
+                ),
+            ],
+        )
+        .await;
+    assert_eq!(
+        environment.status, 200,
+        "case {case:?}: expected 200 from CreateEnvironment, got {} and body {}",
+        environment.status, environment.body
+    );
+    let environment_id = environment.expect("EnvironmentId", case).to_string();
+    assert!(
+        is_environment_id(&environment_id),
+        "case {case:?}: expected an e-<8 lowercase alnum> EnvironmentId, got {environment_id:?}"
+    );
+    let cname = environment.expect("CNAME", case).to_string();
+    assert_eq!(
+        environment.expect("Status", case),
+        "Launching",
+        "case {case:?}: a new environment reports Launching, got {}",
+        environment.body
+    );
+    assert_eq!(
+        environment.expect("Health", case),
+        "Grey",
+        "case {case:?}: a new environment reports Grey health, got {}",
+        environment.body
+    );
+    assert_eq!(
+        environment.expect("HealthStatus", case),
+        "Pending",
+        "case {case:?}: a new environment reports Pending health status, got {}",
+        environment.body
+    );
+    assert_eq!(
+        environment.expect("EnvironmentArn", case),
+        format!(
+            "arn:aws:elasticbeanstalk:{TEST_REGION}:{}:environment/my-app/my-env-1",
+            account()
+        ),
+        "case {case:?}: unexpected EnvironmentArn in {}",
+        environment.body
+    );
+
+    // 5. DescribeEnvironments returns exactly what was persisted.
+    let described = emulator
+        .call("DescribeEnvironments", &[("ApplicationName", "my-app")])
+        .await;
+    assert_eq!(
+        described.values_at("Environments/member/EnvironmentId"),
+        vec![environment_id.as_str()],
+        "case {case:?}: DescribeEnvironments must return the created environment, got {}",
+        described.body
+    );
+    assert_eq!(
+        described.values_at("Environments/member/CNAME"),
+        vec![cname.as_str()],
+        "case {case:?}: the CNAME must survive the round trip, got {}",
+        described.body
+    );
+    assert_eq!(
+        described.values_at("Environments/member/VersionLabel"),
+        vec!["v1"],
+        "case {case:?}: the VersionLabel must survive the round trip, got {}",
+        described.body
+    );
+
+    // 6. TerminateEnvironment moves it to Terminating, and the record leaves the
+    //    default view once the clock completes the termination.
+    let terminated = emulator
+        .call(
+            "TerminateEnvironment",
+            &[("EnvironmentName", "my-env-1")],
+        )
+        .await;
+    assert_eq!(
+        terminated.status, 200,
+        "case {case:?}: expected 200 from TerminateEnvironment, got {} and body {}",
+        terminated.status, terminated.body
+    );
+    assert_eq!(
+        terminated.expect("Status", case),
+        "Terminating",
+        "case {case:?}: TerminateEnvironment reports Terminating, got {}",
+        terminated.body
+    );
+    std::thread::sleep(PAST_DUE);
+
+    let after = emulator.call("DescribeEnvironments", &[]).await;
+    assert!(
+        after.values_at("Environments/member/EnvironmentId").is_empty(),
+        "case {case:?}: a terminated environment must not be listed, got {}",
+        after.body
+    );
+    let with_deleted = emulator
+        .call("DescribeEnvironments", &[("IncludeDeleted", "true")])
+        .await;
+    assert_eq!(
+        with_deleted.values_at("Environments/member/EnvironmentId"),
+        vec![environment_id.as_str()],
+        "case {case:?}: IncludeDeleted must list the terminated environment, got {}",
+        with_deleted.body
+    );
+    assert_eq!(
+        with_deleted.values_at("Environments/member/Status"),
+        vec!["Terminated"],
+        "case {case:?}: the environment must have reached Terminated, got {}",
+        with_deleted.body
+    );
+
+    // 7. DeleteApplication removes the application and its versions.
+    let deleted = emulator
+        .call(
+            "DeleteApplication",
+            &[
+                ("ApplicationName", "my-app"),
+                ("TerminateEnvByForce", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case {case:?}: expected 200 from DeleteApplication, got {} and body {}",
+        deleted.status, deleted.body
+    );
+    let gone = emulator.call("DescribeApplications", &[]).await;
+    assert!(
+        gone.values_at("Applications/member/ApplicationName").is_empty(),
+        "case {case:?}: the deleted application must not be listed, got {}",
+        gone.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stored values come back as stored
+// ---------------------------------------------------------------------------
+
+/// One row per application shape the create/describe pair must round-trip.
+struct ApplicationCase {
+    name: &'static str,
+    description: Option<&'static str>,
+    /// Version labels to create, oldest first.
+    versions: &'static [&'static str],
+}
+
+#[tokio::test]
+async fn described_applications_are_the_stored_applications() {
+    // Rows differ along what the rule generalises over: name length and shape,
+    // whether a description was supplied, and how many versions the application
+    // accumulated.
+    let cases = [
+        ApplicationCase {
+            name: "a",
+            description: None,
+            versions: &[],
+        },
+        ApplicationCase {
+            name: "app-with-dashes-and-digits-0123",
+            description: Some("a description"),
+            versions: &["v1"],
+        },
+        ApplicationCase {
+            // The modelled maximum for `ApplicationName` is 100 characters.
+            name: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            description: Some(""),
+            versions: &["1.0.0", "1.0.1", "release-2"],
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for case in &cases {
+        let mut params: Vec<(&str, &str)> = vec![("ApplicationName", case.name)];
+        if let Some(description) = case.description {
+            params.push(("Description", description));
+        }
+        let created = emulator.call("CreateApplication", &params).await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: expected 200 from CreateApplication, got {} and body {}",
+            case.name, created.status, created.body
+        );
+
+        for label in case.versions {
+            let version = emulator
+                .call(
+                    "CreateApplicationVersion",
+                    &[("ApplicationName", case.name), ("VersionLabel", label)],
+                )
+                .await;
+            assert_eq!(
+                version.status, 200,
+                "case {:?}: expected 200 from CreateApplicationVersion for {label:?}, got {} and body {}",
+                case.name, version.status, version.body
+            );
+        }
+    }
+
+    for case in &cases {
+        let described = emulator
+            .call("DescribeApplications", &[("ApplicationNames.member.1", case.name)])
+            .await;
+        assert_eq!(
+            described.values_at("Applications/member/ApplicationName"),
+            vec![case.name],
+            "case {:?}: the name filter must return exactly that application, got {}",
+            case.name,
+            described.body
+        );
+        assert_eq!(
+            described.value("Applications/member/Description"),
+            // An empty description is stored, and an empty XML element carries no
+            // text node, so it reads back as absent rather than as "".
+            case.description.filter(|text| !text.is_empty()),
+            "case {:?}: unexpected Description in {}",
+            case.name,
+            described.body
+        );
+        // "Versions: The names of the versions for this application", newest first.
+        let expected: Vec<&str> = case.versions.iter().rev().copied().collect();
+        assert_eq!(
+            described.values_at("Versions/member"),
+            expected,
+            "case {:?}: expected the accumulated versions newest first, got {}",
+            case.name,
+            described.body
+        );
+    }
+}
+
+/// One row per environment shape CreateEnvironment must derive and persist.
+struct EnvironmentCase {
+    environment_name: &'static str,
+    cname_prefix: Option<&'static str>,
+    tier_name: Option<&'static str>,
+    tier_type: Option<&'static str>,
+    region: &'static str,
+}
+
+#[tokio::test]
+async fn created_environments_are_derived_from_the_request_and_persisted() {
+    // Rows differ along the inputs the derivations read: whether a CNAME prefix
+    // was supplied, which tier was asked for, and which region signed the call.
+    let cases = [
+        EnvironmentCase {
+            environment_name: "env-default",
+            cname_prefix: None,
+            tier_name: None,
+            tier_type: None,
+            region: TEST_REGION,
+        },
+        EnvironmentCase {
+            environment_name: "env-with-prefix",
+            cname_prefix: Some("chosen-prefix"),
+            tier_name: None,
+            tier_type: None,
+            region: TEST_REGION,
+        },
+        EnvironmentCase {
+            // "For Standard-mode EC2-based backend application with Amazon SQS –
+            // Worker", with "For Worker tier – SQS/HTTP" as its type.
+            environment_name: "env-worker",
+            cname_prefix: None,
+            tier_name: Some("Worker"),
+            tier_type: Some("SQS/HTTP"),
+            region: "eu-central-1",
+        },
+    ];
+
+    let emulator = Emulator::new();
+    let created_application = emulator
+        .call("CreateApplication", &[("ApplicationName", "tiers")])
+        .await;
+    assert_eq!(
+        created_application.status, 200,
+        "expected 200 from CreateApplication, got {} and body {}",
+        created_application.status, created_application.body
+    );
+
+    for case in &cases {
+        let name = case.environment_name;
+        let mut params: Vec<(&str, &str)> = vec![
+            ("ApplicationName", "tiers"),
+            ("EnvironmentName", name),
+        ];
+        if let Some(prefix) = case.cname_prefix {
+            params.push(("CNAMEPrefix", prefix));
+        }
+        if let Some(tier) = case.tier_name {
+            params.push(("Tier.Name", tier));
+        }
+        if let Some(tier_type) = case.tier_type {
+            params.push(("Tier.Type", tier_type));
+        }
+        let created = emulator
+            .call_in_region(case.region, "CreateEnvironment", &params)
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: expected 200 from CreateEnvironment, got {} and body {}",
+            created.status, created.body
+        );
+
+        let environment_id = created.expect("EnvironmentId", name).to_string();
+        let cname = created.expect("CNAME", name).to_string();
+        let expected_prefix = case
+            .cname_prefix
+            .map(str::to_string)
+            // With no prefix the environment name carries one appended
+            // alphanumeric string — its own unique id body.
+            .unwrap_or_else(|| format!("{name}-{}", environment_id.trim_start_matches("e-")));
+        assert_eq!(
+            cname,
+            format!(
+                "{expected_prefix}.{}.elasticbeanstalk.com",
+                case.region
+            ),
+            "case {name:?}: unexpected CNAME, got {cname:?}"
+        );
+        assert_eq!(
+            created.expect("EnvironmentArn", name),
+            format!(
+                "arn:aws:elasticbeanstalk:{}:{}:environment/tiers/{name}",
+                case.region,
+                account()
+            ),
+            "case {name:?}: the ARN must carry the signing region, got {}",
+            created.body
+        );
+        assert_eq!(
+            created.expect("Tier/Name", name),
+            case.tier_name.unwrap_or("WebServer"),
+            "case {name:?}: unexpected Tier.Name in {}",
+            created.body
+        );
+        assert_eq!(
+            created.expect("Tier/Type", name),
+            case.tier_type.unwrap_or("Standard"),
+            "case {name:?}: unexpected Tier.Type in {}",
+            created.body
+        );
+
+        // The round trip: everything above must come back from the store.
+        let described = emulator
+            .call(
+                "DescribeEnvironments",
+                &[("EnvironmentIds.member.1", environment_id.as_str())],
+            )
+            .await;
+        assert_eq!(
+            described.values_at("Environments/member/EnvironmentName"),
+            vec![name],
+            "case {name:?}: the id filter must return that environment, got {}",
+            described.body
+        );
+        assert_eq!(
+            described.values_at("Environments/member/CNAME"),
+            vec![cname.as_str()],
+            "case {name:?}: the stored CNAME must come back, got {}",
+            described.body
+        );
+        assert_eq!(
+            described.values_at("Environments/member/Tier/Name"),
+            vec![case.tier_name.unwrap_or("WebServer")],
+            "case {name:?}: the stored tier must come back, got {}",
+            described.body
+        );
+    }
+
+    // Every environment is distinct in the store, each with its own id.
+    let all = emulator
+        .call("DescribeEnvironments", &[("ApplicationName", "tiers")])
+        .await;
+    let ids = all.values_at("Environments/member/EnvironmentId");
+    assert_eq!(
+        ids.len(),
+        cases.len(),
+        "expected one environment per case, got {}",
+        all.body
+    );
+    let mut unique: Vec<&str> = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        ids.len(),
+        "EnvironmentIds must be unique, got {ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Filtering and pagination
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn describe_environments_filters_and_paginates() {
+    let emulator = Emulator::new();
+    for application in ["left", "right"] {
+        assert_eq!(
+            emulator
+                .call("CreateApplication", &[("ApplicationName", application)])
+                .await
+                .status,
+            200,
+            "expected 200 from CreateApplication for {application:?}"
+        );
+        assert_eq!(
+            emulator
+                .call(
+                    "CreateApplicationVersion",
+                    &[("ApplicationName", application), ("VersionLabel", "v1")],
+                )
+                .await
+                .status,
+            200,
+            "expected 200 from CreateApplicationVersion for {application:?}"
+        );
+    }
+    let mut ids = Vec::new();
+    for (application, environment) in [
+        ("left", "left-env-1"),
+        ("left", "left-env-2"),
+        ("right", "right-env-1"),
+    ] {
+        let created = emulator
+            .call(
+                "CreateEnvironment",
+                &[
+                    ("ApplicationName", application),
+                    ("EnvironmentName", environment),
+                    ("VersionLabel", "v1"),
+                ],
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "expected 200 from CreateEnvironment for {environment:?}, got {}",
+            created.body
+        );
+        ids.push(created.expect("EnvironmentId", environment).to_string());
+    }
+
+    // One row per filter the operation declares.
+    struct FilterCase<'a> {
+        case: &'a str,
+        params: Vec<(&'a str, &'a str)>,
+        expected: Vec<&'a str>,
+    }
+    let filters = [
+        FilterCase {
+            case: "no filter",
+            params: vec![],
+            expected: vec!["left-env-1", "left-env-2", "right-env-1"],
+        },
+        FilterCase {
+            case: "ApplicationName",
+            params: vec![("ApplicationName", "left")],
+            expected: vec!["left-env-1", "left-env-2"],
+        },
+        FilterCase {
+            case: "EnvironmentNames",
+            params: vec![("EnvironmentNames.member.1", "right-env-1")],
+            expected: vec!["right-env-1"],
+        },
+        FilterCase {
+            case: "EnvironmentIds",
+            params: vec![("EnvironmentIds.member.1", ids[1].as_str())],
+            expected: vec!["left-env-2"],
+        },
+        FilterCase {
+            case: "VersionLabel that nothing is deployed from",
+            params: vec![("VersionLabel", "v9")],
+            expected: vec![],
+        },
+    ];
+    for FilterCase {
+        case,
+        params,
+        expected,
+    } in &filters
+    {
+        let described = emulator.call("DescribeEnvironments", params).await;
+        assert_eq!(
+            described.values_at("Environments/member/EnvironmentName"),
+            *expected,
+            "case {case:?}: unexpected environments in {}",
+            described.body
+        );
+    }
+
+    // MaxRecords pages, and NextToken resumes where the page ended.
+    let first = emulator
+        .call("DescribeEnvironments", &[("MaxRecords", "2")])
+        .await;
+    assert_eq!(
+        first.values_at("Environments/member/EnvironmentName"),
+        vec!["left-env-1", "left-env-2"],
+        "case \"MaxRecords=2\": unexpected first page in {}",
+        first.body
+    );
+    let token = first
+        .value("NextToken")
+        .unwrap_or_else(|| panic!("case \"MaxRecords=2\": expected a NextToken in {}", first.body))
+        .to_string();
+    let second = emulator
+        .call(
+            "DescribeEnvironments",
+            &[("MaxRecords", "2"), ("NextToken", token.as_str())],
+        )
+        .await;
+    assert_eq!(
+        second.values_at("Environments/member/EnvironmentName"),
+        vec!["right-env-1"],
+        "case \"page 2\": unexpected second page in {}",
+        second.body
+    );
+    assert_eq!(
+        second.value("NextToken"),
+        None,
+        "case \"page 2\": the last page carries no NextToken, got {}",
+        second.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The clock-owed status transitions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_launching_environment_becomes_ready_when_the_clock_makes_it_due() {
+    let emulator = Emulator::new();
+    assert_eq!(
+        emulator
+            .call("CreateApplication", &[("ApplicationName", "clock")])
+            .await
+            .status,
+        200,
+        "expected 200 from CreateApplication"
+    );
+    let created = emulator
+        .call(
+            "CreateEnvironment",
+            &[
+                ("ApplicationName", "clock"),
+                ("EnvironmentName", "clock-env"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "expected 200 from CreateEnvironment, got {}",
+        created.body
+    );
+
+    // A caller acting straight after the call still sees the transient status.
+    let immediately = emulator.call("DescribeEnvironments", &[]).await;
+    assert_eq!(
+        immediately.values_at("Environments/member/Status"),
+        vec!["Launching"],
+        "case \"immediately\": a launch in progress must still report Launching, got {}",
+        immediately.body
+    );
+
+    std::thread::sleep(PAST_DUE);
+    let later = emulator.call("DescribeEnvironments", &[]).await;
+    assert_eq!(
+        later.values_at("Environments/member/Status"),
+        vec!["Ready"],
+        "case \"past due\": the launch the clock owed must have completed, got {}",
+        later.body
+    );
+    assert_eq!(
+        later.values_at("Environments/member/Health"),
+        vec!["Green"],
+        "case \"past due\": a launched environment reports Green, got {}",
+        later.body
+    );
+    assert_eq!(
+        later.values_at("Environments/member/HealthStatus"),
+        vec!["Ok"],
+        "case \"past due\": a launched environment reports Ok, got {}",
+        later.body
+    );
+
+    // A describe does not move the environment on by itself: reading it again
+    // reports the same status.
+    let again = emulator.call("DescribeEnvironments", &[]).await;
+    assert_eq!(
+        again.values_at("Environments/member/Status"),
+        vec!["Ready"],
+        "case \"read twice\": a read must not change what a later read sees, got {}",
+        again.body
+    );
+
+    // And the name of a terminated environment can be used again.
+    assert_eq!(
+        emulator
+            .call("TerminateEnvironment", &[("EnvironmentName", "clock-env")])
+            .await
+            .status,
+        200,
+        "expected 200 from TerminateEnvironment"
+    );
+    std::thread::sleep(PAST_DUE);
+    let reused = emulator
+        .call(
+            "CreateEnvironment",
+            &[
+                ("ApplicationName", "clock"),
+                ("EnvironmentName", "clock-env"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        reused.status, 200,
+        "case \"name reuse\": a terminated environment no longer holds its name, got {} and body {}",
+        reused.status, reused.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Refusals
+// ---------------------------------------------------------------------------
+
+/// One row per request the service must refuse, with the code it refuses with.
+struct RefusalCase {
+    case: &'static str,
+    action: &'static str,
+    params: Vec<(&'static str, &'static str)>,
+    status: u16,
+    code: &'static str,
+}
+
+#[tokio::test]
+async fn bad_requests_are_refused_with_the_services_own_error_codes() {
+    let emulator = Emulator::new();
+    assert_eq!(
+        emulator
+            .call("CreateApplication", &[("ApplicationName", "taken")])
+            .await
+            .status,
+        200,
+        "expected 200 from CreateApplication"
+    );
+    assert_eq!(
+        emulator
+            .call(
+                "CreateApplicationVersion",
+                &[("ApplicationName", "taken"), ("VersionLabel", "v1")],
+            )
+            .await
+            .status,
+        200,
+        "expected 200 from CreateApplicationVersion"
+    );
+    assert_eq!(
+        emulator
+            .call(
+                "CreateEnvironment",
+                &[
+                    ("ApplicationName", "taken"),
+                    ("EnvironmentName", "taken-env"),
+                ],
+            )
+            .await
+            .status,
+        200,
+        "expected 200 from CreateEnvironment"
+    );
+
+    // Rows span the classes of refusal: a name that is already used, a name that
+    // names nothing, an absent either/or parameter, an absent required member,
+    // and a value outside a modelled bound.
+    let cases = vec![
+        RefusalCase {
+            case: "duplicate application",
+            action: "CreateApplication",
+            params: vec![("ApplicationName", "taken")],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+        RefusalCase {
+            case: "duplicate version",
+            action: "CreateApplicationVersion",
+            params: vec![("ApplicationName", "taken"), ("VersionLabel", "v1")],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+        RefusalCase {
+            case: "duplicate environment name",
+            action: "CreateEnvironment",
+            params: vec![
+                ("ApplicationName", "taken"),
+                ("EnvironmentName", "taken-env"),
+            ],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+        RefusalCase {
+            case: "version for an unknown application",
+            action: "CreateApplicationVersion",
+            params: vec![("ApplicationName", "nope"), ("VersionLabel", "v1")],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+        RefusalCase {
+            case: "environment for an unknown application",
+            action: "CreateEnvironment",
+            params: vec![("ApplicationName", "nope"), ("EnvironmentName", "nope-env")],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+        RefusalCase {
+            case: "environment from an unknown version",
+            action: "CreateEnvironment",
+            params: vec![
+                ("ApplicationName", "taken"),
+                ("EnvironmentName", "other-env"),
+                ("VersionLabel", "v9"),
+            ],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+        RefusalCase {
+            case: "terminate an unknown environment",
+            action: "TerminateEnvironment",
+            params: vec![("EnvironmentName", "ghost-env")],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+        RefusalCase {
+            case: "delete an unknown application",
+            action: "DeleteApplication",
+            params: vec![("ApplicationName", "nope")],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+        RefusalCase {
+            case: "terminate with neither id nor name",
+            action: "TerminateEnvironment",
+            params: vec![],
+            status: 400,
+            code: "MissingRequiredParameter",
+        },
+        RefusalCase {
+            case: "create an environment with no name",
+            action: "CreateEnvironment",
+            params: vec![("ApplicationName", "taken")],
+            status: 400,
+            code: "MissingRequiredParameter",
+        },
+        RefusalCase {
+            case: "absent required ApplicationName",
+            action: "CreateApplication",
+            params: vec![("Description", "no name supplied")],
+            status: 400,
+            code: "MissingRequiredParameter",
+        },
+        RefusalCase {
+            case: "EnvironmentName under the modelled minimum of 4",
+            action: "CreateEnvironment",
+            params: vec![("ApplicationName", "taken"), ("EnvironmentName", "ab")],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+        RefusalCase {
+            // The modelled maximum for `ApplicationName` is 100 characters.
+            case: "ApplicationName over the modelled maximum of 100",
+            action: "CreateApplication",
+            params: vec![(
+                "ApplicationName",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+        RefusalCase {
+            case: "MaxRecords over the modelled maximum of 1000",
+            action: "DescribeEnvironments",
+            params: vec![("MaxRecords", "1001")],
+            status: 400,
+            code: "InvalidParameterValue",
+        },
+    ];
+
+    for RefusalCase {
+        case,
+        action,
+        params,
+        status,
+        code,
+    } in &cases
+    {
+        let refused = emulator.call(action, params).await;
+        assert_eq!(
+            refused.status, *status,
+            "case {case:?}: expected HTTP {status}, got {} and body {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            *code,
+            "case {case:?}: expected error code {code}, got body {}",
+            refused.body
+        );
+        assert!(
+            refused.value("Error/Message").is_some(),
+            "case {case:?}: a refusal must say what to fix, got body {}",
+            refused.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_application_with_running_environments_is_not_deleted_silently() {
+    let emulator = Emulator::new();
+    assert_eq!(
+        emulator
+            .call("CreateApplication", &[("ApplicationName", "busy")])
+            .await
+            .status,
+        200,
+        "expected 200 from CreateApplication"
+    );
+    let created = emulator
+        .call(
+            "CreateEnvironment",
+            &[("ApplicationName", "busy"), ("EnvironmentName", "busy-env")],
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "expected 200 from CreateEnvironment, got {}",
+        created.body
+    );
+
+    // "You cannot delete an application that has a running environment."
+    let refused = emulator
+        .call("DeleteApplication", &[("ApplicationName", "busy")])
+        .await;
+    assert_eq!(
+        refused.status, 400,
+        "case \"running environment\": expected HTTP 400, got {} and body {}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error_code(),
+        "OperationInProgressFailure",
+        "case \"running environment\": unexpected error code in {}",
+        refused.body
+    );
+    let still_there = emulator.call("DescribeApplications", &[]).await;
+    assert_eq!(
+        still_there.values_at("Applications/member/ApplicationName"),
+        vec!["busy"],
+        "case \"running environment\": the refused delete must not have removed it, got {}",
+        still_there.body
+    );
+
+    // "TerminateEnvByForce: … running environments will be terminated before
+    // deleting the application."
+    let deleted = emulator
+        .call(
+            "DeleteApplication",
+            &[
+                ("ApplicationName", "busy"),
+                ("TerminateEnvByForce", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case \"forced\": expected HTTP 200, got {} and body {}",
+        deleted.status, deleted.body
+    );
+    let terminating = emulator.call("DescribeEnvironments", &[]).await;
+    assert_eq!(
+        terminating.values_at("Environments/member/Status"),
+        vec!["Terminating"],
+        "case \"forced\": the environment must be shutting down, got {}",
+        terminating.body
+    );
+    std::thread::sleep(PAST_DUE);
+    let gone = emulator.call("DescribeEnvironments", &[]).await;
+    assert!(
+        gone.values_at("Environments/member/EnvironmentId").is_empty(),
+        "case \"forced\": the environment must have reached Terminated, got {}",
+        gone.body
+    );
+    let applications = emulator.call("DescribeApplications", &[]).await;
+    assert!(
+        applications
+            .values_at("Applications/member/ApplicationName")
+            .is_empty(),
+        "case \"forced\": the application must be gone, got {}",
+        applications.body
+    );
+}
+
+#[tokio::test]
+async fn auto_create_application_creates_the_application_it_names() {
+    let emulator = Emulator::new();
+    let created = emulator
+        .call(
+            "CreateApplicationVersion",
+            &[
+                ("ApplicationName", "auto-created"),
+                ("VersionLabel", "v1"),
+                ("AutoCreateApplication", "true"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case \"AutoCreateApplication\": expected 200, got {} and body {}",
+        created.status, created.body
+    );
+    let applications = emulator.call("DescribeApplications", &[]).await;
+    assert_eq!(
+        applications.values_at("Applications/member/ApplicationName"),
+        vec!["auto-created"],
+        "case \"AutoCreateApplication\": the application must have been created, got {}",
+        applications.body
+    );
+    assert_eq!(
+        applications.values_at("Versions/member"),
+        vec!["v1"],
+        "case \"AutoCreateApplication\": the version must belong to it, got {}",
+        applications.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The account quotas, which are also what bounds the store
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_account_quotas_are_enforced_with_the_modelled_errors() {
+    let emulator = Emulator::new();
+
+    // Applications: the quota is reached, and the next create is refused with
+    // the error the model declares for it.
+    for index in 0..eb::state::MAX_APPLICATIONS {
+        let name = format!("app-{index:04}");
+        let created = emulator
+            .call("CreateApplication", &[("ApplicationName", name.as_str())])
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: expected 200 while filling the application quota, got {} and body {}",
+            created.status, created.body
+        );
+    }
+    let over = emulator
+        .call("CreateApplication", &[("ApplicationName", "one-too-many")])
+        .await;
+    assert_eq!(
+        over.status, 400,
+        "case \"application quota\": expected HTTP 400, got {} and body {}",
+        over.status, over.body
+    );
+    assert_eq!(
+        over.error_code(),
+        "TooManyApplicationsException",
+        "case \"application quota\": unexpected error code in {}",
+        over.body
+    );
+    let listed = emulator.call("DescribeApplications", &[]).await;
+    assert_eq!(
+        listed
+            .values_at("Applications/member/ApplicationName")
+            .len(),
+        eb::state::MAX_APPLICATIONS,
+        "case \"application quota\": the refused create must not have been stored, got {}",
+        listed.body
+    );
+
+    // Environments: the same, on a store whose application quota is already full.
+    let emulator = Emulator::new();
+    assert_eq!(
+        emulator
+            .call("CreateApplication", &[("ApplicationName", "quota")])
+            .await
+            .status,
+        200,
+        "expected 200 from CreateApplication"
+    );
+    for index in 0..eb::state::MAX_ENVIRONMENTS {
+        let name = format!("env-{index:04}");
+        let created = emulator
+            .call(
+                "CreateEnvironment",
+                &[
+                    ("ApplicationName", "quota"),
+                    ("EnvironmentName", name.as_str()),
+                ],
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: expected 200 while filling the environment quota, got {} and body {}",
+            created.status, created.body
+        );
+    }
+    let over = emulator
+        .call(
+            "CreateEnvironment",
+            &[
+                ("ApplicationName", "quota"),
+                ("EnvironmentName", "env-one-too-many"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        over.status, 400,
+        "case \"environment quota\": expected HTTP 400, got {} and body {}",
+        over.status, over.body
+    );
+    assert_eq!(
+        over.error_code(),
+        "TooManyEnvironmentsException",
+        "case \"environment quota\": unexpected error code in {}",
+        over.body
+    );
+}
+
+#[tokio::test]
+async fn an_unimplemented_operation_still_answers_501() {
+    let emulator = Emulator::new();
+    // The slice this change implements is the application/environment
+    // lifecycle; every other operation keeps the scaffold's 501 until its own
+    // issue is fixed.
+    let refused = emulator
+        .call("CheckDNSAvailability", &[("CNAMEPrefix", "some-prefix")])
+        .await;
+    assert_eq!(
+        refused.status, 501,
+        "case \"CheckDNSAvailability\": expected HTTP 501, got {} and body {}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error_code(),
+        "NotImplemented",
+        "case \"CheckDNSAvailability\": unexpected error code in {}",
+        refused.body
+    );
+}

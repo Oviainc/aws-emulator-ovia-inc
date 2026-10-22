@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMembership
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMembership`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMembership::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The calling account joins a persisted collaboration. Every collaboration-derived
+//! member of the returned `Membership` is copied FROM the stored collaboration, never
+//! from the request, and the membership is indexed by (collaboration, account) so a
+//! second join is a `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +177,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMembership` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMembershipErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMembership"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateMembershipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let caller = st::caller_account_id().to_string();
+        let region = st::request_region(ctx.parts());
+        let collaboration_id = input.collaboration_identifier;
+
+        let mut store = state.lock();
+
+        let Some(record) = store.collaborations.get(&collaboration_id).cloned() else {
+            return Err(CreateMembershipErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("collaboration {collaboration_id} not found"),
+                    resource_id: collaboration_id,
+                    resource_type: st::RESOURCE_TYPE_COLLABORATION.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A membership's `memberAbilities` come from the collaboration's member
+        // specification for the joining account; an account the collaboration never
+        // named has nothing to join.
+        let Some(grant) = record.grant_for(&caller) else {
+            return Err(CreateMembershipErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(format!(
+                        "account {caller} is not a member of collaboration {}",
+                        record.id
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        };
+
+        if let Some(existing) = store.membership_of(&record.id, &caller) {
+            return Err(CreateMembershipErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "account {caller} already has membership {} in collaboration {}",
+                    existing.id, record.id
+                )),
+                resource_id: Some(existing.id.clone()),
+                resource_type: Some(st::RESOURCE_TYPE_MEMBERSHIP.to_string()),
+                reason: Some(st::CONFLICT_REASON_ALREADY_EXISTS.to_string()),
+            })
+            .into());
+        }
+
+        // Last, AFTER the resource-identity checks, so an unknown collaboration still
+        // answers 404 and a repeat join still answers 409 even at the cap: the store
+        // grows by one membership per call and lives for the life of the process, so
+        // past the cap the service answers the quota error it models rather than
+        // accepting another entry. See `st::MAX_MEMBERSHIPS` — the cap and these quota
+        // identifiers are the emulator's own, not values AWS publishes.
+        if store.memberships.len() >= st::MAX_MEMBERSHIPS {
+            return Err(CreateMembershipErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "the number of memberships would exceed the limit of {}",
+                        st::MAX_MEMBERSHIPS
+                    ),
+                    quota_name: "Memberships".to_string(),
+                    quota_value: st::MAX_MEMBERSHIPS as f64,
+                },
+            )
+            .into());
+        }
+
+        let id = st::new_uuid();
+        let arn = st::membership_arn(&region, &id);
+        let payment_configuration =
+            st::membership_payment_configuration(input.payment_configuration.as_ref(), &grant);
+        let membership = st::NewMembership {
+            id: id.clone(),
+            arn: arn.clone(),
+            record: &record,
+            grant,
+            query_log_status: input.query_log_status,
+            job_log_status: input.job_log_status,
+            default_result_configuration: input.default_result_configuration,
+            default_job_result_configuration: input.default_job_result_configuration,
+            payment_configuration,
+            is_metrics_enabled: input.is_metrics_enabled,
+            created_at: st::now(),
+        }
+        .build();
+
+        if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
+            store.tags.insert(arn, tags);
+        }
+        store.memberships.insert(id.clone(), membership);
+        store.membership_order.push(id.clone());
+        store
+            .membership_by_collaboration
+            .insert((record.id.clone(), caller), id.clone());
+
+        let Some(membership) = store.memberships.get(&id).cloned() else {
+            return Err(CreateMembershipErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("membership {id} was not persisted")),
+                },
+            )
+            .into());
+        };
+        Ok(CreateMembershipOutput { membership })
     }
 }

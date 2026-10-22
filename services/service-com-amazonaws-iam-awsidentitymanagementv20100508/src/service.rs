@@ -45,6 +45,49 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
+/// first segment (`"/"`, `""`).
+fn first_path_segment(path: &str) -> Option<&str> {
+    let segment = path.trim_start_matches('/').split('/').next()?;
+    (!segment.is_empty()).then_some(segment)
+}
+
+/// Whether `parts` addresses a path inside `path_segments` — the first URI path segments
+/// this service's wire protocol puts its operations under.
+///
+/// This mirrors the framework's own discriminator,
+/// `emulator_server::can_handle_based_on_route_key_and_path`, which the generated
+/// `can_handle` entry point uses. The framework helper takes a whole buffered
+/// `http::Request`, which the `Service::can_handle` seam below does not receive, so the
+/// rule is applied here over `Parts` instead of called. It is kept identical, including
+/// both edge cases: an EMPTY list means no usable discriminator and is "no constraint",
+/// and the framework's own `ROOT_PATH_SEGMENT` sentinel is how a service that answers
+/// `POST /` claims the root path without claiming every path. Matching is EXACT segment
+/// equality, deliberately never a prefix test.
+fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> bool {
+    if path_segments.is_empty() {
+        return true;
+    }
+    match first_path_segment(parts.uri.path()) {
+        Some(segment) => path_segments.contains(&segment),
+        None => path_segments.contains(&emulator_server::ROOT_PATH_SEGMENT),
+    }
+}
+
+/// The URI path space IAM's wire protocol uses: the ROOT path, and nothing else.
+///
+/// IAM speaks `awsQuery` (`smithy_query(query="service_info")`: protocols `["awsQuery"]`)
+/// and no operation in its model carries a `smithy.api#http` binding, so every one of its
+/// 180 operations arrives as `POST /` with the operation named by the `Action` form field.
+/// The generated `crate::ROUTE_PATH_SEGMENTS` is EMPTY for exactly that case — the
+/// generator keeps it empty for an RPC service with no bindings so as not to narrow
+/// services that already work — and an empty list means "claims every path", which is
+/// what made IAM collide with its signing-name peer. The root claim is therefore stated
+/// here, using the framework's own sentinel for it. It is deliberately NOT called
+/// `ROUTE_PATH_SEGMENTS`: that name belongs to the generated crate-level constant, which
+/// is empty.
+const WIRE_PATH_SEGMENTS: &[&str] = &[emulator_server::ROOT_PATH_SEGMENT];
+
 /// The `com-amazonaws-iam-awsidentitymanagementv20100508` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,12 +117,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // This service signs as `iam` — a signing name it SHARES with IAM Toolbox
+        // (`services/service-com-amazonaws-iamtoolbox-authrequestservice`, sigv4Name
+        // `iam`, endpointPrefix `iam-toolbox`). The router's routing key comes from the
+        // SigV4 credential scope first, so both services resolve to `iam` and matching on
+        // the signing name ALONE makes both claim every request — which the router
+        // answers `500 AmbiguousService` for, in a JSON body an awsQuery client cannot
+        // even parse.
+        //
+        // So the claim is narrowed the way the framework narrows the other signing-name
+        // collisions: the signing name must match AND the request must address this
+        // service's own URI path space, which for an awsQuery service is the root path
+        // (see `WIRE_PATH_SEGMENTS`). IAM Toolbox's `/authorization-details/…` is then
+        // claimed by it alone.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => {
+                claims_modeled_path(parts, WIRE_PATH_SEGMENTS)
+            }
+            _ => false,
         }
     }
 

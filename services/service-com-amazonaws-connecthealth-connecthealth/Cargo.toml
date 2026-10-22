@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA-256 over a sequence number and the clock: the id-minting digest behind every
+# `domainId` / `subscriptionId` this service hands out.
+sha2 = { workspace = true }
+# Hex codec for those ids and for the opaque `nextToken` pagination cursor.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

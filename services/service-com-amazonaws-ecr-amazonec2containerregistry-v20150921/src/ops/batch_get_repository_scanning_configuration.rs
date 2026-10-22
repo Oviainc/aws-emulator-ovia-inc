@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetRepositoryScanningConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetRepositoryScanningConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetRepositoryScanningConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the scanning configuration of each named repository, computed from the
+//! stored repository records (see [`crate::state::Repo::to_scanning_configuration`]).
+//! This is a batch read: a name that matches no repository is reported in `failures`
+//! rather than failing the whole call.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +107,12 @@ impl From<BatchGetRepositoryScanningConfigurationErrorModeled> for BatchGetRepos
     }
 }
 
+/// The only value `ScanningConfigurationFailureCode` carries: the one thing that can go
+/// wrong with a single entry of this batch is that no such repository exists. ECR
+/// reports the code as the reason too, so a client that reads either member sees the
+/// same classification.
+const REPOSITORY_NOT_FOUND_FAILURE: &str = "REPOSITORY_NOT_FOUND";
+
 /// The `BatchGetRepositoryScanningConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,18 +149,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetRepositoryScanningConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetRepositoryScanningConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetRepositoryScanningConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchGetRepositoryScanningConfigurationErrorModeled::ServerException(
+                    ServerException {
+                        message: Some("the ecr repository store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Nothing here is regional or registry-scoped: the request names only repository
+        // names, and every repository this emulator holds is in its own registry.
+        let _ = ctx;
+
+        let store = state.lock();
+
+        // One answer per requested name, in the order asked for: a name that resolves
+        // contributes its configuration, and a name that does not contributes a failure.
+        // `RepositoryNotFoundException` is modelled but not raised for that — a batch
+        // read that refused the whole call could never report the names it did find.
+        let mut scanning_configurations = Vec::with_capacity(input.repository_names.len());
+        let mut failures = Vec::new();
+        for name in &input.repository_names {
+            match store.repositories.get(name) {
+                Some(repo) => scanning_configurations.push(repo.to_scanning_configuration()),
+                None => failures.push(RepositoryScanningConfigurationFailure {
+                    repository_name: Some(name.clone()),
+                    failure_code: Some(REPOSITORY_NOT_FOUND_FAILURE.to_string()),
+                    failure_reason: Some(REPOSITORY_NOT_FOUND_FAILURE.to_string()),
+                }),
+            }
+        }
+
+        Ok(BatchGetRepositoryScanningConfigurationOutput {
+            scanning_configurations: Some(scanning_configurations),
+            failures: Some(failures),
+        })
     }
 }

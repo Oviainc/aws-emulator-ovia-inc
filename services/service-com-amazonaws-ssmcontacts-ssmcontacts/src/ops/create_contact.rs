@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a contact or escalation plan and PERSISTS it in
+//! [`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::contacts`], keyed by the
+//! `ContactArn` it returns, so every later call that names that ARN resolves this record.
+//! `Alias` "must be unique and identifiable", so a second create under a live alias is
+//! refused with the modelled `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +168,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContact"))
+        use crate::state::{check_enum, contact_arn, ContactRecord};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateContactErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "this service is mounted on an engine that holds no state"
+                        .to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        // `Type` is an enum SHAPE, which reaches a handler as a plain string: the
+        // boundary validator enforces length/pattern/range, not an enum's value set.
+        check_enum("type", &input.r#type, CONTACT_TYPE_VALUES).map_err(validation)?;
+
+        let mut state = state.lock();
+
+        // A retried create carrying the token its first call carried is the SAME call:
+        // "a token ensuring that the operation is called only once with the specified
+        // details". It answers with the ARN already minted rather than a second contact —
+        // but only while it still names the SAME alias; a token reused for another alias
+        // is a different request, so it creates rather than replaying.
+        if let Some(arn) = state.idempotent_replay(Self::NAME, input.idempotency_token.as_deref()) {
+            let replayed_alias = state.contacts.get(&arn).map(|contact| contact.alias.clone());
+            if replayed_alias.as_deref() == Some(input.alias.as_str()) {
+                return Ok(CreateContactOutput { contact_arn: arn });
+            }
+        }
+
+        if let Some(existing) = state.alias_index.get(&input.alias) {
+            return Err(CreateContactErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "The contact alias '{}' is already in use by {existing}",
+                    input.alias
+                ),
+                resource_id: existing.clone(),
+                resource_type: CONTACT_RESOURCE_TYPE.to_string(),
+                dependent_entities: None,
+            })
+            .into());
+        }
+
+        // The emulator's own store ceiling, answered with the quota error the model
+        // declares for exactly this condition.
+        if state.contacts.len() >= crate::state::MAX_CONTACTS {
+            return Err(CreateContactErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "This emulator holds at most {} contacts; delete one before creating \
+                         another",
+                        crate::state::MAX_CONTACTS
+                    ),
+                    resource_id: Some(input.alias.clone()),
+                    resource_type: Some(CONTACT_RESOURCE_TYPE.to_string()),
+                    quota_code: "ContactsPerAccount".to_string(),
+                    service_code: "ssm-contacts".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let arn = contact_arn(&crate::state::request_region(ctx.parts()), &input.alias);
+        let record = ContactRecord {
+            arn: arn.clone(),
+            alias: input.alias.clone(),
+            display_name: input.display_name.clone(),
+            contact_type: input.r#type.clone(),
+            plan: input.plan.clone(),
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at: ::std::time::SystemTime::now(),
+        };
+        state.alias_index.insert(input.alias.clone(), arn.clone());
+        state.contacts.insert(arn.clone(), record);
+        state.remember_idempotency_token(Self::NAME, input.idempotency_token.as_deref(), &arn);
+
+        Ok(CreateContactOutput { contact_arn: arn })
     }
+}
+
+/// The `resourceType` this operation's conflict and quota errors name.
+const CONTACT_RESOURCE_TYPE: &str = "contact";
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> CreateContactError {
+    CreateContactErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
 }

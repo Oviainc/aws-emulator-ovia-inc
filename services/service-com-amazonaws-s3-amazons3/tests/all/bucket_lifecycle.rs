@@ -1,0 +1,474 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for S3's bucket lifecycle: create a general purpose bucket and read
+//! it back with `HeadBucket`.
+//!
+//! Every assertion here drives a real HTTP request through the router, so what is pinned
+//! is the wire behaviour (status, bound headers, error code) rather than any handler's
+//! internals.
+//!
+//! The rules under test come from the model's own documentation, quoted beside each
+//! table:
+//!
+//! * `CreateBucketConfiguration$LocationConstraint` decides the bucket's Region — absent
+//!   means `us-east-1`, the legacy value `EU` means `eu-west-1`, any other value IS the
+//!   Region code.
+//! * `CreateBucketOutput$Location` is `/<bucket>` for an account regional namespace
+//!   bucket and for a global bucket in `us-east-1`, and the global endpoint URL
+//!   `http://<bucket>.s3.amazonaws.com/` for a global bucket in any other Region.
+//! * Re-creating a bucket you already own answers `BucketAlreadyOwnedByYou`, except in
+//!   `us-east-1` where, "for legacy compatibility", it answers 200 OK.
+
+use std::sync::Arc;
+
+use service_com_amazonaws_s3_amazons3::state::{
+    BucketCreation, ComAmazonawsS3Amazons3State, MAX_BUCKETS_PER_ACCOUNT,
+};
+use service_com_amazonaws_s3_amazons3::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The router picks a service by the SigV4 credential scope's service field, so every
+/// request carries one naming `s3`. Neither the key id nor the signature is a credential:
+/// this harness turns request authentication off below, exactly as the emulator runs it
+/// unless started with authentication on, so nothing here is verified.
+const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+     Credential=emulator-test-key/20260101/us-east-1/s3/aws4_request, \
+     SignedHeaders=host, Signature=not-verified";
+
+/// One service mounted on its own engine, reached exactly the way the production router
+/// reaches it.
+fn router() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(engine));
+    router
+}
+
+/// One row of the create-and-read-back table: the case name, the location constraint the
+/// request carries (when any), the bucket namespace it carries (when any), the `Location`
+/// the create must report, and the Region the bucket must then read back with.
+type CreateRow<'a> = (
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    &'a str,
+    &'a str,
+);
+
+/// What a dispatched request answered.
+struct Answer {
+    status: u16,
+    headers: http::HeaderMap,
+    body: bytes::Bytes,
+}
+
+impl Answer {
+    /// A bound response header's value.
+    fn header(&self, name: &str) -> Option<String> {
+        self.headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// The wire error code: the `<Code>` element of S3's restXml error document (the
+    /// model sets `noErrorWrapping`, so it is the document's own child), or the
+    /// `x-amzn-errortype` header when the protocol carried it there instead.
+    fn error_code(&self) -> String {
+        let body = String::from_utf8_lossy(&self.body).to_string();
+        let between = body
+            .split_once("<Code>")
+            .and_then(|(_, rest)| rest.split_once("</Code>"))
+            .map(|(code, _)| code.to_string());
+        between
+            .or_else(|| self.header("x-amzn-errortype"))
+            .unwrap_or(body)
+    }
+}
+
+/// Dispatch one request with the given headers and body.
+async fn send(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Answer {
+    let mut builder = http::Request::builder()
+        .method(method)
+        .uri(format!("https://s3.us-east-1.amazonaws.com{uri}"))
+        .header("host", "s3.us-east-1.amazonaws.com")
+        .header("authorization", AUTHORIZATION)
+        .header("content-type", "application/xml");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
+        .body(bytes::Bytes::from(body.to_string()))
+        .expect("the test request must build");
+    let response = router.dispatch(request).await;
+    let (parts, body) = response.into_parts();
+    Answer {
+        status: parts.status.as_u16(),
+        headers: parts.headers,
+        body,
+    }
+}
+
+/// `PUT /<bucket>` — `CreateBucket`, with the location constraint (when any) in the XML
+/// payload and the bucket namespace (when any) in its bound header.
+async fn create_bucket(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    location_constraint: Option<&str>,
+    bucket_namespace: Option<&str>,
+) -> Answer {
+    let body = match location_constraint {
+        None => String::new(),
+        Some(constraint) => format!(
+            "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <LocationConstraint>{constraint}</LocationConstraint>\
+             </CreateBucketConfiguration>"
+        ),
+    };
+    let headers: Vec<(&str, &str)> = bucket_namespace
+        .map(|namespace| vec![("x-amz-bucket-namespace", namespace)])
+        .unwrap_or_default();
+    send(router, "PUT", &format!("/{bucket}"), &headers, &body).await
+}
+
+/// `HEAD /<bucket>` — `HeadBucket`.
+async fn head_bucket(router: &MultiServiceRouter, bucket: &str) -> Answer {
+    send(router, "HEAD", &format!("/{bucket}"), &[], "").await
+}
+
+#[tokio::test]
+async fn creating_a_bucket_reports_its_location_and_region_and_reads_back() {
+    let router = router();
+
+    // (case, location constraint, bucket namespace, expected Location, expected Region).
+    //
+    // The rows differ along what the two rules generalise over: whether a constraint is
+    // present, which Region it names (including the legacy `EU` alias and Regions in
+    // three partitions' worth of prefixes, none of them the one the issue cited), and
+    // which namespace the bucket is created in. Every constraint value below is one of
+    // `BucketLocationConstraint`'s enum values
+    // (`smithy_query(query="shape",shape="BucketLocationConstraint")`); `us-east-1` is
+    // deliberately NOT among them, which is why the absent-constraint row is the only
+    // way to ask for it.
+    let rows: [CreateRow<'_>; 7] = [
+        (
+            "no constraint defaults to us-east-1, so Location is the bucket path",
+            None,
+            None,
+            "/bucket-default",
+            "us-east-1",
+        ),
+        (
+            "a named Region makes Location the global endpoint URL",
+            Some("us-west-2"),
+            None,
+            "http://bucket-us-west-2.s3.amazonaws.com/",
+            "us-west-2",
+        ),
+        (
+            "the legacy EU constraint creates the bucket in eu-west-1",
+            Some("EU"),
+            None,
+            "http://bucket-eu.s3.amazonaws.com/",
+            "eu-west-1",
+        ),
+        (
+            "a Region the issue never cited behaves like any other",
+            Some("ap-southeast-7"),
+            None,
+            "http://bucket-ap-southeast-7.s3.amazonaws.com/",
+            "ap-southeast-7",
+        ),
+        (
+            "a gov-cloud Region is still just a Region code",
+            Some("us-gov-east-1"),
+            None,
+            "http://bucket-us-gov-east-1.s3.amazonaws.com/",
+            "us-gov-east-1",
+        ),
+        (
+            "an account regional namespace bucket reports the bucket path",
+            Some("us-west-2"),
+            Some("account-regional"),
+            "/bucket-account-regional",
+            "us-west-2",
+        ),
+        (
+            "a global namespace bucket in us-east-1 reports the bucket path",
+            None,
+            Some("global"),
+            "/bucket-global-default",
+            "us-east-1",
+        ),
+    ];
+
+    for (case, constraint, namespace, expected_location, expected_region) in rows {
+        // The bucket name is the Location without its leading slash for the path rows,
+        // and the host's first label for the URL rows; both are derived here from the
+        // expectation so a row names its bucket once.
+        let bucket = expected_location
+            .strip_prefix('/')
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                expected_location
+                    .trim_start_matches("http://")
+                    .split('.')
+                    .next()
+                    .expect("the expected URL names the bucket")
+                    .to_string()
+            });
+
+        let created = create_bucket(&router, &bucket, constraint, namespace).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateBucket on the fresh name \
+             {bucket:?}, got {} with body {:?}",
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+        assert_eq!(
+            created.header("location").as_deref(),
+            Some(expected_location),
+            "case {case:?}: expected Location {expected_location:?}, got {:?}",
+            created.header("location")
+        );
+        // Directory buckets only, per `CreateBucketOutput$BucketArn`'s documentation.
+        assert_eq!(
+            created.header("x-amz-bucket-arn"),
+            None,
+            "case {case:?}: a general purpose bucket reports no BucketArn, got {:?}",
+            created.header("x-amz-bucket-arn")
+        );
+
+        // Read the created bucket back: the Region the constraint asked for is the one
+        // persisted state answers with.
+        let head = head_bucket(&router, &bucket).await;
+        assert_eq!(
+            head.status, 200,
+            "case {case:?}: expected HTTP 200 from HeadBucket on the bucket just \
+             created, got {}",
+            head.status
+        );
+        assert_eq!(
+            head.header("x-amz-bucket-region").as_deref(),
+            Some(expected_region),
+            "case {case:?}: expected HeadBucket to report Region {expected_region:?}, \
+             got {:?}",
+            head.header("x-amz-bucket-region")
+        );
+        assert_eq!(
+            head.header("x-amz-access-point-alias").as_deref(),
+            Some("false"),
+            "case {case:?}: the request named a bucket, not an access point alias, \
+             got {:?}",
+            head.header("x-amz-access-point-alias")
+        );
+    }
+}
+
+#[tokio::test]
+async fn recreating_a_bucket_you_own_answers_by_the_bucket_region() {
+    let router = router();
+
+    // (case, location constraint, expected status of the SECOND create, expected error
+    // code of the second create).
+    //
+    // The rule: re-creating a bucket you already own is `BucketAlreadyOwnedByYou`
+    // (HTTP 409 per the model) — except in us-east-1, where "for legacy compatibility
+    // … Amazon S3 returns 200 OK" (`BucketAlreadyOwnedByYou`'s own documentation). The
+    // rows span both sides of that split, in three Regions.
+    let rows: [(&str, Option<&str>, u16, Option<&str>); 4] = [
+        (
+            "us-east-1 re-create is the documented legacy 200",
+            None,
+            200,
+            None,
+        ),
+        (
+            "us-west-2 re-create is refused",
+            Some("us-west-2"),
+            409,
+            Some("BucketAlreadyOwnedByYou"),
+        ),
+        (
+            "the EU alias Region is refused like any other non-us-east-1 Region",
+            Some("EU"),
+            409,
+            Some("BucketAlreadyOwnedByYou"),
+        ),
+        (
+            "ap-northeast-3 re-create is refused",
+            Some("ap-northeast-3"),
+            409,
+            Some("BucketAlreadyOwnedByYou"),
+        ),
+    ];
+
+    for (index, (case, constraint, expected_status, expected_code)) in rows.iter().enumerate() {
+        let bucket = format!("recreate-bucket-{index}");
+
+        let first = create_bucket(&router, &bucket, *constraint, None).await;
+        assert_eq!(
+            first.status, 200,
+            "case {case:?}: the first create of {bucket:?} must succeed, got {}",
+            first.status
+        );
+
+        let second = create_bucket(&router, &bucket, *constraint, None).await;
+        assert_eq!(
+            second.status, *expected_status,
+            "case {case:?}: expected HTTP {expected_status} from the second create, \
+             got {} with body {:?}",
+            second.status,
+            String::from_utf8_lossy(&second.body)
+        );
+        match expected_code {
+            Some(code) => assert_eq!(
+                second.error_code(),
+                *code,
+                "case {case:?}: expected error code {code:?}, got {:?}",
+                second.error_code()
+            ),
+            None => assert_eq!(
+                second.header("location").as_deref(),
+                Some(format!("/{bucket}").as_str()),
+                "case {case:?}: the legacy 200 still reports the bucket's Location, \
+                 got {:?}",
+                second.header("location")
+            ),
+        }
+
+        // Either way the re-create changed nothing: the bucket still reports the Region
+        // it was created in.
+        let head = head_bucket(&router, &bucket).await;
+        let expected_region = match constraint {
+            None => "us-east-1",
+            Some("EU") => "eu-west-1",
+            Some(region) => region,
+        };
+        assert_eq!(
+            head.header("x-amz-bucket-region").as_deref(),
+            Some(expected_region),
+            "case {case:?}: expected the stored Region {expected_region:?} to survive \
+             the re-create, got {:?}",
+            head.header("x-amz-bucket-region")
+        );
+    }
+}
+
+#[tokio::test]
+async fn creating_past_the_account_bucket_quota_is_refused() {
+    // This suite needs the store itself, to stand the account at its quota without
+    // dispatching ten thousand requests. The engine is the SAME one the router hands the
+    // service, so what is seeded here is what the handler sees.
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+
+    {
+        let state = engine.state::<ComAmazonawsS3Amazons3State>();
+        let mut store = state.lock();
+        for index in 0..MAX_BUCKETS_PER_ACCOUNT {
+            assert_eq!(
+                store.create_bucket(&format!("quota-filler-{index}"), "us-east-1"),
+                BucketCreation::Created,
+                "case {index}: seeding the store up to the quota must record every bucket"
+            );
+        }
+        // The bound itself: one more, by any name and in any Region, is refused by the
+        // store rather than recorded.
+        for (name, region) in [
+            ("quota-filler-extra", "us-east-1"),
+            ("another-name", "us-west-2"),
+        ] {
+            assert_eq!(
+                store.create_bucket(name, region),
+                BucketCreation::QuotaReached,
+                "case {name:?}: a create past {MAX_BUCKETS_PER_ACCOUNT} buckets must be \
+                 refused by the store"
+            );
+        }
+    }
+
+    // And over the wire: a fresh name is refused with a 400 rather than growing the
+    // store, in every Region form the create table covers.
+    for (case, bucket, constraint) in [
+        ("default Region", "past-quota-default", None),
+        ("named Region", "past-quota-us-west-2", Some("us-west-2")),
+        ("legacy EU alias", "past-quota-eu", Some("EU")),
+    ] {
+        let refused = create_bucket(&router, bucket, constraint, None).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected the create past the quota to be refused with HTTP \
+             400, got {} with body {:?}",
+            refused.status,
+            String::from_utf8_lossy(&refused.body)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ValidationException",
+            "case {case:?}: expected the framework's refusal code, got {:?}",
+            refused.error_code()
+        );
+        // Nothing was written: the refused name is still not a bucket.
+        let head = head_bucket(&router, bucket).await;
+        assert_eq!(
+            head.status, 400,
+            "case {case:?}: the refused name must not have been recorded, got HeadBucket \
+             {}",
+            head.status
+        );
+    }
+
+    // A bucket the account already holds is NOT growth, so the documented us-east-1
+    // legacy re-create still answers 200 even at the quota.
+    let recreated = create_bucket(&router, "quota-filler-0", None, None).await;
+    assert_eq!(
+        recreated.status, 200,
+        "re-creating a held us-east-1 bucket adds no entry, so it must still answer 200, \
+         got {} with body {:?}",
+        recreated.status,
+        String::from_utf8_lossy(&recreated.body)
+    );
+}
+
+#[tokio::test]
+async fn heading_a_bucket_this_emulator_does_not_hold_is_not_found() {
+    let router = router();
+
+    create_bucket(&router, "held-bucket", None, None).await;
+
+    // Names that are NOT the one bucket created above: a different name, a prefix of it,
+    // an extension of it, and one differing only in case (bucket names are
+    // case-sensitive). `NotFound` is the only error `HeadBucket` models, and the model
+    // carries no `@httpError` on it, so the framework renders the client-error default —
+    // `smithy_query(query="operation",operation="HeadBucket")` reports
+    // `httpError 400, httpErrorDefaulted true`.
+    for bucket in ["absent-bucket", "held", "held-bucket-2", "Held-Bucket"] {
+        let answer = head_bucket(&router, bucket).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {bucket:?}: expected the modeled NotFound status for a bucket this \
+             emulator does not hold, got {}",
+            answer.status
+        );
+    }
+
+    // And the bucket that IS held still reads back, so the rows above failed on the
+    // lookup rather than on the operation being unreachable.
+    let held = head_bucket(&router, "held-bucket").await;
+    assert_eq!(
+        held.status, 200,
+        "the held bucket must still read back, got {}",
+        held.status
+    );
+}

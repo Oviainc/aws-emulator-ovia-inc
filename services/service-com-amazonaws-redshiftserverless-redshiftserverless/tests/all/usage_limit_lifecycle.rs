@@ -465,7 +465,7 @@ async fn an_amount_that_is_not_positive_is_refused() {
 }
 
 #[tokio::test]
-async fn a_limit_over_a_resource_the_account_does_not_hold_is_not_found() {
+async fn a_limit_over_a_resource_the_account_does_not_hold_is_refused_as_invalid() {
     let router = emulator();
     let (namespace_arn, workgroup_arn) = resources(&router, "unknown").await;
 
@@ -508,10 +508,13 @@ async fn a_limit_over_a_resource_the_account_does_not_hold_is_not_found() {
                 }),
             )
             .await;
+            // An ARN that names no resource of this account is a bad `resourceArn`, not a
+            // resource this call addressed: the recorded behaviour of the real service is
+            // the 400 `ValidationException`, NOT the 404 the operation also models.
             assert_eq!(
                 (status, error_code(&body).as_str()),
-                (404, "ResourceNotFoundException"),
-                "case {case:?} ({usage_type}): expected 404 ResourceNotFoundException, \
+                (400, "ValidationException"),
+                "case {case:?} ({usage_type}): expected 400 ValidationException, \
                  got {status} with {body}"
             );
         }

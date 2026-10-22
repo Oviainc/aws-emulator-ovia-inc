@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHostedZones
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHostedZones`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHostedZones::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +93,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::normalize_zone_id;
+
+/// The most hosted zones one response carries.
+///
+/// The operation's own documentation: "Amazon Route 53 returns a maximum of 100
+/// items in each response. If you have a lot of hosted zones, you can use the
+/// maxitems parameter to list them in groups of up to 100."
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The one `HostedZoneType` the model declares, which selects private zones.
+const PRIVATE_HOSTED_ZONE: &str = "PrivateHostedZone";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,20 +173,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHostedZones` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHostedZonesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHostedZones"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Unreachable under the router, which always mounts this service on
+            // the shared `InMemoryEngine`.
+            ListHostedZonesErrorModeled::InvalidInput(InvalidInput {
+                message: Some("the Route 53 emulator's state store is unavailable".to_string()),
+            })
+        })?;
+
+        // A reusable delegation set has to exist to be filtered on, and this
+        // emulator mints none (CreateReusableDelegationSet is not implemented).
+        if let Some(set_id) = input.delegation_set_id.as_deref().filter(|id| !id.is_empty()) {
+            return Err(ListHostedZonesErrorModeled::NoSuchDelegationSet(NoSuchDelegationSet {
+                message: Some(format!(
+                    "no reusable delegation set exists with the ID {set_id}"
+                )),
+            })
+            .into());
+        }
+
+        let page_size = input
+            .max_items
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // Route 53 echoes the `maxitems` the caller asked for; the clamped
+        // `page_size` above only bounds the work and the response size.
+        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        // `Marker` is the hosted zone id the previous page stopped before; the
+        // response echoes it verbatim, so it is kept as the caller sent it.
+        let marker = input.marker.clone().unwrap_or_default();
+        let start = normalize_zone_id(&marker).to_string();
+        let private_only = input.hosted_zone_type.as_deref() == Some(PRIVATE_HOSTED_ZONE);
+
+        let store = state.lock();
+        // The store keys zones by id in a BTreeMap, so this walk is a stable
+        // total order and a marker always resumes at the same place.
+        let matching = store
+            .zones
+            .values()
+            .filter(|zone| !private_only || zone.private_zone)
+            .filter(|zone| start.is_empty() || zone.id.as_str() >= start.as_str());
+
+        let mut hosted_zones = Vec::new();
+        let mut next_marker = None;
+        for zone in matching {
+            if hosted_zones.len() >= page_size as usize {
+                // "the value of NextMarker is the hosted zone ID of the first
+                // hosted zone that Route 53 will return if you submit another
+                // request."
+                next_marker = Some(zone.id.clone());
+                break;
+            }
+            hosted_zones.push(zone.to_hosted_zone());
+        }
+
+        Ok(ListHostedZonesOutput {
+            hosted_zones,
+            marker,
+            is_truncated: next_marker.is_some(),
+            next_marker,
+            // Route 53 echoes the `maxitems` the caller asked for, so a request
+            // outside the documented range reads its own value back while the
+            // page itself stays clamped to MAX_PAGE_SIZE.
+            max_items: reported_max_items,
+        })
     }
 }

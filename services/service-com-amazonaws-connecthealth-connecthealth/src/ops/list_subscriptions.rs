@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: one `SubscriptionDescription` per PERSISTED subscription of the named
+//! domain, paged by `maxResults` with an opaque `nextToken` that resumes exactly after
+//! the last subscription the previous page returned. An unknown domain is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +70,17 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The page-size bound this operation enforces itself, and the page it serves when the
+/// caller asks for no `maxResults` (the maximum).
+///
+/// Treat it as THIS EMULATOR's cap on one page: the generated "Modeled contract" header
+/// above lists `maxResults` without a range, so the handler enforces the bound itself
+/// (refusing, never clamping) rather than relying on the boundary validator.
+/// `smithy_query(query="operation", operation="ListSubscriptions")` does report a
+/// `range {min: 1, max: 100}` for the member, which is where these numbers come from.
+const MIN_PAGE_SIZE: i32 = 1;
+const MAX_PAGE_SIZE: i32 = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +153,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSubscriptions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListSubscriptionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "ListSubscriptions could not reach this service's store".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // Absent `maxResults` means a full page. A value outside the bound is REFUSED
+        // rather than quietly clamped, here in the handler, so the answer does not
+        // depend on whether the boundary validator also refuses it.
+        let page_size = match input.max_results {
+            None => MAX_PAGE_SIZE,
+            Some(requested) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested) => requested,
+            Some(requested) => {
+                return Err(ListSubscriptionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "maxResults {requested} is outside {MIN_PAGE_SIZE}..{MAX_PAGE_SIZE}"
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+        let page_size = usize::try_from(page_size).unwrap_or(1);
+
+        // The cursor is the last key of the previous page: resume strictly after it,
+        // whether or not that subscription still exists.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(ListSubscriptionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "nextToken is not a token this service issued".to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let mut store = state.lock();
+        // A reporting operation, so it writes only what the CLOCK already made due.
+        store.purge_due_deletions(now);
+
+        // The SAME liveness rule the single-subscription readers use, so a
+        // subscription a caller can enumerate here is one it can also read.
+        let Some(domain) = store.live_domain(&input.domain_id) else {
+            return Err(ListSubscriptionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Domain {} was not found", input.domain_id)),
+                },
+            )
+            .into());
+        };
+
+        let mut matching = domain
+            .subscriptions
+            .values()
+            .filter(|subscription| subscription.is_live())
+            .filter(|subscription| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| subscription.subscription_id.as_str() > after)
+            });
+
+        let subscriptions: Vec<SubscriptionDescription> = matching
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::Subscription::description)
+            .collect();
+        // A token only when a subscription is left after this page.
+        let next_token = match (matching.next(), subscriptions.last()) {
+            (Some(_), Some(last)) => Some(crate::state::encode_page_token(&last.subscription_id)),
+            _ => None,
+        };
+
+        Ok(ListSubscriptionsOutput {
+            subscriptions,
+            next_token,
+        })
     }
 }

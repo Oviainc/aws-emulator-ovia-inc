@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `domainId`, builds the domain's ARN, derives its encryption
+//! context and (when asked for) its web-app configuration, PERSISTS the record in
+//! [`crate::state`], and renders the stored record — never the echoed input.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +143,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomain"))
+        // The store is unreachable only when this service was mounted on a foreign
+        // engine; this operation models no server-side error, so a refusal is the only
+        // channel it has.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "CreateDomain could not reach this service's store",
+            ));
+        };
+        let region = crate::state::region_of(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.purge_due_deletions(now);
+
+        // Bound the store BEFORE minting, so a refused request advances nothing: the
+        // operation's own modelled quota error is the channel for a store that is full.
+        if store.domains.len() >= crate::state::MAX_DOMAINS {
+            return Err(CreateDomainErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} domains",
+                        crate::state::MAX_DOMAINS
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(tags) = input.tags.as_ref() {
+            if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+                return Err(CreateDomainErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "tags carries {} entries, more than the maximum of {}",
+                            tags.len(),
+                            crate::state::MAX_TAGS_PER_RESOURCE
+                        )),
+                    },
+                )
+                .into());
+            }
+            if let Some((key, value)) = tags.iter().find(|(key, value)| {
+                key.len() > crate::state::MAX_TAG_KEY_LEN
+                    || value.len() > crate::state::MAX_TAG_VALUE_LEN
+            }) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "tags entry '{}' exceeds the maximum key length {} or value length {} \
+                     (key {} characters, value {} characters)",
+                    key.chars().take(32).collect::<String>(),
+                    crate::state::MAX_TAG_KEY_LEN,
+                    crate::state::MAX_TAG_VALUE_LEN,
+                    key.len(),
+                    value.len()
+                )));
+            }
+        }
+
+        let domain_id = store.mint_domain_id();
+        let arn = crate::state::domain_arn(&region, &domain_id);
+
+        // `encryptionContext` is derived, not asked for: a customer-managed key is in
+        // force exactly when the caller named one, and the model documents the
+        // context's `kmsKeyArn` as present only then.
+        let encryption_type = if input.kms_key_arn.is_some() {
+            crate::state::EncryptionType::CustomerManagedKey
+        } else {
+            crate::state::EncryptionType::AwsOwnedKey
+        };
+
+        // A web app is set up only when asked for. The caller names an Identity Center
+        // INSTANCE; the service creates an application in it and reports that
+        // application's id, so the stored (output) shape is not the input shape.
+        let web_app_configuration = input.web_app_setup_configuration.as_ref().map(|setup| {
+            let idc_application_id = store.mint_idc_application_id();
+            crate::state::WebAppConfigurationRecord {
+                ehr_role: setup.ehr_role.clone(),
+                idc_application_id,
+                idc_region: setup.idc_region.clone(),
+            }
+        });
+        let web_app_url = web_app_configuration
+            .as_ref()
+            .map(|_| crate::state::web_app_url(&region, &domain_id));
+
+        let domain = crate::state::Domain {
+            domain_id: domain_id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            kms_key_arn: input.kms_key_arn,
+            encryption_type,
+            status: crate::state::DomainStatus::Active,
+            purge_due_at: None,
+            web_app_url,
+            web_app_configuration,
+            created_at: now,
+            subscriptions: ::std::collections::BTreeMap::new(),
+        };
+
+        // Tags go to the one ARN-keyed tag store, so `GetDomain` and
+        // `ListTagsForResource` cannot disagree about a domain's tags.
+        if let Some(tags) = input.tags {
+            if !tags.is_empty() {
+                store
+                    .tags_by_arn
+                    .insert(arn.clone(), tags.into_iter().collect());
+            }
+        }
+        // `or_insert` hands back the record it STORED, so every field rendered below is
+        // read out of the store rather than echoed from the request.
+        let stored = store.domains.entry(domain_id).or_insert(domain);
+        Ok(CreateDomainOutput {
+            domain_id: stored.domain_id.clone(),
+            arn: stored.arn.clone(),
+            name: stored.name.clone(),
+            kms_key_arn: stored.kms_key_arn.clone(),
+            encryption_context: Some(EncryptionContext {
+                encryption_type: stored.encryption_type.as_wire().to_string(),
+                kms_key_arn: stored.kms_key_arn.clone(),
+            }),
+            status: stored.status.as_wire().to_string(),
+            web_app_url: stored.web_app_url.clone(),
+            web_app_configuration: stored.web_app_configuration.as_ref().map(|config| {
+                WebAppConfiguration {
+                    ehr_role: config.ehr_role.clone(),
+                    idc_application_id: config.idc_application_id.clone(),
+                    idc_region: config.idc_region.clone(),
+                }
+            }),
+            created_at: crate::state::to_timestamp(stored.created_at),
+        })
     }
 }

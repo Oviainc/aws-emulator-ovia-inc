@@ -40,6 +40,11 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! This service uses that channel for the three awsQuery service-level errors its
+//! model declares no shape for but its own documentation names:
+//! `InvalidParameterValue`, `MissingRequiredParameter` and `InternalFailure`. See
+//! [`Scaffolded::Service`].
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -177,6 +182,86 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic query client-error shape.
+static SERVICE_ERROR_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#ServiceError$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic query client-error shape. In the `smithy.framework`
+/// namespace for the same reason as the two above: the shape is in no service
+/// model, so it must not collide with a modeled one. The awsQuery envelope takes
+/// the `<Code>` from [`OperationError::shape_name`], not from this schema.
+pub static SERVICE_ERROR_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#ServiceError",
+        "smithy.framework",
+        "ServiceError",
+    ),
+    ShapeType::Structure,
+    &[&SERVICE_ERROR_MESSAGE],
+);
+
+/// `InvalidParameterValue`: a parameter the request supplied cannot be used —
+/// it names something that does not exist, or something that already does.
+///
+/// Elastic Beanstalk's own model documents this code for exactly that case: the
+/// `CreateEnvironment$EnvironmentName` doc says "If the specified name already
+/// exists in the region, Elastic Beanstalk returns an InvalidParameterValue
+/// error." The Smithy model declares no error SHAPE for it (it is one of the
+/// awsQuery family's service-level client errors), so it is named here, where the
+/// wrapper already carries the errors a model does not declare.
+pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// `MissingRequiredParameter`: a parameter this operation requires for the
+/// combination of values supplied was absent. The model documents this code for
+/// exactly that case on every operation that takes an either/or pair —
+/// `TerminateEnvironment$EnvironmentId`: "If you do not specify either, Elastic
+/// Beanstalk returns MissingRequiredParameter error." Also a service-level
+/// awsQuery error with no shape in the model.
+pub const MISSING_REQUIRED_PARAMETER: &str = "MissingRequiredParameter";
+
+/// `InternalFailure`: the request failed for a reason internal to the emulator —
+/// the one 5xx of the awsQuery family's service-level errors. Reached only when
+/// the per-service store cannot be resolved, which cannot happen behind the
+/// router (it always mounts the shared `InMemoryEngine`).
+pub const INTERNAL_FAILURE: &str = "InternalFailure";
+
+/// The payload of a query client error: the code a client branches on, the status
+/// it is returned with, and the message explaining what to fix.
+#[derive(Debug, Clone)]
+pub struct ServiceError {
+    /// The wire error code — [`INVALID_PARAMETER_VALUE`],
+    /// [`MISSING_REQUIRED_PARAMETER`] or [`INTERNAL_FAILURE`].
+    /// `'static` because [`OperationError::shape_name`] returns a `&'static str`.
+    pub code: &'static str,
+    /// The HTTP status the code is returned with (400 for both of the above).
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ServiceError {}
+
+impl SerializableStruct for ServiceError {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&SERVICE_ERROR_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +270,10 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A client error this SERVICE names but its model declares no shape for —
+    /// the awsQuery `InvalidParameterValue` / `MissingRequiredParameter` /
+    /// `InternalFailure` codes. See [`ServiceError`].
+    Service(ServiceError),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -221,6 +310,37 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse the request with HTTP 400 [`INVALID_PARAMETER_VALUE`]: a supplied
+    /// parameter names a resource that does not exist, or one that already does.
+    pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
+        Self::Service(ServiceError {
+            code: INVALID_PARAMETER_VALUE,
+            status: 400,
+            message: message.into(),
+        })
+    }
+
+    /// Refuse the request with HTTP 400 [`MISSING_REQUIRED_PARAMETER`]: a
+    /// parameter this operation requires for the values supplied was absent.
+    pub fn missing_required_parameter(message: impl Into<String>) -> Self {
+        Self::Service(ServiceError {
+            code: MISSING_REQUIRED_PARAMETER,
+            status: 400,
+            message: message.into(),
+        })
+    }
+
+    /// Fail with HTTP 500 [`INTERNAL_FAILURE`]. For a fault that is the
+    /// emulator's own, NOT for a bad request and NOT for an unimplemented
+    /// operation (`not_implemented` answers that one).
+    pub fn internal_failure(message: impl Into<String>) -> Self {
+        Self::Service(ServiceError {
+            code: INTERNAL_FAILURE,
+            status: 500,
+            message: message.into(),
+        })
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -228,6 +348,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::Service(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +361,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::Service(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +376,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::Service(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +385,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::Service(_) => &SERVICE_ERROR_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +398,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            // The code the service itself names; see [`ServiceError::code`].
+            Self::Service(e) => e.code,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +412,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::Service(e) => e.status,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,7 +424,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            // The synthetic shapes carry no `awsQueryError` trait, so the query
+            // envelope's `<Code>` falls back to `shape_name()` — which for
+            // `Service` is already the code the service names.
+            Self::Service(_) => None,
             Self::ValidationException(_) => None,
         }
     }

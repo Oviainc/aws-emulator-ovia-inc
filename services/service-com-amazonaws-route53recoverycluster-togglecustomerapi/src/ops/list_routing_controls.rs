@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRoutingControls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRoutingControls`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: a pure READ that enumerates the routing controls held in
+//! `crate::state`, in ARN order, filtered by `ControlPanelArn` when one is given. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRoutingControls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Paging honours `MaxResults` and `NextToken`: the token is an opaque, versioned
+//! encoding of the filter it was issued for plus the offset reached, so issuing a page
+//! writes no state and the pages walk the whole set without repeats or omissions. A
+//! `ControlPanelArn` no control panel holds is a `ResourceNotFoundException` (404); a
+//! token this service did not issue is a `ValidationException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +97,52 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The page size this operation uses when the caller names no `MaxResults`.
+///
+/// From the model's own documentation for the `MaxResults` member: "The number of
+/// routing controls objects that you want to return with this call. The default
+/// value is 500."
+const DEFAULT_MAX_RESULTS: usize = 500;
+
+/// Version tag carried inside every `NextToken` this operation issues, so a token
+/// in a form this build does not understand is refused rather than mis-read.
+const CURSOR_VERSION: &str = "v1";
+
+/// Encode the cursor for the next page as an opaque `PageToken`.
+///
+/// The cursor is the pair (the `ControlPanelArn` filter the page was issued for,
+/// the offset reached), hex-encoded so a caller cannot read structure into it and
+/// treats it as the opaque token the model describes. Encoding it means paging
+/// keeps no server-side token table: a LIST call writes nothing at all.
+/// The listing order is the registry's ARN order, and this data plane models no
+/// operation that adds or removes a routing control, so an offset stays pointing
+/// at the same element between pages.
+fn encode_cursor(control_panel_arn: Option<&str>, offset: usize) -> String {
+    hex::encode(format!(
+        "{CURSOR_VERSION}|{}|{offset}",
+        control_panel_arn.unwrap_or_default()
+    ))
+}
+
+/// The offset `token` points at, or `None` when it is not a token this operation
+/// issued for this same `ControlPanelArn` filter.
+///
+/// An `Arn` cannot contain `|` (its pattern is `^[A-Za-z0-9:./_-]*$`), so the
+/// three encoded fields split unambiguously.
+fn decode_cursor(token: &str, control_panel_arn: Option<&str>) -> Option<usize> {
+    let raw = hex::decode(token).ok()?;
+    let decoded = String::from_utf8(raw).ok()?;
+    let mut fields = decoded.split('|');
+    let (version, panel, offset) = (fields.next()?, fields.next()?, fields.next()?);
+    if version != CURSOR_VERSION || fields.next().is_some() {
+        return None;
+    }
+    if panel != control_panel_arn.unwrap_or_default() {
+        return None;
+    }
+    offset.parse().ok()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,18 +216,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRoutingControls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRoutingControlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRoutingControls"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListRoutingControlsError::from(
+                ListRoutingControlsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the routing control registry is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // One read under the single state guard; nothing here writes.
+        let guard = state.lock();
+
+        let filter = input.control_panel_arn.as_deref();
+        if let Some(control_panel_arn) = filter {
+            if !guard.control_panels.contains_key(control_panel_arn) {
+                return Err(ListRoutingControlsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Control panel {control_panel_arn} was not found"),
+                        resource_id: control_panel_arn.to_string(),
+                        resource_type: "ControlPanel".to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let controls = guard.routing_controls_in(filter);
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => decode_cursor(token, filter).filter(|o| *o <= controls.len()).ok_or_else(
+                || {
+                    ListRoutingControlsError::from(
+                        ListRoutingControlsErrorModeled::ValidationException(ValidationException {
+                            message: "NextToken is not a token this call issued for the \
+                                      requested ControlPanelArn"
+                                .to_string(),
+                            reason: Some("cannotParse".to_string()),
+                            fields: Some(vec![ValidationExceptionField {
+                                name: "NextToken".to_string(),
+                                message: "Member must be a NextToken returned by a previous \
+                                          ListRoutingControls call with the same ControlPanelArn"
+                                    .to_string(),
+                            }]),
+                        }),
+                    )
+                },
+            )?,
+        };
+
+        // `MaxResults` is modelled with `@range(min: 1)`, so a value below it is a
+        // refusal, never a silent fall back to the default; the default is for the
+        // member being ABSENT.
+        let page_size = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(requested) => usize::try_from(requested)
+                .ok()
+                .filter(|requested| *requested >= 1)
+                .ok_or_else(|| {
+                    ListRoutingControlsError::from(
+                        ListRoutingControlsErrorModeled::ValidationException(ValidationException {
+                            message: "MaxResults must be greater than or equal to 1".to_string(),
+                            reason: Some("fieldValidationFailed".to_string()),
+                            fields: Some(vec![ValidationExceptionField {
+                                name: "MaxResults".to_string(),
+                                message: "Member must be greater than or equal to 1".to_string(),
+                            }]),
+                        }),
+                    )
+                })?,
+        };
+
+        let routing_controls: Vec<RoutingControl> = controls[offset..]
+            .iter()
+            .take(page_size)
+            .map(|control| RoutingControl {
+                control_panel_arn: Some(control.control_panel_arn.clone()),
+                control_panel_name: Some(control.control_panel_name.clone()),
+                routing_control_arn: Some(control.routing_control_arn.clone()),
+                routing_control_name: Some(control.routing_control_name.clone()),
+                routing_control_state: Some(control.state.as_wire().to_string()),
+                owner: Some(control.owner.clone()),
+            })
+            .collect();
+
+        // A `NextToken` only when controls remain after this page.
+        let reached = offset + routing_controls.len();
+        let next_token = (reached < controls.len()).then(|| encode_cursor(filter, reached));
+
+        Ok(ListRoutingControlsOutput {
+            routing_controls,
+            next_token,
+        })
     }
 }
