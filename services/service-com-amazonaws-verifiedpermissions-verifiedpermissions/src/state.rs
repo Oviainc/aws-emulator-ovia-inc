@@ -27,6 +27,30 @@ pub const MAX_POLICIES_PER_STORE: usize = 200_000;
 /// [`MAX_POLICY_BYTES_PER_STORE`] below.
 pub const MAX_POLICY_STORES: usize = 100;
 
+/// How many policy store aliases this account may hold. AWS publishes no figure
+/// for this dimension, so this is the emulator's own MEMORY bound and is
+/// deliberately stated as such: `aliases` is, beside `policy_stores`, the other
+/// structure a caller grows by an entry per request, so without a cap a loop of
+/// `CreatePolicyStoreAlias` calls grows host memory without limit. It matches
+/// [`MAX_POLICY_STORES`] because an alias is an alternative identifier for a
+/// store, and a store that reaches it refuses further aliases with the
+/// `ServiceQuotaExceededException` `CreatePolicyStoreAlias` models.
+pub const MAX_POLICY_STORE_ALIASES: usize = 100;
+
+/// The prefix every policy store alias name carries, from
+/// `CreatePolicyStoreAliasInput$aliasName`'s own model documentation: "The alias
+/// name must always be prefixed with `policy-store-alias/`." It is also what
+/// makes an alias name usable in a `policyStoreId` member: a reference carrying
+/// this prefix names an alias, and anything else names a store id.
+pub const ALIAS_PREFIX: &str = "policy-store-alias/";
+
+/// `AliasState$Active`: the alias resolves and can be used normally.
+pub const ALIAS_STATE_ACTIVE: &str = "Active";
+
+/// `AliasState$PendingDeletion`: the alias has been soft-deleted. It no longer
+/// resolves, and its name cannot be taken by a new alias.
+pub const ALIAS_STATE_PENDING_DELETION: &str = "PendingDeletion";
+
 /// The total Cedar text one policy store may hold, and therefore the per-request
 /// STEP BUDGET for [`cedar::authorize`]: an authorization request parses every
 /// static policy in the store, so the work one request can ask for is bounded by
@@ -64,9 +88,11 @@ pub struct ComAmazonawsVerifiedpermissionsVerifiedpermissionsState {
     /// `ListPolicies`/`ListPolicyStores` enumerate in a stable order and a
     /// pagination cursor resumes exactly where the previous page stopped.
     pub policy_stores: BTreeMap<String, PolicyStore>,
-    /// `aliasName` -> `policyStoreId`, so a `policy-store-alias/<name>` reference
-    /// resolves to the store it names.
-    pub aliases: BTreeMap<String, String>,
+    /// Every policy store alias, keyed by its FULL `aliasName` — the name
+    /// including its [`ALIAS_PREFIX`], exactly as the caller gave it, which is
+    /// also the form a `policyStoreId` member carries when it names an alias. A
+    /// `BTreeMap` so `ListPolicyStoreAliases` can enumerate in a stable order.
+    pub aliases: BTreeMap<String, PolicyStoreAlias>,
     /// `(operation, clientToken)` -> the resource that token already created, so
     /// an `@idempotencyToken` replay answers with the first result. The OPERATION
     /// is part of the key because an idempotency token is scoped to one request:
@@ -88,6 +114,18 @@ pub struct IdempotencyRecord {
     pub parameters: String,
     /// When the token was first seen; it is forgotten [`CLIENT_TOKEN_TTL`] later.
     pub recorded_at: SystemTime,
+}
+
+/// One policy store alias: an alternative identifier for a policy store.
+#[derive(Debug, Clone)]
+pub struct PolicyStoreAlias {
+    /// The full alias name, including [`ALIAS_PREFIX`].
+    pub alias_name: String,
+    pub arn: String,
+    pub policy_store_id: String,
+    pub created_at: DateTime,
+    /// [`ALIAS_STATE_ACTIVE`] or [`ALIAS_STATE_PENDING_DELETION`].
+    pub state: String,
 }
 
 /// One policy store and everything it owns.
@@ -159,11 +197,20 @@ impl ComAmazonawsVerifiedpermissionsVerifiedpermissionsState {
     /// Answers `Some` ONLY for a store that is present, on both branches — a
     /// caller-supplied reference must never resolve to a key that is not in
     /// `policy_stores`, or a handler that then looks the key up has no store to
-    /// find.
+    /// find. An alias resolves only while it is [`ALIAS_STATE_ACTIVE`]:
+    /// `DeletePolicyStoreAlias` documents that once an alias is in
+    /// `PendingDeletion`, "if the policy store alias is used in an API that has a
+    /// `policyStoreId` field, the operation will fail with a `ResourceNotFound`
+    /// exception".
     pub fn resolve_store_id(&self, reference: &str) -> Option<String> {
-        let candidate = match reference.strip_prefix("policy-store-alias/") {
-            Some(alias) => self.aliases.get(alias)?.clone(),
-            None => reference.to_string(),
+        let candidate = if reference.starts_with(ALIAS_PREFIX) {
+            let alias = self.aliases.get(reference)?;
+            if alias.state != ALIAS_STATE_ACTIVE {
+                return None;
+            }
+            alias.policy_store_id.clone()
+        } else {
+            reference.to_string()
         };
         self.policy_stores.contains_key(&candidate).then_some(candidate)
     }
@@ -300,6 +347,14 @@ pub fn encode_page_token(next_key: &str) -> String {
 pub fn decode_page_token(token: &str) -> Option<String> {
     let bytes = hex::decode(token).ok()?;
     String::from_utf8(bytes).ok()
+}
+
+/// The ARN of a policy store alias. The alias name already carries its
+/// [`ALIAS_PREFIX`], which is the resource segment's type, so the ARN is that
+/// name under this account — and, like the policy-store ARN
+/// `CreatePolicyStore` mints, it carries no region segment.
+pub fn alias_arn(alias_name: &str) -> String {
+    ::engine::emulator_arn("verifiedpermissions", "", alias_name)
 }
 
 /// `SystemTime::now()` as the model's `date-time` timestamp.
