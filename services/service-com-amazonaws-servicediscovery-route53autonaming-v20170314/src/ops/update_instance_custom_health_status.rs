@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInstanceCustomHealthStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInstanceCustomHealthStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInstanceCustomHealthStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Submits a request to change the health status of a custom health check. The status a
+//! client submits is stored on the instance and reported by every later read; only a
+//! service whose health checking is a custom health check accepts one.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +167,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInstanceCustomHealthStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInstanceCustomHealthStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInstanceCustomHealthStatus"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateInstanceCustomHealthStatusErrorModeled::InvalidInput(
+                InvalidInput {
+                    message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `Status` is modelled as the `CustomHealthStatus` enum, so the boundary
+        // validator has already refused anything else; the check stays because the
+        // value becomes this instance's reported health status, and a status outside
+        // the enum would then be reported back by every later read.
+        if !CUSTOM_HEALTH_STATUS_VALUES.contains(&input.status.as_str()) {
+            return Err(UpdateInstanceCustomHealthStatusErrorModeled::InvalidInput(
+                InvalidInput {
+                    message: Some(format!(
+                        "The Status {} isn't valid; it must be one of {}.",
+                        input.status,
+                        CUSTOM_HEALTH_STATUS_VALUES.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // The one answer for a service this emulator does not hold, whether the
+        // reference resolves to no id at all or the id it resolves to is no longer
+        // stored: a request never depends on the two agreeing.
+        let service_not_found = || {
+            UpdateInstanceCustomHealthStatusErrorModeled::ServiceNotFound(ServiceNotFound {
+                message: Some(format!(
+                    "No service exists with the specified ID {}.",
+                    input.service_id
+                )),
+            })
+        };
+
+        // The service is named by its id or its ARN, as `ServiceId` is modelled `Arn`.
+        let Some(service_id) = state.resolve_service_id(&input.service_id) else {
+            return Err(service_not_found().into());
+        };
+        let Some(service) = state.services.get_mut(&service_id) else {
+            return Err(service_not_found().into());
+        };
+
+        // Only a custom health check's status is client-settable. A service whose
+        // health checking is Route 53's (`HealthCheckConfig`), or that configures none
+        // at all, has no custom health check for any of its instances to carry — so the
+        // request is refused whatever instance it names.
+        if !service.custom_health_checked() {
+            return Err(
+                UpdateInstanceCustomHealthStatusErrorModeled::CustomHealthNotFound(
+                    CustomHealthNotFound {
+                        // The message is built from the request and the stored service:
+                        // it names the instance the caller asked about and the service
+                        // by its own ARN, however the caller addressed it — and the
+                        // real service wraps the whole sentence in single quotes, as
+                        // the recorded unit for this refusal shows.
+                        message: Some(format!(
+                            "'No Custom Health Check for instance '{}' in service '{}''",
+                            input.instance_id, service.arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Materialise what the clock already owes this service's instances before
+        // reading the status this call changes, so a repeated submit is compared
+        // against the status a reader would see rather than a stale one.
+        service.apply_due_health_statuses(now);
+
+        let Some(instance) = service.instances.get_mut(&input.instance_id) else {
+            return Err(
+                UpdateInstanceCustomHealthStatusErrorModeled::InstanceNotFound(
+                    InstanceNotFound {
+                        message: Some(format!(
+                            "No instance exists with the specified ID {} in service {service_id}.",
+                            input.instance_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Cloud Map "just keeps a record of the status specified in the most recent
+        // UpdateInstanceCustomHealthStatus request", and applies it after a wait: what
+        // the instance is heading for is replaced by what this call asks for. Asking
+        // again for the status already owed (or already reported, with nothing owed)
+        // changes nothing — "sending a second or subsequent request with the same value
+        // before 30 seconds has passed doesn't accelerate the change" — so the due
+        // instant the first call stored is left alone.
+        let heading_for = instance
+            .owed_health_status()
+            .unwrap_or(instance.health_status.as_str());
+        if heading_for != input.status {
+            instance.pending_health_status = Some(crate::state::PendingHealthStatus {
+                status: input.status.clone(),
+                due_at: now + crate::state::CUSTOM_HEALTH_STATUS_SPAN,
+            });
+        }
+
+        // The operation is modelled with no output, and no `OperationType` value names
+        // it, so it files no asynchronous operation record either.
+        Ok(UpdateInstanceCustomHealthStatusOutput)
     }
 }

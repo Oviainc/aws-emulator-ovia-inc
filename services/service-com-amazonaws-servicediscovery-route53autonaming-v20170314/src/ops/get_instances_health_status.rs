@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInstancesHealthStatus
+//! Implemented: a real read of the health status stored on each instance record of a
+//! service, with any status change the clock already owes materialised first.
 //!
 //! ## Shape of an operation
 //!
@@ -177,24 +179,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A pure report: an instance's health status is whatever was last stored for it
-        // (`RegisterInstance`'s initial status, or an `UpdateInstanceCustomHealthStatus`
-        // since), so this handler only reads.
-        let state = state.lock();
-        let Some(service) = state
-            .resolve_service_id(&input.service_id)
-            .and_then(|id| state.services.get(&id))
-        else {
-            return Err(GetInstancesHealthStatusErrorModeled::ServiceNotFound(
-                ServiceNotFound {
-                    message: Some(format!(
-                        "No service exists with the specified ID {}.",
-                        input.service_id
-                    )),
-                },
-            )
-            .into());
+        // A report: an instance's health status is whatever was last stored for it
+        // (`RegisterInstance`'s initial status, the verdict of the service's own health
+        // check, or an `UpdateInstanceCustomHealthStatus` since). The one write it makes
+        // is to materialise a status that was due at an instant the clock has already
+        // passed, so it reports nothing a later caller would not have seen anyway.
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // The one answer for a service this emulator does not hold, whether the
+        // reference resolves to no id at all or the id it resolves to is no longer
+        // stored: a read never depends on the two agreeing.
+        let service_not_found = || {
+            GetInstancesHealthStatusErrorModeled::ServiceNotFound(ServiceNotFound {
+                message: Some(format!(
+                    "No service exists with the specified ID {}.",
+                    input.service_id
+                )),
+            })
         };
+        let Some(service_id) = state.resolve_service_id(&input.service_id) else {
+            return Err(service_not_found().into());
+        };
+        let Some(service) = state.services.get_mut(&service_id) else {
+            return Err(service_not_found().into());
+        };
+        service.apply_due_health_statuses(now);
+        // The rest of this handler only reads, so the record is reborrowed immutably.
+        let service = &*service;
 
         // "If you omit Instances, Cloud Map returns the health status for all the
         // instances that are associated with the specified service." A named instance

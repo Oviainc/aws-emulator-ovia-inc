@@ -174,16 +174,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        store.ensure_seeded(&region, now);
+        // The account-level device gate, consulted BEFORE any target is resolved:
+        // on a Region this account has activated no Snow device in, the caller
+        // never learns whether the device ids it named exist. It precedes the
+        // idempotency replay too — a token minted in another Region names no task
+        // here.
+        if !store.has_activated_device(&region) {
+            return Err(CreateTaskErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
         store.settle(now);
 
-        // `@idempotencyToken`: the same token names the same task.
-        let replayed = input
-            .client_token
-            .as_deref()
-            .and_then(|token| store.idempotency.get(token).cloned());
+        // `@idempotencyToken`: the same token, in the Region it was used in, names
+        // the same task.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store
+                .idempotency
+                .get(&(region.clone(), token.to_string()))
+                .cloned()
+        });
         if let Some(task_id) = replayed {
-            if let Some(task) = store.tasks.get(&task_id) {
+            if let Some(task) = store.task_in(&region, &task_id) {
                 return Ok(CreateTaskOutput {
                     task_id: Some(task.task_id.clone()),
                     task_arn: Some(task.task_arn.clone()),
@@ -192,9 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "A list of managed device IDs" — every one of them has to name a device
-        // this account manages, or there is nothing to run the command on.
+        // this account manages in this Region, or there is nothing to run the
+        // command on.
         for target in &input.targets {
-            if !store.devices.contains_key(target) {
+            if store.device_in(&region, target).is_none() {
                 return Err(CreateTaskErrorModeled::ResourceNotFoundException(
                     crate::state::not_found(crate::state::DEVICE_RESOURCE_TYPE, target),
                 )
@@ -220,6 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let task = crate::state::Task {
             task_arn: crate::state::task_arn(&task_id, &region),
             task_id: task_id.clone(),
+            region: region.clone(),
             targets: input.targets.clone(),
             command,
             description: input.description,
@@ -261,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(token) = input.client_token {
-            store.idempotency.insert(token, task_id.clone());
+            store.idempotency.insert((region, token), task_id.clone());
         }
 
         Ok(CreateTaskOutput {

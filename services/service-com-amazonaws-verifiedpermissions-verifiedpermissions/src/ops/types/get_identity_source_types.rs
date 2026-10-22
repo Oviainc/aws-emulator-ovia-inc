@@ -18,7 +18,11 @@ pub struct GetIdentitySourceInput {
     pub identity_source_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#GetIdentitySourceOutput")]
+/// `createdDate`/`lastUpdatedDate` target `TimestampFormat`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `vp_schema_and_codec!` rather than `#[smithy_macros::smithy(shape = ...)]` — see
+/// `types/date_time_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="GetIdentitySourceOutput")`.
 #[derive(Debug, Clone)]
 pub struct GetIdentitySourceOutput {
     pub created_date: ::aws_smithy_types::DateTime,
@@ -29,6 +33,21 @@ pub struct GetIdentitySourceOutput {
     pub principal_entity_type: String,
     pub configuration: Option<ConfigurationDetail>,
 }
+
+vp_schema_and_codec!(
+    GetIdentitySourceOutput,
+    GET_IDENTITY_SOURCE_OUTPUT_SCHEMA,
+    "com.amazonaws.verifiedpermissions#GetIdentitySourceOutput",
+    "com.amazonaws.verifiedpermissions",
+    "GetIdentitySourceOutput",
+    (M_CREATED_DATE, created_date, "createdDate", 0, req, date_time),
+    (M_DETAILS, details, "details", 1, opt, struct_of(IdentitySourceDetails)),
+    (M_IDENTITY_SOURCE_ID, identity_source_id, "identitySourceId", 2, req, string),
+    (M_LAST_UPDATED_DATE, last_updated_date, "lastUpdatedDate", 3, req, date_time),
+    (M_POLICY_STORE_ID, policy_store_id, "policyStoreId", 4, req, string),
+    (M_PRINCIPAL_ENTITY_TYPE, principal_entity_type, "principalEntityType", 5, req, string),
+    (M_CONFIGURATION, configuration, "configuration", 6, opt, union_of(ConfigurationDetail)),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#IdentitySourceDetails")]
 #[derive(Debug, Clone, Default)]

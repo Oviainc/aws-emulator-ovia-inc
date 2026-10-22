@@ -207,9 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // An access key is a dependent too, refused the same way rather than
-        // cascade-deleted. Unreachable until `CreateAccessKey` is implemented and
-        // starts filling this map, which is exactly why the check belongs here now.
-        if store.access_keys.values().any(|owner| *owner == key) {
+        // cascade-deleted: `CreateAccessKey` is what fills that map.
+        if store.access_keys_held_by(&key) > 0 {
             return Err(DeleteUserErrorModeled::DeleteConflictException(
                 DeleteConflictException {
                     message: Some(

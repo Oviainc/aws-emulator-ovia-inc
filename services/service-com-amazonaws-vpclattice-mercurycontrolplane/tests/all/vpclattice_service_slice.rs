@@ -167,11 +167,20 @@ pub(crate) fn as_label(value: &str) -> String {
     value.replace('/', "%2F")
 }
 
-/// A timestamp member is present and carries a real instant. restJson1 renders a
-/// timestamp as epoch seconds unless the member says otherwise, so either a JSON
-/// number or a date-time string counts.
+/// A timestamp member is present and carries a real instant, in the wire form the model
+/// declares for it: every timestamp member of this service targets
+/// `com.amazonaws.vpclattice#Timestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape",shape="Timestamp")`), so the member is an RFC 3339
+/// string and the restJson1 default a member without a declared format falls back to —
+/// a JSON number of epoch seconds — is not the modelled type at all.
 pub(crate) fn is_timestamp(value: &serde_json::Value) -> bool {
-    value.as_f64().is_some_and(|secs| secs > 0.0) || value.as_str().is_some_and(|s| !s.is_empty())
+    value.as_str().is_some_and(|text| {
+        ::aws_smithy_types::DateTime::from_str(
+            text,
+            ::aws_smithy_types::date_time::Format::DateTime,
+        )
+        .is_ok()
+    })
 }
 
 /// An id of `prefix` plus 17 `[0-9a-z]` characters — the shape every modelled id
@@ -312,7 +321,14 @@ async fn creating_service_networks_persists_them_and_both_identifier_forms_read_
             "case {case:?}: expected authType {expected_auth:?}, got {}",
             created.body
         );
-        let expected_sharing = body["sharingConfig"]["enabled"].as_bool();
+        // `sharingConfig` is a member the service fills in: a create that sends no
+        // value for it stores `state::DEFAULT_SHARING_ENABLED`, and the member is
+        // reported either way.
+        let expected_sharing = Some(
+            body["sharingConfig"]["enabled"]
+                .as_bool()
+                .unwrap_or(state::DEFAULT_SHARING_ENABLED),
+        );
         assert_eq!(
             created.body["sharingConfig"]["enabled"].as_bool(),
             expected_sharing,

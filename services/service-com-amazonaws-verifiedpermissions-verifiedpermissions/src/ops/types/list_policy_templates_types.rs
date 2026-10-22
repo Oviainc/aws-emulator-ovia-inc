@@ -26,7 +26,11 @@ pub struct ListPolicyTemplatesOutput {
     pub policy_templates: Vec<PolicyTemplateItem>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.verifiedpermissions#PolicyTemplateItem")]
+/// `createdDate`/`lastUpdatedDate` target `TimestampFormat`
+/// (`@timestampFormat("date-time")`), so this shape's schema comes from
+/// `vp_schema_and_codec!` rather than `#[smithy_macros::smithy(shape = ...)]` — see
+/// `types/date_time_wire.rs`. Member set, order and requiredness from
+/// `smithy_query(query="shape", shape="PolicyTemplateItem")`.
 #[derive(Debug, Clone)]
 pub struct PolicyTemplateItem {
     pub policy_store_id: String,
@@ -36,4 +40,18 @@ pub struct PolicyTemplateItem {
     pub last_updated_date: ::aws_smithy_types::DateTime,
     pub name: Option<String>,
 }
+
+vp_schema_and_codec!(
+    PolicyTemplateItem,
+    POLICY_TEMPLATE_ITEM_SCHEMA,
+    "com.amazonaws.verifiedpermissions#PolicyTemplateItem",
+    "com.amazonaws.verifiedpermissions",
+    "PolicyTemplateItem",
+    (M_POLICY_STORE_ID, policy_store_id, "policyStoreId", 0, req, string),
+    (M_POLICY_TEMPLATE_ID, policy_template_id, "policyTemplateId", 1, req, string),
+    (M_DESCRIPTION, description, "description", 2, opt, string),
+    (M_CREATED_DATE, created_date, "createdDate", 3, req, date_time),
+    (M_LAST_UPDATED_DATE, last_updated_date, "lastUpdatedDate", 4, req, date_time),
+    (M_NAME, name, "name", 5, opt, string),
+);
 

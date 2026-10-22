@@ -145,11 +145,9 @@ fn output_of(network: &crate::state::ServiceNetwork) -> CreateServiceNetworkOutp
         id: Some(network.id.clone()),
         name: Some(network.name.clone()),
         arn: Some(network.arn.clone()),
-        sharing_config: network
-            .sharing_enabled
-            .map(|enabled| SharingConfig {
-                enabled: Some(enabled),
-            }),
+        sharing_config: Some(SharingConfig {
+            enabled: Some(network.sharing_enabled),
+        }),
         auth_type: Some(network.auth_type.clone()),
     }
 }
@@ -308,10 +306,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name.clone(),
             // The model documents NONE as the default auth type.
             auth_type: input.auth_type.clone().unwrap_or_else(|| "NONE".to_string()),
+            // A create that sends no `sharingConfig`, or one that omits `enabled`,
+            // gets the setting the service fills in; see `DEFAULT_SHARING_ENABLED`.
             sharing_enabled: input
                 .sharing_config
                 .as_ref()
-                .and_then(|config| config.enabled),
+                .and_then(|config| config.enabled)
+                .unwrap_or(crate::state::DEFAULT_SHARING_ENABLED),
             tags: input.tags.clone().unwrap_or_default(),
             created_at: now,
             last_updated_at: now,

@@ -17,7 +17,13 @@ pub struct GetServiceNetworkServiceAssociationInput {
     pub service_network_service_association_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#GetServiceNetworkServiceAssociationResponse")]
+/// `GetServiceNetworkServiceAssociationResponse`, with its schema written out instead
+/// of derived because `createdAt` is `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape: same ids, same order, same indices.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape
+/// is an operation OUTPUT, which the server only ever serializes.
 #[derive(Debug, Clone, Default)]
 pub struct GetServiceNetworkServiceAssociationOutput {
     pub id: Option<String>,
@@ -37,3 +43,123 @@ pub struct GetServiceNetworkServiceAssociationOutput {
     pub failure_code: Option<String>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetServiceNetworkServiceAssociationOutput {
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "id", String, 0);
+    // `ServiceNetworkServiceAssociationStatus` is an enum shape, which the generator
+    // writes as `ShapeType::String`.
+    const M_STATUS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "status", String, 1);
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "arn", String, 2);
+    const M_CREATED_BY: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "createdBy", String, 3);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetServiceNetworkServiceAssociationResponse", "createdAt", 4);
+    const M_SERVICE_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "serviceId", String, 5);
+    const M_SERVICE_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "serviceName", String, 6);
+    const M_SERVICE_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "serviceArn", String, 7);
+    const M_SERVICE_NETWORK_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "serviceNetworkId", String, 8);
+    const M_SERVICE_NETWORK_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "serviceNetworkName", String, 9);
+    const M_SERVICE_NETWORK_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "serviceNetworkArn", String, 10);
+    const M_DNS_ENTRY: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "dnsEntry", Structure, 11);
+    const M_CUSTOM_DOMAIN_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "customDomainName", String, 12);
+    const M_FAILURE_MESSAGE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "failureMessage", String, 13);
+    const M_FAILURE_CODE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetServiceNetworkServiceAssociationResponse", "failureCode", String, 14);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#GetServiceNetworkServiceAssociationResponse",
+            shared_types::NAMESPACE,
+            "GetServiceNetworkServiceAssociationResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ID,
+            &Self::M_STATUS,
+            &Self::M_ARN,
+            &Self::M_CREATED_BY,
+            &Self::M_CREATED_AT,
+            &Self::M_SERVICE_ID,
+            &Self::M_SERVICE_NAME,
+            &Self::M_SERVICE_ARN,
+            &Self::M_SERVICE_NETWORK_ID,
+            &Self::M_SERVICE_NETWORK_NAME,
+            &Self::M_SERVICE_NETWORK_ARN,
+            &Self::M_DNS_ENTRY,
+            &Self::M_CUSTOM_DOMAIN_NAME,
+            &Self::M_FAILURE_MESSAGE,
+            &Self::M_FAILURE_CODE,
+        ],
+    );
+}
+
+pub static GET_SERVICE_NETWORK_SERVICE_ASSOCIATION_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetServiceNetworkServiceAssociationOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct
+    for GetServiceNetworkServiceAssociationOutput
+{
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.id.as_ref() {
+            serializer.write_string(&Self::M_ID, value.as_str())?;
+        }
+        if let Some(value) = self.status.as_ref() {
+            serializer.write_string(&Self::M_STATUS, value.as_str())?;
+        }
+        if let Some(value) = self.arn.as_ref() {
+            serializer.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.created_by.as_ref() {
+            serializer.write_string(&Self::M_CREATED_BY, value.as_str())?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.service_id.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_ID, value.as_str())?;
+        }
+        if let Some(value) = self.service_name.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.service_arn.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.service_network_id.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_NETWORK_ID, value.as_str())?;
+        }
+        if let Some(value) = self.service_network_name.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_NETWORK_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.service_network_arn.as_ref() {
+            serializer.write_string(&Self::M_SERVICE_NETWORK_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.dns_entry.as_ref() {
+            serializer.write_struct(&Self::M_DNS_ENTRY, value)?;
+        }
+        if let Some(value) = self.custom_domain_name.as_ref() {
+            serializer.write_string(&Self::M_CUSTOM_DOMAIN_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.failure_message.as_ref() {
+            serializer.write_string(&Self::M_FAILURE_MESSAGE, value.as_str())?;
+        }
+        if let Some(value) = self.failure_code.as_ref() {
+            serializer.write_string(&Self::M_FAILURE_CODE, value.as_str())?;
+        }
+        Ok(())
+    }
+}
