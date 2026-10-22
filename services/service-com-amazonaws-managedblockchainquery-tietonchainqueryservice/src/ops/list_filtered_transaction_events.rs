@@ -11,6 +11,12 @@
 //! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
 //! so leaving it on an implemented operation under-reports progress.
 //!
+//! The one rule this stub DOES enforce is the operation's Bitcoin-only `network` value
+//! set (see [`ListFilteredTransactionEvents::handle`]): a request naming any other
+//! network is refused with the modelled 400 `ValidationException` rather than reaching
+//! the 501, because that refusal is what the operation does with such a request whether
+//! or not the listing behind it is written yet.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -172,7 +178,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
+        let _ = (ctx, &self.engine);
+
+        // This operation is Bitcoin-only: "Lists all the transaction events for an
+        // address on the blockchain. This operation is only supported on the Bitcoin
+        // networks", and `network` documents "Valid Values: BITCOIN_MAINNET |
+        // BITCOIN_TESTNET". The member targets a plain `String` rather than the
+        // `QueryNetwork` enum, so the boundary validator admits any value and the
+        // operation's own value set has to be checked here — BEFORE anything else, so a
+        // request naming a network this operation does not serve is refused rather than
+        // answered from (or about) a ledger it would never read.
+        if !crate::state::is_bitcoin(&input.network) {
+            return Err(ListFilteredTransactionEventsErrorModeled::ValidationException(
+                crate::state::field_validation_exception(
+                    "network",
+                    format!(
+                        "network must be one of [{}], not {}",
+                        crate::state::BITCOIN_NETWORKS.join(", "),
+                        input.network
+                    ),
+                ),
+            )
+            .into());
+        }
+
         // Implement `ListFilteredTransactionEvents` here, then delete the SCAFFOLDED marker at the top of
         // this file. Return modeled failures as
         // `Err(ListFilteredTransactionEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
