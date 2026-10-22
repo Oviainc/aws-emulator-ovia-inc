@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AssociatedSystem, DependencyDiscoveryConfig, DevOpsAgentConfiguration,
     DevOpsAgentConfigurationView, PermissionModel, Service, ServiceReportConfiguration,
-    ServiceSummary,
+    ServiceSummary, TestTemplateSummary,
 };
 
 /// The ARN service namespace for this service's resources: the model's `sigv4Name` /
@@ -464,6 +464,115 @@ pub fn encode_page_token(sequence: u64) -> String {
 pub fn decode_page_token(token: &str) -> Option<u64> {
     let decoded = ::hex::decode(token).ok()?;
     std::str::from_utf8(&decoded).ok()?.parse().ok()
+}
+
+// ---------------------------------------------------------------------------
+// Test-template catalog
+// ---------------------------------------------------------------------------
+
+// This section is a SERVICE-OWNED catalog, not per-account state: a test template is "a
+// pre-configured, AWS recommended test that defines which resilience capability to
+// validate" (the modelled `ListTestTemplates` documentation), and this model publishes no
+// operation that creates, updates or deletes one. So the reporting operations over it
+// (`ListTestTemplates`, and `GetTestTemplate` when it is implemented) answer from this one
+// table and cannot drift from each other.
+
+/// The account segment of a SERVICE-OWNED ARN.
+///
+/// `ServiceOwnedArn`'s modelled pattern allows exactly two account segments —
+/// `([0-9]{12}|aws)` — and the second is the one a resource the SERVICE owns carries,
+/// rather than the emulator account every account-owned resource in this crate is minted
+/// under.
+pub const SERVICE_OWNED_ACCOUNT: &str = "aws";
+
+/// The resource type of a test-template ARN.
+pub const TEST_TEMPLATE_RESOURCE: &str = "test-template";
+
+/// One entry of the test-template catalog.
+#[derive(Debug, Clone, Copy)]
+pub struct TestTemplateCatalogEntry {
+    /// The resource id this template's ARN carries after `test-template/`.
+    pub resource_id: &'static str,
+    /// `TestTemplateSummary$name` — "The name of the test template."
+    pub name: &'static str,
+    /// `TestTemplateSummary$description` — "A description of the test template.",
+    /// `@required`, so every entry carries one.
+    pub description: &'static str,
+}
+
+impl TestTemplateCatalogEntry {
+    /// This entry as the modelled `TestTemplateSummary`, for a request signed for
+    /// `region`.
+    pub fn to_summary(&self, region: &str) -> TestTemplateSummary {
+        TestTemplateSummary {
+            test_template_arn: test_template_arn(region, self.resource_id),
+            name: self.name.to_string(),
+            description: self.description.to_string(),
+        }
+    }
+}
+
+/// The test templates this service publishes.
+///
+/// SOURCE of the catalog's SHAPE and membership: the AWS `ListTestTemplates` response this
+/// service's wire recording carries — the resilience capabilities Resilience Hub
+/// recommends validating (Availability Zone recovery, dependency validation, Multi-Region
+/// isolation and Multi-Region recovery), each under the `aws-<capability>:<code>` resource
+/// id a service-owned template is minted as, enumerated in `name` order. It is a SUBSET of
+/// the published catalog, not the whole of it; adding a capability is adding a row.
+///
+/// `description` is `@required` on `TestTemplateSummary`, so every row carries one. The
+/// first row's is the one AWS published for it; the others state the capability that
+/// template validates in the same form, because nothing AWS publishes gives their exact
+/// wording — the text is DESCRIPTIVE content, not a value a client branches on, and no row
+/// may carry an empty one just because its wording is not published.
+///
+/// Kept sorted by `name`, which is the order `ListTestTemplates` enumerates in, so two
+/// reads answer identically.
+pub const TEST_TEMPLATE_CATALOG: &[TestTemplateCatalogEntry] = &[
+    TestTemplateCatalogEntry {
+        resource_id: "aws-az-recovery:rtaz001",
+        name: "Availability Zone: recovery",
+        // PUBLISHED wording.
+        description:
+            "Validate your service can detect and recover from an Availability Zone impairment.",
+    },
+    TestTemplateCatalogEntry {
+        resource_id: "aws-dependency-validation:rtdep001",
+        name: "Dependency validation",
+        // AUTHORED: states the capability this template validates; no published wording.
+        description:
+            "Validate your service degrades gracefully when a dependency it calls is impaired.",
+    },
+    TestTemplateCatalogEntry {
+        resource_id: "aws-multi-region-isolation:rtmr001",
+        name: "Multi-Region: isolation",
+        // AUTHORED: states the capability this template validates; no published wording.
+        description: "Validate your service in one Region keeps serving when another Region it \
+                      shares resources with is isolated.",
+    },
+    TestTemplateCatalogEntry {
+        resource_id: "aws-multi-region-recovery:rtmr002",
+        name: "Multi-Region: recovery",
+        // AUTHORED: states the capability this template validates; no published wording.
+        description:
+            "Validate your service can recover in another Region after a Regional impairment.",
+    },
+];
+
+/// The ARN of the test template `resource_id` names, in `region`.
+///
+/// Formatted here rather than through `::engine::emulator_arn` for one reason: that
+/// helper always interpolates the emulator ACCOUNT, and a test template belongs to the
+/// service rather than to an account, so its ARN carries
+/// [`SERVICE_OWNED_ACCOUNT`] — the other account segment `ServiceOwnedArn`'s pattern
+/// allows. Every account-owned resource this crate mints still goes through the helper
+/// (see [`mint_service_arn`]).
+pub fn test_template_arn(region: &str, resource_id: &str) -> String {
+    format!(
+        "arn:aws:{ARN_SERVICE_NAMESPACE}:{region}:{SERVICE_OWNED_ACCOUNT}:\
+         {TEST_TEMPLATE_RESOURCE}/{resource_id}"
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
