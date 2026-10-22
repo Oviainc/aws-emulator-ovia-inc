@@ -457,28 +457,19 @@ async fn create_table_stores_the_global_secondary_indexes_it_is_given() {
     )
     .await;
     let table = &described["Table"];
-    let expected_counts = [
-        ("ByOwnerAll", 1),
-        ("ByOwnerRankKeysOnly", 1),
-        ("ByKindInclude", 1),
-    ];
-    for (name, expected) in expected_counts {
+    // An index's figures are metered on the same documented schedule as the table's
+    // ("DynamoDB updates this value approximately every six hours. Recent changes might
+    // not be reflected in this value" — `GlobalSecondaryIndexDescription$IndexSizeBytes`),
+    // so the two writes above are not reflected in them yet.
+    for name in ["ByOwnerAll", "ByOwnerRankKeysOnly", "ByKindInclude"] {
         let index = index_named(table, name);
         assert_eq!(
-            index["ItemCount"],
-            json!(expected),
-            "case index {name} after two writes: only the items carrying its key \
-             attributes are projected, got {index}"
+            (index["ItemCount"].clone(), index["IndexSizeBytes"].clone()),
+            (json!(0), json!(0)),
+            "case index {name} after two writes: expected the metered figures, which a \
+             write does not move, got {index}"
         );
     }
-    let all = index_named(table, "ByOwnerAll");
-    let keys_only = index_named(table, "ByOwnerRankKeysOnly");
-    assert!(
-        all["IndexSizeBytes"].as_i64().unwrap_or(0)
-            > keys_only["IndexSizeBytes"].as_i64().unwrap_or(0),
-        "case index sizes: an ALL projection stores more than a KEYS_ONLY one for the \
-         same item, got {all} and {keys_only}"
-    );
 
     // An index is refused for the same reasons a table's own key schema is.
     let oversized_index_list: Vec<Value> = (0..=MAX_GLOBAL_SECONDARY_INDEXES)

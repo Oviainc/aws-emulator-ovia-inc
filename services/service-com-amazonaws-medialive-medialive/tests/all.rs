@@ -14,6 +14,9 @@
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 
+#[path = "all/channel_schedule.rs"]
+mod channel_schedule;
+
 #[path = "all/cloud_watch_alarm_template_groups.rs"]
 mod cloud_watch_alarm_template_groups;
 

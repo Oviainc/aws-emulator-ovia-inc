@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartFileTransfer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartFileTransfer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartFileTransfer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the `ConnectorId` a transfer is started on against stored state: a
+//! connector the store does not hold is not found, which is what distinguishes a
+//! missing connector from a service fault. A request that names no files to transfer
+//! (neither `SendFilePaths` nor `RetrieveFilePaths`) is refused with the modelled
+//! `InvalidRequestException`.
+//!
+//! Starting the transfer itself is what this emulator cannot do: the transfer runs
+//! against the partner's REMOTE AS2 or SFTP endpoint, an outbound connection the
+//! emulator never makes, so a resolved request answers the scaffold's 501 rather than
+//! handing back a `TransferId` for a transfer nothing will run.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +177,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartFileTransfer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartFileTransferErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            StartFileTransferErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+
+        // The connector is resolved FIRST: it is the resource the request is addressed
+        // at, and a `ConnectorId` the store does not hold is not found — never a
+        // service fault, and never a bad parameter.
+        if !guard.connectors.contains_key(&input.connector_id) {
+            return Err(st::not_found(
+                StartFileTransferErrorModeled::ResourceNotFoundException(st::unknown_connector(
+                    &input.connector_id,
+                )),
+            ));
+        }
+
+        // The direction of the transfer comes from which paths the request names:
+        // "you specify one or more RetrieveFilePaths to identify the files you want to
+        // transfer" (inbound) or "one or more SendFilePaths" (outbound). A request that
+        // names neither identifies no file at all.
+        let names_files =
+            |member: Option<&Vec<String>>| member.is_some_and(|paths| !paths.is_empty());
+        if !names_files(input.send_file_paths.as_ref())
+            && !names_files(input.retrieve_file_paths.as_ref())
+        {
+            return Err(StartFileTransferErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: "SendFilePaths or RetrieveFilePaths must be specified: the \
+                              request names no file to transfer"
+                        .to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The request resolves, so what is left is the transfer: moving bytes between
+        // local storage and the partner's remote AS2 or SFTP endpoint. The emulator
+        // makes no outbound connection, so nothing can run it — and a `TransferId`
+        // handed back here would name a transfer that never happened, whose results
+        // `ListFileTransferResults` would then have to invent. The 501 says that
+        // instead.
         Err(crate::scaffolded::Scaffolded::not_implemented("StartFileTransfer"))
     }
 }

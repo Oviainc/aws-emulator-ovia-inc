@@ -18,7 +18,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{CreateFileSystemOutput, CreateMountTargetOutput, FileSystemSize, Tag};
+use crate::ops::types::{
+    CreateFileSystemOutput, CreateMountTargetOutput, FileSystemSize, LifecyclePolicy, Tag,
+};
 
 /// Values of the modelled `LifeCycleState` enum this slice produces
 /// (`smithy_query(query="shape",shape="LifeCycleState")` -> creating | available |
@@ -27,8 +29,12 @@ pub const LIFE_CYCLE_CREATING: &str = "creating";
 /// See [`LIFE_CYCLE_CREATING`].
 pub const LIFE_CYCLE_AVAILABLE: &str = "available";
 
+/// `PerformanceMode` value `generalPurpose`, the only one the Archive storage class is
+/// available for.
+pub const PERFORMANCE_MODE_GENERAL_PURPOSE: &str = "generalPurpose";
+
 /// `CreateFileSystem$PerformanceMode`: "Default is generalPurpose."
-pub const DEFAULT_PERFORMANCE_MODE: &str = "generalPurpose";
+pub const DEFAULT_PERFORMANCE_MODE: &str = PERFORMANCE_MODE_GENERAL_PURPOSE;
 /// `CreateFileSystem$ThroughputMode`: "Default is bursting."
 pub const DEFAULT_THROUGHPUT_MODE: &str = "bursting";
 /// `ThroughputMode` value that requires `ProvisionedThroughputInMibps`.
@@ -181,6 +187,12 @@ pub struct FileSystem {
     pub size_measured_at: SystemTime,
     pub tags: Vec<Tag>,
     pub mount_target_ids: Vec<String>,
+    /// This file system's `LifecycleConfiguration`, as PutLifecycleConfiguration last
+    /// stored it. "Each Amazon EFS file system supports one lifecycle configuration,
+    /// which applies to all files in the file system", so it lives on the file-system
+    /// record and goes away with it; empty means the file system has none, which
+    /// DescribeLifecycleConfiguration reports as "an empty array in the response".
+    pub lifecycle_policies: Vec<LifecyclePolicy>,
 }
 
 impl FileSystem {

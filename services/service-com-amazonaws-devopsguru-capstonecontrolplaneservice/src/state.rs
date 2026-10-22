@@ -191,6 +191,27 @@ pub struct ResourceCoverage {
     pub tag_collections: BTreeMap<String, BTreeSet<String>>,
 }
 
+impl ResourceCoverage {
+    /// How many resources this coverage puts under DevOps Guru analysis.
+    ///
+    /// The analysed population is the coverage itself: there is no real CloudFormation
+    /// stack or tagged resource for this emulator to expand a filter against, so each
+    /// coverage entry IS one monitored resource — one per covered stack name, and one
+    /// per `(app-boundary key, tag value)` pair. Both halves are sets, so a repeated
+    /// `ADD` does not raise the count and a `REMOVE` lowers it.
+    ///
+    /// `DescribeAccountHealth` reports this as `AnalyzedResourceCount`, and bills one
+    /// resource-analysis hour per entry as `ResourceHours`.
+    pub fn monitored_resource_count(&self) -> usize {
+        self.cloudformation_stack_names.len()
+            + self
+                .tag_collections
+                .values()
+                .map(BTreeSet::len)
+                .sum::<usize>()
+    }
+}
+
 /// One notification channel, as `AddNotificationChannel` stored it.
 #[derive(Debug, Clone, Default)]
 pub struct NotificationChannelRecord {

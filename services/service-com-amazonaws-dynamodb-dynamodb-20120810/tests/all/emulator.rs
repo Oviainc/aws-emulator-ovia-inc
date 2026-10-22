@@ -19,14 +19,21 @@ pub const REGION: &str = "us-east-1";
 
 /// One emulator holding only this service, over one shared engine.
 pub fn emulator() -> MultiServiceRouter {
+    emulator_and_engine().0
+}
+
+/// The same emulator, together with the shared engine it was built on — for a suite that
+/// must reach this service's STORED state (what a handler reaches through `self.engine`)
+/// and not only its wire surface.
+pub fn emulator_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suites drive unsigned requests, so signature verification is off; the
     // `Authorization` header below is still what names the region, exactly as a signed
     // client's would.
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// Send one operation in `region` and return its HTTP status and parsed body.

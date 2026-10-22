@@ -3,8 +3,9 @@
 //! Engine state for the com-amazonaws-resourcegroups-ardi service.
 //!
 //! Every resource group this emulator holds lives in ONE map, [`ComAmazonawsResourcegroupsArdiState::groups`],
-//! so `CreateGroup`, `GetGroup`, `ListGroups`, `GroupResources`, `ListGroupResources`
-//! and `DeleteGroup` all read and write the same records. The map is a
+//! so `CreateGroup`, `GetGroup`, `GetGroupConfiguration`, `ListGroups`, `GroupResources`,
+//! `ListGroupResources`, `UpdateGroup` and `DeleteGroup` all read and write the same
+//! records. The map is a
 //! [`BTreeMap`] keyed by group name: the key order is the listing order, which is
 //! what makes `ListGroups` paging deterministic and resumable from an opaque
 //! token even after a group in the middle of the listing is deleted.
@@ -12,8 +13,8 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    Group, GroupIdentifier, ListGroupResourcesItem, ResourceIdentifier, ResourceQuery,
-    ResourceStatus,
+    Group, GroupConfiguration, GroupConfigurationItem, GroupIdentifier, ListGroupResourcesItem,
+    ResourceIdentifier, ResourceQuery, ResourceStatus,
 };
 
 /// Per-service state for com-amazonaws-resourcegroups-ardi. A handler reaches it through [`service_state`].
@@ -42,7 +43,7 @@ impl ComAmazonawsResourcegroupsArdiState {
     ///
     /// The caller picks the identifier: an operation that models both members takes
     /// `Group` and falls back to the deprecated `GroupName`, so the group a request
-    /// resolves to and the identifier its errors name can never disagree.
+    /// resolves to never depends on which of the two a handler happens to read.
     pub fn lookup(&self, identifier: &str) -> Option<String> {
         if let Some((service, resource)) = parse_arn(identifier) {
             if service != "resource-groups" {
@@ -74,8 +75,18 @@ pub const MAX_GROUPS: usize = 1_000;
 /// [`MAX_GROUPS`] and with the same refusal.
 pub const MAX_MEMBERS_PER_GROUP: usize = 1_000;
 
+/// The modelled `GroupConfigurationStatus` of a service configuration that is in
+/// effect: nothing is being applied to the group.
+///
+/// `CreateGroup` is synchronous — the model gives it HTTP 200 and a
+/// `GroupConfiguration` in its own response, unlike `PutGroupConfiguration`
+/// (HTTP 202) — so the configuration a create stores is already the one in
+/// effect, with no update in flight to report.
+pub const CONFIGURATION_IN_EFFECT: &str = "UPDATE_COMPLETE";
+
 /// One persisted resource group: its identity, its describable attributes, the
-/// query it was created with, its tags, and its static members.
+/// query or the service configuration it was created with, its tags, and its
+/// static members.
 #[derive(Debug, Clone)]
 pub struct GroupRecord {
     /// The group's name, which is also its key in [`ComAmazonawsResourcegroupsArdiState::groups`].
@@ -83,12 +94,20 @@ pub struct GroupRecord {
     /// `arn:aws:resource-groups:<region>:<account>:group/<name>`, minted once at
     /// create time and never recomputed, so every later read returns the same ARN.
     pub group_arn: String,
+    /// The id of the account that owns the group, captured once at create time
+    /// from the emulator's canonical account id — the same account the stored
+    /// ARN names — so every later read reports the same owner.
+    pub owner_id: String,
     pub description: Option<String>,
     pub criticality: Option<i32>,
     pub owner: Option<String>,
     pub display_name: Option<String>,
     /// The resource query the group was created with, if any.
     pub resource_query: Option<ResourceQueryRecord>,
+    /// The service configuration the group was created with, if any. A group
+    /// contains either a configuration or a resource query, never both, and a
+    /// group created with neither carries `None` here.
+    pub configuration: Option<Vec<GroupConfigurationItem>>,
     /// The group's tags, kept in key order so the stored record is deterministic
     /// (the wire map itself is unordered).
     pub tags: BTreeMap<String, String>,
@@ -101,6 +120,7 @@ impl GroupRecord {
     /// The modelled `Group` structure for this record.
     pub fn to_group(&self) -> Group {
         Group {
+            owner_id: Some(self.owner_id.clone()),
             group_arn: self.group_arn.clone(),
             name: self.name.clone(),
             description: self.description.clone(),
@@ -123,6 +143,21 @@ impl GroupRecord {
             owner: self.owner.clone(),
             display_name: self.display_name.clone(),
         }
+    }
+
+    /// The modelled `GroupConfiguration` for this record, if it was created with
+    /// a service configuration, and `None` for a group that has none.
+    ///
+    /// `ProposedConfiguration` is reported only while an update is in flight, and
+    /// `FailureReason` only for one that failed; a stored configuration is in
+    /// effect, so neither is reported here.
+    pub fn to_group_configuration(&self) -> Option<GroupConfiguration> {
+        self.configuration.as_ref().map(|items| GroupConfiguration {
+            configuration: Some(items.clone()),
+            proposed_configuration: None,
+            status: Some(CONFIGURATION_IN_EFFECT.to_string()),
+            failure_reason: None,
+        })
     }
 
     /// The modelled `ResourceQuery` for this record, if it was created with one.
@@ -282,11 +317,28 @@ fn is_arn_region(region: &str) -> bool {
     middle >= 1
 }
 
+/// The message this service answers when a group identifier resolves to no
+/// stored group.
+///
+/// It is the service's own FIXED wording, and it names nothing the caller sent:
+/// the identifier is already in the request, so echoing it back tells the caller
+/// nothing the request does not already say. Every operation that addresses one
+/// group answers the same sentence, so a client cannot tell them apart by their
+/// 404 text.
+pub const GROUP_NOT_FOUND_MESSAGE: &str = "The specified group does not exist";
+
 /// The ARN of the group named `name` in `region`, in the one form every
 /// operation of this service reports: `arn:aws:resource-groups:<region>:<account>:group/<name>`.
 /// The account segment is the emulator's canonical account id.
 pub fn group_arn(region: &str, name: &str) -> String {
     emulator_server::emulator_arn("resource-groups", region, &format!("group/{name}"))
+}
+
+/// The id of the account that owns every group this emulator holds: the
+/// emulator's canonical account id, which is also the account segment of every
+/// ARN [`group_arn`] mints.
+pub fn owning_account_id() -> String {
+    emulator_server::emulator_account_id().to_string()
 }
 
 /// The marker every pagination token this service mints carries, before its

@@ -20,12 +20,15 @@ use service_com_amazonaws_eks_awswesleyfrontend::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One answer from the emulator, reduced to what a client branches on.
+///
+/// `pub(crate)` because every suite in this test binary branches on the same three
+/// things; a second suite reuses this one rather than restating it.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The restJson1 error envelope's `__type`, absent on success.
-    error_type: Option<String>,
-    body: serde_json::Value,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: serde_json::Value,
 }
 
 impl Answer {
@@ -36,7 +39,7 @@ impl Answer {
 
 /// The emulator under test: one shared engine, one service, authentication off so a
 /// test signs nothing (the credential scope below is still parsed for its region).
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -67,7 +70,7 @@ fn encode_label(value: &str) -> String {
         .collect()
 }
 
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     region: &str,
     method: &str,

@@ -72,18 +72,27 @@ enum FileSystemEntry {
     DeleteFileSystem,
     DescribeMountTargets,
     CreateMountTarget,
+    PutLifecycleConfiguration,
+    DescribeLifecycleConfiguration,
 }
 
 impl FileSystemEntry {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 6] = [
         Self::DescribeFileSystems,
         Self::DeleteFileSystem,
         Self::DescribeMountTargets,
         Self::CreateMountTarget,
+        Self::PutLifecycleConfiguration,
+        Self::DescribeLifecycleConfiguration,
     ];
 
     fn takes_id_in_path(self) -> bool {
-        matches!(self, Self::DeleteFileSystem)
+        matches!(
+            self,
+            Self::DeleteFileSystem
+                | Self::PutLifecycleConfiguration
+                | Self::DescribeLifecycleConfiguration
+        )
     }
 
     async fn request(self, efs: &Emulator, requested: &str) -> Reply {
@@ -102,6 +111,24 @@ impl FileSystemEntry {
                     "FileSystemId": requested,
                     "SubnetId": "subnet-0123456789abcdef0",
                 }))
+                .await
+            }
+            Self::PutLifecycleConfiguration => {
+                efs.send(
+                    "PUT",
+                    &format!("/2015-02-01/file-systems/{requested}/lifecycle-configuration"),
+                    Some(json!({
+                        "LifecyclePolicies": [{ "TransitionToIA": "AFTER_30_DAYS" }],
+                    })),
+                )
+                .await
+            }
+            Self::DescribeLifecycleConfiguration => {
+                efs.send(
+                    "GET",
+                    &format!("/2015-02-01/file-systems/{requested}/lifecycle-configuration"),
+                    None,
+                )
                 .await
             }
         }

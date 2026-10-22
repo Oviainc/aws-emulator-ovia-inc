@@ -33,6 +33,8 @@ mod object_and_tagging_roundtrip;
 mod object_listing_and_deletion;
 #[path = "all/object_storage.rs"]
 mod object_storage;
+#[path = "all/object_tagging.rs"]
+mod object_tagging;
 #[path = "all/object_write_and_read_back.rs"]
 mod object_write_and_read_back;
 #[path = "all/objects.rs"]

@@ -71,6 +71,10 @@ pub struct GroupConfigurationParameter {
 #[smithy_macros::smithy(shape = "com.amazonaws.resourcegroups#Group")]
 #[derive(Debug, Clone, Default)]
 pub struct Group {
+    /// The id of the account that owns the group. Every `Group` AWS puts on the
+    /// wire carries it (`CreateGroup`, `GetGroup`, `UpdateGroup`, `DeleteGroup`
+    /// and the deprecated `ListGroups$Groups` alike).
+    pub owner_id: Option<String>,
     pub group_arn: String,
     pub name: String,
     pub description: Option<String>,

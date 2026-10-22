@@ -63,6 +63,7 @@ fn sized_object(length: usize) -> Object {
         expires: None,
         website_redirect_location: None,
         metadata: std::collections::BTreeMap::new(),
+        tags: Vec::new(),
         body,
     }
 }

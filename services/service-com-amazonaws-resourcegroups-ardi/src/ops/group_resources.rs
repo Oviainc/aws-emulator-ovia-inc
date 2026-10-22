@@ -208,10 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let not_found = || {
             GroupResourcesError::from(GroupResourcesErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "no group found with the identifier {}",
-                        input.group,
-                    )),
+                    message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
                 },
             ))
         };

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One update of one channel's schedule: the request's deletes are applied, then
+//! its creates, and the response reports what the schedule now holds. The rules a
+//! request is validated against, the per-channel store and the clock-owed cleanup
+//! of actions whose start time has passed all live in
+//! [`crate::state::schedules`]; this file turns a refusal from there into this
+//! operation's modelled errors.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +156,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateSchedule"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        // Which side of the update the request asked for: each response member is
+        // "actions that have been created/deleted in the schedule", so a request
+        // that only deletes gets only the deletes member back.
+        let asked_to_create = input.creates.is_some();
+        let asked_to_delete = input.deletes.is_some();
+        let creates = input
+            .creates
+            .map(|creates| creates.schedule_actions)
+            .unwrap_or_default();
+        let deletes = input
+            .deletes
+            .map(|deletes| deletes.action_names)
+            .unwrap_or_default();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        let channel = state.channels.get_mut(&input.channel_id).ok_or_else(|| {
+            BatchUpdateScheduleErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Channel", &input.channel_id)),
+            })
+        })?;
+
+        // One update: the whole request is validated before anything is written,
+        // so a request naming one unusable action leaves the schedule as it was.
+        let applied = channel
+            .schedule
+            .apply(&creates, &deletes, now)
+            .map_err(refused)?;
+
+        Ok(BatchUpdateScheduleOutput {
+            creates: asked_to_create.then_some(BatchScheduleActionCreateResult {
+                schedule_actions: applied.created,
+            }),
+            deletes: asked_to_delete.then_some(BatchScheduleActionDeleteResult {
+                schedule_actions: applied.deleted,
+            }),
+        })
     }
+}
+
+/// The modelled error a [`crate::state::ScheduleRefusal`] is answered with.
+///
+/// A request the service cannot apply is `UnprocessableEntityException` (422),
+/// whose `ValidationErrors` is "A collection of validation error responses" — one
+/// entry per problem, each naming the member it was found at. A schedule that
+/// would outgrow the emulator's ceiling is `TooManyRequestsException` (429).
+fn refused(refusal: crate::state::ScheduleRefusal) -> BatchUpdateScheduleError {
+    match refusal {
+        crate::state::ScheduleRefusal::Invalid(errors) => {
+            BatchUpdateScheduleErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(format!(
+                        "{} schedule action problem(s) in this request",
+                        errors.len()
+                    )),
+                    validation_errors: Some(errors),
+                },
+            )
+        }
+        crate::state::ScheduleRefusal::Full { requested, limit } => {
+            BatchUpdateScheduleErrorModeled::TooManyRequestsException(TooManyRequestsException {
+                message: Some(format!(
+                    "this request would leave {requested} actions in the schedule, \
+                     past the {limit} this emulator keeps"
+                )),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no channel store whose schedule could be updated. A modelled
+/// server error, never a fresh engine (which would drop the update on return).
+fn unavailable() -> BatchUpdateScheduleError {
+    BatchUpdateScheduleErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }
