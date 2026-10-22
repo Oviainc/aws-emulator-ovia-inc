@@ -155,7 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store owns the transition: it moves the job to CANCELED and drops the
         // clock-owed exit it no longer needs, so the two cannot disagree.
         match state.cancel_job(&input.id, now) {
-            crate::state::CancelOutcome::Canceled => Ok(CancelJobOutput {}),
+            // A job that was ALREADY `CANCELED` is in the state the request asks for, so
+            // the repeat answers the same empty 202 and leaves the job exactly as it was:
+            // cancelling twice is a no-op success, not a conflict.
+            crate::state::CancelOutcome::Canceled
+            | crate::state::CancelOutcome::AlreadyCanceled => Ok(CancelJobOutput {}),
             crate::state::CancelOutcome::NotFound => {
                 Err(CancelJobErrorModeled::NotFoundException(NotFoundException {
                     // The refusal names the request member the lookup read, `Id`.
@@ -164,7 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
             // "Permanently cancel a job. Once you have canceled a job, you can't start it
-            // again." A job that has left SUBMITTED conflicts with the request.
+            // again." A job that has left SUBMITTED for a status other than CANCELED — one
+            // that already COMPLETE or in ERROR — cannot be cancelled: there is no
+            // cancellation left to perform, and the stored status conflicts with the
+            // request.
             crate::state::CancelOutcome::NotCancelable(status) => {
                 Err(CancelJobErrorModeled::ConflictException(ConflictException {
                     message: Some(format!(

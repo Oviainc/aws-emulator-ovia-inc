@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one hybrid job, as the record `CreateJob` wrote it plus the statuses and
+//! timestamps the clock has made due since.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@readonly`: the only write this handler makes is materialising the transitions the
+//! clock already owed (`crate::state::apply_due_transitions`), which changes no answer
+//! a caller could otherwise have seen. `events` and `queueInfo` are computed from the
+//! stored record rather than kept beside it.
+//!
+//! `jobArn` carries the modelled `@pattern`
+//! (`^arn:aws[a-z\-]*:braket:[a-z0-9\-]+:[0-9]{12}:job/.*$`), which the framework's
+//! boundary validator enforces before this handler runs: a malformed ARN is already a
+//! 400 `ValidationException`, so a value reaching here is well formed and the only
+//! question left is whether the store holds it (404 `ResourceNotFoundException`). That
+//! refusal names the job the way Amazon Braket does, `<accountId>#<jobName>` — both
+//! read back out of the ARN the caller sent, so the wording follows the request.
 //!
 //! ## Shape of an operation
 //!
@@ -155,6 +161,104 @@ impl From<GetJobErrorModeled> for GetJobError {
     }
 }
 
+/// The `additionalAttributeNames` value that asks for `queueInfo`.
+///
+/// The sole member of `HybridJobAdditionalAttributeName`
+/// (`ops::types::HYBRID_JOB_ADDITIONAL_ATTRIBUTE_NAME_VALUES`), so a value outside it
+/// is refused by the boundary validator before this handler runs.
+const ATTRIBUTE_QUEUE_INFO: &str = "QueueInfo";
+
+/// `JobEventType` values, for the events this emulator can honestly report: the three
+/// transitions it actually performs.
+const EVENT_QUEUED_FOR_EXECUTION: &str = "QUEUED_FOR_EXECUTION";
+const EVENT_RUNNING: &str = "RUNNING";
+const EVENT_FAILED: &str = "FAILED";
+const EVENT_COMPLETED: &str = "COMPLETED";
+const EVENT_CANCELLED: &str = "CANCELLED";
+
+/// The identifier Amazon Braket names a hybrid job by in its messages: the account the
+/// job belongs to and the job's name, joined by `#`, as the `jobArn` carries them
+/// (`arn:<partition>:braket:<region>:<account>:job/<name>`).
+///
+/// Built from the REQUEST, so the wording follows the ARN the caller sent rather than
+/// any one recorded message. A value the ARN grammar cannot be read out of falls back
+/// to the ARN itself; the modelled `@pattern` makes that unreachable from the wire.
+fn job_identifier(job_arn: &str) -> String {
+    let mut fields = job_arn.splitn(6, ':');
+    let account = fields.nth(4);
+    let name = fields.next().and_then(|resource| {
+        resource.strip_prefix(crate::state::ARN_RESOURCE_JOB)?.strip_prefix('/')
+    });
+    match (account, name) {
+        (Some(account), Some(name)) => format!("{account}#{name}"),
+        _ => job_arn.to_string(),
+    }
+}
+
+/// Where the job sits in the jobs queue, counted from the stored jobs.
+///
+/// A job that has left the queue has no position: `position` is a required string, so
+/// it reads [`crate::state::QUEUE_POSITION_NOT_QUEUED`] with a message saying why,
+/// rather than a number that would claim the job is still waiting.
+fn queue_info(
+    state: &crate::state::ComAmazonawsBraketBraketState,
+    job: &crate::state::HybridJob,
+) -> HybridJobQueueInfo {
+    let position = state
+        .queued_jobs()
+        .iter()
+        .position(|queued| queued.job_arn == job.job_arn)
+        .map(|index| (index + 1).to_string());
+    HybridJobQueueInfo {
+        queue: crate::state::QUEUE_JOBS.to_string(),
+        position: position
+            .clone()
+            .unwrap_or_else(|| crate::state::QUEUE_POSITION_NOT_QUEUED.to_string()),
+        message: match position {
+            Some(_) => None,
+            None => Some(format!(
+                "Job is in {} status. Queue position is not applicable.",
+                job.status
+            )),
+        },
+    }
+}
+
+/// The job's event history, read back out of the timestamps the record carries.
+///
+/// One entry per transition that HAPPENED: the job was queued when it was created, it
+/// started when the clock moved it to `RUNNING`, and it ended when the clock made its
+/// terminal status due. No event is reported for a step this emulator does not take
+/// (provisioning an instance, downloading data, uploading results), and the terminal
+/// event names the status the job actually reached.
+fn events(job: &crate::state::HybridJob) -> Vec<JobEventDetails> {
+    let mut events = vec![JobEventDetails {
+        event_type: Some(EVENT_QUEUED_FOR_EXECUTION.to_string()),
+        time_of_event: Some(crate::state::to_date_time(job.created_at)),
+        message: None,
+    }];
+    if let Some(started_at) = job.started_at {
+        events.push(JobEventDetails {
+            event_type: Some(EVENT_RUNNING.to_string()),
+            time_of_event: Some(crate::state::to_date_time(started_at)),
+            message: None,
+        });
+    }
+    if let Some(ended_at) = job.ended_at {
+        let event_type = match job.status.as_str() {
+            crate::state::STATUS_COMPLETED => EVENT_COMPLETED,
+            crate::state::STATUS_CANCELLED => EVENT_CANCELLED,
+            _ => EVENT_FAILED,
+        };
+        events.push(JobEventDetails {
+            event_type: Some(event_type.to_string()),
+            time_of_event: Some(crate::state::to_date_time(ended_at)),
+            message: job.failure_reason.clone(),
+        });
+    }
+    events
+}
+
 /// The `GetJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -191,18 +295,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetJob"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetJobError::from(GetJobErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Braket service store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let mut guard = state.lock();
+        guard.apply_due_transitions(::std::time::SystemTime::now());
+
+        let Some(job) = guard.jobs.get(&input.job_arn).cloned() else {
+            return Err(GetJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Job {} not found",
+                        job_identifier(&input.job_arn)
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let wants_queue_info = input
+            .additional_attribute_names
+            .as_deref()
+            .is_some_and(|names| names.iter().any(|name| name == ATTRIBUTE_QUEUE_INFO));
+
+        Ok(GetJobOutput {
+            job_arn: job.job_arn.clone(),
+            job_name: job.job_name.clone(),
+            status: job.status.clone(),
+            role_arn: job.role_arn.clone(),
+            failure_reason: job.failure_reason.clone(),
+            algorithm_specification: job.algorithm_specification.clone(),
+            input_data_config: (!job.input_data_config.is_empty())
+                .then(|| job.input_data_config.clone()),
+            output_data_config: job.output_data_config.clone(),
+            checkpoint_config: job.checkpoint_config.clone(),
+            stopping_condition: job.stopping_condition.clone(),
+            instance_config: job.instance_config.clone(),
+            hyper_parameters: (!job.hyper_parameters.is_empty()).then(|| {
+                job.hyper_parameters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            }),
+            device_config: Some(job.device_config.clone()),
+            created_at: crate::state::to_date_time(job.created_at),
+            started_at: job.started_at.map(crate::state::to_date_time),
+            ended_at: job.ended_at.map(crate::state::to_date_time),
+            // The billable time of a run. Nothing provisioned an instance or executed
+            // the algorithm, so there is no billable duration to report.
+            billable_duration: None,
+            events: Some(events(&job)),
+            tags: (!job.tags.is_empty()).then(|| {
+                job.tags
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            }),
+            queue_info: wants_queue_info.then(|| queue_info(&guard, &job)),
+            associations: (!job.associations.is_empty()).then(|| job.associations.clone()),
+        })
     }
 }

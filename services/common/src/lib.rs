@@ -11,6 +11,9 @@
 //!   disagree about which vendor an ARN names;
 //! * [`nth_path_segment`], for the rarer case of two such services publishing the SAME
 //!   path space;
+//! * [`shared_path`], the reader for the one case the path half of the claim rule
+//!   cannot settle on its own: two colliding models binding the same URI path space,
+//!   where the ARN in the path names the resource and so the service that owns it;
 //! * [`front_door`], the body-rejection layer an AWS REST service puts in front of its
 //!   application code, as a wrapper a service serves its operations behind;
 //! * [`validation`], which restores the value a constraint violation echoes to the one
@@ -87,6 +90,7 @@ pub mod arn;
 pub mod front_door;
 pub mod iot_job_executions;
 pub mod network;
+pub mod shared_path;
 pub mod validation;
 
 use emulator_server::{resolve_route_key, service_from_target, ROOT_PATH_SEGMENT};

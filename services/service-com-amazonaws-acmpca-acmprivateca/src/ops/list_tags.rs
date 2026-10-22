@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -101,10 +92,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-acmpca-acmprivateca.jso
 // here — hence the `ListTagsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.acmpca#ListTags")]
+//
+// `InvalidNextTokenException` is widened in: this operation is `@paginated`, the SERVICE
+// models that shape as its answer for a continuation token it did not issue (its other
+// paginated reads list it), and none of the four errors this operation does list says
+// anything about the token. Widening keeps the refusal on a shape real clients already
+// know instead of inventing one.
+#[smithy_macros::operation_error(
+    "com.amazonaws.acmpca#ListTags",
+    extra_errors = ["InvalidNextTokenException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsErrorModeled {
     InvalidArnException(InvalidArnException),
+    InvalidNextTokenException(InvalidNextTokenException),
     InvalidStateException(InvalidStateException),
     RequestFailedException(RequestFailedException),
     ResourceNotFoundException(ResourceNotFoundException),
@@ -161,18 +162,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTags"))
+        let _ = ctx;
+        let arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(ListTagsErrorModeled::InvalidArnException(InvalidArnException {
+                message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+            })
+            .into());
+        }
+        // Decoded before the store is reached: a token that is not a continuation of
+        // THIS CA's tag listing is refused whether or not the CA it names still exists.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &arn)?),
+            None => None,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // Reporting only: the lookup materialises the CREATING -> PENDING_CERTIFICATE
+        // change the clock already owed, which came due at the same instant whether or
+        // not anybody listed the CA's tags. The tags themselves are readable in every
+        // status a CA of this service reaches — they are set when the CA is created, so
+        // a CA still CREATING already has them.
+        let Some(record) = state.certificate_authority_mut(&arn, ::std::time::SystemTime::now())
+        else {
+            return Err(ListTagsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("the certificate authority {arn} was not found")),
+                },
+            )
+            .into());
+        };
+
+        // One page of the CA's tags, in key order (see [`ordered_tags`]), resuming after
+        // the key a previous page stopped at.
+        let ordered = ordered_tags(&record.tags);
+        let remaining = ordered.into_iter().skip_while(|tag| {
+            resume_after
+                .as_deref()
+                .is_some_and(|cursor| tag.key.as_str() <= cursor)
+        });
+        // `MaxResults` is `range 1..1000`, refused outside that at the boundary, so a
+        // request that names it asks for at least one item; one that does not asks for
+        // every tag the CA holds (at most `TagList`'s 50). The clamp is defensive rather
+        // than load-bearing: it keeps the page size inside the modelled range without
+        // depending on a validation that happens outside this module.
+        let page_size = input
+            .max_results
+            .map_or(usize::MAX, |max| max.clamp(1, 1_000) as usize);
+        let mut page: Vec<Tag> = remaining.take(page_size.saturating_add(1)).collect();
+        // One item beyond the page was taken: its presence is what says the list is
+        // truncated, and the page's own last key is what the next page resumes after.
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+        let next_token = if truncated {
+            page.last().map(|tag| encode_next_token(&arn, &tag.key))
+        } else {
+            None
+        };
+
+        Ok(ListTagsOutput {
+            // `Tags` is `len 1..50`: a CA with no tags, or a page that resumed past the
+            // last one, answers with the member absent rather than an empty list.
+            tags: (!page.is_empty()).then_some(page),
+            next_token,
+        })
     }
+}
+
+/// The order one `ListTags` response is built in, and therefore the order a `NextToken`
+/// from it resumes against.
+///
+/// A tag key is unique within a resource — `TagCertificateAuthority` and
+/// `CreateCertificateAuthority` refuse a tag set that repeats one — so ordering by key is
+/// a TOTAL order over a CA's tags. That is what lets a continuation token carry just the
+/// last key emitted: "the tags whose key sorts after this one" is well defined even if
+/// that tag has since been untagged, so no page can repeat or skip a tag that stayed put.
+fn ordered_tags(tags: &[Tag]) -> Vec<Tag> {
+    let mut ordered = tags.to_vec();
+    ordered.sort_by(|left, right| left.key.cmp(&right.key));
+    ordered
+}
+
+/// The byte that separates the two fields of a token. Outside the `Arn` pattern
+/// (`^arn:[\w+=/,.@-]+:acm-pca:...`) and outside `TagKey`'s
+/// (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`), so it cannot occur inside either field.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The opaque `NextToken` for the last tag a page emitted.
+///
+/// Hex-encoded so the token is opaque to the caller and stays inside `NextToken`'s
+/// `len 1..43739` whatever the key contains. The CA's ARN travels with the key so a token
+/// cannot resume the listing of a CA other than the one it was issued for. The encoding
+/// carries no integrity protection and claims none: a caller that reverses it can name
+/// any resume key of the CA it is already listing, which selects a page of that CA's own
+/// tags and nothing else.
+fn encode_next_token(arn: &str, key: &str) -> String {
+    ::hex::encode(format!("{arn}{TOKEN_SEPARATOR}{key}"))
+}
+
+/// The tag key inside a `NextToken` for `arn`, or `InvalidNextTokenException` when the
+/// token is not a continuation of this CA's tag listing: one [`encode_next_token`] could
+/// have produced for this ARN.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so nothing read out of
+/// it may panic the handler.
+fn decode_next_token(token: &str, arn: &str) -> Result<String, ListTagsError> {
+    let invalid = || {
+        ListTagsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+            message: Some(
+                "NextToken is not a continuation token of this certificate authority's tag \
+                 listing"
+                    .to_string(),
+            ),
+        })
+    };
+    let bytes = ::hex::decode(token).map_err(|_| invalid())?;
+    let decoded = ::std::string::String::from_utf8(bytes).map_err(|_| invalid())?;
+    let (token_arn, key) = decoded.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;
+    if token_arn != arn || key.is_empty() {
+        return Err(invalid().into());
+    }
+    Ok(key.to_string())
 }

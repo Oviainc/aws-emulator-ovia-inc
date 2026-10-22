@@ -16,16 +16,7 @@ use service_com_amazonaws_medialive_medialive::state::MAX_SIGNAL_MAPS;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
-use crate::wire::{call, error_code, medialive, ACCOUNT};
-
-/// The `message` member of a restJson1 error body (`jsonName: "message"` on every
-/// one of this service's error shapes).
-fn error_message(body: &Value) -> String {
-    body.get("message")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
+use crate::wire::{call, error_code, error_message, medialive, ACCOUNT};
 
 /// A case name as a resource name: a signal map's `Name` targets
 /// `__stringMin1Max255PatternS`, whose pattern admits no whitespace, and it also
@@ -770,4 +761,309 @@ async fn the_signal_map_store_is_bounded() {
         "TooManyRequestsException",
         "expected TooManyRequestsException, got {refused}"
     );
+}
+
+/// One channel to build for the input-discovery table: its name, the indexes of
+/// the inputs it attaches, and the index of the channel it follows, if any.
+struct Node {
+    name: &'static str,
+    attaches: &'static [usize],
+    follows: Option<usize>,
+}
+
+/// One row of the input-discovery table.
+struct Graph {
+    case: &'static str,
+    /// The inputs to create, by name, in order.
+    inputs: &'static [&'static str],
+    /// The channels to create, in order; a followed channel is created first.
+    channels: &'static [Node],
+    /// Which channel the discovery entry point names.
+    entry: usize,
+    /// How many resources discovery must find — channels and inputs together.
+    resources: usize,
+    /// The entry point's `Sources` and `Destinations` neighbour counts.
+    neighbors: (usize, usize),
+}
+
+/// Rule: discovery walks every link the resources it discovers declare in state,
+/// and a channel's `InputAttachments` are such links — so each attached input is
+/// itself a resource of the `MediaResourceMap`, listed among that channel's
+/// `Sources`, with the channel listed among the input's `Destinations`; an input
+/// no discovered channel attaches is not part of the graph.
+///
+/// The rows differ along how many inputs a channel attaches, how many channels
+/// attach one input, and how far from the entry point the attachment is — which
+/// is what the rule generalises over. The issue's recorded case (one channel,
+/// one attached input, entered at the channel) is the first row.
+#[tokio::test]
+async fn signal_map_discovery_traces_a_channel_to_the_inputs_it_attaches() {
+    let table = [
+        Graph {
+            case: "one attached input",
+            inputs: &["feed"],
+            channels: &[Node {
+                name: "live",
+                attaches: &[0],
+                follows: None,
+            }],
+            entry: 0,
+            resources: 2,
+            neighbors: (1, 0),
+        },
+        Graph {
+            case: "two attached inputs",
+            inputs: &["feed-a", "feed-b"],
+            channels: &[Node {
+                name: "live",
+                attaches: &[0, 1],
+                follows: None,
+            }],
+            entry: 0,
+            resources: 3,
+            neighbors: (2, 0),
+        },
+        Graph {
+            case: "no attached input",
+            inputs: &["unused"],
+            channels: &[Node {
+                name: "live",
+                attaches: &[],
+                follows: None,
+            }],
+            entry: 0,
+            resources: 1,
+            neighbors: (0, 0),
+        },
+        Graph {
+            // The shared input is the only link between the two channels, so
+            // the second channel is discovered THROUGH it.
+            case: "one input shared by two channels",
+            inputs: &["shared"],
+            channels: &[
+                Node {
+                    name: "first",
+                    attaches: &[0],
+                    follows: None,
+                },
+                Node {
+                    name: "second",
+                    attaches: &[0],
+                    follows: None,
+                },
+            ],
+            entry: 0,
+            resources: 3,
+            neighbors: (1, 0),
+        },
+        Graph {
+            case: "the followed channel's input too",
+            inputs: &["lead-feed", "follow-feed"],
+            channels: &[
+                Node {
+                    name: "lead",
+                    attaches: &[0],
+                    follows: None,
+                },
+                Node {
+                    name: "follower",
+                    attaches: &[1],
+                    follows: Some(0),
+                },
+            ],
+            entry: 1,
+            resources: 4,
+            neighbors: (2, 0),
+        },
+    ];
+
+    for Graph {
+        case,
+        inputs,
+        channels,
+        entry,
+        resources,
+        neighbors: (sources, destinations),
+    } in table
+    {
+        let router = medialive();
+
+        // The inputs first: a channel attaches them by id.
+        let mut input_ids: Vec<String> = Vec::new();
+        let mut input_arns: Vec<String> = Vec::new();
+        for name in inputs {
+            let (status, created) = call(
+                &router,
+                "POST",
+                "/prod/inputs",
+                Some(json!({
+                    "name": name,
+                    "type": "URL_PULL",
+                    "sources": [{ "url": format!("https://example.com/{name}.m3u8") }],
+                })),
+            )
+            .await;
+            assert_eq!(
+                status, 201,
+                "case {case:?}: CreateInput {name:?}: expected 201, got {status}: {created}"
+            );
+            input_ids.push(created["input"]["id"].as_str().unwrap_or_default().to_string());
+            input_arns.push(created["input"]["arn"].as_str().unwrap_or_default().to_string());
+        }
+
+        let mut channel_arns: Vec<String> = Vec::new();
+        for node in channels {
+            let attachments: Vec<Value> = node
+                .attaches
+                .iter()
+                .map(|index| {
+                    json!({
+                        "inputId": input_ids[*index],
+                        "inputAttachmentName": format!("{}-{}", node.name, inputs[*index]),
+                    })
+                })
+                .collect();
+            let mut body = json!({ "name": node.name, "inputAttachments": attachments });
+            if let Some(primary) = node.follows {
+                body["linkedChannelSettings"] = json!({
+                    "followerChannelSettings": {
+                        "linkedChannelType": "FOLLOWING_CHANNEL",
+                        "primaryChannelArn": channel_arns[primary],
+                    }
+                });
+            }
+            let (status, created) = call(&router, "POST", "/prod/channels", Some(body)).await;
+            assert_eq!(
+                status, 201,
+                "case {case:?}: CreateChannel {:?}: expected 201, got {status}: {created}",
+                node.name
+            );
+            channel_arns.push(
+                created["channel"]["arn"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        let entry_arn = channel_arns[entry].clone();
+
+        let name = format!("map-{}", slug(case));
+        let (status, created) = create_signal_map(
+            &router,
+            json!({ "name": name, "discoveryEntryPointArn": entry_arn }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected CreateSignalMap to answer 201, got {status}: {created}"
+        );
+        let id = created["id"].as_str().unwrap_or_default().to_string();
+
+        wait_for_the_clock();
+        let (status, read) = get_signal_map(&router, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetSignalMap to answer 200, got {status}: {read}"
+        );
+        let discovered = read["mediaResourceMap"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+
+        assert_eq!(
+            discovered.len(),
+            resources,
+            "case {case:?}: expected {resources} discovered resources, got {:?}",
+            read["mediaResourceMap"]
+        );
+        let entry_resource = &discovered[&entry_arn];
+        assert_eq!(
+            entry_resource["sources"].as_array().map(Vec::len),
+            Some(sources),
+            "case {case:?}: expected {sources} sources for the entry point, got {:?}",
+            entry_resource["sources"]
+        );
+        assert_eq!(
+            entry_resource["destinations"].as_array().map(Vec::len),
+            Some(destinations),
+            "case {case:?}: expected {destinations} destinations for the entry point, got {:?}",
+            entry_resource["destinations"]
+        );
+
+        // Every input the entry-point channel attaches is a source of it AND a
+        // resource of the graph in its own right.
+        for index in channels[entry].attaches {
+            let input_arn = &input_arns[*index];
+            let listed = entry_resource["sources"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .any(|neighbor| neighbor["arn"] == json!(input_arn));
+            assert!(
+                listed,
+                "case {case:?}: expected the attached input {input_arn:?} among the entry point's \
+                 sources, got {:?}",
+                entry_resource["sources"]
+            );
+            assert!(
+                discovered.contains_key(input_arn),
+                "case {case:?}: expected the attached input {input_arn:?} to be a discovered \
+                 resource, got {:?}",
+                discovered.keys().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                discovered[input_arn]["name"],
+                json!(inputs[*index]),
+                "case {case:?}: expected the discovered input to carry its name, got {:?}",
+                discovered[input_arn]["name"]
+            );
+        }
+
+        // The graph is closed and symmetric: every neighbour is itself a
+        // discovered resource, and an edge read from one end is the same edge
+        // read from the other.
+        for (key, resource) in &discovered {
+            for side in ["sources", "destinations"] {
+                for neighbor in resource[side].as_array().cloned().unwrap_or_default() {
+                    let arn = neighbor["arn"].as_str().unwrap_or_default().to_string();
+                    assert!(
+                        discovered.contains_key(&arn),
+                        "case {case:?}: {key:?}'s {side} names {arn:?}, which is not in the map"
+                    );
+                    let opposite = if side == "sources" {
+                        "destinations"
+                    } else {
+                        "sources"
+                    };
+                    let mirrored = discovered[&arn][opposite]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|back| back["arn"] == json!(key));
+                    assert!(
+                        mirrored,
+                        "case {case:?}: {key:?} names {arn:?} as a {side} neighbour, so {arn:?} \
+                         must name {key:?} back among its {opposite}, got {:?}",
+                        discovered[&arn][opposite]
+                    );
+                }
+            }
+        }
+
+        // Only resources this store holds are claimed, and an input no
+        // discovered channel attaches is not one of them.
+        let attached_arns: Vec<&String> = channels
+            .iter()
+            .flat_map(|node| node.attaches.iter().map(|index| &input_arns[*index]))
+            .collect();
+        for key in discovered.keys() {
+            assert!(
+                channel_arns.contains(key) || attached_arns.contains(&key),
+                "case {case:?}: expected every discovered key to be a created channel or an \
+                 attached input, got {key:?}"
+            );
+        }
+    }
 }

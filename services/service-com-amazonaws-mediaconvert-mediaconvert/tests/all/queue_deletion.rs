@@ -5,8 +5,9 @@
 //! `DeleteQueue` is documented as "Permanently delete a queue you have created", so the
 //! rule under test is: a `DELETE` on a stored custom queue removes it from the store —
 //! every later read of that name is `NotFoundException` — while a name the store does
-//! not hold is `NotFoundException` and a queue the caller did not create or that still
-//! owes work is `ConflictException`. Nothing else in the store moves.
+//! not hold is the delete's own empty 202 (the delete is idempotent, the read is not)
+//! and a queue the caller did not create is `ForbiddenException` or one that still owes
+//! work is `ConflictException`. Nothing else in the store moves.
 //!
 //! Each case drives the real restJson1 wire path through the router (the harness is the
 //! one `job_lifecycle` builds), so what is asserted is the bytes a client would see.
@@ -82,7 +83,8 @@ fn cases() -> Vec<Case> {
 
 /// A deleted queue is gone from the store: the delete is accepted with the modelled 202
 /// and an empty body, every later read of that name is not found, and a second delete of
-/// the same name is not found too. The queues that were not deleted are untouched.
+/// the same name answers the same empty 202 — the delete is idempotent even though the
+/// read is not. The queues that were not deleted are untouched.
 #[tokio::test]
 async fn delete_queue_removes_the_queue_and_a_later_read_cannot_find_it() {
     let emulator = Emulator::new();
@@ -133,16 +135,23 @@ async fn delete_queue_removes_the_queue_and_a_later_read_cannot_find_it() {
 
         let again = delete_queue(&emulator, case.name).await;
         assert_eq!(
-            again.status, 404,
-            "case {:?}: a second delete has nothing to delete, got {} with body {}",
+            again.status, 202,
+            "case {:?}: a second delete is a no-op success, got {} with body {}",
             case.label, again.status, again.body
         );
         assert_eq!(
-            again.error_type.as_deref(),
-            Some("NotFoundException"),
-            "case {:?}: expected NotFoundException on the second delete, got {:?}",
-            case.label,
-            again.error_type
+            again.body,
+            json!({}),
+            "case {:?}: the second delete models no output members, got body {}",
+            case.label, again.body
+        );
+        // The repeat delete did not make the name readable again.
+        let still_gone = emulator.get_queue(case.name).await;
+        assert_eq!(
+            still_gone.status, 404,
+            "case {:?}: the name must stay unreadable after the repeat delete, got {} \
+             with body {}",
+            case.label, still_gone.status, still_gone.body
         );
 
         // Deleting one queue removes exactly that queue: every row not deleted yet, and
@@ -207,11 +216,12 @@ async fn a_built_in_system_queue_cannot_be_deleted() {
     }
 }
 
-/// A name the store does not hold is not found — whatever the name looks like, including
-/// one that differs from a stored queue only in case, since queue names are the stored
-/// keys and not folded.
+/// A name the store does not hold is already in the state the delete asks for, so it is
+/// the empty 202 — whatever the name looks like, including one that differs from a stored
+/// queue only in case, since queue names are the stored keys and not folded. The queue
+/// that IS stored is not touched by any of them.
 #[tokio::test]
-async fn deleting_a_name_the_store_does_not_hold_is_not_found() {
+async fn deleting_a_name_the_store_does_not_hold_is_a_no_op_success() {
     let emulator = Emulator::new();
     let created = emulator.create_queue(json!({ "name": "alpha" })).await;
     assert_eq!(
@@ -227,33 +237,32 @@ async fn deleting_a_name_the_store_does_not_hold_is_not_found() {
         "alpha-",
         "a-queue-with-a-much-longer-name",
     ] {
-        let refused = delete_queue(&emulator, name).await;
+        let accepted = delete_queue(&emulator, name).await;
         assert_eq!(
-            refused.status, 404,
-            "case {name:?}: expected HTTP 404, got {} with body {}",
-            refused.status, refused.body
+            accepted.status, 202,
+            "case {name:?}: expected HTTP 202, got {} with body {}",
+            accepted.status, accepted.body
         );
         assert_eq!(
-            refused.error_type.as_deref(),
-            Some("NotFoundException"),
-            "case {name:?}: expected NotFoundException, got {:?}",
-            refused.error_type
+            accepted.body,
+            json!({}),
+            "case {name:?}: DeleteQueue models no output members, got body {}",
+            accepted.body
         );
-        // The wording names the REQUEST MEMBER the lookup read, so it is the same for
-        // every row however the supplied name differs — it is not built from the value.
+        // A delete over nothing does not make the name readable.
+        let read = emulator.get_queue(name).await;
         assert_eq!(
-            refused.string("/message"),
-            service_com_amazonaws_mediaconvert_mediaconvert::state::not_found_message("name"),
-            "case {name:?}: the refusal must name the request member, got {}",
-            refused.body
+            read.status, 404,
+            "case {name:?}: the absent name must stay unreadable, got {} with body {}",
+            read.status, read.body
         );
     }
 
-    // None of those refusals removed the queue that IS stored.
+    // None of those no-ops removed the queue that IS stored.
     let survivor = emulator.get_queue("alpha").await;
     assert_eq!(
         survivor.status, 200,
-        "the stored queue must survive every refusal, got {} with body {}",
+        "the stored queue must survive every no-op delete, got {} with body {}",
         survivor.status, survivor.body
     );
 }

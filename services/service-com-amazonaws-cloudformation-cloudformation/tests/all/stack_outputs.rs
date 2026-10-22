@@ -174,6 +174,18 @@ fn queue_url(name: &str) -> String {
     format!("https://sqs.{REGION}.amazonaws.com/{ACCOUNT_ID}/{name}")
 }
 
+/// The ARN `Fn::GetAtt <function>.Arn` reports for a Lambda function, per the "Return
+/// values" section of the `AWS::Lambda::Function` resource-type reference.
+fn lambda_function_arn(name: &str) -> String {
+    format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:{name}")
+}
+
+/// The ARN `Fn::GetAtt <role>.Arn` reports for an IAM role. IAM is a global service, so
+/// its ARNs carry no region.
+fn iam_role_arn(name: &str) -> String {
+    format!("arn:aws:iam::{ACCOUNT_ID}:role/{name}")
+}
+
 /// The class the rule covers. Each row differs from the others along what the rule
 /// generalises over: the template's spelling, the intrinsic function the output uses, the
 /// resource type the identifier comes from, and how many outputs are declared.
@@ -298,6 +310,60 @@ fn output_cases() -> Vec<OutputCase> {
                     "TableArn",
                     format!("arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/probe-table"),
                 ),
+            ]),
+        },
+        OutputCase {
+            // A stack of two Lambda functions — one named by a parameter and tagged, one
+            // named outright — whose outputs publish one function's NAME (`Ref`) and the
+            // other's ARN (`Fn::GetAtt`), which is the contract between a template and
+            // whatever runs after it. `AWS::IAM::Role` rides along as a catalogued type
+            // whose ARN carries no region, proving the rule is the resource type's own
+            // documented return value rather than one ARN shape.
+            case: "two lambda functions and a role: Ref is the name, Arn is the attribute",
+            stack_name: "lambda-stack",
+            template: concat!(
+                "Parameters:\n",
+                "  TaggedName:\n",
+                "    Type: String\n",
+                "Resources:\n",
+                "  Tagged:\n",
+                "    Type: AWS::Lambda::Function\n",
+                "    Properties:\n",
+                "      FunctionName: !Ref TaggedName\n",
+                "      Handler: index.handler\n",
+                "      Runtime: python3.12\n",
+                "      Role: !GetAtt ExecutionRole.Arn\n",
+                "      Tags:\n",
+                "        - Key: probe\n",
+                "          Value: tagged\n",
+                "  Untagged:\n",
+                "    Type: AWS::Lambda::Function\n",
+                "    Properties:\n",
+                "      FunctionName: probe-untagged\n",
+                "      Handler: index.handler\n",
+                "      Runtime: python3.12\n",
+                "  ExecutionRole:\n",
+                "    Type: AWS::IAM::Role\n",
+                "    Properties:\n",
+                "      RoleName: probe-exec-role\n",
+                "Outputs:\n",
+                "  TaggedFunctionName:\n",
+                "    Value: !Ref Tagged\n",
+                "  TaggedFunctionArn:\n",
+                "    Value: !GetAtt Tagged.Arn\n",
+                "  UntaggedFunctionArn:\n",
+                "    Value:\n",
+                "      Fn::GetAtt: [Untagged, Arn]\n",
+                "  RoleArn:\n",
+                "    Value: !GetAtt ExecutionRole.Arn\n",
+            )
+            .to_string(),
+            parameters: params(&[("TaggedName", "probe-tagged")]),
+            expected: expect(&[
+                ("TaggedFunctionName", "probe-tagged".to_string()),
+                ("TaggedFunctionArn", lambda_function_arn("probe-tagged")),
+                ("UntaggedFunctionArn", lambda_function_arn("probe-untagged")),
+                ("RoleArn", iam_role_arn("probe-exec-role")),
             ]),
         },
         OutputCase {

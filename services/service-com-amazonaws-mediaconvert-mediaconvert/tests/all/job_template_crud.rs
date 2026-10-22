@@ -29,7 +29,10 @@ const FIXTURE_QUEUE: &str = "templates-queue";
 /// output groups. A job template's `Inputs` are `InputTemplate`s, which carry no file
 /// input — the file comes from the job — so the input is described by its timecode
 /// source.
-fn settings(inputs: usize, groups: usize) -> Value {
+///
+/// `pub(crate)` because the suites about repeated creates build their templates with it
+/// too, so one fixture serves every job-template suite.
+pub(crate) fn settings(inputs: usize, groups: usize) -> Value {
     let inputs: Vec<Value> = (0..inputs)
         .map(|_| json!({ "timecodeSource": "ZEROBASED" }))
         .collect();
@@ -375,11 +378,11 @@ async fn priority_is_stored_inside_its_published_range_and_refused_outside_it() 
     }
 }
 
-/// "Each name must be unique within your account" (`JobTemplate.Name`): a second create
-/// under a name already in use is the modelled conflict, and leaves the stored template
-/// as the first create wrote it.
+/// A second create under a name already in use is IDEMPOTENT: the same 201 with the
+/// template that is already stored, whatever the second request's body asks for, and the
+/// stored template is left as the first create wrote it.
 #[tokio::test]
-async fn a_name_already_in_use_is_a_conflict() {
+async fn a_name_already_in_use_returns_the_stored_template() {
     let emulator = Emulator::new();
     let first = emulator
         .create_job_template(json!({
@@ -406,15 +409,16 @@ async fn a_name_already_in_use_is_a_conflict() {
     ] {
         let again = emulator.create_job_template(request).await;
         assert_eq!(
-            again.status, 409,
-            "case {case:?}: expected HTTP 409 for a name in use, got {} with body {}",
+            again.status, 201,
+            "case {case:?}: expected HTTP 201 for a name in use, got {} with body {}",
             again.status, again.body
         );
         assert_eq!(
-            again.error_type.as_deref(),
-            Some("ConflictException"),
-            "case {case:?}: expected ConflictException, got {:?}",
-            again.error_type
+            again.template(),
+            first.template(),
+            "case {case:?}: the repeat must return the STORED template, got {} after {}",
+            again.template(),
+            first.template()
         );
     }
 
@@ -422,7 +426,7 @@ async fn a_name_already_in_use_is_a_conflict() {
     assert_eq!(
         fetched.template(),
         first.template(),
-        "a refused second create must leave the stored template untouched, got {} after {}",
+        "a repeated create must leave the stored template untouched, got {} after {}",
         fetched.template(),
         first.template()
     );
@@ -809,7 +813,8 @@ async fn an_update_that_cannot_be_applied_is_not_found_and_changes_nothing() {
 
 /// "Permanently delete a job template you have created": the deleted template is the one
 /// named and only that one, a later read of it is the modelled 404, and deleting a
-/// template that is not stored is the same 404 rather than a success over nothing.
+/// template that is not stored is the delete's own empty 202 — the delete is idempotent
+/// on the name even though the read is not.
 ///
 /// The table spans the class by the deleted template's position among the ones created —
 /// the first, a middle and the last name — so a delete is shown to remove one record,
@@ -850,18 +855,20 @@ async fn deleting_a_job_template_removes_only_that_template() {
             );
         }
 
-        // Deleting it again has nothing to delete, which is the modelled 404.
+        // Deleting it again has nothing to delete, which is the same empty 202: the
+        // delete is idempotent on the name, as `DeleteQueue`'s is.
         let again = emulator.delete_job_template(target).await;
         assert_eq!(
-            again.status, 404,
-            "case {target:?}: expected HTTP 404 deleting it twice, got {} with body {}",
+            again.status, 202,
+            "case {target:?}: expected HTTP 202 deleting it twice, got {} with body {}",
             again.status, again.body
         );
+        // And the read of that name is still the modelled 404.
+        let still_gone = emulator.get_job_template(target).await;
         assert_eq!(
-            again.error_type.as_deref(),
-            Some("NotFoundException"),
-            "case {target:?}: expected NotFoundException, got {:?}",
-            again.error_type
+            still_gone.status, 404,
+            "case {target:?}: the name must stay unreadable, got {} with body {}",
+            still_gone.status, still_gone.body
         );
 
         // And the name is free again, so a create under it succeeds.
@@ -1067,13 +1074,6 @@ async fn a_missing_resource_is_reported_by_the_member_that_named_it() {
             "PUT",
             "/2017-08-29/jobTemplates/absent".to_string(),
             Some(json!({ "description": "whatever" })),
-            "name",
-        ),
-        (
-            "DeleteJobTemplate for a template nobody created",
-            "DELETE",
-            "/2017-08-29/jobTemplates/absent".to_string(),
-            None,
             "name",
         ),
         (

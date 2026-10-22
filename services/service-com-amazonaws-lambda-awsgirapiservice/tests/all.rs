@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
+#[path = "all/signing_name_routing.rs"]
+mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

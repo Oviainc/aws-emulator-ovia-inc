@@ -47,6 +47,8 @@ mod ivs_signing_name_routing;
 mod keyspaces_signing_name_routing;
 #[path = "all/keyspaces_streams_routing.rs"]
 mod keyspaces_streams_routing;
+#[path = "all/lambda_signing_name_routing.rs"]
+mod lambda_signing_name_routing;
 #[path = "all/marketplace_signing_name_routing.rs"]
 mod marketplace_signing_name_routing;
 #[path = "all/partnercentral_channel_target_routing.rs"]

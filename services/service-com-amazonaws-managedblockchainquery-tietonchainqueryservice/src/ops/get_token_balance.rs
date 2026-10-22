@@ -166,46 +166,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
 
-        let requested = &input.token_identifier;
-        // `TokenIdentifier` is "the container for the identifier for the token including
-        // the unique token ID and its blockchain network": a network on its own names no
-        // token, so one of `contractAddress`/`tokenId` has to be there. Both are
-        // modelled optional, so the validator cannot say this.
-        if requested.contract_address.is_none() && requested.token_id.is_none() {
-            return Err(GetTokenBalanceErrorModeled::ValidationException(
-                crate::state::field_validation_exception(
-                    "tokenIdentifier",
-                    "tokenIdentifier must specify one of contractAddress or tokenId",
-                ),
+        // The per-holding read `BatchGetTokenBalance` applies to each of its items, so
+        // the two operations cannot disagree about a balance, a refused
+        // `tokenIdentifier` or a holding the ledger does not know.
+        let balance = state
+            .read_token_balance(
+                &input.token_identifier,
+                &input.owner_identifier,
+                input.at_blockchain_instant.as_ref(),
             )
-            .into());
-        }
-
-        let key = crate::state::HoldingKey {
-            contract_address: requested.contract_address.clone(),
-            token_id: requested.token_id.clone(),
-            owner_address: input.owner_identifier.address.clone(),
-        };
-        let at = crate::state::instant_to_secs(input.at_blockchain_instant.as_ref());
-
-        let holding = state
-            .ledger(&requested.network)
-            .and_then(|ledger| ledger.holdings.get(&key));
-        let record = holding.and_then(|holding| holding.balance_at(at));
-        let (holding, record) = match (holding, record) {
-            (Some(holding), Some(record)) => (holding, record),
-            _ => {
-                return Err(GetTokenBalanceErrorModeled::ResourceNotFoundException(
-                    crate::state::not_found(key.resource_id()),
-                )
-                .into());
-            }
-        };
-
-        // `TokenBalance$atBlockchainInstant`: "the time for when the TokenBalance is
-        // requested or the current time if a time is not provided in the request".
-        let asked_at = at.unwrap_or_else(crate::state::now_secs);
-        let balance = holding.token_balance(&requested.network, &key, asked_at, record);
+            .map_err(|failure| match failure {
+                crate::state::BalanceFailure::Unidentified(error) => {
+                    GetTokenBalanceErrorModeled::ValidationException(error)
+                }
+                crate::state::BalanceFailure::NotFound(error) => {
+                    GetTokenBalanceErrorModeled::ResourceNotFoundException(error)
+                }
+            })?;
 
         Ok(GetTokenBalanceOutput {
             owner_identifier: balance.owner_identifier,
