@@ -17,3 +17,5 @@ mod policy_store_alias;
 mod policy_store_authorization;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging.rs"]
+mod tagging;

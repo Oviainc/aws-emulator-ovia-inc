@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchFaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchFaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports which other faces in a collection match one already stored in it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchFaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The searched face must itself be in the collection — the search is by `FaceId`, not
+//! by image — and it is never its own match.
+//!
+//! No face recogniser runs in this process, so this operation computes no graded
+//! similarity and reports none. The one comparison it can make honestly is identity:
+//! a stored face is a match when it was indexed from the SAME image content as the
+//! searched face (`crate::state::image_signature`), and such a face is reported at
+//! `Similarity` 100 — the only value this operation ever reports. Two faces indexed
+//! from different images are not matched at all rather than scored, so nothing here
+//! stands in for the recogniser; `CompareFaces`, `SearchFacesByImage` and the other
+//! operations that can only be answered by one remain unimplemented 501s.
+//!
+//! `FaceMatchThreshold` is applied to that value, so every threshold the model allows
+//! (`Percent`, 0..100) admits an identical-content match and nothing else can be
+//! admitted by lowering it. `MaxFaces` caps how many are reported.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +182,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchFaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchFacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchFaces"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SearchFacesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the Rekognition collection store is unavailable".to_string()),
+                ..InternalServerError::default()
+            })
+        })?;
+        let state = state.lock();
+
+        let collection = state.collections.get(&input.collection_id).ok_or_else(|| {
+            SearchFacesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "The collection id: {} does not exist",
+                    input.collection_id
+                )),
+                ..ResourceNotFoundException::default()
+            })
+        })?;
+
+        // The search starts from a face the collection already holds: an id that was
+        // never indexed, or was deleted, names no face to compare against.
+        let searched = collection.face(&input.face_id).ok_or_else(|| {
+            SearchFacesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "The face id: {} does not exist in collection {}",
+                    input.face_id, input.collection_id
+                )),
+                ..ResourceNotFoundException::default()
+            })
+        })?;
+
+        let threshold = input
+            .face_match_threshold
+            .unwrap_or(crate::state::DEFAULT_FACE_MATCH_THRESHOLD);
+        // `MaxFaces` caps how many matches are reported. The model documents no
+        // default, so an omitted cap reports every match; a value that is not a cap at
+        // all (a negative one, which the modelled range 1..4096 refuses at the
+        // boundary) asks for none, as `state::page_size` does for a page.
+        let max_faces = input
+            .max_faces
+            .map_or(crate::state::DEFAULT_MAX_FACES, |max| {
+                usize::try_from(max).unwrap_or(0)
+            });
+
+        // A match is a face indexed from the same image content as the searched one,
+        // reported at `IDENTICAL_CONTENT_SIMILARITY`; the threshold is applied to that
+        // value rather than skipped, and since it is the same for every match the
+        // comparison is made once, before the faces are walked. Matches keep the
+        // collection's insertion order, since they all carry the same similarity.
+        let matches: Vec<FaceMatch> = if threshold > crate::state::IDENTICAL_CONTENT_SIMILARITY {
+            Vec::new()
+        } else {
+            collection
+                .faces
+                .iter()
+                .filter(|face| {
+                    face.face_id != searched.face_id && face.signature == searched.signature
+                })
+                .take(max_faces)
+                .map(|face| FaceMatch {
+                    similarity: Some(crate::state::IDENTICAL_CONTENT_SIMILARITY),
+                    face: Some(face.modeled()),
+                })
+                .collect()
+        };
+
+        Ok(SearchFacesOutput {
+            searched_face_id: Some(searched.face_id.clone()),
+            face_matches: Some(matches),
+            face_model_version: Some(collection.face_model_version.clone()),
+        })
     }
 }

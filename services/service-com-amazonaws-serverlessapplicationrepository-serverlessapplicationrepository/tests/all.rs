@@ -13,9 +13,13 @@
 // points it into `tests/all/`.
 #[path = "all/application_metadata.rs"]
 mod application_metadata;
+#[path = "all/application_mutations.rs"]
+mod application_mutations;
 #[path = "all/applications.rs"]
 mod applications;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/version_templates.rs"]
+mod version_templates;

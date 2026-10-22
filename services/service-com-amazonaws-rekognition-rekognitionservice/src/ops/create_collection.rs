@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCollection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCollection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCollection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a new, empty face collection in this service's store and answers with the
+//! ARN it minted for it and the face model version it was associated with. The stored
+//! record is the only thing `DescribeCollection`, `ListCollections` and `IndexFaces`
+//! read, so nothing here is answered without being persisted first.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCollection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCollectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCollection"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCollectionErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the Rekognition collection store is unavailable".to_string()),
+                ..InternalServerError::default()
+            })
+        })?;
+        let mut state = state.lock();
+
+        // Collection ids are the store's keys and are case-sensitive (per this
+        // operation's documentation), so a second create of the same id is a
+        // duplicate rather than an update: it must not overwrite the faces already
+        // indexed into the live collection.
+        if state.collections.contains_key(&input.collection_id) {
+            return Err(CreateCollectionErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "The collection id: {} already exists",
+                        input.collection_id
+                    )),
+                    ..ResourceAlreadyExistsException::default()
+                },
+            )
+            .into());
+        }
+
+        // The store is held in memory, so it has a capacity: past it a create is
+        // refused with the modelled quota error rather than allowed to grow the
+        // process without limit. The check precedes the write, so a refused request
+        // stores nothing.
+        if state.collections.len() >= crate::state::MAX_COLLECTIONS {
+            return Err(CreateCollectionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The maximum number of collections ({}) has been reached",
+                        crate::state::MAX_COLLECTIONS
+                    )),
+                    ..ServiceQuotaExceededException::default()
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::collection_arn(&region, &input.collection_id);
+        let collection = crate::state::Collection::new(
+            input.collection_id.clone(),
+            arn.clone(),
+            input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            ::std::time::SystemTime::now(),
+        );
+        let face_model_version = collection.face_model_version.clone();
+        state.collections.insert(input.collection_id, collection);
+
+        Ok(CreateCollectionOutput {
+            // This operation's own documentation for `StatusCode`: "HTTP status code
+            // indicating the result of the operation", which succeeded.
+            status_code: Some(i32::from(Self::SUCCESS_STATUS)),
+            collection_arn: Some(arn),
+            face_model_version: Some(face_model_version),
+        })
     }
 }

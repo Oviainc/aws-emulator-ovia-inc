@@ -260,7 +260,7 @@ async fn a_created_application_is_read_back_member_for_member() {
                 "sourceCodeUrl": "https://example.com/commit/abc",
                 "sourceCodeArchiveUrl": "https://example.com/src.zip",
                 "semanticVersion": "1.0.0",
-                "templateBody": "{\"Resources\":{}}"
+                "templateBody": "{\"Transform\":\"AWS::Serverless-2016-10-31\",\"Resources\":{}}"
             }),
         ),
         (
@@ -1072,6 +1072,8 @@ async fn parameter_definitions_come_from_the_stored_template() {
     let application_id = created(&repo, "template-app").await;
 
     let with_parameters = json!({
+        // SAM is a CloudFormation transform, so a publishable template declares it.
+        "Transform": "AWS::Serverless-2016-10-31",
         "Parameters": {
             "TableName": {
                 "Type": "String",
@@ -1174,12 +1176,13 @@ async fn parameter_definitions_come_from_the_stored_template() {
         (
             "a JSON template with no Parameters",
             "2.0.0",
-            json!({ "templateBody": "{\"Resources\":{}}" }),
+            json!({ "templateBody": "{\"Transform\":\"AWS::Serverless-2016-10-31\",\"Resources\":{}}" }),
         ),
         (
-            "a YAML template, which no reader here parses",
+            "a YAML template, which no reader here parses and which is therefore \
+             neither judged nor guessed at",
             "3.0.0",
-            json!({ "templateBody": "Resources:\n  Fn:\n    Type: AWS::Serverless::Function\n" }),
+            json!({ "templateBody": "Transform: AWS::Serverless-2016-10-31\nResources:\n  Fn:\n    Type: AWS::Serverless::Function\n" }),
         ),
         (
             "a template named only by URL, which is never fetched",
@@ -1453,13 +1456,21 @@ async fn caller_driven_growth_and_work_are_bounded() {
     for index in 0..201 {
         parameters.insert(format!("P{index}"), json!({ "Type": "String" }));
     }
-    let too_many_parameters = json!({ "Parameters": parameters }).to_string();
+    // Each of these declares the SAM transform, so the only thing it can be refused for
+    // is the bound under test.
+    const SAM: &str = "AWS::Serverless-2016-10-31";
+    let too_many_parameters =
+        json!({ "Transform": SAM, "Parameters": parameters }).to_string();
     let mut resources = serde_json::Map::new();
     for index in 0..501 {
         resources.insert(format!("R{index}"), json!({ "Type": "AWS::SQS::Queue" }));
     }
-    let too_many_resources =
-        json!({ "Parameters": { "P": { "Type": "String" } }, "Resources": resources }).to_string();
+    let too_many_resources = json!({
+        "Transform": SAM,
+        "Parameters": { "P": { "Type": "String" } },
+        "Resources": resources
+    })
+    .to_string();
     for (case, semantic_version, body) in [
         ("201 parameters", "2.0.0", too_many_parameters),
         ("501 resources", "3.0.0", too_many_resources),
@@ -1491,7 +1502,8 @@ async fn caller_driven_growth_and_work_are_bounded() {
             json!({ "Type": "AWS::SQS::Queue", "Properties": { "QueueName": { "Ref": "P0" } } }),
         );
     }
-    let at_the_maxima = json!({ "Parameters": parameters, "Resources": resources }).to_string();
+    let at_the_maxima =
+        json!({ "Transform": SAM, "Parameters": parameters, "Resources": resources }).to_string();
     let answer = repo
         .create_version(
             &application_id,

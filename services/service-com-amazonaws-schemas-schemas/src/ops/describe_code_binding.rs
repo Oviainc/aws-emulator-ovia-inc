@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCodeBinding
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCodeBinding`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCodeBinding::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the lifecycle of the code binding `PutCodeBinding` started for one schema
+//! version in one language. Implemented here — this is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCodeBinding` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCodeBindingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCodeBinding"))
+        // `ctx` carries request metadata only; a code binding is named by the schema it
+        // belongs to and carries no ARN, so this handler needs nothing from it.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeCodeBindingError::from(
+                DescribeCodeBindingErrorModeled::InternalServerErrorException(
+                    crate::state::internal_error(),
+                ),
+            )
+        })?;
+        // A read: this operation only REPORTS the binding. The one change a binding
+        // undergoes after it is created — generation completing — is the clock's, and
+        // is derived from the stored due instant, so nothing is written here and two
+        // describes in a row cannot differ for having been called.
+        let state = store.lock();
+
+        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
+            DescribeCodeBindingError::from(DescribeCodeBindingErrorModeled::NotFoundException(
+                crate::state::registry_not_found(&input.registry_name),
+            ))
+        })?;
+        let schema = registry.schemas.get(&input.schema_name).ok_or_else(|| {
+            DescribeCodeBindingError::from(DescribeCodeBindingErrorModeled::NotFoundException(
+                crate::state::schema_not_found(&input.registry_name, &input.schema_name),
+            ))
+        })?;
+        // `SchemaVersion` "limits the results to only this schema version"; absent, the
+        // latest stored version answers, which is the version a put with no
+        // `SchemaVersion` generated against.
+        let version = schema
+            .version_for(input.schema_version.as_deref())
+            .ok_or_else(|| {
+                DescribeCodeBindingError::from(DescribeCodeBindingErrorModeled::NotFoundException(
+                    crate::state::schema_version_not_found(
+                        &input.registry_name,
+                        &input.schema_name,
+                        input.schema_version.as_deref(),
+                    ),
+                ))
+            })?
+            .version;
+
+        // A binding exists only once a put started its generation: describing one
+        // nobody asked for is a 404, exactly as for a schema that was never created.
+        let binding = schema
+            .code_bindings
+            .get(&(version, input.language.clone()))
+            .ok_or_else(|| {
+                DescribeCodeBindingError::from(DescribeCodeBindingErrorModeled::NotFoundException(
+                    crate::state::code_binding_not_found(
+                        &input.registry_name,
+                        &input.schema_name,
+                        version,
+                        &input.language,
+                    ),
+                ))
+            })?;
+
+        let report = binding.report_at(::std::time::SystemTime::now());
+        Ok(DescribeCodeBindingOutput {
+            creation_date: Some(report.creation_date.into()),
+            last_modified: Some(report.last_modified.into()),
+            schema_version: Some(report.schema_version),
+            status: Some(report.status.to_string()),
+        })
     }
 }

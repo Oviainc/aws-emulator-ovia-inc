@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the stored domains out of [`crate::state::ComAmazonawsVoiceidVoiceidState`] in
+//! creation order. A read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +150,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDomains"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDomainsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Voice ID store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+        let size = crate::state::page_size(
+            input.max_results,
+            crate::state::LIST_DOMAINS_MAX_RESULTS,
+        );
+        let page = crate::state::page(&store.domain_order, input.next_token.as_deref(), size)
+            .map_err(|message| {
+                ListDomainsErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+            })?;
+
+        let summaries = page
+            .ids
+            .iter()
+            .filter_map(|domain_id| store.domains.get(domain_id))
+            .map(crate::state::DomainRecord::to_summary)
+            .collect();
+
+        Ok(ListDomainsOutput {
+            domain_summaries: Some(summaries),
+            // Only set when a further page remains, so a caller pages until the
+            // token is absent.
+            next_token: page.next_token,
+        })
     }
 }

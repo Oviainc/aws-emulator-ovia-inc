@@ -199,7 +199,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or(crate::state::DEFAULT_ENABLE_DEFAULT_STANDARDS),
             tags: input.tags.unwrap_or_default(),
         };
-        store.hubs.insert(key, hub);
+        let enable_default_standards = hub.enable_default_standards;
+        store.hubs.insert(key.clone(), hub);
+
+        // Enabling Security Hub CSPM subscribes the account to the standards the
+        // catalog marks `EnabledByDefault`, unless the caller set
+        // `EnableDefaultStandards: false` — those subscriptions are the resources
+        // `GetEnabledStandards` reports, so they are created here, with the
+        // `PENDING` -> `READY` transition this call owes.
+        if enable_default_standards {
+            for definition in crate::state::STANDARDS_CATALOG
+                .iter()
+                .filter(|definition| definition.enabled_by_default)
+            {
+                let (subscription_key, subscription) = crate::state::new_standards_subscription(
+                    &key,
+                    definition,
+                    ::std::collections::HashMap::new(),
+                );
+                store.standards.insert(subscription_key, subscription);
+            }
+        }
 
         Ok(EnableSecurityHubOutput::default())
     }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutCodeBinding
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutCodeBinding`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutCodeBinding::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts code generation for one schema version in one language, and reports the
+//! binding's lifecycle. Implemented here — this is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutCodeBinding` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutCodeBindingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutCodeBinding"))
+        // `ctx` carries request metadata only; a code binding is named by the schema
+        // it belongs to and carries no ARN, so this handler needs nothing from it.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutCodeBindingError::from(PutCodeBindingErrorModeled::InternalServerErrorException(
+                crate::state::internal_error(),
+            ))
+        })?;
+        let mut state = store.lock();
+
+        let registry = state
+            .registries
+            .get_mut(&input.registry_name)
+            .ok_or_else(|| {
+                PutCodeBindingError::from(PutCodeBindingErrorModeled::NotFoundException(
+                    crate::state::registry_not_found(&input.registry_name),
+                ))
+            })?;
+        let schema = registry.schemas.get_mut(&input.schema_name).ok_or_else(|| {
+            PutCodeBindingError::from(PutCodeBindingErrorModeled::NotFoundException(
+                crate::state::schema_not_found(&input.registry_name, &input.schema_name),
+            ))
+        })?;
+        // `SchemaVersion` "limits the results to only this schema version"; absent, the
+        // latest stored version is the one generation runs against. The number is
+        // resolved HERE and stored on the binding, so a later version of the schema
+        // does not silently re-point a binding that was generated from this one.
+        let version = schema
+            .version_for(input.schema_version.as_deref())
+            .ok_or_else(|| {
+                PutCodeBindingError::from(PutCodeBindingErrorModeled::NotFoundException(
+                    crate::state::schema_version_not_found(
+                        &input.registry_name,
+                        &input.schema_name,
+                        input.schema_version.as_deref(),
+                    ),
+                ))
+            })?
+            .version;
+
+        // ONE clock reading for the whole call: the instant this request is served.
+        // The binding is created at it and its generation is due a fixed span later,
+        // which is what makes the `CREATE_IN_PROGRESS` this 202 reports observable to
+        // the next caller.
+        let now = ::std::time::SystemTime::now();
+        let key = (version, input.language.clone());
+        // A put for a binding that already exists does NOT restart generation: the
+        // binding for one version and language is one resource, so its creation date
+        // stays where the first put put it and a repeat call reports the generation
+        // already running (or already finished).
+        if !schema.code_bindings.contains_key(&key) {
+            // The store lives for the life of the process, `Language` is an
+            // unconstrained string and only a put adds a binding, so the number of
+            // bindings one schema holds is capped. See
+            // `crate::state::MAX_CODE_BINDINGS_PER_SCHEMA`.
+            if schema.code_bindings.len() >= crate::state::MAX_CODE_BINDINGS_PER_SCHEMA {
+                return Err(PutCodeBindingErrorModeled::BadRequestException(
+                    crate::state::store_cap_reached(
+                        "code bindings per schema",
+                        crate::state::MAX_CODE_BINDINGS_PER_SCHEMA,
+                    ),
+                )
+                .into());
+            }
+            schema.code_bindings.insert(
+                key.clone(),
+                crate::state::CodeBinding {
+                    language: input.language.clone(),
+                    schema_version: version,
+                    created_date: now,
+                    generation_due: now + crate::state::CODE_GENERATION_DURATION,
+                },
+            );
+        }
+
+        // Answer from the STORED binding, never from `input`: this is the same
+        // rendering `DescribeCodeBinding` serves, as of this instant.
+        let binding = schema
+            .code_bindings
+            .get(&key)
+            .expect("the binding was stored above or already existed");
+        let report = binding.report_at(now);
+        Ok(PutCodeBindingOutput {
+            creation_date: Some(report.creation_date.into()),
+            last_modified: Some(report.last_modified.into()),
+            schema_version: Some(report.schema_version),
+            status: Some(report.status.to_string()),
+        })
     }
 }

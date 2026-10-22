@@ -22,12 +22,15 @@ const REGION: &str = "us-west-2";
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One emulator with its own store, reached over HTTP.
-struct Emulator {
+///
+/// Shared with the sibling suites in `tests/all/`: this is the crate's only test
+/// harness, so a new suite imports it from here rather than standing up a second one.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests assert behaviour, not signatures; the signature check is the
@@ -37,7 +40,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
         self.call_signed_for(REGION, method, uri, body).await
     }
 
@@ -84,14 +87,14 @@ impl Emulator {
 
 /// A response, reduced to what these tests assert on.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The wire error code a client branches on, as restJson1 renders it.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -102,7 +105,7 @@ impl Answer {
             .to_string()
     }
 
-    fn str_at(&self, member: &str) -> String {
+    pub(crate) fn str_at(&self, member: &str) -> String {
         self.body
             .get(member)
             .and_then(Value::as_str)
@@ -116,7 +119,7 @@ impl Answer {
     /// of a timestamp is the framework's (the generated member schema carries no
     /// `@timestampFormat`, so the JSON codec writes epoch seconds), and what this
     /// service owns is the VALUE — fixed at write time and stable across reads.
-    fn value_at(&self, member: &str) -> &Value {
+    pub(crate) fn value_at(&self, member: &str) -> &Value {
         let value = self
             .body
             .get(member)
@@ -130,16 +133,16 @@ impl Answer {
     }
 }
 
-fn registry_uri(registry: &str) -> String {
+pub(crate) fn registry_uri(registry: &str) -> String {
     format!("/v1/registries/name/{registry}")
 }
 
-fn schema_uri(registry: &str, schema: &str) -> String {
+pub(crate) fn schema_uri(registry: &str, schema: &str) -> String {
     format!("/v1/registries/name/{registry}/schemas/name/{schema}")
 }
 
 /// Create a registry, asserting it succeeded; the lifecycle cases start here.
-async fn create_registry(emulator: &Emulator, registry: &str) {
+pub(crate) async fn create_registry(emulator: &Emulator, registry: &str) {
     let created = emulator
         .call("POST", &registry_uri(registry), Some(json!({})))
         .await;

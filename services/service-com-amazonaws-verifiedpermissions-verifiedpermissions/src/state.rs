@@ -60,6 +60,14 @@ pub const ALIAS_STATE_PENDING_DELETION: &str = "PendingDeletion";
 /// the `ServiceQuotaExceededException` `CreatePolicy` already models.
 pub const MAX_POLICY_BYTES_PER_STORE: usize = 1024 * 1024;
 
+/// Published Verified Permissions quota: *Tags per resource* — 50. The model
+/// states this limit twice: `TagResource`'s own documentation ("You can
+/// associate as many as 50 tags with a resource") and `TooManyTagsException`'s
+/// ("No more tags be added because the limit (50) has been reached"). It is NOT
+/// the same bound as `TagMap`'s modelled length (..200), which bounds ONE
+/// request's map; this bounds what a resource ends up holding.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 /// How long a `clientToken` is remembered, from `CreatePolicyStore`'s own model
 /// documentation: "Verified Permissions recognizes a ClientToken for eight hours."
 pub const CLIENT_TOKEN_TTL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -215,6 +223,21 @@ impl ComAmazonawsVerifiedpermissionsVerifiedpermissionsState {
         self.policy_stores.contains_key(&candidate).then_some(candidate)
     }
 
+    /// Resolve a `resourceArn` request member to the `policyStoreId` of the
+    /// resource it names.
+    ///
+    /// In Verified Permissions the taggable resource is the policy store, so an
+    /// ARN is matched against the ARNs `CreatePolicyStore` minted and PERSISTED
+    /// rather than re-parsed into an id: an ARN that names no live resource then
+    /// never resolves, whatever its shape, and the caller gets the
+    /// `ResourceNotFoundException` every tagging operation models.
+    pub fn resolve_resource_arn(&self, resource_arn: &str) -> Option<String> {
+        self.policy_stores
+            .values()
+            .find(|store| store.arn == resource_arn)
+            .map(|store| store.policy_store_id.clone())
+    }
+
     /// The resource an unexpired `clientToken` already created for `operation`,
     /// plus the parameters it was created with.
     pub fn idempotency_replay(
@@ -333,6 +356,19 @@ fn base62(value: u64) -> String {
         out.extend(half.iter().map(|b| char::from(*b)));
     }
     out
+}
+
+/// The resource id an ARN names: its last non-empty `/`- or `:`-separated
+/// segment (`arn:aws:verifiedpermissions::0:policy-store/PS…` -> `PS…`).
+///
+/// Used only to fill `ResourceNotFoundException$resourceId`, which the model
+/// makes required, for a request that named a resource by ARN and found none.
+pub fn resource_id_from_arn(resource_arn: &str) -> String {
+    resource_arn
+        .rsplit(['/', ':'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(resource_arn)
+        .to_string()
 }
 
 /// Encode a pagination cursor: the key the next page starts at, hex-encoded so

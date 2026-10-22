@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored session addressed by the four `@httpLabel` values, exactly
+//! as the last `PutSession` or `RecognizeText` left it. A read: it never changes
+//! what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +85,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::SessionKey;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -163,18 +160,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSession"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSessionErrorModeled::InternalServerException(InternalServerException {
+                message: "the Lex V2 runtime session store is unavailable".to_string(),
+            })
+        })?;
+
+        let now = SystemTime::now();
+        let key = SessionKey::new(
+            &input.bot_id,
+            &input.bot_alias_id,
+            &input.locale_id,
+            &input.session_id,
+        );
+
+        // A read: the store is only looked up (and swept of the sessions the
+        // clock has already expired). An unknown or idle session is the modelled
+        // 404, never an empty 200 — a caller has to be able to tell "no such
+        // conversation" from "a conversation with nothing in it".
+        let mut store = state.lock();
+        let session = store.session(&key, now).ok_or_else(|| {
+            GetSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!(
+                    "no session {} for bot {} alias {} locale {}",
+                    input.session_id, input.bot_id, input.bot_alias_id, input.locale_id
+                ),
+            })
+        })?;
+
+        Ok(GetSessionOutput {
+            session_id: Some(session.session_id.clone()),
+            messages: Some(session.messages.clone()),
+            interpretations: Some(session.interpretations.clone()),
+            session_state: Some(session.visible_session_state(now)),
+        })
     }
 }

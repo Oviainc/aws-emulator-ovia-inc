@@ -14,7 +14,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A router serving only this service, over a fresh shared engine.
-fn router() -> MultiServiceRouter {
+///
+/// `pub(crate)` so a sibling suite in this test target (see `tests/all.rs`)
+/// reaches the same harness rather than declaring a second one.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -25,7 +28,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation and return `(http status, parsed body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -51,7 +54,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// Call one operation, requiring success, and return the parsed body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(status, 200, "{operation} failed: {parsed}");
     parsed
@@ -72,7 +75,7 @@ async fn store_with_validation_off(router: &MultiServiceRouter) -> String {
 }
 
 /// The error code an awsJson1_0 fault carries in `__type`, without its namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or_default()

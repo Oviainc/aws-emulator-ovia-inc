@@ -24,7 +24,26 @@ pub struct GetProposalOutput {
     pub proposal: Option<Proposal>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.managedblockchain#Proposal")]
+// `Proposal` joins the shapes in this service whose schema is written out by hand rather
+// than produced by `#[smithy_macros::smithy(shape = ...)]` (see the same note on
+// `Network` in `get_network_types.rs`), and for the same single reason: the one trait the
+// macro does not read, `@timestampFormat`.
+//
+// The model targets `CreationDate` and `ExpirationDate` at
+// `com.amazonaws.managedblockchain#Timestamp`, which carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape", shape="Proposal")` reports `"timestampFormat": "date-time"`
+// on both). The vendored codegen never emits `with_timestamp_format`, so a macro-built
+// member schema reports no format and the restJson1 JSON codec falls back to its protocol
+// default, epoch seconds — a NUMBER where the model (and every AWS SDK's generated
+// deserializer for a `date-time` member) requires an ISO-8601 string. The hand-written
+// member schemas below differ from the macro's output in exactly that one chain call.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
+// schema per member (index = position in the member list), a `SCHEMA` naming them in
+// order, the `<SHAPE>_SCHEMA` alias, and the serialize/deserialize pair. Constraint traits
+// are deliberately absent: the validating walk runs on operation INPUTS only, and
+// `Proposal` is an output shape, so the macro's captured constraints would be inert here
+// too.
 #[derive(Debug, Clone, Default)]
 pub struct Proposal {
     pub proposal_id: Option<String>,
@@ -41,5 +60,298 @@ pub struct Proposal {
     pub outstanding_vote_count: Option<i32>,
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub arn: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl Proposal {
+    const SHAPE_ID: &'static str = "com.amazonaws.managedblockchain#Proposal";
+    const NAMESPACE: &'static str = "com.amazonaws.managedblockchain";
+
+    pub const M_PROPOSAL_ID: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Proposal$ProposalId",
+                Self::NAMESPACE,
+                "ProposalId",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "ProposalId",
+            0,
+        );
+    pub const M_NETWORK_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Proposal$NetworkId",
+            Self::NAMESPACE,
+            "NetworkId",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "NetworkId",
+        1,
+    );
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Proposal$Description",
+                Self::NAMESPACE,
+                "Description",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "Description",
+            2,
+        );
+    pub const M_ACTIONS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Proposal$Actions",
+            Self::NAMESPACE,
+            "Actions",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        "Actions",
+        3,
+    );
+    pub const M_PROPOSED_BY_MEMBER_ID: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Proposal$ProposedByMemberId",
+                Self::NAMESPACE,
+                "ProposedByMemberId",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "ProposedByMemberId",
+            4,
+        );
+    pub const M_PROPOSED_BY_MEMBER_NAME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Proposal$ProposedByMemberName",
+                Self::NAMESPACE,
+                "ProposedByMemberName",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "ProposedByMemberName",
+            5,
+        );
+    pub const M_STATUS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Proposal$Status",
+            Self::NAMESPACE,
+            "Status",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Status",
+        6,
+    );
+    /// `@timestampFormat("date-time")` from `Timestamp` — the chain the macro cannot
+    /// emit.
+    pub const M_CREATION_DATE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Proposal$CreationDate",
+                Self::NAMESPACE,
+                "CreationDate",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "CreationDate",
+            7,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")` from `Timestamp`, as on `CreationDate` above.
+    pub const M_EXPIRATION_DATE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Proposal$ExpirationDate",
+                Self::NAMESPACE,
+                "ExpirationDate",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "ExpirationDate",
+            8,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_YES_VOTE_COUNT: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Proposal$YesVoteCount",
+                Self::NAMESPACE,
+                "YesVoteCount",
+            ),
+            ::aws_smithy_schema::ShapeType::Integer,
+            "YesVoteCount",
+            9,
+        );
+    pub const M_NO_VOTE_COUNT: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Proposal$NoVoteCount",
+                Self::NAMESPACE,
+                "NoVoteCount",
+            ),
+            ::aws_smithy_schema::ShapeType::Integer,
+            "NoVoteCount",
+            10,
+        );
+    pub const M_OUTSTANDING_VOTE_COUNT: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.managedblockchain#Proposal$OutstandingVoteCount",
+                Self::NAMESPACE,
+                "OutstandingVoteCount",
+            ),
+            ::aws_smithy_schema::ShapeType::Integer,
+            "OutstandingVoteCount",
+            11,
+        );
+    pub const M_TAGS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Proposal$Tags",
+            Self::NAMESPACE,
+            "Tags",
+        ),
+        ::aws_smithy_schema::ShapeType::Map,
+        "Tags",
+        12,
+    );
+    pub const M_ARN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.managedblockchain#Proposal$Arn",
+            Self::NAMESPACE,
+            "Arn",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "Arn",
+        13,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(Self::SHAPE_ID, Self::NAMESPACE, "Proposal"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_PROPOSAL_ID,
+            &Self::M_NETWORK_ID,
+            &Self::M_DESCRIPTION,
+            &Self::M_ACTIONS,
+            &Self::M_PROPOSED_BY_MEMBER_ID,
+            &Self::M_PROPOSED_BY_MEMBER_NAME,
+            &Self::M_STATUS,
+            &Self::M_CREATION_DATE,
+            &Self::M_EXPIRATION_DATE,
+            &Self::M_YES_VOTE_COUNT,
+            &Self::M_NO_VOTE_COUNT,
+            &Self::M_OUTSTANDING_VOTE_COUNT,
+            &Self::M_TAGS,
+            &Self::M_ARN,
+        ],
+    );
+}
+
+pub static PROPOSAL_SCHEMA: &::aws_smithy_schema::Schema = &Proposal::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for Proposal {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.proposal_id.as_ref() {
+            s.write_string(&Self::M_PROPOSAL_ID, v.as_str())?;
+        }
+        if let Some(v) = self.network_id.as_ref() {
+            s.write_string(&Self::M_NETWORK_ID, v.as_str())?;
+        }
+        if let Some(v) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, v.as_str())?;
+        }
+        if let Some(v) = self.actions.as_ref() {
+            s.write_struct(&Self::M_ACTIONS, v)?;
+        }
+        if let Some(v) = self.proposed_by_member_id.as_ref() {
+            s.write_string(&Self::M_PROPOSED_BY_MEMBER_ID, v.as_str())?;
+        }
+        if let Some(v) = self.proposed_by_member_name.as_ref() {
+            s.write_string(&Self::M_PROPOSED_BY_MEMBER_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.creation_date.as_ref() {
+            s.write_timestamp(&Self::M_CREATION_DATE, v)?;
+        }
+        if let Some(v) = self.expiration_date.as_ref() {
+            s.write_timestamp(&Self::M_EXPIRATION_DATE, v)?;
+        }
+        if let Some(v) = self.yes_vote_count.as_ref() {
+            s.write_integer(&Self::M_YES_VOTE_COUNT, *v)?;
+        }
+        if let Some(v) = self.no_vote_count.as_ref() {
+            s.write_integer(&Self::M_NO_VOTE_COUNT, *v)?;
+        }
+        if let Some(v) = self.outstanding_vote_count.as_ref() {
+            s.write_integer(&Self::M_OUTSTANDING_VOTE_COUNT, *v)?;
+        }
+        if let Some(v) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|__sm| {
+                for (__k, __v) in v.iter() {
+                    __sm.write_string(&Self::M_TAGS, __k.as_str())?;
+                    __sm.write_string(&Self::M_TAGS, __v.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for Proposal {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.proposal_id = Some(d.read_string(&Self::M_PROPOSAL_ID)?),
+                Some(1) => out.network_id = Some(d.read_string(&Self::M_NETWORK_ID)?),
+                Some(2) => out.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(3) => {
+                    out.actions = Some(<ProposalActions as
+                        ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?)
+                }
+                Some(4) => {
+                    out.proposed_by_member_id =
+                        Some(d.read_string(&Self::M_PROPOSED_BY_MEMBER_ID)?)
+                }
+                Some(5) => {
+                    out.proposed_by_member_name =
+                        Some(d.read_string(&Self::M_PROPOSED_BY_MEMBER_NAME)?)
+                }
+                Some(6) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(7) => out.creation_date = Some(d.read_timestamp(&Self::M_CREATION_DATE)?),
+                Some(8) => {
+                    out.expiration_date = Some(d.read_timestamp(&Self::M_EXPIRATION_DATE)?)
+                }
+                Some(9) => out.yes_vote_count = Some(d.read_integer(&Self::M_YES_VOTE_COUNT)?),
+                Some(10) => out.no_vote_count = Some(d.read_integer(&Self::M_NO_VOTE_COUNT)?),
+                Some(11) => {
+                    out.outstanding_vote_count =
+                        Some(d.read_integer(&Self::M_OUTSTANDING_VOTE_COUNT)?)
+                }
+                Some(12) => {
+                    let mut __out: std::collections::HashMap<String, String> =
+                        ::std::default::Default::default();
+                    d.read_map(&Self::M_TAGS, &mut |__k, __dm| {
+                        let __value = __dm.read_string(&Self::M_TAGS)?;
+                        __out.insert(__k, __value);
+                        Ok(())
+                    })?;
+                    out.tags = Some(__out);
+                }
+                Some(13) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 

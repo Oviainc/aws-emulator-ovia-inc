@@ -182,6 +182,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read: paging does not consume anything, so the same token always
         // returns the same page.
         let store = state.lock();
+
+        // ENABLEMENT PRECONDITION. A subscriber collection only exists for an account that
+        // has Security Lake enabled somewhere; until then there is no collection to page
+        // over, so the read is refused with the modelled ResourceNotFoundException (404)
+        // rather than answered with an empty page that a client cannot tell apart from a
+        // configured-but-empty account. Checked before the token is interpreted: a token
+        // can only have been issued from a collection that exists.
+        if !store.enabled_in_any_region() {
+            return Err(ListSubscribersErrorModeled::ResourceNotFoundException(
+                crate::state::not_enabled_in_any_region(),
+            )
+            .into());
+        }
+
         let in_region = store.subscribers_in(&region);
 
         let start = match input.next_token.as_deref() {
