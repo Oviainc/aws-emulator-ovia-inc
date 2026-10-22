@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIdentityPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIdentityPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIdentityPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an `IdentityPoolId` (`REGION:GUID`) and PERSISTS the pool, so
+//! `DescribeIdentityPool` reports back exactly what was created.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +191,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIdentityPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIdentityPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIdentityPool"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateIdentityPoolErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The pool is created in the region the request is signed for, and its id names
+        // that region.
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // This emulator holds its pools in memory for the life of the process, so the
+        // store has a ceiling; the modelled error for a pool count past a preset limit is
+        // `LimitExceededException`.
+        if store.identity_pool_store_is_full() {
+            return Err(CreateIdentityPoolErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of identity pools ({}) has been reached.",
+                        crate::state::MAX_IDENTITY_POOLS
+                    )),
+                },
+            )
+            .into());
+        }
+        let identity_pool_id = store.new_identity_pool_id(&region);
+
+        let record = crate::state::IdentityPool {
+            identity_pool_id: identity_pool_id.clone(),
+            identity_pool_name: input.identity_pool_name,
+            allow_unauthenticated_identities: input.allow_unauthenticated_identities,
+            allow_classic_flow: input.allow_classic_flow,
+            supported_login_providers: input
+                .supported_login_providers
+                .map(|providers| providers.into_iter().collect()),
+            developer_provider_name: input.developer_provider_name,
+            open_id_connect_provider_arns: input.open_id_connect_provider_ar_ns,
+            cognito_identity_providers: input.cognito_identity_providers,
+            saml_provider_arns: input.saml_provider_ar_ns,
+            identity_pool_tags: input
+                .identity_pool_tags
+                .map(|tags| tags.into_iter().collect()),
+        };
+
+        // The response is the stored record, so a caller cannot tell the echo of its own
+        // request from what was persisted — because they are the same thing.
+        let output = CreateIdentityPoolOutput {
+            identity_pool_id: record.identity_pool_id.clone(),
+            identity_pool_name: record.identity_pool_name.clone(),
+            allow_unauthenticated_identities: record.allow_unauthenticated_identities,
+            allow_classic_flow: record.allow_classic_flow,
+            supported_login_providers: record
+                .supported_login_providers
+                .clone()
+                .map(|providers| providers.into_iter().collect()),
+            developer_provider_name: record.developer_provider_name.clone(),
+            open_id_connect_provider_ar_ns: record.open_id_connect_provider_arns.clone(),
+            cognito_identity_providers: record.cognito_identity_providers.clone(),
+            saml_provider_ar_ns: record.saml_provider_arns.clone(),
+            identity_pool_tags: record
+                .identity_pool_tags
+                .clone()
+                .map(|tags| tags.into_iter().collect()),
+        };
+        store.identity_pools.insert(identity_pool_id, record);
+        Ok(output)
     }
 }
