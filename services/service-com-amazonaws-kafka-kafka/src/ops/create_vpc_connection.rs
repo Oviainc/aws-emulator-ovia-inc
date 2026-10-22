@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVpcConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVpcConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVpcConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an MSK VPC connection (multi-VPC private connectivity) to a
+//! provisioned cluster and registers it in this service's state, where
+//! `DescribeVpcConnection` reads it back. The record is
+//! [`crate::state::VpcConnection`]; this handler validates the request and
+//! mints it.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,176 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVpcConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVpcConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVpcConnection"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateVpcConnectionErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Everything that depends on the request alone is checked before the
+        // registry lock is taken. `CreateVpcConnection` models no
+        // `NotFoundException`, so every unusable request member — including a
+        // target cluster that does not exist — is refused as a bad request.
+        if !crate::state::is_cluster_arn(&input.target_cluster_arn) {
+            return Err(bad_request(
+                "TargetClusterArn",
+                format!(
+                    "{} is not a valid Amazon MSK cluster ARN.",
+                    input.target_cluster_arn
+                ),
+            ));
+        }
+        let authentication_types = crate::state::VPC_CONNECTION_AUTHENTICATION_TYPES;
+        if !authentication_types.contains(&input.authentication.as_str()) {
+            return Err(bad_request(
+                "Authentication",
+                format!(
+                    "Authentication must be one of {}, not '{}'.",
+                    authentication_types.join(", "),
+                    input.authentication
+                ),
+            ));
+        }
+        if !crate::state::is_ec2_resource_id("vpc", &input.vpc_id) {
+            return Err(bad_request(
+                "VpcId",
+                format!("'{}' is not a valid VPC id.", input.vpc_id),
+            ));
+        }
+        if input.client_subnets.is_empty() {
+            return Err(bad_request(
+                "ClientSubnets",
+                "ClientSubnets must name at least one subnet.".to_string(),
+            ));
+        }
+        if let Some(subnet) = input
+            .client_subnets
+            .iter()
+            .find(|subnet| !crate::state::is_ec2_resource_id("subnet", subnet))
+        {
+            return Err(bad_request(
+                "ClientSubnets",
+                format!("'{subnet}' is not a valid subnet id."),
+            ));
+        }
+        if input.security_groups.is_empty() {
+            return Err(bad_request(
+                "SecurityGroups",
+                "SecurityGroups must name at least one security group.".to_string(),
+            ));
+        }
+        if let Some(group) = input
+            .security_groups
+            .iter()
+            .find(|group| !crate::state::is_ec2_resource_id("sg", group))
+        {
+            return Err(bad_request(
+                "SecurityGroups",
+                format!("'{group}' is not a valid security group id."),
+            ));
+        }
+
+        let mut state = state.lock();
+
+        // A regional endpoint only knows its own region's clusters, so a target
+        // ARN from another region is as unusable as one that names nothing.
+        // Reading the cluster through the settling lookup materialises the
+        // `CREATING` -> `ACTIVE` transition the clock already owed THAT cluster,
+        // which was due at the same instant whether or not anybody called.
+        let now = std::time::SystemTime::now();
+        let (cluster_arn, cluster_name) =
+            match state.settled_cluster_in(&region, &input.target_cluster_arn, now) {
+                Some(cluster) => (cluster.arn.clone(), cluster.name.clone()),
+                None => {
+                    return Err(bad_request(
+                        "TargetClusterArn",
+                        format!(
+                            "No cluster exists in {region} with the ARN {}",
+                            input.target_cluster_arn
+                        ),
+                    ))
+                }
+            };
+
+        // The monotonic counter is what makes each connection's ARN distinct; it
+        // advances whether or not anything else about the request repeats an
+        // earlier one.
+        let suffix = state.next_vpc_connection_suffix;
+        state.next_vpc_connection_suffix += 1;
+        let connection = crate::state::VpcConnection::requested(
+            &region,
+            suffix,
+            now,
+            &cluster_arn,
+            &cluster_name,
+            input,
+        );
+
+        let output = CreateVpcConnectionOutput {
+            vpc_connection_arn: Some(connection.arn.clone()),
+            state: Some(connection.state.clone()),
+            authentication: Some(connection.authentication.clone()),
+            vpc_id: Some(connection.vpc_id.clone()),
+            client_subnets: Some(connection.client_subnets.clone()),
+            security_groups: Some(connection.security_groups.clone()),
+            creation_time: Some(::aws_smithy_types::DateTime::from(connection.creation_time)),
+            tags: Some(connection.tag_map()),
+        };
+        // The registry enforces its own ceiling on the one insertion path, so a
+        // create past it is refused there rather than growing the store by one
+        // more call. A refused create registers nothing, so the ordinal it
+        // reserved goes back: the counter counts connections ever registered,
+        // not calls ever made.
+        if let Err(rejected) = state.register_vpc_connection(connection) {
+            state.next_vpc_connection_suffix = suffix;
+            return Err(match rejected {
+                // No request member is at fault for a process-wide backstop, so
+                // this one names none. `RegionQuota` is not reachable here: the
+                // VPC-connection registry carries no per-region quota.
+                crate::state::RegisterRejected::RegistryCeiling
+                | crate::state::RegisterRejected::RegionQuota => {
+                    CreateVpcConnectionErrorModeled::TooManyRequestsException(
+                        TooManyRequestsException {
+                            invalid_parameter: None,
+                            message: Some(format!(
+                                "This emulator holds its maximum of {} VPC connections.",
+                                crate::state::MAX_VPC_CONNECTIONS_IN_REGISTRY
+                            )),
+                        },
+                    )
+                    .into()
+                }
+                // Unreachable: the ordinal above is monotonic, so the ARN it
+                // mints is new. Reported as a server fault rather than
+                // overwriting a live connection.
+                crate::state::RegisterRejected::DuplicateArn => {
+                    CreateVpcConnectionErrorModeled::InternalServerErrorException(
+                        InternalServerErrorException {
+                            invalid_parameter: None,
+                            message: Some(
+                                "the minted VPC connection ARN is already registered".to_string(),
+                            ),
+                        },
+                    )
+                    .into()
+                }
+            });
+        }
+        Ok(output)
     }
+}
+
+/// The modelled 400 for a request member this operation cannot act on, naming
+/// the member at fault.
+fn bad_request(parameter: &str, message: String) -> CreateVpcConnectionError {
+    CreateVpcConnectionErrorModeled::BadRequestException(BadRequestException {
+        invalid_parameter: Some(parameter.to_string()),
+        message: Some(message),
+    })
+    .into()
 }
