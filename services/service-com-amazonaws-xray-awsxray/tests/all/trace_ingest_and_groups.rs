@@ -38,29 +38,31 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// One emulator with an empty store.
-struct Xray {
+/// One emulator with an empty store. `pub(crate)` so a sibling suite in this
+/// same test target drives the one front door rather than standing up a second
+/// copy of it.
+pub(crate) struct Xray {
     router: MultiServiceRouter,
 }
 
 /// What one call answered.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// restJson1 resolves an error shape from `x-amzn-errortype`.
-    error_type: Option<String>,
-    body: Value,
+    pub(crate) error_type: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// A member of the response body, or `Value::Null`.
-    fn get(&self, member: &str) -> &Value {
+    pub(crate) fn get(&self, member: &str) -> &Value {
         self.body.get(member).unwrap_or(&Value::Null)
     }
 }
 
 impl Xray {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(service_com_amazonaws_xray_awsxray::EmulatedService::new(
@@ -72,7 +74,7 @@ impl Xray {
         Self { router }
     }
 
-    async fn call(&self, path: &str, body: &Value) -> Answer {
+    pub(crate) async fn call(&self, path: &str, body: &Value) -> Answer {
         let request = ::http::Request::builder()
             .method("POST")
             .uri(format!("https://xray.us-east-1.amazonaws.com{path}"))
@@ -880,7 +882,7 @@ fn assert_group_matches(label: &str, source: &str, group: &Value, case: &GroupCa
 }
 
 /// `arn:aws:xray:<region>:<account>:group/<GroupName>/<12 hex digits>`.
-fn assert_group_arn_shape(label: &str, name: &str, arn: &str) {
+pub(crate) fn assert_group_arn_shape(label: &str, name: &str, arn: &str) {
     let expected_prefix = format!("arn:aws:xray:us-east-1:000000000000:group/{name}/");
     assert!(
         arn.starts_with(&expected_prefix),

@@ -730,6 +730,31 @@ impl ComAmazonawsXrayAwsxrayState {
         Err(GroupLookupError::NotFound)
     }
 
+    /// Apply an `UpdateGroup` to the stored group `group_name`, returning the
+    /// record as it now stands, or `None` when no group is stored under that
+    /// name.
+    ///
+    /// Each member the update SUPPLIES replaces the stored one; each member it
+    /// OMITS leaves the stored one as it is. The group's identity — its
+    /// case-sensitive name and the ARN that "was generated upon creation"
+    /// (`UpdateGroupRequest$GroupARN`) — and its tags are never touched by an
+    /// update, so neither the keyed map nor the ARN index needs maintenance
+    /// here and every selector that resolved the group before still does.
+    pub fn apply_group_update(
+        &mut self,
+        group_name: &str,
+        update: GroupUpdate,
+    ) -> Option<&GroupRecord> {
+        let record = self.groups.get_mut(group_name)?;
+        if let Some(filter_expression) = update.filter_expression {
+            record.filter_expression = Some(filter_expression);
+        }
+        if let Some(insights_configuration) = update.insights_configuration {
+            record.insights_configuration = Some(insights_configuration);
+        }
+        Some(record)
+    }
+
     /// Remove a group and its ARN index entry.
     pub fn remove_group(&mut self, group_name: &str) -> Option<GroupRecord> {
         let record = self.groups.remove(group_name)?;
@@ -749,6 +774,19 @@ pub struct GroupRecordDraft {
     pub insights_configuration: Option<InsightsConfigurationRecord>,
     /// The requested tags.
     pub tags: Vec<(String, String)>,
+}
+
+/// What `UpdateGroup` supplies: the members of a group a caller may change.
+///
+/// A `None` member is one the request OMITTED and so leaves alone — which is
+/// why this is not a [`GroupRecordDraft`]: a draft states a whole group, an
+/// update states only the parts of one.
+#[derive(Debug, Clone, Default)]
+pub struct GroupUpdate {
+    /// The updated filter expression, when the request carried one.
+    pub filter_expression: Option<String>,
+    /// The updated insights configuration, when the request carried one.
+    pub insights_configuration: Option<InsightsConfigurationRecord>,
 }
 
 /// The region this request's SigV4 credential scope names, else [`DEFAULT_REGION`].
