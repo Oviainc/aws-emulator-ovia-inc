@@ -130,6 +130,228 @@ pub fn bound_tags(tags: &Option<std::collections::HashMap<String, String>>) -> R
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Server-filled origin-endpoint defaults
+//
+// MediaPackage does not store an origin endpoint as the request wrote it: every optional
+// configuration member the request leaves unset is filled with that member's service
+// default, stored, and returned on EVERY projection of the endpoint (the create response,
+// `DescribeOriginEndpoint`, each entry of `ListOriginEndpoints`). The model declares no
+// `@default` on any of them, so each value below carries its own source:
+//
+// * RECORDED for this service (trace set `simparity-wire-aws-v1`, fixtures
+//   `mediapackage-origin-endpoint-lifecycle`, `mediapackage-conflict-error-paths`,
+//   `mediapackage-harvest-job-workflow`): `origination` ALLOW, `startoverWindowSeconds`
+//   and `timeDelaySeconds` 0, and in `hlsPackage` `adMarkers` NONE, the five-entry
+//   `adTriggers` list, `adsOnDeliveryRestrictions` RESTRICTED, `playlistType` EVENT,
+//   `playlistWindowSeconds` 60, `programDateTimeIntervalSeconds` 0 and the three booleans
+//   `includeIframeOnlyStream` / `useAudioRenditionGroup` / `includeDvbSubtitles` false.
+// * RECORDED for the sibling MediaPackage VOD service, whose packaging shapes carry the
+//   same member names and defaults (same trace set, fixture
+//   `mediapackage-vod-packaging-configuration-multi-format`): a CMAF child `HlsManifest`
+//   takes `adMarkers` NONE, `programDateTimeIntervalSeconds` 0 and
+//   `includeIframeOnlyStream` false, and a DASH package takes `profile` NONE,
+//   `minBufferTimeSeconds` 30, `segmentTemplateFormat` NUMBER_WITH_TIMELINE,
+//   `periodTriggers` [] and `includeIframeOnlyStream` false.
+//
+// The defaults are keyed by MEMBER, so the same member takes the same default wherever it
+// appears (`HlsPackage`, a CMAF child `HlsManifest`, `DashPackage`). A member whose
+// default neither the model nor a recording publishes is left exactly as the request sent
+// it — `SegmentDurationSeconds`, `StreamSelection`, `Encryption`, the DASH window/timing
+// members and every `MssPackage` member — because inventing a value for it would be a
+// fabrication, not a default.
+// ---------------------------------------------------------------------------
+
+/// `Origination`'s default: a new endpoint may be requested unless the caller denies it.
+pub const DEFAULT_ORIGINATION: &str = "ALLOW";
+
+/// `StartoverWindowSeconds`' default. The model documents "If not specified, startover
+/// playback will be disabled for the OriginEndpoint" — a window of zero seconds.
+pub const DEFAULT_STARTOVER_WINDOW_SECONDS: i32 = 0;
+
+/// `TimeDelaySeconds`' default. The model documents "If not specified, there will be no
+/// time delay in effect for the OriginEndpoint" — a delay of zero seconds.
+pub const DEFAULT_TIME_DELAY_SECONDS: i32 = 0;
+
+/// `AdMarkers`' default: no SCTE-35 ad markers are written into the manifest.
+pub const DEFAULT_AD_MARKERS: &str = "NONE";
+
+/// `AdsOnDeliveryRestrictions`' default: only SCTE-35 messages that carry delivery
+/// restrictions become ads.
+pub const DEFAULT_ADS_ON_DELIVERY_RESTRICTIONS: &str = "RESTRICTED";
+
+/// `AdTriggers`' default: the SCTE-35 message types MediaPackage treats as ad markers when
+/// the request names none. Every entry is a value `__AdTriggersElement` accepts
+/// (`crate::ops::types::__AD_TRIGGERS_ELEMENT_VALUES`).
+pub const DEFAULT_AD_TRIGGERS: &[&str] = &[
+    "SPLICE_INSERT",
+    "PROVIDER_ADVERTISEMENT",
+    "DISTRIBUTOR_ADVERTISEMENT",
+    "PROVIDER_PLACEMENT_OPPORTUNITY",
+    "DISTRIBUTOR_PLACEMENT_OPPORTUNITY",
+];
+
+/// `PlaylistType`'s default: the media playlist carries `EXT-X-PLAYLIST-TYPE:EVENT`.
+pub const DEFAULT_PLAYLIST_TYPE: &str = "EVENT";
+
+/// `PlaylistWindowSeconds`' default: the time window each parent manifest contains.
+pub const DEFAULT_PLAYLIST_WINDOW_SECONDS: i32 = 60;
+
+/// `ProgramDateTimeIntervalSeconds`' default: no `EXT-X-PROGRAM-DATE-TIME` tags are
+/// inserted, which the member reports as an interval of zero.
+pub const DEFAULT_PROGRAM_DATE_TIME_INTERVAL_SECONDS: i32 = 0;
+
+/// `IncludeIframeOnlyStream`'s default: no I-Frame-only stream is added to the output.
+pub const DEFAULT_INCLUDE_IFRAME_ONLY_STREAM: bool = false;
+
+/// `UseAudioRenditionGroup`'s default: audio streams are not placed in rendition groups.
+pub const DEFAULT_USE_AUDIO_RENDITION_GROUP: bool = false;
+
+/// `IncludeDvbSubtitles`' default: DVB subtitles are not passed through.
+pub const DEFAULT_INCLUDE_DVB_SUBTITLES: bool = false;
+
+/// `DashPackage.Profile`'s default: no profile-specific (HbbTV, DVB-DASH) output.
+pub const DEFAULT_DASH_PROFILE: &str = "NONE";
+
+/// `DashPackage.MinBufferTimeSeconds`' default.
+pub const DEFAULT_DASH_MIN_BUFFER_TIME_SECONDS: i32 = 30;
+
+/// `DashPackage.SegmentTemplateFormat`'s default.
+pub const DEFAULT_DASH_SEGMENT_TEMPLATE_FORMAT: &str = "NUMBER_WITH_TIMELINE";
+
+/// `DashPackage.PeriodTriggers`' default: the MPD is not partitioned into periods, which
+/// the member reports as the empty list.
+pub const DEFAULT_DASH_PERIOD_TRIGGERS: &[&str] = &[];
+
+/// An owned list for one of the `&[&str]` default lists above.
+fn default_list(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
+/// Fill the server defaults of the HLS packaging members `package` left unset, leaving
+/// every supplied value — including an explicitly empty `AdTriggers` list — alone.
+fn fill_hls_package(package: &mut HlsPackage) {
+    package.ad_markers = package
+        .ad_markers
+        .take()
+        .or_else(|| Some(DEFAULT_AD_MARKERS.to_string()));
+    package.ad_triggers = package
+        .ad_triggers
+        .take()
+        .or_else(|| Some(default_list(DEFAULT_AD_TRIGGERS)));
+    package.ads_on_delivery_restrictions = package
+        .ads_on_delivery_restrictions
+        .take()
+        .or_else(|| Some(DEFAULT_ADS_ON_DELIVERY_RESTRICTIONS.to_string()));
+    package.include_dvb_subtitles = package
+        .include_dvb_subtitles
+        .or(Some(DEFAULT_INCLUDE_DVB_SUBTITLES));
+    package.include_iframe_only_stream = package
+        .include_iframe_only_stream
+        .or(Some(DEFAULT_INCLUDE_IFRAME_ONLY_STREAM));
+    package.playlist_type = package
+        .playlist_type
+        .take()
+        .or_else(|| Some(DEFAULT_PLAYLIST_TYPE.to_string()));
+    package.playlist_window_seconds = package
+        .playlist_window_seconds
+        .or(Some(DEFAULT_PLAYLIST_WINDOW_SECONDS));
+    package.program_date_time_interval_seconds = package
+        .program_date_time_interval_seconds
+        .or(Some(DEFAULT_PROGRAM_DATE_TIME_INTERVAL_SECONDS));
+    package.use_audio_rendition_group = package
+        .use_audio_rendition_group
+        .or(Some(DEFAULT_USE_AUDIO_RENDITION_GROUP));
+}
+
+/// Fill the server defaults of the manifest members a CMAF child `HlsManifest` left unset.
+/// The member set it shares with [`HlsPackage`] takes the same defaults.
+fn fill_hls_manifest(manifest: &mut HlsManifest) {
+    manifest.ad_markers = manifest
+        .ad_markers
+        .take()
+        .or_else(|| Some(DEFAULT_AD_MARKERS.to_string()));
+    manifest.ad_triggers = manifest
+        .ad_triggers
+        .take()
+        .or_else(|| Some(default_list(DEFAULT_AD_TRIGGERS)));
+    manifest.ads_on_delivery_restrictions = manifest
+        .ads_on_delivery_restrictions
+        .take()
+        .or_else(|| Some(DEFAULT_ADS_ON_DELIVERY_RESTRICTIONS.to_string()));
+    manifest.include_iframe_only_stream = manifest
+        .include_iframe_only_stream
+        .or(Some(DEFAULT_INCLUDE_IFRAME_ONLY_STREAM));
+    manifest.playlist_type = manifest
+        .playlist_type
+        .take()
+        .or_else(|| Some(DEFAULT_PLAYLIST_TYPE.to_string()));
+    manifest.playlist_window_seconds = manifest
+        .playlist_window_seconds
+        .or(Some(DEFAULT_PLAYLIST_WINDOW_SECONDS));
+    manifest.program_date_time_interval_seconds = manifest
+        .program_date_time_interval_seconds
+        .or(Some(DEFAULT_PROGRAM_DATE_TIME_INTERVAL_SECONDS));
+}
+
+/// Fill the server defaults of the DASH packaging members `package` left unset. The
+/// SCTE-35 members it shares with [`HlsPackage`] take the same defaults.
+fn fill_dash_package(package: &mut DashPackage) {
+    package.ad_triggers = package
+        .ad_triggers
+        .take()
+        .or_else(|| Some(default_list(DEFAULT_AD_TRIGGERS)));
+    package.ads_on_delivery_restrictions = package
+        .ads_on_delivery_restrictions
+        .take()
+        .or_else(|| Some(DEFAULT_ADS_ON_DELIVERY_RESTRICTIONS.to_string()));
+    package.include_iframe_only_stream = package
+        .include_iframe_only_stream
+        .or(Some(DEFAULT_INCLUDE_IFRAME_ONLY_STREAM));
+    package.min_buffer_time_seconds = package
+        .min_buffer_time_seconds
+        .or(Some(DEFAULT_DASH_MIN_BUFFER_TIME_SECONDS));
+    package.period_triggers = package
+        .period_triggers
+        .take()
+        .or_else(|| Some(default_list(DEFAULT_DASH_PERIOD_TRIGGERS)));
+    package.profile = package
+        .profile
+        .take()
+        .or_else(|| Some(DEFAULT_DASH_PROFILE.to_string()));
+    package.segment_template_format = package
+        .segment_template_format
+        .take()
+        .or_else(|| Some(DEFAULT_DASH_SEGMENT_TEMPLATE_FORMAT.to_string()));
+}
+
+/// Materialise the server-filled members of an origin endpoint built from a create or
+/// update request, BEFORE it is stored.
+///
+/// Every write of an endpoint goes through this, so the stored record — and therefore
+/// every projection of it — carries the same member set whatever the request omitted.
+pub fn apply_origin_endpoint_defaults(record: &mut OriginEndpointRecord) {
+    record.origination = record
+        .origination
+        .take()
+        .or_else(|| Some(DEFAULT_ORIGINATION.to_string()));
+    record.startover_window_seconds = record
+        .startover_window_seconds
+        .or(Some(DEFAULT_STARTOVER_WINDOW_SECONDS));
+    record.time_delay_seconds = record.time_delay_seconds.or(Some(DEFAULT_TIME_DELAY_SECONDS));
+    if let Some(package) = record.hls_package.as_mut() {
+        fill_hls_package(package);
+    }
+    if let Some(package) = record.dash_package.as_mut() {
+        fill_dash_package(package);
+    }
+    if let Some(package) = record.cmaf_package.as_mut() {
+        for manifest in package.hls_manifests.iter_mut().flatten() {
+            fill_hls_manifest(manifest);
+        }
+    }
+}
+
 /// A Channel, exactly as `CreateChannel` stored it.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelRecord {

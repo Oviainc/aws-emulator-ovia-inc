@@ -348,7 +348,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .manifest_name
             .clone()
             .unwrap_or_else(|| crate::state::DEFAULT_MANIFEST_NAME.to_string());
-        let record = crate::state::OriginEndpointRecord {
+        let mut record = crate::state::OriginEndpointRecord {
             arn: crate::state::origin_endpoint_arn(&region, &input.id),
             channel_id: input.channel_id.clone(),
             description: input.description.clone(),
@@ -375,6 +375,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             manifest_name: Some(manifest_name),
             id: input.id.clone(),
         };
+        // MediaPackage does not store the endpoint as the request wrote it: every optional
+        // configuration member the request left unset is server-filled with that member's
+        // default FIRST, so the stored record — and therefore every later projection of it
+        // — carries the same member set whatever the request omitted.
+        crate::state::apply_origin_endpoint_defaults(&mut record);
         // `insert` + the read back below: the record returned is always the STORED one,
         // and the id is free (refused as a duplicate above), so nothing is replaced.
         let id = input.id.clone();
