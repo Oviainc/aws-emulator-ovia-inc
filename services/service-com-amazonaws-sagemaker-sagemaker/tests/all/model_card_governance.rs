@@ -21,14 +21,15 @@ use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emul
 /// Every member of `ModelCardStatus`
 /// (smithy_query query="shape" shape="ModelCardStatus": `Draft | PendingReview |
 /// Approved | Archived`). A card can be created in any of them.
-const MODEL_CARD_STATUSES: [&str; 4] = ["Draft", "PendingReview", "Approved", "Archived"];
+pub(crate) const MODEL_CARD_STATUSES: [&str; 4] =
+    ["Draft", "PendingReview", "Approved", "Archived"];
 
 /// `ModelCardContent`'s modelled maximum length (smithy_query query="operation"
 /// operation="CreateModelCard": `Content` is `len 0..100000`).
-const CONTENT_MAX_LEN: usize = 100_000;
+pub(crate) const CONTENT_MAX_LEN: usize = 100_000;
 
 /// A `CreateModelCard` body naming `name`, in `status`, carrying `content`.
-fn create_body(name: &str, status: &str, content: &str) -> Value {
+pub(crate) fn create_body(name: &str, status: &str, content: &str) -> Value {
     json!({
         "ModelCardName": name,
         "ModelCardStatus": status,
@@ -37,7 +38,7 @@ fn create_body(name: &str, status: &str, content: &str) -> Value {
 }
 
 /// A model card content document whose `model_description` is `description`.
-fn content_with_description(description: &str) -> String {
+pub(crate) fn content_with_description(description: &str) -> String {
     json!({
         "model_card_schema_version": "0.0.1",
         "model_overview": { "model_description": description },
@@ -45,7 +46,7 @@ fn content_with_description(description: &str) -> String {
     .to_string()
 }
 
-fn number_field(body: &Value, member: &str) -> f64 {
+pub(crate) fn number_field(body: &Value, member: &str) -> f64 {
     body.get(member)
         .and_then(Value::as_f64)
         .unwrap_or_else(|| panic!("expected a numeric member {member} in {body}"))

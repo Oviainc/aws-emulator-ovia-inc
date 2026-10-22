@@ -116,6 +116,10 @@ pub const ARTIFACT_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`]. Bounds the model-card store, and is what `CreateModelCard`
 /// answers `ResourceLimitExceeded` past.
 pub const MODEL_CARD_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. Bounds how many versions ONE model card can hold, and is what
+/// `UpdateModelCard` answers `ResourceLimitExceeded` past: every content update appends
+/// a version, so without a bound one card could grow the store without end.
+pub const MODEL_CARD_VERSION_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const PROCESSING_JOB_QUOTA: usize = 1_000;
 
@@ -2006,8 +2010,8 @@ impl ComAmazonawsSagemakerSagemakerState {
 
 /// The version number a model card's FIRST version carries. `DescribeModelCard`'s
 /// `ModelCardVersion` is modelled as an `Integer` and the API's version history starts
-/// at one, so `CreateModelCard` stores version 1 and each `UpdateModelCard` appends the
-/// next integer.
+/// at one, so `CreateModelCard` stores version 1 and an `UpdateModelCard` that carries
+/// new `Content` appends the next integer ([`ModelCard::next_version`]).
 pub const FIRST_MODEL_CARD_VERSION: i32 = 1;
 
 /// One version of a model card, as `CreateModelCard` stores the first one and
@@ -2062,6 +2066,29 @@ impl ModelCard {
     /// The version numbered `version`, or `None` when the card never had it.
     pub fn version(&self, version: i32) -> Option<&ModelCardVersion> {
         self.versions.iter().find(|held| held.version == version)
+    }
+
+    /// The highest-numbered version, mutably — the one version an in-place change (a
+    /// status update) applies to; the versions before it are history and stay as they
+    /// were recorded.
+    pub fn latest_version_mut(&mut self) -> Option<&mut ModelCardVersion> {
+        self.versions.last_mut()
+    }
+
+    /// The number the NEXT version of this card carries: one past the highest it holds,
+    /// so a card's version history is the consecutive run starting at
+    /// [`FIRST_MODEL_CARD_VERSION`].
+    pub fn next_version(&self) -> i32 {
+        self.versions
+            .last()
+            .map_or(FIRST_MODEL_CARD_VERSION, |held| {
+                held.version.saturating_add(1)
+            })
+    }
+
+    /// Whether this card can gain another version. See [`MODEL_CARD_VERSION_QUOTA`].
+    pub fn versions_below_quota(&self) -> bool {
+        self.versions.len() < MODEL_CARD_VERSION_QUOTA
     }
 }
 

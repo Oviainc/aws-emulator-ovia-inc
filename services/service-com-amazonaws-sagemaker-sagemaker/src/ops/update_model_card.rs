@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateModelCard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateModelCard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateModelCard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! `UpdateModelCard` changes ONE of a stored model card's two mutable aspects, never
+//! both: "You cannot update both model card content and model card status in a single
+//! call" (the operation's own documentation). The two aspects are versioned differently:
+//!
+//! * new `Content` APPENDS the next version of the card
+//!   ([`crate::state::ModelCard::next_version`]), carrying forward the status and the
+//!   `SecurityConfig` the previous version held — a model card's content history is what
+//!   `ListModelCardVersions` enumerates and what `DescribeModelCard`'s `ModelCardVersion`
+//!   addresses;
+//! * a new `ModelCardStatus` is the approval state of the version under review, so it is
+//!   applied IN PLACE to the latest version and adds none: the versions behind it are
+//!   history, and `ListModelCardVersions` filters by the status each one carries.
+//!
+//! Either way the call records itself on the version it touched (`LastModifiedTime` /
+//! `LastModifiedBy`) and answers with the card's stored ARN.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +94,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The one change this call makes. `Content` and `ModelCardStatus` are independently
+/// optional members, but the operation accepts EXACTLY one of them, so the pair is
+/// reduced to this before any state is touched.
+enum Change {
+    /// New content, which appends the next version of the card.
+    Content(String),
+    /// A new approval status for the card's latest version.
+    Status(String),
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -155,18 +174,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateModelCard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateModelCardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateModelCard"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // "You cannot update both model card content and model card status in a single
+        // call", and a call that names neither asks for no change at all. Both are
+        // request-shape rules the model cannot express (each member is independently
+        // optional), so they are refused here as a 400 `ValidationException` — never a
+        // 501, and never a 200 that changed nothing.
+        let change = match (input.content, input.model_card_status) {
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "1 validation error detected: Content and ModelCardStatus cannot both \
+                     be updated in a single call to UpdateModelCard.",
+                ))
+            }
+            (Some(content), None) => Change::Content(content),
+            (None, Some(status)) => Change::Status(status),
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "1 validation error detected: UpdateModelCard must specify either \
+                     Content or ModelCardStatus.",
+                ))
+            }
+        };
+
+        // `Content` must be "in model card JSON schema and provided as a string", and the
+        // model bounds only its length — the same structural claim `CreateModelCard`
+        // enforces, checked before anything is written.
+        if let Change::Content(content) = &change {
+            if !crate::state::is_model_card_content(content) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "1 validation error detected: value for member Content must be in model \
+                     card JSON schema and provided as a string: it is not a JSON object.",
+                ));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // Who the update records as the modifier: the identity this request signed with.
+        let modifier = crate::state::caller_user_context(ctx);
+
+        let mut store = state.lock();
+        // `ModelCardName` is a `ModelCardNameOrArn`: both forms name one stored card.
+        let name = crate::state::name_from_arn_or_name(&input.model_card_name);
+        let Some(card) = store.model_cards.get_mut(name) else {
+            // Nothing to update, so never a 200: a caller cannot tell that from an update
+            // that landed.
+            return Err(UpdateModelCardErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Could not find model card '{name}'.")),
+            })
+            .into());
+        };
+
+        match change {
+            // New content is a new version of the card, carrying forward the aspects this
+            // call does not change (the status and the security configuration), so the
+            // version it follows stays readable exactly as it was recorded.
+            Change::Content(content) => {
+                // Every content update appends, so a card's version history is bounded the
+                // way the card store is; `ResourceLimitExceeded` is the limit failure this
+                // operation models.
+                if !card.versions_below_quota() {
+                    let held = card.versions.len();
+                    return Err(UpdateModelCardErrorModeled::ResourceLimitExceeded(
+                        ResourceLimitExceeded {
+                            message: Some(format!(
+                                "The account-level service limit for versions of one model \
+                                 card is {}, with current utilization of {held} and a \
+                                 request delta of 1.",
+                                crate::state::MODEL_CARD_VERSION_QUOTA,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                let version = card.next_version();
+                let (status, security_config) = card.latest_version().map_or_else(
+                    // Unreachable: a card exists only once its first version does.
+                    || (String::new(), None),
+                    |held| (held.status.clone(), held.security_config.clone()),
+                );
+                card.versions.push(crate::state::ModelCardVersion {
+                    version,
+                    content,
+                    status,
+                    security_config,
+                    creation_time: now,
+                    created_by: modifier.clone(),
+                    last_modified_time: now,
+                    // This version exists BECAUSE the card was modified, so the
+                    // modification has an identity to report from the start.
+                    last_modified_by: Some(modifier),
+                });
+            }
+            // A status is the approval state of the version under review: it moves that
+            // version rather than minting one, so the history behind it is untouched.
+            Change::Status(status) => {
+                let Some(latest) = card.latest_version_mut() else {
+                    // Unreachable, as above: a stored card always holds a version.
+                    return Err(UpdateModelCardErrorModeled::ResourceNotFound(
+                        ResourceNotFound {
+                            message: Some(format!("Could not find model card '{name}'.")),
+                        },
+                    )
+                    .into());
+                };
+                latest.status = status;
+                latest.last_modified_time = now;
+                latest.last_modified_by = Some(modifier);
+            }
+        }
+
+        let arn = card.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(UpdateModelCardOutput {
+            model_card_arn: arn,
+        })
     }
 }

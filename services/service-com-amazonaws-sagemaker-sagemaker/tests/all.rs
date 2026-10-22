@@ -39,6 +39,8 @@ mod list_endpoints;
 mod mlflow_app_lifecycle;
 #[path = "all/model_card_governance.rs"]
 mod model_card_governance;
+#[path = "all/model_card_updates.rs"]
+mod model_card_updates;
 #[path = "all/model_package_group_lifecycle.rs"]
 mod model_package_group_lifecycle;
 #[path = "all/model_package_registry.rs"]
