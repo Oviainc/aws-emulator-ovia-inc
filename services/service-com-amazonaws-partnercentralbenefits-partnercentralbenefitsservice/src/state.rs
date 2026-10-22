@@ -127,6 +127,32 @@ pub const MAX_PAGE_SIZE: i32 = 100;
 /// application created, so it is bounded by the same count.
 pub const MAX_APPLICATIONS_PER_CATALOG: usize = 500;
 
+/// The most tags one resource of this service holds.
+///
+/// It is the model's own published bound on an application's tag set —
+/// `CreateBenefitApplicationInput$Tags` is `length {max: 200}` (see
+/// `smithy_query(query="shape",shape="CreateBenefitApplicationInput")`) — so a create
+/// and a `TagResource` agree on how many tags one resource can carry.
+/// `TagResourceRequest$tags` itself carries no length, so this is the bound that keeps a
+/// resource's tag set finite; a merge that would take it past this is refused with the
+/// modelled `ServiceQuotaExceededException`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The `ServiceQuotaExceededException$ResourceType` a tagging refusal reports: the
+/// resource-type segment of the ARN whose tag set is full.
+pub const QUOTA_RESOURCE_TYPE_APPLICATION: &str = APPLICATION_RESOURCE;
+
+/// The `ServiceQuotaExceededException$QuotaCode` a tagging refusal reports.
+///
+/// The member is required and AWS publishes no quota code for this service's tag limit,
+/// so the code NAMES the quota ([`MAX_TAGS_PER_RESOURCE`]) rather than imitating a
+/// Service Quotas `L-########` identifier that no AWS rule produces.
+pub const QUOTA_CODE_TAGS_PER_RESOURCE: &str = "TagsPerResource";
+
+/// How this service renders a `Catalog` the request did not name, in the message of a
+/// lookup that failed (see [`catalog_not_found_message`]).
+pub const CATALOG_ABSENT: &str = "null";
+
 /// The deepest `BenefitApplicationDetails` document this service stores.
 ///
 /// The member is modelled as an unconstrained `Document`, so its nesting is entirely
@@ -571,6 +597,33 @@ impl ComAmazonawsPartnercentralbenefitsPartnercentralbenefitsserviceState {
         }
     }
 
+    /// The resource a tagging operation's `resourceArn` names, for a report of its tags.
+    ///
+    /// The tagging operations (`TagResource`, `UntagResource`, `ListTagsForResource`)
+    /// name their resource by ARN alone — they bind no `Catalog` member — so the lookup
+    /// goes through the same ARN index [`Self::resolve_application_id`] uses, and an ARN
+    /// naming another partition, region or account resolves to nothing rather than to
+    /// the resource that happens to share its id segment.
+    ///
+    /// The benefit application is the one resource of this service that holds a tag set:
+    /// it is the only shape with a `Tags` member (`CreateBenefitApplicationInput$Tags`),
+    /// while a benefit and a benefit allocation carry none on any input or output. An
+    /// ARN of any other resource type therefore resolves to no taggable resource.
+    pub fn taggable_resource(&self, resource_arn: &str) -> Option<&BenefitApplication> {
+        let (catalog, id) = self.arns.get(resource_arn)?;
+        self.catalogs.get(catalog)?.applications.get(id)
+    }
+
+    /// The resource a tagging operation's `resourceArn` names, for a call that changes
+    /// its tag set. Resolved exactly as [`Self::taggable_resource`].
+    pub fn taggable_resource_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut BenefitApplication> {
+        let (catalog, id) = self.arns.get(resource_arn)?.clone();
+        self.catalogs.get_mut(&catalog)?.applications.get_mut(&id)
+    }
+
     /// A `benappl-[0-9a-z]{14}` id no stored application is using.
     ///
     /// The sequence number makes two ids minted in the same millisecond differ, and the
@@ -983,6 +1036,43 @@ pub fn tag_map(tags: Option<&Vec<Tag>>) -> BTreeMap<String, String> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// The tag set `additions` leaves behind when merged onto `current`: a key `additions`
+/// carries takes its value there (`TagResource` "adds or updates tags"), and every other
+/// key keeps the value it had.
+pub fn merged_tags(
+    current: &BTreeMap<String, String>,
+    additions: &[Tag],
+) -> BTreeMap<String, String> {
+    let mut merged = current.clone();
+    for tag in additions {
+        merged.insert(tag.key.clone(), tag.value.clone());
+    }
+    merged
+}
+
+/// A stored tag set as the modelled `Tags` list, in tag-key order.
+///
+/// A resource carrying no tags reports an EMPTY list rather than omitting the member: the
+/// listing reports the set it found, and an empty set is a fact about the resource.
+pub fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// The `ResourceNotFoundException` message a failed catalog lookup carries, built from
+/// the `Catalog` the request named — the one construction [`not_found_message`] writes.
+///
+/// `None` is the tagging operations' case — they bind no `Catalog` member — and renders
+/// as [`CATALOG_ABSENT`], which is what the service reports for a tagging call whose
+/// `resourceArn` resolves to no resource.
+pub fn catalog_not_found_message(catalog: Option<&str>) -> String {
+    not_found_message(CATALOG_KIND, catalog.unwrap_or(CATALOG_ABSENT))
 }
 
 /// Whether `values` carries at least one entry of `filter`. An empty or absent filter
