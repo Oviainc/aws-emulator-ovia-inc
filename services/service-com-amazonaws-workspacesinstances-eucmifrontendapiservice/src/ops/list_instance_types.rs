@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInstanceTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInstanceTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInstanceTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this service's instance-type catalog
+//! ([`crate::state::INSTANCE_TYPE_CATALOG`]): the instance types WorkSpaces Instances
+//! supports, each with the configuration combinations it supports. Reporting only —
+//! the catalog is fixed service data, not per-account state, so no operation can
+//! create or change an instance type and this one writes nothing (`@readonly`).
+//!
+//! `InstanceConfigurationFilter` keeps the instance types that support the requested
+//! combination of billing mode, platform type and tenancy; `MaxResults` and
+//! `NextToken` page through what is left, the token naming the catalogued instance
+//! type the next page resumes at.
+//!
+//! The paragraphs below are the scaffold's own notes on how an operation reaches this
+//! service's state; they are kept because they are still accurate.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +157,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInstanceTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInstanceTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInstanceTypes"))
+        let _ = ctx;
+        // The catalog this operation reports is service data, not per-account state, so
+        // neither the request metadata nor any stored WorkSpace Instance can change the
+        // answer. The engine is still reached the one legal way, so a request served
+        // without this service's store answers the modelled `InternalServerException`
+        // rather than a list from nowhere. The handle is not a lock, so binding it
+        // holds nothing, and a reporting operation writes nothing.
+        let Some(_state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListInstanceTypesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the WorkSpaces Instances store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The `NextToken` this operation mints carries the catalogued instance type the
+        // next page resumes at, in this service's one token encoding
+        // ([`crate::state::decode_next_token`]). A token must decode to an instance type
+        // this catalog holds, so one this service did not issue is refused rather than
+        // guessed at.
+        let resume_from = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let decoded = crate::state::decode_next_token(token)
+                    .and_then(|name| crate::state::instance_type_index(&name));
+                match decoded {
+                    Some(index) => index,
+                    None => {
+                        return Err(ListInstanceTypesErrorModeled::ValidationException(
+                            crate::state::invalid_next_token(),
+                        )
+                        .into());
+                    }
+                }
+            }
+        };
+
+        // `MaxResults` is modelled `range 1..600`, already enforced at the boundary; a
+        // caller that sends none gets that modelled maximum as the page size.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::DEFAULT_INSTANCE_TYPES_MAX_RESULTS, |n| {
+                n as usize
+            });
+
+        // Every member of `InstanceConfigurationFilter` is `@required`, so a filter that
+        // reaches here names one complete configuration combination, and the instance
+        // types reported are those whose supported combinations include it. An absent
+        // filter narrows nothing.
+        let filter = input.instance_configuration_filter.as_ref();
+
+        let mut instance_types = Vec::new();
+        let mut next_token = None;
+        for spec in &crate::state::INSTANCE_TYPE_CATALOG[resume_from..] {
+            if filter.is_some_and(|wanted| {
+                !spec.supports(&wanted.billing_mode, &wanted.platform_type, &wanted.tenancy)
+            }) {
+                continue;
+            }
+            if instance_types.len() == page_size {
+                // One past the page: its name is what the next page resumes at.
+                next_token = Some(crate::state::encode_next_token(spec.instance_type));
+                break;
+            }
+            instance_types.push(spec.info());
+        }
+
+        Ok(ListInstanceTypesOutput {
+            instance_types,
+            next_token,
+        })
     }
 }

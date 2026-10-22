@@ -152,32 +152,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The `NextToken` this operation mints is the hex encoding of the
-        // `WorkspaceInstanceId` the next page resumes at. The encoding carries no
-        // secrecy — hex is trivially reversible — it is a round-trip and validation
-        // device: a token must decode to a value shaped like an instance id, so one
-        // this service did not issue is refused rather than guessed at.
+        // The `NextToken` this operation mints carries the `WorkspaceInstanceId` the
+        // next page resumes at, in this service's one token encoding
+        // ([`crate::state::decode_next_token`]): a token must decode to a value shaped
+        // like an instance id, so one this service did not issue is refused rather than
+        // guessed at.
         let resume_from = match input.next_token.as_deref() {
             None => None,
             Some(token) => {
-                let decoded = hex::decode(token)
-                    .ok()
-                    .and_then(|raw| String::from_utf8(raw).ok())
+                let decoded = crate::state::decode_next_token(token)
                     .filter(|id| crate::state::is_workspace_instance_id(id));
                 match decoded {
                     Some(id) => Some(id),
                     None => {
-                        const WHY: &str = "NextToken is not a token this service issued";
                         return Err(ListWorkspaceInstancesErrorModeled::ValidationException(
-                            ValidationException {
-                                message: WHY.to_string(),
-                                reason: "FIELD_VALIDATION_FAILED".to_string(),
-                                field_list: Some(vec![ValidationExceptionField {
-                                    name: "NextToken".to_string(),
-                                    reason: "FIELD_VALIDATION_FAILED".to_string(),
-                                    message: WHY.to_string(),
-                                }]),
-                            },
+                            crate::state::invalid_next_token(),
                         )
                         .into());
                     }
@@ -223,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for record in matching {
             if workspace_instances.len() == page_size {
                 // One past the page: its id is what the next page resumes at.
-                next_token = Some(hex::encode(&record.id));
+                next_token = Some(crate::state::encode_next_token(&record.id));
                 break;
             }
             workspace_instances.push(WorkspaceInstance {
