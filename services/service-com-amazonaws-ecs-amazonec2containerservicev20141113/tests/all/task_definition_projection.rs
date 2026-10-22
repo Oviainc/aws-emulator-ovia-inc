@@ -10,12 +10,13 @@
 //! empty form, such as the `logConfiguration` structure, stays ABSENT unless it was
 //! declared, because nothing is invented for it.
 //!
-//! Everything goes through the same HTTP front door a client uses, via the harness in
-//! `task_lifecycle`.
+//! Everything goes through the same HTTP front door a client uses, via the wire
+//! harness in [`crate::ecs_wire`].
 
 use serde_json::{json, Value};
 
-use crate::task_lifecycle::{container, ok, service};
+use crate::ecs_wire::{ok, service};
+use crate::task_lifecycle::container;
 
 /// The image every container here starts from; irrelevant to the rule, so one value.
 const IMAGE: &str = "public.ecr.aws/docker/library/nginx:latest";
