@@ -19,6 +19,8 @@ mod bucket_policy_and_tagging;
 mod bucket_tagging;
 #[path = "all/head_object_read_back.rs"]
 mod head_object_read_back;
+#[path = "all/object_and_policy.rs"]
+mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]
 mod object_and_tagging_roundtrip;
 #[path = "all/object_write_and_read_back.rs"]
