@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# SHA256 is the only checksum algorithm the EBS direct APIs model, and every block's
+# `Checksum` is computed over the bytes this service persisted.
+sha2 = { workspace = true }
+# Snapshot ids are lowercase hex (`^snap-[0-9a-f]+$`).
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

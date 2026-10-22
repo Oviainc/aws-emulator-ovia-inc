@@ -2,8 +2,10 @@
 
 //! @op DescribeBackupVault
 //!
-//! Reports the stored vault. `NumberOfRecoveryPoints` is derived from the
-//! per-vault recovery-point index, never stored twice.
+//! Reports the stored vault, through the ONE vault projection
+//! ([`crate::state::ComAmazonawsBackupCryocontrollerusermanagerState::vault_view`])
+//! `ListBackupVaults` reports from too. `NumberOfRecoveryPoints` is derived from
+//! the per-vault recovery-point index, never stored twice.
 //!
 //! ## Shape of an operation
 //!
@@ -252,23 +254,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // ONE projection, shared with `ListBackupVaults`, so the two views of a
+        // vault can never disagree.
+        let view = store.vault_view(vault);
         Ok(DescribeBackupVaultOutput {
-            backup_vault_name: Some(vault.name.clone()),
-            backup_vault_arn: Some(vault.arn.clone()),
-            vault_type: Some(vault.vault_type.clone()),
-            vault_state: Some(vault.vault_state.clone()),
-            encryption_key_arn: vault.encryption_key_arn.clone(),
-            creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
-            creator_request_id: vault.creator_request_id.clone(),
-            number_of_recovery_points: store.recovery_point_count(&input.backup_vault_name),
-            locked: Some(vault.locked),
-            min_retention_days: vault.min_retention_days,
-            max_retention_days: vault.max_retention_days,
-            encryption_key_type: Some(vault.encryption_key_type().to_string()),
-            // Vault lock, the MPA approval team and restore-access vaults are
-            // reached only by operations still at 501, so nothing stored can
-            // populate these yet.
-            lock_date: None,
+            backup_vault_name: Some(view.name),
+            backup_vault_arn: Some(view.arn),
+            vault_type: Some(view.vault_type),
+            vault_state: view.vault_state,
+            encryption_key_arn: Some(view.encryption_key_arn),
+            creation_date: Some(::aws_smithy_types::DateTime::from(view.creation_date)),
+            creator_request_id: view.creator_request_id,
+            number_of_recovery_points: view.number_of_recovery_points,
+            locked: Some(view.locked),
+            min_retention_days: view.min_retention_days,
+            max_retention_days: view.max_retention_days,
+            encryption_key_type: view.encryption_key_type,
+            lock_date: view.lock_date.map(::aws_smithy_types::DateTime::from),
+            // The MPA approval team and restore-access vaults are reached only
+            // by operations still at 501, so nothing stored can populate these
+            // yet.
             source_backup_vault_arn: None,
             mpa_approval_team_arn: None,
             mpa_session_arn: None,

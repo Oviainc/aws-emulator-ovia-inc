@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQueue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQueue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQueue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a queue inside an existing instance: unknown `InstanceId` is a 404, a queue
+//! `Name` already taken within that instance is a 409, and the stored queue's ARN is the
+//! instance's own ARN plus `/queue/<QueueId>`.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +179,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQueue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQueueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQueue"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateQueueErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Amazon Connect store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Minted before the instance is borrowed, so the borrow below is the only one.
+        // Identifiers need not be contiguous: a refused create simply leaves its id
+        // unused.
+        let id = store.mint_resource_id();
+        let instance = store
+            .instances
+            .get_mut(&input.instance_id)
+            .ok_or_else(|| {
+                CreateQueueErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!("Instance not found: {}", input.instance_id)),
+                })
+            })?;
+
+        // A queue name is unique within its instance.
+        if instance.queue_id_named(&input.name).is_some() {
+            return Err(CreateQueueErrorModeled::DuplicateResourceException(
+                DuplicateResourceException {
+                    message: Some(format!("A queue with the name {} already exists", input.name)),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: a queue is kept for the life of the process, so a
+        // create that would grow this instance's queue map past the quota is refused.
+        if instance.queues.len() >= crate::state::QUEUES_PER_INSTANCE_QUOTA {
+            return Err(CreateQueueErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The maximum number of queues ({}) for this instance has been \
+                         reached; delete a queue before creating another",
+                        crate::state::QUEUES_PER_INSTANCE_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let arn = format!("{}/queue/{id}", instance.arn);
+        let record = crate::state::QueueRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            description: input.description,
+            hours_of_operation_id: input.hours_of_operation_id,
+            max_contacts: input.max_contacts,
+            outbound_caller_config: input.outbound_caller_config,
+            outbound_email_config: input.outbound_email_config,
+            quick_connect_ids: input.quick_connect_ids.unwrap_or_default(),
+            queue_type: crate::state::QUEUE_TYPE_STANDARD.to_string(),
+            status: crate::state::QUEUE_STATUS_ENABLED.to_string(),
+            tags: crate::state::tags_in(input.tags),
+            last_modified_time: now,
+            last_modified_region: region,
+        };
+        instance.queues.insert(id.clone(), record);
+
+        Ok(CreateQueueOutput {
+            queue_id: Some(id),
+            queue_arn: Some(arn),
+        })
     }
 }
