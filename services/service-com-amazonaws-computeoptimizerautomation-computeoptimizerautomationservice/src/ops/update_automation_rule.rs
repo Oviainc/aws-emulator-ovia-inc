@@ -224,21 +224,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // between 0 and 1, so its form is checked here.
         if let Some(priority) = input.priority.as_deref() {
             if !crate::state::priority_is_valid(priority) {
-                return Err(invalid_parameter(format!(
-                    "Value '{priority}' at 'priority' failed to satisfy constraint: Member must \
-                     be a decimal number between 0 and 1 with up to 30 digits after the decimal \
-                     point"
+                return Err(invalid_parameter(crate::state::constraint_report(
+                    "priority",
+                    "Member must be a decimal number between 0 and 1 with up to 30 digits after \
+                     the decimal point",
                 )));
             }
         }
         // "Must be 1-128 characters long": the `@length` on `RuleName` has
         // `min: 0`, so the boundary admits an empty name.
         if input.name.as_deref().is_some_and(str::is_empty) {
-            return Err(invalid_parameter(
-                "Value '' at 'name' failed to satisfy constraint: Member must have length \
-                 greater than or equal to 1"
-                    .to_string(),
-            ));
+            return Err(invalid_parameter(crate::state::constraint_report(
+                "name",
+                "Member must have length greater than or equal to 1",
+            )));
         }
 
         let mut probe = input.clone();
@@ -256,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::TokenOutcome::Replay(_) => {
                 return match guard.rules.get(&input.rule_arn) {
                     Some(rule) => Ok(output_for(rule)),
-                    None => Err(not_found(&input.rule_arn)),
+                    None => Err(not_found()),
                 };
             }
             crate::state::TokenOutcome::ParameterMismatch => {
@@ -264,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     UpdateAutomationRuleErrorModeled::IdempotentParameterMismatchException(
                         IdempotentParameterMismatchException {
                             message: Some(
-                                "The same client token was used with different parameters.".into(),
+                                crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.into(),
                             ),
                         },
                     )
@@ -282,16 +281,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let Some(rule) = guard.rules.get(&input.rule_arn) else {
-            return Err(not_found(&input.rule_arn));
+            return Err(not_found());
         };
         // `ruleRevision` is the rule's optimistic-concurrency token: an update
         // carrying a revision other than the stored one is refused rather than
-        // applied over whatever the rule has become.
+        // applied over whatever the rule has become. The rejection reports the
+        // rule's CURRENT revision, so the loser of the race can retry without
+        // re-reading the rule.
         if rule.rule_revision != input.rule_revision {
-            return Err(invalid_parameter(format!(
-                "Value '{}' at 'ruleRevision' failed to satisfy constraint: Member must match the \
-                 current revision of rule '{}'",
-                input.rule_revision, input.rule_arn
+            return Err(invalid_parameter(crate::state::revision_mismatch_message(
+                rule.rule_revision,
             )));
         }
         // The merged rule must still satisfy the rules a create does: an
@@ -303,16 +302,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .or_else(|| rule.organization_configuration.clone());
         if merged_rule_type == "OrganizationRule" && merged_org_config.is_none() {
-            return Err(invalid_parameter(
-                "Value null at 'organizationConfiguration' failed to satisfy constraint: Member \
-                 is required for the OrganizationRule rule type"
-                    .to_string(),
-            ));
+            return Err(invalid_parameter(crate::state::constraint_report(
+                "organizationConfiguration",
+                "Member is required for the OrganizationRule rule type",
+            )));
         }
 
         let updated_at = crate::state::now();
         let Some(rule) = guard.rules.get_mut(&input.rule_arn) else {
-            return Err(not_found(&input.rule_arn));
+            return Err(not_found());
         };
         // Only the members the request carries are applied; an absent member
         // leaves the stored value alone.
@@ -358,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reader sees.
         match guard.rules.get(&input.rule_arn) {
             Some(rule) => Ok(output_for(rule)),
-            None => Err(not_found(&input.rule_arn)),
+            None => Err(not_found()),
         }
     }
 }
@@ -384,9 +382,11 @@ fn output_for(rule: &crate::state::StoredRule) -> UpdateAutomationRuleOutput {
     }
 }
 
-fn not_found(rule_arn: &str) -> UpdateAutomationRuleError {
+/// The 404 for an ARN no rule has. The message is the service's fixed
+/// not-found wording, which names no resource.
+fn not_found() -> UpdateAutomationRuleError {
     UpdateAutomationRuleErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("No automation rule found with ARN '{rule_arn}'.")),
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

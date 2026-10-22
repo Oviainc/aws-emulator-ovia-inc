@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterPullTimeUpdateExclusion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterPullTimeUpdateExclusion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds one IAM principal to this registry's pull time update exclusion list. The
+//! exclusion is a record keyed by the principal ARN, so a register either creates it
+//! (answering the ARN and the instant the record was created) or, when the registry
+//! already excludes that principal, is refused with `ExclusionAlreadyExistsException`.
+//! The list lives in `crate::state`'s `pull_time_update_exclusions`, where
+//! `ListPullTimeUpdateExclusions` reads it back and `DeregisterPullTimeUpdateExclusion`
+//! (still a stub) will remove from it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterPullTimeUpdateExclusion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +153,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterPullTimeUpdateExclusion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterPullTimeUpdateExclusionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterPullTimeUpdateExclusion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RegisterPullTimeUpdateExclusionErrorModeled::ServerException(
+                ServerException {
+                    message: Some(
+                        "the ecr pull time update exclusion store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // The exclusion list belongs to the registry, and this emulator serves exactly
+        // one registry, so nothing in the request metadata selects which list to write.
+        let _ = ctx;
+
+        // `PrincipalArn`'s length and pattern were refused at the boundary, so the ARN
+        // that reaches here is one this list can hold.
+        let principal_arn = input.principal_arn;
+        let created_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // One exclusion per principal: a register naming a principal the registry
+        // already excludes is refused rather than re-creating the record, so the
+        // `createdAt` the first register reported stays the one the list holds.
+        if store.pull_time_update_exclusions.contains_key(&principal_arn) {
+            return Err(
+                RegisterPullTimeUpdateExclusionErrorModeled::ExclusionAlreadyExistsException(
+                    ExclusionAlreadyExistsException {
+                        message: Some(format!(
+                            "The pull time update exclusion for principal '{principal_arn}' \
+                             already exists in the registry with id '{}'",
+                            crate::state::registry_id()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The list is bounded: past its cap a register is refused rather than adding
+        // another record. See [`crate::state::MAX_PULL_TIME_UPDATE_EXCLUSIONS`].
+        if store.pull_time_update_exclusions.len() >= crate::state::MAX_PULL_TIME_UPDATE_EXCLUSIONS
+        {
+            return Err(
+                RegisterPullTimeUpdateExclusionErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this registry already holds the maximum of {} pull time update \
+                             exclusions",
+                            crate::state::MAX_PULL_TIME_UPDATE_EXCLUSIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store
+            .pull_time_update_exclusions
+            .insert(principal_arn.clone(), created_at);
+
+        Ok(RegisterPullTimeUpdateExclusionOutput {
+            principal_arn: Some(principal_arn),
+            created_at: Some(::aws_smithy_types::DateTime::from(created_at)),
+        })
     }
 }

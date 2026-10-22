@@ -96,17 +96,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // CodeBuild states a request it cannot accept as `InvalidInputException`
+        // ("The input value that was provided is not valid"), the client-input error
+        // every operation in its model declares; the framework's default code is a
+        // synthetic `ValidationException` no CodeBuild client branches on. Both the
+        // code and the message are replaced together. The message keeps the
+        // framework's own wording, which names the member and the constraint it
+        // failed, so the clause a caller has to act on is single-homed there.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidInputException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "Invalid input".to_string()),
+            }),
+            // Authentication is the framework's answer to give, not this service's.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

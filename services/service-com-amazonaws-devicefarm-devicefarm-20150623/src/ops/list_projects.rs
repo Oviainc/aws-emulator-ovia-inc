@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProjects
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProjects`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProjects::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored projects in ARN order, one page at a time, and writes nothing.
+//! The `nextToken` it emits is the ARN the next page resumes from, so a resumed call
+//! continues exactly where the truncated page stopped.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +143,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProjects` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProjectsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListProjectsErrorModeled::ServiceAccountException(
+                ServiceAccountException {
+                    message: Some("the Device Farm state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+
+        // `arn` is a filter naming ONE project, so it answers exactly like GetProject:
+        // a non-project Device Farm ARN is a bad argument, and an ARN no project has is
+        // not found.
+        if let Some(arn) = input.arn.as_deref() {
+            if !crate::state::is_project_arn(arn) {
+                return Err(ListProjectsErrorModeled::ArgumentException(ArgumentException {
+                    message: Some(format!("{arn} is not a project ARN")),
+                })
+                .into());
+            }
+            let Some(record) = store.projects.get(arn) else {
+                return Err(ListProjectsErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!("No project found for arn {arn}")),
+                })
+                .into());
+            };
+            return Ok(ListProjectsOutput {
+                projects: Some(vec![record.to_project()]),
+                next_token: None,
+            });
+        }
+
+        // One page of the ARN-ordered store, SEEKING to the token's ARN when one was
+        // handed back rather than scanning from the front, so a page costs the page size
+        // and not the whole store. `nextToken` is emitted ONLY when a further record
+        // remains.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProjects"))
+        // Every token this operation hands out is a project ARN, so a token that is not
+        // one in FORM cannot have come from here: it is a bad argument, not a page, since
+        // seeking with it would silently answer from an arbitrary point in the store.
+        // The check is on the form only — a well-formed project ARN this store never
+        // minted, or one whose project has since been deleted, still resumes the scan
+        // from where that ARN sorts, which is what a resumable ARN-ordered page means.
+        //
+        // `arn` takes precedence over `nextToken`: the filter branch above answers one
+        // project, which is never a truncated page, so no token applies to it.
+        let resume_from = match input.next_token {
+            None => String::new(),
+            Some(token) if crate::state::is_project_arn(&token) => token,
+            Some(token) => {
+                return Err(ListProjectsErrorModeled::ArgumentException(ArgumentException {
+                    message: Some(format!(
+                        "nextToken {token} is not a pagination token ListProjects issues"
+                    )),
+                })
+                .into());
+            }
+        };
+        let mut projects = Vec::new();
+        let mut next_token = None;
+        for (arn, record) in store.projects.range(resume_from..) {
+            if projects.len() == crate::state::PROJECTS_PAGE_SIZE {
+                next_token = Some(arn.clone());
+                break;
+            }
+            projects.push(record.to_project());
+        }
+
+        Ok(ListProjectsOutput {
+            projects: Some(projects),
+            next_token,
+        })
     }
 }
