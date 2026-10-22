@@ -7,6 +7,8 @@
 //! `GetAccountInformation`, `GetAlternateContact` and `GetContactInformation`
 //! report it, and `DeleteAlternateContact` removes one of its contacts. The
 //! record below is the one copy every one of those handlers reads and writes.
+//! It also carries the account's most recent primary email update, which
+//! `StartPrimaryEmailUpdate` records and `GetPrimaryEmailUpdateStatus` reports.
 //!
 //! Account Management operations all take an OPTIONAL `AccountId`: absent, the
 //! call lands on "the Amazon Web Services account of the identity used to call
@@ -78,6 +80,17 @@ pub fn initial_account_name(account_id: &str) -> String {
 /// above any workflow an emulator serves, and it is checked only when a request
 /// would ADD a record: every account already in the store stays writable.
 pub const MAX_ACCOUNTS: usize = 1_000;
+
+/// The `PrimaryEmailUpdateStatus` an update carries from the moment
+/// `StartPrimaryEmailUpdate` records it: `PENDING`, one of that enum's four
+/// values (`PRIMARY_EMAIL_UPDATE_STATUS_VALUES` in `ops::types`).
+///
+/// `PENDING` is not a status the CLOCK moves on: Account Management sends a
+/// one-time passcode to the proposed address and the update advances only when a
+/// caller presents that passcode through `AcceptPrimaryEmailUpdate` (still
+/// scaffolded, with its own stub issue). So no due instant is stored for it —
+/// waiting changes nothing, and an update nobody accepts stays `PENDING`.
+pub const PENDING_PRIMARY_EMAIL_UPDATE_STATUS: &str = "PENDING";
 
 /// The `RegionOptStatus` a Region that Amazon Web Services turns on for every
 /// account carries: `ENABLED_BY_DEFAULT`, one of `RegionOptStatus`'s five values
@@ -217,6 +230,37 @@ impl AlternateContactRecord {
     }
 }
 
+/// The most recent primary email update of one account, as
+/// `StartPrimaryEmailUpdate` recorded it and `GetPrimaryEmailUpdateStatus`
+/// reports it.
+#[derive(Debug, Clone)]
+pub struct PrimaryEmailUpdate {
+    /// The address the update was started for (`PrimaryEmailAddress`,
+    /// `@length(min: 5, max: 64)` and `@sensitive`). Held because the update is
+    /// about an address, and `AcceptPrimaryEmailUpdate` has to check the address
+    /// a caller confirms against the one that was requested; it is never put in
+    /// a response or a log by this service.
+    pub requested_email: String,
+    /// One of `PrimaryEmailUpdateStatus`'s values; see
+    /// [`PENDING_PRIMARY_EMAIL_UPDATE_STATUS`].
+    pub status: String,
+    /// When this status was last set — what `GetPrimaryEmailUpdateStatus`
+    /// reports as `UpdatedAt`.
+    pub updated_at: SystemTime,
+}
+
+impl PrimaryEmailUpdate {
+    /// The update `StartPrimaryEmailUpdate` records at `now`: `PENDING`, because
+    /// the address still has to be confirmed with the one-time passcode.
+    pub fn started(requested_email: String, now: SystemTime) -> Self {
+        Self {
+            requested_email,
+            status: PENDING_PRIMARY_EMAIL_UPDATE_STATUS.to_string(),
+            updated_at: now,
+        }
+    }
+}
+
 /// One Amazon Web Services account, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Account {
@@ -247,6 +291,10 @@ pub struct Account {
     /// operations that write it (each still scaffolded, with its own stub
     /// issue), and `ListRegions` and `GetRegionOptStatus` report it.
     pub region_opt_status: BTreeMap<String, String>,
+    /// The MOST RECENT primary email update of this account, or `None` while
+    /// none has ever been started — which is what makes a status read of an
+    /// account with no update a refusal rather than a reported status.
+    pub primary_email_update: Option<PrimaryEmailUpdate>,
 }
 
 impl Account {
@@ -260,6 +308,7 @@ impl Account {
             alternate_contacts: BTreeMap::new(),
             contact_information: None,
             region_opt_status: BTreeMap::new(),
+            primary_email_update: None,
         }
     }
 
@@ -386,17 +435,59 @@ pub fn account_store_full(account_id: &str) -> AccessDeniedException {
     }
 }
 
+/// The one sentence Account Management states for an alternate contact that is
+/// not set.
+///
+/// INVARIANT OF THE REQUEST: it names neither the `AlternateContactType` asked
+/// for nor the account the call resolved to, so every contact type and both the
+/// `GetAlternateContact` and the `DeleteAlternateContact` path state the
+/// identical literal — and no account identifier is surfaced in an error body.
+pub const ALTERNATE_CONTACT_NOT_FOUND_MESSAGE: &str =
+    "No contact of the inputted alternate contact type found.";
+
 /// The `ResourceNotFoundException` payload for an alternate contact that is not
 /// set — "the operation failed because it specified a resource that can't be
 /// found".
-pub fn alternate_contact_not_found(
-    account_id: &str,
-    contact_type: &str,
-) -> ResourceNotFoundException {
+///
+/// Takes no argument on purpose: see [`ALTERNATE_CONTACT_NOT_FOUND_MESSAGE`].
+pub fn alternate_contact_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!(
-            "No {contact_type} alternate contact is set for account {account_id}"
-        ),
+        message: ALTERNATE_CONTACT_NOT_FOUND_MESSAGE.to_string(),
+        error_type: None,
+    }
+}
+
+/// The `ValidationException` payload for a primary-email status read of an
+/// account that has never had an update started.
+///
+/// `GetPrimaryEmailUpdateStatus` reports "the status of the MOST RECENT primary
+/// email update" and models `Status` as REQUIRED, so an account with no update
+/// has no status to report and the call is refused rather than answered with an
+/// invented status. The modelled refusal is the 400 `ValidationException`; the
+/// `reason` member is left absent because neither
+/// `ValidationExceptionReason` value (`fieldValidationFailed |
+/// invalidRegionOptTarget`) describes it — no input member was invalid.
+pub fn no_primary_email_update() -> ValidationException {
+    ValidationException {
+        message: "No email update found for account".to_string(),
+        reason: None,
+        field_list: None,
+    }
+}
+
+/// The `AccessDeniedException` payload for a `StartPrimaryEmailUpdate` whose
+/// `AccountId` is the caller's own account.
+///
+/// The model's own `AccountId` documentation states the rule: the operation "can
+/// only be called from the management account or the delegated administrator
+/// account of an organization for a member account", and "the management account
+/// can't specify its own `AccountId`". The message names no account id, so it is
+/// the same sentence whichever account the caller is.
+pub fn cannot_target_own_account() -> AccessDeniedException {
+    AccessDeniedException {
+        message: "The operation failed because the management account can't specify its own \
+                  AccountId; this operation updates a member account of the organization"
+            .to_string(),
         error_type: None,
     }
 }

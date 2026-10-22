@@ -1,23 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How Account words a `@pattern` violation, end to end over HTTP.
+//! How Account words a constraint violation, end to end over HTTP.
 //!
-//! The rule under test: a request member whose value violates its modelled
-//! `@pattern` is refused with HTTP 400 `ValidationException` whose `message`
-//! states the violated ECMA-262 expression and the input string that failed it,
-//! as `[ECMA 262 regex "<pattern>" does not match input string "<value>"]` — for
-//! every pattern-constrained member of every operation, at any depth in the
-//! input, and naming neither the member nor its path.
+//! Two rules are under test, both in the JSON-Schema voice this service's
+//! validator speaks — a bracketed list of reasons that names neither the member
+//! nor its path, under HTTP 400 `ValidationException`:
 //!
-//! The table below is that class: one row per pattern-constrained member this
-//! service models, so the rows differ along the operation, the member, the
-//! expression, the member's depth (top level and nested) and the form of the
-//! offending value (plain, quoted, non-ASCII). Each row states the expression
-//! itself rather than importing it from the crate, so an implementation that
-//! renders the wrong expression cannot make this test pass.
+//! 1. a request member whose value violates its modelled `@pattern` states the
+//!    violated ECMA-262 expression and the input string that failed it, as
+//!    `[ECMA 262 regex "<pattern>" does not match input string "<value>"]`;
+//! 2. a request member whose value is longer than its modelled `@length`
+//!    maximum states the subject, its own length and the maximum admitted, as
+//!    `[string "<value>" is too long (length: <len>, maximum allowed: <max>)]`.
 //!
-//! Every clause is checked against the modelled `@pattern` from
-//! `smithy_query(query="operation", operation="…")` on this service's model.
+//! Each rule holds for every so-constrained member of every operation, at any
+//! depth in the input. The tables below are those classes: one row per
+//! constrained member this service models, so the rows differ along the
+//! operation, the member, the bound or expression, the member's depth (top level
+//! and nested) and the form of the offending value (plain, quoted, non-ASCII).
+//! Each row states the expression or the maximum itself rather than importing it
+//! from the crate, so an implementation that renders the wrong one cannot make
+//! this test pass.
+//!
+//! Every clause is checked against the modelled `@pattern` / `@length` from
+//! `smithy_query(query="operation", operation="…")` and
+//! `smithy_query(query="shape", shape="ContactInformation")` on this service's
+//! model.
 
 use std::sync::Arc;
 
@@ -58,6 +66,22 @@ const CONTACT_INFORMATION_PHONE_PATTERN: &str = r"^[+][\s0-9()-]+$";
 /// `Otp`'s `@pattern`, from
 /// `smithy_query(query="operation", operation="VerifyPhoneNumber")`.
 const OTP_PATTERN: &str = "^[a-zA-Z0-9]{6}$";
+
+/// Every `@length` MAXIMUM this suite exercises, each from the member's own
+/// modelled constraint: `smithy_query(query="operation", operation="…")` for the
+/// top-level members and `smithy_query(query="shape",
+/// shape="ContactInformation")` for the nested ones.
+const ACCOUNT_NAME_MAX: usize = 50;
+const CONTACT_NAME_MAX: usize = 64;
+const CONTACT_TITLE_MAX: usize = 50;
+const CONTACT_EMAIL_MAX: usize = 254;
+const CONTACT_PHONE_MAX: usize = 25;
+const PRIMARY_EMAIL_MAX: usize = 64;
+const CONTACT_INFORMATION_FULL_NAME_MAX: usize = 50;
+const CONTACT_INFORMATION_CITY_MAX: usize = 50;
+const CONTACT_INFORMATION_POSTAL_CODE_MAX: usize = 20;
+const CONTACT_INFORMATION_COUNTRY_CODE_MAX: usize = 2;
+const NEXT_TOKEN_MAX: usize = 1000;
 
 /// One emulator: a router carrying only this service, over one shared engine.
 fn emulator() -> MultiServiceRouter {
@@ -118,6 +142,13 @@ fn reason(pattern: &str, value: &str) -> String {
     format!("ECMA 262 regex \"{pattern}\" does not match input string \"{value}\"")
 }
 
+/// The reason Account states for one `@length` maximum violation. `length` is
+/// stated by the row rather than measured off `value`, so a clause that reports
+/// the byte count of a multi-byte value cannot pass.
+fn too_long(value: &str, length: usize, max: usize) -> String {
+    format!("string \"{value}\" is too long (length: {length}, maximum allowed: {max})")
+}
+
 /// The whole `ValidationException.message` for a refusal of `clauses`.
 fn bracketed(clauses: &[String]) -> String {
     format!("[{}]", clauses.join(", "))
@@ -135,6 +166,14 @@ fn alternate_contact(email: &str, phone: &str) -> Value {
     })
 }
 
+/// A `PutAlternateContact` body with every member valid except `member`, which
+/// carries `value`.
+fn alternate_contact_with(member: &str, value: &str) -> Value {
+    let mut body = alternate_contact("ada@example.com", "+1 206-555-0100");
+    body[member] = json!(value);
+    body
+}
+
 /// A `PutContactInformation` body with every member valid except
 /// `ContactInformation.PhoneNumber`.
 fn contact_information(phone: &str) -> Value {
@@ -149,6 +188,24 @@ fn contact_information(phone: &str) -> Value {
         }
     })
 }
+
+/// A `PutContactInformation` body with every member valid except the NESTED
+/// `ContactInformation.<member>`, which carries `value`.
+fn contact_information_with(member: &str, value: &str) -> Value {
+    let mut body = contact_information("+1 206-555-0100");
+    body["ContactInformation"][member] = json!(value);
+    body
+}
+
+/// An email address of exactly `length` characters.
+fn address_of_length(length: usize) -> String {
+    let domain = "@example.com";
+    format!("{}{domain}", "a".repeat(length - domain.len()))
+}
+
+/// A member account id (`^\d{12}$`) that is not the caller's own account, for
+/// the rows whose operation requires one.
+const MEMBER_ACCOUNT: &str = "123456789012";
 
 /// Every pattern-constrained member of this service, refused one at a time: the
 /// message is exactly the bracketed ECMA-262 reason for the violated expression
@@ -346,9 +403,11 @@ async fn two_pattern_violations_are_listed_in_one_message() {
     );
 }
 
-/// A refusal that is NOT a pattern violation keeps the framework's wording: this
-/// service has no recorded phrasing for an absent member, a length bound or a
-/// value outside an enum, so none of them is dressed in the ECMA-262 form.
+/// A refusal that is NOT one of the violations this service words itself keeps
+/// the framework's wording: Account has no recorded phrasing for an absent
+/// member, a `@length` MINIMUM, or a value outside an enum, and a value whose
+/// echo the framework already elided carries neither the input string nor its
+/// length — so none of them is dressed in the bracketed JSON-Schema form.
 #[tokio::test]
 async fn other_refusals_are_not_worded_as_pattern_violations() {
     let cases: Vec<(&str, &str, Value)> = vec![
@@ -363,17 +422,19 @@ async fn other_refusals_are_not_worded_as_pattern_violations() {
             json!({"AccountName": ""}),
         ),
         (
-            "a value past a length bound",
-            "/putAlternateContact",
-            alternate_contact(
-                &format!("{}@example.com", "a".repeat(255 - "@example.com".len())),
-                "+1 206-555-0100",
-            ),
+            "a value below a nested length bound",
+            "/putContactInformation",
+            contact_information_with("CountryCode", "U"),
         ),
         (
             "a value outside an enum",
             "/getAlternateContact",
             json!({"AlternateContactType": "MARKETING"}),
+        ),
+        (
+            "a value whose echo the framework elided",
+            "/listRegions",
+            json!({"NextToken": "t".repeat(NEXT_TOKEN_MAX + 1)}),
         ),
     ];
 
@@ -393,9 +454,191 @@ async fn other_refusals_are_not_worded_as_pattern_violations() {
         );
         assert!(
             !answer.message().starts_with('['),
-            "case {case:?}: a non-pattern refusal must not be worded as a pattern \
-             violation, got {:?}",
+            "case {case:?}: a refusal this service has no wording for must keep the \
+             framework's, got {:?}",
             answer.message()
         );
     }
+}
+
+/// Every `@length`-maximum-constrained member of this service, refused one at a
+/// time: the message is exactly the bracketed too-long reason for the offending
+/// value, its length and the modelled maximum. The same member exactly ON its
+/// maximum is accepted, so each refusal is the bound and not a blanket
+/// rejection.
+#[tokio::test]
+async fn a_length_maximum_violation_is_reported_as_the_too_long_reason() {
+    // (case, uri, how a value becomes a request, the value past the maximum,
+    //  that value's length, the modelled maximum, a value exactly on it)
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(&str, &str, Box<dyn Fn(&str) -> Value>, String, usize, usize, String)> = vec![
+        (
+            "the account name one character past its maximum",
+            "/putAccountName",
+            Box::new(|value| json!({"AccountName": value})),
+            "N".repeat(ACCOUNT_NAME_MAX + 1),
+            ACCOUNT_NAME_MAX + 1,
+            ACCOUNT_NAME_MAX,
+            "N".repeat(ACCOUNT_NAME_MAX),
+        ),
+        (
+            "an account name well past its maximum, with punctuation",
+            "/putAccountName",
+            Box::new(|value| json!({"AccountName": value})),
+            format!("demo-account-{}", "x".repeat(42)),
+            55,
+            ACCOUNT_NAME_MAX,
+            format!("demo-account-{}", "x".repeat(37)),
+        ),
+        (
+            "the alternate contact's name",
+            "/putAlternateContact",
+            Box::new(|value| alternate_contact_with("Name", value)),
+            "A".repeat(CONTACT_NAME_MAX + 1),
+            CONTACT_NAME_MAX + 1,
+            CONTACT_NAME_MAX,
+            "A".repeat(CONTACT_NAME_MAX),
+        ),
+        (
+            "the alternate contact's title",
+            "/putAlternateContact",
+            Box::new(|value| alternate_contact_with("Title", value)),
+            "T".repeat(CONTACT_TITLE_MAX + 1),
+            CONTACT_TITLE_MAX + 1,
+            CONTACT_TITLE_MAX,
+            "T".repeat(CONTACT_TITLE_MAX),
+        ),
+        (
+            "the alternate contact's email address",
+            "/putAlternateContact",
+            Box::new(|value| alternate_contact_with("EmailAddress", value)),
+            address_of_length(CONTACT_EMAIL_MAX + 1),
+            CONTACT_EMAIL_MAX + 1,
+            CONTACT_EMAIL_MAX,
+            address_of_length(CONTACT_EMAIL_MAX),
+        ),
+        (
+            "the alternate contact's phone number",
+            "/putAlternateContact",
+            Box::new(|value| alternate_contact_with("PhoneNumber", value)),
+            "+".repeat(CONTACT_PHONE_MAX + 1),
+            CONTACT_PHONE_MAX + 1,
+            CONTACT_PHONE_MAX,
+            "+".repeat(CONTACT_PHONE_MAX),
+        ),
+        (
+            "the primary email address of an update",
+            "/startPrimaryEmailUpdate",
+            Box::new(|value| json!({"AccountId": MEMBER_ACCOUNT, "PrimaryEmail": value})),
+            address_of_length(PRIMARY_EMAIL_MAX + 1),
+            PRIMARY_EMAIL_MAX + 1,
+            PRIMARY_EMAIL_MAX,
+            address_of_length(PRIMARY_EMAIL_MAX),
+        ),
+        (
+            "the primary contact's nested full name",
+            "/putContactInformation",
+            Box::new(|value| contact_information_with("FullName", value)),
+            "F".repeat(CONTACT_INFORMATION_FULL_NAME_MAX + 1),
+            CONTACT_INFORMATION_FULL_NAME_MAX + 1,
+            CONTACT_INFORMATION_FULL_NAME_MAX,
+            "F".repeat(CONTACT_INFORMATION_FULL_NAME_MAX),
+        ),
+        (
+            // Multi-byte: the length is the CHARACTER count the `@length` trait
+            // counts, not the byte count (51 characters, 102 bytes).
+            "a nested city outside ASCII",
+            "/putContactInformation",
+            Box::new(|value| contact_information_with("City", value)),
+            "é".repeat(CONTACT_INFORMATION_CITY_MAX + 1),
+            CONTACT_INFORMATION_CITY_MAX + 1,
+            CONTACT_INFORMATION_CITY_MAX,
+            "é".repeat(CONTACT_INFORMATION_CITY_MAX),
+        ),
+        (
+            "the primary contact's nested postal code",
+            "/putContactInformation",
+            Box::new(|value| contact_information_with("PostalCode", value)),
+            "9".repeat(CONTACT_INFORMATION_POSTAL_CODE_MAX + 1),
+            CONTACT_INFORMATION_POSTAL_CODE_MAX + 1,
+            CONTACT_INFORMATION_POSTAL_CODE_MAX,
+            "9".repeat(CONTACT_INFORMATION_POSTAL_CODE_MAX),
+        ),
+        (
+            // The tightest bound in the model: `@length(min: 2, max: 2)`.
+            "the primary contact's nested two-letter country code",
+            "/putContactInformation",
+            Box::new(|value| contact_information_with("CountryCode", value)),
+            "USA".to_string(),
+            3,
+            CONTACT_INFORMATION_COUNTRY_CODE_MAX,
+            "US".to_string(),
+        ),
+    ];
+
+    let router = emulator();
+    for (case, uri, build, past_max, length, max, at_max) in cases {
+        let answer = call(&router, uri, build(&past_max)).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: {uri} must answer 400, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.message(),
+            bracketed(&[too_long(&past_max, length, max)]),
+            "case {case:?}: expected the too-long reason, got {:?}",
+            answer.message()
+        );
+
+        // Exactly ON the published maximum: accepted, so the refusal above is
+        // the bound. A stub operation answers 501 here, which is still an
+        // acceptance of the input.
+        let accepted = call(&router, uri, build(&at_max)).await;
+        assert_ne!(
+            accepted.status, 400,
+            "case {case:?}: {uri} must not refuse a value on its maximum, got {} with {:?}",
+            accepted.status, accepted.body
+        );
+    }
+}
+
+/// A value that violates a `@pattern` AND a `@length` maximum at once states
+/// both reasons inside the one pair of brackets, in the order the validating
+/// walk found them.
+#[tokio::test]
+async fn a_pattern_and_a_length_violation_are_listed_in_one_message() {
+    let router = emulator();
+    // 26 characters, one past `PhoneNumber`'s maximum, and no character of it
+    // inside `^[\s0-9()+-]+$`.
+    let phone = "x".repeat(CONTACT_PHONE_MAX + 1);
+    let answer = call(
+        &router,
+        "/putAlternateContact",
+        alternate_contact_with("PhoneNumber", &phone),
+    )
+    .await;
+
+    assert_eq!(
+        answer.status, 400,
+        "case \"a pattern and a length violation\": expected 400, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let pattern = reason(CONTACT_PHONE_PATTERN, &phone);
+    let length = too_long(&phone, CONTACT_PHONE_MAX + 1, CONTACT_PHONE_MAX);
+    let listed = [
+        bracketed(&[pattern.clone(), length.clone()]),
+        bracketed(&[length, pattern]),
+    ];
+    assert!(
+        listed.contains(&answer.message().to_string()),
+        "case \"a pattern and a length violation\": expected one of {listed:?}, got {:?}",
+        answer.message()
+    );
 }

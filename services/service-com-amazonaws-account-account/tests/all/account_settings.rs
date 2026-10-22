@@ -78,6 +78,11 @@ impl Answer {
     fn member(&self, name: &str) -> &str {
         self.body[name].as_str().unwrap_or_default()
     }
+
+    /// The error `message`, or the empty string when there is none.
+    fn message(&self) -> &str {
+        self.body["message"].as_str().unwrap_or_default()
+    }
 }
 
 async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
@@ -302,6 +307,104 @@ async fn deleting_an_unset_contact_type_is_not_found() {
                 "case delete attempt {attempt}: expected ResourceNotFoundException, got {:?}",
                 answer.body
             );
+        }
+    }
+}
+
+/// The one sentence Account Management states for an alternate contact that is
+/// not set. Spelled out here rather than imported from the crate so a
+/// per-request message cannot make this test pass.
+const ALTERNATE_CONTACT_NOT_FOUND: &str = "No contact of the inputted alternate contact type found.";
+
+/// A member account id (`^\d{12}$`) that is not the caller's own account: a
+/// not-found message must be the same literal whichever account resolves.
+const MEMBER_ACCOUNT: &str = "123456789012";
+
+/// The not-found message is ONE CONSTANT: invariant of the
+/// `AlternateContactType` asked for, of the account the call resolved to, and of
+/// whether `GetAlternateContact` or `DeleteAlternateContact` asked — and whether
+/// the type was never set or was just deleted. It names neither the contact type
+/// nor any account id.
+#[tokio::test]
+async fn an_unset_alternate_contact_states_one_constant_message() {
+    let router = emulator();
+
+    // The class: every contact type, both operations, both ways of being unset,
+    // and both ways of resolving the account.
+    for account in [None, Some(MEMBER_ACCOUNT)] {
+        let request = |contact_type: &str| match account {
+            Some(id) => json!({"AlternateContactType": contact_type, "AccountId": id}),
+            None => json!({"AlternateContactType": contact_type}),
+        };
+        for contact_type in ALTERNATE_CONTACT_TYPES {
+            // (how the type is unset, which operation asks)
+            let mut answers: Vec<(String, Answer)> = Vec::new();
+            answers.push((
+                format!("{contact_type} never set, read by Get, account {account:?}"),
+                get_alternate_contact(&router, request(contact_type)).await,
+            ));
+            answers.push((
+                format!("{contact_type} never set, removed by Delete, account {account:?}"),
+                delete_alternate_contact(&router, request(contact_type)).await,
+            ));
+
+            // Now set it and delete it, so the SAME type is unset by a delete.
+            let mut stored = contact_request(contact_type, "Ada");
+            if let Some(id) = account {
+                stored["AccountId"] = json!(id);
+            }
+            let put = put_alternate_contact(&router, stored).await;
+            assert_eq!(
+                put.status, 200,
+                "case {contact_type:?}: the put must answer 200, got {} with {:?}",
+                put.status, put.body
+            );
+            let deleted = delete_alternate_contact(&router, request(contact_type)).await;
+            assert_eq!(
+                deleted.status, 200,
+                "case {contact_type:?}: the delete must answer 200, got {} with {:?}",
+                deleted.status, deleted.body
+            );
+            answers.push((
+                format!("{contact_type} after a delete, read by Get, account {account:?}"),
+                get_alternate_contact(&router, request(contact_type)).await,
+            ));
+            answers.push((
+                format!("{contact_type} after a delete, removed again, account {account:?}"),
+                delete_alternate_contact(&router, request(contact_type)).await,
+            ));
+
+            for (case, answer) in answers {
+                assert_eq!(
+                    answer.status, 404,
+                    "case {case:?}: expected HTTP 404, got {} with {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.error_code(),
+                    "ResourceNotFoundException",
+                    "case {case:?}: expected ResourceNotFoundException, got {:?}",
+                    answer.body
+                );
+                assert_eq!(
+                    answer.message(),
+                    ALTERNATE_CONTACT_NOT_FOUND,
+                    "case {case:?}: expected the constant not-found message, got {:?}",
+                    answer.message()
+                );
+                assert!(
+                    !answer.message().contains(contact_type),
+                    "case {case:?}: the message must not name the contact type, got {:?}",
+                    answer.message()
+                );
+                for id in [default_account_id(), MEMBER_ACCOUNT] {
+                    assert!(
+                        !answer.message().contains(id),
+                        "case {case:?}: the message must not name an account id, got {:?}",
+                        answer.message()
+                    );
+                }
+            }
         }
     }
 }

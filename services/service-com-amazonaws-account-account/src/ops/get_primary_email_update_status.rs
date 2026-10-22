@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPrimaryEmailUpdateStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPrimaryEmailUpdateStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPrimaryEmailUpdateStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the status of the MOST RECENT primary email update of the resolved
+//! account (the one the request names, else the caller's own), as
+//! `StartPrimaryEmailUpdate` recorded it. An account with no update has no
+//! status to report, so the call is refused with the modelled 400
+//! `ValidationException` rather than answered with an invented status.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +156,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPrimaryEmailUpdateStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPrimaryEmailUpdateStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPrimaryEmailUpdateStatus"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetPrimaryEmailUpdateStatusErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::STORE_UNAVAILABLE.to_string(),
+                        error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        // A REPORTING operation (`@readonly`): the store is read, never written, so
+        // no record is created here and a later caller sees exactly what this one
+        // saw. `PENDING` is not a status the clock moves on either (see
+        // `state::PENDING_PRIMARY_EMAIL_UPDATE_STATUS`), so there is nothing a read
+        // could be owed to materialise.
+        let store = state.lock();
+        let Some(account) = store.account(&account_id) else {
+            // Naming another account requires the caller to be an identity in the
+            // organization's management account, with the named account a member of
+            // the same organization. An account this emulator holds no record of is
+            // outside that organization, so the refusal is the modelled
+            // `AccessDeniedException` — the same rule `GetAccountInformation`
+            // applies.
+            return Err(
+                GetPrimaryEmailUpdateStatusErrorModeled::AccessDeniedException(
+                    crate::state::account_not_accessible(&account_id),
+                )
+                .into(),
+            );
+        };
+
+        let Some(update) = account.primary_email_update.as_ref() else {
+            // No update has ever been started for this account, and `Status` is a
+            // REQUIRED output member: there is no most-recent update to report.
+            return Err(
+                GetPrimaryEmailUpdateStatusErrorModeled::ValidationException(
+                    crate::state::no_primary_email_update(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetPrimaryEmailUpdateStatusOutput {
+            status: update.status.clone(),
+            updated_at: Some(::aws_smithy_types::DateTime::from(update.updated_at)),
+        })
     }
 }

@@ -52,6 +52,15 @@ use std::sync::Arc;
 /// together).
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
+/// The framework's own ceiling on the value a refusal echoes
+/// (`MAX_ECHOED_VALUE` in `aws_smithy_schema_server::constraints`, which is
+/// private): a longer value reaches this seam ALREADY elided to
+/// `<prefix>... [<n> bytes]`, so the echoed string is neither the input string
+/// nor a value whose length can be stated. A clause that would have to state
+/// one of those declines (see [`length_clause`]), and an elided value is
+/// exactly the echo that is strictly longer than the cap.
+const ECHOED_VALUE_CAP: usize = 256;
+
 /// One `@pattern` violation as Account states it: the violated ECMA-262 expression
 /// and the input string that did not match it, and nothing else — no member name,
 /// no path, no count. Account validates a request against the JSON-Schema form of
@@ -61,9 +70,8 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 ///
 /// The expression is the `@pattern` verbatim, anchors included, because that is the
 /// expression the value was tested against. `None` for anything that is not a
-/// pattern violation, which lets [`pattern_refusal_message`] decline the whole
-/// refusal and keep the framework's wording rather than invent a sentence for a
-/// violation class this service has no recorded phrasing for.
+/// pattern violation, which lets [`refusal_clause`] try the other clauses this
+/// service words.
 fn pattern_clause(violation: &Violation) -> Option<String> {
     let ViolationKind::Pattern(regex) = &violation.kind else {
         return None;
@@ -76,25 +84,70 @@ fn pattern_clause(violation: &Violation) -> Option<String> {
     ))
 }
 
-/// The `ValidationException` message for a refusal whose violations are all
-/// `@pattern` violations: the bracketed list of the reasons, one per violated
+/// One `@length` MAXIMUM violation as Account states it: the subject, its own
+/// length and the maximum the constraint admits — `string "<value>" is too long
+/// (length: <len>, maximum allowed: <max>)` — in the same JSON-Schema voice as
+/// [`pattern_clause`], naming neither the member nor its path. Every element of
+/// it is derived from the request and the modelled bound, so the clause is a
+/// rule and not a recorded constant.
+///
+/// `length` is the length the `@length` trait itself counts, which for a string
+/// is its CHARACTER count, not its byte count.
+///
+/// The clause says `string` because every `@length`-constrained INPUT member
+/// this service models targets a string shape (`AccountName`, `Name`, `Title`,
+/// `EmailAddress`, `PhoneNumber`, `PrimaryEmailAddress`, `NextToken` and the
+/// `ContactInformation` members, per
+/// `smithy_query(query="operation", operation="…")` over this service's
+/// operations; its one input list, `RegionOptStatusContains`, carries no
+/// `@length`). Should a non-string bound ever appear, it reaches this seam
+/// indistinguishable from a string one, so the wording is kept to what the model
+/// actually holds.
+///
+/// `None` for anything that is not a `@length` maximum violation — a `@length`
+/// MINIMUM included: this service has no recorded phrasing for being too short,
+/// and the framework's wording is better than an invented sentence. Also `None`
+/// when the echoed value was elided past [`ECHOED_VALUE_CAP`], because then
+/// neither the subject nor its length is the caller's.
+fn length_clause(violation: &Violation) -> Option<String> {
+    let ViolationKind::MaxLength(max) = &violation.kind else {
+        return None;
+    };
+    let value = violation.value.as_deref()?;
+    if value.len() > ECHOED_VALUE_CAP {
+        return None;
+    }
+    let length = value.chars().count();
+    Some(format!(
+        "string \"{value}\" is too long (length: {length}, maximum allowed: {max})"
+    ))
+}
+
+/// The reason Account states for ONE violation, or `None` for a violation class
+/// this service has no wording for.
+fn refusal_clause(violation: &Violation) -> Option<String> {
+    pattern_clause(violation).or_else(|| length_clause(violation))
+}
+
+/// The `ValidationException` message for a refusal every one of whose violations
+/// Account words itself: the bracketed list of the reasons, one per violated
 /// member, in the order the validating walk found them.
 ///
 /// The brackets are the list itself — a single violation reads
 /// `[ECMA 262 regex "..." does not match input string "..."]` — so a request that
-/// violates two patterns states both reasons inside the one pair of brackets.
+/// violates two constraints states both reasons inside the one pair of brackets.
 ///
 /// `None` declines the refusal: either it holds no violation at all, or at least
 /// one of them is of a class this service has no wording for (see
-/// [`pattern_clause`]), and a message half in one service's voice and half in
+/// [`refusal_clause`]), and a message half in one service's voice and half in
 /// another's is worse than the framework's consistent default.
-fn pattern_refusal_message(violations: &[Violation]) -> Option<String> {
+fn refusal_message(violations: &[Violation]) -> Option<String> {
     if violations.is_empty() {
         return None;
     }
     let clauses: Vec<String> = violations
         .iter()
-        .map(pattern_clause)
+        .map(refusal_clause)
         .collect::<Option<Vec<_>>>()?;
     Some(format!("[{}]", clauses.join(", ")))
 }
@@ -154,20 +207,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this
         // service reword it.
         //
-        // Account states a `@pattern` violation as the violated ECMA-262
-        // expression and the input string that failed it, for every
-        // pattern-constrained member of every operation and at any depth in the
-        // input — the message names no member and no path. The code stays the
-        // modeled `ValidationException` (HTTP 400), which is what the framework
-        // would have answered; only the wording changes.
+        // Account states a violation in the JSON-Schema voice its validator
+        // speaks, for every constrained member of every operation and at any
+        // depth in the input — the message names no member and no path:
         //
-        // Every other refusal — an absent required member, a `@length` or
+        // - a `@pattern` violation as the violated ECMA-262 expression and the
+        //   input string that failed it;
+        // - a `@length` MAXIMUM violation as the subject, its own length and the
+        //   maximum admitted.
+        //
+        // The code stays the modeled `ValidationException` (HTTP 400), which is
+        // what the framework would have answered; only the wording changes.
+        //
+        // Every other refusal — an absent required member, a `@length` minimum, a
         // `@range` bound, an enum value, an authentication failure — keeps the
         // framework's wording: nothing records how this service phrases those.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),
-                message: pattern_refusal_message(violations)?,
+                message: refusal_message(violations)?,
             }),
             _ => None,
         }
