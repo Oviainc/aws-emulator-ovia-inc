@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Random 128-bit identifiers: the organization id (`m-<32 hex>`), the directory id
+# WorkMail mints for an organization, and each entity's `WorkMailIdentifier`.
+uuid = { version = "1", features = ["v4"] }
+# Hex codec for the opaque `NextToken` pagination cursors the List operations mint.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

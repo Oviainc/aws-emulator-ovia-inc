@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeScalingPlans
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeScalingPlans`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Projects the stored scaling plans — read back from [`crate::state`] — into
+//! `ScalingPlan` structures, filtered by name or application source and paged by
+//! `MaxResults`/`NextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeScalingPlans::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read, except for the transitions the clock already owes: `settle_due` applies
+//! only what was due at this instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +150,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeScalingPlans` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeScalingPlansErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeScalingPlans"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle_due(now);
+
+        let names = input.scaling_plan_names.unwrap_or_default();
+        let sources = input.application_sources.unwrap_or_default();
+
+        // "If you specify application sources, you cannot specify scaling plan names."
+        if !names.is_empty() && !sources.is_empty() {
+            return Err(validation(
+                "ScalingPlanNames and ApplicationSources cannot both be specified",
+            ));
+        }
+        // "The names of the scaling plans (up to 10)."
+        if names.len() > MAX_PLAN_NAMES {
+            return Err(validation(format!(
+                "1 validation error detected: Value at 'scalingPlanNames' failed to satisfy \
+                 constraint: Member must have length less than or equal to {MAX_PLAN_NAMES}"
+            )));
+        }
+        // "If you specify a scaling plan version, you must also specify a scaling plan name."
+        if input.scaling_plan_version.is_some() && names.is_empty() {
+            return Err(validation(
+                "ScalingPlanVersion can only be specified together with ScalingPlanNames",
+            ));
+        }
+
+        let page_size = crate::state::effective_max_results(input.max_results).map_err(validation)?;
+
+        // The cursor is the name the previous page stopped after, so paging is stable
+        // over the ordered map even when plans are created or deleted between pages.
+        let after: Option<String> = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_cursor(CURSOR_KIND, token).ok_or_else(|| {
+                    invalid_next_token("The NextToken provided is not valid")
+                })?,
+            ),
+        };
+
+        // Both filters are membership tests over the request's own values, so they are
+        // built once as sets rather than rescanned per stored plan. Every supplied
+        // application source must identify one application: dropping an entry that
+        // identifies nothing would silently widen the filter to "every plan".
+        let wanted_names: ::std::collections::BTreeSet<&str> =
+            names.iter().map(String::as_str).collect();
+        let mut wanted_source_keys: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        for source in &sources {
+            let key = crate::state::validate_application_source(source).map_err(validation)?;
+            wanted_source_keys.insert(key);
+        }
+
+        let matching = state.scaling_plans.values().filter(|plan| {
+            if !wanted_names.is_empty() {
+                return wanted_names.contains(plan.name.as_str())
+                    && input
+                        .scaling_plan_version
+                        .is_none_or(|version| version == plan.version);
+            }
+            if !wanted_source_keys.is_empty() {
+                return crate::state::application_source_key(&plan.application_source)
+                    .is_some_and(|key| wanted_source_keys.contains(&key));
+            }
+            true
+        });
+        let mut page: Vec<&crate::state::ScalingPlanRecord> = matching
+            .filter(|plan| after.as_ref().is_none_or(|last| plan.name > *last))
+            .take(page_size + 1)
+            .collect();
+
+        // One record more than the page was taken, so "is there another page?" is
+        // answered from state rather than guessed.
+        let next_token = if page.len() > page_size {
+            page.truncate(page_size);
+            page.last()
+                .map(|plan| crate::state::encode_cursor(CURSOR_KIND, &plan.name))
+        } else {
+            None
+        };
+        let scaling_plans: Vec<ScalingPlan> = page.into_iter().map(project).collect();
+
+        Ok(DescribeScalingPlansOutput {
+            scaling_plans: Some(scaling_plans),
+            next_token,
+        })
     }
+}
+
+/// `ScalingPlanNames` is documented as "The names of the scaling plans (up to 10)".
+const MAX_PLAN_NAMES: usize = 10;
+
+/// Namespace for this operation's `NextToken` cursors.
+const CURSOR_KIND: &str = "plans";
+
+/// The stored record as the modelled `ScalingPlan` output shape — a pure projection:
+/// every member comes from state, none from the request.
+fn project(record: &crate::state::ScalingPlanRecord) -> ScalingPlan {
+    ScalingPlan {
+        scaling_plan_name: record.name.clone(),
+        scaling_plan_version: record.version,
+        application_source: record.application_source.clone(),
+        scaling_instructions: record.scaling_instructions.clone(),
+        status_code: record.status_code.clone(),
+        status_message: record.status_message.clone(),
+        status_start_time: Some(crate::state::to_date_time(record.status_start_time)),
+        creation_time: Some(crate::state::to_date_time(record.creation_time)),
+    }
+}
+
+/// This operation's own modelled `ValidationException` (HTTP 400).
+fn validation(message: impl Into<String>) -> DescribeScalingPlansError {
+    DescribeScalingPlansErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `InvalidNextTokenException` (HTTP 400) for a token this service did
+/// not mint for this operation.
+fn invalid_next_token(message: impl Into<String>) -> DescribeScalingPlansError {
+    DescribeScalingPlansErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The service's state is unreachable: a server fault, never a client error.
+fn internal() -> DescribeScalingPlansError {
+    DescribeScalingPlansErrorModeled::InternalServiceException(InternalServiceException {
+        message: Some("the scaling-plan store is unavailable".to_string()),
+    })
+    .into()
 }

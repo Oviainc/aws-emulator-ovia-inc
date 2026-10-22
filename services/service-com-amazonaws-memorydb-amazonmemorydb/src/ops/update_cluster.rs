@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the members the request supplied to the stored cluster in
+//! [`crate::state`], so the next `DescribeClusters` reports the new values.
 //!
 //! ## Shape of an operation
 //!
@@ -209,20 +202,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCluster"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than reporting an update nothing applied.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+
+        if let Some(shards) = input.shard_configuration.as_ref() {
+            // BOUND THE LAYOUT BEFORE ANYTHING IS BUILT OR LOCKED. Like
+            // `CreateCluster`'s `NumShards`, `ShardCount` arrives as a bare `i32` with
+            // no modelled range and sizes the stored shard and node lists, so a value
+            // outside 1..=MAX_SHARDS_PER_CLUSTER is refused rather than allocated.
+            if shards.shard_count < 1 {
+                return Err(UpdateClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "ShardConfiguration.ShardCount must be at least 1.".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            if shards.shard_count > crate::state::MAX_SHARDS_PER_CLUSTER {
+                return Err(
+                    UpdateClusterErrorModeled::ShardsPerClusterQuotaExceededFault(
+                        ShardsPerClusterQuotaExceededFault {
+                            message: Some(format!(
+                                "ShardConfiguration.ShardCount must not exceed {} shards per \
+                                 cluster.",
+                                crate::state::MAX_SHARDS_PER_CLUSTER
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        if let Some(replicas) = input.replica_configuration.as_ref() {
+            if !(0..=crate::state::MAX_REPLICAS_PER_SHARD).contains(&replicas.replica_count) {
+                return Err(UpdateClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "ReplicaConfiguration.ReplicaCount must be between 0 and {}.",
+                            crate::state::MAX_REPLICAS_PER_SHARD
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = std::time::Instant::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        if !state.clusters.contains_key(&input.cluster_name) {
+            return Err(UpdateClusterErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {} not found.", input.cluster_name)),
+                },
+            )
+            .into());
+        }
+        // A new ACL must exist before the cluster can point at it, the same resolution
+        // `CreateCluster` applies to `ACLName`.
+        if let Some(acl_name) = input.acl_name.as_deref() {
+            if !state.acls.contains_key(acl_name) {
+                return Err(UpdateClusterErrorModeled::ACLNotFoundFault(ACLNotFoundFault {
+                    message: Some(format!("ACL {acl_name} not found.")),
+                })
+                .into());
+            }
+        }
+
+        let cluster = state
+            .clusters
+            .get_mut(&input.cluster_name)
+            .expect("the cluster was just resolved under the same lock");
+
+        // Each supplied member replaces the stored one; an absent member leaves the
+        // stored value alone, so an update is a patch and never a re-create. `applied`
+        // counts the members this request actually moved, so the "nothing was asked
+        // for" refusal below is derived from the SAME enumeration that applies them
+        // and cannot drift from it as members are added.
+        let mut applied = 0_usize;
+        if let Some(description) = input.description {
+            cluster.description = Some(description);
+            applied += 1;
+        }
+        if let Some(security_group_ids) = input.security_group_ids {
+            cluster.security_group_ids = security_group_ids;
+            applied += 1;
+        }
+        if let Some(maintenance_window) = input.maintenance_window {
+            cluster.maintenance_window = Some(maintenance_window);
+            applied += 1;
+        }
+        if let Some(sns_topic_arn) = input.sns_topic_arn {
+            cluster.sns_topic_arn = Some(sns_topic_arn);
+            cluster.sns_topic_status = cluster
+                .sns_topic_status
+                .clone()
+                .or_else(|| Some(crate::state::SNS_TOPIC_ACTIVE.to_string()));
+            applied += 1;
+        }
+        if let Some(sns_topic_status) = input.sns_topic_status {
+            cluster.sns_topic_status = Some(sns_topic_status);
+            applied += 1;
+        }
+        if let Some(parameter_group_name) = input.parameter_group_name {
+            cluster.parameter_group_name = Some(parameter_group_name);
+            applied += 1;
+        }
+        if let Some(snapshot_window) = input.snapshot_window {
+            cluster.snapshot_window = Some(snapshot_window);
+            applied += 1;
+        }
+        if let Some(snapshot_retention_limit) = input.snapshot_retention_limit {
+            cluster.snapshot_retention_limit = Some(snapshot_retention_limit);
+            applied += 1;
+        }
+        if let Some(node_type) = input.node_type {
+            cluster.node_type = node_type;
+            applied += 1;
+        }
+        if let Some(engine) = input.engine {
+            cluster.engine = Some(engine);
+            applied += 1;
+        }
+        if let Some(engine_version) = input.engine_version {
+            cluster.engine_version = Some(engine_version);
+            applied += 1;
+        }
+        if let Some(acl_name) = input.acl_name {
+            cluster.acl_name = acl_name;
+            applied += 1;
+        }
+        if let Some(ip_discovery) = input.ip_discovery {
+            cluster.ip_discovery = Some(ip_discovery);
+            applied += 1;
+        }
+        // A change to the shard count or the replica count re-lays the cluster out:
+        // the slots are redistributed over the new shard count and each shard carries
+        // the new number of nodes. Both counts were bounded before the lock, so the
+        // layout rebuilt here is bounded too.
+        let reshape = input.shard_configuration.is_some() || input.replica_configuration.is_some();
+        if let Some(shards) = input.shard_configuration {
+            cluster.number_of_shards = shards.shard_count;
+            applied += 1;
+        }
+        if let Some(replicas) = input.replica_configuration {
+            cluster.num_replicas_per_shard = replicas.replica_count;
+            applied += 1;
+        }
+        if reshape {
+            cluster.shards = crate::state::build_shards(
+                // The cluster's OWN region, not this request's: a resize must not move
+                // the node endpoints and zones of a cluster that lives elsewhere.
+                &cluster.region,
+                &cluster.name,
+                cluster.number_of_shards,
+                cluster.num_replicas_per_shard,
+                cluster.port,
+                cluster.created_at,
+            );
+        }
+
+        // A request carrying none of the members above asks for no change at all,
+        // which is what `NoOperationFault` reports. Nothing was written when `applied`
+        // is zero — every branch above is what writes — so the cluster is untouched.
+        if applied == 0 {
+            return Err(UpdateClusterErrorModeled::NoOperationFault(NoOperationFault {
+                message: Some(
+                    "No modifications were requested. Supply at least one value to update."
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        // The update is accepted but not finished: the cluster reports `updating`
+        // until the clock owes it `available` again.
+        cluster.status = crate::state::cluster_status::UPDATING.to_string();
+        cluster.settles_at = Some(now + crate::state::SETTLE_AFTER);
+        let response = cluster.to_api(true);
+        Ok(UpdateClusterOutput {
+            cluster: Some(response),
+        })
     }
 }

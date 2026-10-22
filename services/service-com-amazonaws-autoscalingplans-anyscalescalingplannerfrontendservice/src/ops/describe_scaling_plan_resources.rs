@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeScalingPlanResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeScalingPlanResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Derives one `ScalingPlanResource` per stored `ScalingInstruction` of the named
+//! plan, read back from [`crate::state`] and paged by `MaxResults`/`NextToken`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeScalingPlanResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read, except for the transitions the clock already owes: `settle_due` applies
+//! only what was due at this instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeScalingPlanResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeScalingPlanResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeScalingPlanResources"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal)?;
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle_due(now);
+
+        let page_size =
+            crate::state::effective_max_results(input.max_results).map_err(validation)?;
+
+        // The cursor is the index into the plan's own instruction list, which is
+        // ordered exactly as the plan stores it.
+        let start: usize = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_cursor(CURSOR_KIND, token)
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| invalid_next_token("The NextToken provided is not valid"))?,
+        };
+
+        // This operation models no not-found error, so an unknown plan (or a version
+        // this service does not have) is refused as a validation issue rather than
+        // answered with an empty 200.
+        let plan = state
+            .plan(&input.scaling_plan_name, input.scaling_plan_version)
+            .ok_or_else(|| {
+                validation(format!(
+                    "No scaling plan found with name '{}' and version {}",
+                    input.scaling_plan_name, input.scaling_plan_version
+                ))
+            })?;
+
+        let scaling_status_code = plan.scaling_status_code();
+        let total = plan.scaling_instructions.len();
+        let scaling_plan_resources: Vec<ScalingPlanResource> = plan
+            .scaling_instructions
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(|instruction| ScalingPlanResource {
+                scaling_plan_name: plan.name.clone(),
+                scaling_plan_version: plan.version,
+                service_namespace: instruction.service_namespace.clone(),
+                resource_id: instruction.resource_id.clone(),
+                scalable_dimension: instruction.scalable_dimension.clone(),
+                // No scaling policies are materialised by this emulator: nothing
+                // creates a target-tracking policy here, so reporting one would be
+                // reporting work that never ran.
+                scaling_policies: None,
+                scaling_status_code: scaling_status_code.to_string(),
+                scaling_status_message: None,
+            })
+            .collect();
+
+        let returned_through = start.saturating_add(scaling_plan_resources.len());
+        let next_token = (returned_through < total)
+            .then(|| crate::state::encode_cursor(CURSOR_KIND, &returned_through.to_string()));
+
+        Ok(DescribeScalingPlanResourcesOutput {
+            scaling_plan_resources: Some(scaling_plan_resources),
+            next_token,
+        })
     }
+}
+
+/// Namespace for this operation's `NextToken` cursors.
+const CURSOR_KIND: &str = "plan-resources";
+
+/// This operation's own modelled `ValidationException` (HTTP 400).
+fn validation(message: impl Into<String>) -> DescribeScalingPlanResourcesError {
+    DescribeScalingPlanResourcesErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The modelled `InvalidNextTokenException` (HTTP 400) for a token this service did
+/// not mint for this operation.
+fn invalid_next_token(message: impl Into<String>) -> DescribeScalingPlanResourcesError {
+    DescribeScalingPlanResourcesErrorModeled::InvalidNextTokenException(
+        InvalidNextTokenException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
+}
+
+/// The service's state is unreachable: a server fault, never a client error.
+fn internal() -> DescribeScalingPlanResourcesError {
+    DescribeScalingPlanResourcesErrorModeled::InternalServiceException(InternalServiceException {
+        message: Some("the scaling-plan store is unavailable".to_string()),
+    })
+    .into()
 }

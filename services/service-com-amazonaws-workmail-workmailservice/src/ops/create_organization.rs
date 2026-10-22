@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOrganization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOrganization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOrganization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an organization in this service's store — a new `OrganizationId`, the alias and
+//! directory reservations that make it unique, and the organization's mail domains — and
+//! answers with the id [`crate::ops::describe_organization`] reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +164,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOrganization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOrganizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOrganization"))
+        // Absent only when this service is mounted on an engine that carries no store,
+        // in which case the operation genuinely cannot be served here.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CreateOrganization"))?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: a retry carrying the token of a completed create replays
+        // that call's id rather than minting a second organization.
+        if let Some(minted) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.client_tokens.get(token))
+        {
+            return Ok(CreateOrganizationOutput {
+                organization_id: Some(minted.clone()),
+            });
+        }
+
+        // "The request exceeds the limit of the resource" (`LimitExceededException`): the
+        // emulator's own ceiling on store growth, since nothing evicts an organization.
+        if store.organizations.len() >= crate::state::MAX_ORGANIZATIONS
+            || store.client_tokens.len() >= crate::state::MAX_CLIENT_TOKENS
+        {
+            return Err(CreateOrganizationErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator holds at most {} organizations.",
+                        crate::state::MAX_ORGANIZATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An alias names at most one organization. WorkMail aliases become DNS labels of
+        // the organization's test domain, so they are compared case-insensitively.
+        let alias_key = input.alias.to_ascii_lowercase();
+        if store.alias_index.contains_key(&alias_key) {
+            return Err(CreateOrganizationErrorModeled::NameAvailabilityException(
+                NameAvailabilityException {
+                    message: Some(format!(
+                        "The organization alias {} is already in use.",
+                        input.alias
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "When true, allows organization interoperability between WorkMail and Microsoft
+        // Exchange. If true, you must include a AD Connector directory ID in the request."
+        // (`CreateOrganizationRequest$EnableInteroperability`).
+        if input.enable_interoperability && input.directory_id.is_none() {
+            return Err(CreateOrganizationErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "EnableInteroperability requires a DirectoryId naming an AD Connector \
+                         directory."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "The directory is already in use by another WorkMail organization in the same
+        // account and Region" (`DirectoryInUseException`).
+        if let Some(directory_id) = input.directory_id.as_deref() {
+            if store.directory_index.contains_key(directory_id) {
+                return Err(CreateOrganizationErrorModeled::DirectoryInUseException(
+                    DirectoryInUseException {
+                        message: Some(format!(
+                            "The directory {directory_id} is already in use by another WorkMail \
+                             organization."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut domains: Vec<crate::state::MailDomain> = input
+            .domains
+            .unwrap_or_default()
+            .into_iter()
+            .map(|domain| crate::state::MailDomain {
+                domain_name: domain.domain_name,
+                hosted_zone_id: domain.hosted_zone_id,
+            })
+            .collect();
+        // Every organization also gets WorkMail's own test domain, `<alias>.awsapps.com`;
+        // it is the default mail domain when the caller associated none of its own.
+        let workmail_domain = format!(
+            "{alias_key}.{suffix}",
+            suffix = crate::state::DEFAULT_MAIL_DOMAIN_SUFFIX
+        );
+        let default_mail_domain = domains
+            .first()
+            .map_or_else(|| workmail_domain.clone(), |d| d.domain_name.clone());
+        if !domains
+            .iter()
+            .any(|d| d.domain_name.eq_ignore_ascii_case(&workmail_domain))
+        {
+            domains.push(crate::state::MailDomain {
+                domain_name: workmail_domain,
+                hosted_zone_id: None,
+            });
+        }
+
+        // "If you choose not to associate an existing directory with your organization,
+        // then we create a new WorkMail directory for you" — so an organization always
+        // reports a directory, whether the caller brought one or WorkMail minted it.
+        let (directory_id, directory_type) = match input.directory_id {
+            Some(id) => (id, crate::state::DIRECTORY_TYPE_ASSOCIATED),
+            None => (
+                crate::state::new_directory_id(),
+                crate::state::DIRECTORY_TYPE_WORKMAIL,
+            ),
+        };
+
+        let organization_id = crate::state::new_organization_id();
+        let organization = crate::state::Organization {
+            arn: ::engine::emulator_arn(
+                "workmail",
+                &region,
+                &format!("organization/{organization_id}"),
+            ),
+            organization_id: organization_id.clone(),
+            alias: input.alias,
+            state: crate::state::ORGANIZATION_STATE_ACTIVE.to_string(),
+            directory_id: Some(directory_id.clone()),
+            directory_type: Some(directory_type.to_string()),
+            domains,
+            default_mail_domain: Some(default_mail_domain),
+            kms_key_arn: input.kms_key_arn,
+            interoperability_enabled: input.enable_interoperability,
+            completed_date: ::std::time::SystemTime::now(),
+            error_message: None,
+            users: ::std::collections::HashMap::new(),
+            user_name_index: ::std::collections::HashMap::new(),
+            email_index: ::std::collections::HashMap::new(),
+        };
+
+        store.alias_index.insert(alias_key, organization_id.clone());
+        store
+            .directory_index
+            .insert(directory_id, organization_id.clone());
+        if let Some(token) = input.client_token {
+            store.client_tokens.insert(token, organization_id.clone());
+        }
+        store
+            .organizations
+            .insert(organization_id.clone(), organization);
+
+        Ok(CreateOrganizationOutput {
+            organization_id: Some(organization_id),
+        })
     }
 }

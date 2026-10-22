@@ -175,6 +175,79 @@ const POSITIVE_STRING_COMPARISONS: [&str; 3] = ["EQUALS", "PREFIX", "CONTAINS"];
 /// field.
 const NEGATIVE_STRING_COMPARISONS: [&str; 3] = ["NOT_EQUALS", "PREFIX_NOT_EQUALS", "NOT_CONTAINS"];
 
+/// The string-valued finding attributes this slice can filter and sort on. The
+/// names are the `AwsSecurityFindingFilters` member names, which are also the names
+/// `SortCriterion$Field` uses.
+///
+/// This list and [`string_attribute`]'s match arms must name the same attributes;
+/// the `every_sortable_attribute_can_order_a_page` test in
+/// `tests/all/security_hub_core_loop.rs` drives one `GetFindings` per name here, so
+/// a name this list carries that the accessor does not know fails the build's tests.
+pub const STRING_ATTRIBUTES: [&str; 22] = [
+    "Id",
+    "ProductArn",
+    "AwsAccountId",
+    "AwsAccountName",
+    "GeneratorId",
+    "Region",
+    "ProductName",
+    "CompanyName",
+    "Title",
+    "Description",
+    "SourceUrl",
+    "SeverityLabel",
+    "RecordState",
+    "WorkflowState",
+    "WorkflowStatus",
+    "VerificationState",
+    "ComplianceStatus",
+    "ComplianceSecurityControlId",
+    "RecommendationText",
+    "NoteText",
+    "NoteUpdatedBy",
+    "Type",
+];
+
+/// The number-valued finding attributes this slice can filter and sort on; paired
+/// with [`number_attribute`]'s match arms, and covered by the same test as
+/// [`STRING_ATTRIBUTES`].
+pub const NUMBER_ATTRIBUTES: [&str; 4] = [
+    "Confidence",
+    "Criticality",
+    "SeverityNormalized",
+    "SeverityProduct",
+];
+
+/// The timestamp-valued finding attributes this slice can sort on, and — for the
+/// five that `AwsSecurityFindingFilters` models a member for — filter on.
+/// `ProcessedAt` has no filter member, so it is sort-only. Paired with
+/// [`date_attribute`]'s match arms, and covered by the same test as
+/// [`STRING_ATTRIBUTES`].
+pub const DATE_ATTRIBUTES: [&str; 6] = [
+    "CreatedAt",
+    "UpdatedAt",
+    "FirstObservedAt",
+    "LastObservedAt",
+    "ProcessedAt",
+    "NoteUpdatedAt",
+];
+
+/// Can a page be ordered by `field`?
+///
+/// Asked of the attribute accessors themselves, so they stay the ONE source of
+/// truth for which attributes exist: a `Default` finding is a cheap probe that
+/// carries no values but still makes each accessor answer `Some` for a name it
+/// knows and `None` for one it does not. [`STRING_ATTRIBUTES`] /
+/// [`NUMBER_ATTRIBUTES`] / [`DATE_ATTRIBUTES`] exist only so the crate's tests can
+/// enumerate those names; they are not consulted here, so neither list can drift
+/// into deciding sortability.
+fn is_sortable_field(field: &str) -> bool {
+    let probe = AwsSecurityFinding::default();
+    date_attribute(&probe, field).is_some()
+        || number_attribute(&probe, field).is_some()
+        || string_attribute(&probe, field).is_some()
+}
+
 /// Does `value` satisfy `comparison` against `filter_value`, read as the positive
 /// form of the comparison? `NOT_*` comparisons are evaluated by negating their
 /// positive twin, which is why they share one function.
@@ -209,6 +282,16 @@ fn check_string_filter_combination(attribute: &str, filters: &[StringFilter]) ->
     if comparisons.contains(&"CONTAINS_WORD") {
         return Err(format!(
             "Filter {attribute}: the CONTAINS_WORD comparison is not supported by GetFindings"
+        ));
+    }
+    // A comparison that is neither a positive nor a negative form names no predicate
+    // this operation can evaluate. Refusing it is what keeps a filtered request from
+    // quietly answering an unfiltered page.
+    if let Some(unknown) = comparisons.iter().find(|c| {
+        !POSITIVE_STRING_COMPARISONS.contains(c) && !NEGATIVE_STRING_COMPARISONS.contains(c)
+    }) {
+        return Err(format!(
+            "Filter {attribute}: {unknown} is not a StringFilterComparison GetFindings evaluates"
         ));
     }
     let has = |wanted: &str| comparisons.contains(&wanted);
@@ -265,7 +348,11 @@ fn number_filters_match(value: Option<f64>, filters: &[NumberFilter]) -> bool {
         return false;
     };
     filters.iter().any(|filter| {
-        filter.eq.is_none_or(|eq| (value - eq).abs() < f64::EPSILON)
+        // `NumberFilter$Eq` is an equality predicate on the value the finding
+        // carries, so this is EXACT equality on purpose: the filtered attributes
+        // (`Confidence`, `Criticality`, `SeverityNormalized`, `SeverityProduct`) are
+        // compared to the value the caller sent, not approximated.
+        filter.eq.is_none_or(|eq| value == eq)
             && filter.gte.is_none_or(|gte| value >= gte)
             && filter.lte.is_none_or(|lte| value <= lte)
             && filter.gt.is_none_or(|gt| value > gt)
@@ -320,9 +407,20 @@ fn date_filters_match(
     Ok(any)
 }
 
-/// The width of a `DateRange` in nanoseconds. `DateRangeUnit` models `DAYS` only.
+/// The width of a `DateRange` in nanoseconds. `DateRangeUnit` models `DAYS` only, and
+/// a range names a window, so its `Value` is required and cannot be negative.
 fn date_range_nanos(attribute: &str, range: &DateRange) -> Result<i128, String> {
-    let value = i128::from(range.value.unwrap_or(0));
+    let Some(value) = range.value else {
+        return Err(format!(
+            "Filter {attribute}: DateRange.Value is required when DateRange is set"
+        ));
+    };
+    if value < 0 {
+        return Err(format!(
+            "Filter {attribute}: DateRange.Value must not be negative, got {value}"
+        ));
+    }
+    let value = i128::from(value);
     match range.unit.as_deref().unwrap_or("DAYS") {
         "DAYS" => Ok(value * 24 * 60 * 60 * 1_000_000_000),
         other => Err(format!(
@@ -744,16 +842,83 @@ fn unsupported_filter_member(filters: &AwsSecurityFindingFilters) -> Option<&'st
         .find_map(|(name, present)| present.then_some(name))
 }
 
+/// `GetFindings$Filters`: "You can filter by up to 10 finding attributes."
+const MAX_FILTER_ATTRIBUTES: usize = 10;
+
+/// `GetFindings$Filters`: "For each attribute, you can provide up to 20 filter
+/// values."
+const MAX_FILTER_VALUES_PER_ATTRIBUTE: usize = 20;
+
 /// Refuse a `Filters` the model's own rules reject, BEFORE any finding is examined:
 /// whether a request is valid cannot depend on what happens to be stored, so an
 /// illegal filter combination or an unparseable date bound is a 400 even for a hub
 /// that holds no findings.
 fn validate_filters(filters: &AwsSecurityFindingFilters) -> Result<(), String> {
+    // The published breadth and depth limits on `Filters`, counted over the members
+    // the caller actually set.
+    let mut attributes = 0usize;
+    for (attribute, count) in string_filter_bindings(filters)
+        .iter()
+        .map(|(name, f)| (*name, f.len()))
+        .chain(
+            number_filter_bindings(filters)
+                .iter()
+                .map(|(name, f)| (*name, f.len())),
+        )
+        .chain(
+            date_filter_bindings(filters)
+                .iter()
+                .map(|(name, f)| (*name, f.len())),
+        )
+        .chain(filters.sample.as_ref().map(|f| ("Sample", f.len())))
+    {
+        // An attribute with an empty filter list expresses no condition, so it does
+        // not count toward "filter by up to 10 finding attributes".
+        if count == 0 {
+            continue;
+        }
+        attributes += 1;
+        if count > MAX_FILTER_VALUES_PER_ATTRIBUTE {
+            return Err(format!(
+                "Filter {attribute}: at most {MAX_FILTER_VALUES_PER_ATTRIBUTE} filter values are allowed per attribute, got {count}"
+            ));
+        }
+    }
+    if attributes > MAX_FILTER_ATTRIBUTES {
+        return Err(format!(
+            "Filters: at most {MAX_FILTER_ATTRIBUTES} finding attributes may be filtered on, got {attributes}"
+        ));
+    }
+
     for (attribute, field_filters) in string_filter_bindings(filters) {
         check_string_filter_combination(attribute, field_filters)?;
+        // A filter with no `Value` names no predicate. Refusing it is what keeps a
+        // filtered request from quietly answering an unfiltered page.
+        if field_filters.iter().any(|f| f.value.is_none()) {
+            return Err(format!("Filter {attribute}: every filter must carry a Value"));
+        }
+    }
+    for (attribute, field_filters) in number_filter_bindings(filters) {
+        if field_filters.iter().any(|f| {
+            f.eq.is_none() && f.gte.is_none() && f.lte.is_none() && f.gt.is_none() && f.lt.is_none()
+        }) {
+            return Err(format!(
+                "Filter {attribute}: every filter must carry at least one of Eq, Gt, Gte, Lt or Lte"
+            ));
+        }
+    }
+    if let Some(sample_filters) = filters.sample.as_ref() {
+        if sample_filters.iter().any(|f| f.value.is_none()) {
+            return Err("Filter Sample: every filter must carry a Value".to_string());
+        }
     }
     for (attribute, field_filters) in date_filter_bindings(filters) {
         for filter in field_filters {
+            if filter.start.is_none() && filter.end.is_none() && filter.date_range.is_none() {
+                return Err(format!(
+                    "Filter {attribute}: every filter must carry Start, End or DateRange"
+                ));
+            }
             for (member, bound) in [
                 ("Start", filter.start.as_deref()),
                 ("End", filter.end.as_deref()),
@@ -834,7 +999,7 @@ impl SortValue {
             (Self::Absent, _) => Ordering::Less,
             (_, Self::Absent) => Ordering::Greater,
             (Self::Text(a), Self::Text(b)) => a.cmp(b),
-            (Self::Number(a), Self::Number(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            (Self::Number(a), Self::Number(b)) => a.total_cmp(b),
             (Self::Instant(a), Self::Instant(b)) => a.cmp(b),
             // Two different kinds never arise: a field resolves to one kind.
             _ => Ordering::Equal,
@@ -935,8 +1100,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let sort_criteria = input.sort_criteria.as_deref().unwrap_or_default();
         let mut ordering: Vec<(String, bool)> = Vec::new();
         for criterion in sort_criteria {
-            let field = criterion.field.clone().unwrap_or_default();
-            if sort_value(&AwsSecurityFinding::default(), &field).is_none() {
+            let Some(field) = criterion.field.as_deref() else {
+                return Err(invalid_input(
+                    "SortCriteria: every criterion must carry a Field".to_string(),
+                ));
+            };
+            if !is_sortable_field(field) {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                     "GetFindings SortCriteria field {field}"
                 )));
@@ -950,7 +1119,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )))
                 }
             };
-            ordering.push((field, descending));
+            ordering.push((field.to_string(), descending));
         }
         if ordering.is_empty() {
             ordering.push((DEFAULT_SORT_FIELD.to_string(), true));
@@ -990,10 +1159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .then_with(|| left_key.cmp(right_key))
         });
 
-        let page_size = match input.max_results {
-            Some(requested) => usize::try_from(requested).unwrap_or(MAX_RESULTS_LIMIT),
-            None => MAX_RESULTS_LIMIT,
-        };
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator already refuses a value outside it; clamping here keeps the page
+        // bounded even if this handler is reached another way.
+        let page_size = input.max_results.map_or(MAX_RESULTS_LIMIT, |requested| {
+            usize::try_from(requested)
+                .unwrap_or(MAX_RESULTS_LIMIT)
+                .clamp(1, MAX_RESULTS_LIMIT)
+        });
         let offset = match input.next_token.as_deref() {
             Some(token) => decode_next_token(token).ok_or_else(|| {
                 invalid_input("NextToken is not a token this operation issued".to_string())
