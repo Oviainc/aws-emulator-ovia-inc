@@ -11,7 +11,14 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediaconnect-mediaconnect.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mediaconnect#RemoveFlowSourceRequest")]
+// `skip_validation = ["FlowArn"]`: this member declares its own, wider, `@pattern` than
+// the `FlowArn` shape it targets, and a flow ARN is an identifier the store resolves — see
+// the note on `DescribeFlowInput` in `describe_flow_types.rs`. `SourceArn` targets
+// `String`, so its own modelled `@pattern` is the only one there is and it keeps it.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.mediaconnect#RemoveFlowSourceRequest",
+    skip_validation = ["FlowArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct RemoveFlowSourceInput {
     pub flow_arn: String,

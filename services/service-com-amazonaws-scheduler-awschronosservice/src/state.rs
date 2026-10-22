@@ -451,10 +451,6 @@ pub fn to_wire_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// Scheduler will use for this target when the schedule is invoked").
 pub const SCHEDULER_SERVICE_PRINCIPAL: &str = "scheduler.amazonaws.com";
 
-/// The `sts` action a role's trust policy must allow for a principal to assume
-/// it.
-const ASSUME_ROLE_ACTION: &str = "sts:AssumeRole";
-
 /// What AWS answers when a schedule's execution role cannot be assumed — the
 /// role does not exist, or its trust policy does not admit Scheduler.
 pub const EXECUTION_ROLE_REFUSAL: &str =
@@ -498,61 +494,17 @@ fn iam_role_name(role_arn: &str) -> Option<&str> {
 
 /// Whether an IAM trust-policy document lets `principal` assume the role.
 ///
-/// The document is an IAM policy: a `Statement` (one object or a list) whose
-/// entry matches the principal when it names the `sts:AssumeRole` action and a
-/// `Principal.Service` naming it. `Action` and `Service` are each either a
-/// single string or a list, and IAM action names are case-insensitive, so both
-/// forms and both casings are accepted. IAM reports the document URL-encoded, so
-/// it is decoded before it is parsed.
+/// The rule is IAM's, so it is read through the ONE evaluator every service that resolves
+/// a caller-supplied execution role shares (`service_common::iam_trust_policy`): a
+/// statement is about the call when it names the principal and the `sts:AssumeRole` action
+/// (either member being one string or a list, compared case-insensitively), an explicit
+/// `Deny` wins over any `Allow`, and the document is percent-decoded before it is parsed.
 ///
-/// Evaluated the way IAM evaluates a policy: an explicit `Deny` for the
-/// principal WINS over any `Allow`, so a document carrying both refuses the
-/// assume rather than admitting it.
+/// A document this emulator cannot read as a policy is not one Scheduler can act on, so it
+/// does not admit the assume — the refusal a resolved role with no readable grant earns.
 fn trust_policy_admits(document: &str, principal: &str) -> bool {
-    let decoded = ::percent_encoding::percent_decode_str(document).decode_utf8_lossy();
-    let Ok(policy) = ::serde_json::from_str::<::serde_json::Value>(&decoded) else {
-        return false;
-    };
-    let statement = &policy["Statement"];
-    let statements: Vec<&::serde_json::Value> = match statement.as_array() {
-        Some(entries) => entries.iter().collect(),
-        None => vec![statement],
-    };
-    let matching = || {
-        statements
-            .iter()
-            .filter(|entry| statement_matches(entry, principal))
-    };
-    let denied = matching().any(|entry| entry["Effect"].as_str() == Some("Deny"));
-    let allowed = matching().any(|entry| entry["Effect"].as_str() == Some("Allow"));
-    allowed && !denied
-}
-
-/// Whether one trust-policy statement is ABOUT `principal` assuming the role —
-/// whatever effect it then states.
-fn statement_matches(statement: &::serde_json::Value, principal: &str) -> bool {
-    let names_assume_role = json_strings(&statement["Action"]).iter().any(|action| {
-        action.eq_ignore_ascii_case(ASSUME_ROLE_ACTION)
-            || action == "sts:*"
-            || action == "*"
-    });
-    let names_principal = json_strings(&statement["Principal"]["Service"])
-        .iter()
-        .any(|service| service == principal);
-    names_assume_role && names_principal
-}
-
-/// The strings a policy member holds, whether it is one string or a list of
-/// them. Anything else contributes none.
-fn json_strings(value: &::serde_json::Value) -> Vec<String> {
-    match value {
-        ::serde_json::Value::String(one) => vec![one.clone()],
-        ::serde_json::Value::Array(many) => many
-            .iter()
-            .filter_map(|item| item.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
+    ::service_common::iam_trust_policy::admits_service_principal(document, principal)
+        .unwrap_or(false)
 }
 
 /// Refuse a target whose execution role EventBridge Scheduler could not assume.

@@ -86,10 +86,22 @@ use std::collections::BTreeSet;
 use crate::state::StoredOutput;
 
 /// Refuse the request with the service's own client-input error, `BadRequestException`
-/// (HTTP 400): "thrown if the request contains a semantic error".
-fn bad_request(message: impl Into<String>) -> AddFlowOutputsError {
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's refusal envelope
+/// ([`crate::state::validation_failed_message`]).
+fn bad_request(detail: impl Into<String>) -> AddFlowOutputsError {
     AddFlowOutputsErrorModeled::BadRequestException(BadRequestException {
-        message: message.into(),
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the flow `identifier` addressed, in this
+/// service's not-found envelope ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> AddFlowOutputsError {
+    AddFlowOutputsErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
     })
     .into()
 }
@@ -206,12 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation adds outputs to "an existing flow", addressed by its own ARN.
         let Some(flow) = store.flows.get(&input.flow_arn) else {
-            return Err(AddFlowOutputsErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: format!("Flow with ARN {} was not found.", input.flow_arn),
-                },
-            )
-            .into());
+            return Err(not_found(&input.flow_arn));
         };
 
         // "You can create up to 50 outputs per flow": the ceiling is on the flow, so it
