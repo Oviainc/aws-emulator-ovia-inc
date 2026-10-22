@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetWebFunction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetWebFunction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetWebFunction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored web function. A read: it reports the record
+//! `CreateWebFunction` persisted, and the only write it makes is materialising the
+//! `Pending -> Active` transition the clock had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +157,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetWebFunction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetWebFunctionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetWebFunction"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetWebFunctionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the web function store is unavailable".to_string()),
+            })
+        })?;        let mut state = state.lock();
+        // The only write a read makes: the state transition the clock already owed
+        // this function, which was due whether or not anybody called.
+        state.materialise_due_transitions(::std::time::SystemTime::now());
+
+        // The caller may name the function by name or by ARN; both resolve to the
+        // one stored record.
+        let name = crate::state::resolve_function_name(&input.function_name);
+        let Some(function) = state.functions.get(name) else {
+            return Err(GetWebFunctionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("The web function {} doesn't exist.", input.function_name),
+                    resource_id: Some(input.function_name.clone()),
+                    resource_type: Some("WebFunction".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetWebFunctionOutput {
+            function_name: function.function_name.clone(),
+            function_arn: function.function_arn.clone(),
+            state: function.state.wire().to_string(),
+            state_reason: function.state_reason.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(function.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(function.updated_at),
+        })
     }
 }
