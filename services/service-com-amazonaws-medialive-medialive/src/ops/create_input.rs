@@ -266,6 +266,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state.record_input_idempotency_token(token, &id);
         }
 
+        // A push input's ingest endpoint is allocated here, where the
+        // destinations are written, not on the read path.
+        state.allocate_input_ingest_addresses(&id);
+
         let created = state.input_description(&id).ok_or_else(unavailable)?;
         Ok(CreateInputOutput {
             input: Some(created),

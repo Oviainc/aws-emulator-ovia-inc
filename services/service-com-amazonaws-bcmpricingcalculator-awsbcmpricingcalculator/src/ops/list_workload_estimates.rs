@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkloadEstimates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkloadEstimates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one `WorkloadEstimateSummary` per live workload estimate, in creation order.
+//! It reports only stored state, as the model's `@readonly` says; its one write is
+//! materialising what the clock had already made due (an expiry, and the move out of the
+//! transient `UPDATING` status), through the same
+//! [`crate::state::ComAmazonawsBcmpricingcalculatorAwsbcmpricingcalculatorState::settle`]
+//! every other reader of an estimate calls.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkloadEstimates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `filters` select on the estimate attribute each `ListWorkloadEstimatesFilterName`
+//! names (`STATUS` | `NAME`), with the filter's `matchOption`; several filters are AND-ed
+//! and the values of one filter are OR-ed. `createdAtFilter` / `expiresAtFilter` keep
+//! only estimates whose timestamp falls in the window. `maxResults` is the page size and
+//! `nextToken` is emitted only while items remain.
+//!
+//! Selection is deliberately account-agnostic, for the same reason `ListBillScenarios`
+//! states: this emulator presents one account (`engine::emulator_account_id`) and no
+//! stored estimate carries an owning account to filter on, so every live estimate is the
+//! caller's.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +117,53 @@ impl From<ListWorkloadEstimatesErrorModeled> for ListWorkloadEstimatesError {
     }
 }
 
+/// Whether `estimate` satisfies every filter the request carries.
+fn selected(
+    estimate: &crate::state::WorkloadEstimate,
+    input: &ListWorkloadEstimatesInput,
+) -> bool {
+    if !crate::state::within_window(
+        estimate.created_at,
+        input
+            .created_at_filter
+            .as_ref()
+            .and_then(|window| window.after_timestamp),
+        input
+            .created_at_filter
+            .as_ref()
+            .and_then(|window| window.before_timestamp),
+    ) {
+        return false;
+    }
+    if !crate::state::within_window(
+        estimate.expires_at,
+        input
+            .expires_at_filter
+            .as_ref()
+            .and_then(|window| window.after_timestamp),
+        input
+            .expires_at_filter
+            .as_ref()
+            .and_then(|window| window.before_timestamp),
+    ) {
+        return false;
+    }
+    input
+        .filters
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .all(|filter| match estimate.filter_value(&filter.name) {
+            Some(candidate) => crate::state::matches_filter(
+                candidate,
+                &filter.values,
+                filter.match_option.as_deref(),
+            ),
+            // The estimate carries nothing for this attribute, so no value matches.
+            None => false,
+        })
+}
+
 /// The `ListWorkloadEstimates` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -143,20 +198,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkloadEstimates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkloadEstimatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkloadEstimates"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListWorkloadEstimatesErrorModeled::DataUnavailableException(
+                DataUnavailableException {
+                    message: "the workload estimate store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+        // Materialise what the clock has already made due before reporting: an estimate
+        // past its `expiresAt` reads as gone rather than lingering for the life of the
+        // process, and one whose recomputation window has closed is listed with the
+        // terminal status it was owed at that instant — the same settlement
+        // `GetWorkloadEstimate` applies, so a list and a get never disagree.
+        state.settle(crate::state::now_millis());
+
+        let matching: Vec<WorkloadEstimateSummary> = state
+            .workload_estimates
+            .iter()
+            .filter(|estimate| selected(estimate, &input))
+            .map(|estimate| WorkloadEstimateSummary {
+                id: estimate.id.clone(),
+                name: Some(estimate.name.clone()),
+                status: Some(estimate.status.clone()),
+                created_at: Some(estimate.created_at),
+                expires_at: Some(estimate.expires_at),
+                rate_type: estimate.rate_type.clone(),
+                rate_timestamp: Some(estimate.rate_timestamp),
+                total_cost: Some(estimate.total_cost),
+                cost_currency: Some(crate::state::COST_CURRENCY.to_string()),
+                failure_message: estimate.failure_message.clone(),
+            })
+            .collect();
+
+        // A page token is bound to the selection it was measured against, so an offset
+        // from one filter set is never applied to a differently filtered list.
+        let mut scope_parts: Vec<String> = vec![Self::NAME.to_string()];
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            scope_parts.push(filter.name.clone());
+            scope_parts.push(filter.match_option.clone().unwrap_or_default());
+            scope_parts.extend(filter.values.iter().cloned());
+        }
+        for window in [&input.created_at_filter, &input.expires_at_filter] {
+            // Both halves of each bound go in, because `within_window` compares
+            // sub-second precision too: two requests whose windows differ only in
+            // nanoseconds select differently, so they must not share a token scope.
+            for bound in [
+                window.as_ref().and_then(|window| window.after_timestamp),
+                window.as_ref().and_then(|window| window.before_timestamp),
+            ] {
+                scope_parts.push(bound.map(|at| at.secs()).unwrap_or_default().to_string());
+                scope_parts.push(
+                    bound
+                        .map(|at| at.subsec_nanos())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        let scope = crate::state::request_fingerprint(&scope_parts);
+
+        let (items, next_token) = crate::state::paginate(
+            &matching,
+            input.next_token.as_deref(),
+            input.max_results,
+            &scope,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        Ok(ListWorkloadEstimatesOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }
