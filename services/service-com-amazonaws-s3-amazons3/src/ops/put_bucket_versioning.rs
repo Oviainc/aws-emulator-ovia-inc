@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketVersioning
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketVersioning`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketVersioning::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets the versioning state of an existing bucket: the submitted
+//! `VersioningConfiguration` is recorded on the named bucket's state and the operation
+//! answers 200 with an empty body, so `GetBucketVersioning` reports exactly what was
+//! last put. A configuration that names no usable `Status` is refused, and a bucket this
+//! emulator does not hold is `NoSuchBucket` (404).
+//!
+//! Object-level versioning is NOT part of this operation and is not emulated: a stored
+//! object still has one current state, so `PutObject` reports no `VersionId` and
+//! `ListObjectVersions` remains its own stub. What this operation keeps is the bucket's
+//! versioning state, which is what `GetBucketVersioning` reads back.
 //!
 //! ## Shape of an operation
 //!
@@ -136,14 +138,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketVersioningOutpu
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketVersioningError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketVersioning")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketVersioning")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketVersioning",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketVersioningErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -197,18 +207,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketVersioning` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketVersioningErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketVersioning"))
+        // Everything this write needs is in its deserialized input; the MFA token and
+        // the expected owner travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `PutBucketVersioningRequest$ExpectedBucketOwner`, judged the way
+        // `HeadObject` judges it: this emulator serves one account, so that account owns
+        // every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine
+            // that is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // this operation models no server-fault error to say so, so the scaffold's
+            // 501 carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketVersioning",
+            ));
+        };
+
+        let configuration = &input.versioning_configuration;
+
+        // "Sets the versioning state of an existing bucket. You can set the versioning
+        // state with one of the following values: Enabled … Suspended …" (this
+        // operation's own documentation). `Status` is NOT required by the model, so a
+        // request can carry a container that names no state to set — and a state outside
+        // that pair is no state either. Both are a configuration S3 cannot apply, which
+        // is what `IllegalVersioningConfigurationException` reports ("the versioning
+        // configuration specified in the request is invalid", HTTP 400); the code is not
+        // a shape in this model, so it goes out through the unmodelled channel.
+        let Some(status) = configuration
+            .status
+            .as_deref()
+            .filter(|status| BUCKET_VERSIONING_STATUS_VALUES.contains(status))
+        else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ILLEGAL_VERSIONING_CONFIGURATION_CODE,
+                400,
+                format!(
+                    "VersioningConfiguration.Status must be one of \
+                     {BUCKET_VERSIONING_STATUS_VALUES:?}, got {:?}",
+                    configuration.status
+                ),
+            ));
+        };
+
+        // "If you are the bucket owner and want to enable MFA Delete in the bucket
+        // versioning configuration, you must include the x-amz-mfa request header and
+        // the Status and the MfaDelete request elements in a request to set the
+        // versioning state of the bucket" (this operation's documentation): a
+        // configuration naming `MfaDelete` without that header, or naming a value
+        // outside `MFADelete`'s pair, is again a configuration that cannot be applied.
+        if let Some(mfa_delete) = configuration.mfa_delete.as_deref() {
+            if !M_F_A_DELETE_VALUES.contains(&mfa_delete) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::ILLEGAL_VERSIONING_CONFIGURATION_CODE,
+                    400,
+                    format!(
+                        "VersioningConfiguration.MfaDelete must be one of \
+                         {M_F_A_DELETE_VALUES:?}, got {mfa_delete:?}"
+                    ),
+                ));
+            }
+            if input.mfa.is_none() {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::ILLEGAL_VERSIONING_CONFIGURATION_CODE,
+                    400,
+                    "VersioningConfiguration.MfaDelete requires the x-amz-mfa request \
+                     header, which this request does not carry",
+                ));
+            }
+        }
+
+        // The configuration is judged BEFORE the store is touched, so a refused request
+        // leaves the bucket's current versioning state exactly as it was.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(PutBucketVersioningErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        bucket.set_versioning(status, configuration.mfa_delete.as_deref());
+
+        // `Unit` output: success is the 200 and an empty body.
+        Ok(PutBucketVersioningOutput)
     }
 }
