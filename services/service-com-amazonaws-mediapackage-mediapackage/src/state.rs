@@ -837,6 +837,21 @@ impl ComAmazonawsMediapackageMediapackageState {
     }
 
     /// The stored tag set of the resource a tagging operation's `ResourceArn` named, for
+    /// a REPORTING operation to render. `None` when this service holds no such resource,
+    /// which is what tells `ListTagsForResource` to report a 404 instead of a tag set.
+    ///
+    /// The same lookup as [`tags_mut`](Self::tags_mut), without the write capability: a
+    /// read must not be able to change what a later caller sees.
+    pub fn tags(&self, target: &TaggedResource) -> Option<&BTreeMap<String, String>> {
+        match target {
+            TaggedResource::Channel(id) => self.channels.get(id).map(|record| &record.tags),
+            TaggedResource::OriginEndpoint(id) => {
+                self.origin_endpoints.get(id).map(|record| &record.tags)
+            }
+        }
+    }
+
+    /// The stored tag set of the resource a tagging operation's `ResourceArn` named, for
     /// that operation to change in place. `None` when this service holds no such
     /// resource, which is what tells `TagResource`/`UntagResource` to report a 404
     /// instead of writing.

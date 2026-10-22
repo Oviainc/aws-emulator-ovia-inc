@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSprites
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSprites`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSprites::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Serves one sprite file of one sheet. The (`Style`, `ColorScheme`, `Variant`)
+//! labels select a stored sprite-sheet record in [`crate::state`]; `FileName`
+//! chooses which of that sheet's two paired files is returned — the PNG sheet
+//! or the JSON index describing it — and at which `pixelRatio` (`@2x`). Both
+//! files are derived from one layout of the same record, so the index always
+//! describes the sheet it is paired with.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +73,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::assets;
+use crate::state::{ColorSchemeKind, MapStyleKind, VariantKind};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -144,18 +143,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSprites` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSpritesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSprites"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. This operation
+            // models no server error, so an engine that carries no maps
+            // catalog is answered as an operation this emulator cannot serve.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("GetSprites"));
+        };
+
+        let Some(style) = MapStyleKind::from_wire(&input.style) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Style must be one of {}",
+                MAP_STYLE_VALUES.join(" | ")
+            )));
+        };
+        let Some(scheme) = ColorSchemeKind::from_wire(&input.color_scheme) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "ColorScheme must be one of {}",
+                COLOR_SCHEME_VALUES.join(" | ")
+            )));
+        };
+        let Some(variant) = VariantKind::from_wire(&input.variant) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Variant must be one of {}",
+                VARIANT_VALUES.join(" | ")
+            )));
+        };
+        // The modeled `FileName` pattern admits only `sprites[@2x].png` and
+        // `sprites[@2x].json`, so the name decides both the media type and the
+        // pixel ratio.
+        let Some((content_type, pixel_ratio)) = assets::sprite_file(&input.file_name) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "FileName must be one of sprites.png, sprites@2x.png, sprites.json or \
+                 sprites@2x.json, got `{}`",
+                input.file_name
+            )));
+        };
+
+        let sheet = {
+            let catalog = state.lock();
+            let Some(sheet) = catalog.sprites.get(&(style, scheme, variant)) else {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "no sprite sheet is published for {}/{}/{}",
+                    style.as_wire(),
+                    scheme.as_wire(),
+                    variant.as_wire()
+                )));
+            };
+            // Read the record and release the catalog: laying the sheet out,
+            // drawing it and encoding it read nothing from state.
+            sheet.clone()
+        };
+
+        let layout = assets::layout_sprites(&sheet, pixel_ratio);
+        let body = if content_type == "image/png" {
+            assets::render_sprite_sheet(&layout)
+        } else {
+            assets::sprite_index_json(&layout)
+        };
+
+        Ok(GetSpritesOutput {
+            e_tag: Some(assets::etag(&body)),
+            content_type: Some(content_type.to_string()),
+            cache_control: Some(sheet.cache_control.clone()),
+            blob: Some(body),
+        })
     }
 }

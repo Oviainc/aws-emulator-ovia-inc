@@ -202,7 +202,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Aborting: Environment is in the process of aborting a deployment."
         // The return to `Ready` is what the clock then owes.
-        environment.begin_abort();
+        let request_id = crate::state::new_request_id();
+        environment.begin_abort(&request_id);
+        let subject = environment.event_subject();
+        // The cancellation has STARTED here; the event for its completion is
+        // recorded when the clock makes that completion due.
+        store.record_event(
+            &request_id,
+            crate::state::SEVERITY_INFO,
+            "abortEnvironmentUpdate is starting.",
+            subject,
+        );
         // This operation's output shape is `Unit`: the acknowledgement is the
         // 200 itself, and the cancelled update is observed through
         // DescribeEnvironments.

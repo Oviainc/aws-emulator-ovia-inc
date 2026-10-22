@@ -4,18 +4,18 @@
 //!
 //! Reports the stored pipeline's state: its name, the stored version, the instants
 //! the store holds for it, and one `StageState` per stage of the stored declaration
-//! — in declaration order, each carrying the stage's action names and the inbound
-//! transition state the transition calls persisted.
+//! — in declaration order, each carrying the stage's action names, the inbound
+//! transition state the transition calls persisted, and the rules of every condition
+//! set the stage declares.
 //!
 //! Reporting only: the answer is computed from the store and nothing is written, so
 //! two consecutive calls on an untouched store answer the same thing.
 //!
-//! The members the stage- and action-execution plane owns (`latestExecution`,
-//! `inboundExecution(s)`, an action's `currentRevision` / `latestExecution`, the
-//! condition states) stay ABSENT: this slice runs no such plane, so there is no
-//! outcome to report for them and inventing one would claim work nothing ran. The
-//! issue `issues/things-that-do-not-work/20261022T173520Z-codepipeline-getpipelinestate-stub.md`
-//! owns filling them in once that plane exists.
+//! The members the stage-, action- and rule-execution plane owns (`latestExecution`,
+//! `inboundExecution(s)`, an action's `currentRevision` / `latestExecution`, a
+//! condition's or a rule's `latestExecution`) stay ABSENT: this slice runs no such
+//! plane, so there is no outcome to report for them and inventing one would claim
+//! work nothing ran.
 //!
 //! ## Shape of an operation
 //!

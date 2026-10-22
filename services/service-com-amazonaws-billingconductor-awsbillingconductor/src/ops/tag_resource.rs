@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! MERGES the request's `Tags` into the resource `ResourceArn` names and persists them
+//! on that resource's OWN record — the same map a create stored its `Tags` in — so
+//! `ListTagsForResource` reads back what this call wrote and a delete reclaims the tags
+//! with the resource. A key the request does not name keeps its value, which is the
+//! documented contract ("If existing tags on a resource are not specified in the request
+//! parameters, they are not changed").
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `ResourceArn` naming no resource this service holds is answered 404 through
+//! [`crate::state::tagging_not_found`]; that constant documents why the code it carries
+//! is the recorded `NotFoundException` rather than the model's
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +149,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The modelled `ResourceArn` pattern and the `Tags` map's own length bound are
+        // refused by the boundary before this runs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        let Some(stored) = state.resource_tags_mut(&input.resource_arn) else {
+            return Err(crate::state::tagging_not_found());
+        };
+
+        // What the resource would hold AFTER the merge: the keys it already has plus the
+        // ones this request adds. A request naming only keys the resource already
+        // carries changes no count, so re-tagging is never refused by the cap.
+        let resulting = stored
+            .keys()
+            .map(String::as_str)
+            .chain(input.tags.keys().map(String::as_str))
+            .collect::<std::collections::BTreeSet<&str>>()
+            .len();
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::validation_exception(
+                    "FIELD_VALIDATION_FAILED",
+                    "tags",
+                    format!(
+                        "Value at 'tags' failed to satisfy constraint: a resource must have \
+                         no more than {} tags; this request would leave it with {resulting}",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // "Associates the specified tags to a resource with the specified resourceArn. If
+        // existing tags on a resource are not specified in the request parameters, they
+        // are not changed." — a MERGE, not a replacement: a key the request names takes
+        // the request's value, every other stored key is left alone.
+        for (key, value) in input.tags {
+            stored.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }
