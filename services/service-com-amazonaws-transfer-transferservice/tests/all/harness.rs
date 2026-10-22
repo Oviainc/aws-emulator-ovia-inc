@@ -31,6 +31,20 @@ pub(crate) const SSH_KEY: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ==";
 /// A role ARN satisfying `Role`'s modelled pattern `^arn:.*role/\S+$` and `len 20..2048`.
 pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/transfer-s3";
 
+/// Identifiers satisfying `CertificateIds`' member shape `CertificateId`
+/// (`len 22..22`, pattern `^cert-([0-9a-f]{17})$`, from
+/// `smithy_query(query="shape",shape="CertificateIds")`): the low end of the id space,
+/// a mid value and the high end.
+pub(crate) const CERTIFICATE_IDS: [&str; 3] = [
+    "cert-00000000000000000",
+    "cert-0123456789abcdef0",
+    "cert-fffffffffffffffff",
+];
+
+/// `ProfileType`'s whole modelled value set (`smithy_query(query="shape",
+/// shape="ProfileType")` reports `[LOCAL, PARTNER]`).
+pub(crate) const PROFILE_TYPES: [&str; 2] = ["LOCAL", "PARTNER"];
+
 /// One emulator: the shared engine plus the transfer service mounted on a router.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
@@ -162,6 +176,21 @@ impl Emulator {
             "CreateUser {user_name}: expected 200, got {} with body {}",
             answer.status, answer.body
         );
+    }
+
+    /// Create an AS2 profile from `request` and return its `ProfileId`.
+    pub(crate) async fn create_profile(&self, request: Value) -> String {
+        let answer = self.call("CreateProfile", request).await;
+        assert_eq!(
+            answer.status, 200,
+            "CreateProfile: expected 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        answer
+            .get("ProfileId")
+            .as_str()
+            .unwrap_or_else(|| panic!("CreateProfile returned no ProfileId: {}", answer.body))
+            .to_string()
     }
 }
 

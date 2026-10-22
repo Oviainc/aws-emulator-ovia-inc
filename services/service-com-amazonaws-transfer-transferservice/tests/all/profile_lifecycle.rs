@@ -16,16 +16,9 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{assert_members, is_modelled_profile_id, member_of, Emulator, ACCOUNT, REGION};
-
-/// Identifiers satisfying `CertificateIds`' member shape `CertificateId`
-/// (`len 22..22`, pattern `^cert-([0-9a-f]{17})$`, from
-/// `smithy_query(query="shape",shape="CertificateIds")`).
-const CERTIFICATE_IDS: [&str; 3] = [
-    "cert-00000000000000000",
-    "cert-0123456789abcdef0",
-    "cert-fffffffffffffffff",
-];
+use crate::harness::{
+    assert_members, is_modelled_profile_id, member_of, Emulator, ACCOUNT, CERTIFICATE_IDS, REGION,
+};
 
 /// One `CreateProfile` request, as the configuration it is built from.
 struct Case {
@@ -151,23 +144,11 @@ fn cases() -> Vec<Case> {
 }
 
 /// Create the profile `case` describes and return its `ProfileId`.
+///
+/// The create-and-assert-200 walk itself is [`Emulator::create_profile`], shared with
+/// every other profile suite; this adds only the modelled-id check and names the case.
 async fn create_profile(emulator: &Emulator, case: &Case) -> String {
-    let answer = emulator.call("CreateProfile", case.request()).await;
-    assert_eq!(
-        answer.status, 200,
-        "case {:?}: expected CreateProfile 200, got {} with body {}",
-        case.name, answer.status, answer.body
-    );
-    let profile_id = answer
-        .get("ProfileId")
-        .as_str()
-        .unwrap_or_else(|| {
-            panic!(
-                "case {:?}: CreateProfile returned no ProfileId, body {}",
-                case.name, answer.body
-            )
-        })
-        .to_string();
+    let profile_id = emulator.create_profile(case.request()).await;
     assert!(
         is_modelled_profile_id(&profile_id),
         "case {:?}: expected a ProfileId matching ^p-([0-9a-f]{{17}})$, got {profile_id:?}",

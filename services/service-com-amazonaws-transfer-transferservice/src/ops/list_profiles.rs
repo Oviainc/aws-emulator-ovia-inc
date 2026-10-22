@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the stored AS2 profiles in `BTreeMap` (`ProfileId`) order, with the same page
+//! bound and opaque-token contract as `ListServers`/`ListUsers`. `ProfileType` is a
+//! FILTER over that order — absent, every type is listed — so a page and its
+//! `NextToken` describe the filtered listing. Reports stored state and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProfiles"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ListProfilesErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListProfilesErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                    message: "The NextToken is not valid".to_string(),
+                })
+            })?),
+            None => None,
+        };
+
+        let guard = state.lock();
+
+        // ONE walk of the profile map, narrowed by the caller's `ProfileType`: the
+        // records to render come straight out of it, so no row is looked up a second
+        // time. Paging is a position in the FILTERED order, so a `NextToken` resumes
+        // the same listing the caller asked for. An absent `ProfileType` narrows
+        // nothing, which is what the member documents ("If not supplied in the
+        // request, the command lists all types of profiles").
+        let wanted_type = input.profile_type.as_deref();
+        let stored: Vec<&st::Profile> = guard
+            .profiles
+            .values()
+            .filter(|profile| wanted_type.is_none_or(|want| profile.profile_type == want))
+            .collect();
+        let ids: Vec<&str> = stored
+            .iter()
+            .map(|profile| profile.profile_id.as_str())
+            .collect();
+        let (page, next_key) =
+            st::page_bounds(&ids, after.as_deref(), st::page_limit(input.max_results));
+
+        let profiles = stored
+            .get(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|stored| ListedProfile {
+                arn: Some(stored.arn.clone()),
+                profile_id: Some(stored.profile_id.clone()),
+                as2_id: Some(stored.as2_id.clone()),
+                profile_type: Some(stored.profile_type.clone()),
+            })
+            .collect();
+
+        Ok(ListProfilesOutput {
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            profiles,
+        })
     }
 }

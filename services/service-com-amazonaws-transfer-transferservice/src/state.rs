@@ -1111,9 +1111,10 @@ impl User {
 
 /// One stored AS2 profile, keyed by `ProfileId`.
 ///
-/// Everything `DescribeProfile` reports is RESOLVED here, at create time, so a reader
-/// projects the stored record without re-deriving anything: the minted id, its ARN,
-/// the AS2-name, the profile type and the certificate ids and tags the create carried.
+/// Everything `DescribeProfile` and `ListProfiles` report is RESOLVED here, at create
+/// time, so a reader projects the stored record without re-deriving anything: the
+/// minted id, its ARN, the AS2-name, the profile type and the certificate ids and tags
+/// the create carried.
 #[derive(Debug, Clone)]
 pub struct Profile {
     /// The minted `p-` + 17 hex-digit identifier (`^p-([0-9a-f]{17})$`).
@@ -1123,6 +1124,9 @@ pub struct Profile {
     pub as2_id: String,
     /// `LOCAL` or `PARTNER` — the `ProfileType` enum, enforced before a handler runs.
     pub profile_type: String,
+    /// The certificate identifiers the create named, stored as given: this service
+    /// holds no certificate records yet (`ImportCertificate` is still a scaffold with
+    /// its own issue), so there is nothing to resolve them against.
     pub certificate_ids: Vec<String>,
     pub tags: Vec<Tag>,
 }
