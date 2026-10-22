@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConsoleAuthorizationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConsoleAuthorizationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConsoleAuthorizationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the console-authorization configuration
+//! `PutConsoleAuthorizationConfiguration` persisted for a target. Absent a `targetId` the
+//! target is the caller's own account; a target that was never configured is a
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConsoleAuthorizationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConsoleAuthorizationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConsoleAuthorizationConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetConsoleAuthorizationConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        error: crate::state::SERVER_ERROR_CODE.to_string(),
+                        message: "the signin console authorization store is unavailable"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let target_id = crate::state::requested_target(input.target_id);
+        // A read: the answer is whatever the put stored for this target, and a target
+        // nothing was stored for is reported missing rather than defaulted.
+        let Some((target_id, scope, console_authorization_enabled)) = state
+            .lock()
+            .console_auth_configs
+            .get(&target_id)
+            .map(crate::state::ConsoleAuthorizationConfiguration::to_members)
+        else {
+            return Err(
+                GetConsoleAuthorizationConfigurationErrorModeled::ResourceNotFoundException(
+                    crate::state::configuration_not_found(&target_id),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetConsoleAuthorizationConfigurationOutput {
+            target_id,
+            scope,
+            console_authorization_enabled,
+        })
     }
 }
