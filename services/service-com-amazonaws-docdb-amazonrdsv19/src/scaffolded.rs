@@ -234,6 +234,89 @@ impl SerializableStruct for InternalFailure {
     }
 }
 
+/// One of the awsQuery protocol's COMMON errors — the error codes AWS documents for every
+/// Query API ("Common Errors" in the API reference) and models as no shape, so an operation
+/// that must answer one cannot do it through its `#[operation_error]` enum.
+///
+/// Each is a client (`Sender`) fault answered with HTTP 400, and the code is what a client
+/// branches on, so it is carried as a `'static` string rather than built per request. The
+/// catalogue is deliberately the whole documented set, not only the code this crate
+/// constructs today: the sibling refusals (a value outside a documented constraint, an
+/// absent required parameter) answer `ValidationException` for now and move onto their own
+/// documented code without a change here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryCommonError {
+    /// "Parameters that must not be used together were used together." — what a Query
+    /// service answers when the request's parameters cannot hold together, including a
+    /// value that is not valid for another parameter it was given (an `EngineVersion` the
+    /// requested `Engine` does not offer).
+    InvalidParameterCombination,
+    /// "An invalid or out-of-range value was supplied for the input parameter."
+    InvalidParameterValue,
+    /// "The request is missing a required parameter."
+    MissingParameter,
+}
+
+impl QueryCommonError {
+    /// The wire error code (`<Code>` in the `<ErrorResponse>` envelope), exactly as AWS
+    /// documents it. Keep these literals: a client matches on them.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidParameterCombination => "InvalidParameterCombination",
+            Self::InvalidParameterValue => "InvalidParameterValue",
+            Self::MissingParameter => "MissingParameter",
+        }
+    }
+}
+
+/// The `message` member of the synthetic query-common error shape.
+static QUERY_COMMON_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#QueryCommonError$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic query-common error shape. In the `smithy.framework` namespace
+/// for the same reason as `NotImplemented`: the shape is in no service's model. The wire
+/// `<Code>` comes from [`OperationError::shape_name`], which answers the documented code.
+pub static QUERY_COMMON_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#QueryCommonError",
+        "smithy.framework",
+        "QueryCommonError",
+    ),
+    ShapeType::Structure,
+    &[&QUERY_COMMON_MESSAGE],
+);
+
+/// The payload of a query-common failure: which documented code, and why.
+#[derive(Debug, Clone)]
+pub struct QueryCommonFailure {
+    pub code: QueryCommonError,
+    pub message: String,
+}
+
+impl std::fmt::Display for QueryCommonFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code.code(), self.message)
+    }
+}
+
+impl std::error::Error for QueryCommonFailure {}
+
+impl SerializableStruct for QueryCommonFailure {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&QUERY_COMMON_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -261,6 +344,15 @@ pub enum Scaffolded<E> {
     /// would claim the operation was never written, and a 400 would blame the caller
     /// for the emulator's own failure.
     InternalFailure(InternalFailure),
+    /// One of the awsQuery protocol's documented COMMON errors, which this model declares
+    /// no shape for. Renders as HTTP 400 with that documented code (a `Sender` fault).
+    ///
+    /// Reach for this ONLY for a refusal whose code AWS documents for every Query service
+    /// and whose shape the model therefore omits — `InvalidParameterCombination` for an
+    /// `EngineVersion` the requested engine does not offer, say. A refusal the operation
+    /// DOES model is returned as that modelled error instead, so a client keeps branching
+    /// on the code the model publishes.
+    QueryCommon(QueryCommonFailure),
 }
 
 impl<E> Scaffolded<E> {
@@ -296,6 +388,16 @@ impl<E> Scaffolded<E> {
     pub fn internal_failure(message: impl Into<String>) -> Self {
         Self::InternalFailure(InternalFailure::new(message))
     }
+
+    /// Refuse the request with one of awsQuery's documented common error codes; see
+    /// [`Scaffolded::QueryCommon`]. The message is what the caller has to fix the request
+    /// from, so build it from the request — name the value that cannot be accepted.
+    pub fn query_common(code: QueryCommonError, message: impl Into<String>) -> Self {
+        Self::QueryCommon(QueryCommonFailure {
+            code,
+            message: message.into(),
+        })
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -305,6 +407,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::InternalFailure(e) => write!(f, "{e}"),
+            Self::QueryCommon(e) => write!(f, "{e}"),
         }
     }
 }
@@ -318,6 +421,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::InternalFailure(e) => e.source(),
+            Self::QueryCommon(e) => e.source(),
         }
     }
 }
@@ -333,6 +437,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::InternalFailure(e) => e,
+            Self::QueryCommon(e) => e,
         }
     }
 
@@ -342,6 +447,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::InternalFailure(_) => &INTERNAL_FAILURE_SCHEMA,
+            Self::QueryCommon(_) => &QUERY_COMMON_SCHEMA,
         }
     }
 
@@ -355,6 +461,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::InternalFailure(_) => "InternalFailure",
+            // The documented common-error code; see [`QueryCommonError::code`].
+            Self::QueryCommon(e) => e.code.code(),
         }
     }
 
@@ -368,6 +476,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::InternalFailure(_) => 500,
+            // Every awsQuery common error is a client fault; AWS answers all of them 400.
+            Self::QueryCommon(_) => 400,
         }
     }
 
@@ -382,6 +492,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => None,
             // Same reason again: the synthetic shape carries no `awsQueryError` trait.
             Self::InternalFailure(_) => None,
+            // The code IS the query code here, and `shape_name` already answers it, so
+            // there is nothing to override: the query envelope renders the same literal
+            // either way.
+            Self::QueryCommon(_) => None,
         }
     }
 }

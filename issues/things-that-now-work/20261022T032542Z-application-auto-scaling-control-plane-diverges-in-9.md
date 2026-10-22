@@ -34,6 +34,38 @@ Issue-Commit: 5598afbcdd0af564c379fb305d1563cf7235aea7
 
 > _Note: this issue was identified against the code base at commit `5598afbcdd0af564c379fb305d1563cf7235aea7`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+Causes 1–5 and 7–9 are satisfied in the Application Auto Scaling crate.
+
+Already in place when this fix landed (and re-verified here): the registration's resolution
+of `ResourceId` against the owning service's store and region, the CloudWatch alarm set a
+target-tracking policy owns (with its cascade on `DeleteScalingPolicy` and
+`DeregisterScalableTarget`), the two request-derived refusal messages (cause 5),
+`PutScheduledAction` including its negative paths (cause 7) and the reserved `aws:` tag
+namespace on `TagResource`/`UntagResource` (cause 8).
+
+Added by this fix: the target-tracking metric rules of cause 1 — a predefined metric is
+accepted only on a scalable dimension its own service publishes it for, with a target value
+inside that metric's published window, a customized metric is refused where the dimension IS
+a provisioned read/write throughput, and one metric takes one target-tracking policy per
+target; the per-dimension capacity floor of cause 2; the suffixed, per-namespace
+service-linked role of cause 4; and the modelled `ConcurrentUpdateException` of cause 9,
+raised when one registration's update of a target overlaps another's.
+
+The two message examples the Description itself flags as constant recorded strings with no
+derivable rule are left as they are.
+
+Cause 6 is DECLINED here and is NOT fixed: `AWS::ApplicationAutoScaling::ScalableTarget`
+/ `ScalingPolicy` provisioning and stack `Outputs` are a CloudFormation capability — that
+emulator provisions no resource of ANY type and resolves no `Outputs` for any template
+(see `services/service-com-amazonaws-cloudformation-cloudformation/src/ops/describe_stacks.rs`,
+which documents it on the `Outputs` member) — and CloudFormation carries its own issue for
+it. The two traces `application-auto-scaling.deploy-cloudformation-scalable-target-and-policy-scale-the-table`
+and `application-auto-scaling.deploy-cloudformation-scalable-target-min-above-max-rejected`
+therefore still fail, on the CloudFormation side; what this service supplies is the refusal
+such a provider must propagate into `CREATE_FAILED`.
+
 ## Operation
 PutScalingPolicy
 

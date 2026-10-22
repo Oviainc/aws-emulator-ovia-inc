@@ -20,8 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    DBCluster, DBClusterMember, DBClusterSnapshot, DBInstance, Endpoint,
-    ServerlessV2ScalingConfigurationInfo, Tag, VpcSecurityGroupMembership,
+    DBCluster, DBClusterMember, DBClusterParameterGroup, DBClusterSnapshot, DBInstance,
+    DBSubnetGroup, Endpoint, ServerlessV2ScalingConfigurationInfo, Subnet, Tag,
+    VpcSecurityGroupMembership,
 };
 
 /// The ARN namespace and sigv4 signing name DocumentDB shares with RDS, so a cluster ARN
@@ -32,8 +33,9 @@ pub const ARN_NAMESPACE: &str = "rds";
 pub const DOCDB_ENGINE: &str = "docdb";
 
 /// `CreateDBClusterMessage$EngineVersion`: "The --engine-version will default to the
-/// latest major engine version." Amazon DocumentDB's latest major version is 5.0.
-pub const DEFAULT_ENGINE_VERSION: &str = "5.0.0";
+/// latest major engine version." Derived from the catalogue rather than restated, so a
+/// version added to [`DOCDB_ENGINE_VERSIONS`] moves the default with it.
+pub const DEFAULT_ENGINE_VERSION: &str = DOCDB_ENGINE_VERSIONS[DOCDB_ENGINE_VERSIONS.len() - 1];
 
 /// The port DocumentDB listens on when `Port` is absent (the engine's default port, and
 /// the one `aws docdb create-db-cluster` reports back for a cluster created without it).
@@ -112,6 +114,42 @@ pub const SNAPSHOT_TYPE_MANUAL: &str = "manual";
 /// The region used when a request carries no SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The engine versions the `docdb` engine offers, oldest first. These are the versions
+/// Amazon DocumentDB publishes for the engine ("Amazon DocumentDB release notes"; they are
+/// also what `DescribeDBEngineVersions` reports), and they are the catalogue
+/// [`resolve_engine_version`] answers from: a request naming a version that is not in it
+/// names a version the engine cannot run.
+pub const DOCDB_ENGINE_VERSIONS: [&str; 3] = ["3.6.0", "4.0.0", "5.0.0"];
+
+/// `CreateDBSubnetGroupMessage$DBSubnetGroupName`: "Must contain no more than 255 letters,
+/// numbers, periods, underscores, spaces, or hyphens."
+pub const MAX_SUBNET_GROUP_NAME_LEN: usize = 255;
+
+/// `CreateDBSubnetGroupMessage$DBSubnetGroupName` and
+/// `DeleteDBSubnetGroupMessage$DBSubnetGroupName` both state it: "Must not be default".
+pub const RESERVED_SUBNET_GROUP_NAME: &str = "default";
+
+/// `CreateDBSubnetGroup`: "subnet groups must contain at least one subnet in at least two
+/// Availability Zones in the Amazon Web Services Region."
+///
+/// Which Availability Zone a subnet sits in is EC2's to say, and this emulator has no
+/// subnet inventory to read it from, so the rule is enforced at the granularity the request
+/// itself carries: fewer than this many distinct subnets cannot cover two zones. A group
+/// that does clear the bound reports its subnets without inventing a zone for them (see
+/// [`DbSubnetGroupRecord::to_shape`]).
+pub const MIN_SUBNETS_PER_SUBNET_GROUP: usize = 2;
+
+/// `DBSubnetGroup$SubnetGroupStatus` for a group whose subnets are all usable.
+pub const SUBNET_GROUP_COMPLETE: &str = "Complete";
+
+/// `Subnet$SubnetStatus` for a subnet that is in service.
+pub const SUBNET_ACTIVE: &str = "Active";
+
+/// The default-parameter-group name prefix AWS uses: a default cluster parameter group is
+/// named `default.<family>` (`default.docdb5.0`), one per engine-version family, and exists
+/// in every account and Region without anybody creating it.
+pub const DEFAULT_PARAMETER_GROUP_PREFIX: &str = "default.";
+
 // ---------------------------------------------------------------------------
 // Store bounds
 //
@@ -145,6 +183,15 @@ pub const MAX_DB_INSTANCES: usize = 40;
 /// create/delete-with-final-snapshot loop stops at this cap with the modelled
 /// `SnapshotQuotaExceededFault` instead of growing without limit.
 pub const MAX_DB_CLUSTER_SNAPSHOTS: usize = 100;
+
+/// Amazon DocumentDB's published default quota "Subnet groups: 50" per Region. An
+/// over-quota create is refused with the modelled `DBSubnetGroupQuotaExceededFault` rather
+/// than stored.
+pub const MAX_DB_SUBNET_GROUPS: usize = 50;
+
+/// Amazon DocumentDB's published default quota "Subnets per subnet group: 20". A create
+/// naming more is refused with the modelled `DBSubnetQuotaExceededFault`.
+pub const MAX_SUBNETS_PER_SUBNET_GROUP: usize = 20;
 
 /// AWS's tagging limit of 50 tags per resource.
 pub const MAX_TAGS: usize = 50;
@@ -495,6 +542,66 @@ impl DbClusterSnapshotRecord {
     }
 }
 
+/// A persisted subnet group: the set of VPC subnets a cluster's instances may be placed
+/// in. Created by `CreateDBSubnetGroup`, reported by `DescribeDBSubnetGroups`, named by
+/// `CreateDBCluster`'s `DBSubnetGroupName`, and reclaimed by `DeleteDBSubnetGroup`.
+///
+/// The name is stored lowercased (`DBSubnetGroupName`: "This value is stored as a lowercase
+/// string") and is this record's key in
+/// [`ComAmazonawsDocdbAmazonrdsv19State::subnet_groups`]. The ARN is derived from the name
+/// rather than stored.
+#[derive(Debug, Clone)]
+pub struct DbSubnetGroupRecord {
+    /// The lowercased `DBSubnetGroupName`.
+    pub name: String,
+    /// `DBSubnetGroupDescription`.
+    pub description: String,
+    /// The region whose credential scope the create was signed with; the ARN sits in it.
+    pub region: String,
+    /// The `SubnetIds` the caller named, in request order.
+    pub subnet_ids: Vec<String>,
+    /// The group's tags, as (key, value).
+    pub tags: Vec<(String, String)>,
+}
+
+impl DbSubnetGroupRecord {
+    /// `DBSubnetGroupArn`, derived from the name.
+    pub fn arn(&self) -> String {
+        ::engine::emulator_arn(
+            ARN_NAMESPACE,
+            &self.region,
+            &format!("subgrp:{}", self.name),
+        )
+    }
+
+    /// This record as the modeled `DBSubnetGroup`.
+    ///
+    /// `VpcId` and `SupportedNetworkTypes` are EC2's to answer — the VPC a subnet belongs
+    /// to, and whether that subnet carries IPv6 — and this emulator has no subnet
+    /// inventory to read either from, so both members are omitted rather than invented.
+    /// `SubnetAvailabilityZone` is omitted for the same reason.
+    pub fn to_shape(&self) -> DBSubnetGroup {
+        DBSubnetGroup {
+            db_subnet_group_name: Some(self.name.clone()),
+            db_subnet_group_description: Some(self.description.clone()),
+            vpc_id: None,
+            subnet_group_status: Some(SUBNET_GROUP_COMPLETE.to_string()),
+            subnets: Some(
+                self.subnet_ids
+                    .iter()
+                    .map(|id| Subnet {
+                        subnet_identifier: Some(id.clone()),
+                        subnet_availability_zone: None,
+                        subnet_status: Some(SUBNET_ACTIVE.to_string()),
+                    })
+                    .collect(),
+            ),
+            db_subnet_group_arn: Some(self.arn()),
+            supported_network_types: None,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-docdb-amazonrdsv19. A handler reaches it through [`service_state`].
 ///
 /// Every map is ordered, so a describe and the pagination marker it hands back are stable
@@ -507,6 +614,8 @@ pub struct ComAmazonawsDocdbAmazonrdsv19State {
     pub instances: BTreeMap<String, DbInstanceRecord>,
     /// Final cluster snapshots, keyed by `DBClusterSnapshotIdentifier`.
     pub snapshots: BTreeMap<String, DbClusterSnapshotRecord>,
+    /// Subnet groups, keyed by lowercased `DBSubnetGroupName`.
+    pub subnet_groups: BTreeMap<String, DbSubnetGroupRecord>,
     /// Monotonic counter behind every minted resource id, so ids are deterministic.
     pub next_resource_id: u64,
 }
@@ -565,6 +674,40 @@ impl ComAmazonawsDocdbAmazonrdsv19State {
             .values()
             .find(|record| record.arn() == value)
             .map(|record| record.identifier.clone())
+    }
+
+    /// The key of the subnet group `value` names: either its (case-insensitive) name or its
+    /// ARN, the two forms every `DBSubnetGroupName` member accepts.
+    pub fn resolve_subnet_group_key(&self, value: &str) -> Option<String> {
+        let lowered = value.to_ascii_lowercase();
+        if self.subnet_groups.contains_key(&lowered) {
+            return Some(lowered);
+        }
+        // See [`Self::resolve_cluster_key`]: only an ARN can match the scan.
+        if !value.starts_with("arn:") {
+            return None;
+        }
+        self.subnet_groups
+            .values()
+            .find(|record| record.arn() == value)
+            .map(|record| record.name.clone())
+    }
+
+    /// The identifiers of the clusters that are placed in the subnet group keyed `key`.
+    ///
+    /// `DeleteDBSubnetGroup`: "The specified database subnet group must not be associated
+    /// with any DB instances", so a group with users is refused rather than deleted.
+    pub fn subnet_group_users(&self, key: &str) -> Vec<String> {
+        self.clusters
+            .values()
+            .filter(|cluster| {
+                cluster
+                    .db_subnet_group
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(key))
+            })
+            .map(|cluster| cluster.identifier.clone())
+            .collect()
     }
 
     /// Give the cluster a writer again after one was removed: the surviving member with
@@ -702,6 +845,142 @@ pub fn validate_engine(value: &str) -> Result<(), String> {
     Err(format!(
         "Invalid value '{value}' for Engine: the only valid value is '{DOCDB_ENGINE}'"
     ))
+}
+
+/// Refuse a subnet-group name outside its documented rule; see
+/// [`MAX_SUBNET_GROUP_NAME_LEN`] and [`RESERVED_SUBNET_GROUP_NAME`].
+pub fn validate_subnet_group_name(member: &str, value: &str) -> Result<(), String> {
+    let allowed = |c: char| {
+        c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == ' ' || c == '-'
+    };
+    let well_formed = !value.is_empty()
+        && value.chars().count() <= MAX_SUBNET_GROUP_NAME_LEN
+        && value.chars().all(allowed)
+        && !value.eq_ignore_ascii_case(RESERVED_SUBNET_GROUP_NAME);
+    if well_formed {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid value '{value}' for {member}: it must contain no more than \
+         {MAX_SUBNET_GROUP_NAME_LEN} letters, numbers, periods, underscores, spaces, or \
+         hyphens, and must not be '{RESERVED_SUBNET_GROUP_NAME}'"
+    ))
+}
+
+/// The published engine version a requested `EngineVersion` names, or `None` when the
+/// engine offers none.
+///
+/// A request may name a version as precisely as it likes: an exact published version
+/// (`5.0.0`) or a leading component of one at a dot boundary (`5.0`, `5`), which is how a
+/// caller asks for "the latest in that line" and how `EngineVersion`'s own documentation
+/// talks about "the intended major engine version". The newest matching version wins, which
+/// is what "The --engine-version will default to the latest major engine version" describes
+/// for the absent case. Anything else names a version the engine cannot run.
+pub fn resolve_engine_version(requested: &str) -> Option<&'static str> {
+    DOCDB_ENGINE_VERSIONS
+        .iter()
+        .rev()
+        .find(|published| {
+            **published == requested
+                || published
+                    .strip_prefix(requested)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+        .copied()
+}
+
+/// The `DBParameterGroupFamily` of an engine version: the engine name followed by the
+/// version's `major.minor` line (`5.0.0` -> `docdb5.0`), which is the form
+/// `DBClusterParameterGroup$DBParameterGroupFamily` reports.
+pub fn parameter_group_family(version: &str) -> String {
+    let mut parts = version.split('.');
+    let major = parts.next().unwrap_or(version);
+    match parts.next() {
+        Some(minor) => format!("{DOCDB_ENGINE}{major}.{minor}"),
+        None => format!("{DOCDB_ENGINE}{major}"),
+    }
+}
+
+/// The cluster parameter group every account and Region already has for `family`, as AWS
+/// names it: `default.<family>`; see [`DEFAULT_PARAMETER_GROUP_PREFIX`].
+pub fn default_parameter_group_name(family: &str) -> String {
+    format!("{DEFAULT_PARAMETER_GROUP_PREFIX}{family}")
+}
+
+/// The default cluster parameter groups the engine's published versions imply: one per
+/// engine-version family, ordered by name, each sitting in `region`.
+///
+/// These are not caller-created records and so are not in the store: AWS provides one
+/// default cluster parameter group per family in every account and Region, and
+/// `DescribeDBClusterParameterGroups` reports them with no create having happened. A
+/// caller-created group (`CreateDBClusterParameterGroup`, still scaffolded) will be a
+/// stored record read alongside these.
+pub fn default_parameter_groups(region: &str) -> Vec<DBClusterParameterGroup> {
+    let mut families: Vec<String> = DOCDB_ENGINE_VERSIONS
+        .iter()
+        .map(|version| parameter_group_family(version))
+        .collect();
+    families.sort();
+    families.dedup();
+    families
+        .iter()
+        .map(|family| {
+            let name = default_parameter_group_name(family);
+            DBClusterParameterGroup {
+                db_cluster_parameter_group_arn: Some(::engine::emulator_arn(
+                    ARN_NAMESPACE,
+                    region,
+                    &format!("cluster-pg:{name}"),
+                )),
+                db_cluster_parameter_group_name: Some(name),
+                db_parameter_group_family: Some(family.clone()),
+                description: Some(format!("Default cluster parameter group for {family}")),
+            }
+        })
+        .collect()
+}
+
+/// The cluster parameter group `name` names, or `None` when there is no such group.
+///
+/// Matching is case-insensitive on the name, as every parameter-group name member is.
+pub fn resolve_parameter_group(name: &str, region: &str) -> Option<DBClusterParameterGroup> {
+    default_parameter_groups(region).into_iter().find(|group| {
+        group
+            .db_cluster_parameter_group_name
+            .as_deref()
+            .is_some_and(|stored| stored.eq_ignore_ascii_case(name))
+    })
+}
+
+/// Whether `family` is a parameter-group family THIS model publishes (`docdb5.0`).
+///
+/// A family belongs to one engine, so a request naming another engine's family
+/// (`aurora-mysql8.0`) is not this model's to answer — see [`serves_parameter_group_name`],
+/// which the shared `rds` front door reads for the same decision.
+pub fn serves_parameter_group_family(family: &str) -> bool {
+    DOCDB_ENGINE_VERSIONS
+        .iter()
+        .any(|version| parameter_group_family(version).eq_ignore_ascii_case(family))
+}
+
+/// Whether THIS model can answer for the cluster parameter group `name` at all.
+///
+/// A default group's name names its family (`default.docdb5.0`), and a family belongs to one
+/// engine, so a `default.<family>` name is answerable only by the model that publishes that
+/// family — this one answers for the DocumentDB families and for no other engine's. Any
+/// other name is a caller-created group, and this service's store is the only cluster
+/// parameter-group store in this emulator, so a name it does not hold is a group that does
+/// not exist whichever engine asked.
+///
+/// The shared `rds` front door reads this to decide which co-located model serves a
+/// parameter-group request (see
+/// `services/service-com-amazonaws-rds-amazonrdsv19/src/service.rs`), so a caller on another
+/// engine naming ITS family is not answered from this engine's catalogue.
+pub fn serves_parameter_group_name(name: &str) -> bool {
+    match name.strip_prefix(DEFAULT_PARAMETER_GROUP_PREFIX) {
+        Some(family) => serves_parameter_group_family(family),
+        None => true,
+    }
 }
 
 /// Refuse a `MasterUsername` outside its documented rule; see [`MAX_MASTER_USERNAME_LEN`].

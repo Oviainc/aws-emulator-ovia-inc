@@ -32,10 +32,10 @@ use std::sync::Arc;
 use aws_emulator_router::{build_router, InMemoryEngine};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The awsQuery API version all three services share.
-const API_VERSION: &str = "2014-10-31";
+pub(crate) const API_VERSION: &str = "2014-10-31";
 
 /// The region every signed request below is signed for.
 const REGION: &str = "us-east-1";
@@ -412,7 +412,7 @@ fn rds_docdb_and_neptune_route_apart_under_one_signing_name() {
 /// The SigV4 `Authorization` header of a request signed for `signing_name`, as every AWS
 /// SDK sends it. The signature is never checked: the claim predicate reads only the
 /// credential scope.
-fn authorization(signing_name: &str) -> String {
+pub(crate) fn authorization(signing_name: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{signing_name}/aws4_request, \
          SignedHeaders=host, Signature=not-verified"

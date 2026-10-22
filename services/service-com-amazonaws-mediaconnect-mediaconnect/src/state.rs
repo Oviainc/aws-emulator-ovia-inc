@@ -8,12 +8,12 @@
 //! segment of the ARN the service mints, so two flows with one name would share one
 //! ARN.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    EncodingConfig, Encryption, Entitlement, FailoverConfig, Flow, ListedFlow, Maintenance,
-    MediaStream, MonitoringConfig, NdiConfig, Output, Source, Transport, VpcInterface,
+    AddOutputRequest, EncodingConfig, Encryption, Entitlement, FailoverConfig, Flow, ListedFlow,
+    Maintenance, MediaStream, MonitoringConfig, NdiConfig, Output, Source, Transport, VpcInterface,
     VpcInterfaceAttachment,
 };
 
@@ -37,6 +37,13 @@ pub const STATUS_DELETING: &str = "DELETING";
 pub const SOURCE_TYPE_OWNED: &str = "OWNED";
 /// See [`SOURCE_TYPE_OWNED`].
 pub const SOURCE_TYPE_ENTITLED: &str = "ENTITLED";
+
+/// `OutputStatus` / `EntitlementStatus` enum value the model documents as the default
+/// MediaConnect applies when the request omits the member: "If you don't specify the
+/// outputStatus field in your request, MediaConnect sets it to ENABLED"
+/// (`AddOutputRequest$OutputStatus`), and the same sentence on
+/// `GrantEntitlementRequest$EntitlementStatus`.
+pub const STATUS_ENABLED: &str = "ENABLED";
 
 /// How long a flow stays in a transient status (`STARTING`, `STOPPING`) before the
 /// clock settles it into the steady one.
@@ -80,6 +87,17 @@ pub const MAX_FLOWS: usize = 5_000;
 /// bound. CreateFlow refuses past it with `BadRequestException`, which the model
 /// describes as the error for "a semantic error" in the request.
 pub const MAX_FLOW_COLLECTION_ENTRIES: usize = 50;
+
+/// The ceiling on how many outputs ONE FLOW holds, however many calls fill it: "You can
+/// create up to 50 outputs per flow"
+/// (`smithy_query(query="operation",operation="AddFlowOutputs")`), the one count AWS
+/// publishes for a flow's outputs. It happens to equal
+/// [`MAX_FLOW_COLLECTION_ENTRIES`] — CreateFlow's per-request bound — but it is a
+/// different rule: this one bounds the STORED flow, so a sequence of adds cannot grow
+/// one past it. AddFlowOutputs refuses past it with its own modelled
+/// `AddFlowOutputs420Exception`, "raised by Elemental MediaConnect when adding the flow
+/// output".
+pub const MAX_FLOW_OUTPUTS: usize = 50;
 
 /// The first port handed to a source that did not ask for one. MediaConnect assigns an
 /// ingest port from its own pool when the request omits `IngestPort`; the emulator
@@ -156,6 +174,57 @@ pub struct StoredOutput {
 }
 
 impl StoredOutput {
+    /// Materialise one `AddOutputRequest` into the output record a flow keeps.
+    ///
+    /// Every operation that adds an output to a flow (CreateFlow's `Outputs`,
+    /// AddFlowOutputs) materialises it HERE, so one request shape always becomes the
+    /// same stored record: the service mints the `OutputArn`, resolves `OutputStatus`
+    /// to the documented `ENABLED` default, and folds the request's transport members
+    /// into `Output.Transport`.
+    pub fn from_add_request(
+        request: &AddOutputRequest,
+        name: String,
+        region: &str,
+        suffix: u64,
+    ) -> Self {
+        StoredOutput {
+            output_arn: ::engine::emulator_arn(
+                SERVICE_NAMESPACE,
+                region,
+                &output_resource_fragment(suffix, &name),
+            ),
+            name,
+            description: request.description.clone(),
+            destination: request.destination.clone(),
+            port: request.port,
+            encryption: request.encryption.clone(),
+            output_status: Some(
+                request
+                    .output_status
+                    .clone()
+                    .unwrap_or_else(|| STATUS_ENABLED.to_string()),
+            ),
+            vpc_interface_attachment: request.vpc_interface_attachment.clone(),
+            // `Transport.Protocol` is required, so an output that names no protocol
+            // carries no transport rather than an empty one.
+            transport: request.protocol.clone().map(|protocol| Transport {
+                protocol,
+                cidr_allow_list: request.cidr_allow_list.clone(),
+                max_latency: request.max_latency,
+                min_latency: request.min_latency,
+                smoothing_latency: request.smoothing_latency,
+                remote_id: request.remote_id.clone(),
+                sender_control_port: request.sender_control_port,
+                stream_id: request.stream_id.clone(),
+                ndi_speed_hq_quality: request.ndi_speed_hq_quality,
+                ndi_program_name: request.ndi_program_name.clone(),
+                ndi_output_timecode_source: request.ndi_output_timecode_source.clone(),
+                ndi_audio_reference_level: request.ndi_audio_reference_level,
+                ..Transport::default()
+            }),
+        }
+    }
+
     /// The modelled `Output` for this record.
     pub fn to_output(&self) -> Output {
         Output {
@@ -229,6 +298,15 @@ impl StoredFlow {
             status: settled.to_string(),
             due_at: now + TRANSITION_SPAN,
         });
+    }
+
+    /// The names of the outputs the flow already holds — what
+    /// [`resolve_output_name`] checks a new output's name against.
+    pub fn output_names(&self) -> BTreeSet<String> {
+        self.outputs
+            .iter()
+            .map(|output| output.name.clone())
+            .collect()
     }
 
     /// `ListedFlow.SourceType`: `ENTITLED` when the flow ingests through an entitlement
@@ -326,6 +404,41 @@ impl ComAmazonawsMediaconnectMediaconnectState {
 /// and is unique per flow.
 pub fn flow_resource_fragment(suffix: u64, name: &str) -> String {
     format!("flow:1-{suffix:08x}:{name}")
+}
+
+/// The resource fragment of an output ARN: `output:<output id>:<name>`.
+///
+/// The id is the ARN counter in zero-padded hex, like [`flow_resource_fragment`]'s, so
+/// the fragment satisfies the pattern the model puts on every `OutputArn` label
+/// (`smithy_query(query="operation",operation="RemoveFlowOutput")`:
+/// `^arn:.+:mediaconnect.+:output:.+$`) and is unique per output.
+pub fn output_resource_fragment(suffix: u64, name: &str) -> String {
+    format!("output:1-{suffix:08x}:{name}")
+}
+
+/// The name an `AddOutputRequest` takes on a flow whose output names are `taken`.
+///
+/// `Output.Name` "must be unique within the current flow"
+/// (`smithy_query(query="shape",shape="Output",member="Name")`), and `Name` is optional
+/// on the request, so:
+///
+/// * a request that names the output keeps that name, unless `taken` already holds it —
+///   then the answer is `None` and the caller refuses the request with its own modelled
+///   client error;
+/// * a request that names none is given the first `output-<n>` (n counting from 1) that
+///   `taken` does not hold, so a generated name cannot collide either.
+///
+/// `taken` is every output name the flow already holds PLUS the names resolved for
+/// earlier outputs of the same request, so one request cannot add two outputs with one
+/// name.
+pub fn resolve_output_name(requested: Option<&str>, taken: &BTreeSet<String>) -> Option<String> {
+    match requested.filter(|name| !name.is_empty()) {
+        Some(name) if taken.contains(name) => None,
+        Some(name) => Some(name.to_string()),
+        None => (1..)
+            .map(|position| format!("output-{position}"))
+            .find(|candidate| !taken.contains(candidate)),
+    }
 }
 
 /// An ingest address for a source the emulator assigns an endpoint to.

@@ -104,12 +104,9 @@ use crate::state::{StoredFlow, StoredOutput, StoredSource};
 /// minting side and the ARN-recognising side name it once.
 use crate::state::SERVICE_NAMESPACE;
 
-/// `OutputStatus` / `EntitlementStatus` enum value the model documents as the default
-/// MediaConnect applies when the request omits the member: "If you don't specify the
-/// outputStatus field in your request, MediaConnect sets it to ENABLED"
-/// (`AddOutputRequest$OutputStatus`), and the same sentence on
-/// `GrantEntitlementRequest$EntitlementStatus`.
-const STATUS_ENABLED: &str = "ENABLED";
+/// The `ENABLED` default for a status the request omits, from [`crate::state`] so this
+/// operation and AddFlowOutputs resolve it the same way.
+use crate::state::STATUS_ENABLED;
 
 /// `NetworkInterfaceType` (`ena | efa`) applied when a VPC interface request omits one;
 /// `ena` is the standard elastic network adapter.
@@ -198,54 +195,6 @@ fn materialise_source(
             source_listener_port: request.source_listener_port,
             stream_id: request.stream_id.clone(),
             ndi_source_settings: request.ndi_source_settings.clone(),
-            ..Transport::default()
-        }),
-    }
-}
-
-/// Materialise one `AddOutputRequest` into the output record the flow keeps.
-fn materialise_output(
-    request: &AddOutputRequest,
-    index: usize,
-    region: &str,
-    suffix: u64,
-) -> StoredOutput {
-    let name = request
-        .name
-        .clone()
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| format!("output-{}", index + 1));
-    StoredOutput {
-        output_arn: ::engine::emulator_arn(
-            SERVICE_NAMESPACE,
-            region,
-            &format!("output:1-{suffix:08x}:{name}"),
-        ),
-        name,
-        description: request.description.clone(),
-        destination: request.destination.clone(),
-        port: request.port,
-        encryption: request.encryption.clone(),
-        output_status: Some(
-            request
-                .output_status
-                .clone()
-                .unwrap_or_else(|| STATUS_ENABLED.to_string()),
-        ),
-        vpc_interface_attachment: request.vpc_interface_attachment.clone(),
-        transport: request.protocol.clone().map(|protocol| Transport {
-            protocol,
-            cidr_allow_list: request.cidr_allow_list.clone(),
-            max_latency: request.max_latency,
-            min_latency: request.min_latency,
-            smoothing_latency: request.smoothing_latency,
-            remote_id: request.remote_id.clone(),
-            sender_control_port: request.sender_control_port,
-            stream_id: request.stream_id.clone(),
-            ndi_speed_hq_quality: request.ndi_speed_hq_quality,
-            ndi_program_name: request.ndi_program_name.clone(),
-            ndi_output_timecode_source: request.ndi_output_timecode_source.clone(),
-            ndi_audio_reference_level: request.ndi_audio_reference_level,
             ..Transport::default()
         }),
     }
@@ -498,10 +447,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let mut outputs = Vec::new();
-        for (index, request) in input.outputs.iter().flatten().enumerate() {
+        // An output's name is unique within its flow, so the outputs this request
+        // creates are named against each other as well as against the flow's (empty,
+        // for a flow being created) set.
+        let mut outputs: Vec<StoredOutput> = Vec::new();
+        let mut output_names: ::std::collections::BTreeSet<String> =
+            ::std::collections::BTreeSet::new();
+        for request in input.outputs.iter().flatten() {
+            let Some(name) =
+                crate::state::resolve_output_name(request.name.as_deref(), &output_names)
+            else {
+                return Err(bad_request(format!(
+                    "This request adds more than one output named {:?}. An output name must \
+                     be unique within its flow.",
+                    request.name.clone().unwrap_or_default()
+                )));
+            };
             let suffix = store.next_suffix();
-            outputs.push(materialise_output(request, index, &region, suffix));
+            output_names.insert(name.clone());
+            outputs.push(StoredOutput::from_add_request(
+                request, name, &region, suffix,
+            ));
         }
 
         let mut entitlements = Vec::new();
