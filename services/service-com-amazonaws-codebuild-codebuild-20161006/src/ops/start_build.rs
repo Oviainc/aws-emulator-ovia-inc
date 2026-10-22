@@ -371,12 +371,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .artifacts_override
                 .clone()
                 .or_else(|| project.artifacts.clone())
-                .map(build_artifacts_of),
+                .map(crate::state::build_artifacts_of),
             secondary_artifacts: input
                 .secondary_artifacts_override
                 .clone()
                 .or(project.secondary_artifacts)
-                .map(|list| list.into_iter().map(build_artifacts_of).collect()),
+                .map(|list| {
+                    list.into_iter()
+                        .map(crate::state::build_artifacts_of)
+                        .collect()
+                }),
             cache: input.cache_override.clone().or(project.cache),
             environment: Some(environment),
             service_role: input
@@ -557,13 +561,9 @@ fn resolve_source(mut source: ProjectSource, input: &StartBuildInput) -> Project
 /// The project's environment with this request's environment `*Override` members
 /// applied. `environmentVariablesOverride` "overrides, for this build only, the latest
 /// ones already defined in the build project", so it replaces a project variable of the
-/// same name and adds the rest.
-///
-/// The merge is keyed by a name -> position index rather than a scan per entry, so it
-/// stays linearithmic in the number of variables (the handler has already refused a
-/// request past [`crate::state::MAX_ENVIRONMENT_VARIABLES`]) while keeping the list
-/// order the model defines: a replaced variable stays where the project put it, and a
-/// new one is appended in the order the request listed it.
+/// same name and adds the rest — the merge itself is
+/// [`crate::state::merge_environment_variables`], shared with `StartBuildBatch`, which
+/// documents the same rule.
 fn resolve_environment(
     mut environment: ProjectEnvironment,
     input: &StartBuildInput,
@@ -596,38 +596,12 @@ fn resolve_environment(
         environment.host_kernel = Some(host_kernel);
     }
     if let Some(overrides) = input.environment_variables_override.clone() {
-        let mut resolved = environment.environment_variables.unwrap_or_default();
-        let mut position_of: ::std::collections::BTreeMap<String, usize> = resolved
-            .iter()
-            .enumerate()
-            .map(|(position, held)| (held.name.clone(), position))
-            .collect();
-        for variable in overrides {
-            match position_of.get(&variable.name) {
-                Some(&position) => resolved[position] = variable,
-                None => {
-                    position_of.insert(variable.name.clone(), resolved.len());
-                    resolved.push(variable);
-                }
-            }
-        }
-        environment.environment_variables = Some(resolved);
+        environment.environment_variables = Some(crate::state::merge_environment_variables(
+            environment.environment_variables.unwrap_or_default(),
+            overrides,
+        ));
     }
     environment
-}
-
-/// The build's view of its output artifacts: the configured destination, with the
-/// checksums and the resolved location left absent because nothing was uploaded.
-fn build_artifacts_of(artifacts: ProjectArtifacts) -> BuildArtifacts {
-    BuildArtifacts {
-        location: artifacts.location,
-        sha256sum: None,
-        md5sum: None,
-        override_artifact_name: artifacts.override_artifact_name,
-        encryption_disabled: artifacts.encryption_disabled,
-        artifact_identifier: artifacts.artifact_identifier,
-        bucket_owner_access: artifacts.bucket_owner_access,
-    }
 }
 
 /// The build's log location, from the resolved logs configuration. The deep links and

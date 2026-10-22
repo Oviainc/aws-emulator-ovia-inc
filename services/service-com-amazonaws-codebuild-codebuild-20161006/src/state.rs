@@ -4,12 +4,13 @@
 //!
 //! Every implemented CodeBuild operation computes its answer from the records
 //! here: `CreateProject` writes a [`Project`], `StartBuild` writes a
-//! [`StoredBuild`], `StartSandbox` writes a [`StoredSandbox`],
+//! [`StoredBuild`], `StartBuildBatch` writes a [`StoredBuildBatch`],
+//! `StartSandbox` writes a [`StoredSandbox`],
 //! `CreateReportGroup` writes a [`StoredReportGroup`],
 //! `ImportSourceCredentials` writes a [`StoredSourceCredentials`],
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
-//! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetSandboxes`,
-//! `BatchGetReportGroups`, `ListProjects`,
+//! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetBuildBatches`,
+//! `BatchGetSandboxes`, `BatchGetReportGroups`, `ListProjects`,
 //! `ListBuildsForProject`, `ListSourceCredentials`) only read them.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
@@ -19,7 +20,8 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    Build, BuildPhase, PhaseContext, Project, ReportGroup, Sandbox, SandboxSession,
+    Build, BuildArtifacts, BuildBatch, BuildBatchPhase, BuildPhase, EnvironmentVariable,
+    PhaseContext, Project, ProjectArtifacts, ReportGroup, Sandbox, SandboxSession,
     SandboxSessionPhase, SourceCredentialsInfo,
 };
 
@@ -39,8 +41,8 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// any build that has not been marked as completed. The default is 60 minutes."
 pub const DEFAULT_BUILD_TIMEOUT_MINUTES: i32 = 60;
 
-/// How long after `StartBuild` the clock owes a build's transition out of
-/// `IN_PROGRESS`.
+/// How long after `StartBuild` or `StartBuildBatch` the clock owes the started
+/// build's — or batch build's — transition out of `IN_PROGRESS`.
 ///
 /// AWS does not document a build duration — it depends on the buildspec — so
 /// this span is CHOSEN, inside the 250-750 ms band this project fixes for an
@@ -57,9 +59,12 @@ pub const BUILD_SETTLE_MILLIS: i64 = 750;
 /// still observes `QUEUED`. The due instant is stored, never slept on.
 pub const SANDBOX_SETTLE_MILLIS: i64 = 500;
 
-/// How long a `StartBuild` idempotency token stays in force. AWS documents it on
+/// How long a `StartBuild` or `StartBuildBatch` idempotency token stays in
+/// force. AWS documents the same lifetime on both members — on
 /// `StartBuildInput$idempotencyToken`: "The token is included in the StartBuild
-/// request and is valid for 5 minutes."
+/// request and is valid for 5 minutes.", and on
+/// `StartBuildBatchInput$idempotencyToken`: "The token is included in the
+/// StartBuildBatch request and is valid for five minutes."
 pub const IDEMPOTENCY_TOKEN_TTL_MILLIS: i64 = 5 * 60 * 1000;
 
 /// How long a `StartSandbox` idempotency token stays in force.
@@ -127,6 +132,15 @@ pub const REPORT_GROUP_ACTIVE_STATUS: &str = "ACTIVE";
 /// CodeBuild ages build history out too; the number itself is this emulator's.
 pub const MAX_BUILDS: usize = 10_000;
 
+/// Batch-build records this emulator retains, across every project.
+///
+/// The same growth-site reasoning as [`MAX_BUILDS`]: a batch build is minted by
+/// each `StartBuildBatch` rather than being a resource the caller deletes, so
+/// [`ComAmazonawsCodebuildCodebuild20161006State::insert_build_batch`] evicts the
+/// oldest batch (preferring one that has already completed) past this ceiling,
+/// pruning `build_batches_by_project` and the per-project counters with it.
+pub const MAX_BUILD_BATCHES: usize = 10_000;
+
 /// `StartBuild` idempotency entries retained at once.
 ///
 /// Every insert first drops the entries whose documented 5-minute lifetime has
@@ -181,6 +195,19 @@ pub const MAX_SANDBOX_IDEMPOTENCY_TOKENS: usize = MAX_IDEMPOTENCY_TOKENS;
 pub const BUILD_NOT_EXECUTED_MESSAGE: &str = "this emulator does not run CodeBuild build \
     containers, so the build could not be provisioned and no buildspec was executed";
 
+/// Why an emulated batch build never reaches `SUCCEEDED`.
+///
+/// A batch build's first act is `DOWNLOAD_BATCHSPEC`: CodeBuild fetches the
+/// project's source inside a build container and reads the batch section of its
+/// buildspec to learn which builds the batch is made of. Nothing in this
+/// emulator fetches a source or runs a container, so the batch specification is
+/// never read, no build of the batch exists, and the batch ends in CodeBuild's
+/// build-system failure status, `FAULT`, carrying this explanation as the
+/// failing phase's context.
+pub const BATCH_SPEC_NOT_DOWNLOADED_MESSAGE: &str = "this emulator does not run CodeBuild \
+    build containers, so the batch build specification could not be downloaded and no build \
+    of the batch was started";
+
 /// Why an emulated sandbox never becomes connectable.
 ///
 /// A sandbox IS a running container a caller attaches a Session Manager session to
@@ -222,6 +249,24 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     pub next_build_numbers: BTreeMap<String, i64>,
     /// `StartBuild` idempotency tokens, keyed by (project name, token).
     pub start_build_tokens: BTreeMap<(String, String), StartBuildToken>,
+    /// Batch builds, keyed by batch build id (`<projectName>:<uuid>`). Batch
+    /// builds are their own resource — a batch id is never a build id — so they
+    /// are held beside `builds` rather than mixed into it.
+    pub build_batches: BTreeMap<String, StoredBuildBatch>,
+    /// Batch build ids per project, in start order — which is
+    /// `buildBatchNumber` order, so a list operation sorts and pages over this
+    /// without re-reading every batch.
+    pub build_batches_by_project: BTreeMap<String, Vec<String>>,
+    /// The next `buildBatchNumber` to hand out per project. A project's first
+    /// batch build is 1 and each subsequent one is incremented by 1; AWS
+    /// documents that deleting a batch build leaves the other numbers alone, so
+    /// the counter is kept and a number is never reused.
+    pub next_build_batch_numbers: BTreeMap<String, i64>,
+    /// `StartBuildBatch` idempotency tokens, keyed by (project name, token).
+    /// Kept apart from `start_build_tokens` because the two operations issue
+    /// their tokens independently: the same token value may be in force for a
+    /// build and for a batch build of one project.
+    pub start_build_batch_tokens: BTreeMap<(String, String), StartBuildToken>,
     /// Report groups, keyed by report group name (names are unique per account,
     /// the same way project names are).
     pub report_groups: BTreeMap<String, StoredReportGroup>,
@@ -274,6 +319,20 @@ pub struct StoredBuild {
     /// `build.startTime` reports, kept as the integer the phase arithmetic uses.
     pub start_millis: i64,
     /// Epoch millis at which this build's terminal transition became due.
+    pub settle_due_millis: i64,
+}
+
+/// A persisted batch build: the modelled [`BuildBatch`] plus the instant at
+/// which the clock owes its move out of `IN_PROGRESS`.
+#[derive(Debug, Clone)]
+pub struct StoredBuildBatch {
+    /// The record every reader hands back.
+    pub build_batch: BuildBatch,
+    /// Epoch millis the batch build was started at — the same instant
+    /// `build_batch.startTime` reports, kept as the integer the phase
+    /// arithmetic uses.
+    pub start_millis: i64,
+    /// Epoch millis at which this batch build's terminal transition became due.
     pub settle_due_millis: i64,
 }
 
@@ -351,10 +410,12 @@ pub struct StartSandboxToken {
     pub issued_millis: i64,
 }
 
-/// What one in-force `StartBuild` idempotency token resolved to.
+/// What one in-force `StartBuild` or `StartBuildBatch` idempotency token
+/// resolved to.
 #[derive(Debug, Clone)]
 pub struct StartBuildToken {
-    /// The build the first request with this token started.
+    /// The build — or, for a `StartBuildBatch` token, the batch build — the
+    /// first request with this token started.
     pub build_id: String,
     /// The request that token was issued for, as a fixed-size
     /// [`request_fingerprint`], so a later request carrying the same token can be
@@ -460,6 +521,75 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         self.next_build_numbers = counters;
     }
 
+    /// Hand out `project_name`'s next `buildBatchNumber` and advance the
+    /// counter. Batch numbers run in their own sequence per project: AWS
+    /// documents a project's first batch build as `buildBatchNumber` 1
+    /// whatever its builds are numbered.
+    pub fn allocate_build_batch_number(&mut self, project_name: &str) -> i64 {
+        allocate_number(&mut self.next_build_batch_numbers, project_name)
+    }
+
+    /// Persist `stored` under `id` and record it as the newest batch build of
+    /// its project, then bring the store back inside [`MAX_BUILD_BATCHES`].
+    ///
+    /// The id is a parameter rather than being read back out of
+    /// `stored.build_batch.id`, so no caller can lose a record to an absent id.
+    pub fn insert_build_batch(&mut self, id: String, stored: StoredBuildBatch) {
+        if let Some(project_name) = stored.build_batch.project_name.clone() {
+            self.build_batches_by_project
+                .entry(project_name)
+                .or_default()
+                .push(id.clone());
+        }
+        self.build_batches.insert(id, stored);
+        self.enforce_build_batch_ceiling();
+    }
+
+    /// Evict batch builds until at most [`MAX_BUILD_BATCHES`] are retained —
+    /// [`Self::enforce_build_ceiling`]'s rule, applied to the batch records:
+    /// the oldest COMPLETED batch goes first so one a caller may still be
+    /// waiting on survives a round, and the per-project `buildBatchNumber`
+    /// counter is retired only once nothing can observe it again.
+    fn enforce_build_batch_ceiling(&mut self) {
+        let mut evicted_any = false;
+        while self.build_batches.len() > MAX_BUILD_BATCHES {
+            let oldest_completed = self
+                .build_batches
+                .iter()
+                .filter(|(_, stored)| stored.build_batch.complete)
+                .min_by_key(|(_, stored)| stored.start_millis)
+                .map(|(id, _)| id.clone());
+            let evicted = oldest_completed.or_else(|| {
+                self.build_batches
+                    .iter()
+                    .min_by_key(|(_, stored)| stored.start_millis)
+                    .map(|(id, _)| id.clone())
+            });
+            let Some(id) = evicted else { break };
+            evicted_any = true;
+            let project_name = self
+                .build_batches
+                .remove(&id)
+                .and_then(|stored| stored.build_batch.project_name);
+            if let Some(project_name) = project_name {
+                if let Some(ids) = self.build_batches_by_project.get_mut(&project_name) {
+                    ids.retain(|held| held != &id);
+                    if ids.is_empty() {
+                        self.build_batches_by_project.remove(&project_name);
+                    }
+                }
+            }
+        }
+        if !evicted_any {
+            return;
+        }
+        let mut counters = ::std::mem::take(&mut self.next_build_batch_numbers);
+        counters.retain(|name, _| {
+            self.projects.contains_key(name) || self.build_batches_by_project.contains_key(name)
+        });
+        self.next_build_batch_numbers = counters;
+    }
+
     /// Record the build an in-force idempotency token resolves to.
     ///
     /// Expired entries are dropped first — past [`IDEMPOTENCY_TOKEN_TTL_MILLIS`]
@@ -473,6 +603,24 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     ) {
         record_token(
             &mut self.start_build_tokens,
+            key,
+            token,
+            now_millis,
+            IDEMPOTENCY_TOKEN_TTL_MILLIS,
+            MAX_IDEMPOTENCY_TOKENS,
+        );
+    }
+
+    /// Record the batch build an in-force `StartBuildBatch` idempotency token
+    /// resolves to, under [`Self::record_start_build_token`]'s rule.
+    pub fn record_start_build_batch_token(
+        &mut self,
+        key: (String, String),
+        token: StartBuildToken,
+        now_millis: i64,
+    ) {
+        record_token(
+            &mut self.start_build_batch_tokens,
             key,
             token,
             now_millis,
@@ -503,6 +651,14 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     /// changes nothing.
     pub fn settled_build(&mut self, id: &str, now_millis: i64) -> Option<&StoredBuild> {
         let stored = self.builds.get_mut(id)?;
+        stored.settle(now_millis);
+        Some(stored)
+    }
+
+    /// Read a batch build, first materialising the transition the clock already
+    /// owes it, under [`Self::settled_build`]'s rule.
+    pub fn settled_build_batch(&mut self, id: &str, now_millis: i64) -> Option<&StoredBuildBatch> {
+        let stored = self.build_batches.get_mut(id)?;
         stored.settle(now_millis);
         Some(stored)
     }
@@ -666,6 +822,24 @@ impl StoredBuild {
     }
 }
 
+impl StoredBuildBatch {
+    /// Materialise this batch build's terminal state once its due instant has
+    /// passed, under [`StoredBuild::settle`]'s rule: idempotent, and purely a
+    /// function of the stored instants.
+    pub fn settle(&mut self, now_millis: i64) {
+        if self.build_batch.complete || now_millis < self.settle_due_millis {
+            return;
+        }
+        let start = self.start_millis;
+        let due = self.settle_due_millis;
+        self.build_batch.build_batch_status = Some("FAULT".to_string());
+        self.build_batch.current_phase = Some("FAILED".to_string());
+        self.build_batch.complete = true;
+        self.build_batch.end_time = Some(datetime(due));
+        self.build_batch.phases = Some(terminal_batch_phases(start, due));
+    }
+}
+
 impl StoredSandbox {
     /// Whether this sandbox has reached a status it can never leave on its own.
     ///
@@ -734,6 +908,16 @@ pub fn datetime(millis: i64) -> ::aws_smithy_types::DateTime {
 /// project can collide.
 pub fn build_uuid(project_name: &str, build_number: i64, start_millis: i64) -> String {
     derived_uuid("build", project_name, build_number, start_millis)
+}
+
+/// A batch build's unique identifier — the UUID AWS puts after `<projectName>:`.
+///
+/// [`build_uuid`]'s derivation, in its own namespace: the digest is taken over a
+/// `build-batch` tag as well as the project, the `buildBatchNumber` just allocated
+/// and the start instant, so a batch build and a build of the same project that were
+/// numbered alike in the same millisecond still carry different ids.
+pub fn build_batch_uuid(project_name: &str, build_batch_number: i64, start_millis: i64) -> String {
+    derived_uuid("build-batch", project_name, build_batch_number, start_millis)
 }
 
 /// A sandbox's unique identifier — the UUID that follows `<projectName>:`, derived
@@ -822,6 +1006,14 @@ pub fn project_arn(region: &str, name: &str) -> String {
 /// `arn:aws:codebuild:<region>:<account>:build/<id>`.
 pub fn build_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("build/{id}"))
+}
+
+/// `arn:aws:codebuild:<region>:<account>:build-batch/<id>`.
+///
+/// `build-batch` is CodeBuild's own resource type for a batch build, which is
+/// how its ARNs are formed and how an IAM policy names one.
+pub fn build_batch_arn(region: &str, id: &str) -> String {
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("build-batch/{id}"))
 }
 
 /// `arn:aws:codebuild:<region>:<account>:report-group/<name>`.
@@ -1091,6 +1283,117 @@ fn open_phase(phase_type: &str, start_millis: i64) -> BuildPhase {
         duration_in_seconds: None,
         contexts: None,
     }
+}
+
+/// The phases of a batch build that is still `IN_PROGRESS`: it was submitted,
+/// and CodeBuild is fetching the batch build specification.
+///
+/// `BuildBatchPhaseType` is its own enum — `SUBMITTED`, `DOWNLOAD_BATCHSPEC`,
+/// `IN_PROGRESS`, `COMBINE_ARTIFACTS`, `SUCCEEDED`, `FAILED`, `STOPPED` — so a
+/// batch's phases are built from these rather than from a build's.
+pub fn in_progress_batch_phases(start_millis: i64) -> Vec<BuildBatchPhase> {
+    vec![
+        finished_batch_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),
+        open_batch_phase("DOWNLOAD_BATCHSPEC", start_millis),
+    ]
+}
+
+/// The phases of a batch build that has reached its terminal state: downloading
+/// the batch build specification is where an emulated batch stops, because
+/// nothing fetches the project's source (see
+/// [`BATCH_SPEC_NOT_DOWNLOADED_MESSAGE`]).
+fn terminal_batch_phases(start_millis: i64, due_millis: i64) -> Vec<BuildBatchPhase> {
+    vec![
+        finished_batch_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),
+        finished_batch_phase(
+            "DOWNLOAD_BATCHSPEC",
+            "FAULT",
+            start_millis,
+            due_millis,
+            Some(vec![PhaseContext {
+                status_code: None,
+                message: Some(BATCH_SPEC_NOT_DOWNLOADED_MESSAGE.to_string()),
+            }]),
+        ),
+        open_batch_phase("FAILED", due_millis),
+    ]
+}
+
+/// [`finished_phase`], for a batch build's phase list.
+fn finished_batch_phase(
+    phase_type: &str,
+    phase_status: &str,
+    start_millis: i64,
+    end_millis: i64,
+    contexts: Option<Vec<PhaseContext>>,
+) -> BuildBatchPhase {
+    BuildBatchPhase {
+        phase_type: Some(phase_type.to_string()),
+        phase_status: Some(phase_status.to_string()),
+        start_time: Some(datetime(start_millis)),
+        end_time: Some(datetime(end_millis)),
+        duration_in_seconds: Some((end_millis - start_millis) / 1000),
+        contexts,
+    }
+}
+
+/// [`open_phase`], for a batch build's phase list.
+fn open_batch_phase(phase_type: &str, start_millis: i64) -> BuildBatchPhase {
+    BuildBatchPhase {
+        phase_type: Some(phase_type.to_string()),
+        phase_status: None,
+        start_time: Some(datetime(start_millis)),
+        end_time: None,
+        duration_in_seconds: None,
+        contexts: None,
+    }
+}
+
+/// A started build's view of its output artifacts: the configured destination, with
+/// the checksums and the resolved location left absent because nothing was uploaded.
+///
+/// Shared by `StartBuild` and `StartBuildBatch`, which project the same
+/// `ProjectArtifacts` onto the `BuildArtifacts` their records carry.
+pub fn build_artifacts_of(artifacts: ProjectArtifacts) -> BuildArtifacts {
+    BuildArtifacts {
+        location: artifacts.location,
+        sha256sum: None,
+        md5sum: None,
+        override_artifact_name: artifacts.override_artifact_name,
+        encryption_disabled: artifacts.encryption_disabled,
+        artifact_identifier: artifacts.artifact_identifier,
+        bucket_owner_access: artifacts.bucket_owner_access,
+    }
+}
+
+/// `defined` with `overrides` applied: an override replaces the variable of the same
+/// name IN PLACE and a new name is appended in the order the request listed it, which
+/// is what both `StartBuild` and `StartBuildBatch` document for
+/// `environmentVariablesOverride` ("override, or add to, the environment variables
+/// defined in the ... project").
+///
+/// The merge is keyed by a name -> position index rather than a scan per entry, so it
+/// stays linearithmic in the number of variables; a handler has already refused a
+/// request past [`MAX_ENVIRONMENT_VARIABLES`] before calling this.
+pub fn merge_environment_variables(
+    mut defined: Vec<EnvironmentVariable>,
+    overrides: Vec<EnvironmentVariable>,
+) -> Vec<EnvironmentVariable> {
+    let mut position_of: BTreeMap<String, usize> = defined
+        .iter()
+        .enumerate()
+        .map(|(position, held)| (held.name.clone(), position))
+        .collect();
+    for variable in overrides {
+        match position_of.get(&variable.name) {
+            Some(&position) => defined[position] = variable,
+            None => {
+                position_of.insert(variable.name.clone(), defined.len());
+                defined.push(variable);
+            }
+        }
+    }
+    defined
 }
 
 /// One page of `items`, resuming after the entry `next_token` names.

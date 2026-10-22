@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartBuildBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartBuildBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartBuildBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a batch build of a stored project and persists it: this is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -242,18 +235,347 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartBuildBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartBuildBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartBuildBatch"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StartBuildBatch (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let initiator = crate::state::request_initiator(ctx.parts());
+        let now = crate::state::now_millis();
+        // The request as sent, hashed to a fixed size, so a repeat carrying the same
+        // idempotency token can be told apart from one that changed a parameter
+        // without retaining a request-sized value per token. `Debug` on the generated
+        // input is the plain derive — it prints every member in full and redacts
+        // nothing — and no member of StartBuildBatch's input closure is `@sensitive`
+        // anyway, so a difference in ANY member changes the fingerprint.
+        let fingerprint = crate::state::request_fingerprint(&format!("{input:?}"));
+
+        // Refused BEFORE the state lock is taken, because the model puts no `@length`
+        // on `EnvironmentVariables`: the count is the caller's alone, and it is the
+        // one factor of the per-request work below that nothing else bounds. The
+        // ceiling is this emulator's own growth-site guard, not an AWS limit — see
+        // `crate::state::MAX_ENVIRONMENT_VARIABLES`.
+        let override_count = input
+            .environment_variables_override
+            .as_ref()
+            .map_or(0, Vec::len);
+        if override_count > crate::state::MAX_ENVIRONMENT_VARIABLES {
+            return Err(StartBuildBatchErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Value at 'environmentVariablesOverride' failed to satisfy constraint: \
+                         Member must have length less than or equal to {}",
+                        crate::state::MAX_ENVIRONMENT_VARIABLES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // READ PASS: take the shared lock only long enough to copy the project and
+        // settle the idempotency question, then release it so none of the
+        // caller-driven resolution below runs inside the critical section every other
+        // CodeBuild request shares. Both are re-asserted in the WRITE PASS, so a
+        // concurrent delete or a concurrent request carrying the same token cannot
+        // slip through the gap.
+        let token_key = input
+            .idempotency_token
+            .clone()
+            .map(|token| (input.project_name.clone(), token));
+        let project = {
+            let mut guard = state.lock();
+            let Some(project) = guard
+                .projects
+                .get(&input.project_name)
+                .map(|stored| stored.project.clone())
+            else {
+                return Err(StartBuildBatchErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Project cannot be found: {}",
+                            crate::state::project_arn(&region, &input.project_name)
+                        )),
+                    },
+                )
+                .into());
+            };
+            if let Some(build_batch) =
+                resolve_idempotency_token(&mut guard, token_key.as_ref(), &fingerprint, now)?
+            {
+                return Ok(StartBuildBatchOutput {
+                    build_batch: Some(build_batch),
+                });
+            }
+            project
+        };
+
+        // Every member below is resolved from the stored project with this request's
+        // `*Override` applied — never echoed from the request alone. None of it needs
+        // the state lock, so none of it is done while holding it.
+        let source = resolve_source(project.source.clone().unwrap_or_default(), &input);
+        let environment =
+            resolve_environment(project.environment.clone().unwrap_or_default(), &input);
+
+        let mut build_batch = BuildBatch {
+            // id, arn and buildBatchNumber are filled in by the WRITE PASS below: the
+            // number is allocated there, and the id is derived from it.
+            id: None,
+            arn: None,
+            build_batch_number: None,
+            start_time: Some(crate::state::datetime(now)),
+            end_time: None,
+            // A batch build's first act after being submitted is to fetch the batch
+            // build specification from the project's source.
+            current_phase: Some("DOWNLOAD_BATCHSPEC".to_string()),
+            build_batch_status: Some("IN_PROGRESS".to_string()),
+            source_version: input.source_version.clone().or(project.source_version),
+            // The commit the source version resolved to. Nothing clones a repository
+            // here, so there is no resolved revision to report.
+            resolved_source_version: None,
+            project_name: Some(input.project_name.clone()),
+            phases: Some(crate::state::in_progress_batch_phases(now)),
+            source: Some(source),
+            secondary_sources: input
+                .secondary_sources_override
+                .clone()
+                .or(project.secondary_sources),
+            secondary_source_versions: input
+                .secondary_sources_version_override
+                .clone()
+                .or(project.secondary_source_versions),
+            artifacts: input
+                .artifacts_override
+                .clone()
+                .or_else(|| project.artifacts.clone())
+                .map(crate::state::build_artifacts_of),
+            secondary_artifacts: input
+                .secondary_artifacts_override
+                .clone()
+                .or(project.secondary_artifacts)
+                .map(|list| {
+                    list.into_iter()
+                        .map(crate::state::build_artifacts_of)
+                        .collect()
+                }),
+            cache: input.cache_override.clone().or(project.cache),
+            environment: Some(environment),
+            service_role: input
+                .service_role_override
+                .clone()
+                .or(project.service_role),
+            log_config: input
+                .logs_config_override
+                .clone()
+                .or_else(|| project.logs_config.clone()),
+            build_timeout_in_minutes: input
+                .build_timeout_in_minutes_override
+                .or(project.timeout_in_minutes),
+            queued_timeout_in_minutes: input
+                .queued_timeout_in_minutes_override
+                .or(project.queued_timeout_in_minutes),
+            complete: false,
+            initiator: Some(initiator),
+            vpc_config: project.vpc_config,
+            encryption_key: input
+                .encryption_key_override
+                .clone()
+                .or(project.encryption_key),
+            file_system_locations: project.file_system_locations,
+            build_batch_config: input
+                .build_batch_config_override
+                .clone()
+                .or(project.build_batch_config),
+            // Which builds a batch is made of is declared by the `batch` section of
+            // the buildspec, which CodeBuild reads out of the project's source during
+            // `DOWNLOAD_BATCHSPEC`. Nothing in this emulator fetches a source or runs
+            // a build container, so no batch specification is ever read, no build of
+            // the batch is started, and the batch carries no build group — see
+            // `crate::state::BATCH_SPEC_NOT_DOWNLOADED_MESSAGE`, which is the context
+            // the failing phase reports once the batch's transition falls due.
+            build_groups: None,
+            debug_session_enabled: input.debug_session_enabled,
+            // Produced by merging the reports of the builds in the batch, of which
+            // this emulator starts none.
+            report_arns: None,
+        };
+
+        // WRITE PASS: one critical section that re-asserts what the read pass saw and
+        // then does every write together, so allocating the batch number, inserting
+        // the batch build and recording the token are atomic with respect to each
+        // other.
+        let mut guard = state.lock();
+        if !guard.projects.contains_key(&input.project_name) {
+            // The project was deleted while this request was resolving: no batch build
+            // is persisted for a project that no longer exists.
+            return Err(StartBuildBatchErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Project cannot be found: {}",
+                        crate::state::project_arn(&region, &input.project_name)
+                    )),
+                },
+            )
+            .into());
+        }
+        // A concurrent request carrying the same token may have won the race; it is
+        // the same request, so it resolves to the batch build that one started.
+        if let Some(build_batch) =
+            resolve_idempotency_token(&mut guard, token_key.as_ref(), &fingerprint, now)?
+        {
+            return Ok(StartBuildBatchOutput {
+                build_batch: Some(build_batch),
+            });
+        }
+        let build_batch_number = guard.allocate_build_batch_number(&input.project_name);
+        let id = format!(
+            "{}:{}",
+            input.project_name,
+            crate::state::build_batch_uuid(&input.project_name, build_batch_number, now)
+        );
+        build_batch.build_batch_number = Some(build_batch_number);
+        build_batch.id = Some(id.clone());
+        build_batch.arn = Some(crate::state::build_batch_arn(&region, &id));
+        guard.insert_build_batch(
+            id.clone(),
+            crate::state::StoredBuildBatch {
+                build_batch: build_batch.clone(),
+                start_millis: now,
+                // The same chosen span a build's owed transition uses: the batch's
+                // move out of `IN_PROGRESS` falls due at this instant whether or not
+                // anybody calls again, and is never slept on.
+                settle_due_millis: now + crate::state::BUILD_SETTLE_MILLIS,
+            },
+        );
+        if let Some(key) = token_key {
+            guard.record_start_build_batch_token(
+                key,
+                crate::state::StartBuildToken {
+                    build_id: id,
+                    request_fingerprint: fingerprint,
+                    issued_millis: now,
+                },
+                now,
+            );
+        }
+
+        Ok(StartBuildBatchOutput {
+            build_batch: Some(build_batch),
+        })
     }
+}
+
+/// What an idempotency token already in force resolves to.
+///
+/// AWS documents the token as "valid for five minutes": a repeat of the SAME request
+/// inside that window resolves to the batch build the first one started
+/// (`Ok(Some(build_batch))`), and the same token with a changed request is "a parameter
+/// mismatch error", which AWS documents as a refusal rather than a second batch build.
+/// `Ok(None)` means this request has to start one.
+fn resolve_idempotency_token(
+    state: &mut crate::state::ComAmazonawsCodebuildCodebuild20161006State,
+    token_key: Option<&(String, String)>,
+    fingerprint: &str,
+    now: i64,
+) -> Result<Option<BuildBatch>, StartBuildBatchError> {
+    let Some(key) = token_key else {
+        return Ok(None);
+    };
+    let in_force = state
+        .start_build_batch_tokens
+        .get(key)
+        .filter(|issued| now - issued.issued_millis < crate::state::IDEMPOTENCY_TOKEN_TTL_MILLIS)
+        .cloned();
+    let Some(issued) = in_force else {
+        return Ok(None);
+    };
+    if issued.request_fingerprint != fingerprint {
+        return Err(StartBuildBatchErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(
+                    "Parameter mismatch: idempotencyToken was already used for a \
+                     StartBuildBatch request with different parameters"
+                        .to_string(),
+                ),
+            },
+        )
+        .into());
+    }
+    Ok(state
+        .settled_build_batch(&issued.build_id, now)
+        .map(|stored| stored.build_batch.clone()))
+}
+
+/// The project's source with this request's source `*Override` members applied.
+///
+/// `StartBuildBatch`'s input is its own shape: it carries
+/// `reportBuildBatchStatusOverride` where `StartBuild` carries
+/// `reportBuildStatusOverride`, and models no `buildStatusConfigOverride`, so the
+/// merge is this operation's own rather than a call into the other handler's.
+fn resolve_source(mut source: ProjectSource, input: &StartBuildBatchInput) -> ProjectSource {
+    if let Some(source_type) = input.source_type_override.clone() {
+        source.r#type = source_type;
+    }
+    if let Some(location) = input.source_location_override.clone() {
+        source.location = Some(location);
+    }
+    if let Some(buildspec) = input.buildspec_override.clone() {
+        source.buildspec = Some(buildspec);
+    }
+    if let Some(depth) = input.git_clone_depth_override {
+        source.git_clone_depth = Some(depth);
+    }
+    if let Some(submodules) = input.git_submodules_config_override.clone() {
+        source.git_submodules_config = Some(submodules);
+    }
+    if let Some(auth) = input.source_auth_override.clone() {
+        source.auth = Some(auth);
+    }
+    if let Some(report) = input.report_build_batch_status_override {
+        source.report_build_status = Some(report);
+    }
+    if let Some(insecure) = input.insecure_ssl_override {
+        source.insecure_ssl = Some(insecure);
+    }
+    source
+}
+
+/// The project's environment with this request's environment `*Override` members
+/// applied. The variable merge itself is
+/// [`crate::state::merge_environment_variables`], shared with `StartBuild`: an
+/// override replaces the project variable of the same name in place and a new name is
+/// appended in the order the request listed it.
+fn resolve_environment(
+    mut environment: ProjectEnvironment,
+    input: &StartBuildBatchInput,
+) -> ProjectEnvironment {
+    if let Some(environment_type) = input.environment_type_override.clone() {
+        environment.r#type = environment_type;
+    }
+    if let Some(image) = input.image_override.clone() {
+        environment.image = image;
+    }
+    if let Some(compute_type) = input.compute_type_override.clone() {
+        environment.compute_type = compute_type;
+    }
+    if let Some(certificate) = input.certificate_override.clone() {
+        environment.certificate = Some(certificate);
+    }
+    if let Some(privileged) = input.privileged_mode_override {
+        environment.privileged_mode = Some(privileged);
+    }
+    if let Some(credential) = input.registry_credential_override.clone() {
+        environment.registry_credential = Some(credential);
+    }
+    if let Some(pull_credentials) = input.image_pull_credentials_type_override.clone() {
+        environment.image_pull_credentials_type = Some(pull_credentials);
+    }
+    if let Some(overrides) = input.environment_variables_override.clone() {
+        environment.environment_variables = Some(crate::state::merge_environment_variables(
+            environment.environment_variables.unwrap_or_default(),
+            overrides,
+        ));
+    }
+    environment
 }
