@@ -15,3 +15,5 @@
 mod cost_optimization_hub;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_exception_fields.rs"]
+mod validation_exception_fields;

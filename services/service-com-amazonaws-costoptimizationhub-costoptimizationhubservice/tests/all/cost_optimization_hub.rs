@@ -18,7 +18,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A router with only this service mounted, over one shared engine — the same
 /// assembly `core/router` performs, minus the other services.
-fn router() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the other suites in this target drive the service through the
+/// one assembly rather than each building its own.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // In-process tests sign with a placeholder key; signature verification is a
@@ -29,7 +32,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation and return its HTTP status and JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("https://cost-optimization-hub.us-east-1.amazonaws.com/")

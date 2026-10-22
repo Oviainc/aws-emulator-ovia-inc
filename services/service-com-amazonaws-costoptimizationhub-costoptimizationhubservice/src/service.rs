@@ -21,8 +21,11 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. EDITED HERE: the key and the handler stay the generated table's,
+//!   but every operation is served through [`InModelledEnvelope`], so a request
+//!   refused for a modelled input constraint is answered in this service's own
+//!   structured `ValidationException` instead of the framework's pre-dispatch
+//!   envelope, which carries a `message` and nothing else.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -39,11 +42,62 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # This service's `ValidationException` is STRUCTURED
+//!
+//! `com.amazonaws.costoptimizationhub#ValidationException` is not a bare message:
+//! besides the required `message` it carries `reason`
+//! (`ValidationExceptionReason`: `FieldValidationFailed` | `Other`) and `fields`,
+//! a list of `ValidationExceptionDetail{fieldName, message}`
+//! (`smithy_query(query="shape", shape="ValidationException")`). A client maps a
+//! refusal back onto the member that caused it by reading those two members, so a
+//! 400 that carries only prose is unusable to it.
+//!
+//! The framework's pre-dispatch renderer gets the status (400) and the error code
+//! (`ValidationException`) right, but it can only choose a code and a sentence —
+//! it has no way to fill a modelled member. So [`InModelledEnvelope`] collects
+//! the refusal itself, from the framework's own deserializer and constraint walk,
+//! and answers it through the model's `ValidationException` schema with `reason`
+//! set and one `fields` entry per invalid member. A refusal a handler raises for a rule
+//! the model cannot express (an unknown `nextToken`, an `orderBy` dimension that
+//! names no member) fills the same two members in the handler itself.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema::serde::SerdeError;
+use aws_smithy_schema_server::constraints;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
+    OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+use crate::ops::types::shared_types::{
+    ValidationException, ValidationExceptionDetail, SCHEMA_VALIDATION_EXCEPTION,
+};
+
+/// The wire error code this service answers a refused request with: the shape
+/// `com.amazonaws.costoptimizationhub#ValidationException`, which every operation
+/// of this service lists.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The HTTP status that shape's `@httpError` declares.
+const VALIDATION_EXCEPTION_STATUS: u16 = 400;
+
+/// The `ValidationExceptionReason` a member outside its declared constraint is
+/// reported under — one of the two values the model's enum holds, the other
+/// (`Other`) being for a refusal no field accounts for.
+const REASON_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+
+/// The top-level `message` of a refusal whose detail is carried in `fields`: the
+/// per-member diagnosis lives in the field list, so the summary points the reader
+/// at it rather than restating one of the entries.
+const FIELD_VALIDATION_SUMMARY: &str =
+    "Input validation failed. Please check the field list for more details.";
+
+/// The path segment the constraint walk spells a step from a collection into one
+/// of its elements with (`aws_smithy_schema_server::constraints::path`), so
+/// `filter.accountIds.1.member` is the first element of the `accountIds` list.
+const COLLECTION_STEP: &str = "member";
 
 /// The `com-amazonaws-costoptimizationhub-costoptimizationhubservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +106,29 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`InModelledEnvelope`] so a request refused before its handler runs is
+    /// answered in this service's structured `ValidationException`. Keyed by the
+    /// routing key the protocol resolves — the key the generated table uses — and
+    /// built from the SAME shared engine, so a wrapped operation reads and writes
+    /// the one store.
+    in_modelled_envelope: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`InModelledEnvelope`] and keyed by its operation shape name — the routing key
+/// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(InModelledEnvelope::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -59,9 +136,285 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // Every operation of the service, not only the ones a recording exercised:
+        // the refusal a modelled constraint owes is the same refusal whichever
+        // operation declared the member, and each of these eight lists
+        // `ValidationException`.
+        let mut in_modelled_envelope = OperationRoutingTable::new();
+        wrap_operations!(
+            in_modelled_envelope,
+            engine,
+            get_preferences::GetPreferences,
+            get_recommendation::GetRecommendation,
+            list_efficiency_metrics::ListEfficiencyMetrics,
+            list_enrollment_statuses::ListEnrollmentStatuses,
+            list_recommendation_summaries::ListRecommendationSummaries,
+            list_recommendations::ListRecommendations,
+            update_enrollment_status::UpdateEnrollmentStatus,
+            update_preferences::UpdatePreferences,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            in_modelled_envelope,
         }
+    }
+}
+
+/// One modelled operation, served with the refusals it owes stated in this
+/// service's own structured `ValidationException`.
+///
+/// The wrapper collects the refusal itself — the very two classes the framework's
+/// own walk collects, from the framework's own deserializer and constraint walk —
+/// and renders it through the model's `ValidationException` schema, so `reason`
+/// and `fields` are filled from the structured [`Violation`]s. Nothing else is
+/// re-implemented: a request this service does not refuse is handed to the
+/// generated `ErasedOperation::run`, which owns deserialize -> validate -> handle
+/// -> serialize, telemetry and every modelled error.
+struct InModelledEnvelope<O> {
+    operation: O,
+}
+
+impl<O> InModelledEnvelope<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O> ErasedOperation for InModelledEnvelope<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // Read the protocol out before the await: `&dyn ErasedServiceDefinition`
+            // is not `Sync`, and this future is. The protocol itself is.
+            let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
+            let violations = refused_by::<O>(protocol, req);
+            if let Some(refusal) = validation_exception(protocol, &violations) {
+                return refusal;
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
+    }
+}
+
+/// Every violation that refuses `req` before `O`'s handler runs: a `@required`
+/// member absent, or a value outside a declared constraint. Empty when the request
+/// is valid, and empty for a failure that is NOT a refusal — a body the codec
+/// cannot read is a serialization failure, which the framework answers in its own
+/// envelope.
+///
+/// Both classes come from the framework's own machinery (the protocol's
+/// deserializer and `constraints::validate` over the built input), so this cannot
+/// find a different set of violations from the walk that follows it.
+fn refused_by<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Vec<Violation> {
+    let Ok(mut deserializer) = protocol.deserialize_input(req, O::INPUT_SCHEMA) else {
+        return Vec::new();
+    };
+    match <O::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
+        Ok(input) => constraints::validate(&input, O::INPUT_SCHEMA),
+        // Absence is found while READING the request and a bad value while walking
+        // what was read; to a caller they are one refusal, so they are one here.
+        Err(SerdeError::MissingMember { member_name }) => vec![Violation {
+            path: member_name,
+            kind: ViolationKind::MissingRequiredMember,
+            value: None,
+        }],
+        Err(_) => Vec::new(),
+    }
+}
+
+/// This service's answer to `violations`: HTTP 400 `ValidationException` with
+/// `reason` = `FieldValidationFailed` and one `fields` entry per invalid member,
+/// serialized through the model's own `ValidationException` schema.
+///
+/// `None` when there is nothing to refuse, when a violation names a constraint
+/// class this file cannot state as a field entry, and when the error cannot be
+/// serialized — each of which leaves the framework's walk to refuse the request in
+/// its own envelope rather than answering a 400 that drops part of the diagnosis.
+fn validation_exception(
+    protocol: &dyn ServerHttpProtocol,
+    violations: &[Violation],
+) -> Option<RtResponse> {
+    let fields = field_details(violations)?;
+    let refused = ValidationException {
+        message: FIELD_VALIDATION_SUMMARY.to_string(),
+        // Every violation here is a member outside its declared constraint, which
+        // is exactly what this reason names.
+        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
+        fields: Some(fields),
+    };
+    protocol
+        .serialize_error(
+            &refused,
+            &SCHEMA_VALIDATION_EXCEPTION,
+            VALIDATION_EXCEPTION,
+            VALIDATION_EXCEPTION_STATUS,
+        )
+        .ok()
+}
+
+/// One `fields` entry per invalid MEMBER — `fields` is "the list of fields that
+/// are invalid", so a member is named once however many of its values failed —
+/// in the order the walk first reached each member.
+///
+/// `None` when there is no violation at all, or when any one of them states a
+/// constraint class [`requirement`] cannot word: a partial field list would tell a
+/// client the request is fine in a member that is not.
+fn field_details(violations: &[Violation]) -> Option<Vec<ValidationExceptionDetail>> {
+    if violations.is_empty() {
+        return None;
+    }
+    let mut invalid: Vec<InvalidField> = Vec::new();
+    for violation in violations {
+        let (field_name, on_element) = attributed_member(&violation.path);
+        let requirement = requirement(&violation.kind)?;
+        match invalid.iter_mut().find(|held| held.name == field_name) {
+            None => invalid.push(InvalidField {
+                name: field_name,
+                on_element,
+                requirements: vec![requirement],
+            }),
+            Some(held) => {
+                held.on_element |= on_element;
+                // Two values of one list failing the same rule state that rule
+                // once: the entry says what the member must satisfy, not how many
+                // of its values did not.
+                if !held.requirements.contains(&requirement) {
+                    held.requirements.push(requirement);
+                }
+            }
+        }
+    }
+    Some(invalid.into_iter().map(InvalidField::detail).collect())
+}
+
+/// One invalid member on its way to a `fields` entry: the member reported, and
+/// every distinct requirement its values failed.
+struct InvalidField {
+    name: String,
+    /// Whether any of the requirements was failed by an ELEMENT of the member
+    /// rather than by the member itself.
+    on_element: bool,
+    requirements: Vec<String>,
+}
+
+impl InvalidField {
+    /// The `fields` entry for this member.
+    fn detail(self) -> ValidationExceptionDetail {
+        // A requirement failed by an ELEMENT of the member, and a member that
+        // failed several, are both stated as the bracketed list of what the member
+        // must satisfy; a member that failed exactly one requirement of its own
+        // states that requirement directly.
+        let message = if self.on_element || self.requirements.len() > 1 {
+            format!(
+                "Member must satisfy constraint: [{}]",
+                self.requirements.join(", ")
+            )
+        } else {
+            self.requirements.join(", ")
+        };
+        ValidationExceptionDetail {
+            field_name: self.name,
+            message,
+        }
+    }
+}
+
+/// The member a violation is reported against, and whether it was found on an
+/// element of that member rather than on the member itself.
+///
+/// A constraint walk reports a position, not a member: `accountId` for a scalar,
+/// `filter.accountIds.1.member` for the first element of a list nested in a
+/// structure. A field entry names a MEMBER, so the collection steps are dropped
+/// (the `member` segment and the index or key before it) and the deepest remaining
+/// segment — the deepest member the path names — is the one reported. A map key
+/// holding a `.` is spelled by the caller and could not be told from a member
+/// boundary; such a key keeps the segment it looks like, which still names a
+/// member of the request.
+fn attributed_member(path: &str) -> (String, bool) {
+    let mut named: Vec<&str> = Vec::new();
+    let mut on_element = false;
+    for segment in path.split('.') {
+        if segment == COLLECTION_STEP {
+            // The segment before it is the element's position (a list) or its key
+            // (a map): neither is a member name.
+            named.pop();
+            on_element = true;
+            continue;
+        }
+        named.push(segment);
+        on_element = false;
+    }
+    match named.last() {
+        Some(member) => ((*member).to_string(), on_element),
+        // Nothing but collection steps: report the position as the walk spelled it
+        // rather than an empty field name.
+        None => (path.to_string(), false),
+    }
+}
+
+/// What a violated constraint requires, as a field entry states it. `None` for a
+/// class this file does not word — [`ViolationKind`] is `#[non_exhaustive]`, so one
+/// can be added upstream, and a clause invented for it would be wrong rather than
+/// merely missing.
+fn requirement(kind: &ViolationKind) -> Option<String> {
+    Some(match kind {
+        ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
+        ViolationKind::MinLength(min) => {
+            format!("Member must have length greater than or equal to {min}")
+        }
+        ViolationKind::MaxLength(max) => {
+            format!("Member must have length less than or equal to {max}")
+        }
+        ViolationKind::MinValue(min) => {
+            format!("Member must have value greater than or equal to {min}")
+        }
+        ViolationKind::MaxValue(max) => {
+            format!("Member must have value less than or equal to {max}")
+        }
+        // The expression is stated without the anchors the model spells it with:
+        // the clause already says the whole member must satisfy it, so the anchors
+        // would be restating the sentence.
+        ViolationKind::Pattern(pattern) => format!(
+            "Member must satisfy regular expression pattern: {}",
+            unanchored(pattern)
+        ),
+        ViolationKind::EnumValue(allowed) => {
+            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+        }
+        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
+        _ => return None,
+    })
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with. A `$`
+/// escaped by a backslash is a literal dollar sign inside the expression, not the
+/// end anchor, so it stays.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
     }
 }
 
@@ -87,24 +440,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // NOT a re-route: the key is the one the generated table's own protocol
+        // resolves, and the operation it names is the one served — wrapped in
+        // `InModelledEnvelope` so a request refused for a modelled constraint is
+        // answered in this service's structured `ValidationException` rather than
+        // in the framework's pre-dispatch envelope, which can carry no `reason`
+        // and no `fields`. A key the model does not name resolves to `None` here
+        // exactly as it does in the generated table, so the router's
+        // routing-error path is unchanged.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.in_modelled_envelope.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
+        // `InModelledEnvelope` answers a constraint refusal itself, in the
+        // modelled envelope, so this seam would only reword what the FRAMEWORK
+        // still renders: a refusal whose violation class `requirement` cannot
+        // state, or an error the modelled shape could not be serialized into.
+        // Both keep the framework's wording deliberately — it names the member
+        // and the constraint in prose, which is strictly more than a summary
+        // pointing at a `fields` list this path cannot build.
         let _ = refusal;
         None
     }
@@ -135,5 +490,55 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The member a violation is attributed to is the deepest member its path
+    /// names, with the collection steps the walk spells (`<index>.member`,
+    /// `<key>.member`) dropped — and a violation found on an element is marked as
+    /// such, because the clause that states it names the holding member.
+    #[test]
+    fn attribution_names_the_deepest_member_of_the_path() {
+        let cases: [(&str, &str, bool); 6] = [
+            ("accountId", "accountId", false),
+            ("status", "status", false),
+            ("filter.accountIds.1.member", "accountIds", true),
+            ("filter.accountIds", "accountIds", false),
+            ("filter.tags.2.member.key", "key", false),
+            ("member", "member", false),
+        ];
+        for (path, expected_member, expected_on_element) in cases {
+            let (member, on_element) = attributed_member(path);
+            assert_eq!(
+                (member.as_str(), on_element),
+                (expected_member, expected_on_element),
+                "case {path:?}: expected ({expected_member:?}, {expected_on_element}), \
+                 got ({member:?}, {on_element})"
+            );
+        }
+    }
+
+    /// A `@pattern` is stated without the anchors that make the match total, and a
+    /// `$` the expression escapes is kept because it is a literal dollar sign.
+    #[test]
+    fn a_pattern_is_stated_without_its_anchors() {
+        let cases: [(&str, &str); 5] = [
+            ("^[0-9]{12}$", "[0-9]{12}"),
+            ("[0-9]{12}", "[0-9]{12}"),
+            ("^[a-z]+", "[a-z]+"),
+            ("^cost\\$$", "cost\\$"),
+            ("^a\\\\$", "a\\\\"),
+        ];
+        for (pattern, expected) in cases {
+            let actual = unanchored(pattern);
+            assert_eq!(
+                actual, expected,
+                "case {pattern:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
     }
 }
