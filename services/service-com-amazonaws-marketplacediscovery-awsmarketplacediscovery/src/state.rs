@@ -426,6 +426,19 @@ pub fn availability_status(expiration_time: Option<i64>, now_secs: i64) -> &'sta
     }
 }
 
+/// The message this service's `ResourceNotFoundException` carries for a resource the
+/// catalog does not hold: `"<Resource> not found"`, and nothing else.
+///
+/// The message is request-INDEPENDENT. Recorded behavior establishes it: three
+/// independent recordings of `GetListing` with three DIFFERENT well-formed but unknown
+/// `listingId`s all answered the identical message "Listing not found", so the message
+/// names only the kind of resource that was missing and discloses neither the requested
+/// id nor the catalog it was looked up in. `resource` is therefore the resource KIND
+/// (`"Listing"`, `"Offer"`, `"Product"`), never a value out of the request.
+pub fn not_found_message(resource: &str) -> String {
+    format!("{resource} not found")
+}
+
 /// A wire timestamp from stored epoch seconds.
 pub fn datetime(secs: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs(secs)

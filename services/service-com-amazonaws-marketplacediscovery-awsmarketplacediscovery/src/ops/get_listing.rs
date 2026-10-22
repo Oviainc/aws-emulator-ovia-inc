@@ -190,10 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let listing = state.listings.get(&input.listing_id).ok_or_else(|| {
             GetListingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "Listing '{}' does not exist in catalog '{}'",
-                    input.listing_id, state.catalog
-                )),
+                message: Some(crate::state::not_found_message("Listing")),
             })
         })?;
 
@@ -202,18 +199,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let locale = listing.text.content_locale(preferred);
         let text = listing.text.text(locale);
 
-        // One entity per associated product, then one per associated offer, each resolved
-        // from the record it names so the association is real in both directions.
+        // `ListingAssociatedEntity` is "A product and offer associated with a listing", and
+        // its `offer` member is "Information about the DEFAULT offer associated with the
+        // listing" — so one entity per associated product, PAIRED with the default offer
+        // the listing associates for that product. That pairing is the documented path from
+        // a listing to an offerId, which `GetOffer` and `GetOfferTerms` then resolve.
         let mut associated_entities: Vec<ListingAssociatedEntity> = Vec::new();
+        let mut paired_offer_ids: Vec<String> = Vec::new();
         for product_id in &listing.product_ids {
-            if let Some(product) = state.product_information(product_id, preferred) {
-                associated_entities.push(ListingAssociatedEntity {
-                    product: Some(product),
-                    offer: None,
-                });
+            let Some(product) = state.product_information(product_id, preferred) else {
+                continue;
+            };
+            // The product's default offer: the first offer the listing associates that
+            // covers this product, resolved from the stored offer so the association is
+            // real in both directions.
+            let offer = listing
+                .offer_ids
+                .iter()
+                .find(|offer_id| {
+                    state
+                        .offers
+                        .get(offer_id.as_str())
+                        .is_some_and(|offer| offer.product_ids.contains(product_id))
+                })
+                .and_then(|offer_id| state.offer_information(offer_id, preferred));
+            if let Some(offer) = &offer {
+                paired_offer_ids.push(offer.offer_id.clone());
             }
+            associated_entities.push(ListingAssociatedEntity {
+                product: Some(product),
+                offer,
+            });
         }
+        // An offer the listing associates that is no product's default offer is still an
+        // association, and has no product to pair with.
         for offer_id in &listing.offer_ids {
+            if paired_offer_ids.contains(offer_id) {
+                continue;
+            }
             if let Some(offer) = state.offer_information(offer_id, preferred) {
                 associated_entities.push(ListingAssociatedEntity {
                     product: None,
