@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates and persists a Neptune DB cluster record, and answers with the
+//! `DBCluster` view of that record.
 //!
 //! ## Shape of an operation
 //!
@@ -275,18 +268,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBCluster"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state as st;
+
+        // Documented input rules the model cannot express, refused before anything is
+        // persisted. Each message names the member and its constraint.
+        let identifier =
+            st::normalize_identifier("DBClusterIdentifier", &input.db_cluster_identifier)
+                .map_err(Scaffolded::validation)?;
+        let engine = st::validate_engine(&input.engine).map_err(Scaffolded::validation)?;
+        let backup_retention_period =
+            st::resolve_backup_retention_period(input.backup_retention_period)
+                .map_err(Scaffolded::validation)?;
+        let region = st::request_region(ctx);
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            // No store means nothing can be persisted, so the operation cannot be served
+            // at all — which is exactly what the 501 channel says.
+            return Err(Scaffolded::not_implemented("CreateDBCluster"));
+        };
+        let mut state = state.lock();
+        state.settle();
+
+        if state.clusters.contains_key(&identifier) {
+            return Err(CreateDBClusterErrorModeled::DBClusterAlreadyExistsFault(
+                DBClusterAlreadyExistsFault {
+                    message: Some(format!("DB Cluster already exists: {identifier}")),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: a caller looping over fresh identifiers hits the quota
+        // the API already models rather than growing this process's memory without limit.
+        if !state.accepts_another_cluster() {
+            return Err(CreateDBClusterErrorModeled::DBClusterQuotaExceededFault(
+                DBClusterQuotaExceededFault {
+                    message: Some(format!(
+                        "Cannot create more than {} DB clusters",
+                        st::MAX_STORED_CLUSTERS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let created = ::std::time::SystemTime::now();
+        let seed = st::record_seed(&identifier, created);
+        let endpoint_token = st::mint_endpoint_token(&identifier, created);
+        let engine_version = input
+            .engine_version
+            .unwrap_or_else(|| st::DEFAULT_ENGINE_VERSION.to_string());
+        let availability_zones = match input.availability_zones {
+            Some(zones) if !zones.is_empty() => zones,
+            _ => st::default_availability_zones(&region),
+        };
+        let record = st::DbClusterRecord {
+            arn: ::engine::emulator_arn("rds", &region, &format!("cluster:{identifier}")),
+            resource_id: st::mint_cluster_resource_id(&identifier, created),
+            // A new cluster is NOT ready: the clock owes it `available`, and
+            // `State::settle` applies that transition once the span has elapsed.
+            status: st::STATUS_CREATING.to_string(),
+            available_at: Some(created + st::PROVISIONING_SPAN),
+            endpoint: format!(
+                "{identifier}.cluster-{endpoint_token}.{region}.neptune.amazonaws.com"
+            ),
+            reader_endpoint: format!(
+                "{identifier}.cluster-ro-{endpoint_token}.{region}.neptune.amazonaws.com"
+            ),
+            endpoint_token,
+            hosted_zone_id: st::hosted_zone_id(&region),
+            port: input.port.unwrap_or(st::DEFAULT_PORT),
+            availability_zones,
+            db_subnet_group: input.db_subnet_group_name,
+            db_cluster_parameter_group: input
+                .db_cluster_parameter_group_name
+                .unwrap_or_else(|| st::default_parameter_group(&engine_version)),
+            backup_retention_period,
+            preferred_backup_window: input
+                .preferred_backup_window
+                .unwrap_or_else(|| st::default_backup_window(&seed)),
+            preferred_maintenance_window: input
+                .preferred_maintenance_window
+                .unwrap_or_else(|| st::default_maintenance_window(&seed)),
+            storage_encrypted: input.storage_encrypted.unwrap_or(false),
+            kms_key_id: input.kms_key_id,
+            // "when you create a new cluster using CreateDBCluster directly, deletion
+            // protection is disabled by default".
+            deletion_protection: input.deletion_protection.unwrap_or(false),
+            copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+            // EnableIAMDatabaseAuthentication — "Default: false".
+            iam_database_authentication_enabled: input
+                .enable_iam_database_authentication
+                .unwrap_or(false),
+            enabled_cloudwatch_logs_exports: input
+                .enable_cloudwatch_logs_exports
+                .unwrap_or_default(),
+            vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
+            serverless_v2_scaling_configuration: input
+                .serverless_v2_scaling_configuration
+                .map(|config| (config.min_capacity, config.max_capacity)),
+            // No instance has joined yet.
+            members: Vec::new(),
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key.unwrap_or_default(), tag.value.unwrap_or_default()))
+                .collect(),
+            cluster_create_time: created,
+            allocated_storage: st::CLUSTER_ALLOCATED_STORAGE,
+            // "When set to standard, the storage type is not returned in the response."
+            storage_type: input
+                .storage_type
+                .filter(|value| !value.eq_ignore_ascii_case(st::STANDARD_STORAGE_TYPE)),
+            network_type: Some(
+                input
+                    .network_type
+                    .unwrap_or_else(|| st::DEFAULT_NETWORK_TYPE.to_string()),
+            ),
+            engine,
+            engine_version,
+            identifier: identifier.clone(),
+        };
+
+        let db_cluster = st::cluster_view(&record, &record.status);
+        state.clusters.insert(identifier, record);
+        Ok(CreateDBClusterOutput {
+            db_cluster: Some(db_cluster),
+        })
     }
 }

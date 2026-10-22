@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDistributions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDistributions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDistributions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted distributions, one page at a time: `MaxItems` is the page
+//! size, `Marker` is the distribution id the previous page ended at, and `NextMarker`
+//! arrives exactly when distributions remain.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +66,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +138,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDistributions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDistributionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDistributions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "MaxItems: the maximum number of distributions you want in the response" — a
+        // page holds at least one item, so a non-positive size names no page at all.
+        // The size served is bounded above by this emulator's own page ceiling, so one
+        // request cannot serve the whole store in a single response.
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListDistributionsErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(format!("MaxItems must be at least 1, was {max_items}")),
+            })
+            .into());
+        };
+        // The marker is the distribution id the previous page ended at, so a value that
+        // is not a distribution id was never a resume point this service handed out.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_distribution_id(marker) {
+                return Err(ListDistributionsErrorModeled::InvalidArgument(InvalidArgument {
+                    message: Some(format!(
+                        "Marker {marker} is not a distribution id returned by ListDistributions"
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        // Materialise the propagation the clock already owes, so each summary reports
+        // the status its distribution has at this instant.
+        store.settle(SystemTime::now());
+
+        let mut items: Vec<DistributionSummary> = Vec::new();
+        let mut is_truncated = false;
+        // `Marker` names where the previous page ENDED, so this page starts after it:
+        // walking the pages enumerates every distribution exactly once. The store is
+        // ordered by id, so the resume point is a range bound rather than a scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        for (_, stored) in store
+            .distributions
+            .range::<str, _>((start, Bound::Unbounded))
+        {
+            if items.len() >= page_size {
+                is_truncated = true;
+                break;
+            }
+            items.push(stored.to_summary());
+        }
+
+        Ok(ListDistributionsOutput {
+            distribution_list: Some(DistributionList {
+                // "The value you provided for the Marker request parameter."
+                marker: input.marker.unwrap_or_default(),
+                // Present exactly when more distributions remain, carrying the id this
+                // page ended at.
+                next_marker: if is_truncated {
+                    items.last().map(|summary| summary.id.clone())
+                } else {
+                    None
+                },
+                // "The value you provided for the MaxItems request parameter."
+                max_items,
+                is_truncated,
+                // "The number of distributions" in this page: the length of `Items`.
+                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+                // A page that lists nothing carries no `Items` element at all, rather
+                // than an empty one.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }

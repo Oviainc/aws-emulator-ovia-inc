@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/supported_resource_types.rs"]
+mod supported_resource_types;
 #[path = "all/vault_and_backup_job.rs"]
 mod vault_and_backup_job;

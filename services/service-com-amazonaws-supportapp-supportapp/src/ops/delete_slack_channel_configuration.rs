@@ -171,11 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteSlackChannelConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no Slack channel configuration exists for channel {} in \
-                             workspace {}",
-                            input.channel_id, input.team_id
-                        )),
+                        message: Some(
+                            crate::state::slack_channel_configuration_not_found(
+                                &input.team_id,
+                                &input.channel_id,
+                            ),
+                        ),
                     },
                 )
                 .into(),

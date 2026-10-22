@@ -205,11 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateSlackChannelConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "no Slack channel configuration exists for channel {} in \
-                             workspace {}",
-                            input.channel_id, input.team_id
-                        )),
+                        message: Some(
+                            crate::state::slack_channel_configuration_not_found(
+                                &input.team_id,
+                                &input.channel_id,
+                            ),
+                        ),
                     },
                 )
                 .into(),
@@ -243,6 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The severity/flag combination rule documented on `notifyOnCaseSeverity`,
         // evaluated over the configuration the update would leave behind.
         if let Some(message) = crate::state::notification_rule_violation(
+            Self::NAME,
             &merged.notify_on_case_severity,
             merged.notify_on_create_or_reopen_case.unwrap_or(false),
             merged.notify_on_add_correspondence_to_case.unwrap_or(false),

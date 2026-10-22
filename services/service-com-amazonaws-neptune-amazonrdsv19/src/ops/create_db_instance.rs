@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: persists a Neptune DB instance record, joins it to its cluster's member
+//! list, and answers with the `DBInstance` view of that record.
 //!
 //! ## Shape of an operation
 //!
@@ -303,18 +296,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBInstance"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state as st;
+
+        let identifier =
+            st::normalize_identifier("DBInstanceIdentifier", &input.db_instance_identifier)
+                .map_err(Scaffolded::validation)?;
+        let engine = st::validate_engine(&input.engine).map_err(Scaffolded::validation)?;
+        let region = st::request_region(ctx);
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(Scaffolded::not_implemented("CreateDBInstance"));
+        };
+        let mut state = state.lock();
+        state.settle();
+
+        let cluster_not_found = |reference: &str| {
+            CreateDBInstanceErrorModeled::DBClusterNotFoundFault(DBClusterNotFoundFault {
+                message: Some(format!("DBCluster {reference} not found.")),
+            })
+        };
+        let cluster_reference = input.db_cluster_identifier.clone();
+        let Some(cluster_key) = state.resolve_cluster_key(&cluster_reference) else {
+            return Err(cluster_not_found(&cluster_reference).into());
+        };
+
+        if state.instances.contains_key(&identifier) {
+            return Err(CreateDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
+                DBInstanceAlreadyExistsFault {
+                    message: Some(format!("DB Instance already exists: {identifier}")),
+                },
+            )
+            .into());
+        }
+
+        // The store and each cluster's member list are bounded: a caller looping over
+        // fresh identifiers hits the quota the API already models rather than growing
+        // this process's memory without limit.
+        let cluster_is_full = state
+            .clusters
+            .get(&cluster_key)
+            .is_some_and(|cluster| cluster.members.len() >= st::MAX_MEMBERS_PER_CLUSTER);
+        if !state.accepts_another_instance() || cluster_is_full {
+            return Err(CreateDBInstanceErrorModeled::InstanceQuotaExceededFault(
+                InstanceQuotaExceededFault {
+                    message: Some(if cluster_is_full {
+                        format!(
+                            "Cannot create more than {} DB instances in DB cluster {cluster_key}",
+                            st::MAX_MEMBERS_PER_CLUSTER
+                        )
+                    } else {
+                        format!(
+                            "Cannot create more than {} DB instances",
+                            st::MAX_STORED_INSTANCES
+                        )
+                    }),
+                },
+            )
+            .into());
+        }
+
+        let created = ::std::time::SystemTime::now();
+        let seed = st::record_seed(&identifier, created);
+
+        let record = {
+            let Some(cluster) = state.clusters.get_mut(&cluster_key) else {
+                return Err(cluster_not_found(&cluster_reference).into());
+            };
+            // An instance in a cluster inherits the cluster's engine version, port,
+            // hosted zone and endpoint shard label; only its own DNS label differs.
+            let engine_version = input
+                .engine_version
+                .unwrap_or_else(|| cluster.engine_version.clone());
+            let record = st::DbInstanceRecord {
+                arn: ::engine::emulator_arn("rds", &region, &format!("db:{identifier}")),
+                dbi_resource_id: st::mint_instance_resource_id(&identifier, created),
+                instance_class: input.db_instance_class,
+                // A new instance is NOT ready; `State::settle` moves it to `available`
+                // once the provisioning span the clock owes has elapsed.
+                status: st::STATUS_CREATING.to_string(),
+                available_at: Some(created + st::PROVISIONING_SPAN),
+                cluster_identifier: cluster.identifier.clone(),
+                endpoint_address: format!(
+                    "{identifier}.{}.{region}.neptune.amazonaws.com",
+                    cluster.endpoint_token
+                ),
+                endpoint_port: input.port.unwrap_or(cluster.port),
+                hosted_zone_id: cluster.hosted_zone_id.clone(),
+                availability_zone: input.availability_zone.unwrap_or_else(|| {
+                    cluster
+                        .availability_zones
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| format!("{region}a"))
+                }),
+                publicly_accessible: input.publicly_accessible.unwrap_or(false),
+                // PromotionTier — "Default: 1".
+                promotion_tier: input.promotion_tier.unwrap_or(1),
+                db_parameter_group: input
+                    .db_parameter_group_name
+                    .unwrap_or_else(|| st::default_parameter_group(&engine_version)),
+                preferred_maintenance_window: input
+                    .preferred_maintenance_window
+                    .unwrap_or_else(|| st::default_maintenance_window(&seed)),
+                // AutoMinorVersionUpgrade — "Default: true".
+                auto_minor_version_upgrade: input.auto_minor_version_upgrade.unwrap_or(true),
+                copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+                multi_az: input.multi_az.unwrap_or(false),
+                monitoring_interval: input.monitoring_interval.unwrap_or(0),
+                vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
+                tags: input
+                    .tags
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|tag| (tag.key.unwrap_or_default(), tag.value.unwrap_or_default()))
+                    .collect(),
+                instance_create_time: created,
+                deletion_protection: input.deletion_protection.unwrap_or(false),
+                engine,
+                engine_version,
+                identifier: identifier.clone(),
+            };
+            // The first member of a cluster is its writer; every later one joins as a
+            // reader until a failover or the writer's deletion promotes it.
+            let is_writer = !cluster.members.iter().any(|member| member.is_cluster_writer);
+            cluster.members.push(st::ClusterMember {
+                db_instance_identifier: record.identifier.clone(),
+                is_cluster_writer: is_writer,
+                promotion_tier: record.promotion_tier,
+                db_cluster_parameter_group_status: "in-sync".to_string(),
+            });
+            record
+        };
+
+        let db_instance =
+            st::instance_view(&record, state.clusters.get(&cluster_key), &record.status);
+        state.instances.insert(identifier, record);
+        Ok(CreateDBInstanceOutput {
+            db_instance: Some(db_instance),
+        })
     }
 }

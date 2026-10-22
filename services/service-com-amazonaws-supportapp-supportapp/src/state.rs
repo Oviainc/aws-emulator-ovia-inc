@@ -4,9 +4,9 @@
 //!
 //! Besides the state struct itself this module holds the few rules the Support App
 //! handlers share — the stored-record-to-modelled-shape conversion, the list cursor
-//! codec and the documented `notifyOnCaseSeverity` consistency rule — so the
-//! operation files agree on one implementation of each instead of carrying copies
-//! that can drift apart.
+//! codec, the documented `notifyOnCaseSeverity` consistency rule and the wording of
+//! the failures several operations can answer with — so the operation files agree on
+//! one implementation of each instead of carrying copies that can drift apart.
 
 use std::collections::BTreeMap;
 
@@ -115,17 +115,51 @@ pub fn decode_cursor(token: &str) -> Option<(String, String)> {
     Some((team_id.to_string(), channel_id.to_string()))
 }
 
-/// Why `severity` cannot hold together with the three notification flags, or `None`
-/// when it can.
+/// The three notification flags as this service's PROSE names them.
+///
+/// A Support App error message states a parameter in the API's PascalCase spelling
+/// (`NotifyOnCreateOrReopenCase`), not in the lowerCamel spelling the wire member
+/// uses, and lists them in this order. The wire members are
+/// `notifyOnCreateOrReopenCase`, `notifyOnAddCorrespondenceToCase` and
+/// `notifyOnResolveCase` on both
+/// `CreateSlackChannelConfigurationRequest` and `UpdateSlackChannelConfigurationRequest`
+/// (`smithy_query(query="operation",operation="CreateSlackChannelConfiguration")`).
+const NOTIFICATION_FLAG_PARAMETERS: [&str; 3] = [
+    "NotifyOnCreateOrReopenCase",
+    "NotifyOnAddCorrespondenceToCase",
+    "NotifyOnResolveCase",
+];
+
+/// A Support App `ValidationException` message: service prose that names the
+/// operation whose request was refused, states the rule the request broke, and asks
+/// the caller to retry.
+///
+/// This is the shape every Support App request-validation message has — "Your
+/// `<Operation>` request isn't valid. `<rule>` Try your request again." — so the
+/// operation's own handler supplies only the clause that states its rule and cannot
+/// spell the envelope differently from its neighbour. `rule` is a complete sentence,
+/// ending in its own full stop.
+pub fn invalid_request_message(operation: &str, rule: &str) -> String {
+    format!("Your {operation} request isn't valid. {rule} Try your request again.")
+}
+
+/// Why `severity` cannot hold together with the three notification flags, as the
+/// message the refusal carries, or `None` when it can.
 ///
 /// The rule is documented on `notifyOnCaseSeverity`
 /// (`smithy_query(query="doc",shape="UpdateSlackChannelConfigurationRequest",member="notifyOnCaseSeverity")`):
 /// with `high` or `all` at least one of the three flags must be `true`, and with
-/// `none` every one of them must be `false`. It is evaluated over the values the
-/// configuration will HOLD — create applies its documented default of `false` to an
-/// absent flag, update keeps the stored value — because that is what the
+/// `none` every one of them must be null or `false`. It is evaluated over the values
+/// the configuration will HOLD — create applies its documented default of `false` to
+/// an absent flag, update keeps the stored value — because that is what the
 /// notification setting means.
+///
+/// The message RESTATES that documented rule in service prose through
+/// [`invalid_request_message`], so the operation that was called is named and the
+/// parameters are named the way the API names them; `operation` is the caller's
+/// `Operation::NAME`.
 pub fn notification_rule_violation(
+    operation: &str,
     severity: &str,
     notify_on_create_or_reopen_case: bool,
     notify_on_add_correspondence_to_case: bool,
@@ -134,19 +168,55 @@ pub fn notification_rule_violation(
     let any_flag_set = notify_on_create_or_reopen_case
         || notify_on_add_correspondence_to_case
         || notify_on_resolve_case;
-    match severity {
-        "high" | "all" if !any_flag_set => Some(format!(
-            "notifyOnCaseSeverity {severity} requires at least one of \
-             notifyOnAddCorrespondenceToCase, notifyOnCreateOrReopenCase or \
-             notifyOnResolveCase to be true"
-        )),
-        "none" if any_flag_set => Some(
-            "notifyOnCaseSeverity none requires notifyOnAddCorrespondenceToCase, \
-             notifyOnCreateOrReopenCase and notifyOnResolveCase to be false"
-                .to_string(),
+    let [create_or_reopen, add_correspondence, resolve] = NOTIFICATION_FLAG_PARAMETERS;
+    let rule = match severity {
+        "high" | "all" if !any_flag_set => format!(
+            "If NotifyOnCaseSeverity is all or high, you must enter true for at least \
+             one of the following parameters: {create_or_reopen}, {add_correspondence} \
+             or {resolve}."
         ),
-        _ => None,
-    }
+        "none" if any_flag_set => format!(
+            "If NotifyOnCaseSeverity is none, the following parameters must be null \
+             or false: {create_or_reopen}, {add_correspondence} or {resolve}."
+        ),
+        _ => return None,
+    };
+    Some(invalid_request_message(operation, &rule))
+}
+
+/// How this service's prose names the Slack channel configuration a request
+/// identified: by the two members that identify it, `teamId` then `channelId`, in
+/// the order the request carries them.
+///
+/// Both members are a Slack id of its own kind — a team id is not a workspace
+/// configuration — so each is named for the member it came from. Every message about
+/// one configuration is built from here, so the not-found and the already-exists
+/// refusals cannot name the same resource two different ways.
+pub fn slack_channel_configuration_subject(team_id: &str, channel_id: &str) -> String {
+    format!("Slack channel configuration for team {team_id} and channel {channel_id}")
+}
+
+/// The `ResourceNotFoundException` message for a `(teamId, channelId)` pair this
+/// account holds no configuration for ("The specified resource is missing or doesn't
+/// exist, such as an account alias, Slack channel configuration, or Slack workspace
+/// configuration" — `ResourceNotFoundException`). Shared by every operation that
+/// looks one up, so they all state a miss the same way.
+pub fn slack_channel_configuration_not_found(team_id: &str, channel_id: &str) -> String {
+    format!(
+        "{} not found",
+        slack_channel_configuration_subject(team_id, channel_id)
+    )
+}
+
+/// The `ConflictException` message for a `(teamId, channelId)` pair that is already
+/// configured ("Add a Slack channel configuration that already exists in your Amazon
+/// Web Services account" — `ConflictException`), naming the resource exactly as
+/// [`slack_channel_configuration_not_found`] does.
+pub fn slack_channel_configuration_exists(team_id: &str, channel_id: &str) -> String {
+    format!(
+        "{} already exists",
+        slack_channel_configuration_subject(team_id, channel_id)
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
