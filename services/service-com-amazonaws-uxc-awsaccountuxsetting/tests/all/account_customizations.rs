@@ -10,6 +10,7 @@
 //! `body_validation_refusals`; this one covers what the service ACCEPTS and
 //! persists.
 
+use crate::support::{canonical, canonical_owned};
 use crate::wire::{
     build_router, call, generated_region, get_customizations, list_page, list_services_uri,
     strings, update_customizations, whole_catalog,
@@ -44,9 +45,10 @@ async fn get_before_any_update_returns_the_documented_defaults() {
 // ---------------------------------------------------------------------------
 
 /// The rule, over a table spanning the class: a settings value accepted by
-/// `UpdateAccountCustomizations` is persisted verbatim for the calling account,
-/// returned by that call, and returned again by `GetAccountCustomizations` — and
-/// re-applying the same request changes neither (`@idempotent`).
+/// `UpdateAccountCustomizations` is persisted for the calling account as the
+/// MEMBER SET it named, reported in the canonical order, returned by that call
+/// and returned again by `GetAccountCustomizations` — and re-applying the same
+/// request changes neither (`@idempotent`).
 ///
 /// Rows differ along colour value, list size (0, 1, 3, 10), element form and
 /// ordering, which is what the rule generalises over.
@@ -79,7 +81,7 @@ async fn update_persists_and_get_reads_back_every_shape_of_setting() {
             regions: vec!["eu-west-3", "ap-southeast-2", "us-gov-west-1"],
         },
         Case {
-            name: "ten services in non-alphabetical order",
+            name: "ten services named in non-alphabetical order",
             color: "lightBlue",
             services: vec![
                 "sqs",
@@ -113,8 +115,8 @@ async fn update_persists_and_get_reads_back_every_shape_of_setting() {
         });
         let expected = json!({
             "accountColor": case.color,
-            "visibleServices": strings(&case.services),
-            "visibleRegions": strings(&case.regions),
+            "visibleServices": canonical(&case.services),
+            "visibleRegions": canonical(&case.regions),
         });
 
         let (status, _, updated) = update_customizations(&router, request.clone()).await;
@@ -211,8 +213,9 @@ async fn settings_omitted_from_a_request_remain_unchanged() {
 }
 
 /// The modelled list bounds (`visibleServices` max 500, `visibleRegions` max 100):
-/// a list AT the bound is accepted and read back verbatim. (One element past the
-/// bound is a body-constraint refusal, which `body_validation_refusals` owns.)
+/// a list AT the bound is accepted and read back, in the canonical order. (One
+/// element past the bound is a body-constraint refusal, which
+/// `body_validation_refusals` owns.)
 ///
 /// `visibleServices` at its bound is built by cycling the catalog
 /// `ListServices` pages over, since every member must name a catalog service and
@@ -227,6 +230,10 @@ async fn lists_are_accepted_at_their_modelled_bound() {
         .map(|n| catalog[n % catalog.len()].clone())
         .collect();
     let regions_at_bound: Vec<String> = (0..100).map(generated_region).collect();
+    // Read back in the canonical order, which for neither list is the order the
+    // rows were generated in.
+    let services_canonical = canonical_owned(&services_at_bound);
+    let regions_canonical = canonical_owned(&regions_at_bound);
 
     let (status, _, body) = update_customizations(
         &router,
@@ -243,13 +250,13 @@ async fn lists_are_accepted_at_their_modelled_bound() {
     let (_, _, fetched) = get_customizations(&router).await;
     assert_eq!(
         fetched.get("visibleServices"),
-        Some(&json!(services_at_bound)),
-        "500 services must round-trip verbatim"
+        Some(&services_canonical),
+        "500 services must round-trip in the canonical order, got {fetched:?}"
     );
     assert_eq!(
         fetched.get("visibleRegions"),
-        Some(&json!(regions_at_bound)),
-        "100 Regions must round-trip verbatim"
+        Some(&regions_canonical),
+        "100 Regions must round-trip in the canonical order, got {fetched:?}"
     );
 }
 
