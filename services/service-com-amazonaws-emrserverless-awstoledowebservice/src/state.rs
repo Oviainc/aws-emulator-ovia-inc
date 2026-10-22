@@ -304,6 +304,17 @@ pub const SESSION_STARTED_STATE_DETAILS: &str = "Session started.";
 pub const SESSION_IDLE_TIMEOUT_STATE_DETAILS: &str =
     "Session terminated after remaining idle for its idle timeout.";
 
+/// `Session$stateDetails` for a session a caller asked to terminate, while the
+/// termination is still in flight.
+///
+/// `TerminateSession` documents the pair of states it moves a session through: "After
+/// you terminate a session, it enters the TERMINATING state and then the TERMINATED
+/// state."
+pub const SESSION_TERMINATING_STATE_DETAILS: &str = "Session termination requested.";
+
+/// `Session$stateDetails` for a session a caller's `TerminateSession` ended.
+pub const SESSION_TERMINATED_STATE_DETAILS: &str = "Session terminated by request.";
+
 /// The `SessionState` values from which a session never moves again.
 ///
 /// Source: the `SessionState` enum (`SUBMITTED`, `STARTING`, `STARTED`, `IDLE`, `BUSY`,
@@ -314,6 +325,29 @@ pub const TERMINAL_SESSION_STATES: &[&str] = &["FAILED", "TERMINATED"];
 pub fn is_terminal_session_state(state: &str) -> bool {
     TERMINAL_SESSION_STATES.contains(&state)
 }
+
+/// The `SessionState` values a `TerminateSession` can act on: the ones naming a session
+/// that is still live, so a terminate has a session left to end.
+///
+/// Derived from the generated `SessionState` value list rather than re-listed, so a value
+/// the enum gains is classified in one place: a state is terminable when the enum holds
+/// it, it is not terminal ([`TERMINAL_SESSION_STATES`]) and it is not
+/// [`SESSION_TERMINATING_STATE`], which already names the termination a terminate asks
+/// for.
+pub fn is_terminable_session_state(state: &str) -> bool {
+    crate::ops::types::SESSION_STATE_VALUES.contains(&state)
+        && !is_terminal_session_state(state)
+        && state != SESSION_TERMINATING_STATE
+}
+
+/// The `SessionState` a terminate moves a live session to.
+///
+/// Source: `TerminateSession`'s own documentation — "After you terminate a session, it
+/// enters the TERMINATING state and then the TERMINATED state."
+pub const SESSION_TERMINATING_STATE: &str = "TERMINATING";
+
+/// The `SessionState` the clock then owes that session, from the same sentence.
+pub const SESSION_TERMINATED_STATE: &str = "TERMINATED";
 
 /// The earliest Amazon EMR release whose applications serve interactive sessions.
 ///
@@ -1601,6 +1635,14 @@ pub const JOB_RUN_NOT_CANCELLABLE_MESSAGE: &str = "Job run is not in a cancellab
 /// The same, for the session a request names: one phrase for the resource class, naming
 /// no identifier, as this service's other not-found refusals do.
 pub const SESSION_NOT_FOUND_MESSAGE: &str = "Session does not exist";
+
+/// What a `ValidationException` says when a session cannot be terminated, because it has
+/// already reached a `SessionState` it never leaves.
+///
+/// State-agnostic on purpose, the way [`JOB_RUN_NOT_CANCELLABLE_MESSAGE`] is: it states
+/// the condition the operation refuses on, not the state the session happens to be in,
+/// so a caller reads the state from `GetSession` rather than out of an error body.
+pub const SESSION_NOT_TERMINABLE_MESSAGE: &str = "Session is not in a state that can be terminated";
 
 /// The `ResourceNotFoundException` payload for an application id that names none.
 ///

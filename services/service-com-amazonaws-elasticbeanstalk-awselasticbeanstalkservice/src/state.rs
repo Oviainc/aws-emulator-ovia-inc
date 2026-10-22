@@ -6,7 +6,8 @@
 //! applications, the application versions, the custom platform versions and the
 //! environments the lifecycle
 //! operations create, describe and delete, plus the managed platform branch
-//! catalog the service publishes. It also owns the few derivations all
+//! catalog the service publishes and the event log those operations append to
+//! and `DescribeEvents` reports. It also owns the few derivations all
 //! of them share — the server clock, the request's region, this service's ARN
 //! forms, and the clock-owed environment status transitions — so no handler
 //! spells one of them a second way.
@@ -16,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     ApplicationDescription, ApplicationResourceLifecycleConfig, ApplicationVersionDescription,
-    ConfigurationOptionSetting, EnvironmentTier, PlatformBranchSummary, PlatformDescription,
-    PlatformSummary, S3Location, Tag,
+    ConfigurationOptionSetting, EnvironmentTier, EventDescription, PlatformBranchSummary,
+    PlatformDescription, PlatformSummary, S3Location, Tag,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -107,6 +108,47 @@ const WEB_SERVER_ONLY: &[&str] = &[TIER_WEB_SERVER];
 /// The only `ApplicationVersionStatus` this service reports: it runs no version
 /// processing pipeline, so a stored version is never `Processing`/`Processed`.
 pub const VERSION_STATUS_UNPROCESSED: &str = "Unprocessed";
+
+/// `EventSeverity` from least to most severe, in the order the model declares the
+/// enum's members (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`) — the
+/// alphabetical `crate::ops::types::EVENT_SEVERITY_VALUES` is the same SET in a
+/// different order. `DescribeEvents$Severity` is documented as "limits the events
+/// returned from this call to include only those with the specified severity or
+/// higher", so this order is what "higher" means.
+pub const EVENT_SEVERITY_LADDER: &[&str] = &["TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"];
+
+/// The severity every event this service records carries: each one reports a
+/// lifecycle call that succeeded, which is informational. Nothing here runs a
+/// deployment, a health check or a managed action, so there is no failure or
+/// degradation to report at a higher severity and none is invented.
+pub const SEVERITY_INFO: &str = "INFO";
+
+/// How far back `DescribeEvents` reports: "Returns list of event descriptions
+/// matching criteria **up to the last 6 weeks**" (the model's `DescribeEvents`
+/// doc). An event older than this is outside the window the operation reports, so
+/// the store drops it.
+pub const EVENT_RETENTION: Duration = Duration::from_secs(6 * 7 * 24 * 60 * 60);
+
+/// The page size `DescribeEvents` uses when the caller names none: "This action
+/// returns the most recent 1,000 events from the specified NextToken" (the
+/// model's `DescribeEvents` doc), which is also `MaxRecords`' modelled maximum.
+pub const DEFAULT_EVENT_PAGE_SIZE: usize = 1_000;
+
+/// How many events the store keeps.
+///
+/// [`EVENT_RETENTION`] bounds the log by AGE, which bounds nothing inside one
+/// emulator run: a create/terminate loop can append thousands of events in a
+/// second, none of them six weeks old. So the log is also capped by COUNT, with
+/// the oldest records dropped first. The count is chosen, not documented.
+pub const MAX_RETAINED_EVENTS: usize = 10_000;
+
+/// Where `severity` sits on [`EVENT_SEVERITY_LADDER`], or `None` when it is not
+/// one of the modelled values.
+pub fn severity_rank(severity: &str) -> Option<usize> {
+    EVENT_SEVERITY_LADDER
+        .iter()
+        .position(|known| *known == severity)
+}
 
 /// Elastic Beanstalk's published default account quotas, which bound this store:
 /// 75 applications, 1,000 application versions and 200 environments per account
@@ -401,6 +443,25 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// A fresh id for "the web service request ID for the activity of this event"
+/// (`EventDescription$RequestId`): a v4 UUID, the form the real service reports
+/// it in.
+///
+/// The response envelope's own request id is minted inside the protocol
+/// serializer, after a handler has returned, so a handler cannot record THAT id.
+/// This is the id this service records for the activity of one call: every event
+/// a single call appends shares it, and no two calls share one. It is a
+/// server-generated per-run value, so nothing is derived from the request.
+///
+/// The randomness is the `uuid` crate's, reached through `emulator_telemetry`'s
+/// uuid-backed id newtype (`BatchId::random()` is `uuid::Uuid::new_v4()`
+/// rendered canonically — `vendor/emulator-telemetry/src/types.rs`), which this
+/// crate already depends on: nothing here is a hand-rolled generator and this
+/// crate declares no second path to the same crate.
+pub fn new_request_id() -> String {
+    ::emulator_telemetry::BatchId::random().as_str().to_string()
+}
+
 /// `arn:aws:elasticbeanstalk:<region>:<account>:application/<name>`.
 pub fn application_arn(region: &str, application_name: &str) -> String {
     ::engine::emulator_arn(
@@ -614,6 +675,56 @@ impl ApplicationVersion {
             date_created: Some(self.date_created),
             date_updated: Some(self.date_updated),
             status: Some(self.status.clone()),
+        }
+    }
+}
+
+/// The resources one recorded event is about — exactly the members
+/// `DescribeEvents` filters on, so a filter and a recording cannot disagree
+/// about which resource an event belongs to.
+///
+/// `environment_id` is NOT an `EventDescription` member: the wire shape reports
+/// only `EnvironmentName`. It is kept here because `DescribeEvents$EnvironmentId`
+/// filters on it, and an id identifies the record even after its name has been
+/// released by a termination and taken by a new environment.
+#[derive(Debug, Clone, Default)]
+pub struct EventSubject {
+    pub application_name: Option<String>,
+    pub version_label: Option<String>,
+    pub template_name: Option<String>,
+    pub environment_id: Option<String>,
+    pub environment_name: Option<String>,
+    pub platform_arn: Option<String>,
+}
+
+/// One recorded event: what happened, when, how severe it was, which request
+/// produced it and which resources it is about.
+#[derive(Debug, Clone)]
+pub struct Event {
+    /// Append order within this emulator, so "most recent first" is a total
+    /// order even for events recorded inside one clock tick, and so a
+    /// `NextToken` names one event unambiguously.
+    pub sequence: u64,
+    pub event_date: ::aws_smithy_types::DateTime,
+    pub message: String,
+    pub severity: String,
+    pub request_id: String,
+    pub subject: EventSubject,
+}
+
+impl Event {
+    /// The modelled `EventDescription` for this record.
+    pub fn to_description(&self) -> EventDescription {
+        EventDescription {
+            event_date: Some(self.event_date),
+            message: Some(self.message.clone()),
+            application_name: self.subject.application_name.clone(),
+            version_label: self.subject.version_label.clone(),
+            template_name: self.subject.template_name.clone(),
+            environment_name: self.subject.environment_name.clone(),
+            platform_arn: self.subject.platform_arn.clone(),
+            request_id: Some(self.request_id.clone()),
+            severity: Some(self.severity.clone()),
         }
     }
 }
@@ -1031,14 +1142,24 @@ fn managed_platform_branch_catalog() -> BTreeMap<String, PlatformBranch> {
         .collect()
 }
 
-/// A status change the clock owes an environment: what it moves to, and when
-/// that move is due. See [`STATUS_TRANSITION_SPAN`].
+/// A status change the clock owes an environment: what it moves to, when that
+/// move is due, and the event the move records. See [`STATUS_TRANSITION_SPAN`].
 #[derive(Debug, Clone)]
 pub struct PendingStatus {
     pub due_at: Instant,
+    /// The same instant on the server clock, so the record and the event the
+    /// change records are dated when the change came DUE rather than when a
+    /// later call happened to observe it as due.
+    pub due_date: ::aws_smithy_types::DateTime,
     pub status: String,
     pub health: String,
     pub health_status: Option<String>,
+    /// The request that started the change. The event the completion records
+    /// belongs to that request's activity, not to whichever later call happened
+    /// to observe the change as due.
+    pub request_id: String,
+    /// The message of the event recorded when the move is materialised.
+    pub completion_message: String,
 }
 
 impl PendingStatus {
@@ -1047,15 +1168,35 @@ impl PendingStatus {
     /// performed on it"), reporting healthy ("Green: Indicates the environment
     /// is healthy and fully functional"). Both the launch CreateEnvironment
     /// starts and the cancellation AbortEnvironmentUpdate starts end here, so
-    /// the two cannot drift apart.
-    pub fn completion_to_ready() -> Self {
+    /// the two cannot drift apart; they differ only in the request the
+    /// completion belongs to and the event it records.
+    pub fn completion_to_ready(request_id: &str, completion_message: impl Into<String>) -> Self {
         Self {
             due_at: Instant::now() + STATUS_TRANSITION_SPAN,
+            due_date: due_date(),
             status: STATUS_READY.to_string(),
             health: HEALTH_GREEN.to_string(),
             health_status: Some(HEALTH_STATUS_OK.to_string()),
+            request_id: request_id.to_string(),
+            completion_message: completion_message.into(),
         }
     }
+
+    /// The move CreateEnvironment owes: `Launching` -> `Ready`, recording that
+    /// the launch the call started has finished.
+    pub fn launch_completion(request_id: &str, environment_name: &str) -> Self {
+        Self::completion_to_ready(
+            request_id,
+            format!("Successfully launched environment: {environment_name}"),
+        )
+    }
+}
+
+/// One [`STATUS_TRANSITION_SPAN`] from now, on the server clock.
+fn due_date() -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_secs_f64(
+        now().as_secs_f64() + STATUS_TRANSITION_SPAN.as_secs_f64(),
+    )
 }
 
 /// A stored environment.
@@ -1102,9 +1243,22 @@ impl Environment {
         self.status == STATUS_READY
     }
 
+    /// The resources an event about this environment belongs to.
+    pub fn event_subject(&self) -> EventSubject {
+        EventSubject {
+            application_name: Some(self.application_name.clone()),
+            version_label: self.version_label.clone(),
+            template_name: self.template_name.clone(),
+            environment_id: Some(self.environment_id.clone()),
+            environment_name: Some(self.environment_name.clone()),
+            platform_arn: self.platform_arn.clone(),
+        }
+    }
+
     /// Start the move to `Terminating`, with the move to `Terminated` due one
-    /// [`STATUS_TRANSITION_SPAN`] from now.
-    pub fn begin_termination(&mut self) {
+    /// [`STATUS_TRANSITION_SPAN`] from now. `request_id` is the request asking
+    /// for the termination, which the completion event is then attributed to.
+    pub fn begin_termination(&mut self, request_id: &str) {
         self.status = STATUS_TERMINATING.to_string();
         self.health = HEALTH_GREY.to_string();
         self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
@@ -1112,11 +1266,14 @@ impl Environment {
         self.date_updated = now();
         self.pending_status = Some(PendingStatus {
             due_at: Instant::now() + STATUS_TRANSITION_SPAN,
+            due_date: due_date(),
             status: STATUS_TERMINATED.to_string(),
             health: HEALTH_GREY.to_string(),
             // A terminated environment runs nothing, so it reports no health
             // status at all rather than one of the running values.
             health_status: None,
+            request_id: request_id.to_string(),
+            completion_message: "terminateEnvironment completed successfully.".to_string(),
         });
     }
 
@@ -1126,12 +1283,15 @@ impl Environment {
     /// model describes for a new one — "Launching: Environment is in the process
     /// of initial deployment" — and the move back to `Ready` is what the clock
     /// then owes, exactly as after CreateEnvironment.
-    pub fn begin_rebuild(&mut self) {
+    pub fn begin_rebuild(&mut self, request_id: &str) {
         self.status = STATUS_LAUNCHING.to_string();
         self.health = HEALTH_GREY.to_string();
         self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
         self.date_updated = now();
-        self.pending_status = Some(PendingStatus::completion_to_ready());
+        self.pending_status = Some(PendingStatus::completion_to_ready(
+            request_id,
+            "rebuildEnvironment completed successfully.",
+        ));
     }
 
     /// Start an application-server restart: the environment keeps its status —
@@ -1140,12 +1300,15 @@ impl Environment {
     /// gives as the `Grey` case ("health checks are suspended during an
     /// UpdateEnvironment or RestartEnvironment request"). The health the
     /// environment reported before the restart is what the clock owes back.
-    pub fn begin_app_server_restart(&mut self) {
+    pub fn begin_app_server_restart(&mut self, request_id: &str) {
         let restored = PendingStatus {
             due_at: Instant::now() + STATUS_TRANSITION_SPAN,
+            due_date: due_date(),
             status: self.status.clone(),
             health: self.health.clone(),
             health_status: self.health_status.clone(),
+            request_id: request_id.to_string(),
+            completion_message: "restartAppServer completed successfully.".to_string(),
         };
         self.health = HEALTH_GREY.to_string();
         self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
@@ -1158,41 +1321,63 @@ impl Environment {
     /// process of aborting a deployment"), stops reporting an abortable
     /// operation — the one in flight is already being cancelled — and the
     /// return to `Ready` is what the clock then owes, one
-    /// [`STATUS_TRANSITION_SPAN`] later.
+    /// [`STATUS_TRANSITION_SPAN`] later. `request_id` is the request asking for
+    /// the cancellation, which the completion event is then attributed to.
     ///
     /// Health goes `Grey`/`Pending` for the duration, as the model documents
     /// for an environment whose "health checks are suspended during an
     /// UpdateEnvironment or RestartEnvironment request".
-    pub fn begin_abort(&mut self) {
+    pub fn begin_abort(&mut self, request_id: &str) {
         self.status = STATUS_ABORTING.to_string();
         self.health = HEALTH_GREY.to_string();
         self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
         self.abortable_operation_in_progress = false;
         self.date_updated = now();
-        self.pending_status = Some(PendingStatus::completion_to_ready());
+        self.pending_status = Some(PendingStatus::completion_to_ready(
+            request_id,
+            "abortEnvironmentUpdate completed successfully.",
+        ));
     }
 
-    /// Apply the pending status change if the clock has already made it due.
+    /// Apply the pending status change if the clock has already made it due, and
+    /// answer the completion that change records (`None` when nothing was due).
     ///
     /// This is the one write a reporting operation performs: the change was owed
     /// at `due_at` whether or not anybody called, so materialising it on read
-    /// cannot show a caller a state the clock had not already reached.
-    fn materialize_due(&mut self, at: Instant) {
-        let Some(pending) = self.pending_status.as_ref() else {
-            return;
-        };
+    /// cannot show a caller a state the clock had not already reached. The event
+    /// is owed by the same instant, for the same reason, and is dated by it —
+    /// never by the moment some later call noticed.
+    fn materialize_due(&mut self, at: Instant) -> Option<CompletedTransition> {
+        let pending = self.pending_status.as_ref()?;
         if pending.due_at > at {
-            return;
+            return None;
         }
         let pending = self.pending_status.take().expect("checked above");
         self.status = pending.status;
         self.health = pending.health;
         self.health_status = pending.health_status;
-        self.date_updated = now();
+        self.date_updated = pending.due_date;
         if self.status == STATUS_TERMINATED {
-            self.date_terminated = Some(self.date_updated);
+            self.date_terminated = Some(pending.due_date);
         }
+        Some(CompletedTransition {
+            request_id: pending.request_id,
+            message: pending.completion_message,
+            at: pending.due_date,
+            subject: self.event_subject(),
+        })
     }
+}
+
+/// A status change the clock has made due and this store has applied, and the
+/// event that change records: the request it belongs to, its message, the
+/// instant it came due and the resources it is about.
+#[derive(Debug, Clone)]
+struct CompletedTransition {
+    request_id: String,
+    message: String,
+    at: ::aws_smithy_types::DateTime,
+    subject: EventSubject,
 }
 
 /// Build one of the generated `EnvironmentDescription` structs from a stored
@@ -1343,12 +1528,17 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// `EnvironmentName` -> `EnvironmentId`, so an operation that takes either
     /// one resolves the same record.
     pub environment_name_index: BTreeMap<String, String>,
+    /// The service's event log, OLDEST first: every lifecycle call appends here
+    /// and `DescribeEvents` reports from it. Append order is the record's
+    /// `sequence`, which breaks a tie between two events the clock dated alike.
+    pub events: Vec<Event>,
     /// The managed platform branches this account can see, by
     /// [`PlatformBranch::key`]. Service-owned reference data: seeded from
     /// [`MANAGED_PLATFORM_BRANCHES`] when the store is created, so every
     /// platform operation reads one catalog.
     pub platform_branches: BTreeMap<String, PlatformBranch>,
-    /// Source of unique `EnvironmentId` values and of version sequence numbers.
+    /// Source of unique `EnvironmentId` values, of version sequence numbers and
+    /// of event sequence numbers.
     pub next_id_counter: u64,
 }
 
@@ -1365,6 +1555,7 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             platform_versions: BTreeMap::new(),
             environments: BTreeMap::new(),
             environment_name_index: BTreeMap::new(),
+            events: Vec::new(),
             platform_branches: managed_platform_branch_catalog(),
             next_id_counter: 0,
         }
@@ -1382,6 +1573,45 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     pub fn next_counter(&mut self) -> u64 {
         self.next_id_counter += 1;
         self.next_id_counter
+    }
+
+    /// Append one event to the log: what happened, how severe it was, which
+    /// request produced it and which resources it is about. The event date is
+    /// the server clock at the moment it is recorded.
+    ///
+    /// Every lifecycle handler records through here, so `DescribeEvents` reads
+    /// one log rather than reconstructing events from the resources.
+    pub fn record_event(
+        &mut self,
+        request_id: &str,
+        severity: &str,
+        message: impl Into<String>,
+        subject: EventSubject,
+    ) {
+        self.record_event_at(request_id, severity, message, subject, now());
+    }
+
+    /// As [`Self::record_event`], with the event dated `event_date` rather than
+    /// the moment of the call: a change the CLOCK owed is dated when it came
+    /// due, not when a later call happened to observe it.
+    pub fn record_event_at(
+        &mut self,
+        request_id: &str,
+        severity: &str,
+        message: impl Into<String>,
+        subject: EventSubject,
+        event_date: ::aws_smithy_types::DateTime,
+    ) {
+        let sequence = self.next_counter();
+        self.events.push(Event {
+            sequence,
+            event_date,
+            message: message.into(),
+            severity: severity.to_string(),
+            request_id: request_id.to_string(),
+            subject,
+        });
+        self.evict_retired_events();
     }
 
     /// An application's version labels, newest first.
@@ -1554,18 +1784,77 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     }
 
     /// Materialise every status change the clock has already made due — an
-    /// environment's, and a platform version's. Every handler that reads or acts
-    /// on one of them calls this first,
-    /// so no two of them disagree about what state the store is in.
+    /// environment's, and a platform version's — record the event each completed
+    /// environment change owes, and drop the events the clock has carried out of
+    /// the reporting window. Every handler that reads or acts on one of them
+    /// calls this first, so no two of them disagree about what state the store is
+    /// in.
     pub fn materialize_due_transitions(&mut self) {
         let at = Instant::now();
+        // The event cannot be appended while `environments` is borrowed, so the
+        // completions are collected first and recorded below.
+        let mut completed: Vec<CompletedTransition> = Vec::new();
         for environment in self.environments.values_mut() {
-            environment.materialize_due(at);
+            if let Some(transition) = environment.materialize_due(at) {
+                completed.push(transition);
+            }
         }
+        for transition in completed {
+            self.record_event_at(
+                &transition.request_id,
+                SEVERITY_INFO,
+                transition.message,
+                transition.subject,
+                transition.at,
+            );
+        }
+        self.expire_events();
         for platform_version in self.platform_versions.values_mut() {
             platform_version.materialize_due(at);
         }
         self.evict_retired_environments();
+    }
+
+    /// Drop every event older than [`EVENT_RETENTION`] — the window
+    /// `DescribeEvents` reports over. The expiry was due at the moment the event
+    /// aged out, whether or not anybody called, so applying it here cannot hide
+    /// an event that was still reportable.
+    fn expire_events(&mut self) {
+        let horizon = now().as_secs_f64() - EVENT_RETENTION.as_secs_f64();
+        self.events
+            .retain(|event| event.event_date.as_secs_f64() >= horizon);
+    }
+
+    /// Hold the count bound on the event log: past [`MAX_RETAINED_EVENTS`] the
+    /// oldest-DATED events are dropped, so a create/terminate loop cannot grow
+    /// the log without bound inside a single run, where nothing is six weeks old
+    /// yet.
+    ///
+    /// By date, not by append position: a clock-owed completion is recorded with
+    /// the date it came due, so it can sit later in the append order than its
+    /// date. Dropping by date is what makes the bound agree with the order
+    /// `DescribeEvents` reports in, so the record dropped is always one that had
+    /// already fallen off the end of the answer.
+    fn evict_retired_events(&mut self) {
+        while self.events.len() > MAX_RETAINED_EVENTS {
+            let oldest = self
+                .events
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    left.event_date
+                        .as_secs_f64()
+                        .total_cmp(&right.event_date.as_secs_f64())
+                        .then_with(|| left.sequence.cmp(&right.sequence))
+                })
+                .map(|(index, _)| index);
+            match oldest {
+                Some(index) => {
+                    self.events.remove(index);
+                }
+                None => break,
+            }
+        }
     }
 
     /// Hold the retention bound on terminated environments: past
