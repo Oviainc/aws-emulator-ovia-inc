@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Derives a mapping template in the requested language from the two sample documents the
+//! caller supplies, by ALIGNING the target document's structure with the source
+//! document's: every target leaf whose value also occurs in the source document becomes a
+//! reference to the path it occurs at, and every other target leaf stays a literal. The
+//! template is therefore exact on the sample pair — applied to `inputFileContent` it
+//! reproduces `outputFileContent` — and `mappingAccuracy` reports the fraction of the
+//! target document's value-carrying leaves the template really sources from the input, so
+//! a fully data-driven template reports `1.0` and one that could source nothing reports
+//! `0.0` (the modelled `Float range 0.0..1.0`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Amazon Bedrock is not reachable from this emulator, so nothing here pretends a model
+//! ran: the alignment above is a deterministic computation over the request's own two
+//! documents, and the same request always answers with the same template.
+//!
+//! This operation owns no resource — AWS persists nothing for it — so it neither reads nor
+//! writes [`crate::state`], and a call leaves what every later caller sees untouched.
+//!
+//! ## One deliberate narrowing
+//!
+//! The model documents each sample as being "either in JSON or XML format" and sets no
+//! cross-member constraint, but a JSONata expression can only navigate and construct JSON
+//! and an XSLT stylesheet only XML. A template cannot be generated across that line, so a
+//! sample whose format the requested `mappingType` cannot consume is refused with the
+//! modelled `ValidationException` naming the member — stricter than the modelled contract,
+//! and the only template the emulator could otherwise answer with would not run. A sample
+//! is read as JSON when its first non-blank character is `{` or `[` and as XML when it is
+//! `<`, so a JSON document whose ROOT is a scalar (`42`, `"ST*850"`) is refused as well —
+//! a parsed EDI document is an object or an array, and a scalar carries no structure to
+//! align.
+//!
+//! The bounds below ([`MAX_DOCUMENT_DEPTH`], [`MAX_DOCUMENT_NODES`], [`MAX_PATH_BYTES`],
+//! [`MAX_INDEXED_PATH_BYTES`], [`MAX_TEMPLATE_CHARS`]/[`MAX_TEMPLATE_BYTES`]) are this
+//! emulator's own: they keep the work and the allocation one 5 MB request can drive
+//! bounded, and each one refuses with that same modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +116,10 @@
 //!   are violated, invalid codes are used in code list validations, or required elements are
 //!   missing based on configured element requirement rules.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -129,6 +158,1178 @@ impl From<GenerateMappingErrorModeled> for GenerateMappingError {
     }
 }
 
+/// The two values of the modelled `MappingType` enum (the generated
+/// `MAPPING_TYPE_VALUES` enumerates the same pair, and the refusal below quotes it).
+const MAPPING_TYPE_JSONATA: &str = "JSONATA";
+const MAPPING_TYPE_XSLT: &str = "XSLT";
+
+/// The deepest nesting a sample document may carry before this operation refuses it.
+///
+/// 64 levels: deeper than any X12 transaction-set document (segment groups nest a handful
+/// of levels), and it bounds the recursion the walk and the render do per request, which a
+/// 5 MB document could otherwise drive arbitrarily deep. Counted in NODES on one root-to-leaf
+/// chain, so the same number holds for both formats: 64 nested XML elements, or 63 nested
+/// JSON containers around a value.
+const MAX_DOCUMENT_DEPTH: usize = 64;
+
+/// The most NODES one sample document may carry before this operation refuses it.
+///
+/// EVERY node counts — a JSON object, array or scalar, an XML element, attribute or text
+/// run — not only the value-carrying leaves: the walk and the render both do work per
+/// node, so a document of nothing but empty containers has to be bounded as well as one
+/// full of values. This is what keeps a single 5 MB document (the modelled
+/// `len 0..5000000`) from costing unbounded time.
+const MAX_DOCUMENT_NODES: usize = 50_000;
+
+/// The longest path to a single value this operation will reference, in bytes.
+///
+/// A path is the concatenation of its ancestors' names, so without this bound a document
+/// nesting very long names would make every leaf own a multi-kilobyte path. 1 KiB is far
+/// past any chain of X12 element names. It is checked on the way DOWN the walk — before a
+/// child's path is assembled — so a subtree under an over-long path costs nothing, and in
+/// bytes rather than characters so the check is O(1) (bytes are never fewer than
+/// characters, which makes the test conservative).
+const MAX_PATH_BYTES: usize = 1024;
+
+/// The longest template this operation returns.
+///
+/// The modelled `MappingTemplate` length bound (`len 0..350000`) — the member
+/// `TestMapping`, `CreateTransformer` and `UpdateTransformer` accept a template in. A
+/// template past it could not be used with the operations it is generated for, so the
+/// request is refused instead of answered with one.
+const MAX_TEMPLATE_CHARS: usize = 350_000;
+
+/// The most BYTES of template text that is ever assembled.
+///
+/// [`MAX_TEMPLATE_CHARS`] characters cannot take more UTF-8 bytes than this, so rendering
+/// that has already passed it can only end in a template the request is refused for:
+/// rendering stops there, so an oversized request costs a bounded allocation instead of
+/// first materialising the whole template and measuring it afterwards.
+const MAX_TEMPLATE_BYTES: usize = 4 * MAX_TEMPLATE_CHARS;
+
+/// The most path text a [`SourceIndex`] holds at once, in bytes.
+///
+/// The index exists to be quoted into the template, which carries at most
+/// [`MAX_TEMPLATE_CHARS`] characters, so holding more path text than that can never pay
+/// off — and it bounds the index's own allocation independently of how the names in a
+/// document nest.
+const MAX_INDEXED_PATH_BYTES: usize = MAX_TEMPLATE_CHARS;
+
+/// The most namespace declarations copied from a source document onto the generated
+/// stylesheet: one per distinct prefix, and no more than a stylesheet needs to resolve the
+/// prefixes an XPath can carry. A source declaring more is REFUSED, like every other bound
+/// here, rather than answered with a stylesheet that leaves some prefix unbound.
+const MAX_SOURCE_NAMESPACES: usize = 64;
+
+/// The prefix the generated stylesheet binds to the XSLT namespace itself, which a source
+/// document's own declaration must never be allowed to redeclare.
+const XSL_PREFIX: &str = "xsl";
+
+/// The namespace an XSLT processor recognises its instructions by — whatever prefix a
+/// document happens to bind to it, which is why the guards below test this URI and not
+/// only the [`XSL_PREFIX`] spelling.
+const XSLT_NAMESPACE: &str = "http://www.w3.org/1999/XSL/Transform";
+
+/// One indentation level of generated template text.
+const INDENT: &str = "  ";
+
+/// The tree key an element's text content is held under, where the element also carries
+/// attributes or child elements.
+const TEXT_KEY: &str = "#text";
+
+/// The language a mapping template is generated in, from the modelled `mappingType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Language {
+    /// A JSONata expression: an expression over a JSON document, producing JSON.
+    Jsonata,
+    /// An XSLT 1.0 stylesheet: a transform over an XML document, producing XML.
+    Xslt,
+}
+
+impl Language {
+    /// The document format this language consumes and produces — a JSONata expression
+    /// navigates JSON and an XSLT stylesheet navigates XML, so both samples must be in it.
+    fn document_format(self) -> DocumentFormat {
+        match self {
+            Self::Jsonata => DocumentFormat::Json,
+            Self::Xslt => DocumentFormat::Xml,
+        }
+    }
+
+    /// The modelled `MappingType` value.
+    fn modelled_name(self) -> &'static str {
+        match self {
+            Self::Jsonata => MAPPING_TYPE_JSONATA,
+            Self::Xslt => MAPPING_TYPE_XSLT,
+        }
+    }
+}
+
+/// The format a sample document is written in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentFormat {
+    Json,
+    Xml,
+}
+
+impl DocumentFormat {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Json => "JSON",
+            Self::Xml => "XML",
+        }
+    }
+
+    /// How a path into a document of this format is written in the matching template
+    /// language: a JSONata path expression for JSON, an XPath for XML.
+    fn path_flavor(self) -> PathFlavor {
+        match self {
+            Self::Json => PathFlavor::Jsonata,
+            Self::Xml => PathFlavor::XPath,
+        }
+    }
+}
+
+/// A scalar value a document's leaf carries.
+#[derive(Debug, Clone, PartialEq)]
+enum Scalar {
+    Text(String),
+    /// The number as the document wrote it, so a generated literal keeps the sample's own
+    /// notation rather than a reformatted one.
+    Number(String),
+    Bool(bool),
+    Null,
+}
+
+impl Scalar {
+    /// The text a document holds for this value, or `None` for JSON `null` — which holds
+    /// no value, so nothing in the source document can be the place it came from.
+    fn source_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Number(number) => Some(number),
+            Self::Bool(true) => Some("true"),
+            Self::Bool(false) => Some("false"),
+            Self::Null => None,
+        }
+    }
+
+    /// The value as a JSONata literal.
+    fn jsonata_literal(&self) -> String {
+        match self {
+            Self::Text(text) => json_string(text),
+            Self::Number(number) => number.clone(),
+            Self::Bool(value) => value.to_string(),
+            Self::Null => "null".to_string(),
+        }
+    }
+}
+
+/// A sample document as a tree, with JSON objects/arrays and XML elements/attributes
+/// reduced to the same three shapes so one alignment serves both formats.
+#[derive(Debug, Clone)]
+enum Node {
+    /// Named children in document order: a JSON object, or an XML element's attributes
+    /// (keyed `@name`), its text (keyed [`TEXT_KEY`]) and its child elements.
+    Branch(Vec<(String, Node)>),
+    /// Repeated values under one name: a JSON array, or an XML element's repeated
+    /// same-named children.
+    Series(Vec<Node>),
+    Leaf(Scalar),
+}
+
+/// How a path into a source document is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathFlavor {
+    Jsonata,
+    XPath,
+}
+
+impl PathFlavor {
+    /// The path of the document root.
+    fn root(self) -> String {
+        match self {
+            // JSONata's context, so every generated reference is rooted explicitly.
+            Self::Jsonata => "$".to_string(),
+            // An XPath is rooted by the leading `/` of the root element step.
+            Self::XPath => String::new(),
+        }
+    }
+
+    /// The path of the child held under `key` of the value at `parent`.
+    fn child(self, parent: &str, key: &str) -> String {
+        match self {
+            Self::Jsonata => format!("{parent}.{}", jsonata_name(key)),
+            Self::XPath => match key.strip_prefix('@') {
+                Some(attribute) => format!("{parent}/@{attribute}"),
+                None if key == TEXT_KEY => format!("{parent}/text()"),
+                None => format!("{parent}/{key}"),
+            },
+        }
+    }
+
+    /// The path of item `index` of the `len`-item series at `path`.
+    fn item(self, path: &str, index: usize, len: usize) -> String {
+        match self {
+            // JSONata indexes an array from 0.
+            Self::Jsonata => format!("{path}[{index}]"),
+            // XPath positions are 1-based, and a name with a single element needs no
+            // predicate at all.
+            Self::XPath if len > 1 => format!("{path}[{}]", index + 1),
+            Self::XPath => path.to_string(),
+        }
+    }
+}
+
+/// Is `key` an XML namespace declaration rather than data?
+///
+/// A declaration is part of the document's structure: it is copied onto the generated
+/// stylesheet verbatim (so the prefixes an XPath uses resolve), never sourced from the
+/// input document and never counted as a mapping opportunity.
+fn is_namespace_declaration(key: &str) -> bool {
+    key == "@xmlns" || key.starts_with("@xmlns:")
+}
+
+/// `text` as a JSON (and JSONata) string literal, escaped by `serde_json` rather than by
+/// hand.
+fn json_string(text: &str) -> String {
+    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// `text` with the five XML metacharacters escaped — and with the code points XML 1.0
+/// forbids outright replaced — by the vendored codec's own escaper, which is what every
+/// XML this emulator emits goes through.
+fn xml_escaped(text: &str) -> String {
+    ::aws_smithy_schema_server::xml_escape(text)
+}
+
+/// `key` as a JSONata name step: bare where the name is a plain identifier, backtick-quoted
+/// otherwise — JSONata's own quoting for a name carrying characters its grammar reads as
+/// operators (`$` introduces a variable reference, so a name holding one is quoted too). A
+/// name holding a backtick itself has no JSONata spelling at all, and is filtered out
+/// before it reaches here ([`SourceIndex::walk`]).
+fn jsonata_name(key: &str) -> String {
+    let plain = !key.is_empty()
+        && !key.starts_with(|c: char| c.is_ascii_digit())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        key.to_string()
+    } else {
+        format!("`{key}`")
+    }
+}
+
+/// A leaf name reduced to what two documents can be expected to agree on: case and the
+/// separators (`_`, `-`, `.`, `@`, `#`) differ freely between an EDI document's JSON and
+/// XML renderings of the same element.
+fn normalized_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Where each value in the SOURCE document can be read from.
+///
+/// Two indexes, consulted in order, so a value that occurs more than once resolves to the
+/// most defensible of its paths: first the occurrence whose leaf name matches the target
+/// leaf's name, then the first occurrence in document order. A path is stored ONCE and
+/// shared between the two (`Arc<str>`), and a document is REFUSED — like every other
+/// bound here, rather than silently half-indexed — once one path passes
+/// [`MAX_PATH_BYTES`] or its paths together pass [`MAX_INDEXED_PATH_BYTES`], so the
+/// index's allocation never scales as leaves × path length.
+#[derive(Debug, Default)]
+struct SourceIndex {
+    by_name_and_value: HashMap<(String, String), Arc<str>>,
+    by_value: HashMap<String, Arc<str>>,
+    /// How much distinct path text the two maps hold between them, in bytes.
+    indexed_path_bytes: usize,
+}
+
+impl SourceIndex {
+    /// Index every value-carrying leaf of `root`, written in `flavor`'s path syntax.
+    fn build(root: &Node, flavor: PathFlavor) -> Result<Self, String> {
+        let mut index = Self::default();
+        index.walk(root, &flavor.root(), "", flavor)?;
+        Ok(index)
+    }
+
+    fn walk(
+        &mut self,
+        node: &Node,
+        path: &str,
+        name: &str,
+        flavor: PathFlavor,
+    ) -> Result<(), String> {
+        // Checked on the way DOWN, before any child path is built: every path below this
+        // one starts with it, so the descent stops here rather than assembling and
+        // copying the longer paths underneath. `len()` is bytes — never fewer than
+        // characters — so the test is conservative and costs no scan of the path.
+        if path.len() > MAX_PATH_BYTES {
+            return Err(format!(
+                "has a value path longer than the {MAX_PATH_BYTES} bytes this emulator references"
+            ));
+        }
+        if self.indexed_path_bytes.saturating_add(path.len()) > MAX_INDEXED_PATH_BYTES {
+            return Err(format!(
+                "has more value-path text than the {MAX_INDEXED_PATH_BYTES} bytes this emulator indexes"
+            ));
+        }
+        match node {
+            Node::Branch(entries) => {
+                for (key, child) in entries {
+                    // A namespace declaration is structure, not data; and a name holding a
+                    // backtick has no JSONata spelling, so nothing under it can be
+                    // referenced from a JSONata template (such a value stays a literal in
+                    // the generated template, which is still a correct template).
+                    if is_namespace_declaration(key)
+                        || (flavor == PathFlavor::Jsonata && key.contains('`'))
+                    {
+                        continue;
+                    }
+                    self.walk(child, &flavor.child(path, key), key, flavor)?;
+                }
+            }
+            Node::Series(items) => {
+                for (position, item) in items.iter().enumerate() {
+                    let item_path = flavor.item(path, position, items.len());
+                    self.walk(item, &item_path, name, flavor)?;
+                }
+            }
+            Node::Leaf(scalar) => {
+                let Some(value) = scalar.source_text().filter(|value| !value.is_empty()) else {
+                    return Ok(());
+                };
+                let shared: Arc<str> = Arc::from(path);
+                let mut stored = false;
+                if let Entry::Vacant(slot) = self
+                    .by_name_and_value
+                    .entry((normalized_name(name), value.to_string()))
+                {
+                    slot.insert(Arc::clone(&shared));
+                    stored = true;
+                }
+                if let Entry::Vacant(slot) = self.by_value.entry(value.to_string()) {
+                    slot.insert(Arc::clone(&shared));
+                    stored = true;
+                }
+                // Counted once however many maps point at it: they share one allocation.
+                if stored {
+                    self.indexed_path_bytes += path.len();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The path a target leaf named `name` holding `value` can be sourced from.
+    fn path_for(&self, name: &str, value: &str) -> Option<&str> {
+        self.by_name_and_value
+            .get(&(normalized_name(name), value.to_string()))
+            .or_else(|| self.by_value.get(value))
+            .map(|path| &**path)
+    }
+}
+
+/// The template being generated, and the count of target leaves it sources from the input.
+struct Template<'a> {
+    source: &'a SourceIndex,
+    /// Target leaves carrying a value — the leaves a mapping could source.
+    mappable: usize,
+    /// Of those, the ones the template really does source from the input document.
+    matched: usize,
+    /// Set when rendering stopped short of the whole target document because the budget
+    /// ran out: the request is refused rather than answered with a partial template.
+    truncated: bool,
+    text: String,
+}
+
+/// What the template holds at one target leaf.
+enum Mapped {
+    /// A reference to the source path the value was found at.
+    Reference(String),
+    /// The sample target's own value, because the source document does not hold it.
+    Literal(Scalar),
+}
+
+impl<'a> Template<'a> {
+    fn new(source: &'a SourceIndex) -> Self {
+        Self {
+            source,
+            mappable: 0,
+            matched: 0,
+            truncated: false,
+            text: String::new(),
+        }
+    }
+
+    /// Align one target leaf against the source document, counting the opportunity and
+    /// whether it was taken.
+    fn map_leaf(&mut self, name: &str, scalar: &Scalar) -> Mapped {
+        if let Some(value) = scalar.source_text().filter(|value| !value.is_empty()) {
+            self.mappable += 1;
+            if let Some(path) = self.source.path_for(name, value) {
+                self.matched += 1;
+                return Mapped::Reference(path.to_string());
+            }
+        }
+        Mapped::Literal(scalar.clone())
+    }
+
+    /// The share of the target document's value-carrying leaves the template sources from
+    /// the input document, in the modelled `0.0..1.0` range. A target document with no
+    /// value-carrying leaf offers nothing to source, so it scores `0.0`.
+    fn accuracy(&self) -> f32 {
+        if self.mappable == 0 {
+            return 0.0;
+        }
+        (self.matched as f32 / self.mappable as f32).clamp(0.0, 1.0)
+    }
+
+    /// Whether rendering has already produced more text than any answerable template can
+    /// carry ([`MAX_TEMPLATE_BYTES`]).
+    ///
+    /// Checked at the top of every node, so an oversized target document is refused after
+    /// a bounded amount of text has been assembled rather than after the whole template
+    /// has been materialised.
+    fn over_budget(&self) -> bool {
+        self.text.len() > MAX_TEMPLATE_BYTES
+    }
+
+    /// [`over_budget`](Self::over_budget), counting one element's not-yet-emitted
+    /// attribute, instruction and text fragments as well.
+    ///
+    /// A wide element — tens of thousands of attributes — is collected before any of it is
+    /// emitted, so the budget has to cover what has been collected or the collection alone
+    /// could outgrow the template it is destined for.
+    fn collected_over_budget(
+        &self,
+        literal_attributes: &str,
+        constructed_attributes: &[String],
+        content: &[String],
+    ) -> bool {
+        let collected = literal_attributes.len()
+            + constructed_attributes
+                .iter()
+                .chain(content)
+                .map(String::len)
+                .sum::<usize>();
+        self.text.len().saturating_add(collected) > MAX_TEMPLATE_BYTES
+    }
+
+    fn indent(&mut self, depth: usize) {
+        for _ in 0..depth {
+            self.text.push_str(INDENT);
+        }
+    }
+
+    // --- JSONata -----------------------------------------------------------------
+
+    /// Render `target` as a JSONata expression constructing it.
+    fn jsonata(&mut self, target: &Node) {
+        self.text.push_str(
+            "/* JSONata mapping template generated by the b2bi emulator from the sample\n   \
+             inputFileContent and outputFileContent documents. Every leaf is the input path\n   \
+             whose value the sample output carried in that position, or the sample output's\n   \
+             own literal where the input holds no such value. Edit it for your needs. */\n",
+        );
+        self.jsonata_node(target, "", 0);
+        self.text.push('\n');
+    }
+
+    fn jsonata_node(&mut self, node: &Node, name: &str, depth: usize) {
+        if self.over_budget() {
+            return;
+        }
+        match node {
+            Node::Branch(entries) if entries.is_empty() => self.text.push_str("{}"),
+            Node::Branch(entries) => {
+                self.text.push_str("{\n");
+                for (position, (key, child)) in entries.iter().enumerate() {
+                    if self.over_budget() {
+                        break;
+                    }
+                    self.indent(depth + 1);
+                    self.text.push_str(&json_string(key));
+                    self.text.push_str(": ");
+                    self.jsonata_node(child, key, depth + 1);
+                    if position + 1 < entries.len() {
+                        self.text.push(',');
+                    }
+                    self.text.push('\n');
+                }
+                self.indent(depth);
+                self.text.push('}');
+            }
+            Node::Series(items) if items.is_empty() => self.text.push_str("[]"),
+            Node::Series(items) => {
+                self.text.push_str("[\n");
+                for (position, item) in items.iter().enumerate() {
+                    if self.over_budget() {
+                        break;
+                    }
+                    self.indent(depth + 1);
+                    self.jsonata_node(item, name, depth + 1);
+                    if position + 1 < items.len() {
+                        self.text.push(',');
+                    }
+                    self.text.push('\n');
+                }
+                self.indent(depth);
+                self.text.push(']');
+            }
+            Node::Leaf(scalar) => {
+                let rendered = match self.map_leaf(name, scalar) {
+                    Mapped::Reference(path) => path,
+                    Mapped::Literal(scalar) => scalar.jsonata_literal(),
+                };
+                self.text.push_str(&rendered);
+            }
+        }
+    }
+
+    // --- XSLT --------------------------------------------------------------------
+
+    /// Render `target` as an XSLT 1.0 stylesheet producing it.
+    ///
+    /// `source_namespaces` are the `(prefix, uri)` declarations the SOURCE document makes,
+    /// copied onto the stylesheet element so every prefix an emitted XPath carries
+    /// resolves there too.
+    fn xslt(&mut self, target: &Node, source_namespaces: &[(String, String)]) {
+        self.text.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        self.text.push_str(
+            "<!-- XSLT mapping template generated by the b2bi emulator from the sample\n     \
+             inputFileContent and outputFileContent documents. Every value is selected from\n     \
+             the input path whose value the sample output carried in that position, and is a\n     \
+             literal where the input holds no such value. Edit it for your needs. -->\n",
+        );
+        self.text.push_str(&format!(
+            "<{XSL_PREFIX}:stylesheet version=\"1.0\" xmlns:{XSL_PREFIX}=\"{XSLT_NAMESPACE}\""
+        ));
+        for (prefix, uri) in source_namespaces {
+            self.text
+                .push_str(&format!(" xmlns:{prefix}=\"{}\"", xml_escaped(uri)));
+        }
+        self.text.push_str(">\n");
+        self.text
+            .push_str("  <xsl:output method=\"xml\" indent=\"yes\"/>\n");
+        self.text.push_str("  <xsl:template match=\"/\">\n");
+        if let Node::Branch(entries) = target {
+            for (name, child) in entries {
+                self.xslt_node(name, child, 2);
+            }
+        }
+        self.text.push_str("  </xsl:template>\n");
+        self.text.push_str("</xsl:stylesheet>\n");
+    }
+
+    fn xslt_node(&mut self, name: &str, node: &Node, depth: usize) {
+        if self.over_budget() {
+            return;
+        }
+        match node {
+            // A repeated element name: one result element per occurrence.
+            Node::Series(items) => {
+                for item in items {
+                    if self.over_budget() {
+                        break;
+                    }
+                    self.xslt_node(name, item, depth);
+                }
+            }
+            Node::Leaf(scalar) => {
+                let content = match self.map_leaf(name, scalar) {
+                    Mapped::Reference(path) => {
+                        format!("<xsl:value-of select=\"{}\"/>", xml_escaped(&path))
+                    }
+                    Mapped::Literal(scalar) => {
+                        xml_escaped(scalar.source_text().unwrap_or_default())
+                    }
+                };
+                self.indent(depth);
+                if content.is_empty() {
+                    self.text.push_str(&format!("<{name}/>\n"));
+                } else {
+                    self.text.push_str(&format!("<{name}>{content}</{name}>\n"));
+                }
+            }
+            Node::Branch(entries) => self.xslt_element(name, entries, depth),
+        }
+    }
+
+    fn xslt_element(&mut self, name: &str, entries: &[(String, Node)], depth: usize) {
+        // Attributes the source document can supply have to be created with
+        // `xsl:attribute` children; every other attribute is written on the start tag.
+        let mut literal_attributes = String::new();
+        let mut constructed_attributes: Vec<String> = Vec::new();
+        let mut content: Vec<String> = Vec::new();
+        let mut children: Vec<(&String, &Node)> = Vec::new();
+
+        for (key, child) in entries {
+            // Checked per entry, not only per element: a single element can carry tens of
+            // thousands of attributes, and each one contributes a line of template text.
+            if self.collected_over_budget(&literal_attributes, &constructed_attributes, &content) {
+                self.truncated = true;
+                break;
+            }
+            match (key.strip_prefix('@'), child) {
+                (Some(attribute), Node::Leaf(scalar)) => {
+                    if is_namespace_declaration(key) {
+                        // A declaration the TARGET document makes is copied onto the
+                        // result element — EXCEPT one that rebinds the reserved `xsl`
+                        // prefix, which would turn the `xsl:value-of` / `xsl:attribute`
+                        // nodes emitted inside this element into plain literal elements,
+                        // so the stylesheet would no longer perform the mapping.
+                        if !declares_xsl_prefix(key) {
+                            literal_attributes.push_str(&format!(
+                                " {attribute}=\"{}\"",
+                                xml_escaped(scalar.source_text().unwrap_or_default())
+                            ));
+                        }
+                        continue;
+                    }
+                    match self.map_leaf(key, scalar) {
+                        Mapped::Reference(path) => constructed_attributes.push(format!(
+                            "<xsl:attribute name=\"{attribute}\"><xsl:value-of select=\"{}\"/></xsl:attribute>",
+                            xml_escaped(&path)
+                        )),
+                        Mapped::Literal(scalar) => literal_attributes.push_str(&format!(
+                            " {attribute}=\"{}\"",
+                            xml_escaped(scalar.source_text().unwrap_or_default())
+                        )),
+                    }
+                }
+                (_, child) if key == TEXT_KEY => {
+                    if let Node::Leaf(scalar) = child {
+                        content.push(match self.map_leaf(key, scalar) {
+                            Mapped::Reference(path) => {
+                                format!("<xsl:value-of select=\"{}\"/>", xml_escaped(&path))
+                            }
+                            Mapped::Literal(scalar) => {
+                                xml_escaped(scalar.source_text().unwrap_or_default())
+                            }
+                        });
+                    }
+                }
+                (_, child) => children.push((key, child)),
+            }
+        }
+
+        let empty = constructed_attributes.is_empty() && content.is_empty() && children.is_empty();
+        self.indent(depth);
+        if empty {
+            self.text
+                .push_str(&format!("<{name}{literal_attributes}/>\n"));
+            return;
+        }
+        self.text
+            .push_str(&format!("<{name}{literal_attributes}>\n"));
+        for attribute in constructed_attributes {
+            if self.over_budget() {
+                break;
+            }
+            self.indent(depth + 1);
+            self.text.push_str(&attribute);
+            self.text.push('\n');
+        }
+        for text in content {
+            if self.over_budget() {
+                break;
+            }
+            self.indent(depth + 1);
+            self.text.push_str(&text);
+            self.text.push('\n');
+        }
+        for (key, child) in children {
+            if self.over_budget() {
+                break;
+            }
+            self.xslt_node(key, child, depth + 1);
+        }
+        self.indent(depth);
+        self.text.push_str(&format!("</{name}>\n"));
+    }
+}
+
+/// The format `content` is written in, from its first non-blank character, or `None` when
+/// it is neither a JSON nor an XML document.
+fn document_format_of(content: &str) -> Option<DocumentFormat> {
+    let first = content
+        .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+        .chars()
+        .next()?;
+    match first {
+        '{' | '[' => Some(DocumentFormat::Json),
+        '<' => Some(DocumentFormat::Xml),
+        _ => None,
+    }
+}
+
+/// Count one more node — a container as well as a value — refusing a document past
+/// [`MAX_DOCUMENT_NODES`].
+fn count_node(nodes: &mut usize) -> Result<(), String> {
+    *nodes += 1;
+    if *nodes > MAX_DOCUMENT_NODES {
+        return Err(format!(
+            "carries more than the {MAX_DOCUMENT_NODES} values and containers this emulator generates a mapping for"
+        ));
+    }
+    Ok(())
+}
+
+/// The reason a document nests too deeply to generate a mapping for.
+fn too_deep() -> String {
+    format!("nests deeper than the {MAX_DOCUMENT_DEPTH} levels this emulator generates a mapping for")
+}
+
+/// `content` as a tree, in the format it was already established to be in.
+fn parse_document(
+    content: &str,
+    format: DocumentFormat,
+    nodes: &mut usize,
+) -> Result<Node, String> {
+    match format {
+        DocumentFormat::Json => {
+            let value: serde_json::Value = serde_json::from_str(content)
+                .map_err(|e| format!("is not a well-formed JSON document: {e}"))?;
+            node_from_json(&value, 0, nodes)
+        }
+        DocumentFormat::Xml => node_from_xml(content, nodes),
+    }
+}
+
+fn node_from_json(
+    value: &serde_json::Value,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<Node, String> {
+    // The same comparison the XML reader makes (`stack.len() >= MAX_DOCUMENT_DEPTH`), so
+    // the bound means the same number of levels whichever format a document is written in.
+    if depth >= MAX_DOCUMENT_DEPTH {
+        return Err(too_deep());
+    }
+    // Containers count too: a document of nothing but empty objects and arrays still
+    // costs a walk and a rendered line per node.
+    count_node(nodes)?;
+    Ok(match value {
+        serde_json::Value::Object(members) => {
+            let mut entries = Vec::with_capacity(members.len());
+            for (key, member) in members {
+                entries.push((key.clone(), node_from_json(member, depth + 1, nodes)?));
+            }
+            Node::Branch(entries)
+        }
+        serde_json::Value::Array(items) => {
+            let mut series = Vec::with_capacity(items.len());
+            for item in items {
+                series.push(node_from_json(item, depth + 1, nodes)?);
+            }
+            Node::Series(series)
+        }
+        serde_json::Value::String(text) => Node::Leaf(Scalar::Text(text.clone())),
+        serde_json::Value::Number(number) => Node::Leaf(Scalar::Number(number.to_string())),
+        serde_json::Value::Bool(value) => Node::Leaf(Scalar::Bool(*value)),
+        serde_json::Value::Null => Node::Leaf(Scalar::Null),
+    })
+}
+
+/// An XML element whose start tag has been read and whose children are still arriving.
+#[derive(Debug, Default)]
+struct OpenElement {
+    name: String,
+    /// `("@name", value)` per attribute, in document order.
+    attributes: Vec<(String, String)>,
+    /// Child elements, grouped under their name in first-occurrence order.
+    children: Vec<(String, Node)>,
+    /// Where each name in [`children`](Self::children) sits, so grouping a repeated
+    /// element costs no scan of its siblings.
+    child_positions: HashMap<String, usize>,
+    /// The element's accumulated character data.
+    text: String,
+}
+
+/// Add `node` under `name`, turning a repeated name into a [`Node::Series`].
+fn add_child(element: &mut OpenElement, name: String, node: Node) {
+    if let Some(position) = element.child_positions.get(&name).copied() {
+        let existing = &mut element.children[position].1;
+        if let Node::Series(items) = existing {
+            items.push(node);
+        } else {
+            let first = std::mem::replace(existing, Node::Series(Vec::new()));
+            if let Node::Series(items) = existing {
+                items.push(first);
+                items.push(node);
+            }
+        }
+        return;
+    }
+    element.child_positions.insert(name.clone(), element.children.len());
+    element.children.push((name, node));
+}
+
+/// The element's tree node, once its end tag has been read.
+fn finish_element(element: OpenElement, nodes: &mut usize) -> Result<(String, Node), String> {
+    // The element itself is a node, whether it turns out to be a leaf or a branch.
+    count_node(nodes)?;
+    // Trimmed: indentation a formatter added is not part of the value. An element with no
+    // attributes and no child elements is a leaf holding exactly that text.
+    let text = element.text.trim().to_string();
+    if element.attributes.is_empty() && element.children.is_empty() {
+        return Ok((element.name, Node::Leaf(Scalar::Text(text))));
+    }
+
+    let mut entries: Vec<(String, Node)> = Vec::with_capacity(element.attributes.len() + 1);
+    for (key, value) in element.attributes {
+        count_node(nodes)?;
+        entries.push((key, Node::Leaf(Scalar::Text(value))));
+    }
+    if !text.is_empty() {
+        count_node(nodes)?;
+        entries.push((TEXT_KEY.to_string(), Node::Leaf(Scalar::Text(text))));
+    }
+    entries.extend(element.children);
+    Ok((element.name, Node::Branch(entries)))
+}
+
+/// Is `c` permitted as the FIRST character of an XML 1.0 `NCName` (a `Name` with no
+/// colon)?
+///
+/// The vendored codec carries the same tables privately (`vendor/smithy-schema-server`'s
+/// `is_xml_name`), but exports only `xml_escape`, and `vendor/` is read-only from here —
+/// hence this copy.
+fn is_name_start_char(c: char) -> bool {
+    matches!(c,
+        '_' | 'A'..='Z' | 'a'..='z'
+        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}'
+        | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+}
+
+/// Is `c` permitted in an XML 1.0 `NCName` after its first character?
+fn is_name_char(c: char) -> bool {
+    is_name_start_char(c)
+        || matches!(c,
+            '-' | '.' | '0'..='9' | '\u{B7}'
+            | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+}
+
+/// Is `part` an XML `NCName` — one colon-free piece of a qualified name?
+fn is_ncname(part: &str) -> bool {
+    let mut characters = part.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    is_name_start_char(first) && characters.all(is_name_char)
+}
+
+/// Is `name` a `QName`, as every element and attribute name a namespace-aware document
+/// carries must be: an `NCName`, or a prefix and a local part separated by ONE colon?
+///
+/// `quick_xml::Reader` is non-validating, so a name it hands back can hold characters — or
+/// a second colon — that no name may carry, and such a name copied into the generated
+/// stylesheet would make it unparseable. A document carrying one is refused instead of
+/// answered with a template that is not a stylesheet.
+fn is_xml_name(name: &str) -> bool {
+    match name.split_once(':') {
+        Some((prefix, local)) => is_ncname(prefix) && is_ncname(local),
+        None => is_ncname(name),
+    }
+}
+
+/// Does `name` use the prefix the generated stylesheet reserves for XSLT itself?
+///
+/// A result element or attribute spelled `xsl:…` would be read by the client's XSLT
+/// processor as an INSTRUCTION rather than as a literal element to produce, so a target
+/// document carrying one cannot be built by a stylesheet at all.
+fn uses_xsl_prefix(name: &str) -> bool {
+    name.trim_start_matches('@')
+        .split_once(':')
+        .is_some_and(|(prefix, _)| prefix == XSL_PREFIX)
+}
+
+/// Does `key` DECLARE the reserved [`XSL_PREFIX`] (`xmlns:xsl="…"`)?
+///
+/// Such a declaration copied onto a result element would rebind the XSLT namespace over
+/// that element's subtree, so the `xsl:value-of` / `xsl:attribute` nodes emitted inside it
+/// would stop being instructions and the stylesheet would no longer map anything. Note the
+/// test is on the LOCAL part: the prefix of `@xmlns:xsl` is `xmlns`, so
+/// [`uses_xsl_prefix`] does not — and must not — answer this question.
+fn declares_xsl_prefix(key: &str) -> bool {
+    key.strip_prefix("@xmlns:") == Some(XSL_PREFIX)
+}
+
+/// Does `key` bind a prefix to the XSLT namespace, whatever that prefix is spelled?
+fn binds_xslt_namespace(key: &str, child: &Node) -> bool {
+    is_namespace_declaration(key)
+        && matches!(child, Node::Leaf(scalar) if scalar.source_text() == Some(XSLT_NAMESPACE))
+}
+
+/// The first name in `node`'s tree that a generated stylesheet cannot carry, if any:
+/// either a name in the reserved [`XSL_PREFIX`], or a declaration binding any prefix to
+/// the [`XSLT_NAMESPACE`] — which would make the elements under it instructions for the
+/// client's processor instead of literal elements to produce, whatever prefix spells them.
+fn reserved_prefix_name(node: &Node) -> Option<&str> {
+    match node {
+        Node::Branch(entries) => entries.iter().find_map(|(key, child)| {
+            if binds_xslt_namespace(key, child)
+                || (uses_xsl_prefix(key) && !is_namespace_declaration(key))
+            {
+                return Some(key.as_str());
+            }
+            reserved_prefix_name(child)
+        }),
+        Node::Series(items) => items.iter().find_map(reserved_prefix_name),
+        Node::Leaf(_) => None,
+    }
+}
+
+/// The attributes of a start tag, decoded, each keyed `@name`.
+fn element_attributes(
+    start: &::quick_xml::events::BytesStart<'_>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut attributes = Vec::new();
+    for attribute in start.attributes() {
+        let attribute = attribute.map_err(|e| format!("is not a well-formed XML document: {e}"))?;
+        let key = String::from_utf8(attribute.key.as_ref().to_vec())
+            .map_err(|e| format!("has an attribute name that is not valid utf-8: {e}"))?;
+        if !is_xml_name(&key) {
+            return Err("has an attribute name that is not a valid XML name".to_string());
+        }
+        // The same two steps the vendored XML codec takes for a text value: decode the
+        // bytes, then resolve the entity references `quick-xml` leaves verbatim.
+        let raw = std::str::from_utf8(attribute.value.as_ref())
+            .map_err(|e| format!("has an attribute value that is not valid utf-8: {e}"))?;
+        let value = ::quick_xml::escape::unescape(raw)
+            .map_err(|e| format!("is not a well-formed XML document: {e}"))?
+            .into_owned();
+        attributes.push((format!("@{key}"), value));
+    }
+    Ok(attributes)
+}
+
+/// The element a start tag opens, with its name validated as an XML name.
+fn open_element(start: &::quick_xml::events::BytesStart<'_>) -> Result<OpenElement, String> {
+    let name = String::from_utf8(start.name().as_ref().to_vec())
+        .map_err(|e| format!("has an element name that is not valid utf-8: {e}"))?;
+    if !is_xml_name(&name) {
+        return Err("has an element name that is not a valid XML name".to_string());
+    }
+    Ok(OpenElement {
+        name,
+        attributes: element_attributes(start)?,
+        ..OpenElement::default()
+    })
+}
+
+fn node_from_xml(content: &str, nodes: &mut usize) -> Result<Node, String> {
+    use ::quick_xml::events::Event;
+
+    let mut reader = ::quick_xml::Reader::from_str(content);
+    // Text is assembled per element and trimmed once there, so the reader must not trim
+    // per fragment: it breaks text at every entity reference, and per-fragment trimming
+    // would eat a value's own interior spaces.
+    reader.config_mut().trim_text(false);
+
+    let mut stack: Vec<OpenElement> = Vec::new();
+    let mut root: Option<(String, Node)> = None;
+
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|e| format!("is not a well-formed XML document: {e}"))?;
+        match event {
+            Event::Start(start) => {
+                if stack.len() >= MAX_DOCUMENT_DEPTH {
+                    return Err(too_deep());
+                }
+                stack.push(open_element(&start)?);
+            }
+            Event::Empty(start) => {
+                let (name, node) = finish_element(open_element(&start)?, nodes)?;
+                place_node(&mut stack, &mut root, name, node)?;
+            }
+            Event::End(_) => {
+                let Some(element) = stack.pop() else {
+                    return Err("is not a well-formed XML document: an end tag closes no open element".to_string());
+                };
+                let (name, node) = finish_element(element, nodes)?;
+                place_node(&mut stack, &mut root, name, node)?;
+            }
+            Event::Text(text) => {
+                if let Some(open) = stack.last_mut() {
+                    let decoded = text
+                        .xml10_content()
+                        .map_err(|e| format!("is not a well-formed XML document: {e}"))?;
+                    let unescaped = ::quick_xml::escape::unescape(&decoded)
+                        .map_err(|e| format!("is not a well-formed XML document: {e}"))?;
+                    open.text.push_str(&unescaped);
+                }
+            }
+            // CDATA holds bytes no entity resolution should touch, so it is taken verbatim.
+            Event::CData(cdata) => {
+                if let Some(open) = stack.last_mut() {
+                    let text = std::str::from_utf8(cdata.as_ref())
+                        .map_err(|e| format!("has CDATA that is not valid utf-8: {e}"))?;
+                    open.text.push_str(text);
+                }
+            }
+            // The reader breaks text at an entity reference and emits it on its own, so a
+            // loop that ignored this would silently drop every entity from a value.
+            Event::GeneralRef(reference) => {
+                if let Some(open) = stack.last_mut() {
+                    let name = reference
+                        .decode()
+                        .map_err(|e| format!("is not a well-formed XML document: {e}"))?;
+                    let reconstructed = format!("&{name};");
+                    let resolved = ::quick_xml::escape::unescape(&reconstructed)
+                        .map_err(|e| format!("is not a well-formed XML document: {e}"))?;
+                    open.text.push_str(&resolved);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    if !stack.is_empty() {
+        return Err("is not a well-formed XML document: an element is never closed".to_string());
+    }
+    let (name, node) = root.ok_or_else(|| "has no root element".to_string())?;
+    Ok(Node::Branch(vec![(name, node)]))
+}
+
+/// Attach a finished element to its parent, or make it the document root.
+fn place_node(
+    stack: &mut [OpenElement],
+    root: &mut Option<(String, Node)>,
+    name: String,
+    node: Node,
+) -> Result<(), String> {
+    if let Some(parent) = stack.last_mut() {
+        add_child(parent, name, node);
+        return Ok(());
+    }
+    if root.is_some() {
+        return Err("is not a well-formed XML document: it has more than one root element".to_string());
+    }
+    *root = Some((name, node));
+    Ok(())
+}
+
+/// Every PREFIXED namespace declaration the source document makes, as `(prefix, uri)`,
+/// in document order with the first URI per prefix winning.
+///
+/// A generated XPath carries whatever prefixes the source document used, so the
+/// declarations have to reach the stylesheet for it to resolve — and a prefix declared
+/// deeper than the root is just as reachable from an XPath as one on the root, hence the
+/// whole document is walked, not only its root element. Three declarations are deliberately
+/// dropped: the DEFAULT one (`xmlns="…"`), because an XPath 1.0 unprefixed name never
+/// matches a namespaced element anyway, so copying it would buy nothing and would wrongly
+/// place the literal result elements in the source's namespace; any redeclaration of
+/// the reserved [`XSL_PREFIX`], because a second `xmlns:xsl` attribute would make the
+/// stylesheet element itself non-well-formed; and any declaration binding the
+/// [`XSLT_NAMESPACE`] under another prefix, which would give the stylesheet a second
+/// prefix its own instructions answer to.
+///
+/// More than [`MAX_SOURCE_NAMESPACES`] distinct prefixes is a refusal, not a silent drop:
+/// a stylesheet missing a declaration leaves an emitted XPath unresolvable, which would be
+/// answered as a success.
+fn source_namespaces(root: &Node) -> Result<Vec<(String, String)>, String> {
+    let mut declarations: Vec<(String, String)> = Vec::new();
+    collect_namespaces(root, &mut declarations)?;
+    Ok(declarations)
+}
+
+fn collect_namespaces(
+    node: &Node,
+    declarations: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    match node {
+        Node::Branch(entries) => {
+            for (key, child) in entries {
+                if binds_xslt_namespace(key, child) || declares_xsl_prefix(key) {
+                    continue;
+                }
+                let declared = key.strip_prefix("@xmlns:");
+                match (declared, child) {
+                    (Some(prefix), Node::Leaf(scalar)) => {
+                        if declarations.iter().any(|(seen, _)| seen == prefix) {
+                            continue;
+                        }
+                        if declarations.len() >= MAX_SOURCE_NAMESPACES {
+                            return Err(format!(
+                                "declares more than the {MAX_SOURCE_NAMESPACES} namespace prefixes this emulator carries onto a stylesheet"
+                            ));
+                        }
+                        declarations.push((
+                            prefix.to_string(),
+                            scalar.source_text().unwrap_or_default().to_string(),
+                        ));
+                    }
+                    _ => collect_namespaces(child, declarations)?,
+                }
+            }
+        }
+        Node::Series(items) => {
+            for item in items {
+                collect_namespaces(item, declarations)?;
+            }
+        }
+        Node::Leaf(_) => {}
+    }
+    Ok(())
+}
+
+/// A modelled `ValidationException` (HTTP 400) — this service declares its own, and
+/// `GenerateMapping` lists it, so a refusal names the member and the rule it broke.
+fn invalid(message: impl Into<String>) -> GenerateMappingError {
+    GenerateMappingErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// [`invalid`], with an access record of why the call was refused.
+fn refused(message: impl Into<String>, reason: &str) -> GenerateMappingError {
+    tracing::debug!(
+        operation = "GenerateMapping",
+        outcome = "refused",
+        reason,
+        "GenerateMapping refused"
+    );
+    invalid(message)
+}
+
+/// Check that a sample document is in the format the requested language works over, and
+/// parse it.
+fn sample_document(
+    member: &str,
+    content: &str,
+    language: Language,
+    nodes: &mut usize,
+) -> Result<Node, GenerateMappingError> {
+    let required = language.document_format();
+    match document_format_of(content) {
+        Some(format) if format == required => {}
+        Some(format) => {
+            return Err(invalid(format!(
+                "{member} is {} but mappingType {} maps {} documents",
+                format.name(),
+                language.modelled_name(),
+                required.name()
+            )))
+        }
+        None => {
+            return Err(invalid(format!(
+                "{member} must be a {} document: it starts with none of '{{', '[' or '<'",
+                required.name()
+            )))
+        }
+    }
+    parse_document(content, required, nodes).map_err(|reason| invalid(format!("{member} {reason}")))
+}
+
 /// The `GenerateMapping` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,18 +1366,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateMapping"))
+        // The template is computed from the request's own two documents: this operation
+        // owns no resource, so it reads and writes no state and the engine goes unused.
+        let _ = &self.engine;
+
+        // An access record for the call. The method and URI are values `http` already
+        // parsed, and the sizes are numbers — the caller's `mappingType` string and the
+        // sample documents themselves are NOT logged, so nothing request-controlled
+        // reaches the log unsanitised. The resolved mapping language is recorded below,
+        // once it has been validated against the modelled enum.
+        tracing::debug!(
+            operation = Self::NAME,
+            method = %ctx.parts().method,
+            uri = %ctx.parts().uri,
+            input_bytes = input.input_file_content.len(),
+            output_bytes = input.output_file_content.len(),
+            "GenerateMapping requested"
+        );
+
+        let language = match input.mapping_type.as_str() {
+            MAPPING_TYPE_JSONATA => Language::Jsonata,
+            MAPPING_TYPE_XSLT => Language::Xslt,
+            _ => {
+                return Err(refused(
+                    format!(
+                        "mappingType must be one of {}",
+                        super::types::MAPPING_TYPE_VALUES.join(", ")
+                    ),
+                    "unknown mappingType",
+                ))
+            }
+        };
+        tracing::debug!(
+            operation = Self::NAME,
+            mapping_type = language.modelled_name(),
+            "GenerateMapping mapping language resolved"
+        );
+
+        let mut source_nodes = 0usize;
+        let source = sample_document(
+            "inputFileContent",
+            &input.input_file_content,
+            language,
+            &mut source_nodes,
+        )
+        // A fixed discriminant, never the parser's text: that text quotes the sample
+        // document, so interpolating it would put request-controlled bytes in the log.
+        .inspect_err(|_| {
+            tracing::debug!(
+                operation = Self::NAME,
+                outcome = "refused",
+                member = "inputFileContent",
+                "GenerateMapping refused"
+            )
+        })?;
+        let mut target_nodes = 0usize;
+        let target = sample_document(
+            "outputFileContent",
+            &input.output_file_content,
+            language,
+            &mut target_nodes,
+        )
+        .inspect_err(|_| {
+            tracing::debug!(
+                operation = Self::NAME,
+                outcome = "refused",
+                member = "outputFileContent",
+                "GenerateMapping refused"
+            )
+        })?;
+
+        // A result element or attribute in the stylesheet's own `xsl` prefix — or under any
+        // prefix the target binds to the XSLT namespace — would be read as an XSLT
+        // instruction rather than produced as a literal element, so no stylesheet can build
+        // this target document.
+        if language == Language::Xslt && reserved_prefix_name(&target).is_some() {
+            return Err(refused(
+                format!(
+                    "outputFileContent names an element or attribute in the {XSL_PREFIX} prefix, \
+                     or binds a prefix to {XSLT_NAMESPACE}, which a generated XSLT stylesheet \
+                     cannot produce as a literal element"
+                ),
+                "target document uses the XSLT namespace",
+            ));
+        }
+
+        let index = SourceIndex::build(&source, language.document_format().path_flavor())
+            .map_err(|reason| refused(format!("inputFileContent {reason}"), "source paths past a bound"))?;
+        let mut template = Template::new(&index);
+        match language {
+            Language::Jsonata => template.jsonata(&target),
+            Language::Xslt => {
+                let namespaces = source_namespaces(&source).map_err(|reason| {
+                    refused(
+                        format!("inputFileContent {reason}"),
+                        "source namespaces past a bound",
+                    )
+                })?;
+                template.xslt(&target, &namespaces);
+            }
+        }
+
+        // `MappingTemplate` is a length constraint in CHARACTERS; rendering already
+        // stopped at `MAX_TEMPLATE_BYTES`, which no answerable template can reach, so
+        // either condition means this target cannot be mapped inside the bound.
+        let template_chars = template.text.chars().count();
+        if template.truncated || template.over_budget() || template_chars > MAX_TEMPLATE_CHARS {
+            return Err(refused(
+                format!(
+                    "outputFileContent is too large to generate a mapping template for: the \
+                     template would be longer than the {MAX_TEMPLATE_CHARS} characters a b2bi \
+                     mapping template may carry"
+                ),
+                "template past the length a mapping template may carry",
+            ));
+        }
+
+        tracing::debug!(
+            operation = Self::NAME,
+            outcome = "generated",
+            template_chars,
+            mapped_leaves = template.matched,
+            mappable_leaves = template.mappable,
+            "GenerateMapping answered"
+        );
+
+        Ok(GenerateMappingOutput {
+            mapping_accuracy: Some(template.accuracy()),
+            mapping_template: template.text,
+        })
     }
 }
