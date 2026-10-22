@@ -9,6 +9,10 @@
 //! would report a deletion that never happened, so an unknown ARN is refused with the
 //! modelled `ValidationException` (400).
 //!
+//! Being state-changing — and destructive — it emits the audit record
+//! `crate::state::record_state_change` writes (timestamp, source, presented access key
+//! id, operation, resource, outcome) on both the success and the refusal path.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -147,7 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteDashboardErrorModeled::InternalServerException(InternalServerException {
                 message: "the dashboard store is unavailable".to_string(),
@@ -158,6 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Removing the record removes the widgets and tags stored on it, since they
         // all live on the one record.
         let Some(removed) = state.dashboards.remove(&input.arn) else {
+            crate::state::record_state_change(
+                ctx,
+                Self::NAME,
+                &input.arn,
+                "ValidationException",
+            );
             return Err(DeleteDashboardErrorModeled::ValidationException(
                 ValidationException {
                     message: format!(
@@ -168,6 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // The record this call changed state, for the audit stream.
+        crate::state::record_state_change(ctx, Self::NAME, &removed.arn, "SUCCESS");
 
         Ok(DeleteDashboardOutput { arn: removed.arn })
     }

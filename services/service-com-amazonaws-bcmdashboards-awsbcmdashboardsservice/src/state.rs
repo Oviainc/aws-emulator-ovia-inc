@@ -118,6 +118,48 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     }
 }
 
+/// The tracing target every audit record below is emitted on, so a host can route or
+/// filter the audit stream on its own. Keep it equal to the `target:` literal in
+/// [`record_state_change`] — the macro needs a literal there.
+pub const AUDIT_TARGET: &str = "emulator::audit";
+
+/// Emit the audit record a state-changing operation owes: when it happened, where the
+/// request came from, which access key id it presented, which operation ran, which
+/// resource it touched and how it came out.
+///
+/// Lives here rather than in one operation's file because every state-changing
+/// dashboard operation emits the same record. Only the presented access key id is
+/// recorded — never a secret, and never the emulator's own credentials. Reporting
+/// operations do not call this: they change nothing to account for.
+pub fn record_state_change(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+    outcome: &str,
+) {
+    let headers = &ctx.parts().headers;
+    let source = headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("host"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown");
+    let timestamp_ms = ::std::time::SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| {
+            u64::try_from(since_epoch.as_millis()).unwrap_or(u64::MAX)
+        });
+    ::tracing::info!(
+        target: "emulator::audit",
+        timestamp_ms,
+        source,
+        akid = ::engine::extract_akid(headers),
+        operation,
+        resource,
+        outcome,
+        "state-changing bcm-dashboards operation"
+    );
+}
+
 /// Encode the ARN a `ListDashboards` page resumes at as an opaque `nextToken`.
 pub fn encode_page_token(arn: &str) -> String {
     format!("{PAGE_TOKEN_PREFIX}{}", hex::encode(arn))
