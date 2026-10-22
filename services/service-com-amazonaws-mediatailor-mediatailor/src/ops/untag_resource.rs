@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named tag keys from a resource this emulator holds. `@idempotent`:
+//! a key the resource does not carry is left out of the result rather than
+//! refused, so a retried untag answers the same way as the first one.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +149,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. Without the
+            // store no tag can be removed, so answer the scaffold's 501 rather
+            // than report a write that did not happen.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "UntagResource",
+            ));
+        };
+
+        let mut store = state.lock();
+        // Tags belong to a resource, so there has to be one: an ARN that names
+        // no resource this service holds is unexpected data in the request.
+        if !store.taggable_resource_exists(&input.resource_arn) {
+            return Err(UntagResourceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "ResourceArn does not name a MediaTailor resource: {}",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if let Some(tags) = store.tags_by_arn.get_mut(&input.resource_arn) {
+            for key in &input.tag_keys {
+                tags.remove(key);
+            }
+            if tags.is_empty() {
+                store.tags_by_arn.remove(&input.resource_arn);
+            }
+        }
+
+        Ok(UntagResourceOutput)
     }
 }
