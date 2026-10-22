@@ -15,3 +15,5 @@
 mod environment_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_not_found.rs"]
+mod tagging_not_found;
