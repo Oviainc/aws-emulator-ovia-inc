@@ -108,6 +108,78 @@ pub fn is_aws_managed_pricing_plan(arn: &str) -> bool {
         .any(|id| arn == *id || arn == aws_managed_pricing_plan_arn(id))
 }
 
+/// The pricing rule type whose rates come from tiers rather than from a
+/// percentage modifier. The other values of `PricingRuleType`
+/// (`MARKUP`, `DISCOUNT`) price by `ModifierPercentage`.
+pub const TIERING_PRICING_RULE_TYPE: &str = "TIERING";
+
+/// The rate members a pricing rule holds: its `ModifierPercentage` and its
+/// `Tiering` configuration, of which a rule ever holds exactly one.
+pub type PricingRuleRate = (Option<f64>, Option<TieringRecord>);
+
+/// A refusal a shared rule hands back for the calling operation to raise as its
+/// OWN modelled `ValidationException` (each operation's error enum is its own
+/// type): the reason, the member at fault and the message.
+pub type ValidationRefusal = (&'static str, &'static str, String);
+
+/// The rate members a pricing rule of `rule_type` must hold, or the refusal the
+/// request earns.
+///
+/// A rule prices EITHER by a percentage (`MARKUP`/`DISCOUNT`) or by tiers
+/// (`TIERING`), never both, which is what the reasons `ValidationExceptionReason`
+/// enumerates for each of them (`ILLEGAL_MODIFIER_PERCENTAGE`,
+/// `ILLEGAL_TIERING_INPUT`) refuse a rule for. So a request that NAMES the member
+/// its resulting type does not price by is refused, the one the type needs has to
+/// be there (named by the request or already stored), and a value only carried
+/// over from storage into a new type is dropped rather than refused.
+///
+/// `Ok` carries the `(ModifierPercentage, Tiering)` pair to store; `Err` carries
+/// the `(reason, member, message)` of the modelled `ValidationException` the
+/// calling operation refuses the request with. `CreatePricingRule` states the
+/// create-time half of the same rule in its own handler (it has no stored record
+/// to merge with); this is the merging form `UpdatePricingRule` applies.
+pub fn reconcile_pricing_rule_rate(
+    rule_type: &str,
+    modifier_percentage: Option<f64>,
+    tiering: Option<TieringRecord>,
+    modifier_named_by_request: bool,
+    tiering_named_by_request: bool,
+) -> Result<PricingRuleRate, ValidationRefusal> {
+    if rule_type == TIERING_PRICING_RULE_TYPE {
+        if modifier_named_by_request {
+            return Err((
+                "ILLEGAL_MODIFIER_PERCENTAGE",
+                "ModifierPercentage",
+                format!("a {TIERING_PRICING_RULE_TYPE} pricing rule has no modifier percentage"),
+            ));
+        }
+        let tiering = tiering.filter(|tiering| !tiering.is_empty());
+        if tiering.is_none() {
+            return Err((
+                "ILLEGAL_TIERING_INPUT",
+                "Tiering",
+                format!("a {TIERING_PRICING_RULE_TYPE} pricing rule needs a tiering configuration"),
+            ));
+        }
+        return Ok((None, tiering));
+    }
+    if tiering_named_by_request {
+        return Err((
+            "ILLEGAL_TIERING_INPUT",
+            "Tiering",
+            format!("a {rule_type} pricing rule has no tiering configuration"),
+        ));
+    }
+    if modifier_percentage.is_none() {
+        return Err((
+            "ILLEGAL_MODIFIER_PERCENTAGE",
+            "ModifierPercentage",
+            format!("a {rule_type} pricing rule needs a modifier percentage"),
+        ));
+    }
+    Ok((modifier_percentage, None))
+}
+
 /// A pricing plan as `CreatePricingPlan` persisted it.
 #[derive(Debug, Clone, Default)]
 pub struct PricingPlanRecord {
@@ -158,6 +230,15 @@ pub struct TieringRecord {
     pub free_tier_activated: Option<bool>,
     /// `Tiering.CustomTiers`, in the order the request listed them.
     pub custom_tiers: Option<Vec<crate::ops::types::CustomTier>>,
+}
+
+impl TieringRecord {
+    /// True when the record holds no tiering configuration, which is how an
+    /// update that names neither member leaves a rule with no `Tiering` at all.
+    pub fn is_empty(&self) -> bool {
+        self.free_tier_activated.is_none()
+            && self.custom_tiers.as_ref().is_none_or(Vec::is_empty)
+    }
 }
 
 /// A billing group as `CreateBillingGroup` persisted it. `Size`, `Status` and
@@ -434,6 +515,14 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         is_aws_managed_pricing_plan(arn) || self.pricing_plans.contains_key(arn)
     }
 
+    /// The pricing rule a name is taken by, when it is not `rule_arn`'s own name.
+    pub fn conflicting_pricing_rule_name(&self, name: &str, rule_arn: &str) -> Option<&str> {
+        self.pricing_rule_names
+            .get(name)
+            .map(String::as_str)
+            .filter(|existing| *existing != rule_arn)
+    }
+
     /// The group an account is already associated with, when it is not `group_arn`.
     pub fn conflicting_association(&self, account_id: &str, group_arn: &str) -> Option<&str> {
         self.account_associations
@@ -631,6 +720,18 @@ pub const MAX_BILLING_GROUPS: usize = 1000;
 /// deletable (`DeletePricingRule`), so a caller that reaches the cap can make room
 /// by deleting one rather than being stuck.
 pub const MAX_PRICING_RULES: usize = 1000;
+
+/// `ModifierPercentage` as the service stores it: "Your entry will be rounded to
+/// the nearest 2 decimal places." (the member's own documentation), so the value
+/// a later read reports is the rounded one rather than whatever precision the
+/// request carried.
+pub fn round_modifier_percentage(value: f64) -> f64 {
+    if value.is_finite() {
+        (value * 100.0).round() / 100.0
+    } else {
+        value
+    }
+}
 
 /// How many linked accounts one billing group may hold. A CHOSEN bound; see
 /// [`MAX_PRICING_PLANS`]. The model caps one `AssociateAccounts` call at 30 account

@@ -19,6 +19,8 @@ mod custom_line_item_and_create_name_refusals;
 mod pricing_rule_core_loop;
 #[path = "all/pricing_rule_lifecycle.rs"]
 mod pricing_rule_lifecycle;
+#[path = "all/pricing_rule_update.rs"]
+mod pricing_rule_update;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging_surface.rs"]

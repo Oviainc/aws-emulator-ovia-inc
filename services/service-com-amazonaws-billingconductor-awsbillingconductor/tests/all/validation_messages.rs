@@ -516,46 +516,55 @@ async fn a_request_within_every_modelled_constraint_reaches_the_operation() {
         "expected the stored group to name the minted plan {arn:?}, got {stored:?}"
     );
 
-    // An operation nobody has written yet still answers the scaffold's 501 for a
-    // conforming request: this seam refuses input, it does not implement operations.
-    let scaffolded = [
+    // A conforming request REACHES the operation: one nobody has written yet answers
+    // the scaffold's 501, and an implemented one answers from its own state (here, the
+    // modelled 404 for a rule ARN nothing created). Either way the answer comes from the
+    // operation, not from this seam: it refuses input, it does not implement operations.
+    let reaches_the_operation = [
         (
             "UpdatePricingPlan with a conforming full-ARN plan",
             "PUT",
             "/update-pricing-plan",
             json!({ "Arn": VALID_PLAN_ARN, "Name": "StillScaffolded" }),
+            501,
         ),
         (
             "UpdatePricingRule with a conforming bare rule id",
             "PUT",
             "/update-pricing-rule",
             json!({ "Arn": VALID_RULE_ARN, "Name": "StillScaffolded" }),
+            // Implemented: no rule answers to this id, so the operation's own
+            // `ResourceNotFoundException` is what comes back.
+            404,
         ),
         (
             "AssociatePricingRules with an AWS-managed plan id and a rule list",
             "PUT",
             "/associate-pricing-rules",
             json!({ "Arn": "BasicPricingPlan", "PricingRuleArns": [VALID_RULE_ARN] }),
+            501,
         ),
         (
             "ListPricingRulesAssociatedToPricingPlan at the lower MaxResults bound",
             "POST",
             "/list-pricing-rules-associated-to-pricing-plan",
             json!({ "PricingPlanArn": VALID_PLAN_ARN, "MaxResults": 1, "BillingPeriod": "2026-1" }),
+            501,
         ),
         (
             "ListPricingPlansAssociatedWithPricingRule at the upper MaxResults bound",
             "POST",
             "/list-pricing-plans-associated-with-pricing-rule",
             json!({ "PricingRuleArn": VALID_RULE_ARN, "MaxResults": 100 }),
+            501,
         ),
     ];
-    for (case, method, path, body) in &scaffolded {
+    for (case, method, path, body, expected) in &reaches_the_operation {
         let (status, answered) = em.call(method, path, Some(body), &[]).await;
         assert_eq!(
-            status, 501,
-            "case {case:?}: expected the conforming request to reach the operation, got {status} \
-             with {answered}"
+            status, *expected,
+            "case {case:?}: expected the conforming request to reach the operation \
+             (HTTP {expected}), got {status} with {answered}"
         );
     }
 }

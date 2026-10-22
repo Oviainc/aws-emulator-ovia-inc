@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePricingRule
+//!
 //! Persists a new pricing rule and answers with the ARN it minted, so a later
 //! `ListPricingRules` reports it and `DeletePricingRule` can remove it.
 //!
@@ -328,7 +329,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             scope: input.scope,
             rule_type: input.r#type,
-            modifier_percentage: input.modifier_percentage,
+            // "Your entry will be rounded to the nearest 2 decimal places." — the
+            // member's own documentation, applied here as well as on the update path
+            // so one documented rule has one behaviour
+            // ([`crate::state::round_modifier_percentage`]).
+            modifier_percentage: input
+                .modifier_percentage
+                .map(crate::state::round_modifier_percentage),
             service: input.service,
             billing_entity: input.billing_entity,
             tiering: input.tiering.map(|tiering| crate::state::TieringRecord {

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePricingRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePricingRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePricingRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the stored pricing rule the request's `Arn` names: every member the
+//! request carries replaces the stored one, every member it omits keeps the value
+//! state already holds, `LastModifiedTime` moves to now, and the response reports
+//! the rule's whole state afterwards — including the members no update can change
+//! (`Scope`, `Service`, `BillingEntity`, `UsageType`, `Operation`) and the derived
+//! `AssociatedPricingPlanCount`.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +190,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePricingRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePricingRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePricingRule"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePricingRuleErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The `PricingRuleArn` pattern accepts the full ARN or the bare id, and both
+        // name the same stored rule.
+        let rule_arn = crate::state::normalize_pricing_rule_arn(&input.arn);
+        let Some(stored) = state.pricing_rules.get(&rule_arn).cloned() else {
+            return Err(UpdatePricingRuleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: "the pricing rule does not exist".to_string(),
+                    resource_id: rule_arn,
+                    resource_type: "pricingrule".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "The name must be unique to each pricing rule." Renaming a rule to the name
+        // it already carries is not a conflict: what the request asks for already holds.
+        if let Some(name) = input.name.as_deref() {
+            if let Some(owner) = state.conflicting_pricing_rule_name(name, &rule_arn) {
+                let owner = owner.to_string();
+                return Err(UpdatePricingRuleErrorModeled::ConflictException(
+                    ConflictException {
+                        message: "a pricing rule with this name already exists".to_string(),
+                        resource_id: owner,
+                        resource_type: "pricingrule".to_string(),
+                        reason: Some("RESOURCE_NAME_CONFLICT".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut updated = merge(&stored, &input)?;
+        updated.last_modified_time_millis = crate::state::now_millis();
+
+        // The name index follows the rename, so the old name frees up and the new one
+        // is taken by exactly this rule.
+        if updated.name != stored.name {
+            state.pricing_rule_names.remove(&stored.name);
+            state
+                .pricing_rule_names
+                .insert(updated.name.clone(), rule_arn.clone());
+        }
+        let associated = state.associated_pricing_plan_count(&rule_arn);
+        let output = render(&updated, associated);
+        state.pricing_rules.insert(rule_arn.clone(), updated);
+
+        // The audit record for a state-changing call: who asked, what changed and
+        // that it succeeded. Never a secret, and never a `@sensitive` member (the
+        // rule's name and description) — only the access key id the caller
+        // presented and the ARN it addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            pricing_rule_arn = %rule_arn,
+            outcome = "updated",
+            "pricing rule updated"
+        );
+        Ok(output)
     }
+}
+
+/// The stored rule as this request leaves it: a member the request carries
+/// replaces the stored one, a member it omits keeps what state holds. Which of the
+/// two rate members the resulting `Type` may hold is
+/// [`crate::state::reconcile_pricing_rule_rate`]'s rule — the MERGING form, which
+/// only an update needs: `CreatePricingRule` has no stored record to merge with and
+/// states its create-time half of the same rule in its own handler.
+fn merge(
+    stored: &crate::state::PricingRuleRecord,
+    input: &UpdatePricingRuleInput,
+) -> Result<crate::state::PricingRuleRecord, UpdatePricingRuleError> {
+    let mut updated = stored.clone();
+    if let Some(name) = input.name.clone() {
+        updated.name = name;
+    }
+    if let Some(description) = input.description.clone() {
+        updated.description = Some(description);
+    }
+    if let Some(rule_type) = input.r#type.clone() {
+        updated.rule_type = rule_type;
+    }
+    if let Some(modifier) = input.modifier_percentage {
+        // "Your entry will be rounded to the nearest 2 decimal places."
+        updated.modifier_percentage = Some(crate::state::round_modifier_percentage(modifier));
+    }
+    if let Some(tiering) = input.tiering.as_ref() {
+        let mut merged = updated.tiering.clone().unwrap_or_default();
+        if let Some(free_tier) = tiering.free_tier.as_ref() {
+            merged.free_tier_activated = Some(free_tier.activated);
+        }
+        if let Some(custom_tiers) = tiering.custom_tiers.clone() {
+            merged.custom_tiers = Some(custom_tiers);
+        }
+        updated.tiering = (!merged.is_empty()).then_some(merged);
+    }
+
+    let (modifier_percentage, tiering) = crate::state::reconcile_pricing_rule_rate(
+        &updated.rule_type,
+        updated.modifier_percentage,
+        updated.tiering.clone(),
+        input.modifier_percentage.is_some(),
+        input.tiering.is_some(),
+    )
+    .map_err(|(reason, member, message)| validation(reason, member, message))?;
+    updated.modifier_percentage = modifier_percentage;
+    updated.tiering = tiering;
+    Ok(updated)
+}
+
+/// The stored rule as this operation reports it. `AssociatedPricingPlanCount` is
+/// passed in because it is derived from the pricing plans that name the rule
+/// rather than held on the rule.
+fn render(
+    rule: &crate::state::PricingRuleRecord,
+    associated_pricing_plan_count: i64,
+) -> UpdatePricingRuleOutput {
+    UpdatePricingRuleOutput {
+        arn: Some(rule.arn.clone()),
+        name: Some(rule.name.clone()),
+        description: rule.description.clone(),
+        scope: Some(rule.scope.clone()),
+        r#type: Some(rule.rule_type.clone()),
+        modifier_percentage: rule.modifier_percentage,
+        service: rule.service.clone(),
+        associated_pricing_plan_count,
+        last_modified_time: rule.last_modified_time_millis,
+        billing_entity: rule.billing_entity.clone(),
+        tiering: rule.tiering.as_ref().map(|tiering| UpdateTieringInput {
+            free_tier: tiering
+                .free_tier_activated
+                .map(|activated| UpdateFreeTierConfig { activated }),
+            custom_tiers: tiering.custom_tiers.clone(),
+        }),
+        usage_type: rule.usage_type.clone(),
+        operation: rule.operation.clone(),
+    }
+}
+
+/// Refuse the request with this operation's modelled 400 `ValidationException`.
+fn validation(reason: &str, field: &str, message: String) -> UpdatePricingRuleError {
+    UpdatePricingRuleErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
 }
