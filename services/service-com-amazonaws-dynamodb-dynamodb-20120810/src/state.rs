@@ -46,6 +46,54 @@ pub const STATUS_TRANSITION: Duration = Duration::from_millis(500);
 /// Amazon DynamoDB Developer Guide: "The maximum item size in DynamoDB is 400 KB").
 pub const MAX_ITEM_SIZE_BYTES: i64 = 400 * 1024;
 
+/// How a write of an item past [`MAX_ITEM_SIZE_BYTES`] is refused: AWS's FIXED
+/// sentence for that quota ("Item size has exceeded the maximum allowed size" —
+/// the Developer Guide's "Error handling" entry for `ValidationException`), with
+/// neither the ceiling nor the offending size appended. Both figures are
+/// internal to the check; the caller is told which quota it crossed.
+pub const ITEM_SIZE_EXCEEDED_MESSAGE: &str = "Item size has exceeded the maximum allowed size";
+
+/// How a `Key` member that is not the table's primary key is refused: AWS's
+/// FIXED sentence for that mismatch, with nothing about WHICH element differs
+/// appended — a caller learns its key does not match without the refusal
+/// reporting this table's schema back to it.
+pub const KEY_SCHEMA_MISMATCH_MESSAGE: &str =
+    "The provided key element does not match the schema";
+
+/// How an `Item` that omits a key attribute the schema declares is refused:
+/// AWS's FIXED sentence for that case, again naming no attribute.
+pub const MISSING_KEY_VALUE_MESSAGE: &str = "One of the required keys was not given a value";
+
+/// Which request member a primary key is being read out of.
+///
+/// The walk over the key schema is the same for both; only the WORDING of a
+/// missing or wrongly-typed element differs, which is what this carries. A
+/// `Key` IS the primary key, so any way it differs from the schema is the one
+/// mismatch; an `Item` is the whole item, so a key attribute it does not carry
+/// is reported as the value it did not give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeySource {
+    Item,
+    Key,
+}
+
+impl KeySource {
+    /// How this source words a key attribute the schema declares and the
+    /// request did not carry.
+    fn absent(self) -> RequestError {
+        match self {
+            Self::Item => RequestError::Validation(MISSING_KEY_VALUE_MESSAGE.to_string()),
+            Self::Key => self.mismatch(),
+        }
+    }
+
+    /// The one sentence a key that is not this table's primary key is refused
+    /// with.
+    fn mismatch(self) -> RequestError {
+        RequestError::Validation(KEY_SCHEMA_MISMATCH_MESSAGE.to_string())
+    }
+}
+
 /// How deeply an attribute value may nest: "DynamoDB supports nested attributes up to
 /// 32 levels deep" ("Service, Account, and Table Quotas"). A value deeper than this
 /// is refused, so no walk over a request's attributes is driven by caller-chosen
@@ -182,6 +230,201 @@ impl RequestError {
             Self::NotFound(message) | Self::Validation(message) => message,
         }
     }
+}
+
+// =============================================================================
+// How this service WORDS a refusal
+//
+// Three wording rules, each stated exactly once so no handler spells a refusal
+// itself and no two of them drift:
+//
+//   * a constraint violation on an input member is reported inside the
+//     `<N> validation error(s) detected: ` envelope ([`validation_message`]),
+//     over one clause per violated member ([`constraint_clause`]);
+//   * a clause states only facts of the REQUEST — the member's dotted input
+//     path, the constraint it violated, and the rejected value where AWS echoes
+//     one — and never an emulator-internal figure (a configured maximum, a byte
+//     count, the operation's name);
+//   * a refusal whose text AWS fixes (the item-size ceiling, the data-plane
+//     `ResourceNotFoundException`) carries exactly that text and nothing
+//     appended.
+//
+// `src/service.rs` words the framework's own constraint refusals through the
+// same functions, so a bound the model declares and a bound this service checks
+// itself read alike.
+//
+// WHY THESE PHRASES LIVE HERE rather than being borrowed from the framework.
+// `aws_smithy_schema_server::constraints` owns the same sentences
+// (`Violation::requirement`, `Violation::message`, `envelope`), and
+// `src/service.rs` DOES call `Violation::message` for the two clause forms that
+// render identically. The rest cannot be borrowed:
+//
+//   * `Violation::requirement` is private to that crate and `vendor/` is
+//     read-only here, so the phrase cannot be reached without the sentence
+//     around it;
+//   * the sentence around it always interpolates a value — `Value '<v>'` when
+//     the violation carries one and `Value null` when it does not — while the
+//     clause AWS states for a size or magnitude bound on this service echoes
+//     NO value, which is a third form that renderer cannot produce;
+//   * the bounds this service checks itself (the `TableName` form, the item and
+//     nesting ceilings) are not model traits at all, so they have no
+//     `Violation` to render from, and `envelope` takes violations rather than
+//     clauses.
+//
+// A violation class this crate has no phrase for is DECLINED in `service.rs`
+// (`ViolationKind` is `#[non_exhaustive]`), which keeps the framework's own
+// wording instead of a stale phrase from here.
+// =============================================================================
+
+/// The `ValidationException` envelope: `1 validation error detected: <clause>`
+/// for one clause, `<N> validation errors detected: <clause>; <clause>` for
+/// several (the plural and the `; ` join are AWS's, and the count is the number
+/// of clauses stated).
+///
+/// Returns `None` when there is nothing to report, so a caller cannot render an
+/// empty refusal.
+pub fn validation_message<I>(clauses: I) -> Option<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let clauses: Vec<String> = clauses.into_iter().collect();
+    match clauses.len() {
+        0 => None,
+        1 => Some(format!("1 validation error detected: {}", clauses[0])),
+        n => Some(format!(
+            "{n} validation errors detected: {}",
+            clauses.join("; ")
+        )),
+    }
+}
+
+/// One clause of the envelope: the member that was wrong, named by its dotted
+/// input path, and the constraint it failed.
+///
+/// `echoed` carries the rejected value for the violations whose recorded AWS
+/// wording interpolates one, and is `None` for the violations whose wording
+/// names the member and the constraint only — AWS echoes a value in some
+/// clauses and not others, and the choice belongs to the call site that knows
+/// which member was refused, not to this renderer.
+pub fn constraint_clause(path: &str, echoed: Option<&str>, requirement: &str) -> String {
+    match echoed {
+        Some(value) => {
+            format!("Value '{value}' at '{path}' failed to satisfy constraint: {requirement}")
+        }
+        None => format!("Value at '{path}' failed to satisfy constraint: {requirement}"),
+    }
+}
+
+/// The requirement phrase for a `@length` minimum, worded as AWS words it. The
+/// phrases below are the ONE place each requirement is spelled: `src/service.rs`
+/// words the framework's violations through them too, so a bound the model
+/// declares and a bound this service checks itself cannot drift apart.
+pub fn min_length_requirement(min: usize) -> String {
+    format!("Member must have length greater than or equal to {min}")
+}
+
+/// The requirement phrase for a `@length` maximum.
+pub fn max_length_requirement(max: usize) -> String {
+    format!("Member must have length less than or equal to {max}")
+}
+
+/// The requirement phrase for a `@range` minimum. The bound is interpolated as
+/// the text it displays with, so an integral bound reads `1` and not `1.0`.
+pub fn min_value_requirement(min: &str) -> String {
+    format!("Member must have value greater than or equal to {min}")
+}
+
+/// The requirement phrase for a `@range` maximum.
+pub fn max_value_requirement(max: &str) -> String {
+    format!("Member must have value less than or equal to {max}")
+}
+
+/// The requirement phrase for `@uniqueItems`.
+pub fn unique_items_requirement() -> String {
+    "Member must have unique values".to_string()
+}
+
+/// The requirement phrase for a `@pattern`, stating the expression the value
+/// must satisfy.
+///
+/// The expression is reported WITHOUT the `^` / `$` the model spells it with: a
+/// service states the pattern a value must satisfy, not the anchoring that makes
+/// the match total, so a client that re-validates locally with the expression it
+/// read out of the message uses the one AWS states.
+pub fn pattern_requirement(pattern: &str) -> String {
+    format!(
+        "Member must satisfy regular expression pattern: {}",
+        unanchored(pattern)
+    )
+}
+
+/// A `@pattern` expression without the anchors a model may spell it with. A `$`
+/// escaped by a backslash is a literal dollar sign inside the expression, not
+/// the end anchor, so it stays.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// A refusal of ONE input member: the envelope over a single clause.
+pub fn invalid_member(path: &str, echoed: Option<&str>, requirement: &str) -> RequestError {
+    refused(constraint_clause(path, echoed, requirement))
+}
+
+/// The refusal a single clause makes: the envelope over that clause, as the 400
+/// `ValidationException` every caller renders.
+fn refused(clause: String) -> RequestError {
+    // One clause is never zero clauses, so the envelope is always rendered; the
+    // bare clause is the unreachable fallback rather than a second wording.
+    RequestError::Validation(validation_message([clause.clone()]).unwrap_or(clause))
+}
+
+/// The refusal for a `ReturnValues` an item write does not accept.
+///
+/// `PutItem` and `DeleteItem` accept only `NONE` and `ALL_OLD` of the five
+/// values the `ReturnValue` enum declares ("Use ReturnValues if you want to get
+/// the item attributes as they appeared before they were updated" — the
+/// `PutItem$ReturnValues` / `DeleteItem$ReturnValues` docs, which list
+/// `NONE | ALL_OLD`). AWS states it inside the validation envelope with its own
+/// fixed clause, which names the member and the values it accepts and nothing
+/// of the rejected value or the refusing operation.
+pub fn return_values_must_be_old_or_none() -> RequestError {
+    refused("ReturnValues can only be ALL_OLD or NONE".to_string())
+}
+
+/// The refusal for an item whose attributes nest deeper than
+/// [`MAX_ATTRIBUTE_DEPTH`]: AWS's fixed clause for that quota, inside the same
+/// envelope, naming the quota and nothing of which attribute reached it.
+pub fn nesting_levels_exceeded() -> RequestError {
+    refused(
+        "Nesting Levels have exceeded supported limits: Attributes in the item have nested \
+         levels beyond supported limit"
+            .to_string(),
+    )
+}
+
+/// The refusal for a key attribute whose value is empty.
+///
+/// A key attribute's value must be non-empty whatever type the table declared
+/// for it — DynamoDB accepts an empty string or binary in a NON-key attribute
+/// and not in a key one — and the refusal names the key it was supplied for.
+/// Not a constraint-envelope refusal: AWS states it as a parameter-value
+/// sentence of its own.
+fn empty_key_attribute(attribute: &str, kind: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "One or more parameter values are not valid. The AttributeValue for a key attribute \
+         cannot contain an empty {kind} value. Key: {attribute}"
+    ))
 }
 
 /// A table's lifecycle status, as the `TableStatus` enum the model declares names it.
@@ -828,6 +1071,16 @@ impl Table {
             ))
         })?;
         match (declared, value) {
+            // "The AttributeValue for a key attribute cannot contain an empty
+            // string value" / an empty binary value: a key attribute's value
+            // must be non-empty, however the table declared its type, and the
+            // refusal names the key it was supplied for.
+            ("S", AttributeValue::S(text)) if text.is_empty() => {
+                Err(empty_key_attribute(attribute, "string"))
+            }
+            ("B", AttributeValue::B(bytes)) if bytes.is_empty() => {
+                Err(empty_key_attribute(attribute, "binary"))
+            }
             ("S", AttributeValue::S(text)) => Ok(AttributeValueKey::S(text.clone())),
             ("B", AttributeValue::B(bytes)) => Ok(AttributeValueKey::B(bytes.clone())),
             ("N", AttributeValue::N(text)) => NumberKey::parse(text)
@@ -847,15 +1100,43 @@ impl Table {
     /// declares must be present, with its declared type. Non-key attributes are the
     /// item's own business.
     pub fn key_of_item(&self, item: &Item) -> Result<ItemKey, RequestError> {
+        self.key_from(item, KeySource::Item)
+    }
+
+    /// The primary key named by a `Key` member: exactly the key attributes, no more.
+    ///
+    /// Unlike an `Item`, a `Key` IS the primary key, so every way it can differ
+    /// from the schema — an attribute the schema does not declare, a key
+    /// attribute it omits, a key attribute of another type — is the one mismatch
+    /// AWS states with [`KEY_SCHEMA_MISMATCH_MESSAGE`].
+    pub fn key_of_key_map(&self, key: &Item) -> Result<ItemKey, RequestError> {
+        for name in key.keys() {
+            if name != self.partition_key_name() && Some(name.as_str()) != self.sort_key_name() {
+                return Err(KeySource::Key.mismatch());
+            }
+        }
+        self.key_from(key, KeySource::Key)
+    }
+
+    /// The one walk over the key schema both `Key` and `Item` are read through:
+    /// each declared key attribute is taken from `supplied` and encoded, and
+    /// `source` decides only how a missing or wrongly-typed element is WORDED.
+    fn key_from(&self, supplied: &Item, source: KeySource) -> Result<ItemKey, RequestError> {
         let mut partition = None;
         let mut sort = None;
         for element in &self.key_schema {
             let name = element.attribute_name.as_str();
-            let value = item.get(name).ok_or_else(|| {
-                RequestError::Validation(format!(
-                    "One of the required keys was not given a value: {name}"
-                ))
-            })?;
+            let value = supplied.get(name).ok_or_else(|| source.absent())?;
+            // Read out of a `Key`, an element of the wrong type does not name
+            // this key either, so it is the same mismatch rather than a report
+            // of the declared and the supplied type.
+            if matches!(source, KeySource::Key)
+                && self
+                    .declared_type(name)
+                    .is_some_and(|declared| declared != attribute_value_type(value))
+            {
+                return Err(source.mismatch());
+            }
             let encoded = self.key_value(name, value)?;
             if element.key_type == "HASH" {
                 partition = Some(encoded);
@@ -863,22 +1144,10 @@ impl Table {
                 sort = Some(encoded);
             }
         }
-        let partition = partition.ok_or_else(|| {
-            RequestError::Validation("The provided key element does not match the schema".into())
-        })?;
-        Ok(ItemKey { partition, sort })
-    }
-
-    /// The primary key named by a `Key` member: exactly the key attributes, no more.
-    pub fn key_of_key_map(&self, key: &Item) -> Result<ItemKey, RequestError> {
-        for name in key.keys() {
-            if name != self.partition_key_name() && Some(name.as_str()) != self.sort_key_name() {
-                return Err(RequestError::Validation(format!(
-                    "The provided key element does not match the schema: {name} is not a key attribute"
-                )));
-            }
-        }
-        self.key_of_item(key)
+        Ok(ItemKey {
+            partition: partition.ok_or_else(|| KeySource::Key.mismatch())?,
+            sort,
+        })
     }
 
     /// The key attributes of a stored item, as the `Key`-shaped map
@@ -1249,11 +1518,13 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         name: &str,
         now: SystemTime,
     ) -> Result<&Table, RequestError> {
-        let table = self.table(region, name)?;
+        let table = self
+            .table(region, name)
+            .map_err(|_| item_resource_not_found())?;
         if table.status(now).serves_items() {
             Ok(table)
         } else {
-            Err(not_found(name))
+            Err(item_resource_not_found())
         }
     }
 
@@ -1266,7 +1537,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     ) -> Result<&mut Table, RequestError> {
         match self.table_mut(region, name) {
             Ok(table) if table.status(now).serves_items() => Ok(table),
-            _ => Err(not_found(name)),
+            _ => Err(item_resource_not_found()),
         }
     }
 
@@ -1357,9 +1628,24 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     }
 }
 
-/// The `ResourceNotFoundException` message for a table that is not readable.
+/// The `ResourceNotFoundException` message the CONTROL plane answers with: the
+/// table-level operations (`DescribeTable`, `UpdateTable`, the tagging surface)
+/// name the resource they could not find, because the caller addressed that
+/// table by name and the describing surface reports it back.
 fn not_found(name: &str) -> RequestError {
     RequestError::NotFound(format!("Requested resource not found: Table: {name} not found"))
+}
+
+/// The `ResourceNotFoundException` message the DATA plane answers with.
+///
+/// An item operation (`GetItem`, `PutItem`, `DeleteItem`, `Query`, …) against a
+/// table that is absent — or present but not yet serving items — is refused with
+/// AWS's FIXED text, with no resource detail appended: the one message is all a
+/// client sees for "the table you addressed is not there", so nothing about this
+/// store's contents (which name was looked up, whether it exists in another
+/// status) leaks through the data-plane refusal.
+fn item_resource_not_found() -> RequestError {
+    RequestError::NotFound("Requested resource not found".to_string())
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -1399,6 +1685,29 @@ pub fn index_arn(region: &str, table: &str, index: &str) -> String {
     )
 }
 
+/// The form a table name must take: 3..=255 characters of
+/// `[a-zA-Z0-9_.-]` (the `CreateTable$TableName` doc's own length and pattern —
+/// the data-plane members target `TableArn`, which widens the modelled bound to
+/// 1..=1024 so an ARN fits, while the name inside it keeps these).
+const MIN_TABLE_NAME_LENGTH: usize = 3;
+const MAX_TABLE_NAME_LENGTH: usize = 255;
+const TABLE_NAME_PATTERN: &str = "^[a-zA-Z0-9_.-]+$";
+
+/// How AWS's refusals name the table-name member: the `tableName` path its own
+/// request validator reports this constraint against, with the rejected name
+/// echoed.
+///
+/// NOT the wire spelling `src/service.rs` restores for a violation of a bound
+/// the MODEL declares, and deliberately so: the public model does not carry this
+/// bound at all (the data-plane members target `TableArn`, length 1..=1024), so
+/// this is a check the service itself makes, and the recorded AWS refusals for
+/// it state the validator's own form — `Value 'ab' at 'tableName' failed to
+/// satisfy constraint: Member must have length greater than or equal to 3` for
+/// a two-character name on `GetItem`. The same clause is stated for every
+/// operation that resolves a table name, and the echoed value is the name the
+/// caller sent, never a figure of this emulator's.
+const TABLE_NAME_MEMBER_PATH: &str = "tableName";
+
 /// The `TableName` member accepts a bare table name or the table's ARN ("You can
 /// also provide the Amazon Resource Name (ARN) of the table in this parameter" —
 /// the `CreateTable$TableName` doc). Resolve either to the bare name, refusing a
@@ -1411,24 +1720,38 @@ pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
             .and_then(|resource| resource.strip_prefix("table/"))
             .and_then(|path| path.split('/').next())
             .ok_or_else(|| {
-                RequestError::Validation(format!(
-                    "Invalid TableName: {table_name} is not a DynamoDB table ARN"
-                ))
+                invalid_member(
+                    TABLE_NAME_MEMBER_PATH,
+                    Some(table_name),
+                    &pattern_requirement(TABLE_NAME_PATTERN),
+                )
             })?,
         None => table_name,
     };
-    if !(3..=255).contains(&name.chars().count()) {
-        return Err(RequestError::Validation(format!(
-            "Invalid TableName: {name} must have length between 3 and 255"
-        )));
+    let length = name.chars().count();
+    if length < MIN_TABLE_NAME_LENGTH {
+        return Err(invalid_member(
+            TABLE_NAME_MEMBER_PATH,
+            Some(name),
+            &min_length_requirement(MIN_TABLE_NAME_LENGTH),
+        ));
+    }
+    if length > MAX_TABLE_NAME_LENGTH {
+        return Err(invalid_member(
+            TABLE_NAME_MEMBER_PATH,
+            Some(name),
+            &max_length_requirement(MAX_TABLE_NAME_LENGTH),
+        ));
     }
     if !name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-')
     {
-        return Err(RequestError::Validation(format!(
-            "Invalid TableName: {name} must satisfy the pattern ^[a-zA-Z0-9_.-]+$"
-        )));
+        return Err(invalid_member(
+            TABLE_NAME_MEMBER_PATH,
+            Some(name),
+            &pattern_requirement(TABLE_NAME_PATTERN),
+        ));
     }
     Ok(name.to_string())
 }

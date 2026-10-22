@@ -30,3 +30,6 @@ mod state_roundtrip;
 
 #[path = "all/table_items.rs"]
 mod table_items;
+
+#[path = "all/validation_message_wording.rs"]
+mod validation_message_wording;

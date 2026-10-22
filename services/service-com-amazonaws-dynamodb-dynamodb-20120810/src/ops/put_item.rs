@@ -331,10 +331,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let return_old = match input.return_values.as_deref() {
             None | Some("NONE") => false,
             Some("ALL_OLD") => true,
-            Some(other) => {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "ReturnValues can only be ALL_OLD or NONE for PutItem, got {other}"
-                )))
+            Some(_) => {
+                return Err(lift(
+                    crate::state::return_values_must_be_old_or_none(),
+                ))
             }
         };
 
@@ -345,12 +345,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Nesting is refused before the item is sized or stored: "DynamoDB supports
         // nested attributes up to 32 levels deep".
-        for (attribute, value) in &input.item {
+        for value in input.item.values() {
             if crate::state::attribute_depth_exceeds(value, crate::state::MAX_ATTRIBUTE_DEPTH) {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Attribute {attribute} nests deeper than the maximum of {} levels",
-                    crate::state::MAX_ATTRIBUTE_DEPTH
-                )));
+                return Err(lift(crate::state::nesting_levels_exceeded()));
             }
         }
 
@@ -366,10 +363,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let size = crate::state::item_size(&item);
         if size > crate::state::MAX_ITEM_SIZE_BYTES {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Item size has exceeded the maximum allowed size of {} bytes: {size} bytes",
-                crate::state::MAX_ITEM_SIZE_BYTES
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+            ));
         }
 
         let mut store = state.lock();
