@@ -199,24 +199,44 @@ impl Emulator {
     }
 }
 
+/// What identifies the handler a request reached.
+#[derive(Debug, Clone, Copy)]
+enum Answer {
+    /// A still-scaffolded operation answers HTTP 501 `NotImplemented` with a message
+    /// naming itself.
+    Scaffolded,
+    /// An IMPLEMENTED operation answers its own modelled error for a request only its
+    /// handler can judge: this status and wire error code.
+    Modelled(u16, &'static str),
+}
+
 /// One VALID request per operation — valid so the boundary validator passes it and it
 /// reaches that operation's own handler. Members and constraints from `OPERATIONS.md`.
-const DISPATCH_TABLE: [(&str, &str); 4] = [
+///
+/// `DeleteApplication` is implemented (the application-lifecycle slice), so the answer
+/// that identifies ITS handler is the `ResourceNotFoundException` it reports for an
+/// application that was never created; the other three are still scaffolds and answer
+/// their own 501.
+const DISPATCH_TABLE: [(&str, &str, Answer); 4] = [
     (
         "DeleteApplication",
         r#"{"ApplicationName":"collision-case","CreateTimestamp":1700000000}"#,
+        Answer::Modelled(400, "ResourceNotFoundException"),
     ),
     (
         "DeleteApplicationOutput",
         r#"{"ApplicationName":"collision-case","CurrentApplicationVersionId":1,"OutputId":"out-1"}"#,
+        Answer::Scaffolded,
     ),
     (
         "AddApplicationOutput",
         r#"{"ApplicationName":"collision-case","CurrentApplicationVersionId":1,"Output":{"Name":"in-app-stream","DestinationSchema":{"RecordFormatType":"JSON"}}}"#,
+        Answer::Scaffolded,
     ),
     (
         "DeleteApplicationCloudWatchLoggingOption",
         r#"{"ApplicationName":"collision-case","CurrentApplicationVersionId":1,"CloudWatchLoggingOptionId":"cw-1"}"#,
+        Answer::Scaffolded,
     ),
 ];
 
@@ -224,28 +244,44 @@ const DISPATCH_TABLE: [(&str, &str); 4] = [
 async fn every_operation_dispatches_to_the_handler_that_bears_its_name() {
     let emulator = Emulator::new();
 
-    for (operation, body) in DISPATCH_TABLE {
+    for (operation, body, answer) in DISPATCH_TABLE {
         let (status, code, parsed) = emulator.call(operation, body).await;
 
-        // Each of these operations is still a scaffold, so the answer that identifies the
-        // handler the request reached is its 501 — which names the operation.
-        assert_eq!(
-            status, 501,
-            "case {operation:?}: expected HTTP 501 from the scaffolded handler, got {status} with {parsed:?}"
-        );
-        assert!(
-            code.ends_with("NotImplemented"),
-            "case {operation:?}: expected the error code NotImplemented, got {code:?} with {parsed:?}"
-        );
+        match answer {
+            // The answer that identifies the handler a scaffold reached is its 501 —
+            // which names the operation.
+            Answer::Scaffolded => {
+                assert_eq!(
+                    status, 501,
+                    "case {operation:?}: expected HTTP 501 from the scaffolded handler, got {status} with {parsed:?}"
+                );
+                assert!(
+                    code.ends_with("NotImplemented"),
+                    "case {operation:?}: expected the error code NotImplemented, got {code:?} with {parsed:?}"
+                );
 
-        let message = parsed
-            .get("message")
-            .or_else(|| parsed.get("Message"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            message.contains(&format!("operation {operation} is")),
-            "case {operation:?}: expected the 501 to name {operation}, got {message:?}"
-        );
+                let message = parsed
+                    .get("message")
+                    .or_else(|| parsed.get("Message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    message.contains(&format!("operation {operation} is")),
+                    "case {operation:?}: expected the 501 to name {operation}, got {message:?}"
+                );
+            }
+            // For an implemented operation it is the modelled error only its own handler
+            // can produce for this request.
+            Answer::Modelled(expected_status, expected_code) => {
+                assert_eq!(
+                    status, expected_status,
+                    "case {operation:?}: expected HTTP {expected_status} from the implemented handler, got {status} with {parsed:?}"
+                );
+                assert!(
+                    code.ends_with(expected_code),
+                    "case {operation:?}: expected the error code {expected_code}, got {code:?} with {parsed:?}"
+                );
+            }
+        }
     }
 }

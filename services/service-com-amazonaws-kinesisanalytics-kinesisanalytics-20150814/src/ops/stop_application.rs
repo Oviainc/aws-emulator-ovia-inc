@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: moves a stored application from `RUNNING` towards `READY`, reporting the
+//! transient `STOPPING` the real service reports until the move comes due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Not emulated by this slice: IAM authorization of the documented
+//! `kinesisanalytics:StopApplication` action, CloudTrail-style access records, and
+//! `UnsupportedOperationException` — every record this store holds is a v1 SQL
+//! application, so there is no resource this V1 API cannot stop.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +72,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::ApplicationStatus;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +145,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopApplication"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service is mounted on an engine that holds no
+            // state, which this emulator never does: for such an engine no behaviour
+            // has been written, so the scaffold signal is the honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "StopApplication",
+            ));
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        store.settle_due(now);
+
+        let Some(application) = store.applications.get_mut(&input.application_name) else {
+            return Err(StopApplicationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Application {} not found",
+                        input.application_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Only a running application is available to be stopped.
+        if application.status != ApplicationStatus::Running {
+            return Err(StopApplicationErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Application {} is in status {} and is not available to be stopped",
+                        application.name,
+                        application.status.as_str()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Stopping is not instantaneous: the application reports `STOPPING` until the
+        // move to `READY` comes due. Nothing sleeps — the due instant is stored.
+        application.begin_transition(ApplicationStatus::Stopping, ApplicationStatus::Ready, now);
+        application.last_update_timestamp_millis = crate::state::now_epoch_millis();
+
+        Ok(StopApplicationOutput {})
     }
 }

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: stores a new application record in [`crate::state`] and answers the
+//! `ApplicationSummary` read back off that record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Not emulated by this slice: IAM authorization of the documented
+//! `kinesisanalytics:CreateApplication` action, CloudTrail-style access records, and
+//! `CodeValidationException` — the Kinesis Analytics SQL dialect (`CREATE STREAM`, `PUMP`)
+//! is not one any maintained parser implements, so `ApplicationCode` is stored unparsed
+//! rather than refused on a guess. The ARNs and role ARNs in `Inputs`/`Outputs`/
+//! `CloudWatchLoggingOptions` are stored as given: nothing here resolves the resource or
+//! assumes the role, so there is nothing to reject them against.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +135,42 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    Application, ApplicationStatus, CloudWatchLoggingOptionRecord, InputRecord, OutputRecord,
+    DEFAULT_INPUT_PARALLELISM_COUNT, MAX_INPUT_PARALLELISM_COUNT, MIN_INPUT_PARALLELISM_COUNT,
+};
+
+/// This service's ARN namespace (`smithy_query query="service_info"` →
+/// `awsService.arnNamespace`).
+const ARN_SERVICE: &str = "kinesisanalytics";
+
+/// The region whose ARNs an unsigned request gets: generated emulators default to
+/// `us-east-1` (see `engine::emulator_arn`).
+const DEFAULT_REGION: &str = "us-east-1";
+
+/// Streaming sources one application may read. This operation's own doc: "You can
+/// configure each application with one streaming source as input".
+const MAX_INPUTS: usize = 1;
+
+/// Destinations one application may write to. This operation's own doc: "up to
+/// three destinations where you want Amazon Kinesis Analytics to write the output
+/// data".
+const MAX_OUTPUTS: usize = 3;
+
+/// CloudWatch log streams one application may write configuration errors to. The
+/// `CloudWatchLoggingOption` doc: "Currently, you can configure only one CloudWatch
+/// log stream to monitor application configuration errors."
+const MAX_CLOUD_WATCH_LOGGING_OPTIONS: usize = 1;
+
+/// User-defined tags one application may carry. The `Tags` member's own doc: "The
+/// maximum number of user-defined application tags is 50".
+const MAX_USER_TAGS: usize = 50;
+
+/// Applications one account may hold in a region, after which this operation
+/// answers the `LimitExceededException` it models ("Exceeded the number of
+/// applications allowed"): the Kinesis Analytics default application quota.
+const MAX_APPLICATIONS: usize = 50;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -207,18 +244,210 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service is mounted on an engine that holds no
+            // state, which this emulator never does: for such an engine no behaviour
+            // has been written, so the scaffold signal is the honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateApplication",
+            ));
+        };
+
+        let inputs = input.inputs.unwrap_or_default();
+        if inputs.len() > MAX_INPUTS {
+            return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(format!(
+                        "Inputs: an application reads at most {MAX_INPUTS} streaming source, got {}",
+                        inputs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `InputParallelismCount`'s modelled range. The boundary validator refuses a
+        // value outside it before this handler runs; checking here too keeps a count
+        // the store expands into one stream name each from ever being stored, whatever
+        // route put it in the request.
+        for configured in &inputs {
+            let Some(count) = configured
+                .input_parallelism
+                .as_ref()
+                .and_then(|parallelism| parallelism.count)
+            else {
+                continue;
+            };
+            if !(MIN_INPUT_PARALLELISM_COUNT..=MAX_INPUT_PARALLELISM_COUNT).contains(&count) {
+                return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "Inputs.InputParallelism.Count: must be between \
+                             {MIN_INPUT_PARALLELISM_COUNT} and \
+                             {MAX_INPUT_PARALLELISM_COUNT}, got {count}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let outputs = input.outputs.unwrap_or_default();
+        if outputs.len() > MAX_OUTPUTS {
+            return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(format!(
+                        "Outputs: an application writes to at most {MAX_OUTPUTS} destinations, got {}",
+                        outputs.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let logging_options = input.cloud_watch_logging_options.unwrap_or_default();
+        if logging_options.len() > MAX_CLOUD_WATCH_LOGGING_OPTIONS {
+            return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(format!(
+                        "CloudWatchLoggingOptions: only {MAX_CLOUD_WATCH_LOGGING_OPTIONS} \
+                         CloudWatch log stream can be configured, got {}",
+                        logging_options.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let supplied_tags = input.tags.unwrap_or_default();
+        if supplied_tags.len() > MAX_USER_TAGS {
+            return Err(CreateApplicationErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "Tags: at most {MAX_USER_TAGS} user-defined tags are allowed, got {}",
+                        supplied_tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let mut tags = ::std::collections::BTreeMap::new();
+        for tag in supplied_tags {
+            if tags.contains_key(&tag.key) {
+                return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!("Tags: duplicate tag key {}", tag.key)),
+                    },
+                )
+                .into());
+            }
+            tags.insert(tag.key, tag.value);
+        }
+
+        // The ARN names the region the request was signed for and the emulator's
+        // canonical account id. It is STORED on the record, so every later read
+        // reports the same ARN however that read is signed.
+        let region = emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+            .map(|scope| scope.region)
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+        let arn = ::engine::emulator_arn(
+            ARN_SERVICE,
+            &region,
+            &format!("application/{}", input.application_name),
+        );
+
+        // The record is built in full BEFORE the shared store is locked, so no work
+        // whose size the caller chose runs inside the critical section.
+        let created_at = crate::state::now_epoch_millis();
+        let mut application = Application {
+            name: input.application_name.clone(),
+            arn,
+            description: input.application_description,
+            // A created application is ready to be started, so no transition is owed.
+            status: ApplicationStatus::Ready,
+            pending: None,
+            version_id: 1,
+            create_timestamp_millis: created_at,
+            last_update_timestamp_millis: created_at,
+            application_code: input.application_code,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            reference_data_sources: Vec::new(),
+            cloud_watch_logging_options: Vec::new(),
+            tags,
+            next_id: 0,
+        };
+
+        for configured in inputs {
+            let input_id = application.mint_id();
+            application.inputs.push(InputRecord {
+                input_id,
+                name_prefix: configured.name_prefix,
+                kinesis_streams_input: configured.kinesis_streams_input,
+                kinesis_firehose_input: configured.kinesis_firehose_input,
+                input_processing_configuration: configured.input_processing_configuration,
+                input_schema: configured.input_schema,
+                input_parallelism_count: configured
+                    .input_parallelism
+                    .and_then(|parallelism| parallelism.count)
+                    .unwrap_or(DEFAULT_INPUT_PARALLELISM_COUNT),
+                // `StartApplication` is what names a starting position.
+                starting_position: None,
+            });
+        }
+
+        for configured in outputs {
+            let output_id = application.mint_id();
+            application.outputs.push(OutputRecord {
+                output_id,
+                name: configured.name,
+                kinesis_streams_output: configured.kinesis_streams_output,
+                kinesis_firehose_output: configured.kinesis_firehose_output,
+                lambda_output: configured.lambda_output,
+                destination_schema: configured.destination_schema,
+            });
+        }
+
+        for configured in logging_options {
+            let cloud_watch_logging_option_id = application.mint_id();
+            application
+                .cloud_watch_logging_options
+                .push(CloudWatchLoggingOptionRecord {
+                    cloud_watch_logging_option_id,
+                    log_stream_arn: configured.log_stream_arn,
+                    role_arn: configured.role_arn,
+                });
+        }
+
+        // Name-collision and quota are decided and the record inserted under ONE lock,
+        // so two concurrent creates of the same name cannot both pass the check.
+        let application_summary = application.summary();
+        let mut store = state.lock();
+        if store.applications.contains_key(&input.application_name) {
+            return Err(CreateApplicationErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Application {} already exists",
+                        input.application_name
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.applications.len() >= MAX_APPLICATIONS {
+            return Err(CreateApplicationErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Exceeded the number of applications allowed: at most {MAX_APPLICATIONS}"
+                    )),
+                },
+            )
+            .into());
+        }
+        store
+            .applications
+            .insert(input.application_name, application);
+
+        Ok(CreateApplicationOutput { application_summary })
     }
 }

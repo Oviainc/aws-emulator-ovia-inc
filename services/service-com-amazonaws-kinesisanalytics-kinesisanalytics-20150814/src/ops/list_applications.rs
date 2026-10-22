@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages the stored applications in name order. Reporting only — the single
+//! write it makes is materialising status transitions the clock had already made due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Not emulated by this slice: IAM authorization of the documented
+//! `kinesisanalytics:ListApplications` action and CloudTrail-style access records.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +77,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::Application;
+
+/// The smallest and largest page `Limit` the model allows
+/// (`ListApplicationsInputLimit` range `1..50`). A request that names no `Limit`
+/// gets the largest page.
+const MIN_LIMIT: usize = 1;
+const MAX_LIMIT: usize = 50;
+const DEFAULT_LIMIT: usize = MAX_LIMIT;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -148,18 +153,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplications"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service is mounted on an engine that holds no
+            // state, which this emulator never does: for such an engine no behaviour
+            // has been written, so the scaffold signal is the honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListApplications",
+            ));
+        };
+
+        // A `Limit` the model's `1..50` range forbids is refused, not silently read as
+        // the default: this operation models no client-input error of its own, so the
+        // refusal is the same 400 `ValidationException` the boundary validator answers
+        // for a range violation.
+        let limit = match input.limit {
+            None => DEFAULT_LIMIT,
+            Some(limit) => usize::try_from(limit)
+                .ok()
+                .filter(|limit| (MIN_LIMIT..=MAX_LIMIT).contains(limit))
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "Limit: must be between {MIN_LIMIT} and {MAX_LIMIT}, got {limit}"
+                    ))
+                })?,
+        };
+        let start_after = input.exclusive_start_application_name;
+
+        let mut store = state.lock();
+        // Status moves the clock has already made due are materialised here rather
+        // than reported stale: each was owed at this instant whether or not anybody
+        // called. Nothing else about any record changes on a read.
+        store.settle_due(::std::time::Instant::now());
+
+        // The store is keyed by name in a `BTreeMap`, so iteration is already in
+        // name order: the page starts STRICTLY after `ExclusiveStartApplicationName`
+        // and `HasMoreApplications` is true only when a further record remains.
+        let mut beyond_start = store.applications.values().filter(|application| {
+            start_after
+                .as_deref()
+                .is_none_or(|start| application.name.as_str() > start)
+        });
+        let application_summaries: Vec<ApplicationSummary> = beyond_start
+            .by_ref()
+            .take(limit)
+            .map(Application::summary)
+            .collect();
+        let has_more_applications = beyond_start.next().is_some();
+
+        Ok(ListApplicationsOutput {
+            application_summaries,
+            has_more_applications,
+        })
     }
 }
