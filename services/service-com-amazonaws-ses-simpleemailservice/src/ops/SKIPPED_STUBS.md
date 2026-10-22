@@ -19,6 +19,10 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 handler returns an error, so it never has to construct a value.
 
 // SKIPPED: GetAccountSendingEnabled — unsupported shape construct: operation 'GetAccountSendingEnabled' has a Unit/absent input, which the generator does not emit yet
-// SKIPPED: GetSendQuota — unsupported shape construct: operation 'GetSendQuota' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: GetSendStatistics — unsupported shape construct: operation 'GetSendStatistics' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: ListVerifiedEmailAddresses — unsupported shape construct: operation 'ListVerifiedEmailAddresses' has a Unit/absent input, which the generator does not emit yet
+
+// HAND-AUTHORED since: GetSendQuota — the generator declined it for the same
+// Unit-input reason, and it is now written out in `ops/get_send_quota.rs` (with
+// its two shapes in `ops/types/get_send_quota_types.rs`), so it is typed, in the
+// service's `operations(...)` allow-list, and served like every other operation.

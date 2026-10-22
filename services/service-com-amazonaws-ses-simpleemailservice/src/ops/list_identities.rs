@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIdentities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIdentities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIdentities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this account's identity list, filtered by `IdentityType`, in one
+//! stable order, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +102,17 @@ impl From<ListIdentitiesErrorModeled> for ListIdentitiesError {
     }
 }
 
+/// The page sizes `MaxItems` accepts, from its own documentation: "The maximum
+/// number of identities per page. Possible values are 1-1000 inclusive." The
+/// model carries no `@range`, so the boundary validator passes a value outside
+/// it and this operation refuses it itself.
+const MAX_ITEMS_RANGE: std::ops::RangeInclusive<i32> = 1..=1000;
+
+/// The page size used when the request names none, so one small request can
+/// never ask the service to serialise the whole identity list. SES pages this
+/// operation at 100 identities by default.
+const DEFAULT_MAX_ITEMS: usize = 100;
+
 /// The `ListIdentities` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -144,18 +149,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIdentities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIdentitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIdentities"))
+        // `ctx` carries only request metadata; this operation needs none of it.
+        let _ = ctx;
+        // `IdentityType` is a modeled enum, so the boundary refuses a value
+        // outside its value set before this handler runs; absent means "all
+        // identities are listed", per the member's documentation. The miss arm
+        // below is the belt-and-braces refusal: this handler never filters on a
+        // value it cannot interpret.
+        let wanted = match input.identity_type.as_deref() {
+            None => None,
+            Some(value) => match crate::state::IdentityType::from_wire(value) {
+                Some(identity_type) => Some(identity_type),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "IdentityType must be one of {:?}, got {value:?}",
+                        IDENTITY_TYPE_VALUES
+                    )))
+                }
+            },
+        };
+
+        let page_size = match input.max_items {
+            // Absent `MaxItems`: the service's own default page size, never the
+            // whole store.
+            None => DEFAULT_MAX_ITEMS,
+            Some(max_items) if MAX_ITEMS_RANGE.contains(&max_items) => max_items as usize,
+            Some(max_items) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "MaxItems must be between {} and {} inclusive, got {max_items}",
+                    MAX_ITEMS_RANGE.start(),
+                    MAX_ITEMS_RANGE.end()
+                )))
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // See `verify_email_identity.rs`: an engine with no store for this
+            // service cannot serve the operation at all, and it models no server
+            // error of its own.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListIdentities",
+            ));
+        };
+        let state = state.lock();
+
+        // The store is keyed by the identity string, so iteration is in one
+        // stable (lexicographic) order for every caller — which is what makes a
+        // `NextToken` resumable at all. The token is the identity the next page
+        // starts at, so a page boundary never repeats or skips an entry even when
+        // identities are added or removed between calls.
+        let resume_from = input.next_token.as_deref().unwrap_or("");
+        // `(Included(&str), Unbounded)` rather than `resume_from..`, so the range
+        // is over `str` keys (a `RangeFrom<&str>` would ask the map for `&str`
+        // keys, which it does not have).
+        let page = (
+            std::ops::Bound::Included(resume_from),
+            std::ops::Bound::Unbounded,
+        );
+        let mut identities: Vec<String> = Vec::new();
+        let mut next_token = None;
+        for (name, identity) in state.identities.range::<str, _>(page) {
+            if wanted.is_some_and(|wanted| wanted != identity.identity_type) {
+                continue;
+            }
+            if identities.len() == page_size {
+                next_token = Some(name.clone());
+                break;
+            }
+            identities.push(name.clone());
+        }
+
+        Ok(ListIdentitiesOutput {
+            identities,
+            next_token,
+        })
     }
 }

@@ -44,6 +44,7 @@ pub mod get_identity_mail_from_domain_attributes_types;
 pub mod get_identity_notification_attributes_types;
 pub mod get_identity_policies_types;
 pub mod get_identity_verification_attributes_types;
+pub mod get_send_quota_types;
 pub mod get_template_types;
 pub mod list_configuration_sets_types;
 pub mod list_custom_verification_email_templates_types;
@@ -143,6 +144,8 @@ pub use get_identity_notification_attributes_types::*;
 pub use get_identity_policies_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_identity_verification_attributes_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use get_send_quota_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_template_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
