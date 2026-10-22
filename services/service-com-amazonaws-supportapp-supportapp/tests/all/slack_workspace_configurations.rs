@@ -56,7 +56,10 @@ fn assert_token_is_modelled(label: &str, token: &str) {
 }
 
 /// Ask `ListSlackWorkspaceConfigurations` for one page.
-async fn list_workspaces(emulator: &Emulator, next_token: Option<&str>) -> Reply {
+///
+/// `pub(crate)` so the sibling suites in this test target read the registry through
+/// this one helper instead of each spelling the route and the body again.
+pub(crate) async fn list_workspaces(emulator: &Emulator, next_token: Option<&str>) -> Reply {
     let body = match next_token {
         Some(token) => json!({ "nextToken": token }),
         None => json!({}),
@@ -67,7 +70,7 @@ async fn list_workspaces(emulator: &Emulator, next_token: Option<&str>) -> Reply
 }
 
 /// The `slackWorkspaceConfigurations` member of a listing reply.
-fn reported(reply: &Reply) -> Vec<Value> {
+pub(crate) fn reported(reply: &Reply) -> Vec<Value> {
     reply
         .body
         .get("slackWorkspaceConfigurations")
@@ -112,7 +115,7 @@ async fn drain_workspace_pages(emulator: &Emulator, label: &str) -> Vec<Value> {
 }
 
 /// The `teamId` of each reported record, in the order the listing reported them.
-fn reported_team_ids(records: &[Value]) -> Vec<String> {
+pub(crate) fn reported_team_ids(records: &[Value]) -> Vec<String> {
     records
         .iter()
         .map(|record| {
@@ -472,3 +475,4 @@ async fn the_workspace_registry_and_the_channel_configurations_are_separate_reso
         emulator.list(None).await.body
     );
 }
+

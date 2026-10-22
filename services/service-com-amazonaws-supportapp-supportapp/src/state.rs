@@ -125,11 +125,13 @@ pub struct ComAmazonawsSupportappSupportappState {
     /// alias to report.
     pub account_alias: Option<String>,
     /// Every Slack workspace registered to this account, keyed by `teamId`, written by
-    /// `RegisterSlackWorkspaceForOrganization` and bounded by
+    /// `RegisterSlackWorkspaceForOrganization`, removed by
+    /// `DeleteSlackWorkspaceConfiguration` and bounded by
     /// [`MAX_SLACK_WORKSPACE_CONFIGURATIONS`]. It is the account's workspace registry:
     /// a Slack channel configuration lives INSIDE a registered workspace, so
     /// `CreateSlackChannelConfiguration` refuses a channel whose `teamId` is absent
-    /// here (see [`workspace_not_registered_message`]).
+    /// here (see [`workspace_not_registered_message`]) and deleting a workspace takes
+    /// that workspace's channel configurations with it.
     pub slack_workspace_configurations: BTreeMap<String, SlackWorkspaceConfig>,
 }
 
@@ -267,6 +269,19 @@ pub fn slack_channel_configuration_not_found(team_id: &str, channel_id: &str) ->
         "{} not found",
         slack_channel_configuration_subject(team_id, channel_id)
     )
+}
+
+/// The `ResourceNotFoundException` message for a `teamId` this account holds no Slack
+/// workspace configuration for ("The specified resource is missing or doesn't exist,
+/// such as an account alias, Slack channel configuration, or Slack workspace
+/// configuration" — `ResourceNotFoundException`).
+///
+/// Worded exactly as [`slack_channel_configuration_not_found`] words a channel miss,
+/// naming the resource and the member that identifies it, so the two misses this
+/// service can report read the same way and differ only in which resource was looked
+/// up.
+pub fn slack_workspace_configuration_not_found(team_id: &str) -> String {
+    format!("Slack workspace configuration for team {team_id} not found")
 }
 
 /// The `ConflictException` message for a `(teamId, channelId)` pair that is already
