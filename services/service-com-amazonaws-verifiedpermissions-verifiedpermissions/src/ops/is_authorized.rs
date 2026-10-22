@@ -199,6 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &resource,
             context,
             entities,
+            // The store's schema, when it holds one: it is what types the
+            // request's entities and context, so the evaluation is made against
+            // it rather than untyped.
+            store.schema.as_ref().map(|schema| schema.cedar_json.as_str()),
         )
         .map_err(crate::scaffolded::Scaffolded::validation)?;
 

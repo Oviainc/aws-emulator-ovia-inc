@@ -71,6 +71,13 @@ pub const MAX_COLLECTION_LEN: usize = 1_000;
 /// policy, so the response needs its own output cap.
 pub const MAX_REPORTED_EVALUATION_ERRORS: usize = 100;
 
+/// How many bytes of Cedar schema JSON one policy store may hold. The model puts
+/// no upper `@length` on `SchemaJson` (`min 1` only), so the boundary validator
+/// cannot refuse an over-long one: this is the emulator's bound on the text
+/// `PutSchema` stores and that every later validation re-parses. CHOSEN, not an
+/// AWS-published quota, and sized well above any hand-written schema.
+pub const MAX_SCHEMA_BYTES: usize = 100_000;
+
 /// What the Cedar parser says a static policy's scope is: the pieces
 /// `CreatePolicy`, `GetPolicy` and `ListPolicies` report back.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +142,91 @@ pub fn parse_static_policy(statement: &str) -> Result<StaticScope, String> {
     })
 }
 
+/// A parsed Cedar schema: the `cedar-policy` schema object every validation
+/// needs, plus the namespaces the schema declares.
+pub struct ParsedSchema {
+    /// The schema as the Cedar validator and the request validator consume it.
+    pub schema: cedar_policy::Schema,
+    /// The namespaces the schema declares, which `PutSchema`/`GetSchema` report.
+    pub namespaces: Vec<String>,
+}
+
+/// Parse one Cedar schema, written in Cedar schema JSON, and read the namespaces
+/// it declares off the parsed form. `Err` carries the schema parser's own
+/// diagnostics, for a `ValidationException`.
+///
+/// `text` must ALREADY be bounded by [`MAX_SCHEMA_BYTES`]: that limit has exactly
+/// one owner, `PutSchema`, which is the only way schema text enters the service
+/// and which refuses an over-long definition with the modelled quota error. Every
+/// other caller here parses text this service already stored, so it is bounded by
+/// construction — and that bound is the whole step budget for a parse, whose cost
+/// is in the bytes it reads, with `serde_json`'s own recursion limit bounding how
+/// deep the nesting inside those bytes can drive the parser's stack. No count or
+/// depth cap is imposed on top, because a real schema's entity-type and action
+/// counts are bounded only by its size.
+///
+/// The namespaces come from the schema JSON's top-level members, which is what
+/// that format defines them to be: a Cedar JSON schema is an object keyed by
+/// namespace name, each value holding that namespace's `entityTypes`, `actions`
+/// and `commonTypes`. The unnamed (empty) namespace is the key `""`, and is
+/// reported as such — `Namespace`'s pattern is `^.*$`, which permits it.
+pub fn parse_schema(text: &str) -> Result<ParsedSchema, String> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("the schema is not valid JSON: {e}"))?;
+    let namespaces: Vec<String> = value
+        .as_object()
+        .map(|members| members.keys().cloned().collect())
+        .unwrap_or_default();
+    let schema = cedar_policy::Schema::from_json_value(value)
+        .map_err(|e| format!("the schema is not a valid Cedar schema: {e}"))?;
+    Ok(ParsedSchema { schema, namespaces })
+}
+
+/// Validate one static policy's Cedar text against a policy store's schema, as
+/// Cedar's own STRICT validation mode does: every entity type, action and
+/// attribute the policy names must be declared by the schema and used at the type
+/// the schema gives it.
+///
+/// `schema_json` is the text the store holds (already accepted by
+/// [`parse_schema`]); `Err` carries the validator's diagnostics, for a
+/// `ValidationException`.
+pub fn validate_static_policy(schema_json: &str, statement: &str) -> Result<(), String> {
+    let parsed = parse_schema(schema_json)?;
+    if statement.len() > MAX_STATEMENT_BYTES {
+        return Err(format!(
+            "definition.static.statement is {} bytes, more than the {MAX_STATEMENT_BYTES} \
+             bytes a policy may carry",
+            statement.len()
+        ));
+    }
+    let policy = cedar_policy::Policy::parse(None, statement)
+        .map_err(|e| format!("the policy statement is not valid Cedar: {e}"))?;
+    let mut set = cedar_policy::PolicySet::new();
+    set.add(policy)
+        .map_err(|e| format!("the policy statement could not be loaded: {e}"))?;
+
+    let result = cedar_policy::Validator::new(parsed.schema)
+        .validate(&set, cedar_policy::ValidationMode::Strict);
+    if result.validation_passed() {
+        return Ok(());
+    }
+    let mut diagnostics: Vec<String> = result
+        .validation_errors()
+        .take(MAX_REPORTED_EVALUATION_ERRORS)
+        .map(ToString::to_string)
+        .collect();
+    if diagnostics.is_empty() {
+        // Defensive: `validation_passed()` is false only when there is at least
+        // one error, but a caller must still get a reason rather than an empty
+        // message.
+        diagnostics.push("the policy does not validate against the schema".to_string());
+    }
+    Err(format!(
+        "the policy does not validate against the schema in this policy store: {}",
+        diagnostics.join("; ")
+    ))
+}
+
 /// A Cedar `Type::"id"` as the API's `entityType`/`entityId` pair.
 ///
 /// `EntityId::as_ref` gives the id's RAW contents. `escaped()` would give it
@@ -169,6 +261,13 @@ pub struct Verdict {
 /// parse is reported as an evaluation error rather than silently skipped, so a
 /// store holding one is never reported as a clean deny.
 ///
+/// `schema_json` is the store's schema, when it holds one. A schema is what gives
+/// the request's entity types, action and context their types, so when one is
+/// present the entity store and the request are parsed AGAINST it: an entity or a
+/// context attribute that does not type-check is refused rather than evaluated,
+/// which is the only way a `context` whose attribute has the wrong type can be
+/// told apart from a deny.
+///
 /// The per-request step budget is enforced here, at the point of work: the total
 /// Cedar text this call parses is capped at
 /// [`crate::state::MAX_POLICY_BYTES_PER_STORE`], and the policy count at
@@ -180,6 +279,7 @@ pub fn authorize(
     resource: &ScopeEntity,
     context: serde_json::Value,
     entities: serde_json::Value,
+    schema_json: Option<&str>,
 ) -> Result<Verdict, String> {
     let mut set = cedar_policy::PolicySet::new();
     let mut errors: Vec<String> = Vec::new();
@@ -221,14 +321,24 @@ pub fn authorize(
     let action_uid = entity_uid(action, "action")?;
     let resource_uid = entity_uid(resource, "resource")?;
 
+    let schema = match schema_json {
+        Some(text) => Some(parse_schema(text)?.schema),
+        None => None,
+    };
+
     let context = cedar_policy::Context::from_json_value(context, None)
         .map_err(|e| format!("context is not a valid Cedar context: {e}"))?;
-    let entities = cedar_policy::Entities::from_json_value(entities, None)
+    let entities = cedar_policy::Entities::from_json_value(entities, schema.as_ref())
         .map_err(|e| format!("entities are not a valid Cedar entity store: {e}"))?;
 
-    let request =
-        cedar_policy::Request::new(principal_uid, action_uid, resource_uid, context, None)
-            .map_err(|e| format!("the authorization request is not valid: {e}"))?;
+    let request = cedar_policy::Request::new(
+        principal_uid,
+        action_uid,
+        resource_uid,
+        context,
+        schema.as_ref(),
+    )
+    .map_err(|e| format!("the authorization request is not valid: {e}"))?;
 
     let response = cedar_policy::Authorizer::new().is_authorized(&request, &set, &entities);
 
