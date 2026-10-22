@@ -2,27 +2,22 @@
 
 //! How `uxc` refuses an input it will not act on, end to end over the wire.
 //!
-//! Two rules, each asserted over a table spanning its class (the shared harness
-//! is `crate::wire`):
+//! One rule, asserted over a table spanning its class (the shared harness is
+//! `crate::wire`): a request BODY that breaks a modelled shape constraint — a
+//! value outside an enum, a string outside its `@pattern` or `@length`, a list
+//! longer than its `@length` — is refused at the front door with HTTP 400 and the
+//! error code `BadRequestException`, and nothing is written. A constraint on a
+//! value bound to the request URI (`ListServices`' `@httpQuery` `maxResults` /
+//! `nextToken`) is NOT a body rejection and keeps the modelled
+//! `ValidationException`.
 //!
-//! 1. A request BODY that breaks a modelled shape constraint — a value outside
-//!    an enum, a string outside its `@pattern` or `@length`, a list longer than
-//!    its `@length` — is refused at the front door with HTTP 400 and the error
-//!    code `BadRequestException`, and nothing is written. A constraint on a value
-//!    bound to the request URI (`ListServices`' `@httpQuery` `maxResults` /
-//!    `nextToken`) is NOT a body rejection and keeps the modelled
-//!    `ValidationException`.
-//! 2. A `visibleServices` identifier that satisfies every shape constraint but
-//!    names no service in the catalog `ListServices` pages over is refused by the
-//!    handler with HTTP 400 and the modelled `ValidationException`, without
-//!    mutating the stored record — the model documents that catalog as the source
-//!    of valid identifiers ("For valid service identifiers, call ListServices",
-//!    `smithy_query(query="doc", shape="UpdateAccountCustomizationsInput",
-//!    member="visibleServices")`).
+//! The modelled constraints are the WHOLE admission rule for these inputs: the
+//! complement of this rule — that a value they admit is accepted, whatever a
+//! catalog happens to hold — is `visible_services_round_trip`'s.
 
 use crate::wire::{
-    build_router, call, encode_query_value, generated_region, generated_service_id,
-    get_customizations, update_customizations, whole_catalog,
+    build_router, call, encode_query_value, get_customizations, legal_region,
+    update_customizations,
 };
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -40,7 +35,7 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// A record to prime state with before a refused request, so "nothing was
 /// written" is an observable claim rather than the absence of one. Its members
-/// are catalog identifiers and legal Region codes.
+/// are identifiers and Region codes legal under their modelled constraints.
 fn primed_record() -> Value {
     json!({
         "accountColor": "red",
@@ -69,7 +64,7 @@ fn message(body: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 1: a body that breaks a modelled shape constraint
+// A body that breaks a modelled shape constraint
 // ---------------------------------------------------------------------------
 
 /// Every class of shape violation reachable in this operation's body is refused
@@ -90,7 +85,7 @@ async fn a_body_breaking_a_modelled_constraint_is_refused_as_bad_request() {
     let over_long_services: Vec<String> = (0..501)
         .map(|n| if n % 2 == 0 { "s3".to_string() } else { "ec2".to_string() })
         .collect();
-    let over_long_regions: Vec<String> = (0..101).map(generated_region).collect();
+    let over_long_regions: Vec<String> = (0..101).map(legal_region).collect();
 
     let cases: Vec<(&str, Value)> = vec![
         // accountColor outside the modelled value set.
@@ -178,9 +173,9 @@ async fn a_body_breaking_a_modelled_constraint_is_refused_as_bad_request() {
 /// service identifier, one of exactly 64 characters, and the shortest legal
 /// Region code.
 ///
-/// The 64-character identifier is legal by shape but names no catalog service, so
-/// it is refused by rule 2 instead — with the modelled `ValidationException`,
-/// which is exactly the boundary between the two rules.
+/// An identifier inside `Service`'s `@length(1, 64)` and `@pattern` is accepted
+/// and read back whatever else it resembles: the modelled constraints are the
+/// whole admission rule for this member.
 #[tokio::test]
 async fn values_at_a_modelled_bound_pass_the_body_check() {
     // The ten values of `AccountColor`
@@ -205,24 +200,22 @@ async fn values_at_a_modelled_bound_pass_the_body_check() {
     }
 
     // A one-character and a 64-character identifier are both inside
-    // `Service`'s `@length(1, 64)`, so the BODY check passes them; neither names
-    // a catalog service, so the handler refuses them as a modelled
-    // `ValidationException` rather than as a malformed body.
+    // `Service`'s `@length(1, 64)`, so both are accepted and read back.
     let at_length_bound = ["a".to_string(), "a".repeat(64)];
     for service in at_length_bound {
         let router = build_router();
         let (status, error_type, body) =
             update_customizations(&router, json!({"visibleServices": [service.clone()]})).await;
         assert_eq!(
-            status, 400,
-            "case {:?}: a non-catalog identifier must be refused, got {status} ({body})",
+            status, 200,
+            "case {} chars: an identifier inside @length(1, 64) must be accepted, got {status} ({body}) [{error_type}]",
             service.len()
         );
         assert_eq!(
-            error_type, VALIDATION_EXCEPTION,
-            "case {:?}: an identifier inside @length must pass the body check and be refused as {VALIDATION_EXCEPTION}, got {error_type:?} (message {:?})",
-            service.len(),
-            message(&body)
+            body.get("visibleServices"),
+            Some(&json!([service.clone()])),
+            "case {} chars: the accepted identifier must be read back, got {body:?}",
+            service.len()
         );
     }
 
@@ -240,8 +233,9 @@ async fn values_at_a_modelled_bound_pass_the_body_check() {
     );
 }
 
-/// The contrast that makes rule 1 a rule about the BODY: a constraint broken by a
-/// value bound to the request URI keeps the modelled `ValidationException`.
+/// The contrast that makes the rule above a rule about the BODY: a constraint
+/// broken by a value bound to the request URI keeps the modelled
+/// `ValidationException`.
 ///
 /// `ListServices` binds both of its inputs with `@httpQuery`
 /// (`smithy_query(query="operation", operation="ListServices")`), so no refusal
@@ -279,180 +273,12 @@ async fn a_uri_bound_value_outside_its_constraint_keeps_the_modelled_code() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 2: visibleServices must name services the catalog holds
+// Resetting a list setting
 // ---------------------------------------------------------------------------
 
-/// An identifier that satisfies every shape constraint but names no service in
-/// the catalog is refused with 400 `ValidationException`, the stored list is
-/// untouched, and a catalog identifier still succeeds afterwards.
-///
-/// The rows differ along the form of the bogus identifier (short, long, hyphenated,
-/// a catalog entry with a suffix, a catalog entry's prefix, a generated one), its
-/// position in the list, and how many of the list's members are bogus.
-#[tokio::test]
-async fn a_service_identifier_outside_the_catalog_is_refused() {
-    let router = build_router();
-    let catalog = whole_catalog(&router).await;
-    for bogus in [
-        "totally-made-up-service-xyz",
-        "glacier",
-        "ec2x",
-        "s3-glacier",
-        "zz",
-        &generated_service_id(7),
-        &"a".repeat(64),
-    ] {
-        assert!(
-            !catalog.contains(&bogus.to_string()),
-            "case {bogus:?}: this test needs an identifier the catalog does NOT hold, but it does: {catalog:?}"
-        );
-    }
-    // A real entry the issue never cited, to pin the accept side on the catalog
-    // itself rather than on the two identifiers the recording used.
-    let real = catalog
-        .iter()
-        .find(|entry| *entry != "s3" && *entry != "ec2")
-        .expect("the catalog must hold an entry beyond the two the recording used")
-        .clone();
-
-    let cases: Vec<(&str, Value)> = vec![
-        (
-            "the recorded made-up identifier",
-            json!(["totally-made-up-service-xyz"]),
-        ),
-        ("a real AWS service the catalog omits", json!(["glacier"])),
-        ("a catalog entry with a suffix", json!(["ec2x"])),
-        ("a catalog entry with a hyphenated suffix", json!(["s3-glacier"])),
-        ("a two-letter identifier", json!(["zz"])),
-        ("a generated identifier", json!([generated_service_id(7)])),
-        ("a 64-character identifier", json!(["a".repeat(64)])),
-        (
-            "one bogus identifier after two catalog entries",
-            json!(["s3", "ec2", "totally-made-up-service-xyz"]),
-        ),
-        (
-            "one bogus identifier before a catalog entry",
-            json!(["totally-made-up-service-xyz", "s3"]),
-        ),
-        (
-            "two bogus identifiers among catalog entries",
-            json!(["s3", "nope-one", "ec2", "nope-two"]),
-        ),
-    ];
-
-    for (case, services) in cases {
-        let router = build_router();
-        let primed = prime(&router).await;
-
-        let (status, error_type, body) =
-            update_customizations(&router, json!({"visibleServices": services.clone()})).await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected HTTP 400, got {status} ({body})"
-        );
-        assert_eq!(
-            error_type, VALIDATION_EXCEPTION,
-            "case {case:?}: expected error code {VALIDATION_EXCEPTION}, got {error_type:?} (message {:?})",
-            message(&body)
-        );
-        // The refusal names the offending members, by their 1-based position in
-        // the request, the way the service's own refusals spell a member path.
-        let field_list = body
-            .get("fieldList")
-            .and_then(Value::as_array)
-            .unwrap_or_else(|| panic!("case {case:?}: no fieldList in {body}"));
-        let expected: Vec<String> = services
-            .as_array()
-            .expect("the case's services are an array")
-            .iter()
-            .enumerate()
-            .filter(|(_, service)| {
-                !catalog.contains(&service.as_str().unwrap_or_default().to_string())
-            })
-            .map(|(index, _)| format!("visibleServices.{}.member", index + 1))
-            .collect();
-        let reported: Vec<String> = field_list
-            .iter()
-            .map(|field| {
-                field
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(
-            reported, expected,
-            "case {case:?}: the refusal must name every offending position, got {reported:?}"
-        );
-
-        // Nothing was written: the whole request is refused, including the
-        // catalog identifiers it also carried.
-        let (_, _, fetched) = get_customizations(&router).await;
-        assert_eq!(
-            fetched, primed,
-            "case {case:?}: a refused update must leave the record untouched, got {fetched:?}"
-        );
-
-        // And a catalog identifier still succeeds afterwards.
-        let (status, _, recovered) =
-            update_customizations(&router, json!({"visibleServices": [real.clone()]})).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: a catalog identifier must still be accepted, got {status} ({recovered})"
-        );
-        assert_eq!(
-            recovered.get("visibleServices"),
-            Some(&json!([real.clone()])),
-            "case {case:?}: the accepted identifier must be stored, got {recovered:?}"
-        );
-    }
-}
-
-/// The check is wired to the catalog `ListServices` serves, not to a list of its
-/// own: every identifier that catalog reports is accepted, and an identifier
-/// derived from it by appending one legal character is not.
-#[tokio::test]
-async fn the_membership_check_follows_the_listservices_catalog() {
-    let router = build_router();
-    let catalog = whole_catalog(&router).await;
-    assert!(
-        !catalog.is_empty(),
-        "the catalog must hold entries for this test to say anything"
-    );
-
-    // Accept: the whole catalog in one request, in the order it was reported.
-    let (status, _, body) =
-        update_customizations(&router, json!({"visibleServices": catalog.clone()})).await;
-    assert_eq!(
-        status, 200,
-        "the whole catalog must be accepted, got {status} ({body})"
-    );
-
-    // Refuse: each entry with a trailing `0`, which keeps it inside the member
-    // `@pattern` and `@length` while taking it out of the catalog.
-    for entry in &catalog {
-        let near_miss = format!("{entry}0");
-        if catalog.contains(&near_miss) {
-            continue;
-        }
-        let router = build_router();
-        let (status, error_type, body) =
-            update_customizations(&router, json!({"visibleServices": [near_miss.clone()]})).await;
-        assert_eq!(
-            status, 400,
-            "case {near_miss:?}: a near-miss identifier must be refused, got {status} ({body})"
-        );
-        assert_eq!(
-            error_type, VALIDATION_EXCEPTION,
-            "case {near_miss:?}: expected {VALIDATION_EXCEPTION}, got {error_type:?} (message {:?})",
-            message(&body)
-        );
-    }
-}
-
-/// Resetting `visibleServices` is not a membership question: an empty list and an
-/// omitted member both go through, because neither names an identifier.
+/// Resetting `visibleServices` is refused by nothing: an empty list and an
+/// omitted member both go through, and an empty list is a configured, empty
+/// setting rather than an unconfigured one.
 #[tokio::test]
 async fn resetting_the_service_list_is_not_refused() {
     let router = build_router();
