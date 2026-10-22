@@ -201,12 +201,12 @@ async fn a_granted_permission_is_listed_back_as_it_was_granted() {
         );
         assert_eq!(
             permission["Actions"],
-            json!(actions),
-            "case {case:?}: expected the actions the grant was made with, got {permission:?}"
+            json!(crate::policy_documents::in_reported_order(actions)),
+            "case {case:?}: expected the granted actions in reported order, got {permission:?}"
         );
         assert!(
-            permission.get("Policy").is_none(),
-            "case {case:?}: a grant made through CreatePermission names no policy, got {permission:?}"
+            permission.get("Policy").is_some(),
+            "case {case:?}: a grant reports the policy it expresses, got {permission:?}"
         );
         let created_at = permission["CreatedAt"].as_f64().unwrap_or_default();
         // The reported instant is the clock read TRUNCATED to milliseconds
@@ -331,7 +331,7 @@ async fn a_repeated_grant_is_refused_and_changes_nothing() {
             .unwrap_or_else(|| panic!("case {case:?}: no grant for {principal} in {permissions:?}"));
         assert_eq!(
             permission["Actions"],
-            json!(actions),
+            json!(crate::policy_documents::in_reported_order(actions)),
             "case {case:?}: the first grant's actions must stand, got {permission:?}"
         );
     }
@@ -628,7 +628,7 @@ async fn a_revocation_removes_exactly_the_grant_it_names() {
                 });
             assert_eq!(
                 permission["Actions"],
-                json!(actions),
+                json!(crate::policy_documents::in_reported_order(actions)),
                 "case {case:?}: {other:?} must keep its actions, got {permission:?}"
             );
         }
@@ -664,7 +664,7 @@ async fn a_revocation_removes_exactly_the_grant_it_names() {
     });
     assert_eq!(
         permission["Actions"],
-        json!(ACTIONS),
+        json!(crate::policy_documents::in_reported_order(&ACTIONS)),
         "case \"granted again\": expected the new grant's actions, got {permission:?}"
     );
 }

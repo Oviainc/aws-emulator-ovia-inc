@@ -2,6 +2,10 @@
 
 //! @op PutPolicy
 //!
+//! Attaches a resource-based policy to a private CA: the submitted document is held, as a
+//! document, on the CA record this service persists, which is what `GetPolicy` reads back
+//! ("The policy can be displayed with GetPolicy") and `DeletePolicy` removes.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -183,23 +187,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The CA a policy is attached to is the one the request names by ARN, so nothing
+        // here is read off the request's metadata.
         let _ = ctx;
         let arn = input.resource_arn;
+        // `Arn`'s modelled pattern admits any `acm-pca` ARN, and a resource-based policy
+        // of this service lives on a private CA, so an ARN that names anything else
+        // refers to no resource a policy can be attached to.
         if crate::state::parse_certificate_authority_arn(&arn).is_none() {
             return Err(PutPolicyErrorModeled::InvalidArnException(InvalidArnException {
                 message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
             })
-            .into());
-        }
-
-        // The document is judged before the CA is read: whether this is a policy at all
-        // does not depend on which CA it was addressed to.
-        if !crate::state::is_well_formed_policy(&input.policy) {
-            return Err(PutPolicyErrorModeled::InvalidPolicyException(
-                InvalidPolicyException {
-                    message: Some(crate::state::INVALID_POLICY_MESSAGE.to_string()),
-                },
-            )
             .into());
         }
 
@@ -213,19 +211,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        // The lookup also materialises the CREATING -> PENDING_CERTIFICATE change the
-        // clock already owed, so the CA this call acts on is the one it is at this
-        // instant.
+        // The CA is resolved before the document is judged: a request that names no CA is
+        // refused about the CA, whatever it carried. The lookup also materialises the
+        // CREATING -> PENDING_CERTIFICATE change the clock already owed, so the CA this
+        // call acts on is the one it is at this instant.
         let Some(record) = state.certificate_authority_mut(&arn, ::std::time::SystemTime::now())
         else {
             return Err(ca_not_found());
         };
 
-        // "The policy can be displayed with GetPolicy and removed with DeletePolicy":
-        // one policy per CA, so attaching replaces whatever was attached before. No
-        // status gate: nothing recorded says a CA refuses a policy before its certificate
-        // is imported, and `GetPolicy` reports the policy of such a CA.
-        record.resource_policy = Some(input.policy);
+        // A deleted CA is waiting to be restored or permanently deleted: what it holds is
+        // not writable in that status, which is what the modelled `InvalidStateException`
+        // answers, as it does for the CA's tag set (`TagCertificateAuthority`). There is
+        // no gate on the statuses before that: nothing recorded says a CA refuses a policy
+        // before its certificate is imported, and `GetPolicy` reports the policy of such a
+        // CA.
+        if record.is_deleted() {
+            return Err(PutPolicyErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(crate::state::DELETED_INVALID_STATE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Judged before anything is written, so a refused document leaves the policy the
+        // CA carried exactly as it was. The document has to be a policy OF THIS CA: every
+        // statement about the CA the request names.
+        if let Some(reason) = crate::state::invalid_policy_reason(&input.policy, &arn) {
+            return Err(PutPolicyErrorModeled::InvalidPolicyException(
+                InvalidPolicyException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        // "The policy can be displayed with GetPolicy and removed with DeletePolicy": one
+        // policy per CA, so attaching replaces whatever was attached before. It is held as
+        // this service holds a policy document — the submitted document with the
+        // whitespace between its tokens dropped, and everything else (member order, and
+        // every string with every character `AWSPolicy` admits) exactly as it was
+        // submitted.
+        record.resource_policy = Some(crate::state::canonical_policy_document(&input.policy));
 
         Ok(PutPolicyOutput)
     }

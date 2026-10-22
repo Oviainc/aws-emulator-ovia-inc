@@ -75,6 +75,22 @@ impl Emulator {
 
     /// Call `operation` and return the HTTP status with the parsed JSON body.
     pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.call_raw(
+            operation,
+            serde_json::to_vec(body).expect("the request body serializes"),
+        )
+        .await
+    }
+
+    /// Call `operation` with the request body EXACTLY as `body` spells it, and return the
+    /// HTTP status with the parsed JSON response.
+    ///
+    /// `call` writes the body with `serde_json`, which emits every character of a string
+    /// as itself; a client is free to spell the same string with `\uXXXX` escapes instead
+    /// (Python's `json.dumps` escapes every non-ASCII character by default, so botocore
+    /// does), and a suite that cares which spelling reaches the service builds the bytes
+    /// itself through here.
+    pub(crate) async fn call_raw(&self, operation: &str, body: Vec<u8>) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("https://acm-pca.eu-west-1.amazonaws.com/")
@@ -82,9 +98,7 @@ impl Emulator {
             .header("host", "acm-pca.eu-west-1.amazonaws.com")
             .header("x-amz-target", format!("ACMPrivateCA.{operation}"))
             .header("authorization", AUTHORIZATION)
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(body).expect("the request body serializes"),
-            ))
+            .body(bytes::Bytes::from(body))
             .expect("the request builds");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();

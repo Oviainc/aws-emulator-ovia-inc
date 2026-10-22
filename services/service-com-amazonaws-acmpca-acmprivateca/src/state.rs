@@ -171,13 +171,14 @@ pub const RESTORE_WITHOUT_RESTORATION_PERIOD_MESSAGE: &str =
      with no assigned restoration period.";
 
 /// The sentence this service answers a permission-not-found refusal with: one sentence
-/// about the permission, in the form the service's other not-found refusals take
-/// ([`CERTIFICATE_NOT_FOUND_MESSAGE`]) and naming no principal of its own.
+/// about the permission the request named, in the form the service's other not-found
+/// refusals take ([`CERTIFICATE_NOT_FOUND_MESSAGE`]) and naming no principal of its own.
 ///
-/// An EXAMPLE, not a requirement: the `ResourceNotFoundException` code and its HTTP 400
-/// are what the refusal has to be, and no rule for this sentence's wording is documented
-/// by AWS, stated by the model or derivable from the request.
-pub const PERMISSION_NOT_FOUND_MESSAGE: &str = "Could not find specified permission.";
+/// The wording is the one a recorded refusal of Amazon Web Services Private CA carries
+/// for a `DeletePermission` naming a grant the CA does not hold. The
+/// `ResourceNotFoundException` code and its HTTP 400 are what the refusal HAS to be; the
+/// sentence is an example of the wording.
+pub const PERMISSION_NOT_FOUND_MESSAGE: &str = "Could not find a Permission for specified CA.";
 
 /// What Amazon Web Services Private CA answers when the resource-based policy a request
 /// asks for is not there.
@@ -378,23 +379,385 @@ impl PermissionRecord {
         (self.principal.as_str(), self.source_account.as_str())
     }
 
-    /// The modelled `Permission` structure, read straight off this record.
+    /// The modelled `Permission` structure, read off this record.
     ///
-    /// `Policy` is left out: it reports "the name of the policy that is associated with
-    /// the permission" (`Permission$Policy`), which a grant made through
-    /// `CreatePermission` does not carry — only a resource-based policy put through
-    /// `PutPolicy` names one.
+    /// Both reported members that are not stored verbatim are DERIVED from the grant:
+    /// `Actions` in the canonical order a grant's actions are reported in
+    /// ([`reported_actions`]) and `Policy` as the access the grant itself expresses
+    /// ([`permission_policy_document`]).
     pub fn to_wire(&self, certificate_authority_arn: &str) -> Permission {
         Permission {
             certificate_authority_arn: Some(certificate_authority_arn.to_string()),
             created_at: Some(to_date_time(self.created_at)),
             principal: Some(self.principal.clone()),
             source_account: Some(self.source_account.clone()),
-            actions: Some(self.actions.clone()),
-            policy: None,
+            actions: Some(reported_actions(&self.actions)),
+            policy: Some(permission_policy_document(
+                certificate_authority_arn,
+                &self.principal,
+                &self.source_account,
+                &self.actions,
+            )),
         }
     }
 }
+
+/// The `ActionType` members a grant names, in the order a `Permission` REPORTS them:
+/// sorted, which is independent of the order `CreatePermission` received them.
+///
+/// Not the model's declaration order either (`ActionType` declares `IssueCertificate`,
+/// `GetCertificate`, `ListPermissions`, in that order): a grant made with all three in
+/// that order is reported as `GetCertificate`, `IssueCertificate`, `ListPermissions`, so
+/// what the reported order follows is the members' own ordering, not the request's and not
+/// the enum's.
+pub fn reported_actions(actions: &[String]) -> Vec<String> {
+    let mut reported = actions.to_vec();
+    reported.sort();
+    reported
+}
+
+/// The `Version` an IAM policy document of this service carries: "2012-10-17" is the
+/// current IAM policy language version, and the one the policy a grant expresses is
+/// written in.
+pub const POLICY_LANGUAGE_VERSION: &str = "2012-10-17";
+
+/// The `Sid` of the one statement the policy a grant expresses holds.
+///
+/// An EXAMPLE, not a requirement: a statement id is a label inside the document, and no
+/// rule for it is documented by AWS, stated by the model or derivable from the request.
+pub const PERMISSION_STATEMENT_SID: &str = "1";
+
+/// The IAM action name an `ActionType` member denotes: this service's action namespace
+/// (`awsService.arnNamespace`, [`ARN_SERVICE`]) and the action.
+pub fn iam_action(action: &str) -> String {
+    format!("{ARN_SERVICE}:{action}")
+}
+
+/// The policy document a grant on a private CA expresses, as `Permission$Policy` reports
+/// it: a single-statement IAM policy allowing the granted actions on the CA the grant was
+/// made on, to the principal that holds it, conditioned on the account that assigned it.
+///
+/// Everything in it comes from the grant — the CA's ARN as the statement's `Resource`,
+/// the holder as its `Principal`, the granted actions (in the order they are reported,
+/// each in this service's action namespace) as its `Action`, and the assigning account as
+/// the `aws:SourceAccount` the statement is conditioned on — so the document is a view of
+/// the grant rather than a second copy of it, and a grant that changes changes it.
+///
+/// `Principal` is written as a `Service` principal: `CreatePermission` grants to "the
+/// Amazon Web Services service or entity that holds the permission"
+/// (`Permission$Principal`).
+///
+/// The JSON is written member by member in the order an IAM policy document is published
+/// in, so the document reads as a policy rather than in a serializer's own key order;
+/// every value is JSON-encoded, so any text a principal or an account carries is escaped.
+pub fn permission_policy_document(
+    certificate_authority_arn: &str,
+    principal: &str,
+    source_account: &str,
+    actions: &[String],
+) -> String {
+    let json_string =
+        |value: &str| ::serde_json::Value::String(value.to_string()).to_string();
+    let action = ::serde_json::Value::Array(
+        reported_actions(actions)
+            .iter()
+            .map(|action| ::serde_json::Value::String(iam_action(action)))
+            .collect(),
+    )
+    .to_string();
+    format!(
+        "{{\"Version\":{version},\"Statement\":[{{\"Sid\":{sid},\"Effect\":\"Allow\",\
+         \"Principal\":{{\"Service\":{principal}}},\"Action\":{action},\
+         \"Resource\":{resource},\"Condition\":{{\"StringEquals\":\
+         {{\"aws:SourceAccount\":{account}}}}}}}]}}",
+        version = json_string(POLICY_LANGUAGE_VERSION),
+        sid = json_string(PERMISSION_STATEMENT_SID),
+        principal = json_string(principal),
+        resource = json_string(certificate_authority_arn),
+        account = json_string(source_account),
+    )
+}
+
+/// Why the submitted resource policy is not one this service attaches to the CA
+/// `certificate_authority_arn` names, or `None` when it is: "If this policy does not
+/// contain all required statements or if it includes any statement that is not allowed,
+/// the PutPolicy action returns an InvalidPolicyException" (`PutPolicyRequest$Policy`
+/// docs).
+///
+/// What is checked is what that sentence states and what a resource-based policy of a
+/// private CA is:
+///
+/// * the document has to BE a policy — the grammar [`is_well_formed_policy`] reads, whose
+///   refusal is the service's own [`INVALID_POLICY_MESSAGE`];
+/// * each statement has to name WHO it is about, in a `Principal` that names an identity
+///   ([`unresolvable_principal_reason`]);
+/// * each statement has to name WHAT it grants, in actions of this service
+///   ([`disallowed_action_reason`]);
+/// * each statement has to be about the CA the policy is attached TO, so every `Resource`
+///   it names is that CA's ARN ([`different_resource_message`]).
+///
+/// Nothing here rewrites the document.
+pub fn invalid_policy_reason(policy: &str, certificate_authority_arn: &str) -> Option<String> {
+    if !is_well_formed_policy(policy) {
+        return Some(INVALID_POLICY_MESSAGE.to_string());
+    }
+    // `is_well_formed_policy` read the document as JSON, so it parses, and it is an object
+    // carrying statements.
+    let document = ::serde_json::from_str::<::serde_json::Value>(policy).ok()?;
+    let statement = document.get("Statement")?;
+    // "Statement" holds one statement or an array of them, which is how IAM reads it.
+    let statements: Vec<&::serde_json::Value> = match statement {
+        ::serde_json::Value::Array(statements) => statements.iter().collect(),
+        other => vec![other],
+    };
+    for statement in statements {
+        let statement = statement.as_object()?;
+        if let Some(reason) = unresolvable_principal_reason(statement.get("Principal")) {
+            return Some(reason);
+        }
+        if let Some(reason) = disallowed_action_reason(statement.get("Action")) {
+            return Some(reason);
+        }
+        if let Some(reason) =
+            different_resource_reason(statement.get("Resource"), certificate_authority_arn)
+        {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// What Amazon Web Services Private CA answers when a statement of the submitted policy
+/// is about a resource other than the private CA the policy is being attached to.
+///
+/// Built from the REQUEST: the refusal names `certificate_authority_arn`, the CA the
+/// policy is being attached to and so the one resource its statements can be about.
+pub fn different_resource_message(certificate_authority_arn: &str) -> String {
+    format!(
+        "InvalidPolicy: The supplied policy contains different resource or incorrect ARN \
+         format: {certificate_authority_arn}"
+    )
+}
+
+/// Why the `Resource` of a policy statement is not the private CA the policy is attached
+/// to, or `None` when every resource it names is.
+///
+/// A resource-based policy is about the resource it hangs on: `PutPolicy` "attaches a
+/// resource-based policy to a private CA" (its docs), so a statement naming another
+/// resource — or something that is not that CA's ARN at all, a wildcard included — is not
+/// a statement this CA's policy can carry.
+fn different_resource_reason(
+    resource: Option<&::serde_json::Value>,
+    certificate_authority_arn: &str,
+) -> Option<String> {
+    let Some(resource) = resource else {
+        return Some(
+            "Each policy statement must name the Resource it is about.".to_string(),
+        );
+    };
+    let entries: Vec<&::serde_json::Value> = match resource {
+        ::serde_json::Value::Array(values) => values.iter().collect(),
+        other => vec![other],
+    };
+    if entries.is_empty() {
+        return Some("Each policy statement must name the Resource it is about.".to_string());
+    }
+    for entry in entries {
+        if entry.as_str() != Some(certificate_authority_arn) {
+            return Some(different_resource_message(certificate_authority_arn));
+        }
+    }
+    None
+}
+
+/// The policy document as this service HOLDS and displays one: the submitted document
+/// with the whitespace between its tokens dropped.
+///
+/// A policy is attached as a document and reported as a document, and the documents this
+/// service reports are compact — the policy a grant expresses
+/// ([`permission_policy_document`]) is reported with no whitespace between its tokens — so
+/// a policy attached pretty-printed is displayed in that same compact form. Everything
+/// else survives untouched: the member order the caller wrote, every string exactly as it
+/// was written (escapes and all), and so every character `AWSPolicy` admits.
+pub fn canonical_policy_document(policy: &str) -> String {
+    let mut compact = String::with_capacity(policy.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for character in policy.chars() {
+        if in_string {
+            compact.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => {
+                in_string = true;
+                compact.push(character);
+            }
+            // Whitespace between JSON tokens carries nothing.
+            ' ' | '\t' | '\n' | '\r' => {}
+            other => compact.push(other),
+        }
+    }
+    compact
+}
+
+/// Why the `Action` of a policy statement is not one a private CA's resource policy can
+/// grant, or `None` when every action it names is.
+///
+/// A statement that grants no action is not a grant at all, and a policy attached to a
+/// private CA grants access ON that CA — `PutPolicy` "attaches a resource-based policy to
+/// a private CA" (its docs) — so every action it names belongs to this service's action
+/// namespace (`awsService.arnNamespace`, [`ARN_SERVICE`]). An action of another service is
+/// "a statement that is not allowed" (`PutPolicyRequest$Policy` docs).
+fn disallowed_action_reason(action: Option<&::serde_json::Value>) -> Option<String> {
+    let not_allowed = |named: &str| {
+        Some(format!(
+            "The policy includes a statement that is not allowed: {named} is not an action \
+             a resource policy on a private CA can grant."
+        ))
+    };
+    let Some(action) = action else {
+        return Some("Each policy statement must name the Action it grants.".to_string());
+    };
+    let entries: Vec<&::serde_json::Value> = match action {
+        ::serde_json::Value::Array(values) => values.iter().collect(),
+        other => vec![other],
+    };
+    if entries.is_empty() {
+        return Some("Each policy statement must name the Action it grants.".to_string());
+    }
+    for entry in entries {
+        let Some(named) = entry.as_str() else {
+            return not_allowed("a non-string action");
+        };
+        if named
+            .strip_prefix(&format!("{ARN_SERVICE}:"))
+            .is_none_or(str::is_empty)
+        {
+            return not_allowed(named);
+        }
+    }
+    None
+}
+
+/// What Amazon Web Services Private CA answers when a statement of the submitted policy
+/// is about an identity it cannot resolve.
+///
+/// The RULE is that the service resolves the identity a resource policy is about rather
+/// than taking the text on trust; the sentence is the one the recorded refusal carries
+/// (`issues/.../20261022T143159Z-acm-pca-putpolicy-stub.md` records
+/// `InvalidPolicyException` / "InvalidPolicy: Principal not found." for a policy naming
+/// an identity that is not there) and is an EXAMPLE of the wording, not a requirement.
+pub const POLICY_PRINCIPAL_NOT_FOUND_MESSAGE: &str = "InvalidPolicy: Principal not found.";
+
+/// Why the `Principal` of a policy statement names no identity this service can resolve,
+/// or `None` when it does.
+///
+/// A resource policy says who may do what, so a statement with no `Principal` is about
+/// nobody, and one naming an identity that is not there is about nobody either: Amazon
+/// Web Services Private CA resolves it and refuses the whole policy when it cannot
+/// ([`POLICY_PRINCIPAL_NOT_FOUND_MESSAGE`]).
+///
+/// What resolves: `*` (every identity), an Amazon Web Services service principal, an
+/// account id, and an ARN that names an identity (an IAM or Organizations ARN). Text that
+/// is none of those names nobody, which is what the refusal says.
+fn unresolvable_principal_reason(principal: Option<&::serde_json::Value>) -> Option<String> {
+    let not_found = || Some(POLICY_PRINCIPAL_NOT_FOUND_MESSAGE.to_string());
+    let Some(principal) = principal else {
+        return not_found();
+    };
+    match principal {
+        // `"Principal": "*"` is every identity, and `"Principal": "<identity>"` is the
+        // shorthand for an Amazon Web Services identity.
+        ::serde_json::Value::String(identity) => {
+            if aws_identity_resolves(identity) {
+                None
+            } else {
+                not_found()
+            }
+        }
+        ::serde_json::Value::Object(members) => {
+            if members.is_empty() {
+                return not_found();
+            }
+            for (kind, value) in members {
+                let entries: Vec<&::serde_json::Value> = match value {
+                    ::serde_json::Value::Array(values) => values.iter().collect(),
+                    other => vec![other],
+                };
+                if entries.is_empty() {
+                    return not_found();
+                }
+                for entry in entries {
+                    let Some(entry) = entry.as_str() else {
+                        return not_found();
+                    };
+                    let resolves = match kind.as_str() {
+                        "AWS" => aws_identity_resolves(entry),
+                        "Service" => is_service_principal(entry),
+                        // `Federated` and `CanonicalUser` name identities outside this
+                        // emulator, which therefore resolve to nothing here.
+                        _ => false,
+                    };
+                    if !resolves {
+                        return not_found();
+                    }
+                }
+            }
+            None
+        }
+        _ => not_found(),
+    }
+}
+
+/// Whether an `AWS` principal entry names an identity: every identity (`*`), an account
+/// id (twelve digits, `AccountId`'s own form) or an ARN that names one.
+fn aws_identity_resolves(identity: &str) -> bool {
+    if identity == "*" {
+        return true;
+    }
+    if identity.len() == 12 && identity.chars().all(|digit| digit.is_ascii_digit()) {
+        return true;
+    }
+    names_an_identity_arn(identity)
+}
+
+/// Whether `identity` is an ARN naming an identity: `arn:<partition>:iam::<account>:<id>`
+/// (an account's root, a user or a role) or an Amazon Web Services Organizations ARN,
+/// which are the identities a resource policy of a private CA grants to — "A policy grants
+/// access on a private CA to an Amazon Web Services customer account, to Amazon Web
+/// Services Organizations, or to an Amazon Web Services Organizations unit" (`PutPolicy`
+/// docs).
+fn names_an_identity_arn(identity: &str) -> bool {
+    let fields: Vec<&str> = identity.split(':').collect();
+    let [prefix, partition, service, region, account, resource] = fields.as_slice() else {
+        return false;
+    };
+    *prefix == "arn"
+        && !partition.is_empty()
+        && matches!(*service, "iam" | "organizations" | "sts")
+        // An identity namespace is global, so its region is empty.
+        && region.is_empty()
+        && !account.is_empty()
+        && !resource.is_empty()
+}
+
+/// Whether `identity` names an Amazon Web Services service principal, the form
+/// `CreatePermission` grants to as well ("the only valid principal is
+/// `acm.amazonaws.com`", `CreatePermissionRequest$Principal` docs).
+fn is_service_principal(identity: &str) -> bool {
+    identity
+        .strip_suffix(".amazonaws.com")
+        .is_some_and(|service| !service.is_empty())
+}
+
 
 /// One private certificate authority.
 #[derive(Debug, Clone)]
