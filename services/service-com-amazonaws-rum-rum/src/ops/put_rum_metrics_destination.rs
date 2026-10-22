@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRumMetricsDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRumMetricsDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRumMetricsDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates ONE extended-metrics destination of the app monitor the request
+//! names, in this service's persisted state. A destination is identified by its
+//! `Destination` plus the Evidently experiment ARN that names it
+//! ([`crate::state::MetricDestinationKey`]), so a second put under the same identity
+//! UPDATES that destination rather than adding a second one, which is what the model's
+//! `@idempotent` and "Creates or updates a destination" ask for.
+//! `ListRumMetricsDestinations` reads the same map back, and deleting the app monitor
+//! drops its destinations with it, because the map lives on the app-monitor record.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +161,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRumMetricsDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRumMetricsDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRumMetricsDestination"))
+        // Nothing in this operation's answer depends on the request's metadata: the
+        // destination it stores is built from the request's own members.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRumMetricsDestinationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `DestinationArn` is modelled `length 0..2048`, so an empty ARN can reach here;
+        // it names no experiment, so it is the same input as an absent one and must not
+        // become a second destination.
+        let destination_arn = input
+            .destination_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty());
+        let iam_role_arn = input
+            .iam_role_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty());
+
+        // The modelled constraints (the app monitor name's pattern and length, both
+        // ARNs' `arn:...` pattern, the ARN's length) are refused before this handler
+        // runs. What is left are the member pairings the model states in prose only: an
+        // Evidently destination is identified by an experiment ARN and written through an
+        // IAM role, and a CloudWatch destination carries neither.
+        if let Some(message) =
+            crate::state::metric_destination_choice_refusal(&input.destination, destination_arn)
+                .or_else(|| {
+                    crate::state::metric_destination_role_refusal(&input.destination, iam_role_arn)
+                })
+        {
+            return Err(PutRumMetricsDestinationErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // A destination belongs to one app monitor, so there is nothing to attach it to
+        // until that monitor exists.
+        let Some(monitor) = store.app_monitors.get_mut(&input.app_monitor_name) else {
+            return Err(
+                PutRumMetricsDestinationErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.app_monitor_name),
+                )
+                .into(),
+            );
+        };
+
+        let record = crate::state::MetricDestinationRecord {
+            destination: input.destination.clone(),
+            destination_arn: destination_arn.map(str::to_string),
+            iam_role_arn: iam_role_arn.map(str::to_string),
+        };
+        let key = record.key();
+        // Only a put that ADDS a destination can cross the emulator's per-monitor bound;
+        // one that updates a destination already stored leaves the entry count alone.
+        if !monitor.metric_destinations.contains_key(&key)
+            && monitor.metric_destinations.len()
+                >= crate::state::MAX_METRIC_DESTINATIONS_PER_APP_MONITOR
+        {
+            return Err(PutRumMetricsDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "App monitor {} already has the maximum number of extended metrics \
+                         destinations ({}).",
+                        input.app_monitor_name,
+                        crate::state::MAX_METRIC_DESTINATIONS_PER_APP_MONITOR
+                    ),
+                },
+            )
+            .into());
+        }
+        // Create-or-update under the one identity: re-putting the same destination
+        // replaces the role it is written through and adds no second entry, so the call
+        // is idempotent as the model declares it.
+        monitor.metric_destinations.insert(key, record);
+
+        // The modelled response carries no members: what the call did is observable
+        // through `ListRumMetricsDestinations`, which reads the map this write changed.
+        Ok(PutRumMetricsDestinationOutput {})
     }
 }
+

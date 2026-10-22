@@ -273,6 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             // No telemetry has arrived for a monitor this call just created.
             events: ::std::collections::VecDeque::new(),
+            // A monitor sends extended metrics nowhere until a
+            // `PutRumMetricsDestination` call names a destination.
+            metric_destinations: ::std::collections::BTreeMap::new(),
             // A monitor is created with no resource policy: `PutResourcePolicy` is the
             // only call that attaches one.
             resource_policy: None,

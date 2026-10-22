@@ -209,23 +209,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 const MAX_PAGE_SIZE: usize = 100;
 
 /// The marker every token this operation issues carries, so a token the service did not
-/// issue is recognisable rather than being read as some other resume point. Without it
-/// any hex-decodable string would be accepted as a continuation.
+/// issue — or one another list issued — is recognisable rather than being read as some
+/// other resume point. The codec itself is shared: [`crate::state::encode_pagination_token`].
 const TOKEN_MARKER: &str = "ListAppMonitors/1/";
 
 /// An opaque continuation token for the last app monitor of a page.
-///
-/// Hex keeps the token printable and opaque to a client — `NextToken` is an unconstrained
-/// `String`, so a client must pass back what it was handed rather than construct one —
-/// while staying decodable by the next call.
 fn encode_next_token(last_returned_name: &str) -> String {
-    hex::encode(format!("{TOKEN_MARKER}{last_returned_name}"))
+    crate::state::encode_pagination_token(TOKEN_MARKER, &[last_returned_name])
 }
 
 /// The app-monitor name a token issued by [`encode_next_token`] resumes after, or `None`
 /// for any value this operation never issued.
 fn decode_next_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    let resume_after = decoded.strip_prefix(TOKEN_MARKER)?;
-    (!resume_after.is_empty()).then(|| resume_after.to_string())
+    crate::state::decode_pagination_token(TOKEN_MARKER, token, 1)?
+        .into_iter()
+        .next()
 }
