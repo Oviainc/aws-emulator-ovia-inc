@@ -902,7 +902,6 @@ async fn out_of_scope_operations_still_answer_501() {
     // never an empty 200 that a client cannot tell from a real implementation.
     for (method, uri) in [
         ("DELETE", "/schedule-groups/default"),
-        ("GET", "/schedule-groups"),
     ] {
         let (status, body) = call(&router, method, uri, None).await;
         assert_eq!(

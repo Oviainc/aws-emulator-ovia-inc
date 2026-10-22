@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
             // A group AWS creates is returned ACTIVE; only DeleteScheduleGroup
             // moves it to DELETING, so no clock-owed transition starts here.
-            state: "ACTIVE".to_string(),
+            state: crate::state::SCHEDULE_GROUP_STATE_ACTIVE.to_string(),
             creation_date: now,
             last_modification_date: now,
             tags: Vec::new(),

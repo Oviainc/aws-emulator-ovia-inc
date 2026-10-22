@@ -57,6 +57,13 @@ pub const MAX_SCHEDULES: usize = 1_000_000;
 /// `MaxResults` means one call can never serialize more than this many records.
 pub const MAX_LIST_SCHEDULES_PAGE: usize = 100;
 
+/// Largest page `ListScheduleGroups` returns, and the page size it uses when
+/// the request names none.
+///
+/// `ListScheduleGroupsInput$MaxResults` is modelled `range 1..100`, exactly as
+/// `ListSchedulesInput$MaxResults` is, so the same bound holds.
+pub const MAX_LIST_SCHEDULE_GROUPS_PAGE: usize = MAX_LIST_SCHEDULES_PAGE;
+
 /// The tag-key prefix AWS keeps for itself.
 ///
 /// "You cannot edit or delete tag keys or values with this prefix. Tags with
@@ -252,6 +259,25 @@ impl ComAmazonawsSchedulerAwschronosserviceState {
         None
     }
 
+    /// Every schedule group this account holds, in `ScheduleGroupName` order:
+    /// the stored rows plus the implicit `default` group in its sorted place,
+    /// as the one record [`Self::group_record`] would hand a reader.
+    ///
+    /// One total order over the whole set is what lets a page token be a
+    /// POSITION in it rather than an index into a list that may have changed
+    /// between calls.
+    pub fn groups_in_name_order(&self, region: &str) -> Vec<ScheduleGroupRecord> {
+        let mut all: Vec<ScheduleGroupRecord> = self.groups.values().cloned().collect();
+        // The built-in group is listed from its stored row once one exists — a
+        // write such as tagging it materialises one — and synthesised otherwise,
+        // so it appears exactly once either way.
+        if !self.groups.contains_key(DEFAULT_SCHEDULE_GROUP) {
+            all.extend(self.group_record(region, DEFAULT_SCHEDULE_GROUP));
+        }
+        all.sort_by(|left, right| left.name.cmp(&right.name));
+        all
+    }
+
     /// The name of the schedule group `arn` identifies in this account and
     /// Region, or `None` when no group there answers to that ARN.
     ///
@@ -388,4 +414,22 @@ pub fn decode_page_token(token: &str) -> Option<(String, String)> {
     let group = value.get("g")?.as_str()?.to_string();
     let name = value.get("n")?.as_str()?.to_string();
     Some((group, name))
+}
+
+/// Encode a `ListScheduleGroups` page token for the last group name returned.
+///
+/// Same encoding as [`encode_page_token`] — hex, so it survives the `NextToken`
+/// query parameter unescaped — under its own payload key, so a token minted for
+/// one listing never decodes as a position in the other.
+pub fn encode_group_page_token(name: &str) -> String {
+    let payload = ::serde_json::json!({ "sg": name });
+    ::hex::encode(payload.to_string())
+}
+
+/// Decode a `ListScheduleGroups` page token. `None` when it is not one this
+/// service minted, which the caller turns into a `ValidationException`.
+pub fn decode_group_page_token(token: &str) -> Option<String> {
+    let bytes = ::hex::decode(token).ok()?;
+    let value: ::serde_json::Value = ::serde_json::from_slice(&bytes).ok()?;
+    Some(value.get("sg")?.as_str()?.to_string())
 }
