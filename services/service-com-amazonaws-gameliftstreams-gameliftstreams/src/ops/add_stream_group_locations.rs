@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddStreamGroupLocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddStreamGroupLocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddStreamGroupLocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds locations to a stored stream group and PERSISTS them: each location this
+//! call configures joins the group's set in `ACTIVATING`, the group reports
+//! `UPDATING_LOCATIONS` until the clock has provisioned them, and every associated
+//! application starts replicating its content to each new location.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddStreamGroupLocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddStreamGroupLocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddStreamGroupLocations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddStreamGroupLocationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the gameliftstreams emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize(now);
+
+        let Some(group) = state.stream_group_mut(&input.identifier) else {
+            return Err(AddStreamGroupLocationsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no stream group matches identifier {}", input.identifier),
+                },
+            )
+            .into());
+        };
+
+        // "To add a location, the stream group must be in ACTIVE status." A group
+        // that is still activating, already updating its locations, being deleted
+        // or expired cannot take on another location; this operation models no
+        // `ConflictException`, so the refusal is the modelled `ValidationException`.
+        if group.status != crate::state::STREAM_GROUP_ACTIVE {
+            return Err(AddStreamGroupLocationsErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "stream group {} is in {} status; a location can only be added to a \
+                         stream group in ACTIVE status",
+                        group.id, group.status
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A `LocationConfiguration` whose capacities this service cannot store is
+        // refused before any of it reaches state, and so is one naming a location
+        // the group already holds, or naming the same location twice: adding is not
+        // how an existing location's capacity changes ("To update the capacity for
+        // an existing stream group, call UpdateStreamGroup"), and one location
+        // cannot hold two capacity configurations at once.
+        let mut configured: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+        for configuration in &input.location_configurations {
+            if let Some(message) = crate::state::unstorable_location_configuration(configuration) {
+                return Err(AddStreamGroupLocationsErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into());
+            }
+            if group.has_location(&configuration.location_name) {
+                return Err(AddStreamGroupLocationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "stream group {} already holds location {}; use UpdateStreamGroup to \
+                             change the capacity of a location it holds",
+                            group.id, configuration.location_name
+                        ),
+                    },
+                )
+                .into());
+            }
+            if !configured.insert(configuration.location_name.as_str()) {
+                return Err(AddStreamGroupLocationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "LocationConfigurations configures location {} more than once",
+                            configuration.location_name
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The emulator's own bound on one group's location set, refused with the
+        // error the model already declares for a quota.
+        if group.locations.len() + input.location_configurations.len()
+            > crate::state::LOCATIONS_PER_STREAM_GROUP
+        {
+            return Err(
+                AddStreamGroupLocationsErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "stream group {} holds {} of the maximum of {} locations; \
+                             adding {} more would exceed it",
+                            group.id,
+                            group.locations.len(),
+                            crate::state::LOCATIONS_PER_STREAM_GROUP,
+                            input.location_configurations.len()
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let added: Vec<String> = input
+            .location_configurations
+            .iter()
+            .map(|configuration| configuration.location_name.clone())
+            .collect();
+        for configuration in input.location_configurations {
+            group
+                .locations
+                .push(crate::state::LocationSlot::activating(configuration, now));
+        }
+        // "ACTIVATING: Amazon GameLift Streams is preparing the location", so the
+        // group itself is "UPDATING_LOCATIONS: One or more locations in the stream
+        // group are in the process of updating" until the clock has provisioned
+        // the capacity those locations asked for. The group keeps serving while it
+        // is: a stream session still starts in any location already provisioned
+        // (`StreamGroup::can_host_sessions`).
+        group.status = crate::state::STREAM_GROUP_UPDATING_LOCATIONS.to_string();
+        group.status_due_at = Some(now + crate::state::TRANSITION);
+        group.last_updated_at = now;
+        let arn = group.arn.clone();
+        let locations = group.location_states_of(&added);
+        let associated_applications = group.associated_applications.clone();
+
+        // "This operation also copies the content files of all associated
+        // applications to an internal S3 bucket at each location", which is what
+        // the applications report as their `ReplicationStatuses`.
+        for application_arn in &associated_applications {
+            let Some(application) = state.application_mut(application_arn) else {
+                continue;
+            };
+            application.last_updated_at = now;
+            for location in &added {
+                application.replications.push(crate::state::Replication {
+                    stream_group_arn: arn.clone(),
+                    location: location.clone(),
+                    completes_at: now + crate::state::TRANSITION,
+                });
+            }
+        }
+
+        Ok(AddStreamGroupLocationsOutput {
+            // The output member resolves the group's `Arn` property
+            // (`@resourceIdentifier("Arn")`), so it answers with the stored ARN
+            // whichever form the request named the group by.
+            identifier: arn,
+            locations,
+        })
     }
 }

@@ -138,8 +138,10 @@ pub(crate) async fn ready_application(
     )
 }
 
-/// Create an `ACTIVE` stream group whose default application is `application`.
-pub(crate) async fn active_stream_group(
+/// Create a stream group with one `AlwaysOnCapacity: 1` location per entry of
+/// `locations`, and return its id and ARN. The group is still `ACTIVATING` on
+/// return: the clock owes it `ACTIVE`.
+pub(crate) async fn stream_group(
     router: &MultiServiceRouter,
     description: &str,
     application: &str,
@@ -165,11 +167,22 @@ pub(crate) async fn active_stream_group(
         status, 201,
         "case {description:?}: expected CreateStreamGroup 201, got {status} {created}"
     );
-    std::thread::sleep(PAST_TRANSITION);
     (
         text(&created, "/Id", description),
         text(&created, "/Arn", description),
     )
+}
+
+/// Create an `ACTIVE` stream group whose default application is `application`.
+pub(crate) async fn active_stream_group(
+    router: &MultiServiceRouter,
+    description: &str,
+    application: &str,
+    locations: &[&str],
+) -> (String, String) {
+    let group = stream_group(router, description, application, locations).await;
+    std::thread::sleep(PAST_TRANSITION);
+    group
 }
 
 #[tokio::test]

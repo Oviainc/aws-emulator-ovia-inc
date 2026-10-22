@@ -338,41 +338,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     None => None,
                 };
 
-                // Every capacity member of `LocationConfiguration` is modelled
-                // `@range(min: 0)`. The capacities are stored, echoed and used in
-                // this service's capacity arithmetic, so a negative one is refused
-                // here rather than carried into state.
+                // A `LocationConfiguration` whose capacities this service cannot
+                // store is refused before any of it reaches state.
                 let configurations = input.location_configurations.unwrap_or_default();
                 for configuration in &configurations {
-                    for (member, value) in [
-                        ("AlwaysOnCapacity", configuration.always_on_capacity),
-                        ("OnDemandCapacity", configuration.on_demand_capacity),
-                        ("TargetIdleCapacity", configuration.target_idle_capacity),
-                        ("MaximumCapacity", configuration.maximum_capacity),
-                    ] {
-                        if value.is_some_and(|capacity| capacity < 0) {
-                            return Err(CreateStreamGroupErrorModeled::ValidationException(
-                                ValidationException {
-                                    message: format!(
-                                        "LocationConfigurations[{}].{member} must not be \
-                                         negative, got {}",
-                                        configuration.location_name,
-                                        value.unwrap_or_default()
-                                    ),
-                                },
-                            )
-                            .into());
-                        }
+                    if let Some(message) =
+                        crate::state::unstorable_location_configuration(configuration)
+                    {
+                        return Err(CreateStreamGroupErrorModeled::ValidationException(
+                            ValidationException { message },
+                        )
+                        .into());
                     }
                 }
                 let locations: Vec<crate::state::LocationSlot> = configurations
                     .into_iter()
-                    .map(|configuration| crate::state::LocationSlot {
-                        name: configuration.location_name,
-                        always_on_capacity: configuration.always_on_capacity,
-                        on_demand_capacity: configuration.on_demand_capacity,
-                        target_idle_capacity: configuration.target_idle_capacity,
-                        maximum_capacity: configuration.maximum_capacity,
+                    .map(|configuration| {
+                        crate::state::LocationSlot::activating(configuration, now)
                     })
                     .collect();
 

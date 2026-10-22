@@ -21,8 +21,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DefaultApplication, DisplayConfiguration, LocationState, PerformanceStatsConfiguration,
-    ReplicationStatus, RuntimeEnvironment,
+    DefaultApplication, DisplayConfiguration, LocationConfiguration, LocationState,
+    PerformanceStatsConfiguration, ReplicationStatus, RuntimeEnvironment,
 };
 
 /// This service's SigV4 signing name, and the `service` segment of its ARNs.
@@ -85,6 +85,17 @@ pub const TAGS_PER_RESOURCE: usize = 50;
 /// `StartStreamSession` does not model `ServiceQuotaExceededException`.
 pub const SESSIONS_PER_STREAM_GROUP: usize = 100;
 
+/// How many locations ONE stream group holds, after which
+/// `AddStreamGroupLocations` refuses with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// The model bounds one request's `LocationConfigurations` list at `length 1..100`
+/// (`CreateStreamGroup` and `AddStreamGroupLocations` share the shape), so a
+/// single stream group can never be configured with more than 100 locations in one
+/// call; this is that same bound applied to the group's accumulated set, which is
+/// what stops repeated adds growing one group without end.
+pub const LOCATIONS_PER_STREAM_GROUP: usize = 100;
+
 /// How long a stream session that has reached a terminal status (`ERROR`,
 /// `TERMINATED`) is kept before the clock releases it.
 ///
@@ -111,6 +122,10 @@ pub const APPLICATION_READY: &str = "READY";
 pub const APPLICATION_DELETING: &str = "DELETING";
 pub const STREAM_GROUP_ACTIVATING: &str = "ACTIVATING";
 pub const STREAM_GROUP_ACTIVE: &str = "ACTIVE";
+/// "UPDATING_LOCATIONS: One or more locations in the stream group are in the
+/// process of updating (either activating or deleting)" (`StreamGroupStatus`
+/// documentation).
+pub const STREAM_GROUP_UPDATING_LOCATIONS: &str = "UPDATING_LOCATIONS";
 pub const STREAM_GROUP_DELETING: &str = "DELETING";
 pub const STREAM_GROUP_EXPIRED: &str = "EXPIRED";
 pub const LOCATION_ACTIVATING: &str = "ACTIVATING";
@@ -240,6 +255,84 @@ pub struct LocationSlot {
     pub on_demand_capacity: Option<i32>,
     pub target_idle_capacity: Option<i32>,
     pub maximum_capacity: Option<i32>,
+    /// A `StreamGroupLocationStatus` value. Each location carries its OWN status,
+    /// because a location added to a group that is already serving is
+    /// `ACTIVATING` while the locations beside it stay `ACTIVE`.
+    pub status: String,
+    /// When the clock owes this location's next status transition, if any.
+    pub status_due_at: Option<SystemTime>,
+}
+
+impl LocationSlot {
+    /// A location as `CreateStreamGroup` or `AddStreamGroupLocations` configured
+    /// it, in `ACTIVATING`: "ACTIVATING: Amazon GameLift Streams is preparing the
+    /// location. You cannot stream from, scale the capacity of, or remove this
+    /// location yet." The clock owes its move to `ACTIVE` one [`TRANSITION`] later,
+    /// once the capacity it provisions is in place.
+    pub fn activating(configuration: LocationConfiguration, now: SystemTime) -> Self {
+        Self {
+            name: configuration.location_name,
+            always_on_capacity: configuration.always_on_capacity,
+            on_demand_capacity: configuration.on_demand_capacity,
+            target_idle_capacity: configuration.target_idle_capacity,
+            maximum_capacity: configuration.maximum_capacity,
+            status: LOCATION_ACTIVATING.to_string(),
+            status_due_at: Some(now + TRANSITION),
+        }
+    }
+
+    /// Is this location still working towards a status of its own?
+    ///
+    /// `REMOVING` counts as well as `ACTIVATING` — "REMOVING: Amazon GameLift
+    /// Streams is working to remove this location" — so a location on its way out
+    /// keeps the group in `UPDATING_LOCATIONS` too. Nothing stores `REMOVING` yet:
+    /// `RemoveStreamGroupLocations` is still a scaffold stub, and whoever
+    /// implements it owns that slot status and the transition that ends it.
+    fn is_settling(&self) -> bool {
+        matches!(self.status.as_str(), LOCATION_ACTIVATING | LOCATION_REMOVING)
+    }
+
+    /// Advance the transition the clock owed this location at `now`.
+    fn advance(&mut self, now: SystemTime) {
+        let Some(due) = self.status_due_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.status_due_at = None;
+        // "ACTIVE: The location is provisioned with initial capacity."
+        if self.status == LOCATION_ACTIVATING {
+            self.status = LOCATION_ACTIVE.to_string();
+        }
+    }
+}
+
+/// The message refusing a `LocationConfiguration` this service cannot store, or
+/// `None` when it can.
+///
+/// Every capacity member of `LocationConfiguration` is modelled `@range(min: 0)`.
+/// The capacities are stored, echoed and used in this service's capacity
+/// arithmetic, so a negative one is refused by the operation that carries it
+/// rather than carried into state. Shared by `CreateStreamGroup` and
+/// `AddStreamGroupLocations`, which configure a location through the same shape.
+pub fn unstorable_location_configuration(configuration: &LocationConfiguration) -> Option<String> {
+    for (member, value) in [
+        ("AlwaysOnCapacity", configuration.always_on_capacity),
+        ("OnDemandCapacity", configuration.on_demand_capacity),
+        ("TargetIdleCapacity", configuration.target_idle_capacity),
+        ("MaximumCapacity", configuration.maximum_capacity),
+    ] {
+        if let Some(capacity) = value {
+            if capacity < 0 {
+                return Some(format!(
+                    "LocationConfigurations[{}].{member} must not be negative, got {capacity}",
+                    configuration.location_name
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// A persisted stream group, together with the stream sessions it hosts.
@@ -273,6 +366,32 @@ impl StreamGroup {
         self.locations.iter().any(|slot| slot.name == location)
     }
 
+    /// Can this group host a stream session right now?
+    ///
+    /// "Prerequisites: You must have a stream group in ACTIVE status"
+    /// (`StartStreamSession` documentation). A group that is updating its
+    /// locations is still serving the capacity its provisioned locations hold —
+    /// `UPDATING_LOCATIONS` says "one or more locations ... are in the process of
+    /// updating", not that the group stopped streaming — so it hosts sessions too,
+    /// on the locations [`StreamGroup::can_stream_from`] admits.
+    pub fn can_host_sessions(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            STREAM_GROUP_ACTIVE | STREAM_GROUP_UPDATING_LOCATIONS
+        )
+    }
+
+    /// Does this group hold `location` in a status that can host a stream?
+    ///
+    /// Only an `ACTIVE` location can: "ACTIVATING: Amazon GameLift Streams is
+    /// preparing the location. You cannot stream from, scale the capacity of, or
+    /// remove this location yet."
+    pub fn can_stream_from(&self, location: &str) -> bool {
+        self.locations
+            .iter()
+            .any(|slot| slot.name == location && slot.status == LOCATION_ACTIVE)
+    }
+
     /// Make room for one more stream session, releasing the sessions that have
     /// reached a terminal status (oldest first) when the store is at
     /// [`SESSIONS_PER_STREAM_GROUP`].
@@ -300,53 +419,79 @@ impl StreamGroup {
         false
     }
 
-    /// `LocationStates` for this group: the requested capacity of each location
-    /// plus what is allocated to it and idle in it right now.
+    /// One location's `LocationState`: the capacity the request configured, the
+    /// location's own status, and what is allocated to it and idle in it right now.
     ///
     /// `AllocatedCapacity` is the always-on capacity the location holds once it is
     /// `ACTIVE` (always-on capacity "is allocated to you and is never released back
     /// to the service" — `CreateStreamGroup` documentation), and `IdleCapacity` is
     /// that allocation less the stream sessions the location is currently running.
+    ///
+    /// The group's own status wins where it says what every location is doing: a
+    /// `DELETING` group is releasing all of them, and an `EXPIRED` group's capacity
+    /// is gone, so its locations are not provisioned any more and cannot host a
+    /// stream.
+    pub fn location_state(&self, slot: &LocationSlot) -> LocationState {
+        let location_status = match self.status.as_str() {
+            STREAM_GROUP_DELETING => LOCATION_REMOVING,
+            STREAM_GROUP_EXPIRED => LOCATION_ERROR,
+            _ => slot.status.as_str(),
+        };
+        let requested = slot.always_on_capacity.unwrap_or(0).max(0);
+        let allocated = if location_status == LOCATION_ACTIVE {
+            requested
+        } else {
+            0
+        };
+        let running = i32::try_from(
+            self.sessions
+                .values()
+                .filter(|session| session.location == slot.name && session.is_running())
+                .count(),
+        )
+        .unwrap_or(i32::MAX);
+        LocationState {
+            location_name: Some(slot.name.clone()),
+            status: Some(location_status.to_string()),
+            always_on_capacity: slot.always_on_capacity,
+            on_demand_capacity: slot.on_demand_capacity,
+            target_idle_capacity: slot.target_idle_capacity,
+            maximum_capacity: slot.maximum_capacity,
+            requested_capacity: Some(requested),
+            allocated_capacity: Some(allocated),
+            // Saturating, not checked: the capacities come from the request,
+            // so the arithmetic must not be able to overflow whatever a
+            // caller sent.
+            idle_capacity: Some(allocated.saturating_sub(running).max(0)),
+            internal_vpc_ipv4_cidr_block: None,
+            vpc_transit_configuration: None,
+        }
+    }
+
+    /// `LocationStates` for every location this group holds, in the order the
+    /// requests that configured them named them.
     pub fn location_states(&self) -> Vec<LocationState> {
         self.locations
             .iter()
-            .map(|slot| {
-                let active = self.status == STREAM_GROUP_ACTIVE;
-                let location_status = match self.status.as_str() {
-                    STREAM_GROUP_ACTIVE => LOCATION_ACTIVE,
-                    STREAM_GROUP_DELETING => LOCATION_REMOVING,
-                    // An expired group's capacity is gone, so its locations are
-                    // not provisioned any more and cannot host a stream.
-                    STREAM_GROUP_EXPIRED => LOCATION_ERROR,
-                    _ => LOCATION_ACTIVATING,
-                };
-                let requested = slot.always_on_capacity.unwrap_or(0).max(0);
-                let allocated = if active { requested } else { 0 };
-                let running = i32::try_from(
-                    self.sessions
-                        .values()
-                        .filter(|session| session.location == slot.name && session.is_running())
-                        .count(),
-                )
-                .unwrap_or(i32::MAX);
-                LocationState {
-                    location_name: Some(slot.name.clone()),
-                    status: Some(location_status.to_string()),
-                    always_on_capacity: slot.always_on_capacity,
-                    on_demand_capacity: slot.on_demand_capacity,
-                    target_idle_capacity: slot.target_idle_capacity,
-                    maximum_capacity: slot.maximum_capacity,
-                    requested_capacity: Some(requested),
-                    allocated_capacity: Some(allocated),
-                    // Saturating, not checked: the capacities come from the request,
-                    // so the arithmetic must not be able to overflow whatever a
-                    // caller sent.
-                    idle_capacity: Some(allocated.saturating_sub(running).max(0)),
-                    internal_vpc_ipv4_cidr_block: None,
-                    vpc_transit_configuration: None,
-                }
-            })
+            .map(|slot| self.location_state(slot))
             .collect()
+    }
+
+    /// `LocationStates` for the locations `names` lists, skipping any this group
+    /// does not hold. Used by `AddStreamGroupLocations`, which reports the
+    /// locations THAT CALL configured rather than the group's whole set.
+    pub fn location_states_of(&self, names: &[String]) -> Vec<LocationState> {
+        names
+            .iter()
+            .filter_map(|name| self.locations.iter().find(|slot| &slot.name == name))
+            .map(|slot| self.location_state(slot))
+            .collect()
+    }
+
+    /// Is any location of this group still activating or being removed? While one
+    /// is, the group reports `UPDATING_LOCATIONS`.
+    pub fn has_settling_location(&self) -> bool {
+        self.locations.iter().any(LocationSlot::is_settling)
     }
 
     /// Advance this group and its sessions. Answers `true` when the group is due
@@ -360,17 +505,29 @@ impl StreamGroup {
         // rather than by every `StartStreamSession` ever served.
         self.sessions
             .retain(|_, session| !session.retention_elapsed(now));
+        for slot in &mut self.locations {
+            slot.advance(now);
+        }
         if let Some(due) = self.status_due_at {
             if now >= due {
-                self.status_due_at = None;
                 // `LastUpdatedAt` moves only when the status actually does.
                 match self.status.as_str() {
-                    STREAM_GROUP_ACTIVATING => {
-                        self.status = STREAM_GROUP_ACTIVE.to_string();
-                        self.last_updated_at = due;
+                    // A group whose locations have all settled is serving again:
+                    // "ACTIVE: The stream group is ready to host streams." While
+                    // one has not, the group is still updating its locations and
+                    // the clock still owes the move, so the due instant stands.
+                    STREAM_GROUP_ACTIVATING | STREAM_GROUP_UPDATING_LOCATIONS => {
+                        if !self.has_settling_location() {
+                            self.status_due_at = None;
+                            self.status = STREAM_GROUP_ACTIVE.to_string();
+                            self.last_updated_at = due;
+                        }
                     }
-                    STREAM_GROUP_DELETING => return true,
-                    _ => {}
+                    STREAM_GROUP_DELETING => {
+                        self.status_due_at = None;
+                        return true;
+                    }
+                    _ => self.status_due_at = None,
                 }
             }
         }
