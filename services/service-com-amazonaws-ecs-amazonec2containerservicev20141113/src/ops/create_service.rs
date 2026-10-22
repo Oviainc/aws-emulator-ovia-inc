@@ -558,6 +558,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let created_at = crate::state::now();
         let deployment_id = guard.next_deployment_id();
+        // The service revision this deployment rolls out is minted with the deployment.
+        let service_revision_arn =
+            guard.next_service_revision_arn(&region, &cluster_name, &name);
         let record = crate::state::ServiceRecord {
             arn: crate::state::service_arn(&region, &cluster_name, &name),
             name: name.clone(),
@@ -572,12 +575,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             launch_type,
             capacity_provider_strategy,
             platform_version: input.platform_version.clone(),
-            role_arn: input.role.clone(),
+            // "If your account has already created the Amazon ECS service-linked role,
+            // that role is used for your service unless you specify a role here."
+            role_arn: crate::state::service_role_arn(input.role.as_deref(), scheduler_owned),
             load_balancers: input.load_balancers.clone().unwrap_or_default(),
             service_registries: input.service_registries.clone().unwrap_or_default(),
             deployment_configuration: crate::state::deployment_configuration(
                 input.deployment_configuration.clone(),
                 daemon,
+                scheduler_owned,
             ),
             deployment_controller: controller,
             placement_constraints: input.placement_constraints.clone().unwrap_or_default(),
@@ -586,7 +592,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             service_connect_configuration: input.service_connect_configuration.clone(),
             volume_configurations: input.volume_configurations.clone().unwrap_or_default(),
             vpc_lattice_configurations: input.vpc_lattice_configurations.clone().unwrap_or_default(),
-            health_check_grace_period_seconds: input.health_check_grace_period_seconds,
+            // "If you do not specify a health check grace period value, the default
+            // value of 0 is used."
+            health_check_grace_period_seconds: Some(
+                input
+                    .health_check_grace_period_seconds
+                    .unwrap_or(crate::state::DEFAULT_HEALTH_CHECK_GRACE_PERIOD_SECONDS),
+            ),
             scheduling_strategy,
             // "If no value is specified, the tags aren't propagated. ... The default is
             // NONE."
@@ -603,11 +615,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .unwrap_or_else(|| crate::state::AZ_REBALANCING_ENABLED.to_string()),
             tags: input.tags.clone().unwrap_or_default(),
+            created_by: crate::state::caller_principal(ctx),
+            // The event stream starts empty: the scheduler has not reached a steady
+            // state yet, and nothing else has happened to write about.
+            events: Vec::new(),
             client_token: input.client_token.clone(),
             created_at,
             deployment_id,
             deployment_created_at: created_at,
             deployment_updated_at: created_at,
+            service_revision_arn,
+            // The rollout this create starts is IN_PROGRESS until the clock settles it;
+            // a controller that is not the ECS scheduler owns no rollout at all.
+            deployment_steady_due_at: if scheduler_owned {
+                Some(now + crate::state::TRANSITION_SPAN)
+            } else {
+                None
+            },
         };
         guard.services.insert(key.clone(), record);
 
