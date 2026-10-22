@@ -261,6 +261,94 @@ const DYNAMIC_CAPABLE_INPUT_TYPES: [&str; 2] = ["MP4_FILE", "TS_FILE"];
 /// string `$urlPath$` in place of the part of the path that will change").
 const DYNAMIC_URL_VARIABLE: &str = "$urlPath$";
 
+/// One PUSH-type input's ingest protocol: the URL scheme the upstream system
+/// pushes with, the port the service opens for it, and whether the
+/// destination's `StreamName` is part of the endpoint URL's path.
+#[derive(Debug, Clone, Copy)]
+struct PushIngestProtocol {
+    scheme: &'static str,
+    port: u16,
+    carries_stream_name: bool,
+}
+
+impl PushIngestProtocol {
+    /// The endpoint URL this protocol's upstream system pushes to -
+    /// `InputDestination$Url`, "the endpoint that the customer stream will be
+    /// pushed to": the scheme, the endpoint's address and the port, plus the
+    /// destination's stream name as the path for the protocol that names one.
+    fn endpoint_url(&self, ip: &str, stream_name: Option<&str>) -> String {
+        let mut url = format!("{}://{ip}:{}", self.scheme, self.port);
+        if self.carries_stream_name {
+            if let Some(stream_name) = stream_name.filter(|name| !name.is_empty()) {
+                url.push('/');
+                url.push_str(stream_name.trim_start_matches('/'));
+            }
+        }
+        url
+    }
+}
+
+/// The ingest protocol of every `InputType` the service allocates a push
+/// endpoint for, keyed by the type name.
+///
+/// Source: the `InputType` enum (`smithy_query(query="shape",
+/// shape="InputType")`) names the types; the push ports are the ones MediaLive
+/// opens for a pushed stream - RTMP's registered 1935, and 5000 for the RTP and
+/// UDP push inputs. Only RTMP's URL carries the destination's stream name,
+/// per `InputDestinationRequest$StreamName`: "A unique name for the location
+/// the RTMP stream is being pushed to."
+///
+/// Every other `InputType` is deliberately absent: the PULL and file types are
+/// not pushed to at all, and for the rest (MEDIACONNECT, MEDIACONNECT_ROUTER,
+/// INPUT_DEVICE, AWS_CDI, MULTICAST, SDI, SMPTE_2110_RECEIVER_GROUP and the two
+/// SRT types) no documented rule gives the `<scheme>://<ip>:<port>` endpoint a
+/// form, so none is invented for them.
+const PUSH_INGEST_PROTOCOLS: [(&str, PushIngestProtocol); 3] = [
+    (
+        "RTMP_PUSH",
+        PushIngestProtocol {
+            scheme: "rtmp",
+            port: 1935,
+            carries_stream_name: true,
+        },
+    ),
+    (
+        "RTP_PUSH",
+        PushIngestProtocol {
+            scheme: "rtp",
+            port: 5000,
+            carries_stream_name: false,
+        },
+    ),
+    (
+        "UDP_PUSH",
+        PushIngestProtocol {
+            scheme: "udp",
+            port: 5000,
+            carries_stream_name: false,
+        },
+    ),
+];
+
+/// The ingest protocol of `input_type`, or `None` when the service allocates no
+/// push endpoint for an input of that type.
+fn push_ingest_protocol(input_type: Option<&str>) -> Option<PushIngestProtocol> {
+    let input_type = input_type?;
+    PUSH_INGEST_PROTOCOLS
+        .iter()
+        .find(|(name, _)| *name == input_type)
+        .map(|(_, protocol)| *protocol)
+}
+
+/// Base of the pool a push input's ingest addresses come from: `198.18.0.0`,
+/// the first address of `198.18.0.0/15`, the RFC 2544 benchmarking range.
+/// Non-routable, so an emulated push endpoint never hands a caller an address
+/// that belongs to somebody.
+const INGEST_IP_POOL_BASE: u32 = u32::from_be_bytes([198, 18, 0, 0]);
+
+/// `198.18.0.0/15` holds 2^17 addresses; allocation wraps inside it.
+const INGEST_IP_POOL_LEN: u32 = 1 << 17;
+
 /// How long a resource stays in a transient state before the clock makes the next
 /// one due: a channel's `CREATING`, `STARTING`, `STOPPING`, `RECOVERING` and
 /// `DELETING`, and a signal map's `CREATE_IN_PROGRESS` discovery.
@@ -927,6 +1015,10 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     pub next_input_id: u64,
     /// `CreateInput`'s `RequestId` (`@idempotencyToken`) -> the input it created.
     input_tokens: IdempotencyTokens,
+    /// Next offset into the ingest-address pool, so no two push destinations
+    /// report the same endpoint address. PRIVATE: the only way in is
+    /// [`Self::allocate_input_ingest_addresses`], which owns the pool.
+    next_ingest_ip: u32,
     /// Every cloudwatch alarm template group that exists, keyed by its minted
     /// `Id`. A `BTreeMap` so a later `ListCloudWatchAlarmTemplateGroups` walks it
     /// in id order on every call.
@@ -1507,6 +1599,60 @@ impl ComAmazonawsMedialiveMedialiveState {
         id.to_string()
     }
 
+    /// Allocate the system-generated ingest address of every push destination
+    /// of `id` that does not hold one yet, so the input reports the endpoint an
+    /// upstream system pushes its stream to.
+    ///
+    /// Call this from the operations that WRITE an input's destinations
+    /// (`CreateInput`, `UpdateInput`): allocating an address is a write, so no
+    /// reporting operation does it.
+    ///
+    /// Top-up only, and only for an input whose type has a push ingest protocol
+    /// ([`PUSH_INGEST_PROTOCOLS`]): an address already allocated for a
+    /// destination slot stays there, which is what keeps
+    /// `InputDestination$Ip` - "the system-generated static IP address of
+    /// endpoint. It remains fixed for the lifetime of the input" - fixed across
+    /// an update that rewrites the destinations.
+    ///
+    /// Every destination slot of a push input gets one, including a slot whose
+    /// request named its own ON-PREM `StaticIpAddress` (which is what that slot
+    /// then reports): the slot keeps an endpoint of its own, so a later update
+    /// that drops the static address does not leave it without one.
+    ///
+    /// An address belongs to the destination SLOT, not to the stream name that
+    /// occupies it: an update that shrinks the list keeps the trailing addresses,
+    /// so a later update that grows it again puts the same address back on the
+    /// same ingest position rather than spending a new one.
+    pub fn allocate_input_ingest_addresses(&mut self, id: &str) {
+        let Some(input) = self.inputs.get(id) else {
+            return;
+        };
+        if push_ingest_protocol(input.input_type.as_deref()).is_none() {
+            return;
+        }
+        let allocated = input.ingest_ips.len();
+        let wanted = input.destinations.len();
+        let fresh: Vec<String> = (allocated..wanted)
+            .map(|_| self.allocate_ingest_address())
+            .collect();
+        if let Some(input) = self.inputs.get_mut(id) {
+            input.ingest_ips.extend(fresh);
+        }
+    }
+
+    /// The next address out of the ingest pool.
+    ///
+    /// The counter wraps at [`INGEST_IP_POOL_LEN`], so an address could in
+    /// principle be reissued - but only after 2^17 allocations, and the store
+    /// holds at most [`MAX_INPUTS`] inputs, each with a caller-bounded
+    /// destination list, so the wrap is the pool's last-resort bound rather than
+    /// a path a client can reach.
+    fn allocate_ingest_address(&mut self) -> String {
+        let offset = self.next_ingest_ip % INGEST_IP_POOL_LEN;
+        self.next_ingest_ip = self.next_ingest_ip.wrapping_add(1);
+        ::std::net::Ipv4Addr::from(INGEST_IP_POOL_BASE + offset).to_string()
+    }
+
     /// Record `token` as having created `input_id`, under the same bounded,
     /// evicting discipline as the channel tokens.
     pub fn record_input_idempotency_token(&mut self, token: String, input_id: &str) {
@@ -1618,7 +1764,10 @@ impl ComAmazonawsMedialiveMedialiveState {
                 input
                     .destinations
                     .iter()
-                    .map(described_input_destination)
+                    .enumerate()
+                    .map(|(index, destination)| {
+                        described_input_destination(input, index, destination)
+                    })
                     .collect(),
             ),
             id: Some(input.id.clone()),
@@ -1648,7 +1797,19 @@ impl ComAmazonawsMedialiveMedialiveState {
                 .multicast_settings
                 .as_ref()
                 .map(described_multicast_settings),
-            smpte2110_receiver_group_settings: input.smpte2110_receiver_group_settings.clone(),
+            // Reported on every Input read, with its (possibly empty) group
+            // list: the structure is how a caller tells a receiver-group input's
+            // streams apart, so an input configured with no receiver group
+            // answers with an empty list rather than an unset member.
+            smpte2110_receiver_group_settings: Some(Smpte2110ReceiverGroupSettings {
+                smpte2110_receiver_groups: Some(
+                    input
+                        .smpte2110_receiver_group_settings
+                        .as_ref()
+                        .and_then(|settings| settings.smpte2110_receiver_groups.clone())
+                        .unwrap_or_default(),
+                ),
+            }),
             sdi_sources: Some(input.sdi_sources.clone()),
             router_settings: input.router_settings.as_ref().map(described_router_settings),
         })
@@ -2444,9 +2605,13 @@ pub fn not_idle_message(resource_type: &str, identifier: &str, state: &str) -> S
 /// `InputDestinationRequest`, …), and the `Input` response shape is projected
 /// out of them by [`ComAmazonawsMedialiveMedialiveState::input_description`], so
 /// nothing a request supplied is dropped and no response is built from the
-/// request that happens to be in flight. Members the real service computes from
-/// infrastructure it owns (a push endpoint's IP, port and URL, a VPC network
-/// interface, a MediaConnect router output ARN) are NOT invented here.
+/// request that happens to be in flight. A push input's ingest endpoint is
+/// allocated into [`InputRecord::ingest_ips`] by
+/// [`ComAmazonawsMedialiveMedialiveState::allocate_input_ingest_addresses`] when
+/// its destinations are written, so the endpoint a response reports comes out of
+/// the store too. Members the real service computes from infrastructure it owns
+/// that this emulator does not provision (a VPC network interface, a
+/// MediaConnect router output ARN) are NOT invented here.
 #[derive(Debug, Clone)]
 pub struct InputRecord {
     pub id: String,
@@ -2461,6 +2626,14 @@ pub struct InputRecord {
     pub security_groups: Vec<String>,
     pub sources: Vec<InputSourceRequest>,
     pub destinations: Vec<InputDestinationRequest>,
+    /// The system-generated static ingest address this input holds for each of
+    /// its destination slots - `InputDestination$Ip`, which "remains fixed for
+    /// the lifetime of the input".
+    ///
+    /// PRIVATE: the only way in is
+    /// [`ComAmazonawsMedialiveMedialiveState::allocate_input_ingest_addresses`],
+    /// which owns the pool and never reassigns a slot's address.
+    ingest_ips: Vec<String>,
     pub media_connect_flows: Vec<MediaConnectFlowRequest>,
     pub input_devices: Vec<InputDeviceSettings>,
     pub sdi_sources: Vec<String>,
@@ -2617,6 +2790,7 @@ pub fn new_input(id: String, arn: String) -> InputRecord {
         security_groups: Vec::new(),
         sources: Vec::new(),
         destinations: Vec::new(),
+        ingest_ips: Vec::new(),
         media_connect_flows: Vec::new(),
         input_devices: Vec::new(),
         sdi_sources: Vec::new(),
@@ -2658,28 +2832,55 @@ fn described_input_source(source: &InputSourceRequest) -> InputSource {
     }
 }
 
-/// `InputDestinationRequest` -> `InputDestination`.
+/// `InputDestinationRequest` -> `InputDestination`, for the destination at
+/// `index` of `input`'s destination list.
 ///
 /// `Ip` is the request's `StaticIpAddress` when it named one (the address an
-/// ON-PREM push input takes on the customer network); `Port`, `Url` and `Vpc`
-/// describe the push endpoint and the VPC network interface the real service
-/// provisions, which this emulator does not, so it claims none of them.
-fn described_input_destination(destination: &InputDestinationRequest) -> InputDestination {
+/// ON-PREM push input takes on the customer network), otherwise the
+/// system-generated address allocated for that destination slot. `Port` and
+/// `Url` are the ingest endpoint of the input type's push protocol, so a client
+/// creating a push input learns where to push the stream; an input type with no
+/// push protocol ([`PUSH_INGEST_PROTOCOLS`]) reports neither.
+///
+/// The three endpoint members are reported together or not at all: without an
+/// address there is no endpoint to announce, so no port is claimed for one
+/// either.
+///
+/// `Vpc` describes the network interface the real service provisions in the
+/// customer VPC, which this emulator does not, so it claims none of it.
+fn described_input_destination(
+    input: &InputRecord,
+    index: usize,
+    destination: &InputDestinationRequest,
+) -> InputDestination {
+    let ip = destination
+        .static_ip_address
+        .clone()
+        .filter(|address| !address.is_empty())
+        .or_else(|| input.ingest_ips.get(index).cloned());
+    let endpoint = push_ingest_protocol(input.input_type.as_deref()).zip(ip.as_deref());
     InputDestination {
-        ip: destination.static_ip_address.clone(),
-        port: None,
-        url: None,
+        port: endpoint.map(|(protocol, _)| protocol.port.to_string()),
+        url: endpoint
+            .map(|(protocol, ip)| protocol.endpoint_url(ip, destination.stream_name.as_deref())),
+        ip,
         vpc: None,
         network: destination.network.clone(),
-        network_routes: destination.network_routes.as_ref().map(|routes| {
-            routes
+        // A list member of the projection is reported as present and empty
+        // rather than unset when the input has no routes, like every other list
+        // in the `Input` shape.
+        network_routes: Some(
+            destination
+                .network_routes
+                .as_deref()
+                .unwrap_or_default()
                 .iter()
                 .map(|route| InputDestinationRoute {
                     cidr: route.cidr.clone(),
                     gateway: route.gateway.clone(),
                 })
-                .collect()
-        }),
+                .collect(),
+        ),
     }
 }
 
