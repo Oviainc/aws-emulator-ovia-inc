@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AdminAddUserToGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AdminAddUserToGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AdminAddUserToGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records membership of a stored user in a stored group of a stored user pool. The
+//! membership is held on the stored user (`crate::state::User::groups`), so a later
+//! sign-in's access and identity tokens carry it as their `cognito:groups` claim.
+//! Adding a user that already belongs to the group stores nothing new and succeeds.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +179,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AdminAddUserToGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AdminAddUserToGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AdminAddUserToGroup"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // The group must be one the pool holds. `GroupNameType` carries no
+        // case-insensitivity trait, so the name is matched exactly as
+        // `CreateGroup` stored it. Which of an absent group and an absent user is
+        // reported first is not something AWS documents; each is reported on its
+        // own.
+        if !pool.groups.contains_key(&input.group_name) {
+            return Err(group_not_found(&input.group_name));
+        }
+
+        // `Username` "can be any of their alias attributes" or "the sub of a
+        // local user" (`AdminAddUserToGroup.Username`), which is how
+        // `UserPool::user_mut` resolves a user.
+        let user = pool
+            .user_mut(&input.username)
+            .ok_or_else(|| user_not_found(&input.username))?;
+
+        // Membership is a set, so a repeated add stores nothing new and the user
+        // belongs to the group exactly once.
+        user.groups.insert(input.group_name.clone());
+
+        Ok(AdminAddUserToGroupOutput)
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> AdminAddUserToGroupError {
+    AdminAddUserToGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a group the pool does not hold.
+fn group_not_found(group_name: &str) -> AdminAddUserToGroupError {
+    AdminAddUserToGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Group not found: {group_name}")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user.
+fn user_not_found(username: &str) -> AdminAddUserToGroupError {
+    AdminAddUserToGroupErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(format!("User {username} does not exist.")),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> AdminAddUserToGroupError {
+    AdminAddUserToGroupErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }
