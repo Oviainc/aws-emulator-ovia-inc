@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateForm
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateForm`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateForm::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a form: the record is persisted in [`crate::state`] and every member of the
+//! returned `Form` is computed from it. A repeated call carrying the same `clientToken`
+//! answers with the form that token already created.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateForm` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFormErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateForm"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFormErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the amplifyuibuilder form store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let data = input.form_to_create;
+        let key = (input.app_id.clone(), input.environment_name.clone());
+        let mut store = state.lock();
+
+        // `clientToken` is an `@idempotencyToken`: the same token names the same
+        // form, so a retried create reports the first one rather than minting a
+        // second. The token is scoped to the (appId, environmentName) it was used
+        // in, so reusing one against another app environment creates that
+        // environment's own form instead of reporting one the request does not
+        // address.
+        if let Some(replayed) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.replayed_form(&key, token))
+        {
+            return Ok(CreateFormOutput {
+                entity: Some(replayed.to_form()),
+            });
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record. `ServiceQuotaExceededException` is the modelled
+        // refusal for exactly this.
+        if store.total_forms() >= crate::state::FORM_QUOTA {
+            return Err(CreateFormErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} forms across all app \
+                         environments",
+                        crate::state::FORM_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_form_id(&key);
+        let form = crate::state::StoredForm {
+            app_id: input.app_id,
+            environment_name: input.environment_name,
+            id: id.clone(),
+            name: data.name,
+            form_action_type: data.form_action_type,
+            style: data.style,
+            data_type: data.data_type,
+            fields: data.fields,
+            sectional_elements: data.sectional_elements,
+            schema_version: data.schema_version,
+            tags: data.tags,
+            cta: data.cta,
+            label_decorator: data.label_decorator,
+        };
+
+        let entity = form.to_form();
+        store.insert_form(form);
+        if let Some(token) = input.client_token {
+            store.remember_form_token(key, token, id);
+        }
+
+        Ok(CreateFormOutput {
+            entity: Some(entity),
+        })
     }
 }

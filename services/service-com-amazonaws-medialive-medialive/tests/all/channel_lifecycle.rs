@@ -654,3 +654,64 @@ async fn a_dry_run_create_is_refused_rather_than_creating_a_channel() {
         listed["channels"]
     );
 }
+
+/// Rule: `InputAttachments` is a caller-chosen list every later read walks, so
+/// its length is bounded — a create at or below the emulator's ceiling is
+/// accepted and stores exactly the attachments it carried, and one past it is
+/// refused with the operation's modelled `BadRequestException` (400), creating
+/// nothing.
+///
+/// The rows span the published bound from both sides (none, one, the ceiling,
+/// one past it), because that is what a bound generalises over.
+#[tokio::test]
+async fn the_attachment_list_of_one_channel_is_bounded() {
+    use service_com_amazonaws_medialive_medialive::state::MAX_INPUT_ATTACHMENTS;
+
+    // (case, how many attachments the request carries, expected status)
+    let table: [(&str, usize, u16); 4] = [
+        ("no attachment", 0, 201),
+        ("one attachment", 1, 201),
+        ("at the ceiling", MAX_INPUT_ATTACHMENTS, 201),
+        ("one past the ceiling", MAX_INPUT_ATTACHMENTS + 1, 400),
+    ];
+
+    for (case, count, expected_status) in table {
+        let router = medialive();
+        let attachments: Vec<Value> = (0..count)
+            .map(|slot| json!({ "inputId": format!("100000{slot}"), "inputAttachmentName": format!("slot-{slot}") }))
+            .collect();
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/prod/channels",
+            Some(json!({ "name": "attaching", "inputAttachments": attachments.clone() })),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status}, got {status}: {body}"
+        );
+
+        if expected_status == 201 {
+            assert_eq!(
+                body["channel"]["inputAttachments"],
+                json!(attachments),
+                "case {case:?}: expected the stored attachments, got {:?}",
+                body["channel"]["inputAttachments"]
+            );
+        } else {
+            assert_eq!(
+                error_code(status, &body),
+                "BadRequestException",
+                "case {case:?}: expected BadRequestException, got {body}"
+            );
+            let (_, listed) = call(&router, "GET", "/prod/channels", None).await;
+            assert_eq!(
+                listed["channels"],
+                json!([]),
+                "case {case:?}: a refused create must not have created a channel, got {:?}",
+                listed["channels"]
+            );
+        }
+    }
+}
