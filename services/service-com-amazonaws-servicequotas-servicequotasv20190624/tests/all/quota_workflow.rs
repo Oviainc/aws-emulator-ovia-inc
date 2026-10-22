@@ -129,8 +129,27 @@ pub(crate) async fn walk_pages(
     items: &str,
     page_size: Option<i64>,
 ) -> Vec<Value> {
+    walk_pages_counted(client, operation, base, items, page_size)
+        .await
+        .0
+}
+
+/// Walk a paginated listing to the end, returning its items AND how many pages it
+/// took.
+///
+/// Asserts the whole page contract: no page exceeds `MaxResults`, a page that is
+/// followed by another is exactly `MaxResults` long (a short non-final page would
+/// mean the cursor skipped items), and the walk ends on a page with no `NextToken`.
+pub(crate) async fn walk_pages_counted(
+    client: &Client,
+    operation: &str,
+    base: &Value,
+    items: &str,
+    page_size: Option<i64>,
+) -> (Vec<Value>, usize) {
     let mut collected: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
+    let mut pages = 0_usize;
 
     // Bounded so a listing that never reports its last page fails instead of hanging.
     // The ceiling clears the longest listing (the service catalog, a few hundred
@@ -149,17 +168,28 @@ pub(crate) async fn walk_pages(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        pages += 1;
+        let next = response
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         if let Some(size) = page_size {
             assert!(
                 page.len() as i64 <= size,
                 "case {operation} {base} MaxResults={size}: a page carried {} items",
                 page.len()
             );
+            assert!(
+                next.is_none() || page.len() as i64 == size,
+                "case {operation} {base} MaxResults={size}: a page followed by another carried \
+                 only {} items",
+                page.len()
+            );
         }
         collected.extend(page);
-        match response.get("NextToken").and_then(Value::as_str) {
-            Some(next) => token = Some(next.to_string()),
-            None => return collected,
+        match next {
+            Some(resume) => token = Some(resume),
+            None => return (collected, pages),
         }
     }
     panic!("case {operation} {base}: the listing never reported a last page");

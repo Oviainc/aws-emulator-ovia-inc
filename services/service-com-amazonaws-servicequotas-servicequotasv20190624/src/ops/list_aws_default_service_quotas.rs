@@ -15,6 +15,10 @@
 //! code). A `NextToken` this service did not issue is
 //! `InvalidPaginationTokenException`.
 //!
+//! The listing is the service's WHOLE published default-quota list (the catalog
+//! seeded in [`crate::state`]), which for a service such as EC2 runs well past the
+//! largest page the model allows, so a walk takes many `NextToken`-chained pages.
+//!
 //! ---
 //!
 //! # Modeled contract for `ListAWSDefaultServiceQuotas`

@@ -5,6 +5,10 @@
 //! Lists the Amazon Web Services services integrated with Service Quotas, from the
 //! seeded catalog in [`crate::state`], one page at a time.
 //!
+//! The catalog is the whole integrated-service list — the documented way to discover
+//! a valid `ServiceCode` — so it runs past the largest page the model allows and a
+//! walk takes many `NextToken`-chained pages.
+//!
 //! `MaxResults` is the page size and `NextToken` resumes where the previous page
 //! stopped; the last page carries no `NextToken`. A caller that names no
 //! `MaxResults` gets the WHOLE catalog in one page (`MaxResults`' 1..100 range

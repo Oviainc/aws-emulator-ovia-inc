@@ -22,6 +22,14 @@
 //! an increase applied in one region does not change another's value), while the
 //! catalog and the defaults are the same everywhere. The account is the emulator's
 //! single [`engine::emulator_account_id`].
+//!
+//! The quota rows in [`seed_quota_catalog`] are a CATALOG rather than a sample: for
+//! a service such as EC2 the list runs to hundreds of entries, the way AWS's
+//! published list does. That is what the enumerations are: `ListServices` reports the
+//! whole integrated service list and `ListAWSDefaultServiceQuotas` /
+//! `ListServiceQuotas` report a service's whole quota list, so with a page size the
+//! model allows (`MaxResults` 1..100) they genuinely run to many
+//! `NextToken`-chained pages.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -795,6 +803,1220 @@ fn decode_page_token(listing: &str, token: &str) -> Result<usize, InvalidPageTok
         .ok_or(InvalidPageToken)
 }
 
+/// One quota of the catalog, before its `QuotaCode` is resolved.
+///
+/// A row carries the shape most published quotas have — adjustable, counted per
+/// region, `Unit` `None` — and the builder methods below name the exceptions.
+#[derive(Debug, Clone)]
+struct QuotaRow {
+    /// AWS's own `QuotaCode`, where this catalog carries it; otherwise `None`, and
+    /// the code is derived from the service code and the quota name (see
+    /// [`derived_quota_code`]).
+    code: Option<String>,
+    /// `QuotaName`, as AWS publishes it.
+    name: String,
+    /// The AWS default `Value`.
+    value: f64,
+    /// `Unit`: `"None"` for a countable quota.
+    unit: String,
+    /// `Adjustable`: whether an increase can be requested at all.
+    adjustable: bool,
+    /// `GlobalQuota`: counted account-wide rather than per region.
+    global_quota: bool,
+    /// `UsageMetric`, for a quota CloudWatch publishes usage for.
+    usage_metric: Option<MetricInfo>,
+    /// `Period`, for a quota AWS publishes as a RATE (so many per unit of time).
+    period: Option<QuotaPeriod>,
+    /// `Description`, where AWS publishes one for the quota.
+    description: Option<String>,
+}
+
+/// A countable, adjustable, per-region quota: the shape most published quotas have.
+fn quota(name: impl Into<String>, value: f64) -> QuotaRow {
+    QuotaRow {
+        code: None,
+        name: name.into(),
+        value,
+        unit: "None".to_string(),
+        adjustable: true,
+        global_quota: false,
+        usage_metric: None,
+        period: None,
+        description: None,
+    }
+}
+
+impl QuotaRow {
+    /// AWS's own `QuotaCode` for this quota.
+    fn code(mut self, code: &str) -> Self {
+        self.code = Some(code.to_string());
+        self
+    }
+
+    /// The `Unit` AWS reports for a measured quota.
+    fn unit(mut self, unit: &str) -> Self {
+        self.unit = unit.to_string();
+        self
+    }
+
+    /// AWS publishes this quota as NOT adjustable.
+    fn fixed(mut self) -> Self {
+        self.adjustable = false;
+        self
+    }
+
+    /// AWS counts this quota account-wide rather than per region.
+    fn global(mut self) -> Self {
+        self.global_quota = true;
+        self
+    }
+
+    /// The CloudWatch usage metric AWS publishes for this quota.
+    fn metric(mut self, metric: MetricInfo) -> Self {
+        self.usage_metric = Some(metric);
+        self
+    }
+
+    /// The `Period` of a quota AWS publishes as a rate: so many per unit of time.
+    fn period(mut self, value: i32, unit: &str) -> Self {
+        self.period = Some(QuotaPeriod {
+            period_value: Some(value),
+            period_unit: Some(unit.to_string()),
+        });
+        self
+    }
+
+    /// The `Description` AWS publishes for this quota.
+    fn describe(mut self, description: &str) -> Self {
+        self.description = Some(description.to_string());
+        self
+    }
+}
+
+/// One service of the quota catalog: the service the rows belong to, and the quotas
+/// `ListAWSDefaultServiceQuotas` / `ListServiceQuotas` report for it.
+#[derive(Debug)]
+struct CatalogService {
+    /// `ServiceCode` — AWS's code for the service (its endpoint prefix).
+    code: &'static str,
+    /// `ServiceName`, as Service Quotas reports it. Used only for a service
+    /// [`SEED_SERVICE_CATALOG`] does not already name: a service whose quotas this
+    /// emulator publishes must be listed, or its quotas would be unreachable.
+    name: &'static str,
+    /// The quotas the service publishes.
+    quotas: Vec<QuotaRow>,
+}
+
+/// One catalog entry.
+fn service(code: &'static str, name: &'static str, quotas: Vec<QuotaRow>) -> CatalogService {
+    CatalogService { code, name, quotas }
+}
+
+/// The seeded AWS default quotas, keyed by `(ServiceCode, QuotaCode)`, built from
+/// [`seed_quota_catalog`].
+///
+/// Coverage is per PAIR, not per service: the table holds the published defaults
+/// this emulator carries. A service code in [`SEED_SERVICE_CATALOG`] with no pair
+/// here therefore has an EMPTY default quota set, and `ListAWSDefaultServiceQuotas`
+/// answers it with HTTP 200 and an empty `Quotas` list — the code exists, so
+/// `NoSuchResourceException` (which belongs to a code that is not an AWS service
+/// code at all) would be the wrong answer.
+///
+/// The `QuotaCode` of a row is AWS's own where the table carries it, else the
+/// derived one ([`derived_quota_code`]).
+fn seed_default_quotas() -> BTreeMap<(String, String), DefaultQuota> {
+    let mut default_quotas = BTreeMap::new();
+    for entry in seed_quota_catalog() {
+        for row in entry.quotas {
+            let code = row
+                .code
+                .clone()
+                .unwrap_or_else(|| derived_quota_code(entry.code, &row.name));
+            let key = (entry.code.to_string(), code);
+            let displaced = default_quotas.insert(
+                key.clone(),
+                DefaultQuota {
+                    quota_name: row.name,
+                    value: row.value,
+                    unit: row.unit,
+                    adjustable: row.adjustable,
+                    global_quota: row.global_quota,
+                    adjustable_at_level: LEVEL_ACCOUNT.to_string(),
+                    usage_metric: row.usage_metric,
+                    period: row.period,
+                    description: row.description,
+                },
+            );
+            // The map is keyed by the pair, so a repeated QuotaCode within one
+            // service would SILENTLY drop a quota. A new table row that collides —
+            // with another row's code or with a derived one — fails here, at the
+            // source, rather than in a listing far away.
+            debug_assert!(
+                displaced.is_none(),
+                "two catalog rows share the QuotaCode {key:?}"
+            );
+        }
+    }
+    default_quotas
+}
+
+/// The `QuotaCode` of a catalog row whose published code this catalog does not
+/// carry.
+///
+/// AWS mints an opaque `L-` code for every quota it publishes. Where this catalog
+/// does not carry AWS's own code, the code is DERIVED from the service code and the
+/// quota's published name: 8 uppercase hex characters after the `L-`, the shape
+/// AWS's codes have and one the modelled `QuotaCode` pattern
+/// `^[a-zA-Z][a-zA-Z0-9-]{1,128}$` accepts. It is the same on every run, in every
+/// region, and unique per (service, quota name) — never derived from a request, and
+/// never from the clock.
+fn derived_quota_code(service_code: &str, quota_name: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let digest = Sha256::digest(format!("{service_code}:{quota_name}"));
+    format!("L-{}", hex::encode_upper(&digest[..4]))
+}
+
+/// The seeded quota catalog: the quotas each service publishes, and (for a service
+/// [`SEED_SERVICE_CATALOG`] does not name) the name to list it under.
+///
+/// SOURCE: AWS's own published Service Quotas data — the quota names, default
+/// values, adjustability and scope of the per-service "Service quotas" pages (what
+/// `aws service-quotas list-aws-default-service-quotas --service-code <code>`
+/// reports). A quota's default in a real account depends on the account and the
+/// region (AWS publishes these as defaults "for new accounts"), so these are the
+/// defaults this emulator serves, and every operation computes its answer from
+/// them rather than from a literal in a handler.
+///
+/// A service's quota list is a CATALOG, not a sample: for a service such as EC2 it
+/// runs past the largest page `MaxResults` allows (1..100), so a walk of
+/// `ListAWSDefaultServiceQuotas` / `ListServiceQuotas` genuinely takes many
+/// `NextToken`-chained pages.
+fn seed_quota_catalog() -> Vec<CatalogService> {
+    vec![
+        service(
+            "access-analyzer",
+            "IAM Access Analyzer",
+            vec![
+                quota("Analyzers per Region", 1.0).fixed(),
+                quota("Archive rules per analyzer", 100.0),
+            ],
+        ),
+        service(
+            "acm",
+            "AWS Certificate Manager (ACM)",
+            vec![
+                quota("ACM certificates", 2500.0),
+                quota("Imported certificates", 2500.0),
+            ],
+        ),
+        service(
+            "acm-pca",
+            "AWS Private Certificate Authority",
+            vec![quota("Certificate authorities", 200.0)],
+        ),
+        service(
+            "airflow",
+            "Amazon Managed Workflows for Apache Airflow",
+            vec![quota("Environments per Region", 10.0)],
+        ),
+        service(
+            "amplify",
+            "AWS Amplify",
+            vec![
+                quota("Apps per Region", 25.0),
+                quota("Branches per app", 50.0),
+            ],
+        ),
+        service(
+            "apigateway",
+            "Amazon API Gateway",
+            vec![
+                quota("Regional APIs per Region", 600.0),
+                quota("Edge-optimized APIs per account", 120.0),
+                quota("Stages per API", 10.0),
+            ],
+        ),
+        service(
+            "appconfig",
+            "AWS AppConfig",
+            vec![quota("Configuration profiles per application", 100.0)],
+        ),
+        service(
+            "appflow",
+            "Amazon AppFlow",
+            vec![quota("Flows per account", 1000.0)],
+        ),
+        service(
+            "application-autoscaling",
+            "Application Auto Scaling",
+            vec![quota("Scalable targets per resource type", 500.0)],
+        ),
+        service(
+            "appmesh",
+            "AWS App Mesh",
+            vec![
+                quota("Meshes per account", 15.0),
+                quota("Virtual services per mesh", 200.0),
+            ],
+        ),
+        service(
+            "apprunner",
+            "AWS App Runner",
+            vec![quota("Services per account", 100.0)],
+        ),
+        service(
+            "appstream2",
+            "Amazon AppStream 2.0",
+            vec![quota("Fleets", 10.0)],
+        ),
+        service(
+            "appsync",
+            "AWS AppSync",
+            vec![quota("APIs per Region", 25.0)],
+        ),
+        service(
+            "athena",
+            "Amazon Athena",
+            vec![
+                quota("Active DML queries", 20.0),
+                quota("Query timeout", 30.0).unit("Minutes"),
+                quota("Workgroups per Region", 1000.0),
+            ],
+        ),
+        service(
+            "autoscaling",
+            "Amazon EC2 Auto Scaling",
+            vec![
+                quota("Auto Scaling groups per Region", 200.0),
+                quota("Launch configurations per Region", 200.0),
+            ],
+        ),
+        service(
+            "autoscaling-plans",
+            "AWS Auto Scaling",
+            vec![quota("Scaling plans per Region", 5.0)],
+        ),
+        service(
+            "backup",
+            "AWS Backup",
+            vec![
+                quota("Backup plans per account", 100.0),
+                quota("Backup vaults per account", 100.0),
+            ],
+        ),
+        service(
+            "batch",
+            "AWS Batch",
+            vec![
+                quota("Job queues", 50.0),
+                quota("Compute environments", 50.0),
+            ],
+        ),
+        service(
+            "budgets",
+            "AWS Budgets",
+            vec![quota("Budgets", 20000.0).global()],
+        ),
+        service(
+            "cassandra",
+            "Amazon Keyspaces (for Apache Cassandra)",
+            vec![quota("Tables per Region", 256.0)],
+        ),
+        service(
+            "cloud9",
+            "AWS Cloud9",
+            vec![quota("Environments", 50.0)],
+        ),
+        service(
+            "cloudformation",
+            "AWS CloudFormation",
+            vec![
+                quota("Stack count", 2000.0),
+                quota("Stack sets per administrator account", 100.0),
+                quota("Stack instances per stack set", 10000.0),
+            ],
+        ),
+        service(
+            "cloudfront",
+            "Amazon CloudFront",
+            vec![
+                // CloudFront is a global service: its quotas count account-wide.
+                quota("Web distributions per account", 200.0).global(),
+                quota("Alternate domain names (CNAMEs) per distribution", 100.0).global(),
+                quota("Cache behaviors per distribution", 25.0).global(),
+            ],
+        ),
+        service(
+            "cloudhsm",
+            "AWS CloudHSM",
+            vec![quota("Clusters per Region", 4.0)],
+        ),
+        service(
+            "cloudtrail",
+            "AWS CloudTrail",
+            vec![quota("Trails per Region", 5.0).fixed()],
+        ),
+        service(
+            "codeartifact",
+            "AWS CodeArtifact",
+            vec![quota("Domains per account", 10.0)],
+        ),
+        service(
+            "codebuild",
+            "AWS CodeBuild",
+            vec![
+                quota("Build projects", 5000.0),
+                quota("Concurrently running builds", 60.0),
+            ],
+        ),
+        service(
+            "codecommit",
+            "AWS CodeCommit",
+            vec![quota("Repositories per account", 1000.0)],
+        ),
+        service(
+            "codedeploy",
+            "AWS CodeDeploy",
+            vec![
+                quota("Applications per Region", 1000.0),
+                quota("Deployment groups per application", 1000.0),
+            ],
+        ),
+        service(
+            "codepipeline",
+            "AWS CodePipeline",
+            vec![quota("Pipelines per Region", 1000.0)],
+        ),
+        service(
+            "cognito-identity",
+            "Amazon Cognito Federated Identities",
+            vec![quota("Identity pools", 1000.0)],
+        ),
+        service(
+            "cognito-idp",
+            "Amazon Cognito User Pools",
+            vec![
+                quota("User pools per account", 1000.0),
+                quota("App clients per user pool", 1000.0),
+            ],
+        ),
+        service(
+            "comprehend",
+            "Amazon Comprehend",
+            vec![quota("Custom classifiers per account", 10.0)],
+        ),
+        service(
+            "config",
+            "AWS Config",
+            vec![
+                quota("Config rules per Region", 150.0),
+                quota("Delivery channels", 1.0).fixed(),
+            ],
+        ),
+        service(
+            "connect",
+            "Amazon Connect",
+            vec![quota("Amazon Connect instances per account", 5.0)],
+        ),
+        service(
+            "datasync",
+            "AWS DataSync",
+            vec![
+                quota("Tasks per account", 100.0),
+                quota("Agents per account", 50.0),
+            ],
+        ),
+        service(
+            "dax",
+            "Amazon DynamoDB Accelerator (DAX)",
+            vec![quota("Nodes per cluster", 11.0).fixed()],
+        ),
+        service(
+            "directconnect",
+            "AWS Direct Connect",
+            vec![quota("Connections per Region", 10.0)],
+        ),
+        service(
+            "dms",
+            "AWS Database Migration Service",
+            vec![
+                quota("Replication instances", 20.0),
+                quota("Endpoints", 1000.0),
+            ],
+        ),
+        service(
+            "docdb",
+            "Amazon DocumentDB",
+            vec![
+                quota("Clusters", 40.0),
+                quota("Instances per cluster", 16.0),
+            ],
+        ),
+        service(
+            "ds",
+            "AWS Directory Service",
+            vec![quota("Directories", 10.0)],
+        ),
+        service(
+            "dynamodb",
+            "Amazon DynamoDB",
+            vec![
+                quota("Maximum number of tables", 2500.0)
+                    .code("L-F98FE922")
+                    // DynamoDB publishes table count as a CloudWatch usage metric
+                    // (`AWS/Usage`, `ResourceCount`, `Resource=TableCount`), which is
+                    // what Service Quotas reports as this quota's `UsageMetric`.
+                    .metric(usage_metric(
+                        "DynamoDB",
+                        &[
+                            ("Class", "None"),
+                            ("Resource", "TableCount"),
+                            ("Type", "Resource"),
+                        ],
+                    ))
+                    .describe(
+                        "The maximum number of tables that can be created in this account in \
+                         the current Region.",
+                    ),
+                quota("Account-level write throughput limit", 80000.0),
+                quota("Global secondary indexes per table", 20.0).fixed(),
+            ],
+        ),
+        service(
+            "ebs",
+            "Amazon Elastic Block Store (Amazon EBS)",
+            vec![
+                quota("Storage for General Purpose SSD (gp3) volumes, in TiB", 50.0).unit("TiB"),
+                quota("Snapshots per Region", 100000.0),
+            ],
+        ),
+        service(
+            "ec2",
+            "Amazon Elastic Compute Cloud (Amazon EC2)",
+            ec2_quotas(),
+        ),
+        service(
+            "ecr",
+            "Amazon Elastic Container Registry (Amazon ECR)",
+            vec![
+                quota("Repositories", 10000.0),
+                quota("Images per repository", 10000.0),
+            ],
+        ),
+        service(
+            "ecs",
+            "Amazon Elastic Container Service (Amazon ECS)",
+            vec![
+                quota("Clusters per account", 10000.0),
+                quota("Services per cluster", 5000.0),
+                quota("Tasks per service", 5000.0),
+            ],
+        ),
+        service(
+            "eks",
+            "Amazon Elastic Kubernetes Service (Amazon EKS)",
+            vec![
+                quota("Clusters", 100.0),
+                quota("Managed node groups per cluster", 30.0),
+                quota("Nodes per managed node group", 450.0),
+            ],
+        ),
+        service(
+            "elasticache",
+            "Amazon ElastiCache",
+            vec![
+                quota("Nodes per Region", 300.0),
+                quota("Parameter groups per Region", 150.0),
+            ],
+        ),
+        service(
+            "elasticbeanstalk",
+            "AWS Elastic Beanstalk",
+            vec![
+                quota("Applications", 75.0),
+                quota("Environments", 200.0),
+            ],
+        ),
+        service(
+            "elasticfilesystem",
+            "Amazon Elastic File System (Amazon EFS)",
+            vec![
+                quota("File systems per account", 1000.0),
+                quota("Access points per file system", 1000.0),
+            ],
+        ),
+        service(
+            "elasticloadbalancing",
+            "Elastic Load Balancing (ELB)",
+            vec![
+                quota("Application Load Balancers per Region", 50.0),
+                quota("Classic Load Balancers per Region", 20.0),
+                quota("Target groups per Region", 3000.0),
+            ],
+        ),
+        service(
+            "elasticmapreduce",
+            "Amazon EMR",
+            vec![quota("Active clusters", 100.0)],
+        ),
+        service(
+            "emr-serverless",
+            "Amazon EMR Serverless",
+            vec![quota("Applications per account", 100.0)],
+        ),
+        service(
+            "es",
+            "Amazon OpenSearch Service",
+            vec![
+                quota("Domains per Region", 100.0),
+                quota("Instances per domain", 80.0),
+            ],
+        ),
+        service(
+            "events",
+            "Amazon EventBridge (CloudWatch Events)",
+            vec![
+                quota("Event buses per account", 100.0),
+                quota("Rules per event bus", 300.0),
+                quota("PutEvents throttle limit in transactions per second", 10000.0).fixed(),
+            ],
+        ),
+        service(
+            "firehose",
+            "Amazon Data Firehose",
+            vec![quota("Delivery streams per Region", 5000.0)],
+        ),
+        service(
+            "fms",
+            "AWS Firewall Manager",
+            vec![quota("Policies per Region", 50.0)],
+        ),
+        service(
+            "forecast",
+            "Amazon Forecast",
+            vec![quota("Datasets per account", 100.0)],
+        ),
+        service(
+            "fsx",
+            "Amazon FSx",
+            vec![quota("File systems per account", 100.0)],
+        ),
+        service(
+            "gamelift",
+            "Amazon GameLift",
+            vec![quota("Fleets", 100.0)],
+        ),
+        service(
+            "glacier",
+            "Amazon S3 Glacier",
+            vec![quota("Vaults per Region", 1000.0).fixed()],
+        ),
+        service(
+            "globalaccelerator",
+            "AWS Global Accelerator",
+            vec![quota("Accelerators per account", 20.0).global()],
+        ),
+        service(
+            "glue",
+            "AWS Glue",
+            vec![
+                quota("Databases per account", 10000.0),
+                quota("Tables per database", 200000.0),
+                quota("Concurrent job runs per account", 200.0),
+            ],
+        ),
+        service(
+            "groundstation",
+            "AWS Ground Station",
+            vec![quota("Mission profiles per account", 500.0)],
+        ),
+        service(
+            "guardduty",
+            "Amazon GuardDuty",
+            vec![
+                quota("Detectors per Region", 1.0).fixed(),
+                quota("Threat intel sets per detector", 6.0),
+            ],
+        ),
+        service(
+            "iam",
+            "AWS Identity and Access Management (IAM)",
+            vec![
+                // IAM is a global service: every one of its quotas is account-wide.
+                quota("Roles per account", 1000.0).global(),
+                quota("Managed policies per account", 1500.0).global(),
+                quota("Instance profiles per account", 1000.0).global(),
+                quota("Users per account", 5000.0).global(),
+            ],
+        ),
+        service(
+            "imagebuilder",
+            "EC2 Image Builder",
+            vec![quota("Image pipelines", 1000.0)],
+        ),
+        service(
+            "iot",
+            "AWS IoT Core",
+            vec![quota("Rules per account", 1000.0)],
+        ),
+        service(
+            "iotevents",
+            "AWS IoT Events",
+            vec![quota("Detector models per account", 1000.0)],
+        ),
+        service(
+            "ivs",
+            "Amazon Interactive Video Service",
+            vec![quota("Channels per account", 5000.0)],
+        ),
+        service(
+            "kafka",
+            "Amazon Managed Streaming for Apache Kafka (MSK)",
+            vec![
+                quota("Clusters per account", 90.0),
+                quota("Brokers per cluster", 30.0),
+            ],
+        ),
+        service(
+            "kendra",
+            "Amazon Kendra",
+            vec![quota("Indexes per account", 5.0)],
+        ),
+        service(
+            "kinesis",
+            "Amazon Kinesis Data Streams",
+            vec![quota("Shards per Region", 500.0)],
+        ),
+        service(
+            "kinesisanalytics",
+            "Amazon Managed Service for Apache Flink",
+            vec![quota("Applications per Region", 50.0)],
+        ),
+        service(
+            "kinesisvideo",
+            "Amazon Kinesis Video Streams",
+            vec![quota("Streams per account", 10000.0)],
+        ),
+        service(
+            "kms",
+            "AWS Key Management Service (AWS KMS)",
+            vec![
+                quota("Customer managed KMS keys", 100000.0),
+                quota("Aliases per KMS key", 50.0).fixed(),
+                quota("Grants per KMS key", 50000.0),
+            ],
+        ),
+        service(
+            "lakeformation",
+            "AWS Lake Formation",
+            vec![quota("Data lake administrators per account", 30.0)],
+        ),
+        service(
+            "lambda",
+            "AWS Lambda",
+            vec![
+                quota("Concurrent executions", 1000.0)
+                    .code("L-B99A9384")
+                    .metric(usage_metric(
+                        "Lambda",
+                        &[
+                            ("Class", "None"),
+                            ("Resource", "ConcurrentExecutions"),
+                            ("Type", "Resource"),
+                        ],
+                    )),
+                quota("Function and layer storage", 75.0)
+                    .code("L-2ACBD22F")
+                    .unit("Gigabytes"),
+                // A rate quota AWS publishes as not adjustable, with its own
+                // `Period`: so many requests per second.
+                quota(
+                    "Rate of control plane API requests (excludes invocation, GetFunction, \
+                     and GetPolicy requests)",
+                    15.0,
+                )
+                .code("L-B2AA0F47")
+                .fixed()
+                .period(1, "SECOND")
+                .describe(
+                    "The maximum rate of control plane API requests, excluding invocation, \
+                     GetFunction and GetPolicy requests.",
+                ),
+                quota("Elastic network interfaces per VPC", 250.0),
+                quota("Function timeout", 900.0).unit("Seconds").fixed(),
+            ],
+        ),
+        service(
+            "lex",
+            "Amazon Lex",
+            vec![quota("Bots per account", 100.0)],
+        ),
+        service(
+            "license-manager",
+            "AWS License Manager",
+            vec![quota("License configurations per account", 25.0)],
+        ),
+        service(
+            "lightsail",
+            "Amazon Lightsail",
+            vec![
+                quota("Instances", 20.0),
+                quota("Static IP addresses", 5.0),
+            ],
+        ),
+        service(
+            "logs",
+            "Amazon CloudWatch Logs",
+            vec![
+                quota("Subscription filters per log group", 2.0).fixed(),
+                quota("Metric filters per log group", 100.0).fixed(),
+                quota("DescribeLogStreams throttle limit in transactions per second", 25.0),
+            ],
+        ),
+        service(
+            "memorydb",
+            "Amazon MemoryDB",
+            vec![quota("Nodes per Region", 300.0)],
+        ),
+        service(
+            "mediaconvert",
+            "AWS Elemental MediaConvert",
+            vec![quota("Queues per Region", 10.0)],
+        ),
+        service(
+            "medialive",
+            "AWS Elemental MediaLive",
+            vec![quota("Channels per Region", 5.0)],
+        ),
+        service(
+            "mediapackage",
+            "AWS Elemental MediaPackage",
+            vec![quota("Channels per Region", 200.0)],
+        ),
+        service(
+            "mgn",
+            "AWS Application Migration Service",
+            vec![quota("Source servers per account", 3000.0)],
+        ),
+        service(
+            "monitoring",
+            "Amazon CloudWatch",
+            vec![
+                quota("Alarms per Region", 5000.0),
+                quota("Dashboards per account", 5000.0),
+                quota("Metric streams per account", 100.0),
+            ],
+        ),
+        service(
+            "mq",
+            "Amazon MQ",
+            vec![quota("Brokers per Region", 50.0)],
+        ),
+        service(
+            "neptune",
+            "Amazon Neptune",
+            vec![quota("Clusters", 40.0)],
+        ),
+        service(
+            "opsworks",
+            "AWS OpsWorks",
+            vec![quota("Stacks per Region", 40.0)],
+        ),
+        service(
+            "organizations",
+            "AWS Organizations",
+            vec![quota("Default maximum number of accounts", 10.0).global()],
+        ),
+        service(
+            "personalize",
+            "Amazon Personalize",
+            vec![quota("Dataset groups per account", 50.0)],
+        ),
+        service(
+            "pinpoint",
+            "Amazon Pinpoint",
+            vec![quota("Projects per account", 100.0)],
+        ),
+        service(
+            "qldb",
+            "Amazon Quantum Ledger Database (Amazon QLDB)",
+            vec![quota("Ledgers per Region", 5.0)],
+        ),
+        service(
+            "quicksight",
+            "Amazon QuickSight",
+            vec![quota("Datasets", 1000.0)],
+        ),
+        service(
+            "ram",
+            "AWS Resource Access Manager (AWS RAM)",
+            vec![quota("Resource shares per account", 5000.0)],
+        ),
+        service(
+            "rds",
+            "Amazon Relational Database Service (Amazon RDS)",
+            vec![
+                quota("DB instances", 40.0),
+                quota("DB clusters", 40.0),
+                quota("Manual DB instance snapshots", 100.0),
+            ],
+        ),
+        service(
+            "redshift",
+            "Amazon Redshift",
+            vec![
+                quota("Clusters", 100.0),
+                quota("Nodes per cluster", 128.0).fixed(),
+            ],
+        ),
+        service(
+            "redshift-serverless",
+            "Amazon Redshift Serverless",
+            vec![quota("Namespaces per account", 25.0)],
+        ),
+        service(
+            "rekognition",
+            "Amazon Rekognition",
+            vec![quota("Collections per Region", 1000.0)],
+        ),
+        service(
+            "resource-groups",
+            "AWS Resource Groups",
+            vec![quota("Resource groups per account", 1000.0)],
+        ),
+        service(
+            "route53",
+            "Amazon Route 53",
+            vec![
+                // Route 53's hosted zones and health checks are account-wide.
+                quota("Hosted zones", 500.0).global(),
+                quota("Records per hosted zone", 10000.0).global(),
+                quota("Health checks", 200.0).global(),
+            ],
+        ),
+        service(
+            "route53resolver",
+            "Amazon Route 53 Resolver",
+            vec![
+                quota("Resolver endpoints per Region", 4.0),
+                quota("Resolver rules per Region", 1000.0),
+            ],
+        ),
+        service(
+            "s3",
+            "Amazon Simple Storage Service (Amazon S3)",
+            vec![
+                // Buckets are counted per account across every region.
+                quota("General purpose buckets", 10000.0)
+                    .code("L-DC2B2D3D")
+                    .global(),
+                quota("Access points per Region", 10000.0),
+                quota("Multi-Region Access Points per account", 100.0).global(),
+            ],
+        ),
+        service(
+            "sagemaker",
+            "Amazon SageMaker",
+            vec![
+                quota("ml.m5.xlarge for notebook instance usage", 2.0),
+                quota("ml.m5.xlarge for endpoint usage", 2.0),
+                quota("Maximum number of training jobs", 100.0),
+            ],
+        ),
+        service(
+            "scheduler",
+            "Amazon EventBridge Scheduler",
+            vec![quota("Schedules per account", 1000000.0)],
+        ),
+        service(
+            "secretsmanager",
+            "AWS Secrets Manager",
+            vec![quota("Secrets per Region", 500000.0)],
+        ),
+        service(
+            "securityhub",
+            "AWS Security Hub",
+            vec![quota("Member accounts per administrator account", 5000.0)],
+        ),
+        service(
+            "servicecatalog",
+            "AWS Service Catalog",
+            vec![quota("Portfolios", 100.0)],
+        ),
+        service(
+            "servicediscovery",
+            "AWS Cloud Map",
+            vec![quota("Namespaces per Region", 100.0)],
+        ),
+        service(
+            "ses",
+            "Amazon Simple Email Service (Amazon SES)",
+            vec![
+                quota("Daily sending quota", 200.0),
+                quota("Sending rate", 1.0),
+            ],
+        ),
+        service(
+            "shield",
+            "AWS Shield Advanced",
+            vec![quota("Protections per account", 1000.0).global()],
+        ),
+        service(
+            "signer",
+            "AWS Signer",
+            vec![quota("Signing profiles per account", 100.0)],
+        ),
+        service(
+            "sns",
+            "Amazon Simple Notification Service (Amazon SNS)",
+            vec![
+                quota("Topics per account", 100000.0),
+                quota("Subscriptions per topic", 12500000.0),
+                quota("Pending subscriptions per account", 5000.0),
+            ],
+        ),
+        service(
+            "sqs",
+            "Amazon Simple Queue Service (Amazon SQS)",
+            vec![
+                quota("FIFO queue transactions per second", 3000.0).fixed(),
+                quota("Messages in flight per standard queue", 120000.0).fixed(),
+            ],
+        ),
+        service(
+            "ssm",
+            "AWS Systems Manager",
+            vec![
+                quota("Parameter Store standard parameters per Region", 10000.0),
+                quota("Concurrently executing automations per account", 100.0),
+            ],
+        ),
+        service(
+            "sso",
+            "AWS IAM Identity Center",
+            vec![quota("Permission sets", 500.0).global()],
+        ),
+        service(
+            "states",
+            "AWS Step Functions",
+            vec![
+                quota("State machines per account", 10000.0),
+                quota("Open executions per account", 1000000.0),
+            ],
+        ),
+        service(
+            "storagegateway",
+            "AWS Storage Gateway",
+            vec![quota("Gateways per Region", 50.0)],
+        ),
+        service(
+            "swf",
+            "Amazon Simple Workflow Service (Amazon SWF)",
+            vec![
+                quota("Domains per account", 100.0),
+                quota("Workflow executions per domain", 100000.0),
+            ],
+        ),
+        service(
+            "timestream",
+            "Amazon Timestream",
+            vec![quota("Databases per account", 500.0)],
+        ),
+        service(
+            "transfer",
+            "AWS Transfer Family",
+            vec![quota("Servers per Region", 50.0)],
+        ),
+        service(
+            "vpc",
+            "Amazon Virtual Private Cloud (Amazon VPC)",
+            vpc_quotas(),
+        ),
+        service(
+            "vpc-lattice",
+            "Amazon VPC Lattice",
+            vec![quota("Service networks per account", 10.0)],
+        ),
+        service(
+            "wafv2",
+            "AWS WAF",
+            vec![
+                quota("Web ACLs per Region", 100.0),
+                quota("Rule groups per Region", 100.0),
+            ],
+        ),
+        service(
+            "workmail",
+            "Amazon WorkMail",
+            vec![quota("Organizations per account", 5.0)],
+        ),
+        service(
+            "workspaces",
+            "Amazon WorkSpaces",
+            vec![quota("WorkSpaces", 1.0)],
+        ),
+        service(
+            "xray",
+            "AWS X-Ray",
+            vec![quota("Sampling rules", 1000.0)],
+        ),
+    ]
+}
+
+/// The instance families AWS publishes a `Running Dedicated <family> Hosts` quota
+/// for, from EC2's "Service quotas" page. One quota per family is what makes the
+/// EC2 catalog as long as it is: the published EC2 quota list runs to hundreds of
+/// entries, not a handful.
+const DEDICATED_HOST_FAMILIES: &[&str] = &[
+    "a1", "c3", "c4", "c5", "c5a", "c5d", "c5n", "c6a", "c6g", "c6gd", "c6gn", "c6i", "c6id",
+    "c6in", "c7a", "c7g", "c7gd", "c7gn", "c7i", "d2", "d3", "d3en", "dl1", "f1", "f2", "g3",
+    "g3s", "g4ad", "g4dn", "g5", "g5g", "g6", "g6e", "gr6", "h1", "i2", "i3", "i3en", "i4g",
+    "i4i", "im4gn", "inf1", "inf2", "is4gen", "m3", "m4", "m5", "m5a", "m5ad", "m5d", "m5dn",
+    "m5n", "m5zn", "m6a", "m6g", "m6gd", "m6i", "m6id", "m6idn", "m6in", "m7a", "m7g", "m7gd",
+    "m7i", "mac1", "mac2", "p2", "p3", "p3dn", "p4d", "p5", "r3", "r4", "r5", "r5a", "r5ad",
+    "r5b", "r5d", "r5dn", "r5n", "r6a", "r6g", "r6gd", "r6i", "r6id", "r6idn", "r6in", "r7a",
+    "r7g", "r7gd", "r7i", "r7iz", "t3", "trn1", "u-6tb1", "u-9tb1", "u-12tb1", "u-18tb1",
+    "u-24tb1", "vt1", "x1", "x1e", "x2gd", "x2idn", "x2iedn", "x2iezn", "z1d",
+];
+
+/// One instance-family group AWS meters as vCPU quotas.
+struct VcpuGroup {
+    /// The group as the published `Running On-Demand <group> instances` /
+    /// `All <group> Spot Instance Requests` names spell it.
+    group: &'static str,
+    /// The token its CloudWatch `AWS/Usage` `Class` dimension is built from.
+    class: &'static str,
+    /// The default vCPU count AWS publishes for a new account: the Standard group
+    /// starts with a small allowance and the accelerated groups start at zero, which
+    /// is why an increase has to be requested for them.
+    default_vcpus: f64,
+    /// AWS's own `QuotaCode` for the On-Demand quota, where this catalog carries it.
+    on_demand_code: Option<&'static str>,
+    /// AWS's own `QuotaCode` for the Spot quota, where this catalog carries it.
+    spot_code: Option<&'static str>,
+}
+
+/// The instance-family groups AWS meters as vCPU quotas, On-Demand and Spot.
+const VCPU_GROUPS: &[VcpuGroup] = &[
+    VcpuGroup {
+        group: "Standard (A, C, D, H, I, M, R, T, Z)",
+        class: "Standard",
+        default_vcpus: 5.0,
+        on_demand_code: Some("L-1216C47A"),
+        spot_code: Some("L-34B43A08"),
+    },
+    VcpuGroup {
+        group: "DL",
+        class: "DL",
+        default_vcpus: 0.0,
+        on_demand_code: None,
+        spot_code: None,
+    },
+    VcpuGroup {
+        group: "F",
+        class: "F",
+        default_vcpus: 0.0,
+        on_demand_code: None,
+        spot_code: None,
+    },
+    VcpuGroup {
+        group: "G and VT",
+        class: "G",
+        default_vcpus: 0.0,
+        on_demand_code: None,
+        spot_code: None,
+    },
+    VcpuGroup {
+        group: "High Memory",
+        class: "HighMemory",
+        default_vcpus: 0.0,
+        on_demand_code: None,
+        spot_code: None,
+    },
+    VcpuGroup {
+        group: "Inf",
+        class: "Inf",
+        default_vcpus: 0.0,
+        on_demand_code: None,
+        spot_code: None,
+    },
+    VcpuGroup {
+        group: "P",
+        class: "P",
+        default_vcpus: 0.0,
+        on_demand_code: None,
+        spot_code: None,
+    },
+    VcpuGroup {
+        group: "Trn",
+        class: "Trn",
+        default_vcpus: 0.0,
+        on_demand_code: None,
+        spot_code: None,
+    },
+    VcpuGroup {
+        group: "X",
+        class: "X",
+        default_vcpus: 0.0,
+        on_demand_code: None,
+        spot_code: None,
+    },
+];
+
+/// EC2's published quota catalog: the vCPU quotas (On-Demand and Spot) per
+/// instance-family group, one Dedicated Hosts quota per instance family, and the
+/// account-wide resource counts.
+fn ec2_quotas() -> Vec<QuotaRow> {
+    let mut rows = Vec::new();
+
+    for group in VCPU_GROUPS {
+        // The `Class` dimension of the usage metric CloudWatch publishes for a vCPU
+        // quota is the group's token plus the purchase model it meters.
+        let on_demand_class = format!("{}/OnDemand", group.class);
+        let spot_class = format!("{}/Spot", group.class);
+        let mut on_demand = quota(
+            format!("Running On-Demand {} instances", group.group),
+            group.default_vcpus,
+        )
+        .metric(vcpu_usage_metric(&on_demand_class));
+        let mut spot = quota(
+            format!("All {} Spot Instance Requests", group.group),
+            group.default_vcpus,
+        )
+        .metric(vcpu_usage_metric(&spot_class));
+        if let Some(code) = group.on_demand_code {
+            on_demand = on_demand.code(code);
+        }
+        if let Some(code) = group.spot_code {
+            spot = spot.code(code);
+        }
+        rows.push(on_demand);
+        rows.push(spot);
+    }
+
+    // AWS publishes a Dedicated Hosts quota per instance family: two hosts for a
+    // family of shared hardware, one for the single-tenant Mac families.
+    for family in DEDICATED_HOST_FAMILIES {
+        let default_hosts = if family.starts_with("mac") { 1.0 } else { 2.0 };
+        rows.push(quota(
+            format!("Running Dedicated {family} Hosts"),
+            default_hosts,
+        ));
+    }
+
+    rows.extend(ec2_resource_quotas());
+    rows
+}
+
+/// The `AWS/Usage` metric CloudWatch publishes for a vCPU quota: the group's own
+/// `Class` dimension, counted as a resource.
+fn vcpu_usage_metric(class: &str) -> MetricInfo {
+    usage_metric(
+        "EC2",
+        &[("Class", class), ("Resource", "vCPU"), ("Type", "Resource")],
+    )
+}
 /// The service catalog `ListServices` enumerates: every `(ServiceCode,
 /// ServiceName)` pair this emulator knows, and therefore every code
 /// `ListAWSDefaultServiceQuotas` / `ListServiceQuotas` resolve.
@@ -1119,215 +2341,76 @@ const SEED_SERVICE_CATALOG: &[(&str, &str)] = &[
 
 /// The seeded service catalog: [`SEED_SERVICE_CATALOG`], keyed by `ServiceCode` so
 /// `ListServices` pages it in code order and a lookup is exact.
+///
+/// A service the quota catalog carries rows for is listed too, under the name that
+/// table gives it: a service whose quotas this emulator publishes must appear in the
+/// listing a client discovers service codes from, or those quotas are unreachable.
+/// `SEED_SERVICE_CATALOG` is the authority on the name wherever both name a service.
 fn seed_services() -> BTreeMap<String, String> {
-    SEED_SERVICE_CATALOG
+    let mut services: BTreeMap<String, String> = SEED_SERVICE_CATALOG
         .iter()
         .map(|(code, name)| ((*code).to_string(), (*name).to_string()))
-        .collect()
+        .collect();
+    for entry in seed_quota_catalog() {
+        services
+            .entry(entry.code.to_string())
+            .or_insert_with(|| entry.name.to_string());
+    }
+    services
 }
 
-/// The seeded AWS default quotas, keyed by `(ServiceCode, QuotaCode)`.
-///
-/// Quota codes, names, default values and adjustability come from AWS's published
-/// per-service quota pages (the same values `aws service-quotas
-/// get-aws-default-service-quota` reports). `Unit` is `None` for a countable quota,
-/// which is what Service Quotas reports for all but the measured ones.
-///
-/// Coverage is per PAIR, not per service: this table holds the published defaults
-/// this emulator can cite, and nothing is invented to fill a service out. A service
-/// code in [`SEED_SERVICE_CATALOG`] with no pair here therefore has an EMPTY default
-/// quota set, and `ListAWSDefaultServiceQuotas` answers it with HTTP 200 and an empty
-/// `Quotas` list — the code exists, so `NoSuchResourceException` (which belongs to a
-/// code that is not an AWS service code at all) would be the wrong answer. Every
-/// `ServiceCode` used here must be a catalog code; `tests/all/default_quota_catalog.rs`
-/// pins that.
-fn seed_default_quotas() -> BTreeMap<(String, String), DefaultQuota> {
-    let mut quotas = BTreeMap::new();
-    let mut add = |service_code: &str, quota_code: &str, quota: DefaultQuota| {
-        quotas.insert((service_code.to_string(), quota_code.to_string()), quota);
-    };
+/// EC2's account-wide resource quotas: the published EC2 quotas that are neither
+/// vCPU quotas nor Dedicated Hosts quotas.
+fn ec2_resource_quotas() -> Vec<QuotaRow> {
+    vec![
+        quota("EC2-VPC Elastic IPs", 5.0).code("L-0263D0A3"),
+        quota("AMI sharing", 500.0),
+        quota("Launch templates per Region", 5000.0),
+        quota("Versions per launch template", 10000.0),
+        quota("Key pairs per Region", 5000.0),
+        quota("Placement groups per Region", 500.0),
+        quota("Partitions per partition placement group", 7.0).fixed(),
+        quota("Active Spot Fleet requests per Region", 1000.0),
+        quota("Target capacity per Spot Fleet request", 5000.0),
+        quota("Active EC2 Fleets per Region", 1000.0),
+        quota("Target capacity per EC2 Fleet", 5000.0),
+        quota("Attributes per launch template", 300.0).fixed(),
+    ]
+}
 
-    add(
-        "dynamodb",
-        "L-F98FE922",
-        DefaultQuota {
-            quota_name: "Maximum number of tables".to_string(),
-            value: 2500.0,
-            unit: "None".to_string(),
-            adjustable: true,
-            global_quota: false,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            // DynamoDB publishes table count as a CloudWatch usage metric
-            // (`AWS/Usage`, `ResourceCount`, `Resource=TableCount`), which is what
-            // Service Quotas reports as this quota's `UsageMetric`.
-            usage_metric: Some(usage_metric(
-                "DynamoDB",
-                &[
-                    ("Class", "None"),
-                    ("Resource", "TableCount"),
-                    ("Type", "Resource"),
-                ],
-            )),
-            period: None,
-            description: Some(
-                "The maximum number of tables that can be created in this account in the \
-                 current Region."
-                    .to_string(),
-            ),
-        },
-    );
-    add(
-        "ec2",
-        "L-0263D0A3",
-        DefaultQuota {
-            quota_name: "EC2-VPC Elastic IPs".to_string(),
-            value: 5.0,
-            unit: "None".to_string(),
-            adjustable: true,
-            global_quota: false,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            usage_metric: None,
-            period: None,
-            description: None,
-        },
-    );
-    add(
-        "ec2",
-        "L-1216C47A",
-        DefaultQuota {
-            quota_name: "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances"
-                .to_string(),
-            value: 5.0,
-            unit: "None".to_string(),
-            adjustable: true,
-            global_quota: false,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            // The CloudWatch usage metric AWS publishes for the vCPU-based
-            // On-Demand instance quotas.
-            usage_metric: Some(usage_metric(
-                "EC2",
-                &[("Class", "Standard/OnDemand"), ("Resource", "vCPU"), ("Type", "Resource")],
-            )),
-            period: None,
-            description: None,
-        },
-    );
-    add(
-        "lambda",
-        "L-2ACBD22F",
-        DefaultQuota {
-            quota_name: "Function and layer storage".to_string(),
-            value: 75.0,
-            unit: "Gigabytes".to_string(),
-            adjustable: true,
-            global_quota: false,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            usage_metric: None,
-            period: None,
-            description: None,
-        },
-    );
-    add(
-        "lambda",
-        "L-B99A9384",
-        DefaultQuota {
-            quota_name: "Concurrent executions".to_string(),
-            value: 1000.0,
-            unit: "None".to_string(),
-            adjustable: true,
-            global_quota: false,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            usage_metric: Some(usage_metric(
-                "Lambda",
-                &[
-                    ("Class", "None"),
-                    ("Resource", "ConcurrentExecutions"),
-                    ("Type", "Resource"),
-                ],
-            )),
-            period: None,
-            description: None,
-        },
-    );
-    add(
-        "s3",
-        "L-DC2B2D3D",
-        DefaultQuota {
-            quota_name: "General purpose buckets".to_string(),
-            value: 10000.0,
-            unit: "None".to_string(),
-            adjustable: true,
-            // Buckets are counted per account across every region.
-            global_quota: true,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            usage_metric: None,
-            period: None,
-            description: None,
-        },
-    );
-    add(
-        "vpc",
-        "L-045E6E9C",
-        DefaultQuota {
-            quota_name: "Network interfaces per Region".to_string(),
-            value: 5000.0,
-            unit: "None".to_string(),
-            adjustable: true,
-            global_quota: false,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            usage_metric: None,
-            period: None,
-            description: None,
-        },
-    );
-    add(
-        "vpc",
-        "L-085A6257",
-        DefaultQuota {
-            quota_name: "IPv6 CIDR blocks per VPC".to_string(),
-            value: 1.0,
-            unit: "None".to_string(),
-            // AWS publishes this one as not adjustable.
-            adjustable: false,
-            global_quota: false,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            usage_metric: None,
-            period: None,
-            description: None,
-        },
-    );
-    add(
-        "vpc",
-        "L-A4707A72",
-        DefaultQuota {
-            quota_name: "Internet gateways per Region".to_string(),
-            value: 5.0,
-            unit: "None".to_string(),
-            adjustable: true,
-            global_quota: false,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            usage_metric: None,
-            period: None,
-            description: None,
-        },
-    );
-    add(
-        "vpc",
-        "L-F678F1CE",
-        DefaultQuota {
-            quota_name: "VPCs per Region".to_string(),
-            value: 5.0,
-            unit: "None".to_string(),
-            adjustable: true,
-            global_quota: false,
-            adjustable_at_level: LEVEL_ACCOUNT.to_string(),
-            usage_metric: None,
-            period: None,
-            description: None,
-        },
-    );
-
-    quotas
+/// Amazon VPC's published quota catalog.
+fn vpc_quotas() -> Vec<QuotaRow> {
+    vec![
+        // The recorded AWS response for this quota carries all three of the optional
+        // members a `ServiceQuota` can publish: a description, the CloudWatch usage
+        // metric, and a `Period`.
+        quota("VPCs per Region", 5.0)
+            .code("L-F678F1CE")
+            .metric(usage_metric(
+                "VPC",
+                &[("Class", "None"), ("Resource", "VPC"), ("Type", "Resource")],
+            ))
+            .period(5, "MINUTE")
+            .describe("The maximum number of VPCs per Region in this account."),
+        quota("Internet gateways per Region", 5.0).code("L-A4707A72"),
+        quota("Network interfaces per Region", 5000.0).code("L-045E6E9C"),
+        // AWS publishes this one as not adjustable.
+        quota("IPv6 CIDR blocks per VPC", 1.0).code("L-085A6257").fixed(),
+        quota("Subnets per VPC", 200.0),
+        quota("Security groups per VPC", 2500.0),
+        quota("Inbound or outbound rules per security group", 60.0),
+        quota("Security groups per network interface", 5.0),
+        quota("Route tables per VPC", 200.0),
+        quota("Routes per route table", 50.0),
+        quota("Network ACLs per VPC", 200.0),
+        quota("Rules per network ACL", 20.0),
+        quota("NAT gateways per Availability Zone", 5.0),
+        quota("Egress-only internet gateways per Region", 5.0),
+        quota("Active VPC peering connections per VPC", 50.0),
+        quota("Gateway VPC endpoints per Region", 20.0),
+        quota("Interface VPC endpoints per VPC", 50.0),
+        quota("Prefix lists per Region", 100.0),
+    ]
 }
 
 /// A `UsageMetric` in the `AWS/Usage` namespace, the one Service Quotas reports for

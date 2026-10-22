@@ -17,6 +17,11 @@
 //! due, so the value listed here is the value in force at the instant of the call and
 //! does not change on a second read.
 //!
+//! The listing is the service's WHOLE applied-quota list (every quota the catalog
+//! seeded in [`crate::state`] publishes for the service, with any approved increase
+//! laid over it), which for a service such as EC2 runs past the largest page the
+//! model allows, so a walk takes many `NextToken`-chained pages.
+//!
 //! ---
 //!
 //! # Modeled contract for `ListServiceQuotas`
