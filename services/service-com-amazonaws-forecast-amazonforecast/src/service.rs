@@ -45,6 +45,18 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The service key `::emulator_server::service_from_target` reads out of the
+/// `X-Amz-Target` header this service's awsJson1_1 operations carry: that reader takes
+/// the segment before the `.`, strips any trailing `_<version>` suffix and lower-cases
+/// the result, so `AmazonForecast.<OperationName>` (`OPERATIONS.md`, "Request routing")
+/// normalises to this key.
+///
+/// Amazon Forecast Runtime holds the mirror image of this constant, in
+/// `services/service-com-amazonaws-forecastquery-amazonforecastruntime/src/service.rs`,
+/// where it is `amazonforecastruntime`. The two decide ONE split of the shared
+/// `forecast` signing name, so change them together.
+const TARGET_SERVICE_KEY: &str = "amazonforecast";
+
 /// The `com-amazonaws-forecast-amazonforecast` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,12 +86,36 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // TWO services sit behind the ONE SigV4 signing name `forecast`: this control
+        // plane (sdkId `forecast`, endpoint `forecast`, target prefix `AmazonForecast`)
+        // and Amazon Forecast Runtime, the query data plane (sdkId `forecastquery`,
+        // endpoint `forecastquery`, target prefix `AmazonForecastRuntime`). The router's
+        // routing key comes from the SigV4 credential scope first, so both services
+        // resolve to `forecast`: matching on the signing name ALONE makes each one claim
+        // the other's traffic, the router finds two claimants and refuses every
+        // Forecast-signed request with `500 AmbiguousService` — so NEITHER service is
+        // reachable.
+        //
+        // So the claim is narrowed to this service's own modelled wire surface, by the
+        // rule every service under a shared signing name applies: the signing name must
+        // match AND the request must address THIS service. This model is `awsJson1_1`,
+        // an RPC protocol: every operation posts to `/` — the path its runtime peer
+        // posts to as well, so a path test cannot separate them — and names its target
+        // service out of band, in `X-Amz-Target: AmazonForecast.<OperationName>`. That
+        // target is therefore the discriminator, read through the framework's OWN reader
+        // so the parsing rule (strip the operation, strip a trailing `_<version>`,
+        // lower-case) stays in one place — the same rule DynamoDB uses against DynamoDB
+        // Streams and Amazon Personalize against its two data planes, and exactly how
+        // real AWS tells `forecast` traffic from `forecastquery` traffic.
+        //
+        // A request carrying no such target names no operation of this awsJson1_1
+        // service, so it is not this service's traffic.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => {
+                ::emulator_server::service_from_target(&parts.headers).as_deref()
+                    == Some(TARGET_SERVICE_KEY)
+            }
+            _ => false,
         }
     }
 

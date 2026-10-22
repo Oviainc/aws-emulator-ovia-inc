@@ -27,6 +27,8 @@ mod dynamodb_streams_routing;
 mod events_signing_name_routing;
 #[path = "all/events_store_ownership.rs"]
 mod events_store_ownership;
+#[path = "all/forecast_signing_name_routing.rs"]
+mod forecast_signing_name_routing;
 #[path = "all/iam_and_signer_signing_name_routing.rs"]
 mod iam_and_signer_signing_name_routing;
 #[path = "all/iam_role_id_agrees_with_sts.rs"]
