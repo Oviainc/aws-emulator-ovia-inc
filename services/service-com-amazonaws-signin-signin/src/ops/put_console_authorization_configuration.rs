@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutConsoleAuthorizationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutConsoleAuthorizationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutConsoleAuthorizationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists the console-authorization configuration of one target and reports it back.
+//! The model documents the operation as "Enable console authorization configuration with
+//! automatic scope detection": the request carries no state beyond the target, so the put
+//! records console authorization as ENABLED for that target and derives `scope` from the
+//! form of the `targetId` (account id, organization or organizational root). Absent a
+//! `targetId` the target is the caller's own account.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutConsoleAuthorizationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutConsoleAuthorizationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutConsoleAuthorizationConfiguration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutConsoleAuthorizationConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        error: crate::state::SERVER_ERROR_CODE.to_string(),
+                        message: "the signin console authorization store is unavailable"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let target_id = crate::state::requested_target(input.target_id);
+        // "automatic scope detection": the scope follows from which alternative of
+        // `TargetId`'s pattern the target matches. The boundary validator admits only
+        // those three forms, so `None` is unreachable through a modelled request —
+        // and is refused rather than guessed.
+        let Some(scope) = crate::state::scope_for_target(&target_id) else {
+            return Err(
+                PutConsoleAuthorizationConfigurationErrorModeled::ValidationException(
+                    crate::state::validation_failed(format!(
+                        "targetId {target_id:?} is neither an account id, an organization id \
+                         nor an organizational root id"
+                    )),
+                )
+                .into(),
+            );
+        };
+
+        let configuration = crate::state::ConsoleAuthorizationConfiguration {
+            target_id,
+            scope: scope.to_string(),
+            // The operation enables console authorization for the target; disabling it
+            // is `DeleteConsoleAuthorizationConfiguration`, filed as its own issue.
+            console_authorization_enabled: true,
+        };
+
+        let key = configuration.target_id.clone();
+        let mut store = state.lock();
+
+        // The store is bounded by `CONSOLE_AUTHORIZATION_TARGET_QUOTA`, and this check
+        // dominates the insert below: `TargetId`'s key space is effectively unlimited
+        // and this service's release path is not implemented yet, so a put naming a
+        // target the store does NOT already hold is refused once that many distinct
+        // targets are configured. A put naming a stored target is an update, grows
+        // nothing, and is always served.
+        if !store.console_auth_configs.contains_key(&key)
+            && store.console_auth_configs.len() >= crate::state::CONSOLE_AUTHORIZATION_TARGET_QUOTA
+        {
+            return Err(
+                PutConsoleAuthorizationConfigurationErrorModeled::TooManyRequestsError(
+                    crate::state::console_target_quota_exceeded(&key),
+                )
+                .into(),
+            );
+        }
+
+        let (target_id, scope, console_authorization_enabled) = {
+            store.console_auth_configs.insert(key.clone(), configuration);
+            // Read the answer back out of the store, so what this call reports is
+            // what a later `GetConsoleAuthorizationConfiguration` will report.
+            store
+                .console_auth_configs
+                .get(&key)
+                .expect("the configuration just written is in the store")
+                .to_members()
+        };
+
+        Ok(PutConsoleAuthorizationConfigurationOutput {
+            target_id,
+            scope,
+            console_authorization_enabled,
+        })
     }
 }

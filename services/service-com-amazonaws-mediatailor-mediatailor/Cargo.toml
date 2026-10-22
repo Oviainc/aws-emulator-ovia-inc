@@ -21,13 +21,20 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Derives each playback configuration's stable endpoint host label and path id
+# from its ARN.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# Percent-encodes the URI path labels and query values the test's requests carry,
+# rather than carrying a second hand-written encoder. Pinned here rather than
+# through `[workspace.dependencies]` because the root manifest is not editable
+# from a service crate.
+percent-encoding = "2"
 
 [lints]
 workspace = true

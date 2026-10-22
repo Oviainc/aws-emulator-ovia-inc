@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTelemetryRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTelemetryRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTelemetryRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a summary of every telemetry rule [`crate::state`] holds in the region the
+//! request was signed for, one `@paginated` page at a time, narrowed to the rules
+//! whose name starts with `RuleNamePrefix`. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +111,48 @@ impl From<ListTelemetryRulesErrorModeled> for ListTelemetryRulesError {
     }
 }
 
+/// The largest page this operation will ever build, and the page size applied when
+/// the request omits `MaxResults`.
+///
+/// It is the maximum of the modelled `ListTelemetryRulesMaxResults` range (1..100),
+/// which the centralized walk already refuses values outside of — but this handler
+/// does not depend on that: the size is clamped to this constant here, so the page it
+/// allocates is decided by the server, never by the request.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// A page token naming the rule the NEXT page starts at.
+///
+/// `NextToken` is modelled opaque, so the rule name is hex-encoded rather than handed
+/// back in the clear — this makes the token opaque to a caller, not secret: hex is
+/// trivially reversible and the token carries nothing beyond a rule name.
+fn encode_page_token(rule_name: &str) -> String {
+    hex::encode(rule_name)
+}
+
+/// The rule name a page token names, or a 400 refusal when the token is not one this
+/// operation issued — which it can tell because the name it carries has to satisfy
+/// the modelled `RuleName` length and pattern.
+fn decode_page_token(token: &str) -> Result<String, ListTelemetryRulesError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|name| {
+            (1..=100).contains(&name.chars().count())
+                && name.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'#' | b'/')
+                })
+        })
+        .ok_or_else(|| {
+            ListTelemetryRulesErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "NextToken is not a pagination token issued by ListTelemetryRules".to_string(),
+                ),
+                ..Default::default()
+            })
+            .into()
+        })
+}
+
 /// The `ListTelemetryRules` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +189,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTelemetryRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTelemetryRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTelemetryRules"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTelemetryRulesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the telemetry rule store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+
+        // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
+        // whatever the request asked for, so no allocation below is sized by input.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
+            requested.clamp(1, MAX_PAGE_SIZE as i32) as usize
+        });
+        let start = input
+            .next_token
+            .as_deref()
+            .map(decode_page_token)
+            .transpose()?;
+        let prefix = input.rule_name_prefix.unwrap_or_default();
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_epoch_millis();
+
+        let store = state.lock();
+        // The store is keyed by (region, RuleName), so one region's rules are one
+        // contiguous, name-ordered run: the page starts at the name the token named
+        // and stops at the first key of another region.
+        let page_start = start.unwrap_or_default();
+        let remaining = store
+            .telemetry_rules
+            .range((region.clone(), page_start)..)
+            .take_while(|((rule_region, _), _)| *rule_region == region)
+            .filter(|(_, record)| record.exists_at(now) && record.rule_name.starts_with(&prefix));
+
+        // Reserve no more than the store can actually yield.
+        let mut telemetry_rule_summaries =
+            Vec::with_capacity(page_size.min(store.telemetry_rules.len()));
+        let mut next_token = None;
+        for ((_, rule_name), record) in remaining {
+            // The first rule that does not fit becomes the next page's start, and
+            // only then is a `NextToken` emitted — the last page carries none.
+            if telemetry_rule_summaries.len() == page_size {
+                next_token = Some(encode_page_token(rule_name));
+                break;
+            }
+            telemetry_rule_summaries.push(record.summary());
+        }
+
+        Ok(ListTelemetryRulesOutput {
+            telemetry_rule_summaries: Some(telemetry_rule_summaries),
+            next_token,
+        })
     }
 }

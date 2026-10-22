@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutPlaybackConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutPlaybackConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutPlaybackConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: creates or replaces the playback configuration named by `Name` in
+//! [`crate::state`] and answers with the PERSISTED record — the members the request
+//! carried, plus the ARN and the endpoint prefixes this service derives when it mints
+//! the configuration. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -221,8 +216,11 @@
 //!   Yield Optimization, which fills unsold ad inventory in ad breaks with programmatic ads
 //!   from Amazon Publisher Services (APS).
 
+use std::collections::{BTreeMap, HashMap};
+
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{tag_set_violation, PlaybackConfigurationRecord, PlaybackConfigurationView};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -230,19 +228,25 @@ use super::types::*;
 // `PutPlaybackConfigurationError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mediatailor-mediatailor.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutPlaybackConfigurationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mediatailor#PutPlaybackConfiguration")]
+/// This operation's modelled failures.
+///
+/// The model lists no error on `PutPlaybackConfiguration` itself, so
+/// `BadRequestException` — the one client error this SERVICE declares ("A
+/// request contains unexpected data", HTTP 400) — is widened in with
+/// `extra_errors` to refuse a request the model's own constraints cannot
+/// express.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mediatailor#PutPlaybackConfiguration",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum PutPlaybackConfigurationErrorModeled {
+    BadRequestException(BadRequestException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::put_playback_configuration::PutPlaybackConfigurationError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// (`crate::ops::put_playback_configuration::PutPlaybackConfigurationError`). The wrapper is kept
+/// for the `validation` refusal channel it carries.
 pub type PutPlaybackConfigurationError = crate::scaffolded::Scaffolded<PutPlaybackConfigurationErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
@@ -252,6 +256,141 @@ pub type PutPlaybackConfigurationError = crate::scaffolded::Scaffolded<PutPlayba
 impl From<PutPlaybackConfigurationErrorModeled> for PutPlaybackConfigurationError {
     fn from(modeled: PutPlaybackConfigurationErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// `InsertionMode`'s modelled `@default`, applied when the request omits the
+/// member (`smithy_query(query="operation",operation="PutPlaybackConfiguration")`:
+/// `InsertionMode` has `default: "STITCHED_ONLY"`).
+const DEFAULT_INSERTION_MODE: &str = "STITCHED_ONLY";
+
+/// `DashConfiguration$MpdLocation`'s documented default: "Valid values are
+/// `DISABLED` and `EMT_DEFAULT`. The `EMT_DEFAULT` setting enables the inclusion
+/// of the tag and is the default value."
+const DEFAULT_MPD_LOCATION: &str = "EMT_DEFAULT";
+
+/// `DashConfiguration$OriginManifestType`'s documented default: "The default
+/// setting is `MULTI_PERIOD`."
+const DEFAULT_ORIGIN_MANIFEST_TYPE: &str = "MULTI_PERIOD";
+
+/// The region an ARN this request mints is scoped to: the region the caller
+/// signed for, which is the region whose endpoint the request addressed.
+/// Emulators default to `us-east-1` when the request carries no SigV4 scope.
+fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| "us-east-1".to_string())
+}
+
+/// Why the configuration this request would store cannot be held, or `None`
+/// when it can.
+///
+/// One stored record must not be unbounded in the size a caller chooses for it,
+/// so the members that carry a documented maximum are held to it and the
+/// caller-sized maps are held to the bounds in [`crate::state`]. Members the
+/// model constrains itself (`PersonalizationThresholdSeconds`' range, the
+/// enums) are already refused by the boundary validator before this runs.
+fn stored_size_violation(input: &PutPlaybackConfigurationInput) -> Option<String> {
+    if let Some(url) = input.ad_decision_server_url.as_deref() {
+        if url.chars().count() > crate::state::MAX_AD_DECISION_SERVER_URL_LENGTH {
+            return Some(format!(
+                "AdDecisionServerUrl is at most {} characters",
+                crate::state::MAX_AD_DECISION_SERVER_URL_LENGTH
+            ));
+        }
+    }
+    if let Some(url) = input.video_content_source_url.as_deref() {
+        if url.chars().count() > crate::state::MAX_VIDEO_CONTENT_SOURCE_URL_LENGTH {
+            return Some(format!(
+                "VideoContentSourceUrl is at most {} characters",
+                crate::state::MAX_VIDEO_CONTENT_SOURCE_URL_LENGTH
+            ));
+        }
+    }
+    if let Some(aliases) = input.configuration_aliases.as_ref() {
+        if aliases.len() > crate::state::MAX_CONFIGURATION_ALIAS_VARIABLES {
+            return Some(format!(
+                "ConfigurationAliases carries aliases for at most {} dynamic variables",
+                crate::state::MAX_CONFIGURATION_ALIAS_VARIABLES
+            ));
+        }
+        for (variable, values) in aliases {
+            if values.len() > crate::state::MAX_ALIASES_PER_VARIABLE {
+                return Some(format!(
+                    "ConfigurationAliases carries at most {} aliases for one dynamic variable: {variable}",
+                    crate::state::MAX_ALIASES_PER_VARIABLE
+                ));
+            }
+        }
+    }
+    if let Some(mapping) = input.function_mapping.as_ref() {
+        // `FunctionMapping`'s key targets the `EventName` enum, so the lifecycle
+        // hooks it can name are exactly those four values — which is also what
+        // bounds the map's size.
+        for event in mapping.keys() {
+            if !EVENT_NAME_VALUES.contains(&event.as_str()) {
+                return Some(format!(
+                    "FunctionMapping keys are the lifecycle hooks {}: {event}",
+                    EVENT_NAME_VALUES.join(", ")
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The per-configuration identifiers MediaTailor's generated playback endpoints
+/// carry: a host label and a path id, both derived from the configuration's ARN
+/// so they are stable for the life of the configuration and distinct between
+/// configurations. The lengths are the ones the documented endpoint form uses
+/// (a 28-character host label and a 40-character path id), and the two are
+/// hashed from domain-separated inputs so neither can be read off the other.
+fn endpoint_ids(arn: &str) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let digest = |input: String| hex::encode(Sha256::digest(input.as_bytes()));
+    let host_label = digest(format!("{arn}#endpoint-host"));
+    let path_id = digest(format!("{arn}#endpoint-path"));
+    (host_label[..28].to_string(), path_id[..40].to_string())
+}
+
+/// The endpoint prefixes the service derives for a configuration.
+struct Endpoints {
+    playback: String,
+    dual_stack_playback: String,
+    session_initialization: String,
+    dual_stack_session_initialization: String,
+    hls_manifest: String,
+    dual_stack_hls_manifest: String,
+    dash_manifest: String,
+    dual_stack_dash_manifest: String,
+}
+
+impl Endpoints {
+    /// Build every endpoint prefix for `name` in `region` from the stable ids of
+    /// `arn`.
+    ///
+    /// The single-stack host is the service's regional endpoint
+    /// (`mediatailor.<region>.amazonaws.com`); the dual-stack host is the
+    /// dual-stack endpoint the model declares for the `aws` partition
+    /// (`standardRegionalEndpoints.partitionSpecialCases.aws`:
+    /// `https://mediatailor.{region}.{dualStackDnsSuffix}`, whose suffix is
+    /// `api.aws`). The paths are the documented session (`/v1/session/..`), HLS
+    /// (`/v1/master/..`) and DASH (`/v1/dash/..`) prefixes.
+    fn derive(arn: &str, name: &str, region: &str) -> Self {
+        let (host_label, path_id) = endpoint_ids(arn);
+        let host = format!("https://{host_label}.mediatailor.{region}.amazonaws.com");
+        let dual_stack_host = format!("https://{host_label}.mediatailor.{region}.api.aws");
+        let path = |kind: &str| format!("/v1/{kind}/{path_id}/{name}/");
+        Self {
+            playback: host.clone(),
+            dual_stack_playback: dual_stack_host.clone(),
+            session_initialization: format!("{host}{}", path("session")),
+            dual_stack_session_initialization: format!("{dual_stack_host}{}", path("session")),
+            hls_manifest: format!("{host}{}", path("master")),
+            dual_stack_hls_manifest: format!("{dual_stack_host}{}", path("master")),
+            dash_manifest: format!("{host}{}", path("dash")),
+            dual_stack_dash_manifest: format!("{dual_stack_host}{}", path("dash")),
+        }
     }
 }
 
@@ -291,18 +430,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutPlaybackConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutPlaybackConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutPlaybackConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in this emulator: the router builds one
+            // `InMemoryEngine` and hands it to every operation. Without the
+            // store there is no configuration to persist or report, so answer
+            // the scaffold's 501 rather than a response nothing backs.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutPlaybackConfiguration",
+            ));
+        };
+
+        // `Name` is this configuration's identifier: it keys the store, it is
+        // the last segment of the ARN, and it is the `@httpLabel` of every other
+        // playback-configuration route. A value that is empty, or that carries
+        // the URI path separator, can therefore address no configuration.
+        if input.name.is_empty() || input.name.contains('/') {
+            return Err(PutPlaybackConfigurationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "Name must be a non-empty identifier that contains no '/': {}",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let insertion_mode = if input.insertion_mode.is_empty() {
+            DEFAULT_INSERTION_MODE.to_string()
+        } else {
+            input.insertion_mode.clone()
+        };
+        if !INSERTION_MODE_VALUES.contains(&insertion_mode.as_str()) {
+            return Err(PutPlaybackConfigurationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "InsertionMode must be one of {}: {insertion_mode}",
+                        INSERTION_MODE_VALUES.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Everything this configuration would store is bounded before any of it
+        // is stored: the lengths the model documents for the two URL members
+        // that declare one, the size of the caller-sized alias and
+        // function-mapping maps, and the modelled key set of `FunctionMapping`.
+        if let Some(violation) = stored_size_violation(&input) {
+            return Err(PutPlaybackConfigurationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(violation),
+                },
+            )
+            .into());
+        }
+
+        // The tag set this request would leave on the resource: `Tags` replaces
+        // the stored set, and a request that omits the member says nothing about
+        // tags, so the resource keeps the ones it has.
+        let replacement_tags: Option<BTreeMap<String, String>> = input
+            .tags
+            .as_ref()
+            .map(|tags| tags.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+        if let Some(violation) = replacement_tags.as_ref().and_then(tag_set_violation) {
+            return Err(PutPlaybackConfigurationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(violation),
+                },
+            )
+            .into());
+        }
+
+        let region = request_region(ctx);
+        let arn = ::engine::emulator_arn(
+            "mediatailor",
+            &region,
+            &format!("playbackConfiguration/{}", input.name),
+        );
+        let endpoints = Endpoints::derive(&arn, &input.name, &region);
+
+        let mut store = state.lock();
+
+        // The store holds a bounded number of configurations, so a caller cannot
+        // grow it without end on request-chosen names. Replacing one that is
+        // already stored consumes no further capacity; `Delete` releases it.
+        if !store.can_hold_configuration(&input.name) {
+            return Err(PutPlaybackConfigurationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!(
+                        "this emulator holds at most {} playback configurations; delete one before creating {}",
+                        crate::state::MAX_PLAYBACK_CONFIGURATIONS,
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Create-or-replace, keyed by `Name`: a second Put under the same name
+        // updates the configuration in place. Only the log settings survive the
+        // replacement — they are owned by the logging operations, not by this
+        // one, so a Put that does not mention them must not reset them.
+        let log_configuration = store
+            .playback_configurations
+            .get(&input.name)
+            .map(|existing| existing.log_configuration.clone())
+            .unwrap_or_default();
+
+        let record = PlaybackConfigurationRecord {
+            name: input.name.clone(),
+            arn: arn.clone(),
+            ad_decision_server_url: input.ad_decision_server_url,
+            video_content_source_url: input.video_content_source_url,
+            slate_ad_url: input.slate_ad_url,
+            transcode_profile_name: input.transcode_profile_name,
+            insertion_mode,
+            personalization_threshold_seconds: input.personalization_threshold_seconds,
+            cdn_configuration: input.cdn_configuration,
+            dash_configuration: Some(DashConfiguration {
+                manifest_endpoint_prefix: Some(endpoints.dash_manifest),
+                dual_stack_manifest_endpoint_prefix: Some(endpoints.dual_stack_dash_manifest),
+                mpd_location: input
+                    .dash_configuration
+                    .as_ref()
+                    .and_then(|dash| dash.mpd_location.clone())
+                    .or_else(|| Some(DEFAULT_MPD_LOCATION.to_string())),
+                origin_manifest_type: input
+                    .dash_configuration
+                    .as_ref()
+                    .and_then(|dash| dash.origin_manifest_type.clone())
+                    .or_else(|| Some(DEFAULT_ORIGIN_MANIFEST_TYPE.to_string())),
+            }),
+            hls_configuration: Some(HlsConfiguration {
+                manifest_endpoint_prefix: Some(endpoints.hls_manifest),
+                dual_stack_manifest_endpoint_prefix: Some(endpoints.dual_stack_hls_manifest),
+            }),
+            manifest_processing_rules: input.manifest_processing_rules,
+            avail_suppression: input.avail_suppression,
+            bumper: input.bumper,
+            configuration_aliases: input.configuration_aliases,
+            live_pre_roll_configuration: input.live_pre_roll_configuration,
+            ad_conditioning_configuration: input.ad_conditioning_configuration,
+            ad_decision_server_configuration: input.ad_decision_server_configuration,
+            yield_optimization_configuration: input.yield_optimization_configuration,
+            function_mapping: input.function_mapping,
+            ads_personalization_timeouts: input.ads_personalization_timeouts,
+            ads_personalization_concurrency: input.ads_personalization_concurrency,
+            beaconing_configuration: input.beaconing_configuration,
+            log_configuration,
+            playback_endpoint_prefix: endpoints.playback,
+            dual_stack_playback_endpoint_prefix: endpoints.dual_stack_playback,
+            session_initialization_endpoint_prefix: endpoints.session_initialization,
+            dual_stack_session_initialization_endpoint_prefix: endpoints
+                .dual_stack_session_initialization,
+        };
+
+        // Tags are stored once, under the resource's ARN, so `TagResource` and
+        // the playback-configuration reads see one tag set. An EMPTY `Tags` map
+        // is a tag set with nothing in it, so it clears the resource's tags.
+        if let Some(tags) = replacement_tags {
+            if tags.is_empty() {
+                store.tags_by_arn.remove(&arn);
+            } else {
+                store.tags_by_arn.insert(arn.clone(), tags);
+            }
+        }
+
+        store
+            .playback_configurations
+            .insert(input.name.clone(), record.clone());
+        let tags: Option<HashMap<String, String>> = store.tags_of(&arn);
+
+        Ok(PutPlaybackConfigurationOutput::from_record(&record, tags))
     }
 }

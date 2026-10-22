@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePermissionStatement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePermissionStatement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePermissionStatement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one permission statement of the account's SignIn resource-based policy from the
+//! condition members the request carries, stores it, and returns the id it stored.
+//! `@idempotent` with an `@idempotencyToken`: a repeated put under one `clientToken`
+//! answers with the statement that token first created.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +172,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePermissionStatement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePermissionStatementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePermissionStatement"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutResourcePermissionStatementErrorModeled::InternalServerException(
+                    InternalServerException {
+                        error: crate::state::SERVER_ERROR_CODE.to_string(),
+                        message: "the signin permission statement store is unavailable"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The one cross-member rule the model cannot express, stated by
+        // `requestedRegion`'s own documentation: "AWS region where the VPC and VPC
+        // endpoint reside Required when sourceVpc or signinSourceVpce/consoleSourceVpce
+        // is provided."
+        let names_vpc_network = input.source_vpc.is_some()
+            || input.signin_source_vpce.is_some()
+            || input.console_source_vpce.is_some();
+        if names_vpc_network && input.requested_region.is_none() {
+            return Err(
+                PutResourcePermissionStatementErrorModeled::ValidationException(
+                    crate::state::validation_failed(
+                        "requestedRegion is required when sourceVpc, signinSourceVpce or \
+                         consoleSourceVpce is provided",
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: the same token names the same statement, so a retried
+        // put reports the first one rather than minting a second. A token whose
+        // statement has since been deleted names nothing, and mints a new one.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.statement_idempotency.get(token))
+            .filter(|id| store.permission_statements.contains_key(id.as_str()))
+            .cloned();
+        if let Some(statement_id) = replayed {
+            return Ok(PutResourcePermissionStatementOutput { statement_id });
+        }
+
+        // The store is bounded: past its quota a put is refused rather than adding
+        // another record. `ServiceQuotaExceededException` is the modelled refusal for
+        // exactly this.
+        if store.permission_statements.len() >= crate::state::PERMISSION_STATEMENT_QUOTA {
+            return Err(
+                PutResourcePermissionStatementErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        error: crate::state::QUOTA_ERROR_CODE.to_string(),
+                        message: format!(
+                            "the SignIn resource-based policy of account {} already holds the \
+                             maximum of {} permission statements",
+                            ::engine::emulator_account_id(),
+                            crate::state::PERMISSION_STATEMENT_QUOTA
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let statement_id = store.mint_statement_id();
+        let statement = crate::state::PermissionStatement {
+            statement_id: statement_id.clone(),
+            source_vpc: input.source_vpc,
+            signin_source_vpce: input.signin_source_vpce,
+            console_source_vpce: input.console_source_vpce,
+            vpc_source_ip: input.vpc_source_ip,
+            source_ip: input.source_ip,
+            requested_region: input.requested_region,
+            excluded_principal: input.excluded_principal,
+        };
+        store
+            .permission_statements
+            .insert(statement_id.clone(), statement);
+        if let Some(token) = input.client_token {
+            store
+                .statement_idempotency
+                .insert(token, statement_id.clone());
+        }
+
+        Ok(PutResourcePermissionStatementOutput { statement_id })
     }
 }
