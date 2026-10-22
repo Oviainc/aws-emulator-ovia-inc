@@ -9,7 +9,7 @@
 //! built-in deployment configurations once, and materialising the deployment
 //! transitions the clock already owes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -106,6 +106,40 @@ pub const MAX_DEPLOYMENT_GROUPS_PER_APPLICATION: usize = 1_000;
 /// is applied as RETENTION: creating a deployment past it drops the oldest
 /// deployments, oldest first, so a caller cannot grow the store without limit.
 pub const MAX_DEPLOYMENT_HISTORY: usize = 500;
+
+/// How many on-premises instance names one call may name, the bound
+/// `InstanceLimitExceededException` ("The maximum number of allowed on-premises
+/// instances in a single call was exceeded") answers.
+///
+/// CodeDeploy's API reference states a 100-name limit for the sibling batch
+/// call over the same resource (`BatchGetOnPremisesInstances`), so the same 100
+/// is applied here; for THIS call the number is CHOSEN to agree with that batch
+/// limit, and enforcing it keeps one call's work bounded.
+pub const MAX_INSTANCE_NAMES_PER_CALL: usize = 100;
+
+/// How many tags one on-premises instance may carry, the bound
+/// `TagLimitExceededException` answers.
+///
+/// CodeDeploy publishes no per-instance tag count this emulator can cite, so
+/// this bound is CHOSEN at the 50 tags per resource AWS's own tagging guidance
+/// uses; enforcing it is also what keeps a stored instance from growing without
+/// limit on repeated `AddTagsToOnPremisesInstances` calls.
+pub const MAX_TAGS_PER_ON_PREMISES_INSTANCE: usize = 50;
+
+/// A tag's key and value, or `None` when the tag is not one CodeDeploy accepts.
+///
+/// The model states the rule for the tags of an on-premises instance: "Keys and
+/// values are both required. Keys cannot be null or empty strings. Value-only
+/// tags are not allowed."
+/// (`smithy_query(query="doc",shape="AddTagsToOnPremisesInstancesInput",member="tags")`),
+/// so a tag missing either member, or carrying an empty key, is refused with the
+/// operation's `InvalidTagException`. An empty VALUE is accepted: only keys are
+/// documented as unable to be empty.
+pub fn tag_key_value(tag: &Tag) -> Option<(&str, &str)> {
+    let key = tag.key.as_deref()?;
+    let value = tag.value.as_deref()?;
+    (!key.is_empty()).then_some((key, value))
+}
 
 /// How many on-premises instance records the store keeps.
 ///
@@ -243,6 +277,41 @@ impl OnPremisesInstance {
     /// Registered | Deregistered) distinguishes the two.
     pub fn is_registered(&self) -> bool {
         self.deregister_time_ms.is_none()
+    }
+
+    /// How many tags this instance would carry once `tags` were added: a tag
+    /// REPLACES the value of a key the instance already carries rather than
+    /// adding a second entry for it, so only genuinely new keys count.
+    ///
+    /// Set-keyed rather than list-scanned, so the cost is linear in the number
+    /// of keys rather than quadratic in it; both sides are bounded anyway
+    /// ([`MAX_TAGS_PER_ON_PREMISES_INSTANCE`] stored, and the same bound on a
+    /// request's tag list, which a tagging request is refused against BEFORE
+    /// this runs).
+    pub fn projected_tag_count(&self, tags: &[(&str, &str)]) -> usize {
+        let known: HashSet<&str> = self.tags.iter().filter_map(|tag| tag.key.as_deref()).collect();
+        let added: HashSet<&str> = tags
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| !known.contains(key))
+            .collect();
+        self.tags.len() + added.len()
+    }
+
+    /// Set `key` to `value`, replacing the value of a key already present so an
+    /// instance never carries two entries for one key.
+    pub fn set_tag(&mut self, key: &str, value: &str) {
+        match self
+            .tags
+            .iter_mut()
+            .find(|tag| tag.key.as_deref() == Some(key))
+        {
+            Some(existing) => existing.value = Some(value.to_string()),
+            None => self.tags.push(Tag {
+                key: Some(key.to_string()),
+                value: Some(value.to_string()),
+            }),
+        }
     }
 }
 

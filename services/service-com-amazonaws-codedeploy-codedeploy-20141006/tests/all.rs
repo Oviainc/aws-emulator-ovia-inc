@@ -17,6 +17,8 @@ mod codedeploy_lifecycle;
 mod git_hub_account_token_names;
 #[path = "all/on_premises_instances.rs"]
 mod on_premises_instances;
+#[path = "all/on_premises_tagging.rs"]
+mod on_premises_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stop_deployment.rs"]
