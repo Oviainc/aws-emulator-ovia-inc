@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkspaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkspaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkspaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: each accepted `WorkspaceRequest` is persisted in this service's state
+//! with a freshly minted `WorkspaceId` and reported in `PendingRequests`; a request that
+//! cannot be created is reported per item in `FailedRequests`.
 //!
 //! ## Shape of an operation
 //!
@@ -93,11 +88,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `CreateWorkspacesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#CreateWorkspaces")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#CreateWorkspaces",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateWorkspacesErrorModeled {
     InvalidParameterValuesException(InvalidParameterValuesException),
     ResourceLimitExceededException(ResourceLimitExceededException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -151,18 +154,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkspaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkspacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkspaces"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWorkspacesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        // Clear any lifecycle transition the clock already owes before judging
+        // whether a directory slot is still occupied.
+        state.settle();
+
+        let mut pending_requests = Vec::new();
+        let mut failed_requests = Vec::new();
+        for request in &input.workspaces {
+            match state.create_workspace(request) {
+                Ok(record) => pending_requests.push(record.to_workspace()),
+                Err((error_code, error_message)) => {
+                    failed_requests.push(FailedCreateWorkspaceRequest {
+                        workspace_request: Some(request.clone()),
+                        error_code: Some(error_code.to_string()),
+                        error_message: Some(error_message),
+                    });
+                }
+            }
+        }
+
+        Ok(CreateWorkspacesOutput {
+            failed_requests: Some(failed_requests),
+            pending_requests: Some(pending_requests),
+        })
     }
 }

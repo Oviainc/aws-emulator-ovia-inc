@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartWorkspaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartWorkspaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartWorkspaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: each stored WorkSpace that is `STOPPED` enters `STARTING` and settles to
+//! `AVAILABLE`; every other request is reported per item in `FailedRequests`.
 //!
 //! ## Shape of an operation
 //!
@@ -76,9 +70,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `StartWorkspacesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#StartWorkspaces")]
+// This operation models no errors of its own, so `InternalServerException` is widened
+// in with `extra_errors`: the service models it ("Unexpected server error occured.")
+// and it is the only shape that can carry the one fault this handler can hit — the
+// engine not being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#StartWorkspaces",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum StartWorkspacesErrorModeled {
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -132,18 +134,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartWorkspaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartWorkspacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartWorkspaces"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartWorkspacesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        // A transition the clock already owes decides whether a WorkSpace can be
+        // started now, so materialise those first.
+        state.settle();
+
+        let mut failed_requests = Vec::new();
+        for request in &input.start_workspace_requests {
+            // `StartRequest$WorkspaceId` is optional in the model; a request that
+            // names no WorkSpace identifies nothing to start.
+            let Some(workspace_id) = request.workspace_id.as_deref() else {
+                failed_requests.push(FailedWorkspaceChangeRequest {
+                    workspace_id: None,
+                    error_code: Some(crate::state::ERROR_CODE_INVALID_PARAMETERS.to_string()),
+                    error_message: Some("WorkspaceId must be specified.".to_string()),
+                });
+                continue;
+            };
+            if let Err((error_code, error_message)) = state.request_start(workspace_id) {
+                failed_requests.push(FailedWorkspaceChangeRequest {
+                    workspace_id: Some(workspace_id.to_string()),
+                    error_code: Some(error_code.to_string()),
+                    error_message: Some(error_message),
+                });
+            }
+        }
+
+        Ok(StartWorkspacesOutput {
+            failed_requests: Some(failed_requests),
+        })
     }
 }

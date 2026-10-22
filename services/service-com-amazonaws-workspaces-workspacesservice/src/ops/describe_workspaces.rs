@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeWorkspaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeWorkspaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeWorkspaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the WorkSpaces this service has persisted, filtered by the one
+//! filter the request names and paginated over creation order.
 //!
 //! ## Shape of an operation
 //!
@@ -103,11 +97,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `DescribeWorkspacesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#DescribeWorkspaces")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#DescribeWorkspaces",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DescribeWorkspacesErrorModeled {
     InvalidParameterValuesException(InvalidParameterValuesException),
     ResourceUnavailableException(ResourceUnavailableException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -161,18 +163,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeWorkspaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeWorkspacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeWorkspaces"))
+        let _ = ctx;
+
+        // "You can filter the results by using the bundle identifier, directory
+        // identifier, or owner, but you can specify only one filter at a time" — and
+        // each of WorkspaceIds / DirectoryId / BundleId / WorkspaceName documents
+        // "You cannot combine this parameter with any other filter".
+        let exclusive = [
+            ("WorkspaceIds", input.workspace_ids.is_some()),
+            ("DirectoryId", input.directory_id.is_some()),
+            ("BundleId", input.bundle_id.is_some()),
+            ("WorkspaceName", input.workspace_name.is_some()),
+        ];
+        let named: Vec<&str> = exclusive
+            .iter()
+            .filter(|(_, present)| *present)
+            .map(|(name, _)| *name)
+            .collect();
+        if named.len() > 1 {
+            return Err(DescribeWorkspacesErrorModeled::InvalidParameterValuesException(
+                InvalidParameterValuesException {
+                    message: Some(format!(
+                        "Only one filter can be specified at a time, but {} were specified.",
+                        named.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+        // `UserName`: "You must specify this parameter with DirectoryId."
+        if input.user_name.is_some() && input.directory_id.is_none() {
+            return Err(DescribeWorkspacesErrorModeled::InvalidParameterValuesException(
+                InvalidParameterValuesException {
+                    message: Some("UserName must be specified with DirectoryId.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The token names the last WorkSpace the previous page reported, by its
+        // creation sequence; this page resumes strictly after it.
+        let after_seq = match input.next_token.as_deref() {
+            Some(token) => crate::state::decode_page_token(token).ok_or_else(|| {
+                DescribeWorkspacesErrorModeled::InvalidParameterValuesException(
+                    InvalidParameterValuesException {
+                        message: Some("The NextToken value is not valid.".to_string()),
+                    },
+                )
+            })?,
+            None => 0,
+        };
+        // `Limit` is `range 1..25`, so request validation refuses anything outside
+        // that; a value that still does not convert is refused here rather than
+        // silently answered with a default-sized page.
+        let limit = match input.limit {
+            Some(limit) => usize::try_from(limit).map_err(|_| {
+                DescribeWorkspacesErrorModeled::InvalidParameterValuesException(
+                    InvalidParameterValuesException {
+                        message: Some(format!(
+                            "The Limit value {limit} is not valid; Limit must be between 1 and 25."
+                        )),
+                    },
+                )
+            })?,
+            None => crate::state::DEFAULT_DESCRIBE_PAGE_SIZE,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeWorkspacesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+        // Reporting only: this materialises the lifecycle transitions the clock
+        // already owes (PENDING -> AVAILABLE, STOPPING -> STOPPED, a completed
+        // termination), each of which was due at this instant whether or not
+        // anybody called.
+        state.settle();
+
+        let matched: Vec<&crate::state::WorkspaceRecord> = state
+            .ordered_workspaces()
+            .into_iter()
+            .filter(|record| {
+                input
+                    .workspace_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&record.workspace_id))
+                    && input
+                        .directory_id
+                        .as_ref()
+                        .is_none_or(|id| *id == record.directory_id)
+                    && input
+                        .bundle_id
+                        .as_ref()
+                        .is_none_or(|id| *id == record.bundle_id)
+                    && input
+                        .workspace_name
+                        .as_ref()
+                        .is_none_or(|name| record.workspace_name.as_deref() == Some(name.as_str()))
+                    // `WorkspaceRequest$UserName`: "The username is not
+                    // case-sensitive", so neither is filtering on it.
+                    && input.user_name.as_ref().is_none_or(|name| {
+                        name.to_lowercase() == record.user_name.to_lowercase()
+                    })
+            })
+            .collect();
+
+        // Resume strictly after the WorkSpace the token names, and report a token
+        // only when a matching WorkSpace is left beyond this page.
+        let mut remaining = matched.into_iter().filter(|record| record.seq > after_seq);
+        let page_records: Vec<&crate::state::WorkspaceRecord> =
+            remaining.by_ref().take(limit).collect();
+        let more_to_come = remaining.next().is_some();
+        let next_token = page_records
+            .last()
+            .filter(|_| more_to_come)
+            .map(|record| crate::state::encode_page_token(record.seq));
+        let page: Vec<Workspace> = page_records
+            .iter()
+            .map(|record| record.to_workspace())
+            .collect();
+
+        Ok(DescribeWorkspacesOutput {
+            workspaces: Some(page),
+            next_token,
+        })
     }
 }
