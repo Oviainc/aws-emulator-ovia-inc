@@ -3,25 +3,25 @@
 //! Engine state for the com-amazonaws-efs-magnolioapiservice-v20150201 service.
 //!
 //! One lock-guarded struct per engine, reached through [`service_state`]. It holds the
-//! file systems, the creation tokens they were made idempotent by, their mount targets,
-//! and the VPC/subnet facts a mount target description is built from — plus the counter
-//! every `fs-`/`fsmt-`/`eni-`/`vpc-` id is minted from.
+//! file systems, the creation tokens they were made idempotent by, their mount targets
+//! and access points, and the VPC/subnet facts a mount target description is built from
+//! — plus the counter every `fs-`/`fsmt-`/`fsap-`/`eni-`/`vpc-` id is minted from.
 //!
 //! The record types here are the single source of every description this service
-//! returns: `FileSystem::describe` and `MountTarget::describe` build the modelled
-//! output shape, so a create and a later describe cannot disagree.
+//! returns: `FileSystem::describe`, `MountTarget::describe` and `AccessPoint::describe`
+//! build the modelled output shape, so a create and a later describe cannot disagree.
 //!
 //! The request-derived error MESSAGES are built here too ([`does_not_exist`],
 //! [`file_system_already_exists_message`]), for the same reason: every operation that
 //! resolves an id refuses with one sentence construction instead of its own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CreateFileSystemOutput, CreateMountTargetOutput, CreateReplicationConfigurationOutput,
-    Destination, FileSystemSize, LifecyclePolicy, Tag, UpdateFileSystemOutput,
-    UpdateFileSystemProtectionOutput,
+    CreateAccessPointOutput, CreateFileSystemOutput, CreateMountTargetOutput,
+    CreateReplicationConfigurationOutput, Destination, FileSystemSize, LifecyclePolicy, PosixUser,
+    RootDirectory, Tag, UpdateFileSystemOutput, UpdateFileSystemProtectionOutput,
 };
 
 /// Values of the modelled `LifeCycleState` enum this slice produces
@@ -103,9 +103,27 @@ pub const IP_ADDRESS_TYPE_DUAL_STACK: &str = "DUAL_STACK";
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// Published EFS quota: "Tags per file system: 50" ("Amazon EFS quotas that you cannot
-/// change", Amazon EFS User Guide). The modelled `Tags` list carries no length bound, so
-/// a handler enforces the quota itself before it walks a caller-supplied list.
-pub const MAX_TAGS_PER_FILE_SYSTEM: usize = 50;
+/// change", Amazon EFS User Guide), which is also AWS's general limit of "50 tags per
+/// resource" ("Tagging AWS resources", AWS General Reference), so every resource this
+/// service tags is bounded by it. The modelled `Tags` list carries no length bound, so a
+/// handler enforces the quota itself before it walks a caller-supplied list.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// Published in `CreateAccessPoint`'s own documentation: "A file system can have a
+/// maximum of 10,000 access points unless you request an increase." It is also what
+/// bounds this store: a file system holds at most this many access points and the Region
+/// at most [`MAX_FILE_SYSTEMS_PER_REGION`] file systems, so a repeated create cannot grow
+/// the process without limit; `AccessPointLimitExceeded` is the modelled answer past it.
+pub const MAX_ACCESS_POINTS_PER_FILE_SYSTEM: usize = 10_000;
+
+/// `DescribeAccessPoints$MaxResults`: "The default value is 100."
+pub const DEFAULT_ACCESS_POINT_PAGE_SIZE: usize = 100;
+
+/// The root directory an access point exposes when the request names none: the file
+/// system root. `RootDirectory$Path` "specifies the path on the EFS file system to expose
+/// as the root directory to NFS clients using the access point", and its modelled pattern
+/// (`^(\/|…)$`) admits exactly this value for the whole file system.
+pub const ROOT_DIRECTORY_DEFAULT_PATH: &str = "/";
 
 /// Published EFS quota: "File systems per account, per Region: 1,000" (same page). The
 /// store is bounded by it, so a repeated create cannot grow this process without limit;
@@ -440,6 +458,45 @@ impl MountTarget {
     }
 }
 
+/// One stored EFS access point: "an application-specific view into an EFS file system".
+#[derive(Debug, Clone)]
+pub struct AccessPoint {
+    /// Creation order, which fixes the order `DescribeAccessPoints` pages in.
+    pub ordinal: u64,
+    pub access_point_id: String,
+    pub access_point_arn: String,
+    pub file_system_id: String,
+    pub owner_id: String,
+    /// "The opaque string specified in the request to ensure idempotent creation."
+    pub client_token: String,
+    /// "The name of the access point. This is the value of the Name tag."
+    pub name: Option<String>,
+    pub life_cycle_state: String,
+    /// When the clock owes this access point `available`; see [`CREATING_FOR`].
+    pub available_at: SystemTime,
+    pub posix_user: Option<PosixUser>,
+    pub root_directory: RootDirectory,
+    pub tags: Vec<Tag>,
+}
+
+impl AccessPoint {
+    /// This record as the modelled `AccessPointDescription`.
+    pub fn describe(&self) -> CreateAccessPointOutput {
+        CreateAccessPointOutput {
+            client_token: Some(self.client_token.clone()),
+            name: self.name.clone(),
+            tags: Some(self.tags.clone()),
+            access_point_id: Some(self.access_point_id.clone()),
+            access_point_arn: Some(self.access_point_arn.clone()),
+            file_system_id: Some(self.file_system_id.clone()),
+            posix_user: self.posix_user.clone(),
+            root_directory: Some(self.root_directory.clone()),
+            owner_id: Some(self.owner_id.clone()),
+            life_cycle_state: Some(self.life_cycle_state.clone()),
+        }
+    }
+}
+
 /// The SplitMix64 increment, the step the id counter advances by.
 const SPLITMIX64_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -471,6 +528,10 @@ pub struct ComAmazonawsEfsMagnolioapiserviceV20150201State {
     pub mount_targets: BTreeMap<String, MountTarget>,
     /// Keyed by `subnet-…` id, recorded on first reference.
     pub subnets: BTreeMap<String, Subnet>,
+    /// Keyed by `fsap-…` id.
+    pub access_points: BTreeMap<String, AccessPoint>,
+    /// `ClientToken` -> `fsap-…` id; backs CreateAccessPoint's idempotency rule.
+    pub access_point_tokens: BTreeMap<String, String>,
     /// Keyed by the SOURCE `fs-…` id — the resource a replication configuration is
     /// addressed by, and the key its uniqueness rule is stated over: "A file system can
     /// be part of only one replication configuration."
@@ -571,6 +632,13 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
                 mount_target.life_cycle_state = LIFE_CYCLE_AVAILABLE.to_string();
             }
         }
+        for access_point in self.access_points.values_mut() {
+            if access_point.life_cycle_state == LIFE_CYCLE_CREATING
+                && access_point.available_at <= now
+            {
+                access_point.life_cycle_state = LIFE_CYCLE_AVAILABLE.to_string();
+            }
+        }
         for replication in self.replications.values_mut() {
             for destination in &mut replication.destinations {
                 if destination.status == REPLICATION_STATUS_ENABLING
@@ -630,6 +698,32 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
         subnet
             .assignable_ipv6()
             .find(|address| !self.ipv6_in_use(&subnet.subnet_id, address))
+    }
+
+    /// How many access points one file system holds — the count alone, without building
+    /// the records [`Self::access_points_of`] returns, for the quota check a create runs.
+    pub fn access_point_count_of(&self, file_system_id: &str) -> usize {
+        self.access_points
+            .values()
+            .filter(|access_point| access_point.file_system_id == file_system_id)
+            .count()
+    }
+
+    /// The access points of one file system in creation order — or, when
+    /// `file_system_id` is `None`, every stored access point in that same order. The one
+    /// way this service lists access points, so a filtered and an unfiltered read cannot
+    /// order them differently.
+    pub fn access_points_of(&self, file_system_id: Option<&str>) -> Vec<AccessPoint> {
+        let mut access_points: Vec<AccessPoint> = self
+            .access_points
+            .values()
+            .filter(|access_point| {
+                file_system_id.is_none_or(|id| access_point.file_system_id == id)
+            })
+            .cloned()
+            .collect();
+        access_points.sort_by_key(|access_point| access_point.ordinal);
+        access_points
     }
 
     /// The mount targets of one file system, in creation order.
@@ -850,6 +944,49 @@ pub fn file_system_already_exists_message(
         quoted(existing_file_system_id),
         quoted(creation_token)
     )
+}
+
+/// `AccessPointAlreadyExists`' message — "Returned if the access point that you are
+/// trying to create already exists, with the creation token you provided in the
+/// request": the same construction as [`file_system_already_exists_message`], over the
+/// existing access point's id and the `ClientToken` the request carried.
+pub fn access_point_already_exists_message(
+    existing_access_point_id: &str,
+    client_token: &str,
+) -> String {
+    format!(
+        "{ACCESS_POINT_NOUN} {} already exists with creation token {}",
+        quoted(existing_access_point_id),
+        quoted(client_token)
+    )
+}
+
+/// Why a caller-supplied tag list cannot be stored, as the `BadRequest` sentence to
+/// refuse with — `None` when the list is storable. Two rules, one per resource this
+/// service tags: the list holds at most [`MAX_TAGS_PER_RESOURCE`] tags, and "each key
+/// must be unique" (`Tags`). The modelled list carries no length bound, so the quota is
+/// checked first and the key scan then runs over a bounded list through a set, not a
+/// nested loop.
+///
+/// Built here once rather than per handler, so every operation that accepts a tag list
+/// refuses it with the same sentence.
+pub fn tag_list_problem(tags: &[Tag]) -> Option<String> {
+    if tags.len() > MAX_TAGS_PER_RESOURCE {
+        return Some(format!(
+            "Tags must hold at most {MAX_TAGS_PER_RESOURCE} tags; got {}",
+            tags.len()
+        ));
+    }
+    let mut keys = BTreeSet::new();
+    for tag in tags {
+        if !keys.insert(tag.key.as_str()) {
+            return Some(format!(
+                "Tags must each have a unique Key; Key {} appears more than once",
+                tag.key
+            ));
+        }
+    }
+    None
 }
 
 /// A `SystemTime` as the modelled `Timestamp`. EFS reports a file system's

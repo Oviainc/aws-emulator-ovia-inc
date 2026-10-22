@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccessPoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccessPoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccessPoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the access points [`crate::state`] holds — one named by
+//! `AccessPointId`, or every access point of a `FileSystemId`, paginated — so a
+//! CreateAccessPoint and a later describe cannot disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +157,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccessPoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccessPointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccessPoints"))
+        use crate::state as efs;
+
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // "You can provide either an AccessPointId or a FileSystemId in the request, but
+        // not both."
+        if input.access_point_id.is_some() && input.file_system_id.is_some() {
+            return Err(bad_request(
+                "AccessPointId and FileSystemId are mutually exclusive",
+            ));
+        }
+
+        let mut state = state.lock();
+        state.materialize_due_transitions(now);
+
+        // Both members accept an id or an ARN.
+        let wanted_access_point = input
+            .access_point_id
+            .as_deref()
+            .map(efs::access_point_id_of);
+        if let Some(id) = wanted_access_point {
+            if !state.access_points.contains_key(id) {
+                return Err(DescribeAccessPointsErrorModeled::AccessPointNotFound(
+                    AccessPointNotFound {
+                        error_code: "AccessPointNotFound".to_string(),
+                        message: Some(efs::access_point_not_found_message(id)),
+                    },
+                )
+                .into());
+            }
+        }
+        let wanted_file_system = input.file_system_id.as_deref().map(efs::file_system_id_of);
+        if let Some(id) = wanted_file_system {
+            if !state.file_systems.contains_key(id) {
+                return Err(DescribeAccessPointsErrorModeled::FileSystemNotFound(
+                    FileSystemNotFound {
+                        error_code: "FileSystemNotFound".to_string(),
+                        message: Some(efs::file_system_not_found_message(id)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "Returns the description of a specific Amazon EFS access point if the
+        // AccessPointId is provided. If you provide an EFS FileSystemId, it returns
+        // descriptions of all access points for that file system" — and with neither,
+        // every access point this account holds. One lister, so a selected and an
+        // unselected read report the same creation order.
+        let matched: Vec<efs::AccessPoint> = match wanted_access_point {
+            Some(id) => state.access_points.get(id).cloned().into_iter().collect(),
+            None => state.access_points_of(wanted_file_system),
+        };
+
+        // "NextToken is present if the response is paginated. You can use NextMarker in
+        // the subsequent request to fetch the next page of access point descriptions" —
+        // the token is the id the next page starts at, so resuming from a returned one
+        // continues exactly where the previous page stopped.
+        let start = match input.next_token.as_deref() {
+            Some(token) => matched
+                .iter()
+                .position(|access_point| access_point.access_point_id == token)
+                .ok_or_else(|| {
+                    bad_request(format!(
+                        "NextToken {token} does not name an access point of this request's \
+                         result set"
+                    ))
+                })?,
+            None => 0,
+        };
+        let page_size = efs::page_size(input.max_results, efs::DEFAULT_ACCESS_POINT_PAGE_SIZE);
+        let page: Vec<CreateAccessPointOutput> = matched[start..]
+            .iter()
+            .take(page_size)
+            .map(|access_point| access_point.describe())
+            .collect();
+        // "Present if there are more access points than returned in the response."
+        let next_token = matched
+            .get(start + page.len())
+            .map(|access_point| access_point.access_point_id.clone());
+
+        Ok(DescribeAccessPointsOutput {
+            access_points: Some(page),
+            next_token,
+        })
     }
+}
+
+/// A 400 `BadRequest`: "the request is malformed or contains an error such as an invalid
+/// parameter value or a missing required parameter".
+fn bad_request(message: impl Into<String>) -> DescribeAccessPointsError {
+    DescribeAccessPointsErrorModeled::BadRequest(BadRequest {
+        error_code: "BadRequest".to_string(),
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// A 500 `InternalServerError`, for the one case this handler cannot serve: the engine
+/// this service was mounted on holds no store for it.
+fn internal_server_error() -> DescribeAccessPointsError {
+    DescribeAccessPointsErrorModeled::InternalServerError(InternalServerError {
+        error_code: "InternalServerError".to_string(),
+        message: Some("the EFS emulator state store is unavailable".to_string()),
+    })
+    .into()
 }

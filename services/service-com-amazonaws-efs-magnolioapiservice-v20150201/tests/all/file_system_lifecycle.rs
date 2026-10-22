@@ -8,6 +8,11 @@
 //! Every rule is asserted over a SET of inputs rather than on one recorded call: the
 //! tables below vary the member the rule generalises over (mode, value, count, id,
 //! Region, page size), and the single-row cases are the published boundaries.
+//!
+//! The harness every suite of this test target shares — `Emulator`, `Reply`, `settle`,
+//! `matches_id_pattern` — lives in `tests/all/harness.rs` and is re-exported below, so
+//! each suite drives the same one service over the same router rather than standing up a
+//! second copy of it.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_efs_magnolioapiservice_v20150201::state;
