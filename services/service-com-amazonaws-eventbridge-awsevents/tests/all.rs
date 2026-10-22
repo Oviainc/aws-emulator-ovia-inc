@@ -17,6 +17,8 @@ mod event_bus_configuration;
 mod event_bus_deletion;
 #[path = "all/event_bus_lifecycle.rs"]
 mod event_bus_lifecycle;
+#[path = "all/input_validation.rs"]
+mod input_validation;
 #[path = "all/rule_lifecycle.rs"]
 mod rule_lifecycle;
 #[path = "all/state_roundtrip.rs"]

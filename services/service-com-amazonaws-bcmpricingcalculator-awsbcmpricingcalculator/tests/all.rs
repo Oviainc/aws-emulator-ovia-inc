@@ -25,3 +25,5 @@ mod workload_estimate_deletion;
 mod workload_estimate_lifecycle;
 #[path = "all/workload_estimate_listing.rs"]
 mod workload_estimate_listing;
+#[path = "all/workload_estimate_usage.rs"]
+mod workload_estimate_usage;

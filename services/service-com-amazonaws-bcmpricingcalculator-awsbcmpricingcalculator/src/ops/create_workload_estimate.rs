@@ -292,6 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             total_cost: 0.0,
             failure_message: None,
             tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+            usage: Vec::new(),
         };
 
         let output = output_for(&estimate);

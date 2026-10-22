@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a group record in this service's store and answers with the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +78,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use crate::state::{new_group_id, request_caller, StoredGroup, AUDIT_TARGET, MAX_GROUPS, STORE_UNAVAILABLE};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,18 +154,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_error)?;
+        let now = SystemTime::now();
+        // "Although the group ARN format reflects the Region name where it was created, a
+        // group is not constrained to any Region": the Region the create was signed for is
+        // the one that goes into the ARN.
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        let stored = StoredGroup {
+            // The id is minted, never derived from the request: the ARN's resource segment
+            // is `[0-9a-z]+` while a group name "can include any Unicode characters".
+            id: new_group_id(),
+            name: input.name,
+            region: region.clone(),
+            created: now,
+            last_modified: now,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+        };
+
+        // Claim the name and read the response back out of the stored record, under ONE
+        // lock, so two concurrent creates of the same name cannot both win and the
+        // response can never describe anything other than what was persisted.
+        let mut guard = state.lock();
+        if guard.groups.contains_key(&stored.name) {
+            // "The names for all groups in your account, across all Regions, must be
+            // unique" (`CreateGroupRequest$Name`): a second create of a live name
+            // conflicts with the group that already holds it.
+            drop(guard);
+            audit(ctx, &region, "rejected_name_conflict");
+            return Err(CreateGroupErrorModeled::ConflictException(ConflictException {
+                message: Some(format!("Group with name {} already exists", stored.name)),
+            })
+            .into());
+        }
+        // Checked under the same lock as the insert, so a concurrent pair of creates
+        // cannot both pass it: the store never grows past the quota.
+        if guard.groups.len() >= MAX_GROUPS {
+            drop(guard);
+            audit(ctx, &region, "rejected_quota_exceeded");
+            return Err(CreateGroupErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "Maximum number of groups reached: {MAX_GROUPS} groups per account"
+                    )),
+                },
+            )
+            .into());
+        }
+        let name = stored.name.clone();
+        let group = guard.groups.entry(name).or_insert(stored).to_group();
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(guard);
+        audit(ctx, &region, "created");
+        Ok(CreateGroupOutput { group: Some(group) })
     }
+}
+
+/// The access record for this state-changing operation: who, where, what and the outcome.
+///
+/// Metadata only — no group name, no tag key or value — so nothing a caller supplied can
+/// reach the trail, and `Debug`-escaped values cannot split a record.
+fn audit(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: AUDIT_TARGET,
+        operation = "CreateGroup",
+        caller = ?request_caller(ctx.parts()),
+        region = ?region,
+        outcome = outcome,
+        "synthetics group create",
+    );
+}
+
+/// The modelled 500 for a store that cannot be reached. Never a fresh engine: a private
+/// store would accept the write and drop it when the request returns.
+fn internal_error() -> CreateGroupError {
+    CreateGroupErrorModeled::InternalServerException(InternalServerException {
+        message: Some(STORE_UNAVAILABLE.to_string()),
+    })
+    .into()
 }

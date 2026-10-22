@@ -52,7 +52,9 @@ fn create_request(case: &CreateCase) -> Value {
 }
 
 /// Create an estimate and return its id, failing the test if the call did not succeed.
-async fn create_estimate(emulator: &Emulator, name: &str) -> String {
+///
+/// `pub(crate)` so every suite in this test target mints an estimate the same way.
+pub(crate) async fn create_estimate(emulator: &Emulator, name: &str) -> String {
     let (status, body) = emulator
         .call("CreateWorkloadEstimate", json!({ "name": name }))
         .await;
