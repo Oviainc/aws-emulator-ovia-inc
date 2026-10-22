@@ -4,12 +4,13 @@
 //!
 //! The slice implemented so far is Lightsail's primary resource, the **instance**
 //! (a virtual private server), the **domain** (a DNS zone the account holds
-//! recordsets in), the append-only **operation log** every mutating call writes,
+//! recordsets in), the **container service** (a compute resource containers are
+//! deployed to), the append-only **operation log** every mutating call writes,
 //! and the service's static **Region catalog** — the Regions and Availability
 //! Zones `GetRegions` lists and every other operation validates a location
 //! against. Everything mutable in this module is reached through [`with_state`],
-//! so no handler can observe a store whose clock-owed instance transitions have
-//! not been applied yet.
+//! so no handler can observe a store whose clock-owed transitions have not been
+//! applied yet.
 //!
 //! Two kinds of value live on a stored instance:
 //!
@@ -19,16 +20,20 @@
 //!   hardware, firewall rules, user name and lifecycle state — each computed
 //!   from the request plus this store's own allocators, never from a canned body.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AddOn, AddOnRequest, AvailabilityZone, BucketBundle, Domain, DomainEntry, Instance,
+    AddOn, AddOnRequest, AvailabilityZone, BucketBundle, Container, ContainerService,
+    ContainerServiceDeployment, ContainerServiceDeploymentRequest,
+    ContainerServiceECRImagePullerRole, ContainerServiceEndpoint,
+    ContainerServiceHealthCheckConfig, ContainerServiceStateDetail, Domain, DomainEntry, Instance,
     InstanceHardware, InstanceMetadataOptions, InstanceNetworking, InstancePortInfo, InstanceState,
-    MonthlyTransfer, Operation, Region, ResourceLocation, Tag, REGION_NAME_VALUES,
+    MonthlyTransfer, Operation, PrivateRegistryAccess, Region, ResourceLocation, Tag,
+    REGION_NAME_VALUES,
 };
 
 // ---------------------------------------------------------------------------
@@ -47,6 +52,22 @@ pub const INSTANCE_ARN_RESOURCE_PREFIX: &str = "Instance/";
 /// The `resourceType` an instance and its operations report, from the modelled
 /// `ResourceType` enum.
 pub const RESOURCE_TYPE_INSTANCE: &str = "Instance";
+
+/// The `resourceType` a container service reports, from the same modelled
+/// `ResourceType` enum.
+pub const RESOURCE_TYPE_CONTAINER_SERVICE: &str = "ContainerService";
+
+/// The resource portion a container service ARN carries before its id. Mirrors
+/// the `Instance/<uuid>` form the modelled `Instance$arn` documentation shows,
+/// with this resource's own `ResourceType` value.
+pub const CONTAINER_SERVICE_ARN_RESOURCE_PREFIX: &str = "ContainerService/";
+
+/// The region a request that carries no SigV4 credential scope is served in.
+///
+/// Lightsail's own default endpoint region, and one of the modelled `RegionName`
+/// enum's values, so a resource created by an unsigned call still reports a
+/// region the model admits.
+pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// The resource portion a domain ARN carries before its id, from the modelled
 /// `Domain$arn` documentation
@@ -118,14 +139,16 @@ pub const STOPPED: Lifecycle = Lifecycle {
     name: "stopped",
 };
 
-/// How long after the call that starts it the clock owes an instance its settled
-/// state (`pending` -> `running`, `stopping` -> `stopped`).
+/// How long after the call that starts it the clock owes a resource its next
+/// settled state: an instance's (`pending` -> `running`, `stopping` ->
+/// `stopped`) and a container service's (`PENDING` -> `READY`, and each step of
+/// `PENDING` -> `DEPLOYING` -> `RUNNING`).
 ///
 /// CHOSEN, not an AWS duration: AWS takes tens of seconds to minutes, which no
 /// caller can be made to wait for here. The span is deliberately NON-ZERO, so a
-/// caller that reads straight after `CreateInstances`, `StartInstance` or
-/// `StopInstance` still observes the transient state exactly as it does against
-/// AWS.
+/// caller that reads straight after `CreateInstances`, `StartInstance`,
+/// `StopInstance` or `CreateContainerService` still observes the transient state
+/// exactly as it does against AWS.
 pub const STATE_TRANSITION_MILLIS: i64 = 500;
 
 /// A state change the clock already owes an instance.
@@ -901,7 +924,8 @@ fn availability_zone_letter(index: usize) -> Option<char> {
 ///
 /// `availability_zone` is absent for a resource that is not zonal: the member
 /// documents the `us-east-2a` form, which addresses one zone of one region, and
-/// a DNS zone is held by the region as a whole, so there is no zone to name.
+/// a DNS zone is held by the region as a whole — as is a container service — so
+/// there is no zone to name.
 #[derive(Debug, Clone)]
 pub struct StoredLocation {
     pub availability_zone: Option<String>,
@@ -914,6 +938,14 @@ impl StoredLocation {
         Self {
             availability_zone: Some(availability_zone.to_string()),
             region_name: region_name.to_string(),
+        }
+    }
+
+    /// The location of a resource that lives in `region` as a whole.
+    pub fn regional(region: &str) -> Self {
+        Self {
+            availability_zone: None,
+            region_name: region.to_string(),
         }
     }
 
@@ -1229,6 +1261,558 @@ impl StoredOperation {
 }
 
 // ---------------------------------------------------------------------------
+// Container services
+// ---------------------------------------------------------------------------
+
+/// `ContainerServiceState` values this slice uses, from the modelled enum and the
+/// `ContainerService$state` documentation: `PENDING` while the service is being
+/// created, `READY` once it runs without an active deployment, `DEPLOYING` while
+/// it launches one, and `RUNNING` once a deployment is active.
+pub const CONTAINER_SERVICE_PENDING: &str = "PENDING";
+/// See [`CONTAINER_SERVICE_PENDING`].
+pub const CONTAINER_SERVICE_READY: &str = "READY";
+/// See [`CONTAINER_SERVICE_PENDING`].
+pub const CONTAINER_SERVICE_DEPLOYING: &str = "DEPLOYING";
+/// See [`CONTAINER_SERVICE_PENDING`].
+pub const CONTAINER_SERVICE_RUNNING: &str = "RUNNING";
+
+/// `ContainerServiceDeploymentState` values this slice uses, from the modelled
+/// enum and the `ContainerServiceDeployment$state` documentation: `ACTIVATING`
+/// while the deployment is being created, `ACTIVE` once it is running (at most
+/// one at a time) and `INACTIVE` for one that ran before.
+pub const DEPLOYMENT_STATE_ACTIVATING: &str = "ACTIVATING";
+/// See [`DEPLOYMENT_STATE_ACTIVATING`].
+pub const DEPLOYMENT_STATE_ACTIVE: &str = "ACTIVE";
+/// See [`DEPLOYMENT_STATE_ACTIVATING`].
+pub const DEPLOYMENT_STATE_INACTIVE: &str = "INACTIVE";
+
+/// The `ContainerServiceStateDetail$code` reported while a deployment is being
+/// created, from that member's own documentation: `CREATING_DEPLOYMENT` is one of
+/// the codes "possible if your container service is in a `DEPLOYING` or
+/// `UPDATING` state".
+pub const STATE_DETAIL_CREATING_DEPLOYMENT: &str = "CREATING_DEPLOYMENT";
+
+/// The most container services this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota. A create that would exceed it is
+/// refused with the modelled `InvalidInputException`.
+pub const MAX_CONTAINER_SERVICES: usize = 100;
+
+/// The most public domain names one container service may carry.
+///
+/// From the modelled `publicDomainNames` documentation: "You can specify up to
+/// four public domain names for a container service."
+pub const MAX_PUBLIC_DOMAIN_NAMES: usize = 4;
+
+/// The most containers one deployment may describe.
+///
+/// Emulator resource guard: the modelled `ContainerMap` declares no length, so
+/// this is where the bound on a caller-sized map lives.
+pub const MAX_CONTAINERS_PER_DEPLOYMENT: usize = 10;
+
+/// The hardware and price one container service power provides.
+///
+/// The figures are the published Lightsail container service plans the modelled
+/// `power` member points `GetContainerServicePowers` at: each step doubles RAM
+/// and the base monthly price, and the vCPU count follows the plan table. The
+/// `power_id` form is the one the modelled `ContainerServicePower$powerId`
+/// documentation shows (`nano-1`).
+#[derive(Debug, Clone, Copy)]
+pub struct ContainerPowerSpec {
+    /// The modelled `ContainerServicePowerName` value that selects this power.
+    pub name: &'static str,
+    pub power_id: &'static str,
+    /// `ContainerServicePower$price`, the base monthly price in USD.
+    pub price: f32,
+    pub cpu_count: f32,
+    pub ram_size_in_gb: f32,
+}
+
+/// Every container service power this slice serves. See [`ContainerPowerSpec`]
+/// for the source.
+pub const CONTAINER_SERVICE_POWERS: &[ContainerPowerSpec] = &[
+    ContainerPowerSpec {
+        name: "nano",
+        power_id: "nano-1",
+        price: 7.0,
+        cpu_count: 0.25,
+        ram_size_in_gb: 0.5,
+    },
+    ContainerPowerSpec {
+        name: "micro",
+        power_id: "micro-1",
+        price: 10.0,
+        cpu_count: 0.25,
+        ram_size_in_gb: 1.0,
+    },
+    ContainerPowerSpec {
+        name: "small",
+        power_id: "small-1",
+        price: 20.0,
+        cpu_count: 0.5,
+        ram_size_in_gb: 2.0,
+    },
+    ContainerPowerSpec {
+        name: "medium",
+        power_id: "medium-1",
+        price: 40.0,
+        cpu_count: 1.0,
+        ram_size_in_gb: 4.0,
+    },
+    ContainerPowerSpec {
+        name: "large",
+        power_id: "large-1",
+        price: 80.0,
+        cpu_count: 2.0,
+        ram_size_in_gb: 8.0,
+    },
+    ContainerPowerSpec {
+        name: "xlarge",
+        power_id: "xlarge-1",
+        price: 160.0,
+        cpu_count: 4.0,
+        ram_size_in_gb: 16.0,
+    },
+];
+
+/// The power `power` names, or `None` when it is not one this service serves.
+pub fn container_service_power(power: &str) -> Option<ContainerPowerSpec> {
+    CONTAINER_SERVICE_POWERS
+        .iter()
+        .find(|spec| spec.name == power)
+        .copied()
+}
+
+/// The power names [`container_service_power`] accepts, for a refusal that has to
+/// tell the caller what to send instead.
+pub fn container_service_power_names() -> String {
+    CONTAINER_SERVICE_POWERS
+        .iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Documented defaults and bounds of a public endpoint's health check, each from
+/// its own member's documentation on `ContainerServiceHealthCheckConfig`:
+/// "The default value is `2`" (healthy and unhealthy thresholds, and the
+/// timeout), "The default value is `5`" (the interval), "The default value is
+/// `/`" (the path), and the success codes "between `200` and `499`".
+const HEALTH_CHECK_DEFAULT_THRESHOLD: i32 = 2;
+/// See [`HEALTH_CHECK_DEFAULT_THRESHOLD`].
+const HEALTH_CHECK_DEFAULT_TIMEOUT_SECONDS: i32 = 2;
+/// See [`HEALTH_CHECK_DEFAULT_THRESHOLD`].
+const HEALTH_CHECK_DEFAULT_INTERVAL_SECONDS: i32 = 5;
+/// See [`HEALTH_CHECK_DEFAULT_THRESHOLD`].
+const HEALTH_CHECK_DEFAULT_PATH: &str = "/";
+/// See [`HEALTH_CHECK_DEFAULT_THRESHOLD`].
+const HEALTH_CHECK_DEFAULT_SUCCESS_CODES: &str = "200-499";
+/// "You can specify between 2 and 60 seconds" (`timeoutSeconds`).
+const HEALTH_CHECK_TIMEOUT_SECONDS_RANGE: (i32, i32) = (2, 60);
+/// "You can specify between 5 and 300 seconds" (`intervalSeconds`).
+const HEALTH_CHECK_INTERVAL_SECONDS_RANGE: (i32, i32) = (5, 300);
+
+/// How many characters the per-service subdomain token of a container service's
+/// default domain carries, from the example in the modelled `serviceName`
+/// documentation (`https://container-service-1.ur4EXAMPLE2uq.us-east-2.cs.amazonlightsail.com`).
+const DOMAIN_TOKEN_LEN: usize = 13;
+
+/// The alphabet that token is drawn from: the mixed-case alphanumerics the same
+/// example shows.
+const DOMAIN_TOKEN_ALPHABET: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// The suffix of the default domain every container service is reachable on,
+/// from the modelled `serviceName` documentation: "The default domain of a
+/// container service is typically `https://...cs.amazonlightsail.com`."
+const CONTAINER_SERVICE_DOMAIN_SUFFIX: &str = "cs.amazonlightsail.com";
+
+/// The suffix of a container service's private domain name, which the Lightsail
+/// container services guide gives as `<service name>.service.local` \u2014 resolvable
+/// only inside the account's default VPC, as the modelled `privateDomainName`
+/// documentation says.
+const PRIVATE_DOMAIN_SUFFIX: &str = "service.local";
+
+/// The ARN of the container service `id` in `region`.
+pub fn container_service_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{CONTAINER_SERVICE_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The publicly accessible URL of the container service `name` whose default
+/// domain carries `token`, in `region`.
+///
+/// The form is the one the modelled `serviceName` documentation gives:
+/// `https://<service name>.<token>.<region>.cs.amazonlightsail.com`.
+pub fn container_service_url(name: &str, token: &str, region: &str) -> String {
+    format!("https://{name}.{token}.{region}.{CONTAINER_SERVICE_DOMAIN_SUFFIX}")
+}
+
+/// The private domain name of the container service `name`. See
+/// [`PRIVATE_DOMAIN_SUFFIX`].
+pub fn container_service_private_domain_name(name: &str) -> String {
+    format!("{name}.{PRIVATE_DOMAIN_SUFFIX}")
+}
+
+/// The principal ARN of the container service `name` in `region`, and the ARN of
+/// the role it pulls private container images with.
+///
+/// The ARN's PATH is emulator-chosen: AWS documents what the principal ARN is
+/// FOR (a trust relationship between the caller's own account and the service)
+/// but not how its string is built. It is an IAM role ARN carrying the service's
+/// region, name and its own domain token, so two services never share one and a
+/// value is stable across reads.
+pub fn container_service_principal_arn(region: &str, name: &str, token: &str) -> String {
+    ::engine::emulator_arn(
+        "iam",
+        "",
+        &format!("role/amazon/lightsail/{region}/containers/{name}/{token}"),
+    )
+}
+
+/// See [`container_service_principal_arn`]: the same role, suffixed so the ECR
+/// image puller principal is distinguishable from the service's own.
+pub fn ecr_image_puller_principal_arn(region: &str, name: &str, token: &str) -> String {
+    ::engine::emulator_arn(
+        "iam",
+        "",
+        &format!("role/amazon/lightsail/{region}/containers/{name}/{token}/ecr-image-puller"),
+    )
+}
+
+/// One stored deployment of a container service: the containers it launches, the
+/// public endpoint that fronts them, and where it is in its own lifecycle.
+#[derive(Debug, Clone)]
+pub struct StoredDeployment {
+    /// 1 for a service's first deployment, incremented per deployment after.
+    pub version: i32,
+    pub state: &'static str,
+    /// A `BTreeMap` so the containers are stored in one stable order, whatever
+    /// order the request's map arrived in.
+    pub containers: BTreeMap<String, Container>,
+    pub public_endpoint: Option<ContainerServiceEndpoint>,
+    pub created_at_ms: i64,
+}
+
+impl StoredDeployment {
+    /// This record as the modelled `ContainerServiceDeployment`.
+    pub fn view(&self) -> ContainerServiceDeployment {
+        ContainerServiceDeployment {
+            version: Some(self.version),
+            state: Some(self.state.to_string()),
+            containers: Some(
+                self.containers
+                    .iter()
+                    .map(|(name, container)| (name.clone(), container.clone()))
+                    .collect::<HashMap<String, Container>>(),
+            ),
+            public_endpoint: self.public_endpoint.clone(),
+            created_at: Some(timestamp(self.created_at_ms)),
+        }
+    }
+}
+
+/// A phase change the clock owes a container service: the state it settles into,
+/// and whether reaching it makes the waiting deployment the active one.
+#[derive(Debug, Clone, Copy)]
+pub struct OwedPhase {
+    /// Epoch milliseconds at which the change became (or becomes) due.
+    pub at_ms: i64,
+    pub state: &'static str,
+    pub activates_next_deployment: bool,
+}
+
+/// One stored container service: what the caller asked for (name, power, scale,
+/// tags, public domain names, private registry access and the deployment, if
+/// any) plus what the service assigns (ARN, creation time, default domain,
+/// principal ARNs and the lifecycle it is walking).
+#[derive(Debug, Clone)]
+pub struct StoredContainerService {
+    pub name: String,
+    pub arn: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    pub power: String,
+    pub power_id: String,
+    pub scale: i32,
+    pub state: &'static str,
+    pub is_disabled: bool,
+    /// The per-service token in the service's default domain, minted once so
+    /// every read reports the same URL.
+    pub domain_token: String,
+    pub principal_arn: String,
+    /// A `BTreeMap` so the certificate/domain pairs are stored in one stable
+    /// order.
+    pub public_domain_names: BTreeMap<String, Vec<String>>,
+    pub ecr_image_puller_role_active: bool,
+    pub current_deployment: Option<StoredDeployment>,
+    pub next_deployment: Option<StoredDeployment>,
+    /// The version the NEXT deployment of this service will carry.
+    pub next_deployment_version: i32,
+    /// The phases the clock still owes this service, soonest first.
+    pub owed: VecDeque<OwedPhase>,
+}
+
+impl StoredContainerService {
+    /// This record as the modelled `ContainerService`.
+    pub fn view(&self) -> ContainerService {
+        ContainerService {
+            container_service_name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_CONTAINER_SERVICE.to_string()),
+            tags: Some(self.tags.clone()),
+            power: Some(self.power.clone()),
+            power_id: Some(self.power_id.clone()),
+            state: Some(self.state.to_string()),
+            state_detail: self.state_detail(),
+            scale: Some(self.scale),
+            current_deployment: self.current_deployment.as_ref().map(StoredDeployment::view),
+            next_deployment: self.next_deployment.as_ref().map(StoredDeployment::view),
+            is_disabled: Some(self.is_disabled),
+            principal_arn: Some(self.principal_arn.clone()),
+            private_domain_name: Some(container_service_private_domain_name(&self.name)),
+            public_domain_names: Some(
+                self.public_domain_names
+                    .iter()
+                    .map(|(certificate, domains)| (certificate.clone(), domains.clone()))
+                    .collect::<HashMap<String, Vec<String>>>(),
+            ),
+            url: Some(container_service_url(
+                &self.name,
+                &self.domain_token,
+                &self.location.region_name,
+            )),
+            private_registry_access: Some(PrivateRegistryAccess {
+                ecr_image_puller_role: Some(ContainerServiceECRImagePullerRole {
+                    is_active: Some(self.ecr_image_puller_role_active),
+                    // The role has a principal only while it is active: an
+                    // inactive role grants nothing, so there is nothing for a
+                    // repository policy to name.
+                    principal_arn: self.ecr_image_puller_role_active.then(|| {
+                        ecr_image_puller_principal_arn(
+                            &self.location.region_name,
+                            &self.name,
+                            &self.domain_token,
+                        )
+                    }),
+                }),
+            }),
+        }
+    }
+
+    /// The service's `stateDetail`, present only while a deployment is being
+    /// created.
+    ///
+    /// The modelled `ContainerServiceStateDetail$code` documentation lists
+    /// progress codes only for a `DEPLOYING` or `UPDATING` service, and reserves
+    /// the two codes of a `PENDING` one for failures; nothing has failed here, so
+    /// every other state reports no detail at all rather than an invented one.
+    fn state_detail(&self) -> Option<ContainerServiceStateDetail> {
+        if self.state != CONTAINER_SERVICE_DEPLOYING {
+            return None;
+        }
+        let version = self.next_deployment.as_ref().map(|next| next.version);
+        Some(ContainerServiceStateDetail {
+            code: Some(STATE_DETAIL_CREATING_DEPLOYMENT.to_string()),
+            message: Some(match version {
+                Some(version) => format!("Creating deployment version {version}"),
+                None => "Creating deployment".to_string(),
+            }),
+        })
+    }
+
+    /// Materialise every phase the clock had already made due at `now_ms`.
+    ///
+    /// Bounded by the number of phases a create enqueues, and the service drops
+    /// out of the work as soon as it has none outstanding.
+    fn advance(&mut self, now_ms: i64) {
+        while let Some(phase) = self.owed.front().copied() {
+            if phase.at_ms > now_ms {
+                break;
+            }
+            self.owed.pop_front();
+            self.state = phase.state;
+            if !phase.activates_next_deployment {
+                continue;
+            }
+            if let Some(mut next) = self.next_deployment.take() {
+                next.state = DEPLOYMENT_STATE_ACTIVE;
+                // "The container service can have only one deployment in an
+                // active state at a time": whatever was running steps down.
+                if let Some(mut previous) = self.current_deployment.replace(next) {
+                    previous.state = DEPLOYMENT_STATE_INACTIVE;
+                }
+            }
+        }
+    }
+}
+
+/// The deployment `request` describes, at `version`, or a refusal naming the
+/// member that is wrong.
+///
+/// A deployment launches containers, so it must name at least one, and each must
+/// name the image it runs. A public endpoint must name one of those containers,
+/// on a port that container opens, and its health check is filled in with the
+/// documented defaults for whatever the request left out.
+pub fn deployment_from_request(
+    version: i32,
+    now_ms: i64,
+    request: &ContainerServiceDeploymentRequest,
+) -> Result<StoredDeployment, String> {
+    let containers: BTreeMap<String, Container> = request
+        .containers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if containers.is_empty() {
+        return Err(
+            "deployment.containers must describe at least one container to launch".to_string(),
+        );
+    }
+    if containers.len() > MAX_CONTAINERS_PER_DEPLOYMENT {
+        return Err(format!(
+            "deployment.containers describes {} containers, more than the \
+             {MAX_CONTAINERS_PER_DEPLOYMENT} this service accepts in one deployment",
+            containers.len()
+        ));
+    }
+    for (name, container) in &containers {
+        if container
+            .image
+            .as_ref()
+            .is_none_or(|image| image.trim().is_empty())
+        {
+            return Err(format!(
+                "deployment.containers['{name}'].image must name the image the container runs"
+            ));
+        }
+    }
+
+    let public_endpoint = match &request.public_endpoint {
+        None => None,
+        Some(endpoint) => {
+            let container = containers.get(&endpoint.container_name).ok_or_else(|| {
+                format!(
+                    "deployment.publicEndpoint.containerName '{}' names no container of this \
+                     deployment, which describes [{}]",
+                    endpoint.container_name,
+                    containers.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })?;
+            let open_ports = container.ports.clone().unwrap_or_default();
+            if !open_ports.contains_key(&endpoint.container_port.to_string()) {
+                let mut open: Vec<String> = open_ports.keys().cloned().collect();
+                open.sort();
+                return Err(format!(
+                    "deployment.publicEndpoint.containerPort {} is not open on container '{}', \
+                     which opens [{}]",
+                    endpoint.container_port,
+                    endpoint.container_name,
+                    open.join(", ")
+                ));
+            }
+            Some(ContainerServiceEndpoint {
+                container_name: Some(endpoint.container_name.clone()),
+                container_port: Some(endpoint.container_port),
+                health_check: Some(health_check_from_request(endpoint.health_check.as_ref())?),
+            })
+        }
+    };
+
+    Ok(StoredDeployment {
+        version,
+        state: DEPLOYMENT_STATE_ACTIVATING,
+        containers,
+        public_endpoint,
+        created_at_ms: now_ms,
+    })
+}
+
+/// The health check `request` asks for, with every member it left out filled in
+/// from that member's documented default, or a refusal naming the member that is
+/// outside its documented range.
+fn health_check_from_request(
+    request: Option<&ContainerServiceHealthCheckConfig>,
+) -> Result<ContainerServiceHealthCheckConfig, String> {
+    let timeout_seconds = request
+        .and_then(|config| config.timeout_seconds)
+        .unwrap_or(HEALTH_CHECK_DEFAULT_TIMEOUT_SECONDS);
+    let (timeout_min, timeout_max) = HEALTH_CHECK_TIMEOUT_SECONDS_RANGE;
+    if !(timeout_min..=timeout_max).contains(&timeout_seconds) {
+        return Err(format!(
+            "deployment.publicEndpoint.healthCheck.timeoutSeconds must be between \
+             {timeout_min} and {timeout_max}, got {timeout_seconds}"
+        ));
+    }
+    let interval_seconds = request
+        .and_then(|config| config.interval_seconds)
+        .unwrap_or(HEALTH_CHECK_DEFAULT_INTERVAL_SECONDS);
+    let (interval_min, interval_max) = HEALTH_CHECK_INTERVAL_SECONDS_RANGE;
+    if !(interval_min..=interval_max).contains(&interval_seconds) {
+        return Err(format!(
+            "deployment.publicEndpoint.healthCheck.intervalSeconds must be between \
+             {interval_min} and {interval_max}, got {interval_seconds}"
+        ));
+    }
+    Ok(ContainerServiceHealthCheckConfig {
+        healthy_threshold: Some(
+            request
+                .and_then(|config| config.healthy_threshold)
+                .unwrap_or(HEALTH_CHECK_DEFAULT_THRESHOLD),
+        ),
+        unhealthy_threshold: Some(
+            request
+                .and_then(|config| config.unhealthy_threshold)
+                .unwrap_or(HEALTH_CHECK_DEFAULT_THRESHOLD),
+        ),
+        timeout_seconds: Some(timeout_seconds),
+        interval_seconds: Some(interval_seconds),
+        path: Some(
+            request
+                .and_then(|config| config.path.clone())
+                .unwrap_or_else(|| HEALTH_CHECK_DEFAULT_PATH.to_string()),
+        ),
+        success_codes: Some(
+            request
+                .and_then(|config| config.success_codes.clone())
+                .unwrap_or_else(|| HEALTH_CHECK_DEFAULT_SUCCESS_CODES.to_string()),
+        ),
+    })
+}
+
+/// The public domain names `requested` carries, or a refusal when it carries more
+/// than [`MAX_PUBLIC_DOMAIN_NAMES`] of them.
+pub fn public_domain_names_from_request(
+    requested: Option<&HashMap<String, Vec<String>>>,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let names: BTreeMap<String, Vec<String>> = requested
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(certificate, mut domains)| {
+            domains.sort();
+            domains.dedup();
+            (certificate, domains)
+        })
+        .collect();
+    let total: usize = names.values().map(Vec::len).sum();
+    if total > MAX_PUBLIC_DOMAIN_NAMES {
+        return Err(format!(
+            "publicDomainNames carries {total} domain names, more than the \
+             {MAX_PUBLIC_DOMAIN_NAMES} a container service accepts"
+        ));
+    }
+    Ok(names)
+}
+
+// ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
 
@@ -1247,6 +1831,13 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// The append-only operation log, newest last: the source of truth for the
     /// `operations` every mutating instance call answers with.
     pub operations: Vec<StoredOperation>,
+    /// Every container service, keyed by the region it was created in and its
+    /// name — the pair that identifies it, because a container service name is
+    /// unique within one region of the account and `GetContainerServices`
+    /// reports "all of your container services in the Amazon Web Services Region
+    /// where the request is made". A `BTreeMap` so a listing walks a stable,
+    /// total order.
+    pub container_services: BTreeMap<(String, String), StoredContainerService>,
     /// Offset of the next address pair to hand out, so two instances never share
     /// a public or a private address within one process.
     next_address: u32,
@@ -1288,6 +1879,53 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// matched.
     pub fn remove_instance(&mut self, name: &str) -> Option<StoredInstance> {
         self.instances.remove(name)
+    }
+
+    /// The container service `name` names in `region`, for a reporting
+    /// operation.
+    pub fn container_service(&self, region: &str, name: &str) -> Option<&StoredContainerService> {
+        self.container_services
+            .get(&(region.to_string(), name.to_string()))
+    }
+
+    /// Every container service in `region`, in the store's stable order.
+    pub fn container_services_in(&self, region: &str) -> Vec<&StoredContainerService> {
+        self.container_services
+            .iter()
+            .filter(|((service_region, _), _)| service_region == region)
+            .map(|(_, service)| service)
+            .collect()
+    }
+
+    /// Store a newly created container service.
+    pub fn insert_container_service(&mut self, service: StoredContainerService) {
+        self.container_services.insert(
+            (service.location.region_name.clone(), service.name.clone()),
+            service,
+        );
+    }
+
+    /// A token for one container service's default domain: see
+    /// [`DOMAIN_TOKEN_LEN`].
+    ///
+    /// Draws from the SAME `next_id` counter [`Self::mint_uuid`] does, on
+    /// purpose: one counter means two values minted in this process are never
+    /// built from the same input, and the hash is domain-separated by its own
+    /// label so a token and a uuid of the same counter value still differ.
+    pub fn mint_domain_token(&mut self) -> String {
+        self.next_id = self.next_id.wrapping_add(1);
+        let mut hasher = Sha256::new();
+        hasher.update(self.next_id.to_be_bytes());
+        hasher.update(process_seed().to_be_bytes());
+        hasher.update(b"container-service-domain");
+        hasher
+            .finalize()
+            .iter()
+            .take(DOMAIN_TOKEN_LEN)
+            .map(|byte| {
+                char::from(DOMAIN_TOKEN_ALPHABET[usize::from(*byte) % DOMAIN_TOKEN_ALPHABET.len()])
+            })
+            .collect()
     }
 
     /// The next private/public IPv4 offset, consumed so no two instances in this
@@ -1388,14 +2026,15 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// Materialise every transition the clock had already made due at `now_ms`:
-    /// an instance settles into the state it was owed, and an operation whose
-    /// work is done settles into `Succeeded`.
+    /// an instance settles into the state it was owed, a container service walks
+    /// into the phase it was owed (activating the deployment that was waiting),
+    /// and an operation whose work is done settles into `Succeeded`.
     ///
     /// This is the one write a reporting operation performs. Each transition was
     /// owed at this instant whether or not anybody called, so applying it here
     /// cannot show a caller anything a later caller would not also see.
     ///
-    /// Both walks are bounded by [`MAX_INSTANCES`] and
+    /// Every walk is bounded by [`MAX_INSTANCES`], [`MAX_CONTAINER_SERVICES`] and
     /// [`MAX_OPERATION_HISTORY`], and a record drops out of the work as soon as
     /// it has nothing outstanding.
     fn advance_clock(&mut self, now_ms: i64) {
@@ -1405,6 +2044,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 instance.state = due.state;
                 instance.due = None;
             }
+        }
+        for service in self.container_services.values_mut() {
+            service.advance(now_ms);
         }
         for operation in &mut self.operations {
             let Some(settles_at_ms) = operation.settles_at_ms else {
@@ -1611,6 +2253,20 @@ pub fn domain_arn(id: &str) -> String {
 /// from the value alone.
 pub fn support_code(id: &str) -> String {
     format!("{}/{id}", ::engine::emulator_account_id())
+}
+
+/// The region a request is scoped to: the one its SigV4 credential scope names,
+/// or [`DEFAULT_REGION`] when the request carries no scope (an unsigned call) or
+/// names a region Lightsail does not serve.
+///
+/// `ResourceLocation$regionName` targets the modelled `RegionName` enum, so the
+/// answer is always one of that enum's values — a scope naming anything else is
+/// not a region this service has resources in.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| REGION_NAME_VALUES.contains(&region.as_str()))
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
 // ---------------------------------------------------------------------------

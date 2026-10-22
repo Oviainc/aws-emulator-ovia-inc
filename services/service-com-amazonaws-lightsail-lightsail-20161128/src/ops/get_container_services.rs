@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetContainerServices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetContainerServices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the container services this service's store holds in the region the
+//! request is made in.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetContainerServices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetContainerServices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetContainerServicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Reporting only: the answer is read from the stored records, and the
+        // one write behind this call is the clock materialising the lifecycle
+        // phases it already owed (see `crate::state::with_state`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetContainerServices"))
+        // From the modelled `serviceName` documentation: when it is omitted the
+        // response carries "all of your container services in the Amazon Web
+        // Services Region where the request is made", so the region of the
+        // request scopes the answer either way.
+        let region = crate::state::request_region(ctx.parts());
+        let wanted = input.service_name;
+
+        crate::state::with_state(&*self.engine, |store| match &wanted {
+            // A well-formed name that names nothing in this region is a modelled
+            // 404, never an empty 200.
+            Some(name) => store
+                .container_service(&region, name)
+                .map(|service| vec![service.view()])
+                .ok_or_else(|| not_found(name, &region)),
+            None => Ok(store
+                .container_services_in(&region)
+                .into_iter()
+                .map(crate::state::StoredContainerService::view)
+                .collect()),
+        })
+        .ok_or_else(unavailable)?
+        .map(|container_services| GetContainerServicesOutput {
+            container_services: Some(container_services),
+        })
     }
+}
+
+/// No container service of that name is stored in that region: the modelled
+/// `NotFoundException` (404).
+fn not_found(name: &str, region: &str) -> GetContainerServicesError {
+    GetContainerServicesErrorModeled::NotFoundException(NotFoundException {
+        message: Some(format!(
+            "no container service named '{name}' exists in {region}"
+        )),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetContainerServicesError {
+    GetContainerServicesErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail container service store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateContainerService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateContainerService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts one container service record into this service's store and answers
+//! the record it stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateContainerService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +195,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateContainerService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateContainerServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateContainerService"))
+        // A container service is a REGIONAL resource and its name is unique
+        // within one region of the account, so the region the request is signed
+        // for is part of the record's identity.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `serviceName`, `power` and `scale` are modelled `@required` members,
+        // the name carries the modelled length and pattern and `scale` the
+        // modelled 1..20 range, so the centralized walk refused anything outside
+        // them before this body ran. What is left is what the model cannot
+        // express: the power must name one this service serves, the caller-sized
+        // collections must be within their bounds, the deployment must describe
+        // something launchable, and the name must still be free. Every one of
+        // those is checked BEFORE the first write, so a refused request creates
+        // nothing.
+        let power = crate::state::container_service_power(&input.power).ok_or_else(|| {
+            invalid(format!(
+                "power must be one of [{}], got '{}'",
+                crate::state::container_service_power_names(),
+                input.power
+            ))
+        })?;
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+        // Whether a public domain name is backed by a validated certificate is
+        // `CreateCertificate`'s business, which this emulator does not hold yet,
+        // so the names are kept as asked for and only their COUNT is bounded.
+        let public_domain_names =
+            crate::state::public_domain_names_from_request(input.public_domain_names.as_ref())
+                .map_err(invalid)?;
+        let now = crate::state::now_ms();
+        // A deployment named at create is this service's FIRST deployment, so it
+        // carries version 1.
+        let deployment = input
+            .deployment
+            .as_ref()
+            .map(|request| crate::state::deployment_from_request(1, now, request))
+            .transpose()
+            .map_err(invalid)?;
+        let ecr_image_puller_role_active = input
+            .private_registry_access
+            .as_ref()
+            .and_then(|access| access.ecr_image_puller_role.as_ref())
+            .and_then(|role| role.is_active)
+            .unwrap_or(false);
+
+        let location = crate::state::StoredLocation::regional(&region);
+
+        crate::state::with_state(&*self.engine, |store| {
+            if store
+                .container_service(&region, &input.service_name)
+                .is_some()
+            {
+                return Err(invalid(format!(
+                    "a container service named '{}' already exists in {region}",
+                    input.service_name
+                )));
+            }
+            if store.container_services.len() >= crate::state::MAX_CONTAINER_SERVICES {
+                return Err(invalid(format!(
+                    "creating another container service would take this account past the {} \
+                     this emulator holds",
+                    crate::state::MAX_CONTAINER_SERVICES
+                )));
+            }
+
+            let id = store.mint_uuid();
+            let domain_token = store.mint_domain_token();
+            // A new container service is not serving yet: the clock owes it the
+            // rest of its lifecycle, which is why a read straight after this
+            // call still reports `PENDING`, exactly as it does against AWS. With
+            // no deployment to launch it settles in `READY`; with one it passes
+            // through `DEPLOYING` and reaches `RUNNING` as that deployment
+            // becomes active.
+            let mut owed = ::std::collections::VecDeque::new();
+            let settles_at = now.saturating_add(crate::state::STATE_TRANSITION_MILLIS);
+            if deployment.is_some() {
+                owed.push_back(crate::state::OwedPhase {
+                    at_ms: settles_at,
+                    state: crate::state::CONTAINER_SERVICE_DEPLOYING,
+                    activates_next_deployment: false,
+                });
+                owed.push_back(crate::state::OwedPhase {
+                    at_ms: settles_at.saturating_add(crate::state::STATE_TRANSITION_MILLIS),
+                    state: crate::state::CONTAINER_SERVICE_RUNNING,
+                    activates_next_deployment: true,
+                });
+            } else {
+                owed.push_back(crate::state::OwedPhase {
+                    at_ms: settles_at,
+                    state: crate::state::CONTAINER_SERVICE_READY,
+                    activates_next_deployment: false,
+                });
+            }
+
+            let service = crate::state::StoredContainerService {
+                name: input.service_name.clone(),
+                arn: crate::state::container_service_arn(&region, &id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags: tags.clone(),
+                power: power.name.to_string(),
+                power_id: power.power_id.to_string(),
+                scale: input.scale,
+                state: crate::state::CONTAINER_SERVICE_PENDING,
+                // Nothing has disabled a service this call just created.
+                is_disabled: false,
+                principal_arn: crate::state::container_service_principal_arn(
+                    &region,
+                    &input.service_name,
+                    &domain_token,
+                ),
+                domain_token,
+                public_domain_names: public_domain_names.clone(),
+                ecr_image_puller_role_active,
+                // The deployment the request named is the one WAITING to become
+                // active: nothing is running on a service that is still being
+                // created.
+                current_deployment: None,
+                next_deployment: deployment.clone(),
+                next_deployment_version: if deployment.is_some() { 2 } else { 1 },
+                owed,
+            };
+            let view = service.view();
+            store.insert_container_service(service);
+            Ok(CreateContainerServiceOutput {
+                container_service: Some(view),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateContainerServiceError {
+    CreateContainerServiceErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateContainerServiceError {
+    CreateContainerServiceErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail container service store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
