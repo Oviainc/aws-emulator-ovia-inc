@@ -150,29 +150,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
-        // The cursor is an inclusive start key: the page begins at the first stored
-        // `(teamId, channelId)` at or after the one the token names, so a
-        // configuration added or removed between pages shifts nothing already
-        // reported. A token this service did not mint names no position, so it is
-        // refused rather than silently read as "from the beginning". This operation
-        // models no client-input error, so the refusal goes through the scaffold's
-        // 400 `ValidationException` channel.
+        // The cursor is a position in the listing's order: the page resumes after the
+        // records the token says were already reported, so a caller that follows the
+        // tokens walks the whole store. A token this service did not mint names no
+        // position, so it is refused rather than silently read as "from the beginning".
+        // This operation models no client-input error, so the refusal goes through the
+        // scaffold's 400 `ValidationException` channel.
         let start_at = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => Some(crate::state::decode_cursor(token).ok_or_else(|| {
+            None => 0,
+            Some(token) => crate::state::decode_cursor(token).ok_or_else(|| {
                 crate::scaffolded::Scaffolded::validation("the specified nextToken is not valid")
-            })?),
+            })?,
         };
 
         let mut remaining = store
             .slack_channel_configurations
-            .iter()
-            .filter(|(key, _)| start_at.as_ref().is_none_or(|from| *key >= from));
+            .values()
+            .skip(start_at);
 
         let page: Vec<SlackChannelConfiguration> = remaining
             .by_ref()
             .take(crate::state::CHANNEL_PAGE_SIZE)
-            .map(|(_, config)| config.to_modeled())
+            .map(crate::state::SlackChannelConfig::to_modeled)
             .collect();
 
         // A `nextToken` is returned only when a further page exists, so a caller that
@@ -180,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reported.
         let next_token = remaining
             .next()
-            .map(|((team_id, channel_id), _)| crate::state::encode_cursor(team_id, channel_id));
+            .map(|_| crate::state::encode_cursor(start_at + page.len()));
 
         Ok(ListSlackChannelConfigurationsOutput {
             next_token,

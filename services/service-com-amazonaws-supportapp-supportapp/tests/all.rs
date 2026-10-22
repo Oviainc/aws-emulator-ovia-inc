@@ -17,5 +17,7 @@ mod error_message_templates;
 mod resource_preconditions;
 #[path = "all/slack_channel_configurations.rs"]
 mod slack_channel_configurations;
+#[path = "all/slack_workspace_configurations.rs"]
+mod slack_workspace_configurations;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

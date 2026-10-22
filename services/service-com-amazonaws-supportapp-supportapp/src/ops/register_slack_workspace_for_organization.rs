@@ -22,8 +22,7 @@
 //! `allowOrganizationMemberAccount` is set on every successful call, including one for
 //! a workspace the account already held: registering a workspace for the organization
 //! from its management account is what lets member accounts authorize the same
-//! workspace. That field is only read by the still-scaffolded
-//! `ListSlackWorkspaceConfigurations`.
+//! workspace. That field is what `ListSlackWorkspaceConfigurations` reports.
 //!
 //! ## Shape of an operation
 //!
