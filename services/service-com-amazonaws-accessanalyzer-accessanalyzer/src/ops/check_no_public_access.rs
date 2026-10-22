@@ -358,11 +358,16 @@ const SCOPING_CONDITION_KEYS: &[&str] = &[
 /// (`aws:PrincipalTag/<tag-key>`), from the same documentation.
 const SCOPING_CONDITION_KEY_PREFIXES: &[&str] = &["aws:PrincipalTag/"];
 
-/// How a statement admits every principal, in the words the matching [`ReasonSummary`]
-/// carries. Both say the same thing a reason must say: which element opened the statement
-/// up, and that nothing scoped it back down.
-const WILDCARD_PRINCIPAL_REASON: &str = "The statement allows every principal (\"Principal\": \"*\") and carries no condition that scopes access to a known principal, account, organization, calling service or network path, so it can grant public access to the resource.";
-const NOT_PRINCIPAL_REASON: &str = "The statement allows every principal its NotPrincipal element does not list and carries no condition that scopes access to a known principal, account, organization, calling service or network path, so it can grant public access to the resource.";
+/// The finding a reason reports, in the service's canonical short form: public access is
+/// granted by one statement of the submitted document, which the reason then names.
+///
+/// The sentence is the model's own, from `CheckNoPublicAccess`'s `smithy.api#examples`
+/// (verify with
+/// `grep 'Public access granted in the following statement' smithy-model/com-amazonaws-accessanalyzer-accessanalyzer.json`);
+/// the statement is named by [`crate::state::statement_reference`]. What made the
+/// statement public (a wildcard `Principal`, a `NotPrincipal`, an unscoped `Condition`)
+/// is the reasoning behind the finding, not part of the sentence AWS emits.
+const PUBLIC_ACCESS_FINDING: &str = "Public access granted in the following statement";
 
 /// Why a parsed statement can grant public access, or `None` when it cannot.
 ///
@@ -374,24 +379,23 @@ fn public_access_reason(statement: &policy::Statement) -> Option<ReasonSummary> 
         return None;
     }
     let principals = statement.principals.as_ref()?;
-    let description = if principals.negated {
-        // `NotPrincipal` with `Allow` admits every principal the element does not list.
-        NOT_PRINCIPAL_REASON
-    } else if principals.any {
-        // The element is `"*"`, or lists it: every caller, anonymous ones included.
-        WILDCARD_PRINCIPAL_REASON
-    } else {
-        // A statement naming only known principals grants nothing to the public,
-        // whatever its conditions say.
+    // `NotPrincipal` with `Allow` admits every principal the element does not list, and a
+    // `"*"` element (or one listing it) admits every caller, anonymous ones included;
+    // a statement naming only known principals grants nothing to the public, whatever its
+    // conditions say.
+    if !principals.negated && !principals.any {
         return None;
-    };
+    }
     // The `Condition` block is a conjunction, so ONE clause that binds the caller is
     // enough to keep the wildcard principal from reaching the public.
     if statement.conditions.iter().any(clause_scopes_access) {
         return None;
     }
     Some(ReasonSummary {
-        description: Some(description.to_string()),
+        description: Some(format!(
+            "{PUBLIC_ACCESS_FINDING} {}.",
+            crate::state::statement_reference(statement.sid.as_deref(), statement.index)
+        )),
         statement_index: Some(statement.index),
         statement_id: statement.sid.clone(),
     })

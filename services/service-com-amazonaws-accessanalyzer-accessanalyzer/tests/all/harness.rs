@@ -316,9 +316,13 @@ pub fn is_timestamp(value: Option<&Value>) -> bool {
 /// wire.
 ///
 /// Both encodings the codec may choose are ordered: epoch seconds numerically, an
-/// RFC3339 rendering lexicographically (its fields run most- to least-significant at a
-/// fixed `Z` offset). A pair of differently encoded values is not comparable, so it is
-/// reported as not ordered and the assertion that reads this fails loudly.
+/// RFC3339 rendering by its whole-second text (whose fields run most- to
+/// least-significant at a fixed `Z` offset) and then by its fractional second as a
+/// NUMBER. Comparing an RFC3339 rendering as plain text is not sound — the codec trims
+/// trailing zeros from the fraction, so a whole second (`…:00Z`) sorts after the same
+/// second plus a fraction (`…:00.5Z`) although it is earlier. A pair of differently
+/// encoded values is not comparable, so it is reported as not ordered and the assertion
+/// that reads this fails loudly.
 pub fn timestamp_at_least(later: Option<&Value>, earlier: Option<&Value>) -> bool {
     match (later, earlier) {
         (Some(Value::Number(later)), Some(Value::Number(earlier))) => {
@@ -327,8 +331,93 @@ pub fn timestamp_at_least(later: Option<&Value>, earlier: Option<&Value>) -> boo
                 _ => false,
             }
         }
-        (Some(Value::String(later)), Some(Value::String(earlier))) => later >= earlier,
+        (Some(Value::String(later)), Some(Value::String(earlier))) => {
+            match (rfc3339_parts(later), rfc3339_parts(earlier)) {
+                (Some((later_second, later_fraction)), Some((earlier_second, earlier_fraction))) => {
+                    later_second > earlier_second
+                        || (later_second == earlier_second && later_fraction >= earlier_fraction)
+                }
+                _ => false,
+            }
+        }
         _ => false,
+    }
+}
+
+/// An RFC3339 instant split into the part that orders lexicographically (everything up to
+/// the seconds field) and the fractional second, which does not.
+fn rfc3339_parts(text: &str) -> Option<(&str, f64)> {
+    let body = text.strip_suffix('Z')?;
+    match body.split_once('.') {
+        Some((whole, fraction)) => {
+            let fraction: f64 = format!("0.{fraction}").parse().ok()?;
+            Some((whole, fraction))
+        }
+        None => Some((body, 0.0)),
+    }
+}
+
+/// The ordering [`timestamp_at_least`] implements, over both renderings the codec may
+/// choose and over the boundary the trimmed fraction creates: a whole second is EARLIER
+/// than the same second plus any fraction, though its text sorts after it.
+#[test]
+fn timestamps_are_ordered_whichever_way_they_are_rendered() {
+    let cases: &[(&str, Value, Value, bool)] = &[
+        (
+            "epoch seconds, later first",
+            Value::from(1_700_000_001.0),
+            Value::from(1_700_000_000.0),
+            true,
+        ),
+        (
+            "epoch seconds, earlier first",
+            Value::from(1_700_000_000.0),
+            Value::from(1_700_000_001.0),
+            false,
+        ),
+        (
+            "RFC3339 whole seconds apart",
+            Value::from("2026-01-01T00:00:01Z"),
+            Value::from("2026-01-01T00:00:00Z"),
+            true,
+        ),
+        (
+            "RFC3339 fraction after a whole second, same second",
+            Value::from("2026-01-01T00:00:00.5Z"),
+            Value::from("2026-01-01T00:00:00Z"),
+            true,
+        ),
+        (
+            "RFC3339 whole second before a fraction of it",
+            Value::from("2026-01-01T00:00:00Z"),
+            Value::from("2026-01-01T00:00:00.5Z"),
+            false,
+        ),
+        (
+            "RFC3339 fractions of unequal length",
+            Value::from("2026-01-01T00:00:00.5Z"),
+            Value::from("2026-01-01T00:00:00.123456Z"),
+            true,
+        ),
+        (
+            "RFC3339 equal instants",
+            Value::from("2026-01-01T00:00:00.25Z"),
+            Value::from("2026-01-01T00:00:00.25Z"),
+            true,
+        ),
+        (
+            "mixed renderings are not comparable",
+            Value::from("2026-01-01T00:00:00Z"),
+            Value::from(1_700_000_000.0),
+            false,
+        ),
+    ];
+    for (case, later, earlier, expected) in cases {
+        assert_eq!(
+            timestamp_at_least(Some(later), Some(earlier)),
+            *expected,
+            "case {case:?}: expected {expected} for {later:?} at or after {earlier:?}"
+        );
     }
 }
 

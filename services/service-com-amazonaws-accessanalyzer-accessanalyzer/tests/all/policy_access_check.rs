@@ -24,15 +24,58 @@ use crate::harness::{Emulator, Reply};
 /// `http: {method: POST, uri: /policy/check-access-not-granted}`.
 const CHECK_PATH: &str = "/policy/check-access-not-granted";
 
-/// The `message` AWS reports with each `result`. The model STATES both strings, in
-/// `CheckAccessNotGranted`'s `smithy.api#examples` trait, so each is a requirement; they
-/// are deliberately not parallel (only the FAIL wording says "one or more of"). Verify
-/// with `grep 'listed actions or resources' smithy-model/com-amazonaws-accessanalyzer-accessanalyzer.json`.
-const MESSAGE_FAIL: &str =
-    "The policy document grants access to perform one or more of the listed actions or resources.";
-/// See [`MESSAGE_FAIL`].
-const MESSAGE_PASS: &str =
-    "The policy document does not grant access to perform the listed actions or resources.";
+/// The `message` AWS reports with each `result`: ONE fixed sentence per result, naming
+/// the dimensions the request's `access` object probed (see [`probed_phrase`]) and
+/// nothing else from the request. The recorded response to an actions-only request says
+/// "the listed actions"; the model's `smithy.api#examples` for this operation say "the
+/// listed actions or resources". The two sentences are deliberately not parallel (only
+/// the FAIL wording says "one or more of"). Verify with
+/// `grep 'one or more of the listed actions or resources' smithy-model/com-amazonaws-accessanalyzer-accessanalyzer.json`.
+fn message_fail(probed: &str) -> String {
+    format!("The policy document grants access to perform one or more of the listed {probed}.")
+}
+
+/// See [`message_fail`].
+fn message_pass(probed: &str) -> String {
+    format!("The policy document does not grant access to perform the listed {probed}.")
+}
+
+/// The noun phrase the answer to this `access` list names its probed dimensions with: the
+/// three modes the `access` member's own documentation defines ("If only actions are
+/// specified … If only resources are specified … If both actions and resources are
+/// specified …", `smithy_query(query="operation", operation="CheckAccessNotGranted")`).
+fn probed_phrase(access: &Value) -> &'static str {
+    let named = |member: &str| {
+        access.as_array().is_some_and(|objects| {
+            objects.iter().any(|object| {
+                object
+                    .get(member)
+                    .and_then(Value::as_array)
+                    .is_some_and(|values| !values.is_empty())
+            })
+        })
+    };
+    match (named("actions"), named("resources")) {
+        (true, false) => "actions",
+        (false, true) => "resources",
+        // Naming neither is refused rather than answered, so the remaining case is a
+        // request that named both.
+        _ => "actions or resources",
+    }
+}
+
+/// The `reasons[].description` AWS reports for a statement that may grant the access: the
+/// canonical finding for the probed dimensions, then the statement named by its `Sid` when
+/// it carries one and by its index when it does not — the `sid` form is the model's
+/// examples' (`grep 'in the statement with sid: ' smithy-model/com-amazonaws-accessanalyzer-accessanalyzer.json`),
+/// the `index` form the recorded response's.
+fn expected_description(probed: &str, statement_id: Option<&str>, statement_index: i64) -> String {
+    let reference = match statement_id {
+        Some(sid) => format!("with sid: {sid}"),
+        None => format!("with index: {statement_index}"),
+    };
+    format!("One or more of the listed {probed} in the statement {reference}.")
+}
 
 /// Actions used by the sweeps. Any string usable as an action in an IAM policy is a
 /// legal value — see the `actions` member's doc in
@@ -465,19 +508,39 @@ async fn the_check_answers_from_the_policy_document() {
             case.result,
             reply.body
         );
+        let probed = probed_phrase(&case.access);
         let expected_message = if case.result == "FAIL" {
-            MESSAGE_FAIL
+            message_fail(probed)
         } else {
-            MESSAGE_PASS
+            message_pass(probed)
         };
         assert_eq!(
             reply.member("message").and_then(Value::as_str),
-            Some(expected_message),
+            Some(expected_message.as_str()),
             "case {:?}: expected the documented {} message, got {:?}",
             case.case,
             case.result,
             reply.member("message")
         );
+        // Every reason reports the canonical finding and the statement it blames — never
+        // prose about what that statement contains.
+        for reason in reply
+            .member("reasons")
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new())
+        {
+            let statement_index = reason
+                .get("statementIndex")
+                .and_then(Value::as_i64)
+                .unwrap_or(-1);
+            let statement_id = reason.get("statementId").and_then(Value::as_str);
+            assert_eq!(
+                reason.get("description").and_then(Value::as_str),
+                Some(expected_description(probed, statement_id, statement_index).as_str()),
+                "case {:?}: expected the canonical reason description, got {reason:?}",
+                case.case
+            );
+        }
         assert_eq!(
             reported_statements(&reply),
             case.reasons,
@@ -862,9 +925,10 @@ async fn a_failing_check_points_at_the_statement_that_grants_the_access() {
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    assert!(
-        description.contains("s3:GetObject") && description.contains("arn:aws:s3:::demo/key"),
-        "case {:?}: expected a description naming the requested permission, got {description:?}",
+    assert_eq!(
+        description,
+        expected_description("actions or resources", Some("AllowRead"), 1),
+        "case {:?}: expected the canonical reason naming the statement's Sid, got {description:?}",
         "the second statement grants the access"
     );
 
@@ -891,6 +955,13 @@ async fn a_failing_check_points_at_the_statement_that_grants_the_access() {
             .get("statementId")
             .is_none_or(|statement_id| statement_id.is_null()),
         "case {:?}: expected no statementId, got {reason:?}",
+        "a granting statement without a Sid"
+    );
+    // With no `Sid` to name, the reason names the statement's index — the recorded form.
+    assert_eq!(
+        reason.get("description").and_then(Value::as_str),
+        Some(expected_description("actions", None, 0).as_str()),
+        "case {:?}: expected the canonical reason naming the statement's index, got {reason:?}",
         "a granting statement without a Sid"
     );
 

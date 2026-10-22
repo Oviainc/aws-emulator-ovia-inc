@@ -274,9 +274,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 new_access
                     .into_iter()
                     .map(|found| ReasonSummary {
+                        // The service's canonical short form: the finding, then the
+                        // statement it blames, named the one way every policy-check reason
+                        // names one (see `crate::state::statement_reference`).
                         description: Some(format!(
-                            "New access in the statement with index: {}.",
-                            found.statement_index
+                            "New access in the statement {}.",
+                            crate::state::statement_reference(
+                                found.statement_id.as_deref(),
+                                found.statement_index
+                            )
                         )),
                         statement_index: Some(found.statement_index),
                         statement_id: found.statement_id,
@@ -1065,6 +1071,10 @@ pub mod policy {
 
         let sid = match elements.get("sid") {
             None => None,
+            // An empty `Sid` identifies no statement, so it is not an identifier: the
+            // statement is named by its index and a reason reports no `statementId` for
+            // it (see `crate::state::statement_reference`).
+            Some(Value::String(text)) if text.is_empty() => None,
             Some(Value::String(text)) => Some(text.clone()),
             Some(_) => return Err(invalid("the Sid element is a string")),
         };
