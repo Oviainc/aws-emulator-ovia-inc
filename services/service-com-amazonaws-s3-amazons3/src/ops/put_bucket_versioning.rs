@@ -8,10 +8,12 @@
 //! last put. A configuration that names no usable `Status` is refused, and a bucket this
 //! emulator does not hold is `NoSuchBucket` (404).
 //!
-//! Object-level versioning is NOT part of this operation and is not emulated: a stored
-//! object still has one current state, so `PutObject` reports no `VersionId` and
-//! `ListObjectVersions` remains its own stub. What this operation keeps is the bucket's
-//! versioning state, which is what `GetBucketVersioning` reads back.
+//! Object-level versioning is not performed HERE, but it follows from what this operation
+//! records: a bucket whose `Status` is `Enabled` makes every later `PutObject` store a new
+//! version under a minted id and report it, and makes the version each write supersedes
+//! stay addressable — see `put_object`, `get_object`, `head_object`, `delete_object` and
+//! `list_object_versions`. What this operation keeps is the bucket's versioning state,
+//! which is what `GetBucketVersioning` reads back and what those five read.
 //!
 //! ## Shape of an operation
 //!

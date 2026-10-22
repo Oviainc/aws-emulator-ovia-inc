@@ -204,11 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // "To put tags of any other version, use the versionId query parameter" — a
-        // version this emulator holds nothing of, because object versioning is not
-        // emulated (`PutObject` keeps one object per key), so there is no version to
-        // associate a tag set with. The 501 says that rather than tagging the current
-        // object as if it were the version the request named.
+        // "To put tags of any other version, use the versionId query parameter" — the
+        // store does keep versions (`PutObject` mints a version id on a
+        // versioning-enabled bucket), but this handler writes the tag set of the CURRENT
+        // object alone, through the byte budgets of the object at the key. Tagging one
+        // stored version is its own behaviour; the 501 says so rather than tagging the
+        // current object as if it were the version the request named.
         if input.version_id.is_some() {
             return Err(crate::scaffolded::Scaffolded::not_implemented(
                 "PutObjectTagging with versionId",

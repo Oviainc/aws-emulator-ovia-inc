@@ -245,12 +245,8 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
         );
     }
 
-    // `partNumber` and `versionId` are query parameters rather than headers, and are
-    // refused the same way.
-    for (case, query) in [
-        ("a part number", "partNumber=1"),
-        ("a version id", "versionId=abc"),
-    ] {
+    // `partNumber` is a query parameter rather than a header, and is refused the same way.
+    for (case, query) in [("a part number", "partNumber=1")] {
         let answer = send(
             &router,
             "HEAD",
@@ -265,6 +261,43 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
             answer.status,
             String::from_utf8_lossy(&answer.body)
         );
+    }
+
+    // `versionId` IS served: it names one stored version of the key. The bucket here was
+    // never versioning-enabled, so its object is the `null` version and no other version
+    // id names anything — which is `NoSuchVersion` (404), not the 501 of an unserved
+    // member and not the `NoSuchKey` of an absent key.
+    for (case, query, expected_status, expected_code) in [
+        ("the null version of an unversioned object", "versionId=null", 200, ""),
+        (
+            "a version id the bucket holds no version for",
+            "versionId=abc",
+            404,
+            "NoSuchVersion",
+        ),
+    ] {
+        let answer = send(
+            &router,
+            "HEAD",
+            &format!("/{bucket}/held.txt?{query}"),
+            &[],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            answer.status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {} with body {:?}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        if !expected_code.is_empty() {
+            assert_eq!(
+                answer.error_code(),
+                expected_code,
+                "case {case:?}: expected {expected_code}, got {:?}",
+                answer.error_code()
+            );
+        }
     }
 
     // Naming another account as the bucket owner is a 403, as it is on a write.

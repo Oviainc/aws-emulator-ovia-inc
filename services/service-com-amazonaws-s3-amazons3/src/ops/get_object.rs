@@ -354,9 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // * the conditional members are answered with HTTP 304 (`If-None-Match`,
         //   `If-Modified-Since`) or 412 (`If-Match`, `If-Unmodified-Since`) when the
         //   condition fails; `PreconditionFailed` is not a shape in this model either.
-        // * `versionId` names a version, and bucket versioning is not emulated
-        //   (`PutBucketVersioning` is still a stub), so this emulator holds no version to
-        //   match it against.
+        // * `versionId` is SERVED (below): it names one stored version of the key.
         // * the SSE-C members are the key an encrypted object would be decrypted with;
         //   `PutObject` refuses to store one, so no object here was encrypted with it.
         for (member, present) in [
@@ -366,7 +364,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("If-None-Match", input.if_none_match.is_some()),
             ("If-Modified-Since", input.if_modified_since.is_some()),
             ("If-Unmodified-Since", input.if_unmodified_since.is_some()),
-            ("versionId", input.version_id.is_some()),
             (
                 "x-amz-server-side-encryption-customer-algorithm",
                 input.sse_customer_algorithm.is_some(),
@@ -389,7 +386,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(GetObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
-        let Some(object) = bucket.object(&input.key) else {
+        // "To retrieve a specific version, you must be the bucket owner and you must use
+        // the versionId subresource" (`GetObject`'s documentation): with one, the read is
+        // of that stored version — current or not — and with none it is of the key's
+        // current version. A `versionId` naming no version the bucket holds is
+        // `NoSuchVersion`, which this model carries no shape for (the model's error set
+        // for this operation is `NoSuchKey` / `InvalidObjectState` / `NoSuchBucket`), so
+        // it goes out through the unmodelled channel with the code and 404 S3 answers.
+        let object = match input.version_id.as_deref() {
+            None => bucket.object(&input.key),
+            Some(version_id) => {
+                let found = bucket.object_version(&input.key, version_id);
+                if found.is_none() {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::NO_SUCH_VERSION_CODE,
+                        404,
+                        crate::state::NO_SUCH_VERSION_MESSAGE,
+                    ));
+                }
+                found
+            }
+        };
+        let Some(object) = object else {
             return Err(GetObjectErrorModeled::NoSuchKey(NoSuchKey {}).into());
         };
 
@@ -439,17 +457,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .or_else(|| object.content_language.clone()),
             expires,
             website_redirect_location: object.website_redirect_location.clone(),
+            // "Version ID of the object" (`GetObjectOutput$VersionId`), reported for a
+            // version the store minted an id for — a write into a bucket whose versioning
+            // status is `Enabled`. A `null` version carries no id of its own, so none is
+            // reported for it.
+            version_id: object.version_id.clone(),
             // Everything else describes a feature no stored object here has, so none of
             // it is reported rather than being invented: `AcceptRanges` would advertise
-            // the ranged reads refused above, `DeleteMarker` and `VersionId` need bucket
-            // versioning, `Expiration` and `Restore`/`ArchiveStatus` need a lifecycle
-            // configuration and an archive tier, the checksum members need a checksum
-            // `PutObject` did not compute, the encryption members are refused at write
-            // time, `TagCount` needs object tags no operation here records, `PartsCount`
-            // needs a multipart upload, `ContentRange` belongs to a ranged read,
-            // `MissingMeta` counts unreadable metadata headers (there are none),
-            // `ReplicationStatus` needs a replication configuration and `RequestCharged`
-            // a Requester Pays charge this emulator does not model.
+            // the ranged reads refused above, `DeleteMarker` needs a delete marker (a
+            // delete records none, so no read can be of one), `Expiration` and
+            // `Restore`/`ArchiveStatus` need a lifecycle configuration and an archive
+            // tier, the checksum members need a checksum `PutObject` did not compute, the
+            // encryption members are refused at write time, `TagCount` needs object tags
+            // no operation here records, `PartsCount` needs a multipart upload,
+            // `ContentRange` belongs to a ranged read, `MissingMeta` counts unreadable
+            // metadata headers (there are none), `ReplicationStatus` needs a replication
+            // configuration and `RequestCharged` a Requester Pays charge this emulator
+            // does not model.
             ..GetObjectOutput::default()
         })
     }

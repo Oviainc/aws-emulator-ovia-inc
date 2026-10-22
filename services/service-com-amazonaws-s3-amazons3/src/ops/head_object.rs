@@ -349,9 +349,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PartNumber` are answered with HTTP 206 and a `Content-Range`, and a
         // conditional read with 304 or 412, none of which an operation whose success
         // status is 200 can render—plus the customer-key encryption nothing here
-        // performs and the versioning this emulator does not keep. A 501 says so
-        // instead of answering 200 with the whole object as if the request had asked
-        // for it.
+        // performs. A 501 says so instead of answering 200 with the whole object as if
+        // the request had asked for it. `VersionId` IS served: it names one stored
+        // version of the key.
         if let Some(unserved) = unserved_feature(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "HeadObject with {unserved}"
@@ -385,21 +385,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Read-only: the guard is taken, the object's metadata is copied out, and
         // nothing is written — a later caller sees exactly what this one saw.
         let store = state.lock();
+        // "To retrieve a specific version, you must be the bucket owner and you must use
+        // the versionId subresource" (`GetObject`, which `HeadObject` shares its read with
+        // — "a HEAD request has the same options as a GET operation on an object"): with
+        // one the read is of that stored version, with none it is of the key's current
+        // version.
+        let object = store.bucket(&input.bucket).and_then(|bucket| {
+            match input.version_id.as_deref() {
+                None => bucket.object(&input.key),
+                Some(version_id) => bucket.object_version(&input.key, version_id),
+            }
+        });
         // A missing bucket and a missing key are both a 404 on a HEAD, which carries no
         // body to tell them apart by an error document. The modelled `NotFound` cannot
         // say it: the shape carries no `@httpError`, so the framework would render the
         // client-error default (400) and an SDK waiter keying on 404 would never see the
-        // object as absent. The code and status S3 sends go out directly instead.
-        let object = store
-            .bucket(&input.bucket)
-            .and_then(|bucket| bucket.object(&input.key));
+        // object as absent. The code and status S3 sends go out directly instead — and a
+        // `versionId` the bucket holds no version for is `NoSuchVersion` rather than
+        // `NoSuchKey`, because the key itself may well be there.
         let Some(object) = object else {
-            let (code, message) = match store.bucket(&input.bucket) {
-                Some(_) => (
+            let (code, message) = match (
+                store.bucket(&input.bucket).is_some(),
+                input.version_id.is_some(),
+            ) {
+                (true, true) => (
+                    crate::state::NO_SUCH_VERSION_CODE,
+                    crate::state::NO_SUCH_VERSION_MESSAGE,
+                ),
+                (true, false) => (
                     crate::state::NO_SUCH_KEY_CODE,
                     crate::state::NO_SUCH_KEY_MESSAGE,
                 ),
-                None => (
+                (false, _) => (
                     crate::state::NO_SUCH_BUCKET_CODE,
                     crate::state::NO_SUCH_BUCKET_MESSAGE,
                 ),
@@ -429,16 +446,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Indicates that a range of bytes was specified" — S3 reports that an
             // object read supports range requests whether or not one was made.
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            // "Version ID of the object" (`HeadObjectOutput$VersionId`), reported for a
+            // version the store minted an id for — a write into a bucket whose versioning
+            // status is `Enabled`. A `null` version carries no id of its own, so none is
+            // reported for it.
+            version_id: object.version_id.clone(),
             // Every remaining member is documented as reported only when something this
             // slice does not serve is true of the object: it is a delete marker
-            // (`DeleteMarker`), a lifecycle rule has it expiring (`Expiration`), it is
-            // archived (`Restore`, `ArchiveStatus`), a checksum was uploaded with it
-            // (`Checksum*`, `ChecksumType`), the bucket is versioned (`VersionId`),
-            // metadata could not be decoded (`MissingMeta`), the read was partial
-            // (`ContentRange`, `PartsCount`), something encrypted it
-            // (`ServerSideEncryption`, `SSE*`, `BucketKeyEnabled`), it carries object
-            // tags (`TagCount`), it is replicated (`ReplicationStatus`), it is locked
-            // (`ObjectLock*`) or the bucket is Requester Pays (`RequestCharged`).
+            // (`DeleteMarker`, which a delete records none of), a lifecycle rule has it
+            // expiring (`Expiration`), it is archived (`Restore`, `ArchiveStatus`), a
+            // checksum was uploaded with it (`Checksum*`, `ChecksumType`), metadata could
+            // not be decoded (`MissingMeta`), the read was partial (`ContentRange`,
+            // `PartsCount`), something encrypted it (`ServerSideEncryption`, `SSE*`,
+            // `BucketKeyEnabled`), it carries object tags (`TagCount`), it is replicated
+            // (`ReplicationStatus`), it is locked (`ObjectLock*`) or the bucket is
+            // Requester Pays (`RequestCharged`).
             ..HeadObjectOutput::default()
         })
     }
@@ -457,7 +479,6 @@ fn unserved_feature(input: &HeadObjectInput) -> Option<&'static str> {
         (input.if_none_match.is_some(), "IfNoneMatch"),
         (input.if_modified_since.is_some(), "IfModifiedSince"),
         (input.if_unmodified_since.is_some(), "IfUnmodifiedSince"),
-        (input.version_id.is_some(), "VersionId"),
         (
             input.sse_customer_algorithm.is_some(),
             "SSECustomerAlgorithm",

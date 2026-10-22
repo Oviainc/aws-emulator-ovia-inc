@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListObjectVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListObjectVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListObjectVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports metadata about every version of the objects in a bucket: the current version
+//! of each key and the noncurrent versions the store kept behind it, newest first.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,14 +151,22 @@ use super::types::*;
 // `ListObjectVersionsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `ListObjectVersionsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#ListObjectVersions")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="ListObjectVersions")` reports `errors: []`),
+// but `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and
+// AWS answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`). `extra_errors` widens the set with that shape, which the SERVICE
+// models, so this handler answers the same 404 every other bucket-scoped operation does
+// rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#ListObjectVersions",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum ListObjectVersionsErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -181,6 +183,13 @@ impl From<ListObjectVersionsErrorModeled> for ListObjectVersionsError {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
+
+/// The most entries one page may carry: "Sets the maximum number of keys returned in the
+/// response. By default, the action returns up to 1,000 key names. The response might
+/// contain fewer keys but will never contain more"
+/// (`MaxKeys`, `com.amazonaws.s3#ListObjectVersionsRequest`). A larger `max-keys` is
+/// answered with this many.
+const MAX_KEYS_PER_PAGE: i32 = 1000;
 
 /// The `ListObjectVersions` operation.
 ///
@@ -218,18 +227,259 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListObjectVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListObjectVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListObjectVersions"))
+        // A listing needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // `encoding-type=url` changes how Delimiter, Prefix, Key and the markers are
+        // written in the response, and `OptionalObjectAttributes` adds restore state:
+        // neither is served here, and answering a plain listing would be answering
+        // something the request did not ask for. `RequestPayer` confirms a charge this
+        // emulator does not model. Each keeps the scaffold's 501, exactly as
+        // `ListObjectsV2` refuses the same three.
+        for (member, present) in [
+            ("encoding-type", input.encoding_type.is_some()),
+            ("x-amz-request-payer", input.request_payer.is_some()),
+            (
+                "x-amz-optional-object-attributes",
+                input
+                    .optional_object_attributes
+                    .as_ref()
+                    .is_some_and(|attributes| !attributes.is_empty()),
+            ),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "ListObjectVersions with {member}"
+                )));
+            }
+        }
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `ExpectedBucketOwner`, judged the way every other bucket-scoped
+        // operation here judges it: this emulator serves one account, so that account owns
+        // every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        let max_keys = match input.max_keys {
+            Some(requested) if requested < 0 => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    "InvalidArgument",
+                    400,
+                    format!(
+                        "Argument max-keys must be an integer between 0 and 2147483647: \
+                         {requested}"
+                    ),
+                ))
+            }
+            Some(requested) => requested.min(MAX_KEYS_PER_PAGE),
+            None => MAX_KEYS_PER_PAGE,
+        };
+        let page_limit = max_keys as usize;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                "InternalError",
+                500,
+                "the shared S3 store is unreachable from this engine",
+            )
+        })?;
+        // Read-only: the guard is taken, the entries are copied out, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let bucket = store
+            .bucket(&input.bucket)
+            .ok_or(ListObjectVersionsErrorModeled::NoSuchBucket(NoSuchBucket {}))?;
+
+        let prefix = input.prefix.clone().unwrap_or_default();
+        let delimiter = input.delimiter.clone().unwrap_or_default();
+
+        let mut versions: Vec<ObjectVersion> = Vec::new();
+        let mut common_prefixes: Vec<String> = Vec::new();
+        // The last entry this page reported, as `(key, version id)` — `None` for a
+        // rolled-up common prefix, which has no version of its own — and whether anything
+        // was left unreported.
+        let mut last_entry: Option<(String, Option<String>)> = None;
+        let mut truncated = false;
+
+        // `max-keys=0` asks for no entries at all, which is an empty page and NOT a
+        // truncated one — reporting it as truncated would hand a paginating client markers
+        // that make no progress — so the walk below is skipped entirely.
+        if page_limit > 0 {
+            // The store keys objects in a `BTreeMap<String, _>`, so this walk is already in
+            // ascending UTF-8 byte order and every key rolling into one common prefix is
+            // contiguous within it; a key's own versions come back newest first.
+            'keys: for key in bucket.version_keys() {
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                // "If you specify key-marker without version-id-marker, the listing begins
+                // with the key immediately after key-marker"; with both, it begins with
+                // the version immediately after the one named, of that key.
+                match input.key_marker.as_deref() {
+                    Some(marker) if key < marker => continue,
+                    Some(marker) if key == marker && input.version_id_marker.is_none() => {
+                        continue
+                    }
+                    _ => {}
+                }
+
+                // With a delimiter, a key whose remainder after the prefix contains one is
+                // reported as the prefix up to and including that delimiter, not as an
+                // entry of its own — and every version of such a key rolls into it.
+                let rolled_up = if delimiter.is_empty() {
+                    None
+                } else {
+                    key[prefix.len()..]
+                        .find(delimiter.as_str())
+                        .map(|at| key[..prefix.len() + at + delimiter.len()].to_string())
+                };
+                if let Some(rolled_up) = rolled_up {
+                    // "All of the keys that roll up into a common prefix count as a single
+                    // return": a key under a prefix already on this page consumes no slot.
+                    if common_prefixes.last() == Some(&rolled_up) {
+                        continue;
+                    }
+                    // "CommonPrefixes is filtered out from results if it is not
+                    // lexicographically greater than the key-marker"
+                    // (`ListObjectVersionsRequest$Delimiter`) — which is what keeps the
+                    // page after one that ended on a rolled-up prefix from reporting that
+                    // prefix, and the keys under it, a second time.
+                    if input
+                        .key_marker
+                        .as_deref()
+                        .is_some_and(|marker| rolled_up.as_str() <= marker)
+                    {
+                        continue;
+                    }
+                    if versions.len() + common_prefixes.len() >= page_limit {
+                        truncated = true;
+                        break 'keys;
+                    }
+                    last_entry = Some((rolled_up.clone(), None));
+                    common_prefixes.push(rolled_up);
+                    continue;
+                }
+
+                let stored = bucket.object_versions(key);
+                // Within one key the version named by `version-id-marker` and everything
+                // newer than it belong to the page before this one.
+                let skip_through = match (
+                    input.key_marker.as_deref(),
+                    input.version_id_marker.as_deref(),
+                ) {
+                    (Some(marker), Some(version_marker)) if key == marker => {
+                        Some(version_marker)
+                    }
+                    _ => None,
+                };
+                let mut reached = skip_through.is_none();
+                for (position, held) in stored.iter().enumerate() {
+                    if !reached {
+                        if version_id_of(held) == skip_through.unwrap_or_default() {
+                            reached = true;
+                        }
+                        continue;
+                    }
+                    // One slot per entry, shared by Versions and CommonPrefixes. Out of
+                    // slots means there is more to report: this page is truncated, and the
+                    // markers below name the last entry it DID report, which is where the
+                    // next one resumes from.
+                    if versions.len() + common_prefixes.len() >= page_limit {
+                        truncated = true;
+                        break 'keys;
+                    }
+                    last_entry = Some((key.to_string(), Some(version_id_of(held).to_string())));
+                    versions.push(ObjectVersion {
+                        key: Some(key.to_string()),
+                        // "Version ID of an object" — the `null` version carries no id of
+                        // its own, and that is the id a request names it by.
+                        version_id: Some(version_id_of(held).to_string()),
+                        // "Specifies whether the object is (true) or is not (false) the
+                        // latest version of an object": the current version is the one the
+                        // store hands back first, and a key whose current version was
+                        // deleted has none at all.
+                        is_latest: Some(position == 0 && bucket.object(key).is_some()),
+                        e_tag: Some(held.etag.clone()),
+                        size: Some(i64::try_from(held.body.len()).unwrap_or(i64::MAX)),
+                        storage_class: Some(held.storage_class.clone()),
+                        last_modified: Some(::aws_smithy_types::DateTime::from(
+                            held.last_modified,
+                        )),
+                        // `Owner` needs an object owner this emulator does not record and
+                        // `RestoreStatus` an archive tier it does not model; the checksum
+                        // members need a checksum `PutObject` did not compute.
+                        ..ObjectVersion::default()
+                    });
+                }
+            }
+        }
+
+        // "If your results were truncated, you can make a follow-up paginated request by
+        // using the NextKeyMarker and NextVersionIdMarker response parameters as a
+        // starting place in another request" (`IsTruncated`) — and a request resumes
+        // "with the key immediately after key-marker", so the markers name the LAST entry
+        // this page reported. That pair is what makes paging lossless: every entry is
+        // reported exactly once, whatever the page size.
+        let (next_key_marker, next_version_id_marker) = match (truncated, last_entry) {
+            (true, Some((key, version_id))) => (Some(key), version_id),
+            _ => (None, None),
+        };
+
+        Ok(ListObjectVersionsOutput {
+            name: Some(input.bucket.clone()),
+            prefix: input.prefix.clone(),
+            delimiter: input.delimiter.clone(),
+            max_keys: Some(max_keys),
+            // "Marks the last key returned in a truncated response" / "Marks the last
+            // version of the key returned in a truncated response": the markers the
+            // request carried are echoed back.
+            key_marker: input.key_marker.clone(),
+            version_id_marker: input.version_id_marker.clone(),
+            // Truncated exactly when an entry was left for the next page; the markers
+            // name the last entry reported here, which the next request resumes after.
+            is_truncated: Some(truncated),
+            next_key_marker,
+            next_version_id_marker,
+            versions: (!versions.is_empty()).then_some(versions),
+            common_prefixes: (!common_prefixes.is_empty()).then(|| {
+                common_prefixes
+                    .into_iter()
+                    .map(|prefix| CommonPrefix {
+                        prefix: Some(prefix),
+                    })
+                    .collect()
+            }),
+            // A delete records no delete marker (see `DeleteObject`: its 204 carries
+            // neither the marker's version id nor the flag that would report it), so there
+            // is none to list rather than an invented one.
+            delete_markers: None,
+            // `EncodingType` is "included in the response" only when the request asked for
+            // one, which is refused above; `RequestCharged` reports a Requester Pays
+            // charge this emulator does not model.
+            encoding_type: None,
+            request_charged: None,
+        })
     }
+}
+
+/// The id a stored version is named by on the wire: its own minted id, or
+/// [`crate::state::NULL_VERSION_ID`] for a version written while the bucket was not
+/// versioning-enabled ("Objects stored in your bucket before you set the versioning state
+/// have a version ID of null").
+fn version_id_of(version: &crate::state::Object) -> &str {
+    version
+        .version_id
+        .as_deref()
+        .unwrap_or(crate::state::NULL_VERSION_ID)
 }

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutObject
-//! Adds an object to a general purpose bucket, replacing any object already at that key.
+//! Adds an object to a general purpose bucket, replacing any object already at that key —
+//! or, on a bucket whose versioning status is `Enabled`, storing it as a new version with
+//! a minted version id that this operation reports.
 //! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -468,6 +470,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // with the key (`x-amz-tagging` is refused above). `PutObjectTagging` is what
             // associates one afterwards.
             tags: Vec::new(),
+            // Minted by the store, which is the only place that sees the bucket's
+            // versioning state: this write carries no id of its own.
+            version_id: None,
             body: input.body,
         };
 
@@ -544,15 +549,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(PutObjectOutput {
             e_tag: Some(etag),
+            // "If you enable versioning for a bucket, Amazon S3 automatically generates a
+            // unique version ID for the object being stored. Amazon S3 returns this ID in
+            // the response" (`PutObjectOutput$VersionId`) — so the id is reported exactly
+            // when the store minted one, which is when the bucket's versioning status is
+            // `Enabled`. It is read back off the STORED object rather than re-derived, so
+            // the caller is told the id the object is addressable by and nothing else.
+            version_id: version_id_of(&store, &input.bucket, &input.key),
             // Everything else this output can carry describes a feature no stored object
             // here has, so none of it is reported rather than being invented:
             // `Expiration` needs a lifecycle configuration (none is recorded for any
-            // bucket), `VersionId` needs bucket versioning (not emulated, and an
-            // unversioned bucket reports none), the checksum members need a checksum
-            // this handler did not compute, the encryption members are refused above,
-            // `Size` is for appends in directory buckets, and `RequestCharged` reports a
-            // Requester Pays charge this emulator does not model.
+            // bucket), the checksum members need a checksum this handler did not compute,
+            // the encryption members are refused above, `Size` is for appends in directory
+            // buckets, and `RequestCharged` reports a Requester Pays charge this emulator
+            // does not model.
             ..PutObjectOutput::default()
         })
     }
+}
+
+/// The version id the object stored at `bucket`/`key` is addressable by, or `None` when
+/// it is the `null` version — one written while the bucket's versioning status was not
+/// `Enabled`, which has no id of its own ([`crate::state::NULL_VERSION_ID`] is what a
+/// request names it by).
+fn version_id_of(
+    store: &crate::state::ComAmazonawsS3Amazons3State,
+    bucket: &str,
+    key: &str,
+) -> Option<String> {
+    store
+        .bucket(bucket)
+        .and_then(|bucket| bucket.object(key))
+        .and_then(|object| object.version_id.clone())
 }

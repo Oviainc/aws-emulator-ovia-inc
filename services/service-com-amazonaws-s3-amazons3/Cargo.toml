@@ -26,12 +26,14 @@ tracing = { workspace = true }
 md-5 = "0.10"
 # Renders that digest as the lowercase hex an ETag carries.
 hex = { workspace = true }
+# An object version id is the SHA-256 of the bucket, the key and the store's mint
+# sequence, Base64 encoded (`state::mint_version_id`).
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 # Reads the restXml bodies the tagging tests assert on, instead of slicing strings.
 quick-xml = "0.41"
 

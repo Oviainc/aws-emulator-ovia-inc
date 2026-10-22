@@ -6,6 +6,12 @@
 //! HeadBucket answer from a bucket's own record, and the object-storage loop
 //! (PutObject / GetObject / ListObjectsV2 / DeleteObject / DeleteBucket) computes
 //! every response from the objects stored inside it.
+//!
+//! A bucket whose versioning status is `Enabled` holds more than one version of a key:
+//! the CURRENT one, which every reader that names no `versionId` answers with, and the
+//! noncurrent ones a later write or a delete displaced, each addressable by the version id
+//! the store minted for it ([`mint_version_id`]). Every stored version counts against the
+//! same ceilings a current object does.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -104,6 +110,23 @@ pub const MAX_OBJECTS_TOTAL: usize = 10_000;
 /// `MAX_TOTAL_HOSTED_CONFIGURATION_BYTES`, codeguruprofiler's `MAX_RETAINED_PROFILE_BYTES`).
 /// A write that would take the whole store past it is refused rather than recorded.
 pub const MAX_OBJECT_BYTES_TOTAL: usize = 64 * 1024 * 1024;
+
+/// The version id an object written while the bucket was NOT versioning-enabled is
+/// addressed by.
+///
+/// "Objects stored in your bucket before you set the versioning state have a version ID
+/// of null", and `PutBucketVersioning`'s own documentation says the same of a suspended
+/// bucket: "Suspended—Disables versioning for the objects in the bucket. All objects
+/// added to the bucket receive the version ID null." Such a version is stored with no
+/// minted id at all ([`Object::version_id`] is `None`), so this is the string a request
+/// names it by rather than a value this store keeps.
+pub const NULL_VERSION_ID: &str = "null";
+
+/// The `BucketVersioningStatus` value that makes a bucket version its objects.
+///
+/// "Enabled—Enables versioning for the objects in the bucket. All objects added to the
+/// bucket receive a unique version ID" (`PutBucketVersioning`'s documentation).
+pub const VERSIONING_ENABLED_STATUS: &str = "Enabled";
 
 /// The most user-defined metadata one stored object may carry, in UTF-8 bytes summed
 /// over every `x-amz-meta-` key and value.
@@ -815,10 +838,25 @@ pub struct Bucket {
     encryption: Option<Vec<BucketEncryptionRule>>,
     /// The objects the bucket holds, by key, as `PutObject` last recorded each.
     ///
-    /// Private for the same reason as `tags`, and sorted by key because that is the order
-    /// S3 lists objects in ("returns some or all of the objects in a bucket … in
-    /// lexicographical order").
+    /// The CURRENT version of each key, and so the whole of a bucket that was never
+    /// versioning-enabled. Private for the same reason as `tags`, and sorted by key
+    /// because that is the order S3 lists objects in ("returns some or all of the objects
+    /// in a bucket … in lexicographical order").
     objects: BTreeMap<String, Object>,
+    /// The NONCURRENT versions of each key, newest first.
+    ///
+    /// A version lands here only when it stops being the current one on a bucket whose
+    /// versioning status is `Enabled`: "when you enable versioning for a bucket, if Amazon
+    /// S3 receives multiple write requests for the same object simultaneously, it stores
+    /// all of the objects" (`PutObject`'s documentation), and a delete on such a bucket
+    /// "inserts a delete marker" rather than removing what was there
+    /// (`DeleteObject`'s). Each entry keeps its own [`Object::version_id`], which is what
+    /// makes it addressable after it is no longer current.
+    ///
+    /// Private, and written only through [`Self::put_object`] / [`Self::remove_object`],
+    /// so a version cannot be recorded without passing the ceilings every stored version
+    /// counts against.
+    noncurrent_versions: BTreeMap<String, Vec<Object>>,
 }
 
 impl Bucket {
@@ -857,6 +895,14 @@ impl Bucket {
             status: status.to_string(),
             mfa_delete: mfa_delete.map(str::to_string),
         });
+    }
+
+    /// Whether the bucket's versioning status is `Enabled`, which is what makes a write
+    /// mint a version id and keep the version it supersedes.
+    pub fn versioning_enabled(&self) -> bool {
+        self.versioning
+            .as_ref()
+            .is_some_and(|versioning| versioning.status == VERSIONING_ENABLED_STATUS)
     }
 
     /// Remove the bucket's tag set, leaving no tags associated with it.
@@ -909,8 +955,45 @@ impl Bucket {
     }
 
     /// The object stored at `key`, or `None` when the bucket holds no such key.
+    ///
+    /// The CURRENT version: what a read that names no `versionId` answers with, and the
+    /// only version a bucket that was never versioning-enabled has.
     pub fn object(&self, key: &str) -> Option<&Object> {
         self.objects.get(key)
+    }
+
+    /// The version of `key` that `version_id` names — current or noncurrent — or `None`
+    /// when the bucket holds no such version.
+    ///
+    /// [`NULL_VERSION_ID`] names the version a write made while the bucket was not
+    /// versioning-enabled, which is stored with no minted id of its own.
+    pub fn object_version(&self, key: &str, version_id: &str) -> Option<&Object> {
+        let named = |held: &&Object| match held.version_id.as_deref() {
+            Some(id) => id == version_id,
+            None => version_id == NULL_VERSION_ID,
+        };
+        self.objects
+            .get(key)
+            .filter(named)
+            .or_else(|| self.noncurrent_versions.get(key)?.iter().find(named))
+    }
+
+    /// Every version of `key` the bucket holds, newest first: the current one (when the
+    /// key has one) followed by its noncurrent versions.
+    ///
+    /// The read seam for anything that reports a key's versions rather than its current
+    /// object, so no caller reaches into either map.
+    pub fn object_versions(&self, key: &str) -> Vec<&Object> {
+        self.objects
+            .get(key)
+            .into_iter()
+            .chain(
+                self.noncurrent_versions
+                    .get(key)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )
+            .collect()
     }
 
     /// Every object the bucket holds, keyed by object key.
@@ -926,11 +1009,30 @@ impl Bucket {
 
     /// Remove the object at `key`, reporting whether the bucket held one.
     ///
+    /// A current version that is [`Self::keeps_superseded`] is kept as a noncurrent version
+    /// instead of being destroyed: "If bucket versioning is enabled, the operation inserts
+    /// a delete marker, which becomes the current version of the object. To permanently
+    /// delete an object in a versioned bucket, you must include the object's versionId in
+    /// the request" (`DeleteObject`'s documentation) — so the version a delete displaces
+    /// is still addressable by its id afterwards, and its bytes are still retained.
+    /// Removing the `null` version of a bucket that is not versioning-enabled releases
+    /// everything that object retained.
+    ///
     /// PRIVATE, so a delete goes through
     /// [`ComAmazonawsS3Amazons3State::remove_object`] and cannot name a bucket that does
     /// not exist.
     fn remove_object(&mut self, key: &str) -> bool {
-        self.objects.remove(key).is_some()
+        let keeps = self.keeps_superseded(key);
+        let Some(removed) = self.objects.remove(key) else {
+            return false;
+        };
+        if keeps {
+            self.noncurrent_versions
+                .entry(key.to_string())
+                .or_default()
+                .insert(0, removed);
+        }
+        true
     }
 
     /// The object stored at `key` for writing one of its subresources, or `None` when the
@@ -944,8 +1046,7 @@ impl Bucket {
         self.objects.get_mut(key)
     }
 
-    /// Store `object` at `key`, replacing any object already there, and report what that
-    /// did.
+    /// Store `object` at `key` as the key's current version, reporting what that did.
     ///
     /// A replacement, not a merge: "If it receives multiple write requests for the same
     /// object simultaneously, it overwrites all but the last object written", and "You
@@ -953,16 +1054,28 @@ impl Bucket {
     /// object. You must put the entire object with updated metadata" (`PutObject`'s own
     /// documentation).
     ///
+    /// `minted` is the version id this write mints, which the caller passes exactly when
+    /// the bucket's versioning status is `Enabled` — "All objects added to the bucket
+    /// receive a unique version ID" (`PutBucketVersioning`).
+    ///
+    /// What the write does to the version it supersedes is [`Self::keeps_superseded`]: on
+    /// a versioning-enabled bucket it is KEPT as a noncurrent version, so both stay
+    /// addressable, and so is a version that carries an id of its own whatever the
+    /// bucket's status is now; the `null` version of a bucket that is not
+    /// versioning-enabled is replaced in place — "Suspended … All objects added to the
+    /// bucket receive the version ID null".
+    ///
     /// PRIVATE, and reached only through
     /// [`ComAmazonawsS3Amazons3State::put_object`]: the per-bucket ceilings checked here
     /// cannot see the service-wide ones, so a handler calling this directly would bypass
     /// them. NOTHING is written unless the answer is [`ObjectWrite::Created`] or
     /// [`ObjectWrite::Replaced`]: an over-long key, metadata past
-    /// [`MAX_OBJECT_METADATA_BYTES`], a bucket at [`MAX_OBJECTS_PER_BUCKET`] objects and a
-    /// write past [`MAX_OBJECT_BYTES_PER_BUCKET`] retained bytes are each refused here.
-    /// Replacing an object releases everything it retained, so the budget is over what the
-    /// bucket WOULD hold, not over everything ever written.
-    fn put_object(&mut self, key: &str, object: Object) -> ObjectWrite {
+    /// [`MAX_OBJECT_METADATA_BYTES`], a bucket at [`MAX_OBJECTS_PER_BUCKET`] stored
+    /// versions and a write past [`MAX_OBJECT_BYTES_PER_BUCKET`] retained bytes are each
+    /// refused here. Replacing an object releases everything it retained, so the budget is
+    /// over what the bucket WOULD hold, not over everything ever written — while a
+    /// versioned write releases nothing, because the version it supersedes is still there.
+    fn put_object(&mut self, key: &str, mut object: Object, minted: Option<String>) -> ObjectWrite {
         if key.len() > MAX_OBJECT_KEY_BYTES {
             return ObjectWrite::KeyTooLong { bytes: key.len() };
         }
@@ -972,39 +1085,155 @@ impl Bucket {
                 bytes: metadata_bytes,
             };
         }
-        let replacing = self.objects.contains_key(key);
-        if !replacing && self.objects.len() >= MAX_OBJECTS_PER_BUCKET {
+        // The id is on the object before anything is measured, so the bytes it retains are
+        // inside the budgets like every other string kept beside the payload.
+        object.version_id = minted;
+        let retaining = self.keeps_superseded(key);
+        let held = self.objects.contains_key(key);
+        if (retaining || !held) && self.stored_versions() >= MAX_OBJECTS_PER_BUCKET {
             return ObjectWrite::ObjectCountReached;
         }
-        let would_hold = self.retained_bytes_excluding(key) + object.retained_bytes();
+        let would_hold = self.retained_bytes_after_write(key, retaining) + object.retained_bytes();
         if would_hold > MAX_OBJECT_BYTES_PER_BUCKET {
             return ObjectWrite::ByteBudgetReached { would_hold };
         }
-        self.objects.insert(key.to_string(), object);
-        if replacing {
+        let superseded = self.objects.insert(key.to_string(), object);
+        if let (true, Some(superseded)) = (retaining, superseded) {
+            self.noncurrent_versions
+                .entry(key.to_string())
+                .or_default()
+                .insert(0, superseded);
+        }
+        if held {
             ObjectWrite::Replaced
         } else {
             ObjectWrite::Created
         }
     }
 
+    /// Every key the bucket holds at least one version of, in ascending UTF-8 byte order
+    /// — the keys with a current object, plus the keys whose only versions left are
+    /// noncurrent ones.
+    ///
+    /// The read seam for a listing over VERSIONS (`ListObjectVersions`), the way
+    /// [`Self::objects`] is the seam for a listing over current objects. Ascending order,
+    /// because that is the order S3 lists keys in.
+    pub fn version_keys(&self) -> Vec<&str> {
+        let mut keys: ::std::collections::BTreeSet<&str> = self
+            .objects
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.extend(self.noncurrent_versions.keys().map(String::as_str));
+        keys.into_iter().collect()
+    }
+
+    /// Remove the version of `key` that `version_id` names, reporting whether the bucket
+    /// held such a version.
+    ///
+    /// "To permanently delete an object in a versioned bucket, you must include the
+    /// object's versionId in the request" (`DeleteObject`'s documentation). Removing the
+    /// key's CURRENT version promotes the newest version left to current, which is what
+    /// makes a versioned bucket's delete reversible: the version before it becomes what a
+    /// read without a `versionId` answers with. Everything the removed version retained is
+    /// released with it.
+    ///
+    /// PRIVATE, so a delete goes through
+    /// [`ComAmazonawsS3Amazons3State::remove_object_version`] and cannot name a bucket
+    /// that does not exist.
+    fn remove_version(&mut self, key: &str, version_id: &str) -> bool {
+        let names = |held: &Object| match held.version_id.as_deref() {
+            Some(id) => id == version_id,
+            None => version_id == NULL_VERSION_ID,
+        };
+        let removed_current = self.objects.get(key).is_some_and(names);
+        if removed_current {
+            self.objects.remove(key);
+            if let Some(remaining) = self.noncurrent_versions.get_mut(key) {
+                if !remaining.is_empty() {
+                    self.objects.insert(key.to_string(), remaining.remove(0));
+                }
+            }
+        } else {
+            let Some(remaining) = self.noncurrent_versions.get_mut(key) else {
+                return false;
+            };
+            let Some(position) = remaining.iter().position(names) else {
+                return false;
+            };
+            remaining.remove(position);
+        }
+        if self
+            .noncurrent_versions
+            .get(key)
+            .is_some_and(Vec::is_empty)
+        {
+            self.noncurrent_versions.remove(key);
+        }
+        true
+    }
+
+    /// Whether a write or a delete at `key` KEEPS the version it displaces rather than
+    /// releasing it.
+    ///
+    /// Two things keep it. A bucket whose versioning status is `Enabled` keeps every
+    /// version it already holds, including one stored before versioning was enabled ("All
+    /// objects added to the bucket receive a unique version ID", and the objects that were
+    /// there keep "a version ID of null"). And a version that carries an id of its own is
+    /// kept whatever the bucket's status is now, because nothing but a delete naming that
+    /// id takes it away ("To permanently delete an object in a versioned bucket, you must
+    /// include the object's versionId in the request") — which is what makes suspension a
+    /// state of the bucket rather than of the versions it holds.
+    ///
+    /// What is left is the `null` version of a bucket that is not versioning-enabled:
+    /// "Suspended … All objects added to the bucket receive the version ID null", so a
+    /// write replaces it and a delete removes it, in place.
+    fn keeps_superseded(&self, key: &str) -> bool {
+        self.versioning_enabled()
+            || self
+                .objects
+                .get(key)
+                .is_some_and(|held| held.version_id.is_some())
+    }
+
+    /// How many object versions this bucket stores: the current object at each key plus
+    /// every noncurrent version it keeps.
+    ///
+    /// What [`MAX_OBJECTS_PER_BUCKET`] counts, because a retained noncurrent version holds
+    /// this process's memory exactly as a current one does.
+    fn stored_versions(&self) -> usize {
+        self.objects.len()
+            + self
+                .noncurrent_versions
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+    }
+
     /// How many bytes this bucket's objects retain — payloads AND every string kept
-    /// beside them, so no part of a stored object escapes the budgets.
+    /// beside them, over every version it stores, so no part of a stored object escapes
+    /// the budgets.
     fn retained_bytes(&self) -> usize {
         self.objects
             .values()
+            .chain(self.noncurrent_versions.values().flatten())
             .map(Object::retained_bytes)
             .sum()
     }
 
-    /// How many bytes this bucket's objects retain at keys OTHER than `key` — what it
-    /// would still hold if the object at `key` were replaced.
-    fn retained_bytes_excluding(&self, key: &str) -> usize {
-        self.objects
-            .iter()
-            .filter(|(held_key, _)| held_key.as_str() != key)
-            .map(|(_, held)| held.retained_bytes())
-            .sum()
+    /// How many bytes this bucket would still retain with a write at `key` applied, not
+    /// counting the incoming object itself.
+    ///
+    /// Everything it holds now, less the current object at `key` when that object is
+    /// replaced in place — which is every write except one that mints a version id, since
+    /// such a write keeps what it supersedes.
+    fn retained_bytes_after_write(&self, key: &str, retaining_current: bool) -> usize {
+        let released = if retaining_current {
+            0
+        } else {
+            self.objects.get(key).map_or(0, Object::retained_bytes)
+        };
+        self.retained_bytes().saturating_sub(released)
     }
 }
 
@@ -1017,6 +1246,14 @@ impl Bucket {
 pub struct Object {
     /// The object's bytes, exactly as the request carried them.
     pub body: Vec<u8>,
+    /// The version id this stored version is addressed by, or `None` for the `null`
+    /// version — a version written while the bucket's versioning status was not `Enabled`.
+    ///
+    /// Minted by [`ComAmazonawsS3Amazons3State::put_object`], the one place that sees both
+    /// the bucket's versioning state and the store's version sequence, so no handler
+    /// constructs one: an `Object` handed to that call carries `None` and comes back
+    /// stored with whatever the bucket's state called for.
+    pub version_id: Option<String>,
     /// The object's entity tag, including the quotes S3 reports it with — see
     /// [`object_etag`].
     pub etag: String,
@@ -1057,6 +1294,7 @@ impl Object {
         self.body.len()
             + self.etag.len()
             + self.storage_class.len()
+            + self.version_id.as_ref().map_or(0, String::len)
             + self.metadata_bytes()
             + tag_set_bytes(&self.tags)
             + [
@@ -1104,6 +1342,36 @@ pub fn content_md5(body: &[u8]) -> String {
     ::aws_smithy_types::base64::encode(Md5::digest(body))
 }
 
+/// The version id a write into a versioning-enabled bucket is stored under.
+///
+/// S3's version ids are OPAQUE: `ObjectVersionId` is a plain string in the model
+/// (`smithy_query(query="shape",shape="ObjectVersionId")` reports no pattern and no
+/// length), and the only thing documented about them is that each is unique ("All objects
+/// added to the bucket receive a unique version ID" — `PutBucketVersioning`). So this is
+/// DERIVED rather than drawn from a generator: the SHA-256 of the bucket, the key and the
+/// store's monotonic mint sequence, Base64 encoded to the 32 characters an S3 version id
+/// is shaped like. Two versions of a key — and two versions anywhere in the store —
+/// therefore never collide, and the value stays what it was once stored, because nothing
+/// re-derives it.
+///
+/// The URL-safe Base64 alphabet (RFC 4648 §5), so the id survives a round trip through the
+/// `versionId` query parameter a client sends it back in: `+` would arrive decoded as a
+/// space and `/` would end the path segment.
+pub fn mint_version_id(bucket: &str, key: &str, sequence: u64) -> String {
+    use ::sha2::Digest;
+    let mut digest = ::sha2::Sha256::new();
+    digest.update(bucket.as_bytes());
+    // A separator, so ("a", "bc") and ("ab", "c") cannot hash the same bytes.
+    digest.update([0u8]);
+    digest.update(key.as_bytes());
+    digest.update([0u8]);
+    digest.update(sequence.to_be_bytes());
+    // 24 bytes encode to exactly 32 unpadded Base64 characters.
+    ::aws_smithy_types::base64::encode(&digest.finalize()[..24])
+        .replace('+', "-")
+        .replace('/', "_")
+}
+
 /// Per-service state for com-amazonaws-s3-amazons3. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsS3Amazons3State {
@@ -1115,6 +1383,12 @@ pub struct ComAmazonawsS3Amazons3State {
     /// Services Regions within a partition" (`CreateBucket`'s documentation). Sorted,
     /// because S3 lists buckets in name order.
     buckets: BTreeMap<String, Bucket>,
+    /// How many object versions this store has minted an id for, ever.
+    ///
+    /// The sequence [`mint_version_id`] derives each id from, so two versions of one key
+    /// — and two versions anywhere in the store — can never carry the same id, whatever
+    /// the clock does. Only [`Self::put_object`] advances it.
+    minted_versions: u64,
     /// How many notification configuration ids this store has minted.
     ///
     /// Only ever increases, so [`Self::mint_notification_configuration_id`] cannot hand
@@ -1150,6 +1424,14 @@ impl ComAmazonawsS3Amazons3State {
     /// `None` when this emulator holds no such bucket (so an object write refuses a name
     /// that is not a bucket instead of creating one).
     ///
+    /// This is also where an object's VERSION ID is minted, because this is the only place
+    /// that sees both the bucket's versioning state and the store's version sequence: a
+    /// write into a bucket whose status is `Enabled` mints a fresh id and keeps the version
+    /// it supersedes ("All objects added to the bucket receive a unique version ID" —
+    /// `PutBucketVersioning`), and a write anywhere else mints none and replaces what the
+    /// key held, which is the `null` version. The id the write stored is read back off the
+    /// stored object, so nothing reports an id the store did not record.
+    ///
     /// This is the ONLY way an object is recorded, because it is the only place that can
     /// see BOTH the per-bucket ceilings and the service-wide ones: the per-bucket pair
     /// alone would leave the store bounded only by their product with
@@ -1157,39 +1439,48 @@ impl ComAmazonawsS3Amazons3State {
     /// and [`MAX_OBJECT_BYTES_TOTAL`]) are what bound this process's object memory
     /// whatever a caller does. Nothing is written unless the answer is
     /// [`ObjectWrite::Created`] or [`ObjectWrite::Replaced`]; a refusal leaves every
-    /// stored object exactly as it was.
+    /// stored object exactly as it was, and mints nothing.
     pub fn put_object(&mut self, bucket: &str, key: &str, object: Object) -> Option<ObjectWrite> {
-        if !self.buckets.contains_key(bucket) {
-            return None;
-        }
+        let held_bucket = self.buckets.get(bucket)?;
+        let versioned = held_bucket.versioning_enabled();
+        // Whether this write keeps the version it supersedes, which is what decides
+        // whether it adds a stored version to the store's counts and budgets or replaces
+        // one in place. It turns on the superseded version, not on the bucket's status.
+        let keeps = held_bucket.keeps_superseded(key);
+        let held = held_bucket.object(key).is_some();
 
         // What the whole store would hold after this write: every other bucket's bytes,
-        // plus what this bucket would hold with the object at `key` replaced. The counts
-        // work the same way — a key the bucket already holds adds no entry.
-        let replacing = self
-            .buckets
-            .get(bucket)
-            .is_some_and(|held| held.object(key).is_some());
-        let held_objects: usize = self
+        // plus what this bucket would hold with the object at `key` written. The counts
+        // work the same way — a key the bucket already holds adds no entry, unless the
+        // version there is kept rather than replaced.
+        let held_versions: usize = self
             .buckets
             .values()
-            .map(|held| held.objects.len())
+            .map(Bucket::stored_versions)
             .sum::<usize>();
-        if !replacing && held_objects >= MAX_OBJECTS_TOTAL {
+        if (keeps || !held) && held_versions >= MAX_OBJECTS_TOTAL {
             return Some(ObjectWrite::TotalObjectCountReached);
         }
+        // The id is minted before the budgets are measured, so the bytes it retains are
+        // counted; a refusal below leaves it unused, which costs nothing but the sequence
+        // number it consumed (ids are opaque, and nothing numbers them).
+        let minted = versioned.then(|| {
+            self.minted_versions = self.minted_versions.saturating_add(1);
+            mint_version_id(bucket, key, self.minted_versions)
+        });
+        let incoming = object.retained_bytes() + minted.as_ref().map_or(0, String::len);
         let would_hold: usize = self
             .buckets
             .iter()
             .map(|(name, held)| {
                 if name == bucket {
-                    held.retained_bytes_excluding(key)
+                    held.retained_bytes_after_write(key, keeps)
                 } else {
                     held.retained_bytes()
                 }
             })
             .sum::<usize>()
-            + object.retained_bytes();
+            + incoming;
         if would_hold > MAX_OBJECT_BYTES_TOTAL {
             return Some(ObjectWrite::TotalByteBudgetReached { would_hold });
         }
@@ -1197,7 +1488,7 @@ impl ComAmazonawsS3Amazons3State {
         // Then the per-bucket ceilings, which also perform the write.
         self.buckets
             .get_mut(bucket)
-            .map(|held| held.put_object(key, object))
+            .map(|held| held.put_object(key, object, minted))
     }
 
     /// Record `configuration` as the whole notification configuration of the bucket named
@@ -1356,6 +1647,26 @@ impl ComAmazonawsS3Amazons3State {
             .map(|held| held.remove_object(key))
     }
 
+    /// Remove the version of `key` that `version_id` names from the bucket named
+    /// `bucket`, reporting whether the bucket held such a version — or `None` when this
+    /// emulator holds no such bucket, so a delete can tell "no such bucket" from "no such
+    /// version".
+    ///
+    /// This is the permanent delete a versioned bucket needs ("To permanently delete an
+    /// object in a versioned bucket, you must include the object's versionId in the
+    /// request"), and the only way a stored version's bytes are released, which is what
+    /// lets a later write back into the byte budgets [`Self::put_object`] checks.
+    pub fn remove_object_version(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Option<bool> {
+        self.buckets
+            .get_mut(bucket)
+            .map(|held| held.remove_version(key, version_id))
+    }
+
     /// Remove the bucket named `bucket_name`, releasing everything it still held.
     /// `false` when this emulator holds no such bucket.
     pub fn remove_bucket(&mut self, bucket_name: &str) -> bool {
@@ -1380,6 +1691,14 @@ pub const NO_SUCH_BUCKET_MESSAGE: &str = "The specified bucket does not exist";
 pub const NO_SUCH_KEY_CODE: &str = "NoSuchKey";
 /// See [`NO_SUCH_KEY_CODE`].
 pub const NO_SUCH_KEY_MESSAGE: &str = "The specified key does not exist.";
+/// The code S3 answers a read or a write that names a `versionId` the bucket holds no
+/// version for: "Indicates that the version ID specified in the request does not match an
+/// existing version", with HTTP 404. Not a shape in this model, so it is answered through
+/// the unmodelled channel.
+pub const NO_SUCH_VERSION_CODE: &str = "NoSuchVersion";
+/// See [`NO_SUCH_VERSION_CODE`].
+pub const NO_SUCH_VERSION_MESSAGE: &str =
+    "The specified version does not exist.";
 /// The code S3 answers a write whose `Content-MD5` is not the digest of the bytes it
 /// carried: "The Content-MD5 or checksum value that you specified did not match what the
 /// server received."
@@ -1571,6 +1890,8 @@ mod tests {
             website_redirect_location: None,
             metadata: BTreeMap::new(),
             tags: Vec::new(),
+            // The store mints the id; an object handed to `put_object` carries none.
+            version_id: None,
         }
     }
 
@@ -1898,6 +2219,137 @@ mod tests {
             store.remove_object("one", "kept"),
             None,
             "a removed bucket holds no objects to delete"
+        );
+    }
+
+    #[test]
+    fn a_versioned_write_keeps_what_it_supersedes_and_counts_it_against_the_budgets() {
+        let mut store = ComAmazonawsS3Amazons3State::default();
+        assert_eq!(
+            store.create_bucket("one", DEFAULT_BUCKET_REGION),
+            BucketCreation::Created
+        );
+
+        // Unversioned first: a second write to the same key REPLACES what was there, so
+        // the store holds one version of it and the first one's bytes are released.
+        for round in 0..2 {
+            assert!(
+                store.put_object("one", "key", object(4)).is_some(),
+                "round {round}: the write is recorded"
+            );
+        }
+        let bucket = store.bucket("one").expect("bucket one exists");
+        assert_eq!(
+            bucket.object_versions("key").len(),
+            1,
+            "an unversioned key holds exactly its current object, got {}",
+            bucket.object_versions("key").len()
+        );
+        assert_eq!(
+            bucket.retained_bytes(),
+            object(4).retained_bytes(),
+            "the replaced version's bytes are released"
+        );
+
+        // With versioning enabled, each write keeps the version before it, and every
+        // stored version counts toward what the bucket retains.
+        store
+            .bucket_mut("one")
+            .expect("bucket one exists")
+            .set_versioning(VERSIONING_ENABLED_STATUS, None);
+        for round in 0..2 {
+            assert!(
+                store.put_object("one", "key", object(4)).is_some(),
+                "versioned round {round}: the write is recorded"
+            );
+        }
+        let bucket = store.bucket("one").expect("bucket one exists");
+        let versions = bucket.object_versions("key");
+        assert_eq!(
+            versions.len(),
+            3,
+            "two versioned writes over a null version leave three stored versions, got {}",
+            versions.len()
+        );
+        let ids: Vec<Option<&str>> = versions
+            .iter()
+            .map(|held| held.version_id.as_deref())
+            .collect();
+        assert_eq!(
+            ids.iter().filter(|id| id.is_some()).count(),
+            2,
+            "only the two versioned writes carry an id, got {ids:?}"
+        );
+        assert!(
+            ids[0] != ids[1],
+            "every minted id differs, got {ids:?}"
+        );
+        assert!(
+            bucket.retained_bytes() > object(4).retained_bytes() * 2,
+            "every stored version is counted, got {} retained bytes",
+            bucket.retained_bytes()
+        );
+
+        // Each stored version is reachable by its id, and the null version by `null`.
+        for id in ids.iter().flatten() {
+            assert!(
+                bucket.object_version("key", id).is_some(),
+                "the version {id:?} is addressable by its id"
+            );
+        }
+        assert!(
+            bucket.object_version("key", NULL_VERSION_ID).is_some(),
+            "the version written before versioning was enabled is the null version"
+        );
+        assert!(
+            bucket.object_version("key", "no-such-version").is_none(),
+            "an id no version carries addresses nothing"
+        );
+
+        // Only a delete that NAMES a version releases it; the current one it displaces
+        // stays addressable.
+        let displaced = ids[0].expect("the newest version carries an id").to_string();
+        assert_eq!(
+            store.remove_object("one", "key"),
+            Some(true),
+            "the key held a current object"
+        );
+        let bucket = store.bucket("one").expect("bucket one exists");
+        assert!(
+            bucket.object("key").is_none(),
+            "the delete took the key out of the current view"
+        );
+        assert!(
+            bucket.object_version("key", &displaced).is_some(),
+            "the displaced version is still addressable by its id"
+        );
+        let held_before = bucket.retained_bytes();
+        assert_eq!(
+            store.remove_object_version("one", "key", &displaced),
+            Some(true),
+            "naming the version removes it"
+        );
+        assert_eq!(
+            store.remove_object_version("one", "key", &displaced),
+            Some(false),
+            "a version removed once is no longer there"
+        );
+        assert_eq!(
+            store.remove_object_version("absent", "key", &displaced),
+            None,
+            "naming a bucket this store does not hold reports no bucket at all"
+        );
+        let bucket = store.bucket("one").expect("bucket one exists");
+        assert!(
+            bucket.retained_bytes() < held_before,
+            "removing a version releases its bytes, still holding {} of {held_before}",
+            bucket.retained_bytes()
+        );
+        assert_eq!(
+            bucket.object_versions("key").len(),
+            2,
+            "the two versions the delete did not name are still stored, got {}",
+            bucket.object_versions("key").len()
         );
     }
 }
