@@ -5,8 +5,8 @@
 //! One in-process emulator behind a real `restJson1` request/response walk: a test
 //! asserts on the HTTP answer only, never by reaching into `crate::state`, so a handler
 //! that answered from a hardcoded value instead of from the store fails. Every suite
-//! (`asset_lifecycle`, `asset_types`, `domain_project_lifecycle`, `glossary_lifecycle`,
-//! `update_project`) reuses this one instead of copying it.
+//! (`asset_lifecycle`, `asset_types`, `domain_project_lifecycle`, `domain_unit_hierarchy`,
+//! `glossary_lifecycle`, `update_project`) reuses this one instead of copying it.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;

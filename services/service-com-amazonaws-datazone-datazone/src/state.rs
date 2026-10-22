@@ -112,6 +112,42 @@ pub struct Domain {
     /// name is unique within the domain and the types go with it when it is deleted.
     /// Bounded by [`MAX_ASSET_TYPES_PER_DOMAIN`].
     pub asset_types: BTreeMap<String, AssetType>,
+    /// The domain units stored in this domain, keyed by id, so they go with it when it
+    /// is deleted. Always holds at least the ROOT unit `root_domain_unit_id` names,
+    /// which is created with the domain itself. Bounded by
+    /// [`MAX_DOMAIN_UNITS_PER_DOMAIN`].
+    pub domain_units: BTreeMap<String, DomainUnit>,
+}
+
+/// One stored DataZone domain unit: a node of the domain's ownership hierarchy.
+///
+/// Every domain has exactly one ROOT unit — the one `Domain::root_domain_unit_id`
+/// names, created with the domain — and every other unit names a parent, so the units
+/// of one domain form a tree rooted there.
+#[derive(Debug, Clone)]
+pub struct DomainUnit {
+    pub id: String,
+    pub domain_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The unit this one hangs under. `None` only for the domain's root unit.
+    pub parent_domain_unit_id: Option<String>,
+    /// The unit's owners, in the order they were added: the principal that created the
+    /// unit, until `AddEntityOwner` adds another.
+    pub owners: Vec<DomainUnitOwner>,
+    pub created_by: String,
+    pub created_at_ms: i64,
+    /// Who last changed the unit, and when — absent until something does.
+    pub last_updated_by: Option<String>,
+    pub last_updated_at_ms: Option<i64>,
+}
+
+/// The stored form of the modelled `DomainUnitOwnerProperties` union, whose members
+/// are `user` and `group` (smithy_query shape="DomainUnitOwnerProperties").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainUnitOwner {
+    User(String),
+    Group(String),
 }
 
 /// One stored DataZone business glossary.
@@ -543,6 +579,12 @@ pub const MAX_DOMAINS: usize = 100;
 /// the same refusal (`CreateProject` models `ServiceQuotaExceededException` too).
 pub const MAX_PROJECTS_PER_DOMAIN: usize = 500;
 
+/// The most domain units this emulator stores in one domain, for the same reason and
+/// with the same refusal (`CreateDomainUnit` models `ServiceQuotaExceededException`).
+/// It also bounds the depth of the hierarchy, since every unit but the root hangs
+/// under a parent that is itself stored.
+pub const MAX_DOMAIN_UNITS_PER_DOMAIN: usize = 100;
+
 /// The most assets this emulator stores in one domain, for the same reason and with the
 /// same refusal (`CreateAsset` models `ServiceQuotaExceededException` too).
 pub const MAX_ASSETS_PER_DOMAIN: usize = 500;
@@ -614,6 +656,7 @@ pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_DOMAINS * 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IdempotentResource {
     Domain,
+    DomainUnit,
     Glossary,
     Asset,
 }
@@ -638,6 +681,16 @@ impl IdempotencyKey {
         Self {
             kind: IdempotentResource::Domain,
             domain_id: String::new(),
+            token: token.to_string(),
+        }
+    }
+
+    /// The key a `CreateDomainUnit` token is filed under: the same token in another
+    /// domain is a different key, so each domain keeps its own record.
+    pub fn domain_unit(domain_id: &str, token: &str) -> Self {
+        Self {
+            kind: IdempotentResource::DomainUnit,
+            domain_id: domain_id.to_string(),
             token: token.to_string(),
         }
     }
@@ -667,6 +720,8 @@ impl IdempotencyKey {
 /// the oldest can be evicted first.
 #[derive(Debug, Clone)]
 pub struct IdempotencyRecord {
+    /// The id of the resource the first request carrying the token created, inside the
+    /// scope its [`IdempotencyKey`] names.
     pub resource_id: String,
     pub recorded_at_ms: i64,
 }
@@ -698,6 +753,19 @@ impl ComAmazonawsDatazoneDatazoneState {
         self.domains.get(&record.resource_id)
     }
 
+    /// The domain unit a `clientToken` already created in `domain_id`, if it is still
+    /// stored. The domain is part of the key, so the same token against a different
+    /// domain creates that domain's own unit and leaves this record alone.
+    pub fn idempotent_domain_unit(&self, domain_id: &str, token: &str) -> Option<&DomainUnit> {
+        let record = self
+            .idempotency
+            .get(&IdempotencyKey::domain_unit(domain_id, token))?;
+        self.domains
+            .get(domain_id)?
+            .domain_units
+            .get(&record.resource_id)
+    }
+
     /// The glossary a `clientToken` already created in `domain_id`, if it is still
     /// stored. The domain is part of the key, so the same token against a different
     /// domain creates that domain's own glossary and leaves this record alone.
@@ -725,6 +793,10 @@ impl ComAmazonawsDatazoneDatazoneState {
     fn record_resolves(&self, key: &IdempotencyKey, record: &IdempotencyRecord) -> bool {
         match key.kind {
             IdempotentResource::Domain => self.domains.contains_key(&record.resource_id),
+            IdempotentResource::DomainUnit => self
+                .domains
+                .get(&key.domain_id)
+                .is_some_and(|domain| domain.domain_units.contains_key(&record.resource_id)),
             IdempotentResource::Glossary => self
                 .domains
                 .get(&key.domain_id)
@@ -871,6 +943,11 @@ impl ComAmazonawsDatazoneDatazoneState {
             .filter(|d| d.status != DOMAIN_STATUS_DELETING)
     }
 
+    /// The domain unit `unit_id` stored in domain `domain_id`, when both exist.
+    pub fn domain_unit(&self, domain_id: &str, unit_id: &str) -> Option<&DomainUnit> {
+        self.domains.get(domain_id)?.domain_units.get(unit_id)
+    }
+
     /// The live domain that already carries `name`, if the account has one.
     ///
     /// A domain name is unique within the account, so this is what `CreateDomain`
@@ -922,6 +999,107 @@ impl ComAmazonawsDatazoneDatazoneState {
     }
 }
 
+/// The ROOT domain unit a domain is created with.
+///
+/// `CreateDomain` reports a `rootDomainUnitId`, so the unit it names exists from the
+/// moment the domain does: it is the one unit in the domain with no parent, it is
+/// owned by the principal that created the domain, and it is the parent every other
+/// unit's chain of ancestors ends at.
+pub fn root_domain_unit(domain: &Domain, created_by: &str, now: i64) -> DomainUnit {
+    DomainUnit {
+        id: domain.root_domain_unit_id.clone(),
+        domain_id: domain.id.clone(),
+        name: domain_unit_name_from(&domain.name, &domain.id),
+        description: None,
+        parent_domain_unit_id: None,
+        owners: vec![DomainUnitOwner::User(created_by.to_string())],
+        created_by: created_by.to_string(),
+        created_at_ms: now,
+        last_updated_by: None,
+        last_updated_at_ms: None,
+    }
+}
+
+/// A `DomainUnitName` for the root unit of a domain called `domain_name`.
+///
+/// The root unit carries the domain's own name, but `DomainName` declares no pattern
+/// while `DomainUnitName` is `^[\w -]+$` with length 1..128 (smithy_query
+/// shape="DomainUnitName"), so a character outside that class becomes `_`, the result
+/// is clipped to 128 characters, and a name that is empty once clipped falls back to
+/// the domain id — itself inside the class.
+///
+/// The class kept here is deliberately NARROWER than the modelled one: `\w` admits
+/// Unicode word characters, and this keeps only ASCII alphanumerics, `_`, `-` and the
+/// space, so every name it produces satisfies the model while a non-ASCII letter is
+/// replaced rather than passed through.
+fn domain_unit_name_from(domain_name: &str, domain_id: &str) -> String {
+    let name: String = domain_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(128)
+        .collect();
+    if name.is_empty() {
+        domain_id.to_string()
+    } else {
+        name
+    }
+}
+
+/// A stored owner as the modelled `DomainUnitOwnerProperties` union
+/// (smithy_query shape="DomainUnitOwnerProperties"), shared by every operation that
+/// reports a domain unit's owners so the two forms cannot drift apart.
+pub fn owner_properties(
+    owner: &DomainUnitOwner,
+) -> crate::ops::types::DomainUnitOwnerProperties {
+    use crate::ops::types::{
+        DomainUnitGroupProperties, DomainUnitOwnerProperties, DomainUnitUserProperties,
+    };
+    match owner {
+        DomainUnitOwner::User(user_id) => {
+            DomainUnitOwnerProperties::User(DomainUnitUserProperties {
+                user_id: Some(user_id.clone()),
+            })
+        }
+        DomainUnitOwner::Group(group_id) => {
+            DomainUnitOwnerProperties::Group(DomainUnitGroupProperties {
+                group_id: Some(group_id.clone()),
+            })
+        }
+    }
+}
+
+/// The ids of `unit_id`'s ancestors in `domain`: its parent first, then that unit's
+/// parent, up to and including the domain's root unit.
+///
+/// Empty for the root unit, which has no ancestor. Only ids with a stored record are
+/// reported, and the walk is bounded by the number of stored units, so neither a
+/// dangling parent pointer nor a cycle can make it report a unit that is not there or
+/// run forever.
+pub fn ancestor_domain_unit_ids(domain: &Domain, unit_id: &str) -> Vec<String> {
+    let mut ancestors: Vec<String> = Vec::new();
+    let mut cursor = domain
+        .domain_units
+        .get(unit_id)
+        .and_then(|unit| unit.parent_domain_unit_id.clone());
+    while let Some(id) = cursor {
+        let Some(parent) = domain.domain_units.get(&id) else {
+            break;
+        };
+        if ancestors.contains(&id) || ancestors.len() >= domain.domain_units.len() {
+            break;
+        }
+        cursor = parent.parent_domain_unit_id.clone();
+        ancestors.push(id);
+    }
+    ancestors
+}
+
 /// The resource kinds this service names in its not-found messages.
 ///
 /// A closed set, so a handler cannot invent a third spelling of a kind or interpolate
@@ -929,6 +1107,7 @@ impl ComAmazonawsDatazoneDatazoneState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceKind {
     Domain,
+    DomainUnit,
     Project,
     AssetType,
     Glossary,
@@ -939,6 +1118,7 @@ impl ResourceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Domain => "Domain",
+            Self::DomainUnit => "Domain unit",
             Self::Project => "Project",
             Self::AssetType => "Asset type",
             Self::Glossary => "Glossary",

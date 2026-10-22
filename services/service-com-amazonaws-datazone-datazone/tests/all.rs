@@ -19,6 +19,8 @@ mod asset_types;
 mod domain_name_conflict_and_not_found;
 #[path = "all/domain_project_lifecycle.rs"]
 mod domain_project_lifecycle;
+#[path = "all/domain_unit_hierarchy.rs"]
+mod domain_unit_hierarchy;
 #[path = "all/glossary_lifecycle.rs"]
 mod glossary_lifecycle;
 #[path = "all/harness.rs"]
