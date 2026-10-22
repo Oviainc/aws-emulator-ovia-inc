@@ -2,18 +2,22 @@
 
 //! Engine state for the com-amazonaws-wafregional-awswaf-regional-20161128 service.
 //!
-//! AWS WAF Classic's `IPSet` records and the change tokens every mutating call
-//! consumes live here, so `GetChangeToken`, `GetChangeTokenStatus`, `CreateIPSet`,
-//! `UpdateIPSet`, `GetIPSet`, `ListIPSets` and `DeleteIPSet` all read and write ONE
-//! copy of each resource. The helpers below (id minting, the change-token protocol,
-//! CIDR parsing, the `IPSet`/`IPSetSummary` projections) are shared by those handlers
-//! rather than duplicated per operation.
+//! AWS WAF Classic's `IPSet` and `SqlInjectionMatchSet` records and the change tokens
+//! every mutating call consumes live here, so `GetChangeToken`,
+//! `GetChangeTokenStatus`, `CreateIPSet`, `UpdateIPSet`, `GetIPSet`, `ListIPSets`,
+//! `DeleteIPSet`, `CreateSqlInjectionMatchSet` and `GetSqlInjectionMatchSet` all read
+//! and write ONE copy of each resource. The helpers below (id minting, the
+//! change-token protocol, CIDR parsing, the `IPSet`/`IPSetSummary` and
+//! `SqlInjectionMatchSet` projections) are shared by those handlers rather than
+//! duplicated per operation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use crate::ops::types::{IPSet, IPSetDescriptor, IPSetSummary};
+use crate::ops::types::{
+    IPSet, IPSetDescriptor, IPSetSummary, SqlInjectionMatchSet, SqlInjectionMatchTuple,
+};
 
 /// `ChangeTokenStatus` wire values, from the model's `CHANGE_TOKEN_STATUS_VALUES`
 /// (`INSYNC`, `PENDING`, `PROVISIONED`).
@@ -76,6 +80,14 @@ pub const MAX_IP_SETS: usize = 50;
 /// an IPSet (10,000 IP address ranges). Together with [`MAX_IP_SETS`] it bounds the
 /// total descriptor state a caller can grow, not just the number of IPSets.
 pub const MAX_IP_SET_DESCRIPTORS: usize = 10_000;
+
+/// The most `SqlInjectionMatchSet`s this emulator stores for the account before
+/// `CreateSqlInjectionMatchSet` answers its modelled `WAFLimitsExceededException`.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes for an
+/// account (100 conditions of each type, a `SqlInjectionMatchSet` being one condition),
+/// which keeps the match-set state a caller can grow bounded.
+pub const MAX_SQL_INJECTION_MATCH_SETS: usize = 100;
 
 /// The most change-token records kept before the oldest settled ones are dropped.
 ///
@@ -213,6 +225,39 @@ impl IPSetEntry {
     }
 }
 
+/// One stored `SqlInjectionMatchSet`.
+#[derive(Debug, Clone)]
+pub struct SqlInjectionMatchSetEntry {
+    pub sql_injection_match_set_id: String,
+    pub name: String,
+    /// The `SqlInjectionMatchTuple`s in insertion order. A newly created set holds
+    /// none: `CreateSqlInjectionMatchSet`'s documentation sends the caller to
+    /// `UpdateSqlInjectionMatchSet` "to specify the parts of web requests in which you
+    /// want to allow, block, or count malicious SQL code".
+    pub tuples: Vec<SqlInjectionMatchTuple>,
+}
+
+impl SqlInjectionMatchSetEntry {
+    /// A new, empty `SqlInjectionMatchSet` record.
+    pub fn new(sql_injection_match_set_id: String, name: String) -> Self {
+        Self {
+            sql_injection_match_set_id,
+            name,
+            tuples: Vec::new(),
+        }
+    }
+
+    /// This record projected onto the modelled `SqlInjectionMatchSet` shape the Create
+    /// and Get responses carry: the stored record's own fields, never request input.
+    pub fn to_modelled(&self) -> SqlInjectionMatchSet {
+        SqlInjectionMatchSet {
+            sql_injection_match_set_id: self.sql_injection_match_set_id.clone(),
+            name: Some(self.name.clone()),
+            sql_injection_match_tuples: self.tuples.clone(),
+        }
+    }
+}
+
 /// One minted change token.
 #[derive(Debug, Clone)]
 pub struct ChangeTokenRecord {
@@ -233,6 +278,10 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// walks them in one stable order and a `NextMarker` taken on one page resumes at
     /// the right place on the next.
     pub ip_sets: BTreeMap<String, IPSetEntry>,
+    /// Every stored `SqlInjectionMatchSet`, keyed by its `SqlInjectionMatchSetId`. A
+    /// `BTreeMap` for the same reason as `ip_sets`: one stable walk order for the
+    /// paginated list.
+    pub sql_injection_match_sets: BTreeMap<String, SqlInjectionMatchSetEntry>,
     /// Every change token this service minted and has not yet dropped, keyed by the
     /// token value, so `GetChangeTokenStatus` can report one and a mutating call can
     /// tell a fresh token from a used one.
