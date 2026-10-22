@@ -727,11 +727,11 @@ fn decode_page_token(token: &str) -> Option<String> {
     String::from_utf8(::hex::decode(token).ok()?).ok()
 }
 
-/// Why a supplied template, or an inline artefact body, was refused.
+/// Why a supplied template was refused.
 ///
 /// Every bound it names is a documented AWS maximum, so the refusal states the rule
 /// rather than an emulator detail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TemplateRefusal {
     /// Bigger than [`MAX_TEMPLATE_BYTES`].
     TemplateTooLarge,
@@ -739,11 +739,17 @@ pub enum TemplateRefusal {
     TooManyParameters,
     /// More than [`MAX_TEMPLATE_RESOURCES`] entries in `Resources`.
     TooManyResources,
+    /// A template that declares no `Transform` field, so it is not a packaged AWS SAM
+    /// template; see [`declares_transform`]. Carries the template as read, because the
+    /// refusal AWS gives quotes it back.
+    MissingTransform(String),
 }
 
 impl TemplateRefusal {
-    /// The refusal wording, naming the member and the bound it exceeded.
-    pub fn message(self) -> String {
+    /// The refusal wording: for a bound, the member and the bound it exceeded; for a
+    /// template that is not a SAM template, the resource it is invalid as and the field
+    /// it must declare, both built from the request.
+    pub fn message(&self) -> String {
         match self {
             Self::TemplateTooLarge => format!(
                 "TemplateBody must be at most {MAX_TEMPLATE_BYTES} bytes, the maximum size of a \
@@ -757,13 +763,69 @@ impl TemplateRefusal {
                 "TemplateBody must declare at most {MAX_TEMPLATE_RESOURCES} resources, the \
                  maximum an AWS CloudFormation template may declare."
             ),
+            Self::MissingTransform(template) => format!(
+                "Resource with name [{TEMPLATE_RESOURCE}] is invalid. Resource must have \
+                 Transform field: {template}"
+            ),
         }
     }
 }
 
-/// The parameters a supplied template declares, as modelled `ParameterDefinition`s.
+/// The name the refusal gives the template artefact of a publish — the "resource" an
+/// invalid template makes invalid, as AWS's own wording names it.
+const TEMPLATE_RESOURCE: &str = "template";
+
+/// How much of the refused template the 400 quotes back.
 ///
-/// CloudFormation's template anatomy — which AWS SAM extends — puts them in the
+/// The refusal names the document it rejected, which is what makes it actionable, but the
+/// document is caller-supplied and bounded only by [`MAX_TEMPLATE_BYTES`] — so the quote
+/// is cut here instead of letting one request be answered with a megabyte of its own
+/// input. The rule the message states (the missing `Transform` field) is unaffected.
+const MAX_QUOTED_TEMPLATE_BYTES: usize = 512;
+
+/// `template` as the refusal quotes it: its JSON form, cut at
+/// [`MAX_QUOTED_TEMPLATE_BYTES`] on a character boundary and marked as cut.
+fn quoted_template(template: &::serde_json::Value, body: &str) -> String {
+    let rendered = ::serde_json::to_string(template).unwrap_or_else(|_| body.to_string());
+    if rendered.len() <= MAX_QUOTED_TEMPLATE_BYTES {
+        return rendered;
+    }
+    let mut cut = MAX_QUOTED_TEMPLATE_BYTES;
+    while cut > 0 && !rendered.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &rendered[..cut])
+}
+
+/// The field a packaged AWS SAM template declares, which makes it a SAM template rather
+/// than plain CloudFormation.
+///
+/// SAM is a CloudFormation *transform*: a SAM template is a CloudFormation template whose
+/// top-level `Transform` field names the SAM macro (`AWS::Serverless-2016-10-31`), and
+/// CloudFormation lets that field be one name or a list of them. A template that declares
+/// none is not the "raw packaged AWS SAM template"
+/// (`smithy_query(query="doc", shape="CreateApplicationVersionRequest",
+/// member="TemplateBody")`) a publish takes, so it is refused rather than published.
+pub fn declares_transform(template: &::serde_json::Value) -> bool {
+    match template.get("Transform") {
+        Some(::serde_json::Value::String(name)) => !name.trim().is_empty(),
+        Some(::serde_json::Value::Array(names)) => names
+            .iter()
+            .any(|name| name.as_str().is_some_and(|name| !name.trim().is_empty())),
+        _ => false,
+    }
+}
+
+/// A supplied template, read: refused when it is not a publishable AWS SAM template, and
+/// otherwise the parameters it declares, as modelled `ParameterDefinition`s.
+///
+/// A publish takes "the raw packaged AWS SAM template of your application"
+/// (`smithy_query(query="doc", shape="CreateApplicationVersionRequest",
+/// member="TemplateBody")`), so a template that declares no `Transform` field is not one
+/// and is refused with [`TemplateRefusal::MissingTransform`] rather than published; see
+/// [`declares_transform`].
+///
+/// CloudFormation's template anatomy — which AWS SAM extends — puts the parameters in the
 /// top-level `Parameters` object: one entry per parameter name, carrying `Type`,
 /// `Default`, `Description`, `AllowedValues`, `AllowedPattern`, `MinLength`/`MaxLength`,
 /// `MinValue`/`MaxValue`, `ConstraintDescription` and `NoEcho`. A parameter's
@@ -773,8 +835,9 @@ impl TemplateRefusal {
 ///
 /// Only a template the caller supplied INLINE and in JSON form is read: an emulator
 /// makes no outbound connections, so a template named only by `TemplateUrl` is never
-/// fetched, and a template in YAML is not parsed (no YAML reader is available here).
-/// Either way the answer is an empty list — never a guess.
+/// fetched, and a template in YAML is not parsed (no YAML reader is available here). A
+/// template this emulator cannot read is neither judged nor guessed at: it is stored as
+/// supplied and reports no parameters.
 ///
 /// # The work is bounded before it is done
 ///
@@ -801,16 +864,28 @@ pub fn parse_template(
     let Ok(template) = ::serde_json::from_str::<::serde_json::Value>(body) else {
         return Ok(Vec::new());
     };
-    let Some(parameters) = template.get("Parameters").and_then(|p| p.as_object()) else {
-        return Ok(Vec::new());
-    };
-    if parameters.len() > MAX_TEMPLATE_PARAMETERS {
+    // The shape bounds come first: counting two maps is the cheapest thing this function
+    // does, and a template past them is refused before any of the rest of the work —
+    // including building a refusal that quotes it back.
+    let parameters = template.get("Parameters").and_then(|p| p.as_object());
+    if parameters.is_some_and(|parameters| parameters.len() > MAX_TEMPLATE_PARAMETERS) {
         return Err(TemplateRefusal::TooManyParameters);
     }
     let resources = template.get("Resources").and_then(|r| r.as_object());
     if resources.is_some_and(|resources| resources.len() > MAX_TEMPLATE_RESOURCES) {
         return Err(TemplateRefusal::TooManyResources);
     }
+    // A template this emulator CAN read is held to the SAM transform: plain
+    // CloudFormation is not the packaged SAM template a publish takes. The refusal quotes
+    // the template as read, so the caller sees which document was rejected.
+    if !declares_transform(&template) {
+        return Err(TemplateRefusal::MissingTransform(quoted_template(
+            &template, body,
+        )));
+    }
+    let Some(parameters) = parameters else {
+        return Ok(Vec::new());
+    };
 
     let referencing = reference_index(resources);
     let mut definitions: Vec<ParameterDefinition> = parameters

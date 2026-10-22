@@ -242,9 +242,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::MAX_ARTIFACT_BYTES,
         )
         .map_err(bad_request)?;
+        // The template is the third inline body this call retains, and its ceiling is the
+        // template one (a packaged CloudFormation template's documented maximum), not the
+        // 5 MB of a license or readme. Checked here, before the body is parsed, so neither
+        // the parse nor the retained bytes is request-controlled.
+        crate::state::bounded_bytes(
+            "TemplateBody",
+            input.template_body.as_ref(),
+            crate::state::MAX_TEMPLATE_BYTES,
+        )
+        .map_err(bad_request)?;
 
-        // Parsed BEFORE the store is locked: the template is caller-supplied, so the work
+        // Read BEFORE the store is locked: the template is caller-supplied, so the work
         // it costs must not be paid while holding the lock every other request waits on.
+        // A `SemanticVersion` makes this call publish a version, so the template it
+        // publishes is held to the same contract CreateApplicationVersion holds one to.
         let parameter_definitions = crate::state::parse_template(input.template_body.as_ref())
             .map_err(|refusal| bad_request(refusal.message()))?;
 

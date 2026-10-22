@@ -8,6 +8,12 @@
 //! the ARN a create returns is read back out of [`StoredGateway`] after the insert, so
 //! a response can only describe a record that is really in the store.
 //!
+//! Beside the gateways the store keeps the ACTIVATION KEYS this service has issued.
+//! `CreateGateway` resolves its `ActivationKey` there and refuses a key the registry
+//! does not hold, so a gateway is only ever minted for an appliance the service really
+//! activated — the read side (`ListGateways`, `GetGateway`) then cannot report a
+//! gateway that a refused create left behind.
+//!
 //! The record carries the members of the later slices too (hypervisor association,
 //! maintenance window, bandwidth schedule), so those operations extend this one struct
 //! instead of opening a second map beside it and splitting one gateway across two
@@ -30,6 +36,33 @@ pub const ARN_SERVICE: &str = "backup-gateway";
 
 /// The ARN resource type of a gateway: `gateway/<id>`.
 pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
+
+/// The ARN resource type of a hypervisor: `hypervisor/<id>`.
+///
+/// The hypervisor is the second resource this service's ARNs name
+/// (`smithy_query(query="shape",shape="GetHypervisorInput")`: `HypervisorArn` targets
+/// `ServerArn`), and the tagging operations take either kind in the one `ResourceARN`
+/// member — so they have to tell them apart. See [`MissingResource`].
+pub const HYPERVISOR_RESOURCE_TYPE: &str = "hypervisor";
+
+/// `ValidationException$ErrorCode` for a `CreateGateway` whose activation key this
+/// service never issued, and the sentence that states it.
+///
+/// `ValidationException$ErrorCode` is documented as "A description of what caused the
+/// validation error" (`smithy_query(query="shape",shape="ValidationException")`), and
+/// the code AWS answers an unissued activation key with is `ActivationKeyNotFound` —
+/// the same name the sibling gateway service spells in its own `ErrorCode` vocabulary.
+pub const ACTIVATION_KEY_NOT_FOUND: &str = "ActivationKeyNotFound";
+
+/// See [`ACTIVATION_KEY_NOT_FOUND`].
+pub const ACTIVATION_KEY_NOT_FOUND_MESSAGE: &str = "The specified activation key was not found.";
+
+/// `ResourceNotFoundException$ErrorCode` for a well-formed hypervisor ARN that names no
+/// hypervisor, and the sentence that states it. See [`MissingResource`].
+pub const HYPERVISOR_NOT_FOUND: &str = "HypervisorNotFound";
+
+/// See [`HYPERVISOR_NOT_FOUND`].
+pub const HYPERVISOR_NOT_FOUND_MESSAGE: &str = "The hypervisor is not found.";
 
 /// The region a minted ARN falls back to when the request carries no SigV4 credential
 /// scope to read one from (an unsigned request on an emulator with authentication off).
@@ -178,9 +211,40 @@ pub struct ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// Monotonic counter behind the `gateway/<id>` ARN suffix, so every minted ARN is
     /// unique within a run and the sequence is reproducible.
     next_gateway_id: u64,
+    /// The activation keys this service has ISSUED, each with the instant it was issued
+    /// at — the registry `CreateGateway` resolves its `ActivationKey` in.
+    ///
+    /// A gateway's activation key is not minted by this API: it reaches the service out
+    /// of band, when the gateway appliance a customer deployed completes its activation
+    /// handshake, which is not an operation of the SDK surface (no operation in this
+    /// model issues one). So on AWS, as here, `CreateGateway` can only ever find a key
+    /// something OUTSIDE the API put in this registry, and a key nothing issued is
+    /// refused — see [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::activation_key_issued`].
+    activation_keys: BTreeMap<String, SystemTime>,
 }
 
 impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
+    /// Record `key` as an activation key this service has issued, and hand back the
+    /// instant it is now registered under — read back out of the map after the insert.
+    ///
+    /// This is the out-of-band channel described on `activation_keys`: the appliance
+    /// handshake that issues a key on AWS has no operation in this model, so nothing
+    /// a client can send over the wire reaches here. Re-issuing a key that is already
+    /// registered keeps the instant it was first issued at: one key, one issuance.
+    pub fn issue_activation_key(&mut self, key: &str, now: SystemTime) -> SystemTime {
+        *self.activation_keys.entry(key.to_string()).or_insert(now)
+    }
+
+    /// Whether this service issued `key`.
+    ///
+    /// `CreateGateway` registers a gateway only for a key this answers `true` for; for
+    /// anything else it raises the modelled `ValidationException` carrying
+    /// [`ACTIVATION_KEY_NOT_FOUND`], rather than minting a gateway for an appliance the
+    /// service never activated. The answer comes from the registry alone — never from
+    /// the key's length, spelling or shape, none of which AWS discloses.
+    pub fn activation_key_issued(&self, key: &str) -> bool {
+        self.activation_keys.contains_key(key)
+    }
     /// Mint and persist a gateway, and hand back the record as it is now STORED —
     /// read out of the map after the insert, so the ARN a caller gets is the key the
     /// store holds rather than anything derived from the request.
@@ -358,6 +422,93 @@ pub fn is_gateway_arn(candidate: &str) -> bool {
     [*region, *account, resource_type, id]
         .into_iter()
         .all(is_arn_segment)
+}
+
+/// The resource-type segment of a backup-gateway ARN — the `gateway` of
+/// `arn:aws:backup-gateway:<region>:<account>:gateway/<id>` — or `None` for anything
+/// that is not an ARN of this service at all.
+///
+/// The one place an ARN is classified: the tagging operations take any of this
+/// service's resources in a single `ResourceARN` member, so the resource they look the
+/// ARN up as is read off the ARN rather than guessed from which store happens to hold
+/// a record.
+pub fn arn_resource_type(arn: &str) -> Option<&str> {
+    let fields: Vec<&str> = arn.split(':').collect();
+    let [literal, partition, service, _region, _account, resource] = fields.as_slice() else {
+        return None;
+    };
+    if *literal != "arn" || !matches!(*partition, "aws" | "aws-cn" | "aws-us-gov") {
+        return None;
+    }
+    if *service != ARN_SERVICE {
+        return None;
+    }
+    resource.split_once('/').map(|(kind, _id)| kind)
+}
+
+/// How this service refuses a well-formed resource ARN that names no resource it holds.
+///
+/// Every such refusal is the modelled `ResourceNotFoundException`, but this service does
+/// not answer alike for all resource types: a missing HYPERVISOR is answered at HTTP 400
+/// with `ErrorCode` [`HYPERVISOR_NOT_FOUND`], where every other resource type takes the
+/// 404 that shape's `@httpError` declares and states no `ErrorCode`. Both halves of a
+/// refusal — the status and the code — are read off this one value, so they cannot be
+/// chosen apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingResource {
+    /// A `hypervisor/<id>` ARN with no hypervisor behind it.
+    ///
+    /// This service holds no hypervisors yet — `ImportHypervisorConfiguration`, the one
+    /// operation that creates one, is still scaffolded and answers 501 under its own
+    /// stub issue — so for now every hypervisor ARN reaches this arm.
+    Hypervisor,
+    /// Every other resource type, including a `gateway/<id>` ARN with no gateway
+    /// behind it.
+    Other,
+}
+
+impl MissingResource {
+    /// Which refusal `arn` takes, read off the resource type the ARN names.
+    pub fn for_arn(arn: &str) -> Self {
+        match arn_resource_type(arn) {
+            Some(HYPERVISOR_RESOURCE_TYPE) => Self::Hypervisor,
+            _ => Self::Other,
+        }
+    }
+
+    /// `ResourceNotFoundException$ErrorCode` — "A description of which resource wasn't
+    /// found" (`smithy_query(query="shape",shape="ResourceNotFoundException")`) — or
+    /// `None` for a resource type this service states no code for.
+    pub fn error_code(self) -> Option<&'static str> {
+        match self {
+            Self::Hypervisor => Some(HYPERVISOR_NOT_FOUND),
+            Self::Other => None,
+        }
+    }
+
+    /// The sentence the refusal states.
+    pub fn message(self, arn: &str) -> String {
+        match self {
+            Self::Hypervisor => HYPERVISOR_NOT_FOUND_MESSAGE.to_string(),
+            Self::Other => resource_not_found_message(arn),
+        }
+    }
+
+    /// The status this service answers the refusal with where it is NOT the one
+    /// `ResourceNotFoundException`'s `@httpError` declares (404), and `None` where it
+    /// is: a missing hypervisor is answered 400 with the same shape.
+    pub fn status_override(self) -> Option<u16> {
+        match self {
+            Self::Hypervisor => Some(400),
+            Self::Other => None,
+        }
+    }
+}
+
+/// The sentence `ResourceNotFoundException` states for an ARN this service holds no
+/// record for. One wording for every operation that resolves an ARN.
+pub fn resource_not_found_message(arn: &str) -> String {
+    format!("The resource '{arn}' was not found.")
 }
 
 /// One `[a-zA-Z-0-9]+` ARN segment, as the modelled `GatewayArn` pattern spells it.

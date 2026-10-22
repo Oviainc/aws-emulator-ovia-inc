@@ -169,7 +169,11 @@ pub(crate) async fn create_network(router: &MultiServiceRouter, body: Value) -> 
 }
 
 /// Create one network that has already settled to `AVAILABLE`, so it can take nodes.
-async fn available_network(router: &MultiServiceRouter, token: &str, name: &str) -> (String, String) {
+pub(crate) async fn available_network(
+    router: &MultiServiceRouter,
+    token: &str,
+    name: &str,
+) -> (String, String) {
     let ids = create_network(router, create_network_body(token, name)).await;
     tokio::time::sleep(PAST_TRANSITION).await;
     ids

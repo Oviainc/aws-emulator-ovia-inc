@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -83,9 +74,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-applicationautoscaling-
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.applicationautoscaling#ListTagsForResource")]
+//
+// `InternalServiceException` is widened in through `extra_errors`: this SERVICE models it
+// (see `types::shared_types`, and every `Describe*` of this service lists it) but this
+// operation does not, and it is the only honest answer for "this service is mounted on an
+// engine that holds no state" — a 404 would claim the target is not registered, a 400 would
+// blame the caller's request and a 501 would claim the operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.applicationautoscaling#ListTagsForResource",
+    extra_errors = ["InternalServiceException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
+    InternalServiceException(InternalServiceException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -138,20 +139,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A pure read: the ARN is resolved through the index `RegisterScalableTarget`
+        // populates and the stored tag set is COPIED out, so the store is left exactly as
+        // the next caller will find it.
+        let state = state.lock();
+        let record = state
+            .arn_index
+            .get(&input.resource_arn)
+            .and_then(|key| state.targets.get(key));
+
+        // "Returns all the tags on the specified Application Auto Scaling scalable
+        // target" — so an ARN no registered target carries is a 404 rather than an empty
+        // tag set: the two are different answers and a client tells them apart.
+        let Some(record) = record else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No scalable target found for resource {}",
+                        input.resource_arn
+                    )),
+                    // The member's own documentation: "The name of the Application Auto
+                    // Scaling resource. This value is an Amazon Resource Name (ARN)."
+                    resource_name: Some(input.resource_arn.clone()),
+                },
+            )
+            .into());
+        };
+
+        // A registered target carrying no tags answers with an EMPTY map rather than an
+        // absent member: the target exists and has zero tags, which is exactly what the
+        // map says, and a client iterating the result needs no special case for it.
+        Ok(ListTagsForResourceOutput {
+            tags: Some(
+                record
+                    .tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+        })
     }
 }
