@@ -223,7 +223,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetChannelOutput {
             multiview_configuration: channel.multiview_configuration.clone(),
-            attached_multiview_channels: None,
+            // Read-only and derived on every read: the multiview channels of this group
+            // that list this channel as an available source.
+            attached_multiview_channels: crate::state::attached_multiview_channels(
+                group,
+                &channel.name,
+            ),
             arn: channel.arn.clone(),
             channel_name: channel.name.clone(),
             channel_group_name: channel.group_name.clone(),
