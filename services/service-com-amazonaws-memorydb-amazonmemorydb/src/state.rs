@@ -210,8 +210,13 @@ pub mod acl_status {
 
 /// `User$Status`: "Indicates the user status. Can be \"active\", \"modifying\" or
 /// \"deleting\"."
+///
+/// `DELETING` is TERMINAL for this store: a deleted user is removed outright, so the
+/// status only ever appears on the response that reports the deletion, never on a
+/// user a later call can still read.
 pub mod user_status {
     pub const ACTIVE: &str = "active";
+    pub const DELETING: &str = "deleting";
 }
 
 /// The two `InputAuthenticationType` tokens a request may ASK for, named so the
@@ -367,6 +372,27 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
             }
         }
         membership
+    }
+
+    /// Take `user_name` out of the `UserNames` of every ACL that lists it, answering
+    /// the names of those ACLs in name order.
+    ///
+    /// `DeleteUser` — "The user will be removed from all ACLs and in turn removed from
+    /// all clusters" — is what owes this: membership lives ONCE, on the ACL
+    /// ([`Self::user_membership`] derives `User$ACLNames` from it), so a user that is
+    /// gone has to leave the ACLs rather than linger in a list no user resolves
+    /// through. The returned names are the membership the user held UP TO this call,
+    /// which is what the delete reports back.
+    pub fn remove_user_from_every_acl(&mut self, user_name: &str) -> Vec<String> {
+        let mut left_behind = Vec::new();
+        for acl in self.acls.values_mut() {
+            let before = acl.user_names.len();
+            acl.user_names.retain(|name| name != user_name);
+            if acl.user_names.len() != before {
+                left_behind.push(acl.name.clone());
+            }
+        }
+        left_behind
     }
 }
 

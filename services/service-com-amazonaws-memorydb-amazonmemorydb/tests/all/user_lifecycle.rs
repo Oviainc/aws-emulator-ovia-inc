@@ -73,7 +73,10 @@ fn password_of_length(length: usize) -> String {
 }
 
 /// `CreateUser` with the full-access string and one password.
-async fn create_user(router: &MultiServiceRouter, name: &str) -> Value {
+///
+/// `pub(crate)` so the sibling suites create their users through the SAME call rather
+/// than each spelling out an `AuthenticationMode`.
+pub(crate) async fn create_user(router: &MultiServiceRouter, name: &str) -> Value {
     ok(
         router,
         "CreateUser",
@@ -87,8 +90,9 @@ async fn create_user(router: &MultiServiceRouter, name: &str) -> Value {
     .await
 }
 
-/// The `Users` of a `DescribeUsers` body, as `(Name, user)` pairs in wire order.
-fn user_names(body: &Value) -> Vec<String> {
+/// The `Name` of every user in a `DescribeUsers` body, in wire order. `pub(crate)`
+/// for the sibling suites, so one reader serves every listing assertion.
+pub(crate) fn user_names(body: &Value) -> Vec<String> {
     body["Users"]
         .as_array()
         .unwrap_or_else(|| panic!("expected Users in {body}"))
