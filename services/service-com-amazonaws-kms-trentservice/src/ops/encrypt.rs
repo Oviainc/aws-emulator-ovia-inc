@@ -306,6 +306,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::KEY_USAGE_ENCRYPT_DECRYPT
             )));
         }
+        // The AES-GCM encryption this service performs is what a `SYMMETRIC_DEFAULT`
+        // key does. An asymmetric ENCRYPT_DECRYPT key (an RSA or SM2 key pair) is a
+        // valid key for `Encrypt`, but it has no key pair here and the RSAES-OAEP /
+        // SM2PKE encryption it calls for is not implemented, so the request is
+        // answered as not implemented rather than with a ciphertext some other scheme
+        // produced.
+        if key.key_spec != crate::state::KEY_SPEC_SYMMETRIC_DEFAULT {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "Encrypt with an asymmetric KMS key",
+            ));
+        }
         let algorithm = input
             .encryption_algorithm
             .clone()
