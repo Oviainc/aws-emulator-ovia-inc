@@ -14,8 +14,12 @@
 //! * the modelled [`Membership`] shape IS stored as-is: every one of its members is
 //!   absolute, so there is nothing to derive.
 //!
-//! Insertion order is kept in `collaboration_order` / `membership_order` so the list
-//! operations page deterministically and a pagination token stays valid across calls.
+//! * the modelled [`ConfiguredTable`] is likewise stored as-is: a configured table is an
+//!   account-level resource, so none of its members describes the caller.
+//!
+//! Insertion order is kept in `collaboration_order` / `membership_order` /
+//! `configured_table_order` so the list operations page deterministically and a
+//! pagination token stays valid across calls.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -23,15 +27,16 @@ use std::time::{Duration, SystemTime};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    Collaboration, CollaborationSummary, ComputeConfiguration, DataEncryptionMetadata,
-    MLMemberAbilities, MemberSpecification, Membership, MembershipJobComputePaymentConfig,
-    MembershipMLPaymentConfig, MembershipModelInferencePaymentConfig,
-    MembershipModelTrainingPaymentConfig, MembershipPaymentConfiguration,
-    MembershipProtectedJobResultConfiguration, MembershipProtectedQueryOutputConfiguration,
-    MembershipProtectedQueryResultConfiguration, MembershipQueryComputePaymentConfig,
-    MembershipSummary, MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration,
-    ProtectedQuery, ProtectedQueryError, ProtectedQueryOutputConfiguration,
-    ProtectedQueryResultConfiguration, WorkerComputeConfiguration,
+    Collaboration, CollaborationSummary, ComputeConfiguration, ConfiguredTable,
+    DataEncryptionMetadata, MLMemberAbilities, MemberSpecification, Membership,
+    MembershipJobComputePaymentConfig, MembershipMLPaymentConfig,
+    MembershipModelInferencePaymentConfig, MembershipModelTrainingPaymentConfig,
+    MembershipPaymentConfiguration, MembershipProtectedJobResultConfiguration,
+    MembershipProtectedQueryOutputConfiguration, MembershipProtectedQueryResultConfiguration,
+    MembershipQueryComputePaymentConfig, MembershipSummary,
+    MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration, ProtectedQuery,
+    ProtectedQueryError, ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration,
+    TableReference, WorkerComputeConfiguration,
 };
 
 /// The ARN service segment and the SigV4 signing name for Clean Rooms, from
@@ -126,10 +131,34 @@ pub const ABILITY_CAN_QUERY: &str = "CAN_QUERY";
 pub const ABILITY_CAN_RUN_JOB: &str = "CAN_RUN_JOB";
 
 /// `ResourceType` values this slice reports on a modelled error (model shape
-/// `ResourceType`).
+/// `ResourceType`: CONFIGURED_TABLE | COLLABORATION | MEMBERSHIP |
+/// CONFIGURED_TABLE_ASSOCIATION).
 pub const RESOURCE_TYPE_COLLABORATION: &str = "COLLABORATION";
 /// See [`RESOURCE_TYPE_COLLABORATION`].
 pub const RESOURCE_TYPE_MEMBERSHIP: &str = "MEMBERSHIP";
+/// See [`RESOURCE_TYPE_COLLABORATION`].
+pub const RESOURCE_TYPE_CONFIGURED_TABLE: &str = "CONFIGURED_TABLE";
+
+/// `TableReferenceType` values (model shape `TableReferenceType`: GLUE | SNOWFLAKE |
+/// ATHENA | DATABRICKS) — the `tableType` a configured table reports, one per variant
+/// of the `TableReference` union.
+pub const TABLE_TYPE_GLUE: &str = "GLUE";
+/// See [`TABLE_TYPE_GLUE`].
+pub const TABLE_TYPE_SNOWFLAKE: &str = "SNOWFLAKE";
+/// See [`TABLE_TYPE_GLUE`].
+pub const TABLE_TYPE_ATHENA: &str = "ATHENA";
+/// See [`TABLE_TYPE_GLUE`].
+pub const TABLE_TYPE_DATABRICKS: &str = "DATABRICKS";
+
+/// The smallest `selectedAnalysisMethods` a request may configure.
+///
+/// Documented on `CreateConfiguredTableInput$selectedAnalysisMethods` and
+/// `UpdateConfiguredTableInput$selectedAnalysisMethods`: "The analysis methods to enable
+/// for the configured table. When configured, you must specify at least two analysis
+/// methods." The model cannot express it (`SelectedAnalysisMethods` carries no length
+/// constraint), so the handler enforces it with the `ValidationException` the operation
+/// declares.
+pub const MIN_SELECTED_ANALYSIS_METHODS: usize = 2;
 
 /// `ConflictExceptionReason` for a resource that already exists (model shape
 /// `ConflictExceptionReason`: ALREADY_EXISTS | SUBRESOURCES_EXIST | INVALID_STATE).
@@ -175,6 +204,11 @@ pub const MAX_COLLABORATIONS: usize = 5_000;
 
 /// See [`MAX_COLLABORATIONS`].
 pub const MAX_MEMBERSHIPS: usize = 5_000;
+
+/// See [`MAX_COLLABORATIONS`]: the same EMULATOR-enforced bound on the configured-table
+/// store, reported through the `ServiceQuotaExceededException` (HTTP 402)
+/// `CreateConfiguredTable` declares.
+pub const MAX_CONFIGURED_TABLES: usize = 5_000;
 
 /// The largest number of protected queries the store holds, for the same reason as
 /// [`MAX_COLLABORATIONS`]: `StartProtectedQuery` is the only operation that adds one,
@@ -276,6 +310,16 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// duplicate-membership conflict and a `Collaboration`'s `membershipId` computable
     /// instead of guessed.
     pub membership_by_collaboration: HashMap<(String, String), String>,
+    /// Configured tables by `ConfiguredTable.id`.
+    ///
+    /// The modelled `ConfiguredTable` is stored as-is: every one of its members is
+    /// absolute (nothing about it depends on who is asking), so there is nothing to
+    /// derive per request. `analysisRuleTypes` is the one member another operation
+    /// maintains — a configured table is created with no analysis rules, and the
+    /// analysis-rule operations add to and remove from this list.
+    pub configured_tables: HashMap<String, ConfiguredTable>,
+    /// Configured table ids in creation order — the order the list operation pages in.
+    pub configured_table_order: Vec<String>,
     /// Tags by resource ARN, shared by collaboration and membership ARNs so a later
     /// TagResource/ListTagsForResource slice has one place to read and write.
     pub tags: HashMap<String, HashMap<String, String>>,
@@ -485,6 +529,39 @@ pub fn collaboration_arn(region: &str, id: &str) -> String {
 /// `MembershipArn` pattern declares.
 pub fn membership_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("membership/{id}"))
+}
+
+/// `arn:aws:cleanrooms:<region>:<account>:configuredtable/<id>`, the form the model's
+/// `ConfiguredTableArn` pattern declares
+/// (`^arn:aws:[\w]+:[\w]{2}-[\w]{4,9}-[\d]:[\d]{12}:configuredtable/[\d\w-]+$`).
+pub fn configured_table_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("configuredtable/{id}"))
+}
+
+/// The `tableType` a configured table reports: the `TableReferenceType` of the
+/// `TableReference` union variant the table actually points at, so the member is
+/// computed from the stored reference rather than taken from the request.
+pub fn table_reference_type(reference: &TableReference) -> &'static str {
+    match reference {
+        TableReference::Glue(_) => TABLE_TYPE_GLUE,
+        TableReference::Snowflake(_) => TABLE_TYPE_SNOWFLAKE,
+        TableReference::Athena(_) => TABLE_TYPE_ATHENA,
+        TableReference::Databricks(_) => TABLE_TYPE_DATABRICKS,
+    }
+}
+
+/// How many DISTINCT analysis methods a `selectedAnalysisMethods` list configures.
+///
+/// The list is a set of enum values, so a method repeated in the request still
+/// configures one method — see [`MIN_SELECTED_ANALYSIS_METHODS`].
+pub fn distinct_selected_analysis_methods(methods: &[String]) -> usize {
+    let mut seen: Vec<&str> = Vec::with_capacity(methods.len());
+    for method in methods {
+        if !seen.contains(&method.as_str()) {
+            seen.push(method.as_str());
+        }
+    }
+    seen.len()
 }
 
 /// Whether `region` can appear in the ARN region segment the model's

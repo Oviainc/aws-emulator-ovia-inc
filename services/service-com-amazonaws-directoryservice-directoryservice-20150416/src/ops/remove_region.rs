@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveRegion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveRegion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveRegion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops a stored directory's replication in the Region the request was made against.
+//!
+//! The Region is not a request member: it is the one the call was signed for, read from
+//! the sigv4 credential scope ([`crate::state::region_from_request`]). Three outcomes
+//! follow from what the store holds for that Region:
+//!
+//! * the directory id names no stored directory, or names one that does not exist in
+//!   the Region the call was made against — `DirectoryDoesNotExistException`, "The
+//!   specified directory does not exist in the system";
+//! * it names the directory's PRIMARY Region — refused with
+//!   `UnsupportedOperationException`, because this operation's own documentation says
+//!   "You cannot remove the primary Region with this operation. Instead, use the
+//!   DeleteDirectory API";
+//! * it names a Region the directory is replicated to — the replication is dropped.
+//!
+//! `AccessDeniedException` is modelled for this operation and is NOT reachable here:
+//! the emulator has no authorization boundary to evaluate — it verifies a request's
+//! signature and nothing else, and no member of the request distinguishes one caller's
+//! permissions from another's — so refusing a caller would be a refusal computed from
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +157,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveRegion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveRegionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveRegion"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        // The Region this call acts on: the one it was signed for. `RemoveRegion` takes
+        // no Region member, so this is the only place the Region can come from.
+        let region = crate::state::region_from_request(ctx.parts());
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let directory = store
+            .directories
+            .get_mut(&input.directory_id)
+            .ok_or_else(|| directory_does_not_exist(&input.directory_id, &region))?;
+
+        if !directory.exists_in_region(&region) {
+            return Err(directory_does_not_exist(&input.directory_id, &region).into());
+        }
+
+        if directory.primary_region == region {
+            return Err(
+                RemoveRegionErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(format!(
+                            "Region {region} is the primary Region of directory {id} and cannot \
+                             be removed with RemoveRegion; use DeleteDirectory instead",
+                            id = directory.directory_id
+                        )),
+                        request_id: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Stopping replication and removing domain controllers changes the directory
+        // itself, so it needs a directory that is in service: one still being built by
+        // the transition its create owes is unavailable.
+        if directory.stage != crate::state::STAGE_ACTIVE {
+            return Err(RemoveRegionErrorModeled::DirectoryUnavailableException(
+                DirectoryUnavailableException {
+                    message: Some(format!(
+                        "Directory {id} is in stage {stage} and is not available for Region \
+                         changes",
+                        id = directory.directory_id,
+                        stage = directory.stage
+                    )),
+                    request_id: None,
+                },
+            )
+            .into());
+        }
+
+        directory.additional_regions.remove(&region);
+
+        Ok(RemoveRegionOutput {})
     }
+}
+
+/// Refuse the request with the modelled `DirectoryDoesNotExistException`: the id names
+/// no directory that exists in the Region the call was made against.
+fn directory_does_not_exist(directory_id: &str, region: &str) -> RemoveRegionErrorModeled {
+    RemoveRegionErrorModeled::DirectoryDoesNotExistException(DirectoryDoesNotExistException {
+        message: Some(crate::state::no_such_directory_in_region(
+            directory_id,
+            region,
+        )),
+        request_id: None,
+    })
 }

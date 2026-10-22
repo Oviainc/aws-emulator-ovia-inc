@@ -10,9 +10,9 @@
 //!
 //! * [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`], which
 //!   materialises the status transitions the clock has already made due (a directory
-//!   leaving `Requested`, a snapshot leaving `Creating`). Every handler calls it before
-//!   reading or writing, so a reporting operation reports what the clock already owed
-//!   and nothing more.
+//!   leaving `Requested`, a snapshot leaving `Creating`, an IP route leaving `Adding`).
+//!   Every handler calls it before reading or writing, so a reporting operation reports
+//!   what the clock already owed and nothing more.
 //! * [`Directory::to_description`], the one place a stored directory is rendered as the
 //!   modelled `DirectoryDescription`, so every operation that reports a directory
 //!   reports the same derived values (`Alias`, `AccessUrl`), and
@@ -30,7 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DirectoryDescription, DirectoryVpcSettingsDescription, EventTopic, Snapshot, Tag,
+    ClientAuthenticationSettingInfo, DirectoryDescription, DirectoryVpcSettingsDescription,
+    EventTopic, IpRouteInfo, LDAPSSettingInfo, Snapshot, SnapshotLimits, Tag,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -48,6 +49,18 @@ pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 
 /// The stage a directory is in between `CreateDirectory` and [`TRANSITION_SPAN`].
 pub const STAGE_REQUESTED: &str = "Requested";
+
+/// The `IpRouteStatusMsg` an address block carries between `AddIpRoutes` and
+/// [`TRANSITION_SPAN`]: the first value of the modelled `IpRouteStatusMsg` enum.
+///
+/// `AddIpRoutes` answers before the block is in service, so the move to
+/// [`IP_ROUTE_STATUS_ADDED`] is owed by the clock, on the same span a create's stage
+/// transition uses.
+pub const IP_ROUTE_STATUS_ADDING: &str = "Adding";
+
+/// The `IpRouteStatusMsg` an address block reaches once [`TRANSITION_SPAN`] has
+/// elapsed: the `Added` value of the modelled `IpRouteStatusMsg` enum.
+pub const IP_ROUTE_STATUS_ADDED: &str = "Added";
 
 /// The status a snapshot is in between `CreateSnapshot` and [`TRANSITION_SPAN`]: the
 /// first value of the modelled `SnapshotStatus` enum.
@@ -132,6 +145,11 @@ pub const MAX_DIRECTORIES: usize = 10;
 /// `TagLimitExceededException` reports.
 pub const MAX_TAGS: usize = 50;
 
+/// The number of IP address blocks a directory may carry, from
+/// `IpRouteLimitExceededException`'s own documentation: "The maximum allowed number of
+/// IP addresses was exceeded. The default limit is 100 IP address blocks."
+pub const MAX_IP_ROUTES: usize = 100;
+
 /// Directory Service's default quota "Manual snapshots: 5" per directory, the bound
 /// `SnapshotLimitExceededException` reports — the same bound `GetSnapshotLimits`
 /// describes as `SnapshotLimits$ManualSnapshotsLimit`.
@@ -159,9 +177,9 @@ pub const TOPIC_STATUS_REGISTERED: &str = "Registered";
 /// through [`::engine::emulator_arn`] rather than written as a literal.
 const SNS_ARN_SERVICE: &str = "sns";
 
-/// The Region an ARN this service reports carries when the request carries no sigv4
-/// credential scope to read one from — the default `emulator_arn` documents for
-/// generated emulators.
+/// The Region an ARN this service reports carries, and the Region a request that acts
+/// per Region is taken to name, when the request carries no sigv4 credential scope to
+/// read one from — the default `emulator_arn` documents for generated emulators.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
 /// The most Amazon SNS topics this emulator will associate with one directory.
@@ -224,6 +242,109 @@ pub const MAX_NEXT_TOKEN_CHARS: usize = 1024;
 /// The version tag every [`encode_cursor`] token carries, so a token minted by an older
 /// build is refused rather than misread.
 const CURSOR_VERSION: &str = "v1";
+
+/// One IP address block `AddIpRoutes` added to a directory, as `ListIpRoutes` reports
+/// it.
+///
+/// A block is identified by the CIDR it routes — exactly one of `CidrIp` (IPv4) or
+/// `CidrIpv6` — which is why [`Self::block`] is what the per-directory map is keyed by:
+/// a second `AddIpRoutes` naming a block already routed is a duplicate, not an update.
+#[derive(Debug, Clone)]
+pub struct IpRouteRecord {
+    /// The IPv4 block this route carries, when the caller gave one.
+    pub cidr_ip: Option<String>,
+    /// The IPv6 block this route carries, when the caller gave one.
+    pub cidr_ipv6: Option<String>,
+    /// The caller's description of the block, absent when the request carried none.
+    pub description: Option<String>,
+    /// One of the modelled `IpRouteStatusMsg` values.
+    pub status: String,
+    /// When the status transition the add owes falls due; `None` once there is none
+    /// left to make. See [`TRANSITION_SPAN`].
+    pub status_due_at: Option<SystemTime>,
+    /// When `AddIpRoutes` added the block, as `AddedDateTime` reports it.
+    pub added_at: SystemTime,
+}
+
+impl IpRouteRecord {
+    /// The address block this route routes: the IPv4 CIDR when it carries one, the
+    /// IPv6 CIDR otherwise. This is the identity of the route within a directory.
+    pub fn block(&self) -> &str {
+        self.cidr_ip
+            .as_deref()
+            .or(self.cidr_ipv6.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// This route as the modelled `IpRouteInfo` of `directory_id`.
+    ///
+    /// `IpRouteStatusReason` ("The reason for the IpRouteStatusMsg") stays absent: a
+    /// route this emulator adds never fails, so there is no reason to report.
+    pub fn to_info(&self, directory_id: &str) -> IpRouteInfo {
+        IpRouteInfo {
+            directory_id: Some(directory_id.to_string()),
+            cidr_ip: self.cidr_ip.clone(),
+            cidr_ipv6: self.cidr_ipv6.clone(),
+            ip_route_status_msg: Some(self.status.clone()),
+            added_date_time: Some(as_timestamp(self.added_at)),
+            ip_route_status_reason: None,
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// The LDAPS security recorded for one `LDAPSType` of a directory, as
+/// `DescribeLDAPSSettings` reports it.
+///
+/// `EnableLDAPS` and `DisableLDAPS` (both still scaffolded) are what record and
+/// change one, so a directory nothing has enabled LDAPS for carries no entry at all —
+/// which is what `DescribeLDAPSSettings` then reports: an empty list.
+#[derive(Debug, Clone)]
+pub struct LdapsSetting {
+    /// One of the modelled `LDAPSStatus` values.
+    pub status: String,
+    /// The modelled `LDAPSStatusReason`, "Describes a state change for LDAPS".
+    pub status_reason: Option<String>,
+    /// When this setting last changed, as `LastUpdatedDateTime` reports it.
+    pub last_updated: SystemTime,
+}
+
+impl LdapsSetting {
+    /// This setting as the modelled `LDAPSSettingInfo`.
+    pub fn to_info(&self) -> LDAPSSettingInfo {
+        LDAPSSettingInfo {
+            ldaps_status: Some(self.status.clone()),
+            ldaps_status_reason: self.status_reason.clone(),
+            last_updated_date_time: Some(as_timestamp(self.last_updated)),
+        }
+    }
+}
+
+/// The client authentication recorded for one `ClientAuthenticationType` of a
+/// directory, as `DescribeClientAuthenticationSettings` reports it.
+///
+/// `EnableClientAuthentication` and `DisableClientAuthentication` (both still
+/// scaffolded) are what record and change one, so a directory nothing has configured
+/// client authentication for carries no entry and reports an empty list.
+#[derive(Debug, Clone)]
+pub struct ClientAuthenticationSetting {
+    /// One of the modelled `ClientAuthenticationStatus` values.
+    pub status: String,
+    /// When this setting last changed, as `LastUpdatedDateTime` reports it.
+    pub last_updated: SystemTime,
+}
+
+impl ClientAuthenticationSetting {
+    /// This setting as the modelled `ClientAuthenticationSettingInfo` for
+    /// `authentication_type`.
+    pub fn to_info(&self, authentication_type: &str) -> ClientAuthenticationSettingInfo {
+        ClientAuthenticationSettingInfo {
+            r#type: Some(authentication_type.to_string()),
+            status: Some(self.status.clone()),
+            last_updated_date_time: Some(as_timestamp(self.last_updated)),
+        }
+    }
+}
 
 /// Separates the creation rank a cursor resumes after from the filter it was issued
 /// under, in every paginated operation of this service. Not a character a `DirectoryId`,
@@ -318,6 +439,23 @@ pub struct Directory {
     /// This directory's tags, keyed by tag key: a second `AddTagsToResource` with a key
     /// already present overwrites that key's value.
     pub tags: BTreeMap<String, String>,
+    /// The Region this directory was created in: the one `RegionType` `Primary` names,
+    /// which only `DeleteDirectory` removes. Read from the create request's sigv4
+    /// credential scope, the only Region a request carries.
+    pub primary_region: String,
+    /// The Regions this directory is replicated to beside [`Self::primary_region`] —
+    /// the `Additional` ones. `AddRegion` (still scaffolded) is what adds one, and
+    /// `RemoveRegion` is what removes one.
+    pub additional_regions: BTreeSet<String>,
+    /// The IP address blocks `AddIpRoutes` routed to this directory, keyed by
+    /// [`IpRouteRecord::block`].
+    pub ip_routes: BTreeMap<String, IpRouteRecord>,
+    /// The LDAPS security recorded for this directory, keyed by the modelled
+    /// `LDAPSType`; `DescribeLDAPSSettings` reports it.
+    pub ldaps_settings: BTreeMap<String, LdapsSetting>,
+    /// The client authentication recorded for this directory, keyed by the modelled
+    /// `ClientAuthenticationType`; `DescribeClientAuthenticationSettings` reports it.
+    pub client_authentication_settings: BTreeMap<String, ClientAuthenticationSetting>,
     /// The Amazon SNS topics `RegisterEventTopic` associated with this directory, keyed
     /// by topic name — a directory publishes to a given topic at most once, and the
     /// associations live on the directory record, so deleting the directory takes its
@@ -374,6 +512,12 @@ impl Directory {
                 value: value.clone(),
             })
             .collect()
+    }
+
+    /// Whether this directory exists in `region` at all: its primary Region, or one of
+    /// the Regions it is replicated to.
+    pub fn exists_in_region(&self, region: &str) -> bool {
+        self.primary_region == region || self.additional_regions.contains(region)
     }
 
     /// This directory as the modelled `DirectoryDescription`.
@@ -526,18 +670,28 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
 
     /// Materialise every status transition the clock has already made due at `now`.
     ///
-    /// This is the ONLY write a reporting operation performs: the change here was owed
-    /// at `now` whether or not anybody called, because its due instant was stored when
-    /// the directory or snapshot was created.
+    /// This is the ONLY write a reporting operation performs: the changes here were
+    /// owed at `now` whether or not anybody called, because each due instant was stored
+    /// when the record it belongs to was created — a directory's stage when
+    /// `CreateDirectory` ran, a snapshot's status when `CreateSnapshot` ran, an IP
+    /// route's status when `AddIpRoutes` ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
-            let Some(due) = directory.stage_due_at else {
-                continue;
-            };
-            if now >= due {
-                directory.stage = STAGE_ACTIVE.to_string();
-                directory.stage_last_updated = due;
-                directory.stage_due_at = None;
+            if let Some(due) = directory.stage_due_at {
+                if now >= due {
+                    directory.stage = STAGE_ACTIVE.to_string();
+                    directory.stage_last_updated = due;
+                    directory.stage_due_at = None;
+                }
+            }
+            for route in directory.ip_routes.values_mut() {
+                let Some(due) = route.status_due_at else {
+                    continue;
+                };
+                if now >= due {
+                    route.status = IP_ROUTE_STATUS_ADDED.to_string();
+                    route.status_due_at = None;
+                }
             }
         }
         for snapshot in self.snapshots.values_mut() {
@@ -576,6 +730,30 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
             })
             .count()
     }
+
+    /// The manual snapshot limits `GetSnapshotLimits` reports for `directory_id`, as
+    /// the modelled `SnapshotLimits`.
+    ///
+    /// Every member is derived rather than stored: the limit is the quota
+    /// [`MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY`], the current count is what the snapshot
+    /// store holds for that directory ([`Self::manual_snapshot_count`]), and
+    /// `ManualSnapshotsLimitReached` ("Indicates if the manual snapshot limit has been
+    /// reached") is the comparison of the two.
+    pub fn snapshot_limits(&self, directory_id: &str) -> SnapshotLimits {
+        let taken = self.manual_snapshot_count(directory_id);
+        SnapshotLimits {
+            manual_snapshots_limit: Some(clamp_to_i32(MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY)),
+            manual_snapshots_current_count: Some(clamp_to_i32(taken)),
+            manual_snapshots_limit_reached: taken >= MAX_MANUAL_SNAPSHOTS_PER_DIRECTORY,
+        }
+    }
+}
+
+/// A count as the modelled `Limit` integer, which is 32 bits wide: both counts a
+/// `SnapshotLimits` reports are bounded by [`MAX_SNAPSHOTS`], far below the maximum, so
+/// the saturation can never be reached and is here only so no cast can wrap.
+fn clamp_to_i32(count: usize) -> i32 {
+    i32::try_from(count).unwrap_or(i32::MAX)
 }
 
 /// The opaque `NextToken` for a page of `kind` that ended at `value`.
@@ -643,8 +821,9 @@ pub fn sns_topic_arn(region: &str, topic_name: &str) -> String {
     ::engine::emulator_arn(SNS_ARN_SERVICE, region, topic_name)
 }
 
-/// The Region a reported ARN carries: the Region of the caller's sigv4 credential
-/// scope, or [`DEFAULT_REGION`] when the request carries none.
+/// The Region a reported ARN carries, and the Region an operation that acts per Region
+/// (`RemoveRegion`) acts on: the Region of the caller's sigv4 credential scope, or
+/// [`DEFAULT_REGION`] when the request carries none.
 ///
 /// The scope is parsed by `emulator_server::sigv4_credential_scope`, the single source
 /// of SigV4-scope parsing, so a header that is not a well-formed sigv4 `Authorization`
@@ -653,6 +832,13 @@ pub fn region_from_request(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The `DirectoryDoesNotExistException` message for an id that names no directory in
+/// `region` — either because nothing was ever created under it, or because the
+/// directory it names lives in other Regions only.
+pub fn no_such_directory_in_region(directory_id: &str, region: &str) -> String {
+    format!("Directory: '{directory_id}' does not exist in {region}.")
 }
 
 /// The `EntityDoesNotExistException` message for an id that names no stored snapshot.

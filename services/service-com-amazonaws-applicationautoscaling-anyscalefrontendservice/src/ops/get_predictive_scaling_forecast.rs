@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPredictiveScalingForecast
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPredictiveScalingForecast`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPredictiveScalingForecast::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +86,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::MetricSeries;
+// A forecast is computed from the observations of the load metric, which live in the
+// CloudWatch emulator's own metric store, reached through the shared engine.
+use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,20 +158,491 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPredictiveScalingForecast` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPredictiveScalingForecastErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::{check_dimension_namespace, check_enum, PolicyKey, TargetKey};
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetPredictiveScalingForecastErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some(
+                            "this service is mounted on an engine that holds no state".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        check_enum(
+            "serviceNamespace",
+            &input.service_namespace,
+            SERVICE_NAMESPACE_VALUES,
+        )
+        .map_err(validation)?;
+        check_enum(
+            "scalableDimension",
+            &input.scalable_dimension,
+            SCALABLE_DIMENSION_VALUES,
+        )
+        .map_err(validation)?;
+        check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
+            .map_err(validation)?;
+
+        let now = ::std::time::SystemTime::now()
+            .duration_since(::std::time::UNIX_EPOCH)
+            .map(|since_epoch| since_epoch.as_secs() as i64)
+            .unwrap_or_default();
+        let start = epoch_secs_of(&input.start_time);
+        let end = epoch_secs_of(&input.end_time);
+        check_window(now, start, end)?;
+
+        let key = PolicyKey {
+            target: TargetKey {
+                service_namespace: input.service_namespace.clone(),
+                resource_id: input.resource_id.clone(),
+                scalable_dimension: input.scalable_dimension.clone(),
+            },
+            policy_name: input.policy_name.clone(),
+        };
+
+        // Everything this forecast is computed FROM, copied out under this service's lock
+        // so the CloudWatch read below happens with it released: the policy's predictive
+        // configuration and the capacity window the forecast capacity lies in.
+        let (predictive_config, min_capacity, max_capacity) = {
+            let state = state.lock();
+            // This operation models no `ObjectNotFoundException`, so a policy that is not
+            // there — or is not a predictive one — is a validation failure: there is no
+            // predictive scaling policy by that name to forecast.
+            let Some(record) = state.policies.get(&key) else {
+                return Err(validation(format!(
+                    "No predictive scaling policy found for service namespace: {}, resource ID: \
+                     {}, scalable dimension: {}, policy name: {}",
+                    key.target.service_namespace,
+                    key.target.resource_id,
+                    key.target.scalable_dimension,
+                    key.policy_name
+                )));
+            };
+            if record.policy_type != PREDICTIVE_SCALING {
+                return Err(validation(format!(
+                    "Value '{}' at 'policyName' failed to satisfy constraint: Member must name a \
+                     {PREDICTIVE_SCALING} policy, and that policy has policy type {}",
+                    key.policy_name, record.policy_type
+                )));
+            }
+            let Some(config) = record.predictive_config.clone() else {
+                return Err(validation(format!(
+                    "Value '{}' at 'policyName' failed to satisfy constraint: Member must name a \
+                     {PREDICTIVE_SCALING} policy carrying a \
+                     PredictiveScalingPolicyConfiguration",
+                    key.policy_name
+                )));
+            };
+            let (min_capacity, max_capacity) = state
+                .targets
+                .get(&key.target)
+                .map(|target| (target.min_capacity, target.max_capacity))
+                .unwrap_or_default();
+            (config, min_capacity, max_capacity)
+        };
+
+        // The hourly instants the forecast reports at: every forecast-interval boundary
+        // inside the requested range, from the inclusive start time to the exclusive end.
+        let slots = forecast_slots(start, end);
+        let timestamps: Vec<::aws_smithy_types::DateTime> = slots
+            .iter()
+            .map(|slot| ::aws_smithy_types::DateTime::from_secs(*slot))
+            .collect();
+
+        // One load forecast per metric specification, each computed from the observations
+        // CloudWatch holds for THAT specification's load series.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPredictiveScalingForecast"))
+        // The work and the response are the PRODUCT of the number of specifications and the
+        // number of slots, so BOTH factors are bounded: the slots by the window the model
+        // allows to be asked for ([`check_window`], at most 30 days of hours), and the
+        // specifications by the count `PutScalingPolicy` admits
+        // ([`crate::state::MAX_PREDICTIVE_METRIC_SPECIFICATIONS`]) — taken again here so a
+        // record from any other source cannot widen the product either. The `yield_now` is
+        // there only as a CANCELLATION point: with the count bounded at one it buys no
+        // fairness, but it is where a client timeout or a dropped connection lands instead
+        // of being discovered after the whole response has been built.
+        let mut load_forecast = Vec::new();
+        let mut load_total = vec![0.0f64; slots.len()];
+        for specification in predictive_config
+            .metric_specifications
+            .iter()
+            .take(crate::state::MAX_PREDICTIVE_METRIC_SPECIFICATIONS)
+        {
+            ::tokio::task::yield_now().await;
+            let series = load_series(&key.target, specification)?;
+            let profile = HourlyProfile::of_series(&*self.engine, &series, now);
+            let values: Vec<f64> = slots.iter().map(|slot| profile.at(*slot)).collect();
+            for (total, value) in load_total.iter_mut().zip(&values) {
+                *total += *value;
+            }
+            load_forecast.push(LoadForecast {
+                timestamps: timestamps.clone(),
+                values,
+                metric_specification: specification.clone(),
+            });
+        }
+
+        // "Capacity forecasts are represented as predicted values for the minimum capacity
+        // that is needed on an hourly basis, based on the hourly load forecast": the
+        // capacity that holds the forecast load at the target utilisation, inside the
+        // target's own capacity window.
+        let target_value = predictive_config
+            .metric_specifications
+            .first()
+            .map(|specification| specification.target_value)
+            .unwrap_or_default();
+        // Only the one value that asks for the maximum to give way selects the uncapped
+        // branch: the member is a closed enum ("HonorMaxCapacity | IncreaseMaxCapacity")
+        // that "defaults to HonorMaxCapacity if not specified", so both an absent and an
+        // unrecognised value keep the target's maximum.
+        let honor_max = predictive_config
+            .max_capacity_breach_behavior
+            .as_deref()
+            != Some(INCREASE_MAX_CAPACITY);
+        let capacity_values = load_total
+            .iter()
+            .map(|load| {
+                capacity_for(
+                    *load,
+                    target_value,
+                    min_capacity,
+                    max_capacity,
+                    honor_max,
+                )
+            })
+            .collect();
+
+        Ok(GetPredictiveScalingForecastOutput {
+            load_forecast: Some(load_forecast),
+            capacity_forecast: Some(CapacityForecast {
+                timestamps,
+                values: capacity_values,
+            }),
+            // "The time the forecast was made" — this call is what made it.
+            update_time: Some(::aws_smithy_types::DateTime::from_secs(now)),
+        })
     }
+}
+
+/// The `PolicyType` this operation forecasts for; every other type has no forecast.
+const PREDICTIVE_SCALING: &str = "PredictiveScaling";
+
+/// The default `MaxCapacityBreachBehavior`: "Defaults to `HonorMaxCapacity` if not
+/// specified." The other value is the only one that lets the maximum give way.
+const INCREASE_MAX_CAPACITY: &str = "IncreaseMaxCapacity";
+
+/// The forecast interval, in seconds: the model documents "the forecast interval duration
+/// of 3600 seconds (60 minutes)", and load forecasts are "predictions of the hourly load
+/// values".
+const FORECAST_INTERVAL_SECS: i64 = 3_600;
+
+/// The longest window a single call may forecast over: "The maximum time duration between
+/// the start and end time is 30 days" (`GetPredictiveScalingForecastRequest$EndTime`).
+const MAX_FORECAST_WINDOW_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// How far before now a start time may lie: "At most, the date and time can be one year
+/// before the current date and time" (`GetPredictiveScalingForecastRequest$StartTime`).
+const MAX_START_AGE_SECS: i64 = 365 * 24 * 60 * 60;
+
+/// How much history the forecast is computed from: "A minimum of 24 hours of data is
+/// required to create the initial forecasts. However, having a full 14 days of historical
+/// data results in more accurate forecasts" — so 14 days is the whole window an analysis
+/// reads, and observations older than that are outside it.
+const LOOKBACK_SECS: i64 = 14 * 24 * 60 * 60;
+
+/// How many hours of the day the hour-of-day profile holds.
+const HOURS_PER_DAY: i64 = 24;
+
+/// A modelled timestamp as whole epoch seconds, clamped to the range this service computes
+/// in (see [`crate::state::system_time_of`]): a request timestamp is not trusted at either
+/// end.
+fn epoch_secs_of(stamp: &::aws_smithy_types::DateTime) -> i64 {
+    let at = crate::state::system_time_of(stamp);
+    at.duration_since(::std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// Refuse a forecast window the model does not allow to be asked for.
+fn check_window(now: i64, start: i64, end: i64) -> Result<(), GetPredictiveScalingForecastError> {
+    if end <= start {
+        return Err(validation(
+            "Value at 'endTime' failed to satisfy constraint: Member must be after 'startTime': \
+             the start time is inclusive and the end time exclusive",
+        ));
+    }
+    if end - start > MAX_FORECAST_WINDOW_SECS {
+        return Err(validation(format!(
+            "Value at 'endTime' failed to satisfy constraint: the maximum time duration between \
+             the start and end time is {} days",
+            MAX_FORECAST_WINDOW_SECS / (24 * 60 * 60)
+        )));
+    }
+    if now - start > MAX_START_AGE_SECS {
+        return Err(validation(
+            "Value at 'startTime' failed to satisfy constraint: Member must be at most one year \
+             before the current date and time",
+        ));
+    }
+    Ok(())
+}
+
+/// The instants the forecast reports a value at: the hour boundaries that lie inside the
+/// requested range, from the INCLUSIVE start time up to the EXCLUSIVE end time.
+///
+/// A forecast is a series of "hourly load values", so its data points sit on the hour; a
+/// request names a time RANGE, and the points it asks for are the ones inside that range.
+/// An unaligned start time therefore reports from the next hour rather than from a point
+/// before the range the caller asked about.
+fn forecast_slots(start: i64, end: i64) -> Vec<i64> {
+    let past_the_hour = start.rem_euclid(FORECAST_INTERVAL_SECS);
+    let mut slot = if past_the_hour == 0 {
+        start
+    } else {
+        start + FORECAST_INTERVAL_SECS - past_the_hour
+    };
+    let mut slots = Vec::new();
+    while slot < end {
+        slots.push(slot);
+        slot += FORECAST_INTERVAL_SECS;
+    }
+    slots
+}
+
+/// The capacity the forecast load needs at the target utilisation, inside the scalable
+/// target's capacity window.
+///
+/// The capacity is the forecast load divided by the target utilisation, rounded UP — it is
+/// "the minimum capacity that is needed", so a fractional unit is a whole unit — and never
+/// below the target's `MinCapacity`, which the target is kept at or above. `MaxCapacity`
+/// caps it under the default `HonorMaxCapacity`; under `IncreaseMaxCapacity` the maximum is
+/// the one that gives way, so the capacity the load needs is reported as it is.
+fn capacity_for(
+    load: f64,
+    target_value: f64,
+    min_capacity: i32,
+    max_capacity: i32,
+    honor_max_capacity: bool,
+) -> f64 {
+    let floor = f64::from(min_capacity);
+    let ceiling = f64::from(max_capacity).max(floor);
+    // A target utilisation of zero (or one that is not a finite number) divides no load
+    // into a capacity, so the forecast is the floor the target is held at.
+    if target_value <= 0.0 || !target_value.is_finite() || !load.is_finite() {
+        return floor;
+    }
+    let needed = (load / target_value).ceil().max(floor);
+    if honor_max_capacity {
+        needed.min(ceiling)
+    } else {
+        needed
+    }
+}
+
+/// The load series one metric specification is forecast from.
+///
+/// A predictive metric specification names its load metric in one of three ways — a
+/// customized load metric, a predefined load metric, or a metric PAIR, which "determines
+/// the appropriate scaling metric and load metric to use" — so all three resolve to one
+/// CloudWatch series. A specification that names none of them describes no load at all and
+/// is refused; one whose series this emulator cannot identify is answered with the
+/// scaffold's 501 rather than with a forecast of a metric nobody can name.
+fn load_series(
+    target: &crate::state::TargetKey,
+    specification: &PredictiveScalingMetricSpecification,
+) -> Result<MetricSeries, GetPredictiveScalingForecastError> {
+    if let Some(customized) = specification.customized_load_metric_specification.as_ref() {
+        return customized_series(customized);
+    }
+    let predefined = specification
+        .predefined_load_metric_specification
+        .as_ref()
+        .map(|load| (&load.predefined_metric_type, load.resource_label.as_deref()))
+        .or_else(|| {
+            specification
+                .predefined_metric_pair_specification
+                .as_ref()
+                .map(|pair| (&pair.predefined_metric_type, pair.resource_label.as_deref()))
+        });
+    let Some((metric_type, resource_label)) = predefined else {
+        return Err(validation(
+            "Value at 'predictiveScalingPolicyConfiguration.metricSpecifications' failed to \
+             satisfy constraint: a metric specification must name a metric pair, or a load metric \
+             and a scaling metric individually",
+        ));
+    };
+    crate::state::predictive_metric_series(target, metric_type, resource_label).ok_or_else(|| {
+        crate::scaffolded::Scaffolded::not_implemented(&format!(
+            "GetPredictiveScalingForecast for the predictive scaling metric type {metric_type}"
+        ))
+    })
+}
+
+/// The series a customized load metric specification describes.
+///
+/// The specification is a list of metric data queries, of which the one that returns data
+/// is the series the forecast reads ("specify `true` for this value for only the final math
+/// expression that the metric specification is based on"; `ReturnData` "sets it to its
+/// default (`true`)" when absent). A query that is a math EXPRESSION computes a series that
+/// is not stored under any metric name, so it is answered with the scaffold's 501.
+fn customized_series(
+    customized: &PredictiveScalingCustomizedMetricSpecification,
+) -> Result<MetricSeries, GetPredictiveScalingForecastError> {
+    let returning = customized
+        .metric_data_queries
+        .iter()
+        .find(|query| query.return_data.unwrap_or(true));
+    let Some(query) = returning.or_else(|| customized.metric_data_queries.first()) else {
+        return Err(validation(
+            "Value at 'predictiveScalingPolicyConfiguration.metricSpecifications' failed to \
+             satisfy constraint: a customized metric specification requires at least one metric \
+             data query",
+        ));
+    };
+    let series = query.metric_stat.as_ref().and_then(|stat| {
+        let (Some(namespace), Some(metric_name)) =
+            (stat.metric.namespace.clone(), stat.metric.metric_name.clone())
+        else {
+            return None;
+        };
+        Some(MetricSeries {
+            namespace,
+            metric_name,
+            statistic: stat.stat.clone(),
+            dimensions: stat
+                .metric
+                .dimensions
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|dimension| (dimension.name, dimension.value))
+                .collect(),
+        })
+    });
+    let series = series.ok_or_else(|| {
+        crate::scaffolded::Scaffolded::not_implemented(
+            "GetPredictiveScalingForecast for a customized metric specification that is a metric \
+             math expression",
+        )
+    })?;
+    // The hourly load is CloudWatch's own aggregate of that hour's observations
+    // (`cloudwatch::state::BasicStatistics`), which is defined for the basic statistics
+    // only: an extended (percentile) statistic needs the individual published values, which
+    // a stored aggregate does not carry. AWS accepts such a `Stat`, so it is answered with
+    // the scaffold's 501 rather than with a forecast aggregated some other way.
+    if !cloudwatch::ops::types::STATISTIC_VALUES.contains(&series.statistic.as_str()) {
+        return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+            "GetPredictiveScalingForecast for a load metric aggregated with the statistic {}",
+            series.statistic
+        )));
+    }
+    Ok(series)
+}
+
+/// The hourly load one series was observed at, as the analysis of historical trends a
+/// forecast is made from.
+///
+/// "Load forecasts are predictions of the hourly load values using historical load data
+/// from CloudWatch and an analysis of historical trends": the observations of the series
+/// are aggregated into the clock hours they fall in, and each hour OF THE DAY is forecast
+/// as the mean of the hours of that time of day that were observed — the trend a daily
+/// load cycle has. An hour of the day nothing was observed at falls back to the mean over
+/// every observed hour, and a series with no observations at all forecasts no load.
+#[derive(Debug, Default)]
+struct HourlyProfile {
+    /// Per hour of the day, the total of the hourly loads observed at it and how many
+    /// hours that total is over.
+    by_hour_of_day: [(f64, u32); HOURS_PER_DAY as usize],
+    /// The same totals over every observed hour.
+    overall: (f64, u32),
+}
+
+impl HourlyProfile {
+    /// The profile of `series` over the [`LOOKBACK_SECS`] before `now`, read from the
+    /// CloudWatch store the datapoints were published to.
+    fn of_series<Eng: Send + Sync + 'static>(engine: &Eng, series: &MetricSeries, now: i64) -> Self {
+        let mut profile = Self::default();
+        let Some(store) = cloudwatch::state::service_state(engine) else {
+            return profile;
+        };
+        let key = cloudwatch::state::MetricKey {
+            namespace: series.namespace.clone(),
+            metric_name: series.metric_name.clone(),
+            dimensions: series
+                .dimensions
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        };
+        let store = store.lock();
+        let Some(data) = store.metrics.get(&key) else {
+            return profile;
+        };
+
+        // One bucket per clock hour an observation fell in, aggregated the way the series'
+        // statistic aggregates: the hourly load is the statistic OF THAT HOUR's
+        // observations, not of the individual datapoints. The fold is CloudWatch's own
+        // ([`cloudwatch::state::BasicStatistics`]), the same one `GetMetricStatistics`
+        // aggregates a period's window with.
+        let mut hours: ::std::collections::BTreeMap<i64, cloudwatch::state::BasicStatistics> =
+            ::std::collections::BTreeMap::new();
+        let oldest = now - LOOKBACK_SECS;
+        for datum in data {
+            let at = datum.timestamp_secs;
+            if !at.is_finite() {
+                continue;
+            }
+            let at = at as i64;
+            if at < oldest || at > now {
+                continue;
+            }
+            hours
+                .entry(at.div_euclid(FORECAST_INTERVAL_SECS))
+                .or_default()
+                .add(datum);
+        }
+
+        for (hour, bucket) in hours {
+            let Some(load) = bucket.named(&series.statistic) else {
+                continue;
+            };
+            let hour_of_day = hour.rem_euclid(HOURS_PER_DAY) as usize;
+            profile.by_hour_of_day[hour_of_day].0 += load;
+            profile.by_hour_of_day[hour_of_day].1 += 1;
+            profile.overall.0 += load;
+            profile.overall.1 += 1;
+        }
+        profile
+    }
+
+    /// The load this profile forecasts for the hour beginning at `slot`.
+    fn at(&self, slot: i64) -> f64 {
+        let hour_of_day = slot
+            .div_euclid(FORECAST_INTERVAL_SECS)
+            .rem_euclid(HOURS_PER_DAY) as usize;
+        let (total, hours) = self.by_hour_of_day[hour_of_day];
+        if hours > 0 {
+            return total / f64::from(hours);
+        }
+        let (total, hours) = self.overall;
+        if hours > 0 {
+            return total / f64::from(hours);
+        }
+        0.0
+    }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> GetPredictiveScalingForecastError {
+    GetPredictiveScalingForecastErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
 }

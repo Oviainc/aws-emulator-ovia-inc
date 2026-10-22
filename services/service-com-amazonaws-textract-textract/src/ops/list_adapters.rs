@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAdapters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAdapters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAdapters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the adapters this service holds, filtered by the request's creation-time
+//! window and cut into pages.
+//!
+//! A READ: it derives its answer from the stored adapter records (`state::adapters`) —
+//! the same records `GetAdapter` reports — and writes nothing, so a listing can never
+//! disagree with a read of one adapter and polling the listing moves no state. The
+//! filtering and the ordering live in [`crate::state::listed_adapters`] and the page
+//! cutting in [`crate::state::page_of`], shared with this service's other paginated
+//! reads, so one rule answers them all.
 //!
 //! ## Shape of an operation
 //!
@@ -163,20 +164,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAdapters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAdaptersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAdapters"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAdaptersErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("Textract state is unavailable".to_string()),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        // A `NextToken` is an offset into the listing the SAME filtration criteria
+        // produce, so the cursor is bound to those criteria and checked before anything
+        // is reported.
+        let scope = crate::state::adapter_page_scope(
+            input.after_creation_time.as_ref(),
+            input.before_creation_time.as_ref(),
+        );
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(&scope, token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(ListAdaptersErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "NextToken was not issued for this listing's filtration \
+                                 criteria"
+                                    .to_string(),
+                            ),
+                            code: None,
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let adapters = {
+            let store = state.lock();
+            crate::state::listed_adapters(
+                &store,
+                input.after_creation_time.as_ref(),
+                input.before_creation_time.as_ref(),
+            )
+        };
+
+        let Some((page, next_token)) =
+            crate::state::page_of(&scope, &adapters, input.max_results, offset)
+        else {
+            return Err(ListAdaptersErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "MaxResults must be at least 1, got {:?}",
+                        input.max_results
+                    )),
+                    code: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(ListAdaptersOutput {
+            adapters: Some(page),
+            next_token,
+        })
     }
 }
