@@ -141,20 +141,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the iotdeviceadvisor store is unavailable".to_string()),
             })
         })?;
+
+        // A token is a position this service handed out, never arbitrary caller text: it
+        // is the suite-definition id the next page resumes AT, so one that cannot be an id
+        // this service mints is refused with the modelled client-input error instead of
+        // being read as "start from the beginning". `Token` is `len 0..2000`, and an empty
+        // token carries no position, so it is the same request as naming none.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if crate::state::is_page_token_shape(token) => Some(token.to_string()),
+            Some(_) => {
+                return Err(ListSuiteDefinitionsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some("Invalid nextToken".to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
         let store = state.lock();
 
         // `maxResults` is `range 1..50`, so an absent one defaults to the modelled
         // maximum: one page holds every definition unless the caller asks for fewer. The
         // boundary validator has already refused anything outside that range; `max(1)`
         // only keeps the paging loop below total if it ever stops doing so.
-        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_RESULTS_MAX))
+        let page_size = usize::try_from(input.max_results.unwrap_or(crate::state::MAX_RESULTS_MAX))
             .unwrap_or(1)
             .max(1);
 
         // The token is the id to resume AT, so paging is stable while definitions are
         // created or deleted between pages. An absent token resumes at the empty string,
         // which is the start of the map — the same iterator type, so no boxing.
-        let mut remaining = match input.next_token {
+        let mut remaining = match resume_at {
             Some(token) => store.definitions.range(token..).peekable(),
             None => store.definitions.range(String::new()..).peekable(),
         };
@@ -183,6 +202,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The upper bound the model puts on `maxResults` (`range 1..50`), which is also the page
-/// size a caller who names none gets.
-const MAX_RESULTS_MAX: i32 = 50;

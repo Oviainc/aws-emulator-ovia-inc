@@ -158,9 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let definition = store.definitions.get(&input.suite_definition_id).ok_or_else(|| {
             GetSuiteDefinitionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!(
-                    "No suite definition with suiteDefinitionId {}",
-                    input.suite_definition_id
+                message: Some(crate::state::not_found_message(
+                    "suiteDefinitionId",
+                    &input.suite_definition_id,
                 )),
             })
         })?;
@@ -174,9 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetSuiteDefinitionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Suite definition {} has no version {version}",
-                            definition.id
+                        message: Some(crate::state::not_found_message(
+                            "suiteDefinitionVersion",
+                            &version,
                         )),
                     },
                 )

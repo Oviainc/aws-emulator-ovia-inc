@@ -7,7 +7,8 @@
 //! their bytes, so a `GetSuiteDefinition` naming an earlier version still answers the
 //! configuration that version was recorded with, while an unqualified read answers the
 //! one this call stored. `createdAt` is the definition's own creation instant (an update
-//! never moves it) and `lastUpdatedAt` is the instant this call recorded.
+//! never moves it) and `lastUpdatedAt` is the instant this call recorded. An id the store
+//! does not hold is refused as not found.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +74,10 @@
 //!
 //! * `InternalServerException` (HTTP 500) — Sends an Internal Failure exception.
 //! * `ValidationException` (HTTP 400) — Sends a validation exception.
+//!
+//! `ResourceNotFoundException` (HTTP 404, as the shape's own `httpError` binds it) is not
+//! in that list, but it is what Device Advisor answers for a `suiteDefinitionId` it does
+//! not hold — so it is widened in below with `extra_errors`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -88,10 +93,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-iotdeviceadvisor-iotsen
 // here — hence the `UpdateSuiteDefinitionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.iotdeviceadvisor#UpdateSuiteDefinition")]
+// `ResourceNotFoundException` is widened in through `extra_errors`: this SERVICE models
+// it (with `httpError` 404, as `GetSuiteDefinition` binds it) and it is what AWS answers
+// for an unknown `suiteDefinitionId` here, even though this operation's own error list
+// advertises only the two below.
+#[smithy_macros::operation_error(
+    "com.amazonaws.iotdeviceadvisor#UpdateSuiteDefinition",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateSuiteDefinitionErrorModeled {
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
 }
 
@@ -168,17 +181,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // Resolved before the lookup so the refusal path below can name the resource in
+        // the audit trail without holding a borrow of the store.
+        let requested_arn = crate::state::arn(
+            &region,
+            &format!("suitedefinition/{}", input.suite_definition_id),
+        );
         let mut store = state.lock();
 
-        // `smithy_query` lists no `ResourceNotFoundException` for this operation, so an
-        // update of a definition the store does not hold is refused with the modelled
-        // client-input error it does declare — the same way `StartSuiteRun` refuses one.
+        // An update of a definition the store does not hold changes nothing and is refused
+        // with the service's not-found error: `ResourceNotFoundException`, HTTP 404 as the
+        // shape's own `httpError` binds it, widened in above because this operation's
+        // error list does not advertise it.
         let Some(definition) = store.definitions.get_mut(&input.suite_definition_id) else {
-            return Err(UpdateSuiteDefinitionErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "No suite definition with suiteDefinitionId {}",
-                        input.suite_definition_id
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                &region,
+                &requested_arn,
+                "not-found",
+            );
+            return Err(UpdateSuiteDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        "suiteDefinitionId",
+                        &input.suite_definition_id,
                     )),
                 },
             )

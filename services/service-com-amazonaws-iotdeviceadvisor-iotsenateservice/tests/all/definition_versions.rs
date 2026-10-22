@@ -226,10 +226,11 @@ async fn an_update_touches_only_the_named_definition() {
     );
 }
 
-/// What an update refuses: an id the store does not hold, and a configuration that breaks
-/// the `rootGroup` rule — each with the modelled client-input error this operation
-/// declares (`smithy_query` lists only `ValidationException` and
-/// `InternalServerException` for it), never a 501 and never a success.
+/// What an update refuses: an id the store does not hold — AWS answers that with
+/// `ResourceNotFoundException` (HTTP 404 per the shape's own `httpError`), which this
+/// operation's error list does not advertise — and a configuration that breaks the
+/// `rootGroup` rule, refused with the modelled `ValidationException`. Never a 501 and
+/// never a success.
 #[tokio::test]
 async fn updates_outside_the_rules_are_refused() {
     let emulator = Emulator::new();
@@ -249,7 +250,7 @@ async fn updates_outside_the_rules_are_refused() {
             "unknown but well-formed id",
             "00000000-0000-4000-8000-000000000000".to_string(),
             legal.clone(),
-            400,
+            404,
         ),
         (
             // `UUID` is `len 12..36`: shorter than the minimum is refused by the modelled
@@ -307,6 +308,21 @@ async fn updates_outside_the_rules_are_refused() {
                 Some("ValidationException"),
                 "case {case:?}: expected the modelled ValidationException, got {:?} {}",
                 answer.error_code,
+                answer.body
+            );
+        }
+        if expected_status == 404 {
+            assert_eq!(
+                answer.error_code.as_deref(),
+                Some("ResourceNotFoundException"),
+                "case {case:?}: an id the store does not hold is a not-found, got {:?} {}",
+                answer.error_code,
+                answer.body
+            );
+            assert_eq!(
+                answer.member("message").as_str(),
+                Some(format!("Unable to find resource with suiteDefinitionId: {id}").as_str()),
+                "case {case:?}: expected the AWS not-found template, got {}",
                 answer.body
             );
         }

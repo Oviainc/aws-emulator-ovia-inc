@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSuiteRuns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSuiteRuns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSuiteRuns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the suite runs the store holds, narrowed by the filters the caller named and
+//! paged by `maxResults`. A filter that matches nothing is an EMPTY list, not an error;
+//! only a `nextToken` this service cannot have issued is refused. The one write it does
+//! is materialising the status transitions the clock already made due for the runs the
+//! FILTERS select — the set this paginated listing is about, whichever page it answers —
+//! so a listing shows the same statuses a caller would have seen had nobody called at all.
+//!
+//! Runs are listed in suite-run id order — the order the store's `BTreeMap` holds them in
+//! — so one listing has one deterministic order and the `nextToken` (the id to resume at)
+//! stays valid while runs are started or aged out between pages. The model states no
+//! ordering for `suiteRunsList`, so id order is NOT chronological order: nothing here
+//! promises newest-first.
 //!
 //! ## Shape of an operation
 //!
@@ -145,20 +149,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSuiteRuns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSuiteRunsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSuiteRuns"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSuiteRunsErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the iotdeviceadvisor store is unavailable".to_string()),
+            })
+        })?;
+
+        // The model's own words for `ListSuiteRunsRequest$suiteDefinitionVersion`: "Must
+        // be passed along with suiteDefinitionId" — a version filter alone names no
+        // suite, so it is refused with the modelled client-input error.
+        if input.suite_definition_version.is_some() && input.suite_definition_id.is_none() {
+            return Err(ListSuiteRunsErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "Invalid Request: suiteDefinitionVersion must be passed along with \
+                     suiteDefinitionId"
+                        .to_string(),
+                ),
+            })
+            .into());
+        }
+
+        // A token is a position this service handed out, never arbitrary caller text: it
+        // is the suite-run id the next page resumes AT, so one that cannot be an id this
+        // service mints is refused instead of being read as "start from the beginning".
+        // `Token` is `len 0..2000`, and an empty token carries no position, so it is the
+        // same request as naming none.
+        let resume_at = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if crate::state::is_page_token_shape(token) => Some(token.to_string()),
+            Some(_) => {
+                return Err(ListSuiteRunsErrorModeled::ValidationException(ValidationException {
+                    message: Some("Invalid nextToken".to_string()),
+                })
+                .into());
+            }
+        };
+
+        // An absent `maxResults` means one page holds everything, so it defaults to the
+        // modelled maximum. The boundary validator has already refused anything outside
+        // `range 1..50`; `max(1)` only keeps the loop below terminating if it ever stops
+        // doing so.
+        let page_size = usize::try_from(input.max_results.unwrap_or(crate::state::MAX_RESULTS_MAX))
+            .unwrap_or(1)
+            .max(1);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The runs this call is ABOUT: every run matching the filters the caller named —
+        // the whole paginated set, not just the page answered here — with the transitions
+        // the clock already owes them materialised. A run the filters exclude is matched
+        // out BEFORE the materialisation, so a narrowed listing never advances a run it
+        // was not asked about. `runs` is a `BTreeMap` keyed by run id, so the matches come
+        // out in one deterministic order and the token below is stable while runs are
+        // started or aged out between pages.
+        let mut matching: Vec<crate::state::SuiteRun> = Vec::new();
+        for run in store.runs.values_mut() {
+            let other_definition = input
+                .suite_definition_id
+                .as_deref()
+                .is_some_and(|id| run.suite_definition_id != id);
+            let other_version = input
+                .suite_definition_version
+                .as_deref()
+                .is_some_and(|version| run.suite_definition_version != version);
+            if other_definition || other_version {
+                continue;
+            }
+            run.materialize_due(now);
+            matching.push(run.clone());
+        }
+
+        let mut remaining = matching
+            .iter()
+            .filter(|run| {
+                resume_at
+                    .as_deref()
+                    .is_none_or(|from| run.id.as_str() >= from)
+            })
+            .peekable();
+
+        let mut page = Vec::new();
+        while page.len() < page_size {
+            let Some(run) = remaining.next() else {
+                break;
+            };
+            page.push(SuiteRunInformation {
+                suite_definition_id: Some(run.suite_definition_id.clone()),
+                suite_definition_version: Some(run.suite_definition_version.clone()),
+                // The name as the DEFINITION holds it, not as the run recorded it: a
+                // definition updated since the run started reports its current name.
+                suite_definition_name: store
+                    .definitions
+                    .get(&run.suite_definition_id)
+                    .map(|definition| definition.name().to_string()),
+                suite_run_id: Some(run.id.clone()),
+                created_at: Some(run.created_at.into()),
+                started_at: run.started_at.map(Into::into),
+                end_at: run.end_at.map(Into::into),
+                status: Some(run.status.clone()),
+                // No test case executed (see `crate::state::NO_TEST_RUNNER_REASON`), so
+                // there is no passed/failed count to report: zeroes would claim a result
+                // for tests nothing ran.
+                passed: None,
+                failed: None,
+            });
+        }
+
+        Ok(ListSuiteRunsOutput {
+            // The id the NEXT page resumes at, absent on the last page: that is what
+            // terminates a client's paging loop.
+            next_token: remaining.peek().map(|run| run.id.clone()),
+            suite_runs_list: Some(page),
+        })
     }
 }
+
