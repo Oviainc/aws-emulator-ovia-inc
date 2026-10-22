@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketTagging
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketTagging`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketTagging::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the request's `TagSet` as the named bucket's whole tag set, replacing whatever
+//! the bucket held, and answers 200 with an empty body. `GetBucketTagging` reads the same
+//! state back and `DeleteBucketTagging` removes it.
 //!
 //! ## Shape of an operation
 //!
@@ -131,14 +126,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketTaggingOutput {
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketTaggingError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketTagging")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketTagging")` reports `errors: []`),
+// but `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and
+// AWS answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`). `extra_errors` widens the set with that shape, which the SERVICE
+// models, so this handler answers the same 404 every other bucket-scoped operation does
+// rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketTagging",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketTaggingErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -192,18 +195,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketTagging` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketTaggingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketTagging"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine
+            // that is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // this operation models no server-fault error to say so, so the scaffold's
+            // 501 carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketTagging",
+            ));
+        };
+
+        // The tag set the request carries, in the order it arrived. `Tagging` is the
+        // @httpPayload and `Tagging$TagSet` is required, so reaching here means the
+        // boundary already parsed both.
+        let tags: Vec<crate::state::BucketTag> = input
+            .tagging
+            .tag_set
+            .iter()
+            .map(|tag| crate::state::BucketTag {
+                key: tag.key.clone(),
+                value: tag.value.clone(),
+            })
+            .collect();
+
+        // The bucket is looked up FIRST, so a request that names a bucket this emulator
+        // does not hold answers that — the way the service orders the two refusals —
+        // rather than reporting whatever is wrong with a tag set the bucket could never
+        // have carried.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(PutBucketTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
+        // Validated BEFORE anything is written, so a refused tag set leaves the bucket's
+        // current tags exactly as they were. AWS refuses these with `InvalidTag`, a code
+        // this service's model does not declare as a shape and so cannot render, so the
+        // refusal goes out through the framework's 400 `ValidationException` channel —
+        // the same channel `CreateBucket` uses for the unmodelled bucket quota refusal.
+        if let Err(rejection) = crate::state::validate_tag_set(&tags) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                rejection.to_string(),
+            ));
+        }
+
+        // A replacement, not a merge: "it will overwrite any current tags the bucket
+        // already has. You cannot use this operation to add tags to an existing list of
+        // tags" (this operation's own documentation). An empty `TagSet` therefore leaves
+        // the bucket with no tags associated.
+        bucket.replace_tags(tags);
+
+        // `Unit` output: success is the 200 and an empty body.
+        Ok(PutBucketTaggingOutput)
     }
 }
