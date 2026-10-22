@@ -136,6 +136,34 @@ pub const DEFAULT_CEDAR_VERSION: &str = "CEDAR_4";
 /// and that path answers this constant too.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
 
+/// The message EVERY `ConflictException` this service raises carries.
+///
+/// A CONSTANT, for the same reason as [`RESOURCE_NOT_FOUND_MESSAGE`]: the model
+/// gives the exception a required `resources` member — "the list of resources
+/// referenced with this failed request", each a `ResourceConflict{resourceId,
+/// resourceType}` — so the identity of what was collided with is reported
+/// there, machine-readably, rather than spliced into prose, and the message
+/// stays the exception's own documented summary ("The request failed because
+/// another request to modify a resource occurred at the same time"). The corpus
+/// records this same text for two STRUCTURALLY DIFFERENT conflict causes on
+/// `CreatePolicyStoreAlias` — racing claims of one alias name by different
+/// stores, and re-creating a name that is in [`ALIAS_STATE_PENDING_DELETION`] —
+/// which is what establishes it as one fixed sentence rather than per-cause
+/// prose. Every conflicting path of this service fills it through the single
+/// builder [`crate::ops::conflict`].
+pub const CONFLICT_MESSAGE: &str = "Conflict occurred during the processing of this request";
+
+/// The message EVERY `TooManyTagsException` this service raises carries.
+///
+/// A CONSTANT for the same reason again: the exception models its own
+/// `resourceName` member (an `AmazonResourceName`), so the resource that is at
+/// the limit is reported there and neither the count nor the offending key
+/// belongs in the text — [`MAX_TAGS_PER_RESOURCE`] is a published quota a client
+/// already knows, not news carried by one refusal. The corpus records this text
+/// for the refusal of a 51st distinct key. Filled through
+/// [`crate::ops::too_many_tags`].
+pub const TOO_MANY_TAGS_MESSAGE: &str = "The request exceeds the maximum number of user tags allowed";
+
 /// The refusal `DeletePolicyStore` answers when deletion protection is enabled.
 ///
 /// A CONSTANT for the same reason: `InvalidStateException` models a single
@@ -873,6 +901,9 @@ pub const RESOURCE_TYPE_POLICY_STORE_ALIAS: &str = "POLICY_STORE_ALIAS";
 
 /// `ResourceType$POLICY`, from the model's `ResourceType` enum.
 pub const RESOURCE_TYPE_POLICY: &str = "POLICY";
+
+/// `ResourceType$POLICY_TEMPLATE`, from the model's `ResourceType` enum.
+pub const RESOURCE_TYPE_POLICY_TEMPLATE: &str = "POLICY_TEMPLATE";
 
 /// `ResourceType$SCHEMA`, from the model's `ResourceType` enum.
 pub const RESOURCE_TYPE_SCHEMA: &str = "SCHEMA";

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterOnPremisesInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterOnPremisesInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterOnPremisesInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +173,221 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterOnPremisesInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterOnPremisesInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterOnPremisesInstance"))
+        // `instanceName` is @required but carries NO modelled length or pattern
+        // (`smithy_query(query="shape",shape="InstanceName")`), so the boundary
+        // validator passes every string through and the name's form is decided
+        // here, against the shared rule in `crate::state`.
+        let name = input.instance_name;
+        match crate::state::check_instance_name(&name) {
+            Ok(()) => {}
+            Err(crate::state::NameRefusal::Missing) => {
+                return Err(RegisterOnPremisesInstanceErrorModeled::InstanceNameRequiredException(
+                    InstanceNameRequiredException {
+                        message: Some("An on-premises instance name was not specified".to_string()),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::NameRefusal::Malformed) => {
+                return Err(RegisterOnPremisesInstanceErrorModeled::InvalidInstanceNameException(
+                    InvalidInstanceNameException {
+                        message: Some(format!(
+                            "The on-premises instance name {name} was specified in an invalid \
+                             format"
+                        )),
+                    },
+                )
+                .into())
+            }
+        }
+
+        // "Only one IAM ARN (an IAM session ARN or IAM user ARN) is supported in
+        // the request. You cannot use both" — so exactly one has to be there, and
+        // each has its own form and its own refusal.
+        let user_arn = input.iam_user_arn.filter(|arn| !arn.trim().is_empty());
+        let session_arn = input.iam_session_arn.filter(|arn| !arn.trim().is_empty());
+        let identity = match (user_arn, session_arn) {
+            (Some(_), Some(_)) => {
+                return Err(RegisterOnPremisesInstanceErrorModeled::MultipleIamArnsProvidedException(
+                    MultipleIamArnsProvidedException {
+                        message: Some(
+                            "Both an user ARN and an IAM session ARN were included in the \
+                             request. Use only one ARN type"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+            (None, None) => {
+                return Err(RegisterOnPremisesInstanceErrorModeled::IamArnRequiredException(
+                    IamArnRequiredException {
+                        message: Some(
+                            "No IAM ARN was included in the request. You must use an IAM session \
+                             ARN or IAM user ARN in the request"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+            (Some(arn), None) => {
+                if !crate::state::is_iam_user_arn(&arn) {
+                    return Err(RegisterOnPremisesInstanceErrorModeled::InvalidIamUserArnException(
+                        InvalidIamUserArnException {
+                            message: Some(format!(
+                                "The user ARN {arn} was specified in an invalid format"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Identity::User(arn)
+            }
+            (None, Some(arn)) => {
+                if !crate::state::is_iam_session_arn(&arn) {
+                    return Err(
+                        RegisterOnPremisesInstanceErrorModeled::InvalidIamSessionArnException(
+                            InvalidIamSessionArnException {
+                                message: Some(format!(
+                                    "The IAM session ARN {arn} was specified in an invalid format"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                Identity::Session(arn)
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The whole registration — the name check, the IAM-ARN check and the write
+        // — happens under ONE hold of the store, so two concurrent registrations
+        // of the same name or the same IAM ARN cannot both pass their checks.
+        crate::state::with_state(&*self.engine, |state| {
+            // A name is taken only while its instance is REGISTERED: CodeDeploy
+            // keeps a deregistered instance's record, and registering that name
+            // again is a new registration of it.
+            if state
+                .on_premises_instances
+                .get(&name)
+                .is_some_and(crate::state::OnPremisesInstance::is_registered)
+            {
+                return Err(
+                    RegisterOnPremisesInstanceErrorModeled::InstanceNameAlreadyRegisteredException(
+                        InstanceNameAlreadyRegisteredException {
+                            message: Some(format!(
+                                "The on-premises instance {name} is already registered"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // One IAM identity backs at most one REGISTERED instance. A LOOKUP in
+            // the store's IAM-ARN index, so this refusal costs the same however
+            // many instances the store holds.
+            let holder = state
+                .instance_registered_with(identity.arn())
+                .map(|instance| instance.instance_name.clone())
+                .filter(|holder| *holder != name);
+            if let Some(holder) = holder {
+                return Err(match &identity {
+                    Identity::User(arn) => {
+                        RegisterOnPremisesInstanceErrorModeled::IamUserArnAlreadyRegisteredException(
+                            IamUserArnAlreadyRegisteredException {
+                                message: Some(format!(
+                                    "The user ARN {arn} is already registered with the \
+                                     on-premises instance {holder}"
+                                )),
+                            },
+                        )
+                    }
+                    Identity::Session(arn) => {
+                        RegisterOnPremisesInstanceErrorModeled::IamSessionArnAlreadyRegisteredException(
+                            IamSessionArnAlreadyRegisteredException {
+                                message: Some(format!(
+                                    "The IAM session ARN {arn} has already been used to register \
+                                     the on-premises instance {holder}"
+                                )),
+                            },
+                        )
+                    }
+                }
+                .into());
+            }
+
+            // Re-registering a deregistered name keeps the tags already on that
+            // instance: deregistration does not remove them, so a later
+            // `GetOnPremisesInstance` reports the tags the instance still carries.
+            let tags = state
+                .on_premises_instances
+                .get(&name)
+                .map(|previous| previous.tags.clone())
+                .unwrap_or_default();
+            // The write goes through the store, which bounds the registry: it
+            // evicts records a caller already deregistered to make room, and
+            // refuses only when every record it holds is still registered. That
+            // refusal is not something CodeDeploy models, so it is stated as a
+            // refusal rather than dressed up as one of the modelled errors.
+            let recorded = state.register_on_premises_instance(crate::state::OnPremisesInstance {
+                instance_name: name.clone(),
+                instance_arn: crate::state::instance_arn(&region, &name),
+                iam_user_arn: identity.user_arn(),
+                iam_session_arn: identity.session_arn(),
+                register_time_ms: crate::state::now_ms(),
+                deregister_time_ms: None,
+                tags,
+            });
+            if !recorded {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "The maximum number of registered on-premises instances was exceeded: at \
+                     most {} can be registered at once",
+                    crate::state::MAX_ON_PREMISES_INSTANCES
+                )));
+            }
+            Ok(())
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })??;
+
+        Ok(RegisterOnPremisesInstanceOutput)
     }
 }
+
+/// The ONE IAM ARN a registration is made with. Holding it as either/or is what
+/// keeps "an IAM session ARN or an IAM user ARN, never both" true of every
+/// stored instance rather than only of the request that created it.
+enum Identity {
+    User(String),
+    Session(String),
+}
+
+impl Identity {
+    /// The ARN itself, whichever type it is.
+    fn arn(&self) -> &str {
+        match self {
+            Self::User(arn) | Self::Session(arn) => arn.as_str(),
+        }
+    }
+
+    /// The IAM user ARN this registration carries, if it is a user one.
+    fn user_arn(&self) -> Option<String> {
+        match self {
+            Self::User(arn) => Some(arn.clone()),
+            Self::Session(_) => None,
+        }
+    }
+
+    /// The IAM session ARN this registration carries, if it is a session one.
+    fn session_arn(&self) -> Option<String> {
+        match self {
+            Self::Session(arn) => Some(arn.clone()),
+            Self::User(_) => None,
+        }
+    }
+}
+

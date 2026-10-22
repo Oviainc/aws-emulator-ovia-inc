@@ -74,14 +74,14 @@ fn roles_of(account_id: &str) -> Vec<String> {
 }
 
 /// One emulator holding this service, plus the handle its state is seeded through.
-struct Portal {
+pub(crate) struct Portal {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 impl Portal {
     /// An emulator with [`FIXTURE`]'s accounts seeded and no sessions.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -98,12 +98,12 @@ impl Portal {
 
     /// The same store the handlers reach: the seam an administrator's assignments and a
     /// sign-in arrive through, since the portal models no create API.
-    fn state(&self) -> engine::ServiceState<ComAmazonawsSsoSwbportalserviceState> {
+    pub(crate) fn state(&self) -> engine::ServiceState<ComAmazonawsSsoSwbportalserviceState> {
         state::service_state(&*self.engine).expect("the portal store is reachable")
     }
 
     /// Seed an active session for `access_token`, assigned to `accounts`.
-    fn sign_in(&self, access_token: &str, accounts: &[&str]) {
+    pub(crate) fn sign_in(&self, access_token: &str, accounts: &[&str]) {
         self.state().lock().put_session(
             access_token,
             format!("{access_token}@example.com"),
@@ -126,20 +126,20 @@ impl Portal {
         self.router.dispatch(request).await
     }
 
-    async fn get(&self, uri: &str, token: Option<&str>) -> Response<Bytes> {
+    pub(crate) async fn get(&self, uri: &str, token: Option<&str>) -> Response<Bytes> {
         self.send(Method::GET, uri, token).await
     }
 
-    async fn logout(&self, token: Option<&str>) -> Response<Bytes> {
+    pub(crate) async fn logout(&self, token: Option<&str>) -> Response<Bytes> {
         self.send(Method::POST, "/logout", token).await
     }
 }
 
-fn body_text(response: &Response<Bytes>) -> String {
+pub(crate) fn body_text(response: &Response<Bytes>) -> String {
     String::from_utf8_lossy(response.body()).to_string()
 }
 
-fn body_json(response: &Response<Bytes>) -> serde_json::Value {
+pub(crate) fn body_json(response: &Response<Bytes>) -> serde_json::Value {
     serde_json::from_slice(response.body()).unwrap_or_else(|error| {
         panic!(
             "the response body must be JSON ({error}), got {:?}",
@@ -149,8 +149,16 @@ fn body_json(response: &Response<Bytes>) -> serde_json::Value {
 }
 
 /// The wire error code (`__type`) of a failure response.
-fn error_code(response: &Response<Bytes>) -> String {
+pub(crate) fn error_code(response: &Response<Bytes>) -> String {
     body_json(response)["__type"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `message` an error envelope carries, or the empty string when it carries none.
+pub(crate) fn error_message(response: &Response<Bytes>) -> String {
+    body_json(response)["message"]
         .as_str()
         .unwrap_or_default()
         .to_string()

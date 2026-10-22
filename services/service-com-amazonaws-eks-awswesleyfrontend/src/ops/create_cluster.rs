@@ -280,7 +280,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_deref()
                 .filter(|token| !token.trim().is_empty());
             if let Some(token) = replayed_token {
-                if existing.client_request_token.as_deref() == Some(token) {
+                // And only a retry of a CREATE: a token that happens to match the
+                // one a `RegisterCluster` used for this name is not a retry of this
+                // call, so it conflicts rather than answering with a connected
+                // cluster the caller never asked for.
+                if !existing.is_connected() && existing.client_request_token.as_deref() == Some(token)
+                {
                     return Ok(CreateClusterOutput {
                         cluster: Some(existing.to_cluster()),
                     });
@@ -447,7 +452,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = ClusterRecord {
             name: input.name.clone(),
-            endpoint: state::derive_cluster_endpoint(&resource_id, &region),
+            endpoint: Some(state::derive_cluster_endpoint(&resource_id, &region)),
             identity: Some(Identity {
                 oidc: Some(OIDC {
                     issuer: Some(state::derive_oidc_issuer(&resource_id, &region)),
@@ -459,17 +464,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             arn: arn.clone(),
             created_at: now,
-            version: input
-                .version
-                .clone()
-                .unwrap_or_else(|| DEFAULT_KUBERNETES_VERSION.to_string()),
-            platform_version: INITIAL_PLATFORM_VERSION.to_string(),
-            role_arn: input.role_arn.clone(),
-            resources_vpc_config,
+            version: Some(
+                input
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_KUBERNETES_VERSION.to_string()),
+            ),
+            platform_version: Some(INITIAL_PLATFORM_VERSION.to_string()),
+            role_arn: Some(input.role_arn.clone()),
+            resources_vpc_config: Some(resources_vpc_config),
             kubernetes_network_config: Some(kubernetes_network_config),
             logging: input.logging.clone(),
             status: STATUS_CREATING.to_string(),
             active_at: Some(now + CLUSTER_ACTIVATION_DELAY),
+            // `CreateCluster` provisions an Amazon EKS control plane, so the
+            // record it writes is never a connected cluster: only
+            // `RegisterCluster` fills these two in.
+            connector_config: None,
+            activation_expires_at: None,
             tags: input
                 .tags
                 .unwrap_or_default()
