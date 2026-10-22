@@ -7,6 +7,10 @@
 //! stores the message as the topic's retained message, and an empty retained payload
 //! clears it, which is how MQTT deletes a retained message.
 //!
+//! A publish is refused before any of that when the topic is not one a client may
+//! publish to: a topic in the reserved `$` namespace (the service's own system
+//! topics) or one carrying MQTT subscription wildcards.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -102,6 +106,24 @@ use super::types::*;
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
 // `PublishError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-iotdataplane-iotmoonrakerservice.json");
+
+/// The first character of the RESERVED topic namespace. AWS IoT Core keeps every
+/// topic name that begins with `$` for its own system topics (`$aws/…`, and the
+/// MQTT-reserved `$`-space generally) and refuses a client publish to one before the
+/// message reaches the broker. Only the FIRST character is reserved: `$` later in a
+/// topic name (`sensors/$batch`) is an ordinary application topic.
+pub const RESERVED_TOPIC_PREFIX: char = '$';
+
+/// The fixed message this service answers a reserved-topic publish with. The
+/// requirement is the 400 and the `InvalidRequestException` identity; this is the
+/// service's constant wording for it, which carries no request data.
+pub const RESERVED_TOPIC_MESSAGE: &str = "Topic can't start with $";
+
+/// Whether `topic` names a topic in the reserved `$` namespace, which a client may
+/// not publish to.
+pub fn is_reserved_topic(topic: &str) -> bool {
+    topic.starts_with(RESERVED_TOPIC_PREFIX)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct PublishOutput;
@@ -199,6 +221,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the retained-message store is unavailable".to_string()),
             })
         })?;
+
+        // The `$`-prefixed namespace is the service's own: a client publish to a topic
+        // whose name starts with `$` is refused, so no reserved topic ever reaches the
+        // broker or the retained-message store.
+        if is_reserved_topic(&input.topic) {
+            return Err(PublishErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(RESERVED_TOPIC_MESSAGE.to_string()),
+            })
+            .into());
+        }
 
         // MQTT forbids the single-level (`+`) and multi-level (`#`) wildcards in a
         // PUBLISH topic: they are subscription syntax.
