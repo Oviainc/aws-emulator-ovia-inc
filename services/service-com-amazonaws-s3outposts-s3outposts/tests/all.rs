@@ -17,3 +17,5 @@ mod endpoint_lifecycle;
 mod not_found_messages;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unprovisioned_account.rs"]
+mod unprovisioned_account;

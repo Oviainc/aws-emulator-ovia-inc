@@ -10,11 +10,14 @@
 //! those records.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_s3outposts_s3outposts::state::{ENDPOINT_TRANSITION, PAGE_LIMIT};
+use service_com_amazonaws_s3outposts_s3outposts::state::{
+    EndpointRecord, OutpostRecord, ACCESS_TYPE_PRIVATE, ENDPOINT_STATUS_AVAILABLE,
+    ENDPOINT_TRANSITION, PAGE_LIMIT,
+};
 use service_com_amazonaws_s3outposts_s3outposts::ComAmazonawsS3outpostsS3outpostsState;
 use service_com_amazonaws_s3outposts_s3outposts::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -22,9 +25,26 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The Region most cases sign for; the ARN cases vary it.
 const REGION: &str = "us-east-1";
 
-/// One emulator: a router carrying only this service, over one shared engine — returned
-/// beside the router for the one case that has to look at the store itself.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+/// One tebibyte (1024^4), the unit the capacities below are stated in
+/// (`Outpost$CapacityInBytes` is "The Amazon S3 capacity of the outpost in bytes").
+const TEBIBYTE: i64 = 1024 * 1024 * 1024 * 1024;
+
+/// An account that is NOT the one this emulator serves: the owner of the Outpost these
+/// cases have shared with the caller through Resource Access Manager. A synthetic,
+/// non-routable placeholder in the same all-zero family as `engine::emulator_account_id`;
+/// no real account id appears anywhere.
+const SHARING_ACCOUNT_ID: &str = "000000000001";
+
+/// The Outpost [`SHARING_ACCOUNT_ID`] has shared with the caller.
+pub(crate) const SHARED_OUTPOST_ID: &str = "op-2c3d4e5f607182930";
+
+/// One emulator over a store NOBODY has provisioned anything in — what a new Amazon Web
+/// Services account is: no Outposts, no endpoints.
+///
+/// An Outpost is hardware Amazon installs, and this API models no operation that
+/// provisions one, so this is the store every engine starts with.
+pub(crate) fn unprovisioned_emulator_with_engine(
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -32,7 +52,80 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     (router, engine)
 }
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// One emulator over a store NOBODY has provisioned anything in.
+pub(crate) fn unprovisioned_emulator() -> MultiServiceRouter {
+    unprovisioned_emulator_with_engine().0
+}
+
+/// One emulator for an account that DOES have S3 on Outposts capacity: two Outposts of
+/// its own and one another account shares with it, plus that account's own endpoint on
+/// the Outpost it shared — the endpoint `ListSharedEndpoints` reports and `ListEndpoints`
+/// does not.
+///
+/// None of those three facts is something an operation of this API creates, so the
+/// capacity is stood up through the store's own provisioning seam — the same seam
+/// `S3_OUTPOSTS_PROVISIONED_OUTPOSTS` reaches in a running emulator — and every answer
+/// the cases below assert on is still computed by a handler from those records.
+///
+/// Returned beside the router for the cases that have to look at the store itself.
+fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (router, engine) = unprovisioned_emulator_with_engine();
+    let state = engine.state::<ComAmazonawsS3outpostsS3outpostsState>();
+    let mut store = state.lock();
+
+    let owner = engine::emulator_account_id().to_string();
+    for (outpost_id, owner_id, capacity) in [
+        ("op-0a1b2c3d4e5f60718", owner.clone(), 48 * TEBIBYTE),
+        ("op-1b2c3d4e5f6071829", owner, 96 * TEBIBYTE),
+        (
+            SHARED_OUTPOST_ID,
+            SHARING_ACCOUNT_ID.to_string(),
+            24 * TEBIBYTE,
+        ),
+    ] {
+        store.provision_outpost(
+            OutpostRecord::provisioned(outpost_id, &owner_id, capacity).unwrap_or_else(|| {
+                panic!("{outpost_id} owned by {owner_id} must be a provisionable Outpost")
+            }),
+        );
+    }
+
+    // The sharing account's own endpoint on the Outpost it shared, minted through the
+    // same counters a created endpoint uses, so no `CreateEndpoint` can mint a colliding
+    // id, CIDR or interface. It was provisioned before this engine existed, so the clock
+    // owes it nothing.
+    let endpoint_id = store.mint_endpoint_id();
+    let subnet_id = "subnet-0a1b2c3d4e5f60718".to_string();
+    let vpc_id = store.vpc_for_subnet(&subnet_id);
+    let network_interface_id = store.mint_network_interface_id();
+    let cidr_block = store
+        .allocate_cidr_block()
+        .expect("the first /26 of the reserved block is free in an empty store");
+    store.endpoints.insert(
+        (SHARED_OUTPOST_ID.to_string(), endpoint_id.clone()),
+        EndpointRecord {
+            endpoint_id,
+            outpost_id: SHARED_OUTPOST_ID.to_string(),
+            cidr_block,
+            status: ENDPOINT_STATUS_AVAILABLE.to_string(),
+            pending: None,
+            creation_time: SystemTime::now(),
+            network_interfaces: vec![network_interface_id],
+            vpc_id,
+            subnet_id,
+            security_group_id: "sg-0a1b2c3d4e5f60718".to_string(),
+            access_type: ACCESS_TYPE_PRIVATE.to_string(),
+            customer_owned_ipv4_pool: None,
+            owner_account: SHARING_ACCOUNT_ID.to_string(),
+        },
+    );
+    drop(store);
+
+    (router, engine)
+}
+
+/// One emulator for an account that has S3 on Outposts capacity (see
+/// [`emulator_with_engine`]).
 pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
@@ -71,7 +164,7 @@ impl Answer {
     }
 
     /// The `Outposts` list `ListOutpostsWithS3` carries.
-    fn outposts(&self) -> &[Value] {
+    pub(crate) fn outposts(&self) -> &[Value] {
         self.body["Outposts"]
             .as_array()
             .unwrap_or_else(|| panic!("ListOutpostsWithS3 must carry Outposts: {:?}", self.body))
@@ -79,7 +172,7 @@ impl Answer {
     }
 
     /// The `NextToken` the answer carries, if it carries one.
-    fn next_token(&self) -> Option<String> {
+    pub(crate) fn next_token(&self) -> Option<String> {
         self.body["NextToken"].as_str().map(str::to_string)
     }
 }
@@ -156,11 +249,15 @@ async fn list_endpoints_in(router: &MultiServiceRouter, region: &str, query: &st
     .await
 }
 
-async fn list_endpoints(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list_endpoints(router: &MultiServiceRouter, query: &str) -> Answer {
     list_endpoints_in(router, REGION, query).await
 }
 
-async fn list_outposts_in(router: &MultiServiceRouter, region: &str, query: &str) -> Answer {
+pub(crate) async fn list_outposts_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    query: &str,
+) -> Answer {
     call_in(
         router,
         region,
@@ -171,7 +268,7 @@ async fn list_outposts_in(router: &MultiServiceRouter, region: &str, query: &str
     .await
 }
 
-async fn list_outposts(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list_outposts(router: &MultiServiceRouter, query: &str) -> Answer {
     list_outposts_in(router, REGION, query).await
 }
 
@@ -202,8 +299,8 @@ pub(crate) async fn delete_endpoint(
 }
 
 /// The `(OutpostId, OwnerId)` pairs the emulator presents, in the order
-/// `ListOutpostsWithS3` reports them. Nothing in these tests hardcodes a seeded id: the
-/// Outposts are discovered through the API, the way a client discovers them.
+/// `ListOutpostsWithS3` reports them. Nothing in these cases hardcodes a provisioned id:
+/// the Outposts are discovered through the API, the way a client discovers them.
 async fn all_outposts(router: &MultiServiceRouter) -> Vec<(String, String)> {
     let answer = list_outposts(router, "?maxResults=100").await;
     assert_eq!(

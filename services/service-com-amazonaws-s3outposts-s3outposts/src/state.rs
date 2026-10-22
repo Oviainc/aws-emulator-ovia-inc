@@ -9,15 +9,22 @@
 //! [`OutpostRecord`] and [`EndpointRecord`] below are the one copy of each that
 //! every handler of this service reads and writes.
 //!
-//! ## Why the Outposts are seeded
+//! ## Why the store starts with NO Outposts
 //!
 //! An Outpost is hardware Amazon installs at a customer site, and this service
 //! models NO operation that creates one — `ListOutpostsWithS3` only reports the
 //! Outposts "that have S3 provisioned ... to which the calling Amazon Web
-//! Services account has access". So the store seeds a fixed set at init: without
-//! a parent Outpost no `CreateEndpoint` could ever succeed. The seed is part of
-//! [`Default`], so every engine that mounts this service holds the same
-//! Outposts, and every answer is still computed from these records.
+//! Services account has access". A resource no operation of the API creates
+//! exists only where something outside the API provisioned it, so an account
+//! that was never provisioned has none and `ListOutpostsWithS3` reports an empty
+//! inventory. The store therefore starts EMPTY: inventing Outposts would report
+//! capacity, and a cross-account owner, for hardware nobody installed.
+//!
+//! The one thing outside the API that can say an Outpost was provisioned is the
+//! operator running this emulator, through [`PROVISIONED_OUTPOSTS_ENV`]: each
+//! entry it names enters the inventory as an [`OutpostRecord`], and
+//! `CreateEndpoint` then has a parent Outpost to attach an endpoint to. Unset —
+//! the default — means no capacity, which is what a new AWS account has.
 //!
 //! ## Why an ARN is projected and not stored
 //!
@@ -68,27 +75,51 @@ pub const ENDPOINT_TRANSITION: Duration = Duration::from_millis(500);
 /// read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The account that owns the seeded Outpost this emulator presents as shared
-/// through Resource Access Manager.
+/// The environment variable an operator uses to tell this emulated service which
+/// Outposts have S3 on Outposts capacity provisioned, since the API models no
+/// operation that provisions one: comma-separated
+/// `<OutpostId>:<CapacityInBytes>[:<OwnerAccountId>]` entries, read once when
+/// this service's store is created
+/// (`S3_OUTPOSTS_PROVISIONED_OUTPOSTS="op-0a1b2c3d4e5f60718:52776558133248"`).
 ///
-/// `ListOutpostsWithS3` reports the Outposts the caller owns AND those it has
-/// "as a shared user from Resource Access Manager (RAM)", `ListSharedEndpoints`
-/// lists the endpoints of "an Outpost that has been shared by ... Resource
-/// Access Manager" and `Outpost$OwnerId` is documented as "useful for comparing
-/// owned versus shared outposts" — none of which can be told apart unless some
-/// resource is owned by an account that is not the caller. This is a second
-/// synthetic, non-routable placeholder in the same all-zero family as
-/// [`engine::emulator_account_id`], which stays the one account this emulator
-/// serves requests for; no real account id appears anywhere.
-pub const SHARING_ACCOUNT_ID: &str = "000000000001";
+/// Unset means no capacity at all, which is what an account that never had S3 on
+/// Outposts provisioned has: `ListOutpostsWithS3` reports an empty inventory and
+/// every reference to an Outpost is the modelled 404. An entry whose owner is
+/// another account is one shared with the caller through Resource Access
+/// Manager, which is what `Outpost$OwnerId` ("useful for comparing owned versus
+/// shared outposts") distinguishes and what `ListSharedEndpoints` lists over.
+pub const PROVISIONED_OUTPOSTS_ENV: &str = "S3_OUTPOSTS_PROVISIONED_OUTPOSTS";
 
-/// The seeded Outpost [`SHARING_ACCOUNT_ID`] shares with the caller.
-pub const SHARED_OUTPOST_ID: &str = "op-2c3d4e5f607182930";
-
-/// One tebibyte, the unit the seeded Outpost capacities are stated in
-/// (`Outpost$CapacityInBytes` is "The Amazon S3 capacity of the outpost in
-/// bytes").
-const TEBIBYTE: i64 = 1024 * 1024 * 1024 * 1024;
+/// The Outposts `setting` declares: comma-separated
+/// `<OutpostId>:<CapacityInBytes>[:<OwnerAccountId>]` entries, surrounding space
+/// trimmed. The owner defaults to the account this emulator serves, so an
+/// operator naming only an id and a capacity gets an Outpost the caller owns.
+///
+/// An entry that is not of that form, or whose values are not ones this API
+/// could report (see [`OutpostRecord::provisioned`]), is SKIPPED rather than
+/// guessed at: a typo provisions nothing instead of provisioning something
+/// unintended.
+pub fn parse_provisioned_outposts(setting: &str) -> Vec<OutpostRecord> {
+    setting
+        .split(',')
+        .filter(|entry| !entry.trim().is_empty())
+        .filter_map(|entry| {
+            let mut fields = entry.split(':').map(str::trim);
+            let outpost_id = fields.next()?;
+            let capacity_in_bytes: i64 = fields.next()?.parse().ok()?;
+            let owner_id = match fields.next() {
+                Some(owner) => owner.to_string(),
+                None => caller_account(),
+            };
+            // A fourth field means the entry is not the form documented above,
+            // so it says something this parser does not understand.
+            if fields.next().is_some() {
+                return None;
+            }
+            OutpostRecord::provisioned(outpost_id, &owner_id, capacity_in_bytes)
+        })
+        .collect()
+}
 
 /// How many `/26` CIDRs fit in the `/16` the emulator reserves for endpoint
 /// commitments — and so the largest number of endpoints the store holds at once.
@@ -108,12 +139,26 @@ pub struct OutpostRecord {
     /// `OutpostId`'s `^(op-[a-f0-9]{17}|\d{12}|ec2)$`.
     pub outpost_id: String,
     /// The 12-digit account that owns the Outpost — the caller's own account for
-    /// an owned Outpost, [`SHARING_ACCOUNT_ID`] for a shared one.
+    /// an owned Outpost, another account for one shared with the caller.
     pub owner_id: String,
     pub capacity_in_bytes: i64,
 }
 
 impl OutpostRecord {
+    /// The record for an Outpost provisioned with S3 capacity, or `None` when the
+    /// values are not ones this API could ever report: `OutpostId`'s
+    /// `^(op-[a-f0-9]{17}|\d{12}|ec2)$` for the id, `AwsAccountId`'s `^\d{12}$`
+    /// for the owner, and a capacity above zero — an Outpost with no S3 capacity
+    /// is not one `ListOutpostsWithS3` reports at all.
+    pub fn provisioned(outpost_id: &str, owner_id: &str, capacity_in_bytes: i64) -> Option<Self> {
+        (is_outpost_id(outpost_id) && is_account_outpost_id(owner_id) && capacity_in_bytes > 0)
+            .then(|| Self {
+                outpost_id: outpost_id.to_string(),
+                owner_id: owner_id.to_string(),
+                capacity_in_bytes,
+            })
+    }
+
     /// `arn:aws:outposts:<region>:<owner>:outpost/<id>`, as
     /// `OutpostArn`'s pattern spells it.
     pub fn outpost_arn(&self, region: &str) -> String {
@@ -235,6 +280,11 @@ pub struct ComAmazonawsS3outpostsS3outpostsState {
     /// Every Outpost with S3 capacity, keyed by its id. The `BTreeMap` is what
     /// gives `ListOutpostsWithS3` the one stable total order its pagination
     /// cursor indexes into.
+    ///
+    /// BOUNDED: nothing a client can send adds an entry — the API models no
+    /// operation that provisions an Outpost, so the only writer is
+    /// [`Self::provision_outpost`], reached from [`PROVISIONED_OUTPOSTS_ENV`]
+    /// once when the store is created.
     pub outposts: BTreeMap<String, OutpostRecord>,
     /// Every endpoint, keyed by `(OutpostId, EndpointId)` — the pair
     /// `DeleteEndpoint` names — which is also the stable order the endpoint
@@ -269,12 +319,15 @@ pub struct ComAmazonawsS3outpostsS3outpostsState {
 }
 
 impl Default for ComAmazonawsS3outpostsS3outpostsState {
-    /// The seeded store: two Outposts owned by the account this emulator serves
-    /// and one shared with it by [`SHARING_ACCOUNT_ID`], which already carries
-    /// that owner's endpoint — the endpoint `ListSharedEndpoints` reports and
-    /// `ListEndpoints` does not.
+    /// An account with NO resources: no endpoints, and no Outposts beyond the
+    /// ones [`PROVISIONED_OUTPOSTS_ENV`] says were provisioned (none, unless it
+    /// is set).
+    ///
+    /// Nothing is invented here. The API models no operation that provisions an
+    /// Outpost, so an account nobody provisioned capacity for reports none, and
+    /// every answer that mentions an Outpost is computed from the records the
+    /// operator declared.
     fn default() -> Self {
-        let owner = caller_account();
         let mut state = Self {
             outposts: BTreeMap::new(),
             endpoints: BTreeMap::new(),
@@ -285,61 +338,29 @@ impl Default for ComAmazonawsS3outpostsS3outpostsState {
             cidr_block_seq: 0,
         };
 
-        for (outpost_id, owner_id, capacity) in [
-            ("op-0a1b2c3d4e5f60718", owner.clone(), 48 * TEBIBYTE),
-            ("op-1b2c3d4e5f6071829", owner, 96 * TEBIBYTE),
-            (
-                SHARED_OUTPOST_ID,
-                SHARING_ACCOUNT_ID.to_string(),
-                24 * TEBIBYTE,
-            ),
-        ] {
-            state.outposts.insert(
-                outpost_id.to_string(),
-                OutpostRecord {
-                    outpost_id: outpost_id.to_string(),
-                    owner_id,
-                    capacity_in_bytes: capacity,
-                },
-            );
+        for record in ::std::env::var(PROVISIONED_OUTPOSTS_ENV)
+            .map(|setting| parse_provisioned_outposts(&setting))
+            .unwrap_or_default()
+        {
+            state.provision_outpost(record);
         }
-
-        // The sharing account's own endpoint on the Outpost it shared. It is
-        // minted through the same counters a created endpoint uses, so no
-        // `CreateEndpoint` can ever mint a colliding id, CIDR or interface.
-        let endpoint_id = state.mint_endpoint_id();
-        let subnet_id = "subnet-0a1b2c3d4e5f60718".to_string();
-        let vpc_id = state.vpc_for_subnet(&subnet_id);
-        let network_interface_id = state.mint_network_interface_id();
-        let cidr_block = state
-            .allocate_cidr_block()
-            .expect("the first /26 of the reserved block is free in an empty store");
-        state.endpoints.insert(
-            (SHARED_OUTPOST_ID.to_string(), endpoint_id.clone()),
-            EndpointRecord {
-                endpoint_id,
-                outpost_id: SHARED_OUTPOST_ID.to_string(),
-                cidr_block,
-                // A seeded endpoint was provisioned before this process started,
-                // so the clock owes it nothing.
-                status: ENDPOINT_STATUS_AVAILABLE.to_string(),
-                pending: None,
-                creation_time: SystemTime::now(),
-                network_interfaces: vec![network_interface_id],
-                vpc_id,
-                subnet_id,
-                security_group_id: "sg-0a1b2c3d4e5f60718".to_string(),
-                access_type: ACCESS_TYPE_PRIVATE.to_string(),
-                customer_owned_ipv4_pool: None,
-                owner_account: SHARING_ACCOUNT_ID.to_string(),
-            },
-        );
 
         state
     }
 }
 
 impl ComAmazonawsS3outpostsS3outpostsState {
+    /// Put `record` in the inventory `ListOutpostsWithS3` reports, replacing the
+    /// record of an Outpost already there.
+    ///
+    /// This is the ONLY way an Outpost enters the store, because the API models
+    /// no operation that provisions one: it is reached from
+    /// [`PROVISIONED_OUTPOSTS_ENV`] at init, and from a test standing up an
+    /// account that does have capacity.
+    pub fn provision_outpost(&mut self, record: OutpostRecord) {
+        self.outposts.insert(record.outpost_id.clone(), record);
+    }
+
     /// Mint an unused endpoint id matching `EndpointId`'s `^[a-zA-Z0-9]{19}$`.
     ///
     /// A `u64` is at most 16 hex digits, so the width-19 padding always yields
