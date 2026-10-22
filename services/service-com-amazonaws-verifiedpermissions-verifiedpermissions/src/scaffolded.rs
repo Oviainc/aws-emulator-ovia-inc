@@ -218,6 +218,13 @@ impl<E> Scaffolded<E> {
     /// operation already lists it, it is a plain variant on the generated error enum;
     /// `#[operation_error]`'s `extra_errors` is only for widening in a shape the
     /// SERVICE models that this OPERATION does not list.
+    ///
+    /// Verified Permissions is such a service, so NOTHING here should need this:
+    /// every operation answers a bad request with the modelled
+    /// `ValidationException`, built by [`crate::ops::validation_exception`], which
+    /// fills the `fieldList` that names the offending member. This variant is kept
+    /// because it is the only refusal channel an operation whose model declares no
+    /// client-input error would have.
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }

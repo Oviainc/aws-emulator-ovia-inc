@@ -12,6 +12,12 @@
 //! operation slice, so it answers the scaffold's 501 rather than a fabricated
 //! policy.
 //!
+//! A statement this operation refuses — unparseable Cedar, longer than one policy
+//! may carry, or not sanctioned by the store's schema in `STRICT` mode — is
+//! refused with the model's own `ValidationException`, whose `fieldList` names
+//! `/definition/static/statement`, the member at fault. See
+//! [`crate::ops::validation_exception`].
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -95,6 +101,9 @@
 //!   resource that doesn't exist.
 //! * `ServiceQuotaExceededException` (HTTP 402) — The request failed because it would cause a
 //!   service quota to be exceeded.
+//! * `ValidationException` (HTTP 400) — The request failed because one or more input
+//!   parameters don't satisfy their constraint requirements; `fieldList` names each
+//!   member that isn't valid and why.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -112,7 +121,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#CreatePolicy",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum CreatePolicyErrorModeled {
@@ -120,6 +129,7 @@ pub enum CreatePolicyErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -184,6 +194,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the service state store is unavailable".to_string(),
             })
         };
+        // Every refusal of the caller's policy text answers with the model's own
+        // `ValidationException`, whose `fieldList` names the member at fault —
+        // here always `definition.static.statement`, the one member whose content
+        // this operation validates. A refusal the CALLER cannot fix (the store's
+        // own stored schema failing to parse) is a server fault instead.
+        let invalid = |invalid: crate::ops::InvalidInput| -> CreatePolicyError {
+            CreatePolicyErrorModeled::ValidationException(crate::ops::validation_exception([
+                invalid,
+            ]))
+            .into()
+        };
+        let refused = |refusal: crate::state::cedar::Refusal| -> CreatePolicyError {
+            match refusal {
+                crate::state::cedar::Refusal::InvalidInput(field) => invalid(field),
+                crate::state::cedar::Refusal::ServiceFault(message) => {
+                    CreatePolicyErrorModeled::InternalServerException(InternalServerException {
+                        message,
+                    })
+                    .into()
+                }
+            }
+        };
 
         // Only the `static` arm is served here: instantiating a template into a
         // policy (resolving its `?principal`/`?resource` slots and linking the
@@ -204,8 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // length is checked here — the full parse stays where it was, after the
         // store is resolved, so an unknown store is still a 404 and a client
         // token still replays before the statement is parsed.
-        crate::state::cedar::check_statement_size(&definition.statement)
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        crate::state::cedar::check_statement_size(&definition.statement).map_err(invalid)?;
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();
@@ -263,9 +294,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.validation_mode == "STRICT" {
             match store.schema.as_ref() {
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(format!(
-                        "policy store {store_id} has validation mode STRICT but contains no \
-                         schema, so the static policy cannot be validated"
+                    // Nothing is wrong with the statement here: the STORE the
+                    // request named holds no schema, which is the member the
+                    // caller can act on (put a schema in it, or name a store
+                    // that has one).
+                    return Err(invalid(crate::ops::InvalidInput::new(
+                        crate::ops::paths::POLICY_STORE_ID,
+                        "its validation mode is STRICT and it contains no schema, so there \
+                         is nothing to validate a static policy against",
                     )));
                 }
                 Some(schema) => {
@@ -273,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &schema.cedar_json,
                         &definition.statement,
                     )
-                    .map_err(crate::scaffolded::Scaffolded::validation)?;
+                    .map_err(refused)?;
                 }
             }
         }
@@ -323,7 +359,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The effect and the scope are properties of the Cedar text, so they come
         // from the Cedar parser. A statement it refuses is refused here too.
         let scope = crate::state::cedar::parse_static_policy(&definition.statement)
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+            .map_err(invalid)?;
 
         let store = state
             .policy_stores

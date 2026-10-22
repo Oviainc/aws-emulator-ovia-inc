@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOptionGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOptionGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation persists a new option group in this service's store.
+//! This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOptionGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its record and the projection onto the modelled `OptionGroup` wire shape live in
+//! [`crate::state`], shared with `DescribeOptionGroups`.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOptionGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOptionGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region =
+            crate::state::request_region(ctx).map_err(CreateOptionGroupError::validation)?;
+        let name = input.option_group_name;
+        // "Constraints: Must be 1 to 255 letters, numbers, or hyphens. First character
+        // must be a letter. Can't end with a hyphen or contain two consecutive
+        // hyphens." — the rule the identifier members share, at this member's bound.
+        crate::state::check_identifier("OptionGroupName", &name, 255)
+            .map_err(CreateOptionGroupError::validation)?;
+        crate::state::check_option_group_engine_name(&input.engine_name)
+            .map_err(CreateOptionGroupError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated option group.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope, so
+        // one name can be a different option group in each region.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOptionGroup"))
+        // `OptionGroupName` carries no "isn't case-sensitive" note — the members that
+        // fold case say so explicitly, as `DescribeDBInstances$DBInstanceIdentifier`
+        // does — so the name is stored and matched exactly as given.
+        let key = (region.clone(), name.clone());
+        if store.option_groups.contains_key(&key) {
+            return Err(CreateOptionGroupErrorModeled::OptionGroupAlreadyExistsFault(
+                OptionGroupAlreadyExistsFault {
+                    message: Some(format!("Option group already exists: {name}")),
+                },
+            )
+            .into());
+        }
+
+        // The region's option group quota, and the number of regions this store keeps
+        // records for at all: the store cannot be grown without bound, and the
+        // modelled fault says exactly this.
+        if store.option_groups_in(&region).len() >= crate::state::OPTION_GROUP_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(CreateOptionGroupErrorModeled::OptionGroupQuotaExceededFault(
+                OptionGroupQuotaExceededFault {
+                    message: Some(format!(
+                        "the request would exceed the allowed number of option groups \
+                         ({} per region, in at most {} regions)",
+                        crate::state::OPTION_GROUP_QUOTA_PER_REGION,
+                        crate::state::MAX_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::OptionGroupRecord {
+            name,
+            region,
+            description: input.option_group_description,
+            engine_name: input.engine_name,
+            major_engine_version: input.major_engine_version,
+            tags: input.tags.unwrap_or_default(),
+        };
+        let option_group = record.to_wire();
+        store.option_groups.insert(key, record);
+
+        Ok(CreateOptionGroupOutput {
+            option_group: Some(option_group),
+        })
     }
 }
+

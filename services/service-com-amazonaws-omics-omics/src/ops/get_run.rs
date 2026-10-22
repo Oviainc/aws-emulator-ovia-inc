@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the stored run record. Reporting-only: it materialises the status steps the
+//! clock already owed the run (each stamped with the instant it was DUE, so `startTime`
+//! and `stopTime` do not depend on when anybody polled) and writes nothing else. An id no
+//! stored run carries answers the modelled `ResourceNotFoundException` (HTTP 404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The `export` query is NOT served, and a request that asks for one is REFUSED rather
+//! than answered: `DEFINITION` asks for a presigned URL to the run's exported workflow
+//! definition, and this emulator serves no object store for it. Answering 200 with the
+//! member unset would report success for an export nobody performed, so an `export`
+//! request gets the scaffold's HTTP 501 instead.
 //!
 //! ## Shape of an operation
 //!
@@ -228,18 +229,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRun"))
+        let _ = ctx;
+        // Same rule as `GetWorkflow`: no object store means no export to sign, so the
+        // request is refused rather than answered 200 with the member unset.
+        if input.export.as_deref().is_some_and(|export| !export.is_empty()) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetRun with an export requested",
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetRunErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics run store is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut store = state.lock();
+        store.settle(now_ms);
+
+        let run = store.run(&input.id).ok_or_else(|| {
+            GetRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("no run with id {} exists in this region", input.id),
+            })
+        })?;
+
+        Ok(GetRunOutput {
+            arn: Some(run.arn.clone()),
+            id: Some(run.id.clone()),
+            cache_id: run.cache_id.clone(),
+            cache_behavior: run.cache_behavior.clone(),
+            // `engineVersion` is the version of the workflow engine the run executed
+            // on. This slice runs no workflow engine, so it reports none rather than a
+            // version nothing ran.
+            engine_version: None,
+            status: Some(run.status.clone()),
+            workflow_id: Some(run.workflow_id.clone()),
+            workflow_type: Some(run.workflow_type.clone()),
+            run_id: run.source_run_id.clone(),
+            role_arn: Some(run.role_arn.clone()),
+            name: run.name.clone(),
+            run_group_id: run.run_group_id.clone(),
+            // Run batches are their own resource (`StartRunBatch` is still a 501 in
+            // this crate), so no run here belongs to one.
+            batch_id: None,
+            priority: run.priority,
+            definition: run.definition.clone(),
+            digest: run.digest.clone(),
+            parameters: run.parameters.clone(),
+            storage_capacity: run.storage_capacity,
+            output_uri: Some(run.output_uri.clone()),
+            log_level: run.log_level.clone(),
+            // `resourceDigests` and `logLocation` describe the container images the run
+            // pulled and the CloudWatch streams it wrote. Nothing executed and nothing
+            // was logged, so neither is reported.
+            resource_digests: None,
+            // `startedBy` is the principal that started the run. The emulator verifies
+            // every signature but models no principal resolution for this service, so
+            // it reports none rather than a fabricated identity.
+            started_by: None,
+            creation_time: Some(crate::state::timestamp(run.creation_time_ms)),
+            start_time: run.start_time_ms.map(crate::state::timestamp),
+            stop_time: run.stop_time_ms.map(crate::state::timestamp),
+            status_message: run.status_message.clone(),
+            tags: run.tags_output(),
+            accelerators: run.accelerators.clone(),
+            retention_mode: Some(run.retention_mode.clone()),
+            failure_reason: run.failure_reason.clone(),
+            log_location: None,
+            uuid: Some(run.uuid.clone()),
+            run_output_uri: Some(run.run_output_uri.clone()),
+            storage_type: Some(run.storage_type.clone()),
+            // Cross-account workflow sharing is its own slice (`CreateShare` is still a
+            // 501), so every workflow a run here uses is owned by this account and the
+            // member is left unset, as it is for a run on an own workflow.
+            workflow_owner_id: None,
+            workflow_version_name: run.workflow_version_name.clone(),
+            workflow_uuid: run.workflow_uuid.clone(),
+            networking_mode: run.networking_mode.clone(),
+            scratch_storage_mode: run.scratch_storage_mode.clone(),
+            // The run configuration and VPC configuration resources are their own
+            // slices; neither is resolved here.
+            configuration: None,
+            vpc_config: None,
+            engine_settings: run.engine_settings.clone(),
+            session_policy: run.session_policy.clone(),
+        })
     }
 }

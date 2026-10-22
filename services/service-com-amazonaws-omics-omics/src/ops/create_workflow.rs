@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a private workflow and PERSISTS it in [`crate::state`]: this handler mints the
+//! numeric id, the ARN and the UUID, stores every member the request carried, and answers
+//! from that record. `requestId` is this operation's `@idempotencyToken`, so a replay of
+//! the same token answers with the workflow the first call created.
 //!
 //! ## Shape of an operation
 //!
@@ -254,18 +249,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkflow"))
+        // Every string length and pattern on this input, the `parameterTemplate` map's
+        // 1..2000 size, `storageCapacity`'s 0..100000 range and the required
+        // `requestId` are modelled constraints the centralized walk has already
+        // refused anything outside of. The `tags` map carries NO modelled length, so
+        // its bound is checked here.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWorkflowErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics workflow store is unavailable".to_string(),
+            })
+        })?;
+
+        if let Some(why) = crate::state::tag_bounds_rejection(input.tags.as_ref()) {
+            return Err(
+                CreateWorkflowErrorModeled::ValidationException(ValidationException {
+                    message: why,
+                })
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now_ms = crate::state::now_epoch_millis();
+        let digest = crate::state::definition_digest(input.definition_zip.as_deref());
+        let uuid = crate::state::fresh_uuid();
+
+        let mut store = state.lock();
+        store.settle(now_ms);
+
+        // A replayed idempotency token answers with the workflow the first call
+        // created: same id, same ARN, same UUID, and the status that record holds now.
+        if let Some(key) = store.replayed(
+            crate::state::IdempotencyScope::CreateWorkflow,
+            &input.request_id,
+        ) {
+            let workflow = store.workflows.get(&key).ok_or_else(|| {
+                CreateWorkflowErrorModeled::InternalServerException(InternalServerException {
+                    message: "the workflow this requestId created is no longer held".to_string(),
+                })
+            })?;
+            return Ok(CreateWorkflowOutput {
+                arn: Some(workflow.arn.clone()),
+                id: Some(workflow.id.clone()),
+                status: Some(workflow.status.clone()),
+                tags: workflow.tags_output(),
+                uuid: Some(workflow.uuid.clone()),
+            });
+        }
+
+        // The store is finite: a create that would take it past its cap is refused
+        // rather than growing it, the way the service refuses one past its quota.
+        if store.workflows.len() >= crate::state::MAX_WORKFLOWS {
+            return Err(CreateWorkflowErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} workflows",
+                        crate::state::MAX_WORKFLOWS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let (key, id) = store.next_workflow_id();
+        let arn = crate::state::workflow_arn(&region, &id);
+        let workflow = crate::state::Workflow {
+            id: id.clone(),
+            arn: arn.clone(),
+            uuid: uuid.clone(),
+            name: input.name,
+            description: input.description,
+            // The engine is NOT guessed from the definition here: detecting it means
+            // parsing the archive, which this slice does not do. What the caller
+            // declared is what is stored, and nothing is invented when it declared
+            // nothing.
+            engine: input.engine,
+            main: input.main,
+            definition: input.definition_uri,
+            digest,
+            parameter_template: input
+                .parameter_template
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            storage_capacity: input.storage_capacity,
+            storage_type: input.storage_type,
+            accelerators: input.accelerators,
+            readme_path: input.readme_path,
+            container_registry_map: input.container_registry_map,
+            definition_repository: input.definition_repository,
+            r#type: crate::state::WORKFLOW_TYPE_PRIVATE.to_string(),
+            // A newly created workflow is not usable yet, so it starts in the modelled
+            // non-terminal `CREATING` and owes the clock its move to `ACTIVE`; a
+            // caller that reads it straight away still observes `CREATING`.
+            status: crate::state::WORKFLOW_STATUS_CREATING.to_string(),
+            status_message: None,
+            creation_time_ms: now_ms,
+            status_due_at_ms: Some(now_ms + crate::state::TRANSITION_DELAY.as_millis() as i64),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+        let status = workflow.status.clone();
+        let tags = workflow.tags_output();
+        store.workflows.insert(key, workflow);
+        store.remember(
+            crate::state::IdempotencyScope::CreateWorkflow,
+            input.request_id,
+            key,
+        );
+
+        Ok(CreateWorkflowOutput {
+            arn: Some(arn),
+            id: Some(id),
+            status: Some(status),
+            tags,
+            uuid: Some(uuid),
+        })
     }
 }

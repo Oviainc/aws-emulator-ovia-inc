@@ -79,12 +79,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#ListPolicies",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum ListPoliciesErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -151,9 +152,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume_from = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                crate::scaffolded::Scaffolded::validation(
-                    "nextToken is not a cursor this service issued",
-                )
+                ListPoliciesErrorModeled::ValidationException(crate::ops::validation_exception([
+                    crate::ops::InvalidInput::new(
+                        crate::ops::paths::NEXT_TOKEN,
+                        "it is not a cursor this service issued",
+                    ),
+                ]))
             })?),
         };
 

@@ -31,6 +31,8 @@ mod policy_store_authorization;
 mod policy_store_settings;
 #[path = "all/policy_templates.rs"]
 mod policy_templates;
+#[path = "all/policy_validation.rs"]
+mod policy_validation;
 #[path = "all/schema.rs"]
 mod schema;
 #[path = "all/schema_lifecycle.rs"]

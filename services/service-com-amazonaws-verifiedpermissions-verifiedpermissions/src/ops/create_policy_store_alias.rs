@@ -59,7 +59,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 /// cannot be reached, which is a server fault and not a bad request.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#CreatePolicyStoreAlias",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum CreatePolicyStoreAliasErrorModeled {
@@ -67,6 +67,7 @@ pub enum CreatePolicyStoreAliasErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -165,11 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // referenced through a `policyStoreId` member, so the request is refused
         // rather than persisted as unreachable.
         if !input.alias_name.starts_with(crate::state::ALIAS_PREFIX) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "aliasName must be prefixed with {}, got {}",
-                crate::state::ALIAS_PREFIX,
-                input.alias_name
-            )));
+            return Err(CreatePolicyStoreAliasErrorModeled::ValidationException(
+                crate::ops::validation_exception([crate::ops::InvalidInput::new(
+                    crate::ops::paths::ALIAS_NAME,
+                    format!(
+                        "it must be prefixed with {}",
+                        crate::state::ALIAS_PREFIX
+                    ),
+                )]),
+            )
+            .into());
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;

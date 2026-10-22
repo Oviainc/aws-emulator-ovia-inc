@@ -21,38 +21,38 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// `SuiteDefinitionConfiguration$devicePermissionRoleArn` is `len 20..2048`; this is the
 /// role every row below points at.
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/DeviceAdvisorRole";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/DeviceAdvisorRole";
 
 /// A thing ARN for a device under test.
-fn thing_arn(n: usize) -> String {
+pub(crate) fn thing_arn(n: usize) -> String {
     format!("arn:aws:iot:us-east-1:000000000000:thing/device-under-test-{n}")
 }
 
 /// The emulator, assembled in-process with authentication off: this suite asserts
 /// behaviour, and signature verification is the framework's own concern.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The one shared engine the service's handlers write through, kept so a case can
     /// assert an invariant of the STORE itself (its occupancy bounds) and not only of the
     /// responses.
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 /// One response, reduced to what a client branches on.
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The parsed JSON body, or `Value::Null` for an empty one.
-    body: Value,
+    pub(crate) body: Value,
     /// The restJson1 error code (`x-amzn-errortype`), when the answer carries one.
-    error_code: Option<String>,
+    pub(crate) error_code: Option<String>,
 }
 
 impl Answer {
-    fn member(&self, name: &str) -> &Value {
+    pub(crate) fn member(&self, name: &str) -> &Value {
         &self.body[name]
     }
 
-    fn string(&self, name: &str) -> String {
+    pub(crate) fn string(&self, name: &str) -> String {
         self.member(name)
             .as_str()
             .unwrap_or_else(|| panic!("member {name} is not a string in {}", self.body))
@@ -61,7 +61,7 @@ impl Answer {
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -140,7 +140,7 @@ impl Emulator {
 
     /// Send one request, signed (in scope only — authentication is off) for `region`, so
     /// the handler resolves the same region a real SDK client would.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         method: &str,
         path_and_query: &str,
@@ -185,7 +185,7 @@ impl Emulator {
         }
     }
 
-    async fn create_definition(&self, configuration: &Value, region: &str) -> Answer {
+    pub(crate) async fn create_definition(&self, configuration: &Value, region: &str) -> Answer {
         self.call(
             "POST",
             "/suiteDefinitions",
@@ -200,7 +200,7 @@ impl Emulator {
 /// the model enumerates (source: the `Protocol` enum, re-exported as `PROTOCOL_VALUES`),
 /// plus rows differing in device-list size (0, 1 and the modelled maximum of 2), in both
 /// booleans, and in `rootGroup` form.
-fn definition_rows() -> Vec<(String, Value)> {
+pub(crate) fn definition_rows() -> Vec<(String, Value)> {
     let mut rows: Vec<(String, Value)> = Vec::new();
 
     for (index, protocol) in iotdeviceadvisor::ops::types::PROTOCOL_VALUES

@@ -33,24 +33,37 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
 
 /// What the emulator answered: the HTTP status and the JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Answer {
     /// The wire error code (`__type`), or the empty string on a success.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body["__type"].as_str().unwrap_or_default()
     }
 
+    /// The `Message` an error payload carries, or the empty string when it
+    /// carries none.
+    ///
+    /// A modelled error renders its own member name (`Message`), while the
+    /// boundary validator renders the protocol's generic `message`; a client
+    /// reads whichever is present, so this does too.
+    pub(crate) fn message(&self) -> &str {
+        self.body["Message"]
+            .as_str()
+            .or_else(|| self.body["message"].as_str())
+            .unwrap_or_default()
+    }
+
     /// The `Endpoints` list an endpoint listing carries.
-    fn endpoints(&self) -> &[Value] {
+    pub(crate) fn endpoints(&self) -> &[Value] {
         self.body["Endpoints"]
             .as_array()
             .unwrap_or_else(|| panic!("an endpoint listing must carry Endpoints: {:?}", self.body))
@@ -81,7 +94,7 @@ fn authorization(region: &str) -> String {
     )
 }
 
-async fn call_in(
+pub(crate) async fn call_in(
     router: &MultiServiceRouter,
     region: &str,
     method: &str,
@@ -128,7 +141,7 @@ async fn create_in(router: &MultiServiceRouter, region: &str, request: Value) ->
     .await
 }
 
-async fn create(router: &MultiServiceRouter, request: Value) -> Answer {
+pub(crate) async fn create(router: &MultiServiceRouter, request: Value) -> Answer {
     create_in(router, REGION, request).await
 }
 
@@ -162,7 +175,7 @@ async fn list_outposts(router: &MultiServiceRouter, query: &str) -> Answer {
     list_outposts_in(router, REGION, query).await
 }
 
-async fn list_shared(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list_shared(router: &MultiServiceRouter, query: &str) -> Answer {
     call_in(
         router,
         REGION,
@@ -173,7 +186,11 @@ async fn list_shared(router: &MultiServiceRouter, query: &str) -> Answer {
     .await
 }
 
-async fn delete_endpoint(router: &MultiServiceRouter, outpost_id: &str, endpoint_id: &str) -> Answer {
+pub(crate) async fn delete_endpoint(
+    router: &MultiServiceRouter,
+    outpost_id: &str,
+    endpoint_id: &str,
+) -> Answer {
     call_in(
         router,
         REGION,
@@ -207,7 +224,7 @@ async fn all_outposts(router: &MultiServiceRouter) -> Vec<(String, String)> {
 }
 
 /// The Outposts this caller owns.
-async fn owned_outposts(router: &MultiServiceRouter) -> Vec<String> {
+pub(crate) async fn owned_outposts(router: &MultiServiceRouter) -> Vec<String> {
     all_outposts(router)
         .await
         .into_iter()
@@ -217,7 +234,7 @@ async fn owned_outposts(router: &MultiServiceRouter) -> Vec<String> {
 }
 
 /// An Outpost another account shared with this caller.
-async fn shared_outpost(router: &MultiServiceRouter) -> String {
+pub(crate) async fn shared_outpost(router: &MultiServiceRouter) -> String {
     all_outposts(router)
         .await
         .into_iter()
@@ -227,7 +244,7 @@ async fn shared_outpost(router: &MultiServiceRouter) -> String {
 }
 
 /// The string member `name` of `value`, or a panic naming what was there instead.
-fn string_at(value: &Value, name: &str) -> String {
+pub(crate) fn string_at(value: &Value, name: &str) -> String {
     value[name]
         .as_str()
         .unwrap_or_else(|| panic!("member {name} must be a string in {value:?}"))
@@ -252,7 +269,7 @@ fn matches_endpoint_id(value: &str) -> bool {
 
 /// The endpoint id an `EndpointArn` ends with, per `EndpointArn`'s pattern
 /// `^arn:(aws|…):s3-outposts:[a-z\-0-9]*:[0-9]{12}:outpost/(op-[a-f0-9]{17}|ec2)/endpoint/[a-zA-Z0-9]{19}$`.
-fn endpoint_id_of(arn: &str) -> String {
+pub(crate) fn endpoint_id_of(arn: &str) -> String {
     let (prefix, endpoint_id) = arn
         .rsplit_once("/endpoint/")
         .unwrap_or_else(|| panic!("{arn} is not an EndpointArn"));
@@ -272,7 +289,7 @@ fn endpoint_id_of(arn: &str) -> String {
 const UNKNOWN_OUTPOST_ID: &str = "op-fffffffffffffffff";
 
 /// A create request with only the three required members.
-fn minimal_create(outpost_id: &str) -> Value {
+pub(crate) fn minimal_create(outpost_id: &str) -> Value {
     json!({
         "OutpostId": outpost_id,
         "SubnetId": "subnet-00000000000000001",

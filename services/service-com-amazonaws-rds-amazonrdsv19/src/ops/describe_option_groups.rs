@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOptionGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOptionGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports option groups out of this service's store.
+//! This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOptionGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records and their projection onto the modelled `OptionGroup` wire shape live
+//! in [`crate::state`], shared with `CreateOptionGroup`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOptionGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOptionGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOptionGroups"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeOptionGroupsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeOptionGroupsError::validation)?;
+        check_selection(&input).map_err(DescribeOptionGroupsError::validation)?;
+        if let Some(engine_name) = &input.engine_name {
+            crate::state::check_option_group_engine_name(engine_name)
+                .map_err(DescribeOptionGroupsError::validation)?;
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let store = state.lock();
+
+        // RDS is regional: a request sees only the option groups of the region it was
+        // signed for. A name that names no stored group is the modelled 404, not an
+        // empty list — which is what lets a caller branch on "no such option group".
+        let candidates: Vec<&crate::state::OptionGroupRecord> = match &input.option_group_name {
+            Some(requested) => {
+                let record = store
+                    .option_groups
+                    .get(&(region.clone(), requested.clone()))
+                    .ok_or_else(|| {
+                        DescribeOptionGroupsError::from(
+                            DescribeOptionGroupsErrorModeled::OptionGroupNotFoundFault(
+                                OptionGroupNotFoundFault {
+                                    message: Some(format!(
+                                        "Specified OptionGroupName: {requested} not found."
+                                    )),
+                                },
+                            ),
+                        )
+                    })?;
+                vec![record]
+            }
+            None => store.option_groups_in(&region),
+        };
+
+        let matching: Vec<(String, OptionGroup)> = candidates
+            .into_iter()
+            .filter(|record| matches_engine(record, input.engine_name.as_deref()))
+            .filter(|record| {
+                matches_major_engine_version(record, input.major_engine_version.as_deref())
+            })
+            .map(|record| (record.name.clone(), record.to_wire()))
+            .collect();
+
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        Ok(DescribeOptionGroupsOutput {
+            marker: page.next_marker,
+            option_groups_list: Some(page.items),
+        })
     }
+}
+
+/// Refuse a request whose selection members cannot hold together, per what they
+/// document:
+///
+/// * `OptionGroupName` "Can't be supplied together with EngineName or
+///   MajorEngineVersion."
+/// * `MajorEngineVersion` "If specified, then EngineName must also be specified."
+/// * `Filters` "This parameter isn't currently supported." — refused rather than
+///   ignored: silently dropping a filter would report groups the caller excluded.
+fn check_selection(input: &DescribeOptionGroupsInput) -> Result<(), String> {
+    if input.option_group_name.is_some()
+        && (input.engine_name.is_some() || input.major_engine_version.is_some())
+    {
+        return Err(
+            "OptionGroupName can't be supplied together with EngineName or MajorEngineVersion"
+                .to_string(),
+        );
+    }
+    if input.major_engine_version.is_some() && input.engine_name.is_none() {
+        return Err(
+            "MajorEngineVersion was specified without EngineName: if MajorEngineVersion is \
+             specified, then EngineName must also be specified"
+                .to_string(),
+        );
+    }
+    if input.filters.as_ref().is_some_and(|filters| !filters.is_empty()) {
+        return Err("Filters isn't currently supported by DescribeOptionGroups".to_string());
+    }
+    Ok(())
+}
+
+/// Whether `record` passes the `EngineName` filter: "A filter to only include option
+/// groups associated with this database engine." No engine named is no constraint.
+fn matches_engine(record: &crate::state::OptionGroupRecord, engine_name: Option<&str>) -> bool {
+    engine_name.is_none_or(|wanted| wanted == record.engine_name)
+}
+
+/// Whether `record` passes the `MajorEngineVersion` filter: "Filters the list of
+/// option groups to only include groups associated with a specific database engine
+/// version." No version named is no constraint.
+fn matches_major_engine_version(
+    record: &crate::state::OptionGroupRecord,
+    major_engine_version: Option<&str>,
+) -> bool {
+    major_engine_version.is_none_or(|wanted| wanted == record.major_engine_version)
 }

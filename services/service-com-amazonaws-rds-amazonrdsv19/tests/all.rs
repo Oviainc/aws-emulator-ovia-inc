@@ -15,6 +15,8 @@
 mod db_engine_versions;
 #[path = "all/db_instances.rs"]
 mod db_instances;
+#[path = "all/option_groups.rs"]
+mod option_groups;
 #[path = "all/orderable_db_instance_options.rs"]
 mod orderable_db_instance_options;
 #[path = "all/state_roundtrip.rs"]
