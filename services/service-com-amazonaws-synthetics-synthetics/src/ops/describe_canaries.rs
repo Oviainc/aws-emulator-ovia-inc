@@ -87,7 +87,7 @@ use std::time::SystemTime;
 
 use aws_smithy_schema_server::{constraints::path, envelope, Violation, ViolationKind};
 
-use crate::state::STORE_UNAVAILABLE;
+use crate::state::{PageStart, STORE_UNAVAILABLE};
 
 /// `DescribeCanariesRequest$MaxResults`: "If you omit this parameter, the default of 20
 /// is used." (which is also the member's modelled maximum).
@@ -106,28 +106,24 @@ const MIN_MAX_RESULTS: i32 = 1;
 /// and this is the bound the operation applies.
 const MAX_MAX_RESULTS: i32 = 1000;
 
-/// The modelled maximum length of `Token`, which both the input and the output
-/// `NextToken` target.
-const MAX_TOKEN_LEN: usize = 252;
-
-/// A page token that resumes at a canary NAME: exact across inserts and deletes, because
-/// the page boundary is a key in the ordered store rather than a position in it.
+/// This operation's page-token prefix: a token resumes at a canary NAME, exact across
+/// inserts and deletes, because the page boundary is a key in the ordered store rather than
+/// a position in it. The token form itself — and the offset fallback for a name so long that
+/// prefix + name would exceed the modelled token length — is
+/// [`crate::state::encode_page_token`], shared with this service's other paged operation.
 ///
-/// Three characters, so the shortest legal canary name (one character) still yields a
-/// token at the modelled minimum length of 4.
+/// Three characters, so the shortest legal canary name (one character) still yields a token
+/// at the modelled minimum length of 4.
 const TOKEN_NAME_PREFIX: &str = "nm#";
 
-/// A page token that resumes at an OFFSET, used for the one case a name cannot be carried
-/// in a token: a name so long that prefix + name would exceed [`MAX_TOKEN_LEN`] (a canary
-/// name may be up to 255 characters).
-const TOKEN_OFFSET_PREFIX: &str = "ix#";
-
-/// Where a page starts within the ordered, filtered canary list.
-enum PageStart {
-    /// Resume at the first canary whose name is at or after this one.
-    Name(String),
-    /// Resume at this position.
-    Offset(usize),
+/// Whether `name` could be a canary name this operation put in a token: `CanaryName`'s own
+/// modelled constraints (`len 1..255, pattern ^[0-9a-z_\-]+$`), the only thing this operation
+/// ever puts there — so a forged token is refused rather than resuming at an arbitrary key.
+fn is_canary_name(name: &str) -> bool {
+    (1..=255).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'_' || b == b'-')
 }
 
 /// The refusal of a page size outside `MIN_MAX_RESULTS..=MAX_MAX_RESULTS`.
@@ -157,35 +153,6 @@ fn out_of_range(requested: i32) -> DescribeCanariesError {
         message: Some(message),
     })
     .into()
-}
-
-/// The token that resumes the next page after `offset` entries, whose first entry is
-/// `next_name`.
-fn encode_token(offset: usize, next_name: &str) -> String {
-    if TOKEN_NAME_PREFIX.len() + next_name.len() <= MAX_TOKEN_LEN {
-        format!("{TOKEN_NAME_PREFIX}{next_name}")
-    } else {
-        format!("{TOKEN_OFFSET_PREFIX}{offset}")
-    }
-}
-
-/// Read a token this operation issued. Anything else is a bad request, not an empty page.
-///
-/// The payload of a name token is checked against `CanaryName`'s own modelled constraints
-/// (`len 1..255, pattern ^[0-9a-z_\-]+$`), the only thing this operation ever puts there,
-/// so a forged token is refused rather than resuming at an arbitrary key.
-fn decode_token(token: &str) -> Option<PageStart> {
-    if let Some(name) = token.strip_prefix(TOKEN_NAME_PREFIX) {
-        let legal_canary_name = (1..=255).contains(&name.len())
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'_' || b == b'-');
-        return legal_canary_name.then(|| PageStart::Name(name.to_string()));
-    }
-    token
-        .strip_prefix(TOKEN_OFFSET_PREFIX)
-        .and_then(|offset| offset.parse().ok())
-        .map(PageStart::Offset)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -266,16 +233,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        let start = match input.next_token.as_deref() {
-            None => PageStart::Offset(0),
-            Some(token) => decode_token(token).ok_or_else(|| {
-                DescribeCanariesError::from(DescribeCanariesErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some("NextToken is not a token this operation issued".to_string()),
-                    },
-                ))
-            })?,
-        };
         // `MaxResults` is the one member of this input the boundary walk does not judge
         // (`skip_validation`), so the page size is checked here, against the ceiling the
         // service applies rather than the modelled one. A size ON either bound is honoured
@@ -309,9 +266,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        let start = match input.next_token.as_deref() {
+            None => PageStart::Offset(0),
+            Some(token) => crate::state::decode_page_token(
+                TOKEN_NAME_PREFIX,
+                token,
+                matching.len(),
+                is_canary_name,
+            )
+            .ok_or_else(|| {
+                DescribeCanariesError::from(DescribeCanariesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some("NextToken is not a token this operation issued".to_string()),
+                    },
+                ))
+            })?,
+        };
+
         let from = match &start {
             PageStart::Offset(offset) => (*offset).min(matching.len()),
-            PageStart::Name(name) => matching
+            PageStart::Key(name) => matching
                 .iter()
                 .position(|canary| canary.name.as_str() >= name.as_str())
                 .unwrap_or(matching.len()),
@@ -324,7 +298,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A token only when entries actually remain, so a client stops paging.
         let next_token = matching
             .get(until)
-            .map(|next| encode_token(until, &next.name));
+            .map(|next| crate::state::encode_page_token(TOKEN_NAME_PREFIX, until, &next.name));
 
         Ok(DescribeCanariesOutput {
             canaries: Some(canaries),

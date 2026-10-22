@@ -580,6 +580,7 @@ async fn describe_canaries_pages_over_live_state() {
         ("name prefix with an illegal canary name", "nm#NotALegalName"),
         ("name prefix with an empty name", "nm#"),
         ("offset prefix with a non-number", "ix#abc"),
+        ("offset prefix past the end of the collection", "ix#9999"),
     ] {
         let bogus = aws.describe(json!({ "NextToken": token })).await;
         assert_eq!(
