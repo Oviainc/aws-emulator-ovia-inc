@@ -17,6 +17,8 @@ mod role_attached_policies;
 mod role_lifecycle;
 #[path = "all/service_linked_roles.rs"]
 mod service_linked_roles;
+#[path = "all/service_specific_credentials.rs"]
+mod service_specific_credentials;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/user_lifecycle.rs"]

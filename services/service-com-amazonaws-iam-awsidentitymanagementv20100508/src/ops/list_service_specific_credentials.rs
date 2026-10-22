@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceSpecificCredentials
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceSpecificCredentials`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceSpecificCredentials::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +163,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceSpecificCredentials` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceSpecificCredentialsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceSpecificCredentials"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault
+            // (`smithy_query(query="operation", operation="ListServiceSpecificCredentials")`
+            // lists only `NoSuchEntityException` and `ServiceNotSupportedException`),
+            // and an engine this service was not mounted on cannot serve the operation
+            // at all — which is exactly what the scaffold's 501 states.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListServiceSpecificCredentials",
+            ));
+        };
+        let now = crate::state::now();
+
+        // `AllUsers` "cannot be specified together with UserName": the two name
+        // different sets, so a request carrying both says nothing about which it
+        // wants. This operation models no client-input error, so the refusal goes
+        // through the crate's generic client-input channel (HTTP 400).
+        let all_users = input.all_users.unwrap_or(false);
+        if all_users && input.user_name.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "AllUsers cannot be specified together with UserName",
+            ));
+        }
+
+        // A `ServiceName` filter names a service, so a name no service supporting
+        // service-specific credentials carries selects nothing that could exist.
+        let service_filter = match &input.service_name {
+            Some(service_name) => match crate::state::service_with_credentials(service_name) {
+                Some(service) => Some(service.service_name),
+                None => {
+                    return Err(
+                        ListServiceSpecificCredentialsErrorModeled::ServiceNotSupportedException(
+                            ServiceNotSupportedException {
+                                message: Some(format!(
+                                    "The service {service_name} does not support \
+                                     service-specific credentials."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
+            None => None,
+        };
+
+        // The page resumes strictly after the POSITION in the key order the marker
+        // names, so a token this service's encoding cannot have produced is refused
+        // rather than silently read as "start from the beginning" — the same rule
+        // `ListUsers` follows.
+        let resume_after = match &input.marker {
+            Some(marker) => match crate::state::decode_marker(
+                crate::state::MARKER_SCOPE_SERVICE_SPECIFIC_CREDENTIALS,
+                marker,
+            ) {
+                Some(key) => Some(key),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Invalid Marker: the value is not a marker this service issued",
+                    ));
+                }
+            },
+            None => None,
+        };
+        // `maxItemsType` is range 1..1000 and the boundary validator has already
+        // refused anything outside it, so the only choice left here is the default for
+        // an absent `MaxItems`. `.max(1)` is what makes the cast lossless.
+        let page_size = input
+            .max_items
+            .unwrap_or(crate::state::DEFAULT_MAX_ITEMS)
+            .max(1) as usize;
+
+        let mut store = state.lock();
+        // A read, with the ONE exception the clock owes: a credential past its
+        // expiration date is `Expired` whether or not anybody called, so the status
+        // this reports is the status that instant already carried.
+        store.expire_service_specific_credentials(now);
+
+        // Whose credentials: the named user, every user when `AllUsers` is set, or —
+        // with neither — "the user whose credentials are used to call the operation",
+        // resolved from the request's access key id exactly as `GetUser` resolves it.
+        let user_filter = if all_users {
+            None
+        } else {
+            match &input.user_name {
+                Some(user_name) => Some(crate::state::name_key(user_name)),
+                None => {
+                    let akid = ::engine::extract_akid(&ctx.parts().headers);
+                    match store.access_keys.get(&akid) {
+                        Some(key) => Some(key.clone()),
+                        None => {
+                            // Credentials that belong to no IAM user resolve to no
+                            // user, and the call is refused rather than answered from
+                            // an invented identity.
+                            return Err(crate::scaffolded::Scaffolded::validation(
+                                "Must specify userName when calling with non-User credentials",
+                            ));
+                        }
+                    }
+                }
+            }
+        };
+        // A named user must exist: the operation reports the credentials of an IAM
+        // user, and a name the account does not hold names no user to report on.
+        if let (Some(user_key), Some(user_name)) = (&user_filter, &input.user_name) {
+            if !store.users.contains_key(user_key) {
+                return Err(
+                    ListServiceSpecificCredentialsErrorModeled::NoSuchEntityException(
+                        NoSuchEntityException {
+                            message: Some(format!(
+                                "The user with name {user_name} cannot be found."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let tail = store.service_specific_credentials.range::<str, _>((
+            match &resume_after {
+                Some(key) => ::std::ops::Bound::Excluded(key.as_str()),
+                None => ::std::ops::Bound::Unbounded,
+            },
+            ::std::ops::Bound::Unbounded,
+        ));
+        let selected = tail.filter(|(_, credential)| {
+            user_filter
+                .as_ref()
+                .is_none_or(|user_key| &crate::state::name_key(&credential.user_name) == user_key)
+                && service_filter.is_none_or(|service_name| {
+                    credential.service_name.eq_ignore_ascii_case(service_name)
+                })
+        });
+
+        let mut credentials = Vec::new();
+        let mut is_truncated = false;
+        let mut last_key = None;
+        for (key, credential) in selected {
+            if credentials.len() == page_size {
+                // There is at least one more matching credential, so the caller needs
+                // another page to see it.
+                is_truncated = true;
+                break;
+            }
+            credentials.push(credential.clone());
+            last_key = Some(key.clone());
+        }
+
+        Ok(ListServiceSpecificCredentialsOutput {
+            // "If none exists, the operation returns an empty list" — the member is
+            // always present, and empty is the answer for a user holding none.
+            service_specific_credentials: Some(credentials),
+            marker: is_truncated
+                .then(|| {
+                    last_key.as_deref().map(|key| {
+                        crate::state::encode_marker(
+                            crate::state::MARKER_SCOPE_SERVICE_SPECIFIC_CREDENTIALS,
+                            key,
+                        )
+                    })
+                })
+                .flatten(),
+            is_truncated,
+        })
     }
 }
