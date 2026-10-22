@@ -15,3 +15,5 @@
 mod profiling_group_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_profiling_group.rs"]
+mod update_profiling_group;
