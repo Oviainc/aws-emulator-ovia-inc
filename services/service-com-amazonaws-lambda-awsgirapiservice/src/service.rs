@@ -40,10 +40,57 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use service_common::shared_path::SharedPathArn;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The literal first URI path segments that LEAD to the `{Resource}` ARN label of the
+/// one path space this model and a peer signing as `lambda` bind IDENTICALLY:
+/// `ListTags` (`GET`), `TagResource` (`POST`) and `UntagResource` (`DELETE`) are all
+/// bound to `/2017-03-31/tags/{Resource}` here AND in the Lambda MicroVMs model, so the
+/// model-derived path discriminator alone cannot separate the two there. Source:
+/// `smithy_query(query="digest", …)` on both models.
+const SHARED_TAGGING_PATH: &[&str] = &["2017-03-31", "tags"];
+
+/// The `aws.api#service$arnNamespace` every service signing as `lambda` shares
+/// (`smithy_query(query="service_info")`: `arnNamespace: lambda` for all four), and so
+/// the only service field an ARN any of their tagging operations addresses can carry.
+const SHARED_ARN_NAMESPACE: &str = "lambda";
+
+/// The ARN resource types reachable on [`SHARED_TAGGING_PATH`] that belong to a PEER
+/// service rather than to this one.
+///
+/// A resource belongs to the service whose own operations MINT it: `microvm-image` is
+/// minted by `CreateMicrovmImage` in the Lambda MicroVMs service, whose model binds the
+/// same tagging URIs and whose `TaggableResource` pattern accepts it (this model's does
+/// not). Every other type that pattern accepts here — `function`, `code-signing-config`,
+/// `event-source-mapping`, `capacity-provider`, `network-connector` — is minted by this
+/// service or has no other claimant, so it stays with this endpoint, whose own identity
+/// IS the shared signing name (`sdkId: Lambda`, `endpointPrefix: lambda`). Source:
+/// `smithy_query(query="shape", shape="TaggableResource")` on both models.
+const PEER_TAGGING_RESOURCE_TYPES: &[&str] = &["microvm-image"];
+
+/// Whether this service claims a request on the `/2017-03-31/tags/{Resource}` path space
+/// it shares with the Lambda MicroVMs service.
+///
+/// The ARN in the path names the resource, and a resource belongs to exactly one of the
+/// two endpoints, so the resource type decides: this endpoint claims every tagging
+/// request EXCEPT one whose ARN names a peer's resource. Everything else on the shared
+/// API-date segment stays here — a label that names no recognisable `lambda` resource, and
+/// a path under that segment neither model binds — because this is the service the shared
+/// signing name belongs to, so exactly one service claims every request on it.
+fn claims_shared_tagging_path(parts: &http::request::Parts) -> bool {
+    match service_common::shared_path::shared_path_arn(
+        parts.uri.path(),
+        SHARED_TAGGING_PATH,
+        SHARED_ARN_NAMESPACE,
+    ) {
+        SharedPathArn::NotShared | SharedPathArn::Unrecognised => true,
+        SharedPathArn::Resource(kind) => !PEER_TAGGING_RESOURCE_TYPES.contains(&kind.as_str()),
+    }
+}
 
 /// The `com-amazonaws-lambda-awsgirapiservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -74,13 +121,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `lambda` — a signing name it SHARES with every other
+        // emulated service in the Lambda family (Lambda Core, Lambda MicroVMs and
+        // Lambda Web; `smithy_query(query="service_info")` gives all four
+        // `sigv4Name: lambda`). The router resolves a request's routing key from the
+        // SigV4 credential scope first, so all four see the key `lambda`: claiming on
+        // the signing name alone makes each one claim the others' traffic, which the
+        // router answers `500 AmbiguousService` instead of serving any of them —
+        // leaving every Lambda operation unreachable.
+        //
+        // So the claim is narrowed to this service's own request space, by the one rule
+        // `service-common` states for a shared signing name: this model is `restJson1`
+        // (a REST protocol, so the `rpc_service_shape_id` argument is `None`), and a
+        // REST service's own surface is the modelled URI path space its generated
+        // `ROUTE_PATH_SEGMENTS` publishes — here the API-date segments this model binds
+        // (`2015-03-31`, `2018-10-31`, …), which are disjoint from the peers' own
+        // (`2026-04-04`, `2025-09-09`, `2025-03-07`) except for the shared tagging path
+        // `/2017-03-31/tags/{Resource}`, where the ARN decides (see
+        // [`claims_shared_tagging_path`]).
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            None,
+        ) && claims_shared_tagging_path(parts)
     }
 
     fn override_operation(
