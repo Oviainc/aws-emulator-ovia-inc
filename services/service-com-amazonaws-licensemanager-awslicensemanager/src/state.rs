@@ -26,6 +26,8 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 use crate::ops::types::{
     ConsumedLicenseSummary, ConsumptionConfiguration, DatetimeRange, Entitlement, Issuer,
     IssuerDetails, License, LicenseConfiguration, ManagedResourceSummary, Metadata,
@@ -116,6 +118,63 @@ pub const MAX_COLLECTION_ENTRIES: usize = 50;
 /// The longest caller-supplied text this emulator stores in a configuration, a
 /// license or a tag.
 pub const MAX_TEXT_LEN: usize = 2048;
+
+/// The domain tag mixed into the preimage of an issuer key fingerprint, so a digest
+/// this service derives for an issuer identity cannot be confused with a digest it
+/// derives for anything else.
+const ISSUER_FINGERPRINT_DOMAIN: &str = "license-manager:issuer:v1";
+
+/// The issuer key fingerprint a license of this issuer carries.
+///
+/// `KeyFingerprint` ("Issuer key fingerprint") is on the READ shape only:
+/// `IssuerDetails`, which `License.Issuer` targets, carries `Name`, `SignKey` and
+/// `KeyFingerprint`, while `Issuer` — the shape a create carries — has only `Name`
+/// and `SignKey`
+/// (`smithy_query(query="shape",shape="Issuer,IssuerDetails")`). No caller can
+/// supply a fingerprint, so the service derives it, and it derives it from the
+/// ISSUER IDENTITY alone — the name and the signing key the create named — so one
+/// issuer always fingerprints the same way however many licenses it issues, two
+/// different issuers never share a fingerprint, and every read of a license reports
+/// one stable value that `CheckoutLicense` can resolve against as the second half of
+/// its (`ProductSKU`, `KeyFingerprint`) key.
+///
+/// The form mirrors the colon-delimited fingerprint License Manager reports for a
+/// license issuer, `aws:<account>:<issuer name>:<fingerprint>`, with the last
+/// segment the SHA-256 digest of the length-prefixed issuer identity — length
+/// prefixes so no name/key boundary can be shifted to spell another issuer's
+/// preimage. An absent `SignKey` names no key and so hashes as an empty one. No key
+/// material is held or signed here: the digest IDENTIFIES the issuer, it does not
+/// certify it.
+pub fn issuer_key_fingerprint(name: &str, sign_key: Option<&str>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(ISSUER_FINGERPRINT_DOMAIN.as_bytes());
+    for part in [name, sign_key.unwrap_or_default()] {
+        digest.update(format!(":{}:", part.len()).as_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!(
+        "aws:{}:{name}:{}",
+        ::engine::emulator_account_id(),
+        ::hex::encode(digest.finalize())
+    )
+}
+
+/// The `IssuerDetails` a read of a license reports for the `Issuer` its create
+/// carried: the name and signing key exactly as given, plus the fingerprint this
+/// service derives for that issuer.
+///
+/// Every path that stores a license issuer goes through here, so one issuer
+/// fingerprints the same way whichever operation minted the license.
+pub fn issuer_details(issuer: Issuer) -> IssuerDetails {
+    IssuerDetails {
+        key_fingerprint: Some(issuer_key_fingerprint(
+            &issuer.name,
+            issuer.sign_key.as_deref(),
+        )),
+        name: Some(issuer.name),
+        sign_key: issuer.sign_key,
+    }
+}
 
 /// One stored license configuration: every member `GetLicenseConfiguration`
 /// reports, except the tags, which are keyed by ARN in
@@ -208,8 +267,8 @@ pub struct StoredLicense {
     pub product_name: String,
     pub product_sku: String,
     /// The issuer, as the `IssuerDetails` a read reports: the `Issuer` the create
-    /// carried, with no `KeyFingerprint` — this emulator holds no KMS key material
-    /// and signs no license, so there is no fingerprint to report.
+    /// carried plus the `KeyFingerprint` [`issuer_details`] derived for it, which is
+    /// on the read shape only and so can come from nowhere else.
     pub issuer: IssuerDetails,
     pub home_region: String,
     /// One of the modelled `LicenseStatus` values.
