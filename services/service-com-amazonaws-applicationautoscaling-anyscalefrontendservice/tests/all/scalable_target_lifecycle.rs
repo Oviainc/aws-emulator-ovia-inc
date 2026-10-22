@@ -11,83 +11,22 @@
 //! under test generalises over (the namespace/dimension pair, which members a partial
 //! update names, the policy type, the page size), and the case the bootstrap issue cited
 //! is one row among them.
-
-use std::sync::Arc;
+//!
+//! The emulator itself, and the helpers every suite in this target shares, live in
+//! `tests/all/emulator.rs`.
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region the test's SigV4 credential scope names; every minted ARN is scoped to it.
-pub(crate) const REGION: &str = "us-east-1";
+use super::emulator::{error_code, Emulator, ACCOUNT, REGION};
 
-/// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
-pub(crate) const ACCOUNT: &str = "000000000000";
-
-/// One emulator over one shared engine, driven through the same `dispatch` the served
-/// socket path uses.
+/// The DynamoDB tables this suite's `dynamodb` rows register a scalable target on.
 ///
-/// `pub(crate)` so every suite in this test target drives the emulator the same way
-/// rather than growing a second harness (see `tests/all/tags.rs`,
-/// `tests/all/scheduled_action_lifecycle.rs`, `tests/all/resource_tags.rs` and
-/// `tests/all/scaling_activities.rs`).
-pub(crate) struct Emulator {
-    router: MultiServiceRouter,
-}
-
-impl Emulator {
-    pub(crate) fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // The suite drives unsigned requests, so signature verification is off; the
-        // `Authorization` header below is still what routes the request and names the
-        // region, exactly as a signed client's would.
-        router.set_request_authentication(false);
-        router.register_service(
-            service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::EmulatedService::new(
-                engine,
-            ),
-        );
-        Self { router }
-    }
-
-    /// Call `operation` with `body`, returning the HTTP status and the parsed response.
-    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("content-type", "application/x-amz-json-1.1")
-            .header(
-                "x-amz-target",
-                format!("AnyScaleFrontendService.{operation}"),
-            )
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{REGION}\
-                     /application-autoscaling/aws4_request, SignedHeaders=host, Signature=0"
-                ),
-            )
-            .body(bytes::Bytes::from(
-                serde_json::to_vec(&body).expect("the request body serializes"),
-            ))
-            .expect("a well-formed request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let bytes = response.into_body();
-        let parsed = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        (status, parsed)
-    }
-}
-
-/// The `__type` discriminator an awsJson error body carries, or `""`.
-pub(crate) fn error_code(body: &Value) -> &str {
-    body.get("__type").and_then(Value::as_str).unwrap_or("")
-}
+/// A scalable target is a capacity dimension OF A RESOURCE, so registering one resolves
+/// that resource in the service that owns it: these exist before the targets do.
+const TABLES: &[&str] = &[
+    "my-table", "alpha", "bravo", "charlie", "delta", "echo", "row-a", "row-b", "row-c",
+    "row-d", "row-e", "row-f", "row-g", "row-h",
+];
 
 /// The single `ScalableTarget` a namespace holds, for a case that registered exactly one.
 async fn only_target(emulator: &Emulator, namespace: &str, case: &str) -> Value {
@@ -174,7 +113,7 @@ const TARGET_CATALOG: &[TargetRow] = &[
 
 #[tokio::test]
 async fn a_registered_target_is_described_from_what_was_persisted() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
 
     for row in TARGET_CATALOG {
         let case = format!("{}/{}", row.namespace, row.dimension);
@@ -285,7 +224,7 @@ struct UpdateRow {
 
 #[tokio::test]
 async fn register_updates_only_the_members_the_request_names() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let namespace = "dynamodb";
     let resource_id = "table/my-table";
     let dimension = "dynamodb:table:ReadCapacityUnits";
@@ -426,40 +365,40 @@ async fn register_updates_only_the_members_the_request_names() {
 
 #[tokio::test]
 async fn a_registration_outside_the_contract_is_refused_and_persists_nothing() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
 
     let rows: &[(&str, Value)] = &[
         (
             "no MinCapacity on a first registration",
-            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/a", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MaxCapacity": 10}),
+            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/row-a", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MaxCapacity": 10}),
         ),
         (
             "no MaxCapacity on a first registration",
-            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/b", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MinCapacity": 1}),
+            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/row-b", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MinCapacity": 1}),
         ),
         (
             "neither capacity on a first registration",
-            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/c", "ScalableDimension": "dynamodb:table:ReadCapacityUnits"}),
+            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/row-c", "ScalableDimension": "dynamodb:table:ReadCapacityUnits"}),
         ),
         (
             "an inverted capacity window",
-            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/d", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MinCapacity": 5, "MaxCapacity": 2}),
+            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/row-d", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MinCapacity": 5, "MaxCapacity": 2}),
         ),
         (
             "a negative MinCapacity",
-            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/e", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MinCapacity": -1, "MaxCapacity": 10}),
+            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/row-e", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MinCapacity": -1, "MaxCapacity": 10}),
         ),
         (
             "a negative MaxCapacity",
-            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/f", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MinCapacity": 0, "MaxCapacity": -3}),
+            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/row-f", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MinCapacity": 0, "MaxCapacity": -3}),
         ),
         (
             "a namespace outside the enum",
-            json!({"ServiceNamespace": "not-a-namespace", "ResourceId": "table/g", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MinCapacity": 1, "MaxCapacity": 10}),
+            json!({"ServiceNamespace": "not-a-namespace", "ResourceId": "table/row-g", "ScalableDimension": "dynamodb:table:ReadCapacityUnits", "MinCapacity": 1, "MaxCapacity": 10}),
         ),
         (
             "a dimension outside the enum",
-            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/h", "ScalableDimension": "dynamodb:table:NotACapacity", "MinCapacity": 1, "MaxCapacity": 10}),
+            json!({"ServiceNamespace": "dynamodb", "ResourceId": "table/row-h", "ScalableDimension": "dynamodb:table:NotACapacity", "MinCapacity": 1, "MaxCapacity": 10}),
         ),
     ];
 
@@ -569,7 +508,7 @@ const POLICY_CATALOG: &[PolicyRow] = &[
 
 #[tokio::test]
 async fn a_policy_round_trips_for_every_modelled_policy_type() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
 
     for row in POLICY_CATALOG {
         let case = row.case;
@@ -622,11 +561,23 @@ async fn a_policy_round_trips_for_every_modelled_policy_type() {
             )),
             "case {case:?}: expected the PolicyARN to name its resource and policy, got {policy_arn:?}"
         );
-        assert_eq!(
-            body["Alarms"],
-            json!([]),
-            "case {case:?}: expected the persisted (empty) alarm list, got {body:?}"
-        );
+        // Only a target-tracking policy is alarm-driven, so only it mints alarms; a step
+        // or predictive policy's `Alarms` list is the alarms the CALLER attached, and this
+        // row attached none.
+        let minted = body["Alarms"].as_array().cloned().unwrap_or_default();
+        if row.policy_type == "TargetTrackingScaling" {
+            assert!(
+                !minted.is_empty(),
+                "case {case:?}: expected a target-tracking policy to mint alarms, got {body:?}"
+            );
+        } else {
+            assert_eq!(
+                body["Alarms"],
+                json!([]),
+                "case {case:?}: expected no alarms for a {} policy, got {body:?}",
+                row.policy_type
+            );
+        }
 
         // A repeated Put for the same identity is an update, not a second policy.
         let (status, again) = emulator.call("PutScalingPolicy", request).await;
@@ -694,8 +645,8 @@ async fn a_policy_round_trips_for_every_modelled_policy_type() {
         );
         assert_eq!(
             policy["Alarms"],
-            json!([]),
-            "case {case:?}: expected the persisted alarm list, got {policy:?}"
+            json!(minted),
+            "case {case:?}: expected Describe to report the alarms Put minted, got {policy:?}"
         );
         assert!(
             policy["CreationTime"].as_f64().is_some_and(|at| at > 0.0),
@@ -718,7 +669,7 @@ async fn a_policy_round_trips_for_every_modelled_policy_type() {
 
 #[tokio::test]
 async fn a_policy_without_a_registered_target_is_refused() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
 
     // Register one target, so the refusal is about the identity and not about an empty
     // store.
@@ -792,7 +743,7 @@ async fn a_policy_without_a_registered_target_is_refused() {
 
 #[tokio::test]
 async fn a_policy_missing_the_configuration_its_type_requires_is_refused() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let (status, body) = emulator
         .call(
             "RegisterScalableTarget",
@@ -857,7 +808,7 @@ async fn a_policy_missing_the_configuration_its_type_requires_is_refused() {
 
 #[tokio::test]
 async fn describe_pages_through_every_target_in_key_order() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let namespace = "dynamodb";
     let dimension = "dynamodb:table:ReadCapacityUnits";
     let resource_ids = [
@@ -946,7 +897,7 @@ async fn describe_pages_through_every_target_in_key_order() {
 
 #[tokio::test]
 async fn describe_refuses_a_token_it_did_not_issue_and_a_page_size_out_of_range() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let (status, body) = emulator
         .call(
             "RegisterScalableTarget",
@@ -1021,7 +972,7 @@ async fn describe_refuses_a_token_it_did_not_issue_and_a_page_size_out_of_range(
 
 #[tokio::test]
 async fn describe_policies_pages_and_filters_by_resource_and_dimension() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let namespace = "dynamodb";
     let resources = ["table/alpha", "table/bravo"];
     let dimensions = [
@@ -1154,7 +1105,7 @@ async fn every_modelled_dimension_names_the_namespace_it_belongs_to() {
         );
     }
 
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
 
     // A namespace and a dimension that are each legal but do not belong together are
     // refused by every operation that takes both as part of the target's identity, and
@@ -1208,18 +1159,27 @@ async fn every_modelled_dimension_names_the_namespace_it_belongs_to() {
         }
     }
 
-    // And the matching pair of the same namespaces still registers.
-    for (namespace, dimension) in [
-        ("ecs", "ecs:service:DesiredCount"),
-        ("dynamodb", "dynamodb:table:ReadCapacityUnits"),
-        ("lambda", "lambda:function:ProvisionedConcurrency"),
-        ("rds", "rds:cluster:ReadReplicaCount"),
+    // And the matching pair of the same namespaces still registers — each with the
+    // `ResourceId` form its own resource type takes.
+    for (namespace, dimension, resource_id) in [
+        ("ecs", "ecs:service:DesiredCount", "service/prod/web"),
+        (
+            "dynamodb",
+            "dynamodb:table:ReadCapacityUnits",
+            "table/my-table",
+        ),
+        (
+            "lambda",
+            "lambda:function:ProvisionedConcurrency",
+            "function:ingest:green",
+        ),
+        ("rds", "rds:cluster:ReadReplicaCount", "cluster:my-db"),
     ] {
         let case = format!("{namespace} with {dimension}");
         let (status, body) = emulator
             .call(
                 "RegisterScalableTarget",
-                json!({"ServiceNamespace": namespace, "ResourceId": "res/one", "ScalableDimension": dimension, "MinCapacity": 1, "MaxCapacity": 10}),
+                json!({"ServiceNamespace": namespace, "ResourceId": resource_id, "ScalableDimension": dimension, "MinCapacity": 1, "MaxCapacity": 10}),
             )
             .await;
         assert_eq!(
@@ -1231,7 +1191,7 @@ async fn every_modelled_dimension_names_the_namespace_it_belongs_to() {
 
 #[tokio::test]
 async fn delete_and_deregister_are_observable_and_refuse_a_second_time() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let namespace = "dynamodb";
     let resource_id = "table/my-table";
     let dimension = "dynamodb:table:ReadCapacityUnits";

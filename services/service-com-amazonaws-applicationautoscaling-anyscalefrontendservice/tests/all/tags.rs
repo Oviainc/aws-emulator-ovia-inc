@@ -24,13 +24,30 @@
 
 use serde_json::{json, Value};
 
-use crate::scalable_target_lifecycle::{error_code, Emulator, ACCOUNT, REGION};
+use crate::emulator::{error_code, Emulator, ACCOUNT, REGION};
 
 /// The namespace/dimension every row registers under: the tag rule is independent of the
 /// scaled resource, so one legal pair is enough and each row varies only its tags.
 const NAMESPACE: &str = "dynamodb";
 /// See [`NAMESPACE`].
 const DIMENSION: &str = "dynamodb:table:ReadCapacityUnits";
+
+/// The DynamoDB tables this suite's rows register a scalable target on: a target resolves
+/// the resource it scales in the service that owns it, so each table exists first.
+const TABLES: &[&str] = &[
+    "untagged",
+    "empty-tags",
+    "one-tag",
+    "many-tags",
+    "shortest-key",
+    "longest-key",
+    "empty-value",
+    "longest-value",
+    "unicode",
+    "resident",
+    "deregistered",
+    "upserted",
+];
 
 /// One row of the tag catalog: the tags a target is registered with (`None` omits the
 /// member entirely), and therefore the tag set `ListTagsForResource` must answer with.
@@ -140,7 +157,7 @@ async fn register(emulator: &Emulator, row: &TagRow) -> String {
 
 #[tokio::test]
 async fn list_tags_answers_exactly_the_tags_the_target_was_registered_with() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
 
     for row in TAG_CATALOG {
         let case = row.case;
@@ -197,7 +214,7 @@ async fn list_tags_answers_exactly_the_tags_the_target_was_registered_with() {
 
 #[tokio::test]
 async fn list_tags_refuses_an_arn_no_registered_target_carries() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
 
     // One registered target, so the store is not empty and a 404 means "not this ARN"
     // rather than "nothing at all".
@@ -357,7 +374,7 @@ const UPSERT_CATALOG: &[UpsertRow] = &[
 
 #[tokio::test]
 async fn the_tags_a_target_carries_outlive_every_upsert_of_it() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
 
     let created = TagRow {
         case: "the upserted target",

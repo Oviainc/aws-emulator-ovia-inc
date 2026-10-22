@@ -23,7 +23,20 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::scalable_target_lifecycle::{error_code, Emulator};
+use crate::emulator::{error_code, Emulator};
+
+/// The DynamoDB tables this suite's rows register a scalable target on: a target resolves
+/// the resource it scales in the service that owns it, so each table exists first.
+const TABLES: &[&str] = &[
+    "my-table",
+    "other-table",
+    "in-flight",
+    "quiet-table",
+    "paged-table",
+    "one",
+    "two",
+    "three",
+];
 
 /// How long a case waits before expecting an activity to have reached its terminal
 /// status. It must exceed `crate::state::ACTIVITY_FULFILMENT` (600 ms), the span the
@@ -219,7 +232,7 @@ async fn a_capacity_movement_is_reported_as_one_activity_that_reaches_its_termin
     let mut staged: Vec<(Emulator, Value)> = Vec::new();
     for row in MOVEMENT_CATALOG {
         let case = format!("{}/{}", row.namespace, row.dimension);
-        let emulator = Emulator::new();
+        let emulator = Emulator::with_tables(TABLES).await;
 
         register(
             &emulator,
@@ -433,7 +446,7 @@ async fn a_capacity_movement_is_reported_as_one_activity_that_reaches_its_termin
 /// reads bracketing the fulfilment instant.
 #[tokio::test]
 async fn a_movement_is_observable_before_the_clock_fulfils_it() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let case = "a movement in flight";
     let identity = json!({
         "ServiceNamespace": "dynamodb",
@@ -541,7 +554,7 @@ async fn a_registration_that_moves_no_capacity_reports_no_activity() {
 
     for row in QUIET_CATALOG {
         let case = row.case;
-        let emulator = Emulator::new();
+        let emulator = Emulator::with_tables(TABLES).await;
         register(
             &emulator,
             merged(target.clone(), json!({"MinCapacity": 2, "MaxCapacity": 10})),
@@ -573,7 +586,7 @@ const PAGE_SIZES: &[i64] = &[1, 2, 3, 5, 6, 50];
 
 #[tokio::test]
 async fn the_log_reads_newest_first_and_pages_at_max_results() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let target = json!({
         "ServiceNamespace": "dynamodb",
         "ResourceId": "table/paged-table",
@@ -716,7 +729,7 @@ const FILTER_CATALOG: &[FilterRow] = &[
 
 #[tokio::test]
 async fn resource_id_and_scalable_dimension_filter_the_log() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     // Four targets that moved, and one that did not.
     let moved = [
         ("dynamodb", "table/one", "dynamodb:table:ReadCapacityUnits"),
@@ -840,7 +853,7 @@ const REFUSAL_CATALOG: &[RefusalRow] = &[
 
 #[tokio::test]
 async fn a_request_outside_the_contract_is_refused_with_the_modelled_error() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let identity = json!({
         "ServiceNamespace": "dynamodb",
         "ResourceId": "table/one",

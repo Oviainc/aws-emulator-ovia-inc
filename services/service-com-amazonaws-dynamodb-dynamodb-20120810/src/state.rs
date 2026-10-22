@@ -549,7 +549,8 @@ pub struct Table {
     /// reports them.
     pub throughput_history: ThroughputHistory,
     /// The global secondary indexes defined on this table, in the order they were
-    /// declared.
+    /// declared, exactly as the request gave them — `DescribeTable` projects each into a
+    /// `GlobalSecondaryIndexDescription` and never stores one.
     pub global_secondary_indexes: Vec<GlobalSecondaryIndex>,
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,

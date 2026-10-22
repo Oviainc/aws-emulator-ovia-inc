@@ -18,7 +18,12 @@ use service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::ops::p
     SCHEDULE_CRON_FIELDS, SCHEDULE_RATE_UNITS,
 };
 
-use super::scalable_target_lifecycle::{error_code, Emulator, ACCOUNT, REGION};
+use super::emulator::{error_code, Emulator, ACCOUNT, REGION};
+
+/// The DynamoDB tables this suite's `dynamodb` rows register a scalable target on: a
+/// target resolves the resource it scales in the service that owns it, so each table
+/// exists before the target does.
+const TABLES: &[&str] = &["my-table", "schedules", "updates", "alpha", "bravo", "bounds"];
 
 /// Register `resource_id`/`dimension` so a scheduled action has a target to hang off.
 async fn register(emulator: &Emulator, namespace: &str, resource_id: &str, dimension: &str) {
@@ -216,7 +221,7 @@ fn put_request(row: &PutRow, name: &str) -> Value {
 
 #[tokio::test]
 async fn a_scheduled_action_round_trips_through_describe() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let name = "scale-up";
 
     for row in PUT_CATALOG {
@@ -353,7 +358,7 @@ async fn a_scheduled_action_round_trips_through_describe() {
 
 #[tokio::test]
 async fn only_the_documented_schedule_forms_are_accepted() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let namespace = "dynamodb";
     let resource_id = "table/schedules";
     let dimension = "dynamodb:table:WriteCapacityUnits";
@@ -363,7 +368,7 @@ async fn only_the_documented_schedule_forms_are_accepted() {
     // rather than only the one the recorded case used.
     let mut accepted: Vec<String> = SCHEDULE_RATE_UNITS
         .iter()
-        .map(|unit| format!("rate(1 {unit})"))
+        .map(|(unit, _seconds)| format!("rate(1 {unit})"))
         .collect();
     accepted.extend(
         [
@@ -488,7 +493,7 @@ struct UpdateRow {
 
 #[tokio::test]
 async fn a_partial_update_keeps_what_it_does_not_name_except_the_times() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let namespace = "dynamodb";
     let resource_id = "table/updates";
     let dimension = "dynamodb:table:ReadCapacityUnits";
@@ -670,7 +675,7 @@ async fn a_partial_update_keeps_what_it_does_not_name_except_the_times() {
 
 #[tokio::test]
 async fn a_scheduled_action_name_is_scoped_to_its_target() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
     let namespace = "dynamodb";
     let resources = ["table/alpha", "table/bravo"];
     let dimensions = [
@@ -804,7 +809,7 @@ async fn a_scheduled_action_name_is_scoped_to_its_target() {
 
 #[tokio::test]
 async fn a_scheduled_action_needs_a_registered_target_and_a_matching_dimension() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
 
     // An action on a target nobody registered: "You cannot create a scheduled action
     // until you have registered the resource as a scalable target."
@@ -953,7 +958,7 @@ async fn a_scheduled_action_needs_a_registered_target_and_a_matching_dimension()
 
 #[tokio::test]
 async fn describe_refuses_a_filter_it_cannot_apply() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(TABLES).await;
 
     // "If you specify a scalable dimension, you must also specify a resource ID."
     for dimension in [

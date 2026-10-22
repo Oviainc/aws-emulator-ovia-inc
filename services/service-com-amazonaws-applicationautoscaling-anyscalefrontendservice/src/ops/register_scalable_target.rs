@@ -233,11 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            check_dimension_namespace, check_enum, scalable_target_arn, service_linked_role_arn,
-            ScalableTargetRecord, TargetKey,
+            check_dimension_namespace, check_enum, check_resource_id_form, scalable_target_arn,
+            service_linked_role_arn, ScalableTargetRecord, TargetKey,
         };
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        let Some(self_state) = crate::state::service_state(&*self.engine) else {
             return Err(RegisterScalableTargetErrorModeled::InternalServiceException(
                 InternalServiceException {
                     message: Some(
@@ -247,6 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let state = self_state.clone();
 
         // The two identifying enums. The boundary validator refuses anything the model
         // constrains, but an enum SHAPE arrives as a plain string, so the permitted set
@@ -265,6 +266,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(validation)?;
         check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
             .map_err(validation)?;
+        // `ResourceId` and `ScalableDimension` describe ONE resource between them, so a
+        // resource id that is not of the form the dimension's resource type takes names
+        // no resource at all.
+        check_resource_id_form(
+            &input.service_namespace,
+            &input.resource_id,
+            &input.scalable_dimension,
+        )
+        .map_err(validation)?;
 
         for (member, capacity) in [
             ("minCapacity", input.min_capacity),
@@ -286,9 +296,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             scalable_dimension: input.scalable_dimension.clone(),
         };
 
+        // The resource the target scales has to exist, in the service that owns it, with
+        // the capacity the dimension names. Resolved before anything is persisted, so a
+        // refused registration leaves no record behind, and OUTSIDE this service's own
+        // store lock — the capacity it answers is also what the alarm thresholds are
+        // computed from below.
+        let region = crate::state::request_region(ctx.parts());
+        let resolved_capacity =
+            crate::state::resolve_target_resource(&*self.engine, &region, &key)
+                .map_err(validation)?;
+
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
         let state = &mut *guard;
+        crate::state::apply_due_scheduled_actions(state, now);
 
         // Register is an upsert on the (namespace, resource id, dimension) identity: "To
         // update a scalable target, specify the parameters that you want to change. […]
@@ -350,10 +371,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let (Some(min_capacity), Some(max_capacity)) =
                     (input.min_capacity, input.max_capacity)
                 else {
-                    return Err(validation(
-                        "MinCapacity and MaxCapacity are required when registering a new \
-                         scalable target",
-                    ));
+                    return Err(validation(if input.min_capacity.is_none() {
+                        "Minimum capacity must be specified"
+                    } else {
+                        "Maximum capacity must be specified"
+                    }));
                 };
                 check_capacity_range(min_capacity, max_capacity)?;
                 // The emulator's own store bound, checked only on the create path so an
@@ -370,7 +392,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                let arn = scalable_target_arn(&crate::state::request_region(ctx.parts()), &key);
+                let arn =
+                    scalable_target_arn(&crate::state::request_region(ctx.parts()), &key, now);
                 let record = ScalableTargetRecord {
                     arn: arn.clone(),
                     min_capacity,
@@ -397,6 +420,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn
             }
         };
+
+        // Suspending or resuming a scaling activity changes which alarms the target's
+        // policies want to exist, and a capacity move changes what their thresholds are
+        // computed from, so the alarm set is re-materialised here: planned under this
+        // service's lock, applied with it RELEASED, recorded under it again.
+        let plan = crate::state::plan_target_alarms(state, &region, &key, resolved_capacity);
+        drop(guard);
+        let minted = crate::state::apply_target_alarms(&*self.engine, &plan);
+        let orphaned = crate::state::record_minted_alarms(&mut self_state.lock(), minted);
+        // A policy deleted while the lock was released owns nothing any more, so the
+        // alarms just written for it are retired rather than left behind.
+        for key in &orphaned {
+            crate::state::retire_policy_alarms(&*self.engine, key, "TargetTrackingScaling");
+        }
+
+        // The audit record for a state-changing call: who asked, what changed and that it
+        // succeeded. Never the caller's secret — only the access key id it presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            service_namespace = %key.service_namespace,
+            resource_id = %key.resource_id,
+            scalable_dimension = %key.scalable_dimension,
+            scalable_target_arn = %arn,
+            outcome = "registered",
+            "scalable target registered"
+        );
 
         Ok(RegisterScalableTargetOutput {
             scalable_target_arn: Some(arn),

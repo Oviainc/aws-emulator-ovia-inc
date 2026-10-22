@@ -16,7 +16,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -25,6 +25,19 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Renders that digest, and the opaque `NextToken` payload, as printable text.
 hex = { workspace = true }
+# A target-tracking policy's CloudWatch alarms are created in the CloudWatch
+# emulator's own alarm store, and a scalable target resolves the DynamoDB table or
+# index it names in the DynamoDB emulator's own table store: both are reached through
+# the shared engine, which needs the owning service's state TYPE.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# Parses the `cron(...)` schedule a scheduled action carries (and `chrono`, which it
+# is built on, parses an `at(...)` expression's date and time).
+cron = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# Resolves the IANA time zone a scheduled action names, so its `at`/`cron` expression is
+# read in that zone rather than only in UTC.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

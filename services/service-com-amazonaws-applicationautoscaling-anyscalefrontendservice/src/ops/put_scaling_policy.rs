@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ScalingPolicyRecord, TargetKey,
         };
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
+        let Some(self_state) = crate::state::service_state(&*self.engine) else {
             return Err(PutScalingPolicyErrorModeled::InternalServiceException(
                 InternalServiceException {
                     message: Some(
@@ -236,6 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let state = self_state.clone();
 
         check_enum(
             "serviceNamespace",
@@ -264,6 +265,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy_name: input.policy_name.clone(),
         };
 
+        // The resource's own provisioned capacity, which the utilisation thresholds are
+        // computed from. Read from the service that owns the resource BEFORE this
+        // service's store is locked, so no request holds two stores at once; a resource
+        // that cannot be resolved falls back to the target's own floor.
+        let region = crate::state::request_region(ctx.parts());
+        let resolved_capacity = crate::state::resolve_target_resource(
+            &*self.engine,
+            &region,
+            &key.target,
+        )
+        .ok()
+        .flatten();
+
         let mut state = state.lock();
 
         // A policy only exists against a registered scalable target: "You cannot create
@@ -272,8 +286,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(PutScalingPolicyErrorModeled::ObjectNotFoundException(
                 ObjectNotFoundException {
                     message: Some(format!(
-                        "No scalable target found for service namespace: {}, resource ID: {}, \
-                         scalable dimension: {}",
+                        "No scalable target registered for service namespace: {}, resource ID: \
+                         {}, scalable dimension: {}",
                         key.target.service_namespace,
                         key.target.resource_id,
                         key.target.scalable_dimension
@@ -342,6 +356,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "A {policy_type} policy requires {member}"
             )));
         }
+        // The configuration the effective policy type carries has to hold together on its
+        // own terms, whatever the namespace the target is in.
+        if let Some(config) = target_tracking_config.as_ref() {
+            check_target_tracking_config(config)?;
+        }
+        if let Some(config) = step_config.as_ref() {
+            check_step_config(config)?;
+        }
 
         // The ARN and the creation time are minted once per policy identity and survive
         // every later Put for the same (namespace, resource, dimension, policy name).
@@ -363,7 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
                 (
-                    scaling_policy_arn(&crate::state::request_region(ctx.parts()), &key),
+                    scaling_policy_arn(&region, &key),
                     ::std::time::SystemTime::now(),
                 )
             }
@@ -375,20 +397,201 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             step_config,
             target_tracking_config,
             predictive_config,
-            // The CloudWatch alarms a target-tracking policy owns are created in
-            // CloudWatch, which this emulator does not drive, so the list stays as
-            // persisted rather than carrying invented alarm names.
-            alarms: stored.map(|p| p.alarms).unwrap_or_default(),
+            // Filled in by the alarm sync below, which is what creates them in
+            // CloudWatch: a policy's alarms are state, not a value a response invents.
+            alarms: Vec::new(),
             creation_time,
         };
-        let alarms = record.alarms.clone();
-        state.policies.insert(key, record);
+        state.policies.insert(key.clone(), record);
+
+        // A target-tracking policy IS its alarms: putting one materialises the alarm set
+        // in CloudWatch and records it on the policy. Planned under this service's lock,
+        // applied with it RELEASED, then recorded under it again — so the CloudWatch write
+        // never happens inside this service's critical section.
+        let plan = crate::state::plan_target_alarms(&state, &region, &key.target, resolved_capacity);
+        drop(state);
+        let minted = crate::state::apply_target_alarms(&*self.engine, &plan);
+        let (alarms, orphaned) = {
+            let mut state = self_state.lock();
+            let orphaned = crate::state::record_minted_alarms(&mut state, minted);
+            let alarms = state
+                .policies
+                .get(&key)
+                .map(|record| record.alarms.clone())
+                .unwrap_or_default();
+            (alarms, orphaned)
+        };
+        // A policy deleted while the lock was released owns nothing any more, so the
+        // alarms just written for it are retired rather than left behind.
+        for key in &orphaned {
+            crate::state::retire_policy_alarms(&*self.engine, key, "TargetTrackingScaling");
+        }
+
+        // The audit record for a state-changing call.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            service_namespace = %key.target.service_namespace,
+            resource_id = %key.target.resource_id,
+            scalable_dimension = %key.target.scalable_dimension,
+            policy_name = %key.policy_name,
+            policy_arn = %policy_arn,
+            alarms = alarms.len(),
+            outcome = "put",
+            "scaling policy put"
+        );
 
         Ok(PutScalingPolicyOutput {
             policy_arn,
             alarms: Some(alarms),
         })
     }
+}
+
+/// Refuse a target-tracking configuration that cannot describe one metric.
+///
+/// "A predefined metric. You can specify either a predefined metric or a customized metric"
+/// — either, so exactly one: with both the policy has two metrics to track and with neither
+/// it has none. And `ResourceLabel` "identifies the resource associated with the metric
+/// type. You can't specify a resource label unless the metric type is
+/// ALBRequestCountPerTarget", which is also the one metric type that cannot be resolved
+/// without one: the request count per target is counted per target group.
+fn check_target_tracking_config(
+    config: &TargetTrackingScalingPolicyConfiguration,
+) -> Result<(), PutScalingPolicyError> {
+    /// The one predefined metric type that names a resource beside the scalable target.
+    const ALB_REQUEST_COUNT_PER_TARGET: &str = "ALBRequestCountPerTarget";
+
+    match (
+        config.predefined_metric_specification.as_ref(),
+        config.customized_metric_specification.as_ref(),
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(validation(
+                "A TargetTrackingScaling policy takes either a PredefinedMetricSpecification or a \
+                 CustomizedMetricSpecification, not both",
+            ))
+        }
+        (None, None) => {
+            return Err(validation(
+                "A TargetTrackingScaling policy requires either a PredefinedMetricSpecification \
+                 or a CustomizedMetricSpecification",
+            ))
+        }
+        (Some(predefined), None) => {
+            crate::state::check_enum(
+                "predefinedMetricSpecification.predefinedMetricType",
+                &predefined.predefined_metric_type,
+                METRIC_TYPE_VALUES,
+            )
+            .map_err(validation)?;
+            let is_alb = predefined.predefined_metric_type == ALB_REQUEST_COUNT_PER_TARGET;
+            match (is_alb, predefined.resource_label.as_deref()) {
+                (true, None) => {
+                    return Err(validation(format!(
+                        "A {ALB_REQUEST_COUNT_PER_TARGET} policy requires a ResourceLabel \
+                         identifying the target group the request count is measured per"
+                    )))
+                }
+                (false, Some(_)) => {
+                    return Err(validation(format!(
+                        "ResourceLabel cannot be specified unless the predefined metric type is \
+                         {ALB_REQUEST_COUNT_PER_TARGET}, got {}",
+                        predefined.predefined_metric_type
+                    )))
+                }
+                _ => {}
+            }
+        }
+        (None, Some(customized)) => {
+            if let Some(statistic) = customized.statistic.as_deref() {
+                crate::state::check_enum(
+                    "customizedMetricSpecification.statistic",
+                    statistic,
+                    METRIC_STATISTIC_VALUES,
+                )
+                .map_err(validation)?;
+            }
+            // A customised specification describes a metric either by naming one or as a
+            // metric math query, and one of the two has to be there.
+            let names_metric = customized.metric_name.is_some() && customized.namespace.is_some();
+            let has_query = customized
+                .metrics
+                .as_ref()
+                .is_some_and(|metrics| !metrics.is_empty());
+            if !names_metric && !has_query {
+                return Err(validation(
+                    "A CustomizedMetricSpecification requires either MetricName and Namespace or \
+                     a Metrics query",
+                ));
+            }
+            // A query names no single series, so the alarms a policy of this shape would be
+            // driven by are not ones this slice can materialise. AWS accepts the form, so
+            // it is answered with the scaffold's 501 — "nobody has written this yet" —
+            // rather than with a 200 that provisions nothing.
+            if !names_metric {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "PutScalingPolicy with a CustomizedMetricSpecification metric math query",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a step-scaling configuration whose steps cannot be evaluated.
+///
+/// Both rules are the model's own: "At least one step adjustment is required if you are
+/// adding a new step scaling policy configuration", and of a step adjustment's bounds, "the
+/// upper and lower bound can't be null in the same step adjustment" with "at most one step
+/// adjustment can have a null lower bound" and the same for the upper bound.
+fn check_step_config(
+    config: &StepScalingPolicyConfiguration,
+) -> Result<(), PutScalingPolicyError> {
+    if let Some(adjustment_type) = config.adjustment_type.as_deref() {
+        crate::state::check_enum("adjustmentType", adjustment_type, ADJUSTMENT_TYPE_VALUES)
+            .map_err(validation)?;
+    }
+    if let Some(aggregation) = config.metric_aggregation_type.as_deref() {
+        crate::state::check_enum(
+            "metricAggregationType",
+            aggregation,
+            METRIC_AGGREGATION_TYPE_VALUES,
+        )
+        .map_err(validation)?;
+    }
+    let adjustments = config.step_adjustments.as_deref().unwrap_or(&[]);
+    if adjustments.is_empty() {
+        return Err(validation(
+            "A StepScaling policy requires at least one StepAdjustment",
+        ));
+    }
+    let mut unbounded_below = 0usize;
+    let mut unbounded_above = 0usize;
+    for adjustment in adjustments {
+        match (
+            adjustment.metric_interval_lower_bound,
+            adjustment.metric_interval_upper_bound,
+        ) {
+            (None, None) => {
+                return Err(validation(
+                    "A StepAdjustment must specify MetricIntervalLowerBound or \
+                     MetricIntervalUpperBound: the upper and lower bound cannot both be null in \
+                     the same step adjustment",
+                ))
+            }
+            (None, Some(_)) => unbounded_below += 1,
+            (Some(_), None) => unbounded_above += 1,
+            (Some(_), Some(_)) => {}
+        }
+    }
+    if unbounded_below > 1 || unbounded_above > 1 {
+        return Err(validation(
+            "At most one StepAdjustment can have a null MetricIntervalLowerBound, and at most one \
+             a null MetricIntervalUpperBound",
+        ));
+    }
+    Ok(())
 }
 
 /// This operation's modelled `ValidationException`, carrying `message`.

@@ -167,7 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{check_dimension_namespace, check_enum, PolicyKey, TargetKey};
 
@@ -206,24 +206,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy_name: input.policy_name.clone(),
         };
 
-        let mut state = state.lock();
-        // Deleting a policy that is not there is a failure, not a quiet success: the
-        // caller has to be able to tell "it is gone now" from "that is not its name".
-        if state.policies.remove(&key).is_none() {
-            return Err(DeleteScalingPolicyErrorModeled::ObjectNotFoundException(
-                ObjectNotFoundException {
-                    message: Some(format!(
-                        "No scaling policy found for service namespace: {}, resource ID: {}, \
-                         scalable dimension: {}, policy name: {}",
-                        key.target.service_namespace,
-                        key.target.resource_id,
-                        key.target.scalable_dimension,
-                        key.policy_name
-                    )),
-                },
-            )
-            .into());
-        }
+        // The removal happens under this service's lock and nothing else does: the guard
+        // is released at the end of this block, BEFORE the CloudWatch write below, so no
+        // request holds two service stores at once.
+        let removed = {
+            let mut state = state.lock();
+            // Deleting a policy that is not there is a failure, not a quiet success: the
+            // caller has to be able to tell "it is gone now" from "that is not its name".
+            let Some(removed) = state.policies.remove(&key) else {
+                return Err(DeleteScalingPolicyErrorModeled::ObjectNotFoundException(
+                    ObjectNotFoundException {
+                        message: Some(format!(
+                            "No scaling policy found for service namespace: {}, resource ID: \
+                             {}, scalable dimension: {}, policy name: {}",
+                            key.target.service_namespace,
+                            key.target.resource_id,
+                            key.target.scalable_dimension,
+                            key.policy_name
+                        )),
+                    },
+                )
+                .into());
+            };
+            removed
+        };
+        // The alarms a target-tracking policy minted exist because the policy does:
+        // "Deleting a target tracking scaling policy deletes the CloudWatch alarms that it
+        // created." A step policy's alarms are the CALLER's and survive it. Every other
+        // policy of the same target keeps its own either way.
+        crate::state::retire_policy_alarms(&*self.engine, &key, &removed.policy_type);
+
+        // The audit record for a destructive call.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            service_namespace = %key.target.service_namespace,
+            resource_id = %key.target.resource_id,
+            scalable_dimension = %key.target.scalable_dimension,
+            policy_name = %key.policy_name,
+            policy_type = %removed.policy_type,
+            outcome = "deleted",
+            "scaling policy deleted, with the alarms it minted"
+        );
 
         Ok(DeleteScalingPolicyOutput {})
     }

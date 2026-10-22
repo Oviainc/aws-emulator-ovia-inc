@@ -163,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{check_dimension_namespace, check_enum, TargetKey};
 
@@ -199,28 +199,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             scalable_dimension: input.scalable_dimension.clone(),
         };
 
-        let mut state = state.lock();
-        let Some(removed) = state.targets.remove(&key) else {
-            return Err(DeregisterScalableTargetErrorModeled::ObjectNotFoundException(
-                ObjectNotFoundException {
-                    message: Some(format!(
-                        "No scalable target found for service namespace: {}, resource ID: {}, \
-                         scalable dimension: {}",
-                        key.service_namespace, key.resource_id, key.scalable_dimension
-                    )),
-                },
-            )
-            .into());
-        };
+        // The whole cascade happens under this service's lock, and the guard is released
+        // at the end of this block — BEFORE the CloudWatch writes below, so no request
+        // holds two service stores at once.
+        let (removed, retired) = {
+            let mut state = state.lock();
+            let Some(removed) = state.targets.remove(&key) else {
+                return Err(DeregisterScalableTargetErrorModeled::ObjectNotFoundException(
+                    ObjectNotFoundException {
+                        message: Some(format!(
+                            "No scalable target registered for service namespace: {}, resource \
+                             ID: {}, scalable dimension: {}",
+                            key.service_namespace, key.resource_id, key.scalable_dimension
+                        )),
+                    },
+                )
+                .into());
+            };
 
-        // "Deregistering a scalable target deletes the scaling policies and the
-        // scheduled actions that are associated with it." Nothing may outlive the target
-        // it hangs off, or a later Describe would report a policy with no target.
-        state.arn_index.remove(&removed.arn);
-        state.policies.retain(|policy_key, _| policy_key.target != key);
-        state
-            .scheduled_actions
-            .retain(|action_key, _| action_key.target != key);
+            // "Deregistering a scalable target deletes the scaling policies and the
+            // scheduled actions that are associated with it." Nothing may outlive the
+            // target it hangs off, or a later Describe would report a policy with no
+            // target — and the CloudWatch alarms those policies minted go with them, so a
+            // re-registration of the same identity starts from a clean resource.
+            let retired: Vec<(crate::state::PolicyKey, String)> = state
+                .policies
+                .iter()
+                .filter(|(policy_key, _)| policy_key.target == key)
+                .map(|(policy_key, record)| (policy_key.clone(), record.policy_type.clone()))
+                .collect();
+            state.arn_index.remove(&removed.arn);
+            state.policies.retain(|policy_key, _| policy_key.target != key);
+            state
+                .scheduled_actions
+                .retain(|action_key, _| action_key.target != key);
+            (removed, retired)
+        };
+        for (policy_key, policy_type) in &retired {
+            crate::state::retire_policy_alarms(&*self.engine, policy_key, policy_type);
+        }
+
+        // The audit record for a destructive call: what was removed, and what went with it.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            service_namespace = %key.service_namespace,
+            resource_id = %key.resource_id,
+            scalable_dimension = %key.scalable_dimension,
+            scalable_target_arn = %removed.arn,
+            policies_retired = retired.len(),
+            outcome = "deregistered",
+            "scalable target deregistered, with its policies, scheduled actions and alarms"
+        );
 
         Ok(DeregisterScalableTargetOutput {})
     }

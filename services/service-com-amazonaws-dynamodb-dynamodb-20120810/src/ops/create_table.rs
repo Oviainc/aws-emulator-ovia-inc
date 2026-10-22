@@ -359,6 +359,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let description = table.describe(now);
         store.insert_table(table);
 
+        // The audit record for a state-changing call: who asked, what was created and that
+        // it succeeded. Never a credential — only the access key id the caller presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %name,
+            billing_mode = %description
+                .billing_mode_summary
+                .as_ref()
+                .and_then(|summary| summary.billing_mode.clone())
+                .unwrap_or_default(),
+            global_secondary_indexes = description
+                .global_secondary_indexes
+                .as_ref()
+                .map_or(0, Vec::len),
+            outcome = "created",
+            "table created"
+        );
+
         Ok(CreateTableOutput {
             table_description: Some(description),
         })

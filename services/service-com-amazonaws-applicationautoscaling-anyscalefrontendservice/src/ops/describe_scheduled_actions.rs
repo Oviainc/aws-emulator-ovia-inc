@@ -242,7 +242,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let state = state.lock();
+        let mut state = state.lock();
+        // An occurrence the clock has already made due has moved the target's capacity
+        // bounds whether or not anybody called, so it is materialised before this report
+        // is built rather than left to the next write.
+        crate::state::apply_due_scheduled_actions(&mut state, ::std::time::SystemTime::now());
+
         // Every filter the request carries narrows the set; they intersect rather than
         // widen it, and the stored action is returned as persisted.
         let matching: Vec<ScheduledAction> = state
@@ -268,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(names) => names.contains(&key.scheduled_action_name),
             })
             .filter(|(key, _)| resume_after.as_ref().is_none_or(|after| *key > after))
-            .map(|(_, action)| action.clone())
+            .map(|(_, record)| record.action.clone())
             .collect();
 
         let (scheduled_actions, next_token) = take_page(matching, page_size, |action| {

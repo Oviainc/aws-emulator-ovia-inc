@@ -1,0 +1,257 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The emulator the suites beside this file drive, and the request helpers they share.
+//!
+//! Application Auto Scaling does not stand alone: a scalable target is a capacity dimension
+//! of a resource that lives in ANOTHER service, and a target-tracking policy's alarms live
+//! in CloudWatch. So the emulator built here holds the three services over ONE engine —
+//! exactly what `core/router` assembles — and every call goes through the production
+//! `MultiServiceRouter::dispatch`, so what the suites assert is what a signing AWS client
+//! would see.
+#![allow(dead_code)]
+
+use std::sync::Arc;
+
+use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The region every test's SigV4 credential scope names; every minted ARN is scoped to it.
+pub const REGION: &str = "us-east-1";
+
+/// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
+pub const ACCOUNT: &str = "000000000000";
+
+/// One emulator over one shared engine.
+pub struct Emulator {
+    router: MultiServiceRouter,
+}
+
+impl Emulator {
+    /// Application Auto Scaling, DynamoDB and CloudWatch on one engine, with each name in
+    /// `tables` created as a PROVISIONED DynamoDB table of one read and one write unit.
+    ///
+    /// A scalable target is a capacity dimension OF A RESOURCE, so registering one resolves
+    /// that resource in the service that owns it: a suite whose rows register a `dynamodb`
+    /// target names the tables those rows need here, rather than relying on a list another
+    /// suite maintains.
+    pub async fn with_tables(tables: &[&str]) -> Self {
+        let emulator = Self::empty();
+        for table in tables {
+            emulator.create_provisioned_table(table, 1, 1).await;
+        }
+        emulator
+    }
+
+    /// The same emulator with no resource created yet, for a suite whose rows create the
+    /// resources they need (or deliberately do not).
+    pub fn empty() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        // The suites drive unsigned requests; the `Authorization` header is still what
+        // routes each request and names its region, as a signed client's would.
+        router.set_request_authentication(false);
+        router.register_service(
+            service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
+        router.register_service(
+            service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
+        );
+        router.register_service(
+            service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+                engine,
+            ),
+        );
+        Self { router }
+    }
+
+    /// Call an Application Auto Scaling operation.
+    pub async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.dispatch(
+            "application-autoscaling",
+            "application/x-amz-json-1.1",
+            &format!("AnyScaleFrontendService.{operation}"),
+            body,
+        )
+        .await
+    }
+
+    /// Call a DynamoDB operation.
+    pub async fn call_dynamodb(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.dispatch(
+            "dynamodb",
+            "application/x-amz-json-1.0",
+            &format!("DynamoDB_20120810.{operation}"),
+            body,
+        )
+        .await
+    }
+
+    /// Call a CloudWatch operation.
+    pub async fn call_cloudwatch(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.dispatch(
+            "monitoring",
+            "application/x-amz-json-1.0",
+            &format!("GraniteServiceVersion20100801.{operation}"),
+            body,
+        )
+        .await
+    }
+
+    /// Dispatch one request, returning the HTTP status and the parsed response.
+    async fn dispatch(
+        &self,
+        signing_name: &str,
+        content_type: &str,
+        target: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", content_type)
+            .header("x-amz-target", target)
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{REGION}/{signing_name}\
+                     /aws4_request, SignedHeaders=host, Signature=0"
+                ),
+            )
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(&body).expect("the request body serializes"),
+            ))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let parsed = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
+    /// Create a PROVISIONED DynamoDB table with `read` and `write` capacity units.
+    pub async fn create_provisioned_table(&self, name: &str, read: i64, write: i64) {
+        self.create_table(
+            name,
+            json!({"BillingMode": "PROVISIONED",
+                   "ProvisionedThroughput": {"ReadCapacityUnits": read, "WriteCapacityUnits": write}}),
+        )
+        .await;
+    }
+
+    /// Create a PAY_PER_REQUEST (on-demand) DynamoDB table, which has no provisioned
+    /// capacity at all.
+    pub async fn create_on_demand_table(&self, name: &str) {
+        self.create_table(name, json!({"BillingMode": "PAY_PER_REQUEST"}))
+            .await;
+    }
+
+    /// Create a PROVISIONED table carrying one global secondary index on `index_key`.
+    pub async fn create_table_with_index(
+        &self,
+        name: &str,
+        index: &str,
+        index_key: &str,
+        read: i64,
+        write: i64,
+    ) {
+        self.create_table(
+            name,
+            json!({
+                "BillingMode": "PROVISIONED",
+                "ProvisionedThroughput": {"ReadCapacityUnits": read, "WriteCapacityUnits": write},
+                "AttributeDefinitions": [
+                    {"AttributeName": "pk", "AttributeType": "S"},
+                    {"AttributeName": index_key, "AttributeType": "S"},
+                ],
+                "GlobalSecondaryIndexes": [{
+                    "IndexName": index,
+                    "KeySchema": [{"AttributeName": index_key, "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                    "ProvisionedThroughput": {
+                        "ReadCapacityUnits": read, "WriteCapacityUnits": write,
+                    },
+                }],
+            }),
+        )
+        .await;
+    }
+
+    /// Create a table from `overrides` merged over the one-attribute default.
+    async fn create_table(&self, name: &str, overrides: Value) {
+        let mut request = json!({
+            "TableName": name,
+            "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        });
+        for (member, value) in overrides.as_object().into_iter().flatten() {
+            request[member] = value.clone();
+        }
+        let (status, body) = self.call_dynamodb("CreateTable", request).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected CreateTable to answer 200, got {status} {body:?}"
+        );
+    }
+
+    /// Every alarm CloudWatch holds under the `TargetTracking` prefix, by alarm name.
+    pub async fn target_tracking_alarms(&self) -> Vec<Value> {
+        let (status, body) = self
+            .call_cloudwatch(
+                "DescribeAlarms",
+                json!({"AlarmNamePrefix": ALARM_NAME_PREFIX, "MaxRecords": 100}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "expected DescribeAlarms to answer 200, got {status} {body:?}"
+        );
+        let mut alarms = body["MetricAlarms"].as_array().cloned().unwrap_or_default();
+        alarms.sort_by_key(|alarm| alarm["AlarmName"].as_str().unwrap_or_default().to_string());
+        alarms
+    }
+}
+
+/// The prefix Application Auto Scaling gives every alarm it mints, which is what lets a
+/// client find them with `DescribeAlarms`.
+pub const ALARM_NAME_PREFIX: &str = "TargetTracking";
+
+/// Which of a policy's alarms an alarm name is: the segment between the resource id and the
+/// opaque id, as `TargetTracking-<resource id>-<kind>-<id>`.
+pub fn alarm_kind(alarm: &Value) -> String {
+    let name = alarm["AlarmName"].as_str().unwrap_or_default();
+    let mut segments = name.rsplitn(3, '-');
+    segments.next();
+    segments.next().unwrap_or_default().to_string()
+}
+
+/// The kinds of the alarms in `alarms`, sorted, as `DescribeAlarms` reported them.
+pub fn alarm_kinds(alarms: &[Value]) -> Vec<String> {
+    let mut kinds: Vec<String> = alarms.iter().map(alarm_kind).collect();
+    kinds.sort();
+    kinds
+}
+
+/// The `__type` discriminator an awsJson error body carries, without its namespace.
+pub fn error_code(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .map(|name| name.rsplit('#').next().unwrap_or(name).to_string())
+        .unwrap_or_default()
+}
+
+/// The `Message` an error body carries, whichever casing the protocol rendered it in.
+pub fn error_message(body: &Value) -> String {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}

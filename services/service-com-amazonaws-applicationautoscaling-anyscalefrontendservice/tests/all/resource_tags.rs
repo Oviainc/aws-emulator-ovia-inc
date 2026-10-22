@@ -24,7 +24,7 @@ use service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::state:
     MAX_TAGS_PER_RESOURCE, RESERVED_TAG_KEY_PREFIX,
 };
 
-use crate::scalable_target_lifecycle::{error_code, Emulator, ACCOUNT, REGION};
+use crate::emulator::{error_code, Emulator, ACCOUNT, REGION};
 
 /// `(ServiceNamespace, ResourceId, ScalableDimension)` triples the suites register, so
 /// the rule is exercised against more than one target identity. The namespace/dimension
@@ -73,12 +73,18 @@ fn generated_tags(count: usize) -> Value {
 /// the ARN the service minted for it.
 async fn register(emulator: &Emulator, index: usize, case: &str) -> String {
     let (namespace, resource_id, dimension) = IDENTITIES[index % IDENTITIES.len()];
+    let resource_id = format!("{resource_id}-{index}");
+    // A scalable target resolves the resource it scales in the service that owns it, so
+    // the DynamoDB rows get their table created first.
+    if let Some(table) = resource_id.strip_prefix("table/") {
+        emulator.create_provisioned_table(table, 1, 1).await;
+    }
     let (status, body) = emulator
         .call(
             "RegisterScalableTarget",
             json!({
                 "ServiceNamespace": namespace,
-                "ResourceId": format!("{resource_id}-{index}"),
+                "ResourceId": resource_id,
                 "ScalableDimension": dimension,
                 "MinCapacity": 1,
                 "MaxCapacity": 10,
@@ -200,7 +206,7 @@ const MERGE_TABLE: &[MergeRow] = &[
 
 #[tokio::test]
 async fn tagging_merges_the_batch_into_the_stored_tag_set() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
 
     for (index, row) in MERGE_TABLE.iter().enumerate() {
         let case = row.case;
@@ -223,7 +229,7 @@ async fn tagging_merges_the_batch_into_the_stored_tag_set() {
 
 #[tokio::test]
 async fn tags_set_when_the_target_is_registered_are_reported_and_then_mergeable() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::with_tables(&["created-with-tags"]).await;
     let case = "create-time tags round-trip";
 
     // `RegisterScalableTarget` takes create-time `Tags`; the same tag set must be what
@@ -337,7 +343,7 @@ const UNTAG_TABLE: &[UntagRow] = &[
 
 #[tokio::test]
 async fn untagging_removes_exactly_the_keys_named() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
 
     for (index, row) in UNTAG_TABLE.iter().enumerate() {
         let case = row.case;
@@ -369,7 +375,7 @@ async fn untagging_removes_exactly_the_keys_named() {
 
 #[tokio::test]
 async fn the_per_resource_tag_maximum_is_the_bound_on_the_whole_tag_set() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
 
     // AT the bound: a batch of exactly the maximum lands, and every key is readable.
     let case = format!("a batch of {MAX_TAGS_PER_RESOURCE} tags (the bound)");
@@ -454,7 +460,7 @@ async fn the_per_resource_tag_maximum_is_the_bound_on_the_whole_tag_set() {
 
 #[tokio::test]
 async fn the_modelled_key_and_value_lengths_are_enforced_at_their_bounds() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
     // The bounds are the model's own: `TagMap` keys target `TagKey` (len 1..128) and
     // values target `TagValue` (len 0..256) — `smithy_query(query="shape",
     // shape="TagMap,TagKey,TagValue")`.
@@ -532,7 +538,7 @@ async fn the_modelled_key_and_value_lengths_are_enforced_at_their_bounds() {
 
 #[tokio::test]
 async fn the_reserved_tag_key_namespace_is_refused_atomically() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
 
     // Rows differ along how the reserved prefix appears: alone, with the rest of a real
     // AWS-generated key, in the other case, and beside keys that are perfectly legal.
@@ -616,7 +622,7 @@ async fn the_reserved_tag_key_namespace_is_refused_atomically() {
 
 #[tokio::test]
 async fn a_resource_arn_naming_no_registered_target_is_refused() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
 
     // A target that was registered and then deregistered: its ARN was real and is not
     // any more, so it names no scalable target either.
@@ -714,7 +720,7 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
 
 #[tokio::test]
 async fn a_resource_arn_outside_the_modelled_pattern_is_refused_at_the_boundary() {
-    let emulator = Emulator::new();
+    let emulator = Emulator::empty();
 
     // Rows that break the modelled `@pattern`/`@length` on `ResourceARN`: a different
     // resource type, a different service, and the empty string (len min 1). Each is a

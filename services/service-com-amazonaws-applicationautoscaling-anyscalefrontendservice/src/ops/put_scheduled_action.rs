@@ -205,8 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            check_dimension_namespace, check_enum, scheduled_action_arn, timestamp_of,
-            ScheduledActionKey, TargetKey,
+            check_dimension_namespace, check_enum, check_resource_id_form, parse_schedule,
+            scheduled_action_arn, timestamp_of, ScheduledActionKey, ScheduledActionRecord,
+            TargetKey,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -237,12 +238,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(validation)?;
         check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
             .map_err(validation)?;
+        check_resource_id_form(
+            &input.service_namespace,
+            &input.resource_id,
+            &input.scalable_dimension,
+        )
+        .map_err(validation)?;
+        check_scheduled_action_name(&input.scheduled_action_name).map_err(validation)?;
 
+        // A schedule the request carries has to be one of the three documented
+        // expressions: one that cannot be parsed names no instant, so the action could
+        // never run. An absent `Schedule` keeps what was persisted, which is resolved
+        // against the stored action below.
         if let Some(schedule) = input.schedule.as_deref() {
-            check_schedule(schedule).map_err(validation)?;
+            parse_schedule(schedule).map_err(validation)?;
         }
         if let Some(action) = input.scalable_target_action.as_ref() {
             check_scalable_target_action(action).map_err(validation)?;
+        }
+        // The time zone the schedule is read in, resolved against the IANA zone database.
+        crate::state::schedule_timezone(input.timezone.as_deref()).map_err(validation)?;
+        // Both instants have to be inside the range this service computes in, so no stored
+        // record carries a value a later pass cannot work with.
+        for (member, instant) in [
+            ("startTime", input.start_time.as_ref()),
+            ("endTime", input.end_time.as_ref()),
+        ] {
+            if let Some(instant) = instant {
+                let seconds = instant.as_secs_f64();
+                if !seconds.is_finite()
+                    || seconds < 0.0
+                    || seconds > crate::state::MAX_TIMESTAMP_SECS as f64
+                {
+                    return Err(validation(format!(
+                        "Value '{seconds}' at '{member}' failed to satisfy constraint: Member \
+                         must be between the epoch and {} seconds after it",
+                        crate::state::MAX_TIMESTAMP_SECS
+                    )));
+                }
+            }
         }
         // "When you specify start and end times […] they form the boundaries for when the
         // recurring action starts and stops": a pair of boundaries in the wrong order is
@@ -264,7 +298,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             scheduled_action_name: input.scheduled_action_name.clone(),
         };
 
+        let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
+        crate::state::apply_due_scheduled_actions(&mut state, now);
 
         // A scheduled action only exists against a registered scalable target: "You
         // cannot create a scheduled action until you have registered the resource as a
@@ -273,8 +309,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(PutScheduledActionErrorModeled::ObjectNotFoundException(
                 ObjectNotFoundException {
                     message: Some(format!(
-                        "No scalable target found for service namespace: {}, resource ID: {}, \
-                         scalable dimension: {}",
+                        "No scalable target registered for service namespace: {}, resource ID: \
+                         {}, scalable dimension: {}",
                         key.target.service_namespace,
                         key.target.resource_id,
                         key.target.scalable_dimension
@@ -293,7 +329,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the action is being created.
         let schedule = match (input.schedule.clone(), stored.as_ref()) {
             (Some(schedule), _) => schedule,
-            (None, Some(existing)) => existing.schedule.clone(),
+            (None, Some(existing)) => existing.action.schedule.clone(),
             (None, None) => {
                 return Err(validation(
                     "Schedule is required when creating a scheduled action",
@@ -305,8 +341,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // survive every later Put for the same (namespace, resource, dimension, name).
         let (scheduled_action_arn, creation_time) = match stored.as_ref() {
             Some(existing) => (
-                existing.scheduled_action_arn.clone(),
-                existing.creation_time,
+                existing.action.scheduled_action_arn.clone(),
+                existing.action.creation_time,
             ),
             None => {
                 // The emulator's own store bound, checked only on the create path so an
@@ -325,7 +361,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 (
                     scheduled_action_arn(&crate::state::request_region(ctx.parts()), &key),
-                    timestamp_of(::std::time::SystemTime::now()),
+                    timestamp_of(now),
                 )
             }
         };
@@ -340,7 +376,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             timezone: input.timezone.clone().or_else(|| {
                 stored
                     .as_ref()
-                    .and_then(|existing| existing.timezone.clone())
+                    .and_then(|existing| existing.action.timezone.clone())
             }),
             resource_id: key.target.resource_id.clone(),
             scalable_dimension: Some(key.target.scalable_dimension.clone()),
@@ -354,14 +390,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             scalable_target_action: input.scalable_target_action.clone().or_else(|| {
                 stored
                     .as_ref()
-                    .and_then(|existing| existing.scalable_target_action.clone())
+                    .and_then(|existing| existing.action.scalable_target_action.clone())
             }),
             creation_time,
         };
-        state.scheduled_actions.insert(key, action);
+        state.scheduled_actions.insert(
+            key.clone(),
+            ScheduledActionRecord {
+                action,
+                // A put re-arms the action: the occurrence that fires next is the first one
+                // AFTER this moment, so the schedule it was just given decides it and no
+                // occurrence from before the put is replayed.
+                last_applied: Some(now),
+            },
+        );
+
+        // The audit record for a state-changing call.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            service_namespace = %key.target.service_namespace,
+            resource_id = %key.target.resource_id,
+            scalable_dimension = %key.target.scalable_dimension,
+            scheduled_action_name = %key.scheduled_action_name,
+            outcome = "put",
+            "scheduled action put"
+        );
 
         Ok(PutScheduledActionOutput {})
     }
+}
+
+/// `Ok` when `name` satisfies the `ScheduledActionName` pattern.
+///
+/// The model's own constraint:
+/// `^(?!((^[ ]+.*)|(.*([\u0000-\u001f]|[\u007f-\u009f]|[:/|])+.*)|(.*[ ]+$))).+$` — a
+/// non-empty name that neither starts nor ends with a space and carries no control
+/// character and no `:`, `/` or `|`. It is checked here because the name is a path segment
+/// of the action's own ARN: a name carrying one of those characters would not be
+/// recoverable from it.
+fn check_scheduled_action_name(name: &str) -> Result<(), String> {
+    /// The characters the pattern's middle alternative forbids anywhere in the name.
+    const FORBIDDEN: [char; 3] = [':', '/', '|'];
+
+    let forbidden = |character: char| {
+        FORBIDDEN.contains(&character)
+            || character.is_control()
+            || ('\u{7f}'..='\u{9f}').contains(&character)
+    };
+    if !name.is_empty()
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && !name.chars().any(forbidden)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Value '{name}' at 'scheduledActionName' failed to satisfy constraint: Member must \
+         satisfy regular expression pattern: \
+         ^(?!((^[ ]+.*)|(.*([\\u0000-\\u001f]|[\\u007f-\\u009f]|[:/|])+.*)|(.*[ ]+$))).+$"
+    ))
 }
 
 /// This operation's modelled `ValidationException`, carrying `message`.
@@ -375,85 +463,15 @@ fn validation(message: impl Into<String>) -> PutScheduledActionError {
 /// The units a `rate(value unit)` schedule accepts, from the model's own documentation
 /// for `Schedule`: "For rate expressions, value is a positive integer and unit is
 /// `minute` | `minutes` | `hour` | `hours` | `day` | `days`."
-pub const SCHEDULE_RATE_UNITS: &[&str] = &["minute", "minutes", "hour", "hours", "day", "days"];
+///
+/// Re-exported from [`crate::state::RATE_UNITS`], the table `parse_schedule` reads, so the
+/// set a suite pins and the set the parser enforces cannot drift apart.
+pub use crate::state::RATE_UNITS as SCHEDULE_RATE_UNITS;
 
 /// How many whitespace-separated fields a `cron(…)` schedule carries: "The cron format
 /// consists of six fields separated by white spaces: [Minutes] [Hours] [Day_of_Month]
-/// [Month] [Day_of_Week] [Year]."
-pub const SCHEDULE_CRON_FIELDS: usize = 6;
-
-/// The character count of an `at` expression's body — `yyyy-mm-ddThh:mm:ss`, the format
-/// the model documents, with no zone designator and no fractional seconds.
-const AT_EXPRESSION_LEN: usize = "yyyy-mm-ddThh:mm:ss".len();
-
-/// `Ok` when `schedule` is one of the three expression forms the model documents, else
-/// the `ValidationException` message naming the member and what it must be.
-///
-/// Only the expression's SYNTAX is checked here. Nothing in this emulator dispatches a
-/// scheduled action yet, so a cron expression's fields are stored as written rather than
-/// resolved to fire times.
-fn check_schedule(schedule: &str) -> Result<(), String> {
-    let refuse = |detail: &str| {
-        format!(
-            "Value '{schedule}' at 'schedule' failed to satisfy constraint: \
-             Member must be an at, rate or cron expression ({detail})"
-        )
-    };
-
-    let Some((kind, rest)) = schedule.split_once('(') else {
-        return Err(refuse("expected at(…), rate(…) or cron(…)"));
-    };
-    let Some(body) = rest.strip_suffix(')') else {
-        return Err(refuse("the expression is not closed by ')'"));
-    };
-
-    match kind {
-        "at" => {
-            // `at(yyyy-mm-ddThh:mm:ss)` is a civil time — UTC unless `Timezone` says
-            // otherwise — so it parses as RFC 3339 once a zone is appended.
-            if body.len() != AT_EXPRESSION_LEN
-                || ::aws_smithy_types::DateTime::from_str(
-                    &format!("{body}Z"),
-                    ::aws_smithy_types::date_time::Format::DateTime,
-                )
-                .is_err()
-            {
-                return Err(refuse("an at expression reads at(yyyy-mm-ddThh:mm:ss)"));
-            }
-            Ok(())
-        }
-        "rate" => {
-            let fields: Vec<&str> = body.split_whitespace().collect();
-            let [value, unit] = fields[..] else {
-                return Err(refuse("a rate expression reads rate(value unit)"));
-            };
-            // "value is a positive integer": zero is not an interval, and a sign or a
-            // fraction is not an integer.
-            if !value.bytes().all(|byte| byte.is_ascii_digit())
-                || value.parse::<u64>().unwrap_or_default() == 0
-            {
-                return Err(refuse("a rate expression's value is a positive integer"));
-            }
-            if !SCHEDULE_RATE_UNITS.contains(&unit) {
-                return Err(refuse(&format!(
-                    "a rate expression's unit is one of [{}]",
-                    SCHEDULE_RATE_UNITS.join(", ")
-                )));
-            }
-            Ok(())
-        }
-        "cron" => {
-            let fields = body.split_whitespace().count();
-            if fields != SCHEDULE_CRON_FIELDS {
-                return Err(refuse(&format!(
-                    "a cron expression carries {SCHEDULE_CRON_FIELDS} fields, not {fields}"
-                )));
-            }
-            Ok(())
-        }
-        _ => Err(refuse("expected at(…), rate(…) or cron(…)")),
-    }
-}
+/// [Month] [Day_of_Week] [Year]." Re-exported from the parser's own constant.
+pub use crate::state::CRON_FIELDS as SCHEDULE_CRON_FIELDS;
 
 /// `Ok` when the scheduled capacity window is a window at all.
 ///

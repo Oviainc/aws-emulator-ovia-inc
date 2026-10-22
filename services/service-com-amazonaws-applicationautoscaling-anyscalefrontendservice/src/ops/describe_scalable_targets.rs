@@ -225,7 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        let state = state.lock();
+        let mut state = state.lock();
+        // A scheduled action's occurrence moves the target's capacity bounds, and it was
+        // due at its scheduled instant whether or not anybody called, so what this report
+        // shows is the bounds AFTER every occurrence the clock has already made due.
+        crate::state::apply_due_scheduled_actions(&mut state, ::std::time::SystemTime::now());
         let matching: Vec<ScalableTarget> = state
             .targets
             .iter()
