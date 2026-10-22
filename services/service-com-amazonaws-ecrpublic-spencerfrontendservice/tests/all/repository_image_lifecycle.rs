@@ -1451,7 +1451,6 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
     for (operation, body) in [
         ("GetAuthorizationToken", json!({})),
         ("DescribeRegistries", json!({})),
-        ("GetRegistryCatalogData", json!({})),
         (
             "GetRepositoryCatalogData",
             json!({"repositoryName": "team/app"}),

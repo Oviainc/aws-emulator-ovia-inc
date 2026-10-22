@@ -15,6 +15,8 @@
 mod client_error_message_templates;
 #[path = "all/layer_upload_sessions.rs"]
 mod layer_upload_sessions;
+#[path = "all/registry_catalog_data.rs"]
+mod registry_catalog_data;
 #[path = "all/repository_image_lifecycle.rs"]
 mod repository_image_lifecycle;
 #[path = "all/state_roundtrip.rs"]

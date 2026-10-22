@@ -3,8 +3,9 @@
 //! Engine state for the com-amazonaws-ecrpublic-spencerfrontendservice service.
 //!
 //! This module owns the public registry the handlers in `src/ops/` share — its
-//! repositories and the images pushed into them, plus the in-flight layer uploads
-//! `InitiateLayerUpload` opens — plus the few pieces of behaviour
+//! repositories, the images pushed into them, the in-flight layer uploads
+//! `InitiateLayerUpload` opens and the one catalog display name the registry itself
+//! carries — plus the few pieces of behaviour
 //! that no single operation file can own on its own:
 //!
 //! * the ARN / URI forms every repository carries ([`StoredRepository`] is built once,
@@ -24,8 +25,8 @@ use std::time::SystemTime;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ImageDetail, ImageIdentifier, Repository, RepositoryCatalogData, RepositoryCatalogDataInput,
-    Tag,
+    ImageDetail, ImageIdentifier, RegistryCatalogData, Repository, RepositoryCatalogData,
+    RepositoryCatalogDataInput, Tag,
 };
 
 /// The `ecr-public` ARN namespace, as the Smithy model's `awsService` trait declares it
@@ -293,6 +294,13 @@ pub struct ComAmazonawsEcrpublicSpencerfrontendserviceState {
     /// Repositories keyed by `repositoryName`, so `DescribeRepositories` pages in name
     /// order.
     pub repositories: BTreeMap<String, StoredRepository>,
+    /// The registry's catalog display name — the ONE `RegistryCatalogData` this registry
+    /// has (`RegistryCatalogData` is "the metadata for a public registry" and carries
+    /// `displayName` alone), so it lives here beside the registry id rather than per
+    /// repository. `None` until a `PutRegistryCatalogData` call sets one, which is what
+    /// lets `GetRegistryCatalogData` report an unset display name as absent rather than
+    /// as an invented string.
+    pub registry_display_name: Option<String>,
     /// In-flight layer uploads keyed by the `uploadId` `InitiateLayerUpload` minted, the
     /// handle `UploadLayerPart` and `CompleteLayerUpload` address an upload by.
     pub uploads: BTreeMap<String, LayerUpload>,
@@ -304,6 +312,7 @@ impl Default for ComAmazonawsEcrpublicSpencerfrontendserviceState {
             registry_id: ::engine::EMULATOR_ACCOUNT_ID.to_string(),
             registry_alias: DEFAULT_REGISTRY_ALIAS.to_string(),
             repositories: BTreeMap::new(),
+            registry_display_name: None,
             uploads: BTreeMap::new(),
         }
     }
@@ -326,6 +335,16 @@ impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
     /// registry alias, then the repository name.
     pub fn repository_uri(&self, repository_name: &str) -> String {
         format!("{GALLERY_HOST}/{}/{repository_name}", self.registry_alias)
+    }
+
+    /// This registry's catalog metadata as the modelled `RegistryCatalogData` shape: what
+    /// `GetRegistryCatalogData` reports and `PutRegistryCatalogData` answers with after a
+    /// write. There is exactly one per registry, so both operations project this one
+    /// stored value.
+    pub fn registry_catalog_data(&self) -> RegistryCatalogData {
+        RegistryCatalogData {
+            display_name: self.registry_display_name.clone(),
+        }
     }
 
     /// Whether `registry_id` — a request's `registryId`, which the model lets be either
