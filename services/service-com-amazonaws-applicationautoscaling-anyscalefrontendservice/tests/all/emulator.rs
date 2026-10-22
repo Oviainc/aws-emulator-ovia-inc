@@ -369,6 +369,31 @@ pub fn alarm_kinds(alarms: &[Value]) -> Vec<String> {
     kinds
 }
 
+/// An `at(yyyy-mm-ddThh:mm:ss)` schedule for the instant `due_in` from now, and that
+/// instant.
+///
+/// A suite that watches an occurrence come due needs the expression and the instant it
+/// names together: nothing sleeps in the service, so the occurrence is materialised by the
+/// first request after that instant passes, and the caller waits for it itself. Shared here
+/// rather than copied per suite so both read the same wall clock the same way.
+pub fn at_schedule_in(due_in: std::time::Duration) -> (String, std::time::SystemTime) {
+    let at = std::time::SystemTime::now() + due_in;
+    let seconds = at
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("an instant after the epoch")
+        .as_secs();
+    let schedule = format!(
+        "at({})",
+        chrono::DateTime::from_timestamp(
+            i64::try_from(seconds).expect("a representable instant"),
+            0
+        )
+        .expect("a representable instant")
+        .format("%Y-%m-%dT%H:%M:%S")
+    );
+    (schedule, at)
+}
+
 /// The `__type` discriminator an awsJson error body carries, without its namespace.
 pub fn error_code(body: &Value) -> String {
     body.get("__type")

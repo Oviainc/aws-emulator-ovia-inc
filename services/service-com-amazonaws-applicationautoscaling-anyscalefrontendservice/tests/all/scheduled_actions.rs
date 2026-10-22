@@ -20,7 +20,7 @@
 
 use serde_json::{json, Value};
 
-use super::emulator::{error_code, error_message, Emulator};
+use super::emulator::{at_schedule_in, error_code, error_message, Emulator};
 
 /// The scalable target every case below schedules against.
 const NAMESPACE: &str = "dynamodb";
@@ -419,18 +419,7 @@ async fn an_action_whose_time_has_come_moves_the_targets_capacity_bounds() {
     let emulator = registered().await;
     // An `at` expression a few seconds out: once that instant passes, the occurrence was
     // owed whether or not anybody called, so the next report shows the bounds it set.
-    let due_in = std::time::Duration::from_secs(5);
-    let at = std::time::SystemTime::now() + due_in;
-    let seconds = at
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .expect("an instant after the epoch")
-        .as_secs();
-    let schedule = format!(
-        "at({})",
-        chrono::DateTime::from_timestamp(seconds as i64, 0)
-            .expect("a representable instant")
-            .format("%Y-%m-%dT%H:%M:%S")
-    );
+    let (schedule, at) = at_schedule_in(std::time::Duration::from_secs(5));
     let mut request = action("due-shortly", &schedule);
     request["ScalableTargetAction"] = json!({"MinCapacity": 6, "MaxCapacity": 30});
     let (status, body) = emulator.call("PutScheduledAction", request).await;
