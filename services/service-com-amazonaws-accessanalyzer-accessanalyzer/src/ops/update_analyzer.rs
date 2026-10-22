@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAnalyzer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAnalyzer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAnalyzer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the stored `configuration` of the analyzer the path names, so every later
+//! `GetAnalyzer`/`ListAnalyzers` rebuilds its summary from the configuration this call
+//! stored, and answers with that same stored configuration.
+//!
+//! Supported only for an analyzer whose `type` HAS a configuration (the
+//! `_UNUSED_ACCESS` and `_INTERNAL_ACCESS` families): the model documents "This action
+//! is not supported for external access analyzers", so `ACCOUNT` / `ORGANIZATION` are
+//! refused with the modelled `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +150,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAnalyzer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAnalyzerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAnalyzer"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAnalyzerErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let mut state = state.lock();
+
+        // The analyzer has to exist: this operation modifies one, it never creates one.
+        // Fixed text, the name the caller asked for in the modelled `resourceId`: every
+        // resource-scoped refusal in this service goes through `crate::state`'s
+        // constructors.
+        let analyzer = state.analyzers.get_mut(&input.analyzer_name).ok_or_else(|| {
+            UpdateAnalyzerErrorModeled::ResourceNotFoundException(
+                crate::state::analyzer_not_found(&input.analyzer_name),
+            )
+        })?;
+
+        // "This action is not supported for external access analyzers" — an `ACCOUNT` or
+        // `ORGANIZATION` analyzer has no `AnalyzerConfiguration` to modify, so the
+        // request is refused rather than silently storing one.
+        let configured_access = analyzer.configured_access().ok_or_else(|| {
+            UpdateAnalyzerErrorModeled::ValidationException(crate::state::not_supported_exception(
+                format!(
+                    "UpdateAnalyzer is not supported for an analyzer of type {}",
+                    analyzer.r#type
+                ),
+            ))
+        })?;
+
+        if let Some(configuration) = input.configuration {
+            // An analyzer configures exactly ONE union member — the one its `type`
+            // names — so a configuration for the other family cannot be stored on it.
+            if !configured_access.matches(&configuration) {
+                return Err(UpdateAnalyzerErrorModeled::ValidationException(
+                    crate::state::field_validation_exception(
+                        "configuration",
+                        format!(
+                            "an analyzer of type {} is configured by `{}`, so `configuration` must carry that member",
+                            analyzer.r#type,
+                            configured_access.member_name()
+                        ),
+                    ),
+                )
+                .into());
+            }
+
+            // Bounds the model documents but does not express as constraints, so the
+            // boundary validator let them through; shared with `CreateAnalyzer`.
+            crate::state::validate_configuration(&configuration)
+                .map_err(UpdateAnalyzerErrorModeled::ValidationException)?;
+
+            // The configuration is REPLACED, not merged: the union holds one member and
+            // the request carries the whole of it.
+            analyzer.configuration = Some(configuration);
+        }
+
+        // A request carrying no `configuration` asks for no change, so the stored
+        // configuration stands — and either way the response is what is now stored,
+        // which is what a later `GetAnalyzer` reports.
+        Ok(UpdateAnalyzerOutput {
+            configuration: analyzer.configuration.clone(),
+        })
     }
 }

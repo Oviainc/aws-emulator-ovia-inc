@@ -163,6 +163,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
+        // Bounds the model documents for a configuration member but does not express as
+        // constraints, so the boundary validator let them through. Refused before
+        // anything is stored, and shared with `UpdateAnalyzer`, which accepts the same
+        // `AnalyzerConfiguration`.
+        //
+        // Only that documented NUMERIC bound is enforced here. Create deliberately does
+        // NOT refuse a `configuration` whose union member differs from the `type` asked
+        // for, even though `UpdateAnalyzer` does: the refusal Update applies is one its
+        // own documentation states ("This action is not supported for external access
+        // analyzers"), while this operation's `configuration` doc says only that the
+        // supplied scope "is used" when the analyzer is of the matching kind and
+        // publishes no refusal for any other pairing. Create therefore keeps storing
+        // exactly what the request carried, and `GetAnalyzer`/`ListAnalyzers` report it
+        // back; narrowing that is a change to THIS operation's accept/refuse surface and
+        // belongs to an issue about `CreateAnalyzer`, with a recording behind it.
+        if let Some(configuration) = input.configuration.as_ref() {
+            crate::state::validate_configuration(configuration)
+                .map_err(CreateAnalyzerErrorModeled::ValidationException)?;
+        }
+
         // A repeated `clientToken` is the SAME create retried, not a second create: it
         // answers with the ARN the first one returned rather than conflicting with the
         // analyzer that create already made.

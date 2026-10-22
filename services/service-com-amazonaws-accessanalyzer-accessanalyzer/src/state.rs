@@ -408,7 +408,70 @@ pub struct Analyzer {
     pub access_preview_tokens: ClientTokens<String>,
 }
 
+/// Which `AnalyzerConfiguration` union member an analyzer's `type` configures.
+///
+/// The model's `Type` enum has three families (`smithy_query(query="shape",
+/// shape="Type")`): the `_UNUSED_ACCESS` types configure `unusedAccess`, the
+/// `_INTERNAL_ACCESS` types configure `internalAccess`, and plain `ACCOUNT` /
+/// `ORGANIZATION` are the external access analyzers, which configure neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfiguredAccess {
+    /// `ACCOUNT_UNUSED_ACCESS` / `ORGANIZATION_UNUSED_ACCESS`.
+    UnusedAccess,
+    /// `ACCOUNT_INTERNAL_ACCESS` / `ORGANIZATION_INTERNAL_ACCESS`.
+    InternalAccess,
+}
+
+impl ConfiguredAccess {
+    /// The union member this family's configuration is carried in, as the wire names it.
+    pub fn member_name(self) -> &'static str {
+        match self {
+            Self::UnusedAccess => "unusedAccess",
+            Self::InternalAccess => "internalAccess",
+        }
+    }
+
+    /// Whether `configuration` is the union member this family configures.
+    pub fn matches(self, configuration: &AnalyzerConfiguration) -> bool {
+        matches!(
+            (self, configuration),
+            (
+                Self::UnusedAccess,
+                AnalyzerConfiguration::unusedAccess(_)
+            ) | (
+                Self::InternalAccess,
+                AnalyzerConfiguration::internalAccess(_)
+            )
+        )
+    }
+}
+
+/// Which configuration family an analyzer `type` belongs to, or `None` for an external
+/// access analyzer, which has no `AnalyzerConfiguration` to set.
+///
+/// The arms name the `Type` values the model publishes
+/// (`crate::ops::types::TYPE_VALUES`); a value this match does not name falls into the
+/// external-access arm, which is the conservative answer — `UpdateAnalyzer` then refuses
+/// it rather than storing a configuration under a family nothing here knows.
+pub fn configured_access(analyzer_type: &str) -> Option<ConfiguredAccess> {
+    match analyzer_type {
+        "ACCOUNT_UNUSED_ACCESS" | "ORGANIZATION_UNUSED_ACCESS" => {
+            Some(ConfiguredAccess::UnusedAccess)
+        }
+        "ACCOUNT_INTERNAL_ACCESS" | "ORGANIZATION_INTERNAL_ACCESS" => {
+            Some(ConfiguredAccess::InternalAccess)
+        }
+        // `ACCOUNT` and `ORGANIZATION` are external access analyzers.
+        _ => None,
+    }
+}
+
 impl Analyzer {
+    /// Which configuration family THIS analyzer belongs to; see [`configured_access`].
+    pub fn configured_access(&self) -> Option<ConfiguredAccess> {
+        configured_access(&self.r#type)
+    }
+
     /// Project the stored analyzer onto the modelled `AnalyzerSummary`.
     pub fn summary(&self) -> AnalyzerSummary {
         AnalyzerSummary {
@@ -677,6 +740,82 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// the model's own `VALIDATION_EXCEPTION_REASON_VALUES`.
 pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
+/// The `ValidationExceptionReason` for a well-formed request asking for something this
+/// resource does not support, from the same `VALIDATION_EXCEPTION_REASON_VALUES` list.
+pub const VALIDATION_REASON_NOT_SUPPORTED: &str = "notSupported";
+
+/// A `ValidationException` about ONE request member: the reason the model lists for a
+/// member that failed validation, and a `fieldList` naming it.
+///
+/// Unlike the resource-scoped refusals above, a validation message says what is wrong
+/// with the request, so it is composed from it; what this helper fixes is that every
+/// such refusal in this service carries the same reason and the same single-entry
+/// `fieldList` shape, built in one place rather than per call site.
+pub fn field_validation_exception(member: &str, message: impl Into<String>) -> ValidationException {
+    let message = message.into();
+    ValidationException {
+        message: message.clone(),
+        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }]),
+    }
+}
+
+/// A `ValidationException` for a well-formed request the named resource does not support
+/// at all, so no single member is at fault and there is no `fieldList`.
+pub fn not_supported_exception(message: impl Into<String>) -> ValidationException {
+    ValidationException {
+        message: message.into(),
+        reason: VALIDATION_REASON_NOT_SUPPORTED.to_string(),
+        field_list: None,
+    }
+}
+
+/// The smallest `unusedAccessAge` an `UnusedAccessConfiguration` may carry.
+///
+/// The model gives the member no `@range`, but its documentation does bound it — "You
+/// can choose a value between 1 and 365 days."
+/// (`smithy_query(query="doc",shape="UnusedAccessConfiguration",member="unusedAccessAge")`),
+/// so the boundary validator passes a value the service itself refuses. Hence the check
+/// in [`validate_configuration`].
+pub const UNUSED_ACCESS_AGE_MIN_DAYS: i32 = 1;
+
+/// The largest `unusedAccessAge` an `UnusedAccessConfiguration` may carry; see
+/// [`UNUSED_ACCESS_AGE_MIN_DAYS`] for the documented sentence both bounds come from.
+pub const UNUSED_ACCESS_AGE_MAX_DAYS: i32 = 365;
+
+/// Refuse an `AnalyzerConfiguration` whose values fall outside what the model documents
+/// but does not constrain, as this service's modelled `ValidationException`.
+///
+/// Shared by every operation that ACCEPTS a configuration (`CreateAnalyzer`,
+/// `UpdateAnalyzer`), so one member is bounded in one place rather than per operation.
+pub fn validate_configuration(
+    configuration: &AnalyzerConfiguration,
+) -> Result<(), ValidationException> {
+    let AnalyzerConfiguration::unusedAccess(unused_access) = configuration else {
+        // `internalAccess` carries no documented numeric bound of its own; its
+        // `analysisRule` members are strings the model already constrains.
+        return Ok(());
+    };
+    let Some(days) = unused_access.unused_access_age else {
+        return Ok(());
+    };
+    if (UNUSED_ACCESS_AGE_MIN_DAYS..=UNUSED_ACCESS_AGE_MAX_DAYS).contains(&days) {
+        return Ok(());
+    }
+    let message = format!(
+        "unusedAccessAge must be between {UNUSED_ACCESS_AGE_MIN_DAYS} and \
+         {UNUSED_ACCESS_AGE_MAX_DAYS} days, but was {days}"
+    );
+    // The member path a client has to fix, named the way the wire names the members.
+    Err(field_validation_exception(
+        "configuration.unusedAccess.unusedAccessAge",
+        message,
+    ))
+}
+
 /// One page of a listing: the items on it, and the token that resumes after them.
 #[derive(Debug)]
 pub struct Page<T> {
@@ -744,14 +883,7 @@ pub fn page_validation_exception(error: &PageError) -> ValidationException {
             format!("maxResults must be at least 1, but was {requested}"),
         ),
     };
-    ValidationException {
-        message: message.clone(),
-        reason: VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: name.to_string(),
-            message,
-        }]),
-    }
+    field_validation_exception(name, message)
 }
 
 /// Encode a listing key as an opaque continuation token.

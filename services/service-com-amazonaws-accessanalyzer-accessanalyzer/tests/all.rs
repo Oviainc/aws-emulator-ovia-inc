@@ -25,3 +25,5 @@ mod harness;
 mod policy_checks;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/update_analyzer.rs"]
+mod update_analyzer;

@@ -105,6 +105,11 @@ impl Emulator {
         self.send("GET", &format!("/analyzer/{name}"), None).await
     }
 
+    pub async fn update_analyzer(&self, name: &str, body: Value) -> Reply {
+        self.send("PUT", &format!("/analyzer/{name}"), Some(body))
+            .await
+    }
+
     pub async fn delete_analyzer(&self, name: &str) -> Reply {
         self.send("DELETE", &format!("/analyzer/{name}"), None).await
     }

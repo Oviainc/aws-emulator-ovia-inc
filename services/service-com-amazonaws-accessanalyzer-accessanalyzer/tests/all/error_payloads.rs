@@ -64,6 +64,7 @@ const RULE_NAME_FORMS: &[&str] = &["r", "nope", "Rule.Two-3_x"];
 #[derive(Debug, Clone, Copy)]
 enum AnalyzerCall {
     Get,
+    Update,
     Delete,
     GetArchiveRule,
     ListArchiveRules,
@@ -75,6 +76,7 @@ enum AnalyzerCall {
 /// absent analyzer rather than only the one the issue cited.
 const ANALYZER_CALLS: &[AnalyzerCall] = &[
     AnalyzerCall::Get,
+    AnalyzerCall::Update,
     AnalyzerCall::Delete,
     AnalyzerCall::GetArchiveRule,
     AnalyzerCall::ListArchiveRules,
@@ -86,6 +88,14 @@ impl AnalyzerCall {
     async fn send(self, emulator: &Emulator, analyzer: &str) -> Reply {
         match self {
             AnalyzerCall::Get => emulator.get_analyzer(analyzer).await,
+            AnalyzerCall::Update => {
+                emulator
+                    .update_analyzer(
+                        analyzer,
+                        json!({"configuration": {"unusedAccess": {"unusedAccessAge": 90}}}),
+                    )
+                    .await
+            }
             AnalyzerCall::Delete => emulator.delete_analyzer(analyzer).await,
             AnalyzerCall::GetArchiveRule => emulator.get_archive_rule(analyzer, "rule1").await,
             AnalyzerCall::ListArchiveRules => emulator.list_archive_rules(analyzer, "").await,
