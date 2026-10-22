@@ -23,9 +23,13 @@
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
-//! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//! - `override_refusal` — EDITED HERE. An ARN this service checks itself is refused with
+//!   this service's own sentence (see "This service's own ARN check" below); every other
+//!   request refused for breaking a modelled input constraint is worded by the ONE
+//!   formatter in [`validation`]: a `@pattern` is quoted without the `^` / `$` anchors the
+//!   model spells it with, and a violation on a collection's ELEMENT is reported at the
+//!   collection member with that element shape's whole constraint set. See the inline
+//!   note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -59,6 +63,8 @@
 //!   region the request addresses is not knowable there.
 //! * `override_refusal` words what is left: an ARN of this service's namespace that is
 //!   in-region but is not a well-formed ARN of the resource type it names.
+
+pub mod validation;
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -190,17 +196,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // `find_map`, not "every violation": the ARN check runs ahead of the modelled
         // constraints, so it decides the answer even when the same request also breaks
-        // another rule. Every OTHER refusal — a value outside a length, range or enum, a
-        // member that is not an ARN at all, an absent required member — keeps the
-        // framework's own wording, and so does an authentication refusal, which is not an
-        // input-constraint failure at all.
+        // another rule.
+        //
+        // EVERY OTHER input-constraint refusal — a value outside a length, range or enum,
+        // a member that is not an ARN at all, an absent required member — is worded by the
+        // ONE formatter in [`validation`], which states the AWS envelope with the two
+        // rules the framework's generic wording does not: a `@pattern` quoted WITHOUT the
+        // `^` / `$` the model anchors it with, and a violation on an ELEMENT of a
+        // collection reported against the collection MEMBER carrying that element shape's
+        // whole constraint set rather than against an indexed element position. Either way
+        // the code is the modelled `ValidationException` (HTTP 400) the framework would
+        // also have named: only the words change.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),
-                message: violations.iter().find_map(refused_arn_format)?,
+                message: violations
+                    .iter()
+                    .find_map(refused_arn_format)
+                    .or_else(|| validation::envelope(violations))?,
             }),
             // `Refusal` is `#[non_exhaustive]`: a refusal this service has no wording of
-            // its own for keeps the framework's.
+            // its own for keeps the framework's — an authentication refusal, say, which is
+            // not an input-constraint failure at all.
             _ => None,
         }
     }
