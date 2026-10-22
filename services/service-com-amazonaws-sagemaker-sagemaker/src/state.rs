@@ -2,12 +2,12 @@
 
 //! Engine state for the com-amazonaws-sagemaker-sagemaker service.
 //!
-//! The inference-deployment lifecycle (model -> endpoint config -> endpoint) and the
-//! model-card governance resources, batch-transform jobs and the AI benchmarking
-//! control plane's workload configurations are kept here, in `BTreeMap`s keyed by the
-//! resource name AWS keys them by, so `ListModels` has one stable order to sort and
-//! paginate over and every `Describe*` replays exactly what the matching `Create*`
-//! stored. The Studio
+//! The inference-deployment lifecycle (model -> endpoint config -> endpoint), the
+//! pipeline lifecycle, the model-card governance resources, batch-transform jobs and
+//! the AI benchmarking control plane's workload configurations are kept here, in
+//! `BTreeMap`s keyed by the resource name AWS keys them by, so `ListModels` has one
+//! stable order to sort and paginate over and every `Describe*` replays exactly what
+//! the matching `Create*` stored. The Studio
 //! AppImageConfig registry and the Git repositories `CreateCodeRepository` registers
 //! are kept the same way, keyed by `AppImageConfigName` and `CodeRepositoryName`.
 //!
@@ -26,9 +26,9 @@ use crate::ops::types::{
     KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
     ModelCardSecurityConfig, ModelClientConfig, ModelLifeCycle, ModelMetrics,
     ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
-    ModelPackageStatusItem, ModelPackageValidationSpecification, ProductionVariant,
-    ProductionVariantSummary, ResourceSpec, SourceAlgorithmSpecification, Tag, TransformInput,
-    TransformOutput, TransformResources, UserContext, VpcConfig,
+    ModelPackageStatusItem, ModelPackageValidationSpecification, ParallelismConfiguration,
+    ProductionVariant, ProductionVariantSummary, ResourceSpec, SourceAlgorithmSpecification, Tag,
+    TransformInput, TransformOutput, TransformResources, UserContext, VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -89,6 +89,8 @@ pub const MLFLOW_APP_QUOTA: usize = 1_000;
 /// mints and `DeleteModelPackage` releases.
 pub const MODEL_PACKAGE_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
+pub const PIPELINE_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`].
 pub const APP_IMAGE_CONFIG_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const CODE_REPOSITORY_QUOTA: usize = 1_000;
@@ -110,6 +112,61 @@ pub const MODEL_CARD_QUOTA: usize = 1_000;
 /// each entity in it; this emulator models no other lineage group, so every artifact
 /// reports this one.
 pub const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
+
+/// How long after `DeletePipeline` the clock owes the pipeline's disappearance.
+///
+/// `DeletePipeline` is asynchronous: the pipeline reports `PipelineStatus` `Deleting`
+/// (one of the two members the modelled `PipelineStatus` enum carries) before it is
+/// gone, so a caller that describes it straight after deleting it still observes that
+/// transient status, and one that waits observes the not-found refusal. Real SageMaker
+/// takes as long as it takes; the span is compressed, never zero.
+pub const PIPELINE_DELETED_AFTER: Duration = Duration::from_millis(300);
+
+/// `PipelineStatus`'s members (`smithy_query(query="shape",shape="PipelineStatus")`
+/// answers exactly `Active` and `Deleting`). Named once here so no handler compares a
+/// bare string literal.
+pub const PIPELINE_STATUS_ACTIVE: &str = "Active";
+/// See [`PIPELINE_STATUS_ACTIVE`].
+pub const PIPELINE_STATUS_DELETING: &str = "Deleting";
+
+/// The one pipeline-definition schema version SageMaker Pipelines publishes, and the
+/// value a definition's required `Version` key carries.
+pub const PIPELINE_DEFINITION_VERSION: &str = "2020-12-01";
+
+/// The `Type` of the one step kind that holds steps of its own, in the branches the
+/// schema gives it (`IfSteps` / `ElseSteps`). Every other step's `Arguments` are its own
+/// payload, so nothing inside them is walked as a pipeline step.
+const PIPELINE_CONDITION_STEP_TYPE: &str = "Condition";
+
+/// The version id a pipeline carries from the moment it is created. `UpdatePipeline`
+/// mints later ones; nothing here does yet, so a created pipeline has exactly this one.
+pub const PIPELINE_INITIAL_VERSION: i64 = 1;
+
+/// How deeply a pipeline definition's steps may nest (a condition step's branches hold
+/// steps, which may themselves be condition steps). A bound, so a definition cannot
+/// drive the step walk below into unbounded recursion.
+const PIPELINE_MAX_STEP_DEPTH: usize = 32;
+
+/// The most steps one pipeline definition may declare, counting the steps nested in a
+/// condition step's branches, and the most `DependsOn` edges those steps may declare
+/// between them.
+///
+/// `PipelineDefinition` is modelled `len 1..1048576`, and a megabyte of JSON can declare
+/// tens of thousands of steps and edges — the two factors the dependency walk's work is
+/// the product of. These are the emulator's OWN bounds on one definition rather than a
+/// claim about any account's published quota: each sits far above any pipeline an
+/// emulator serves, and together they are what keeps validating a definition short and
+/// bounded however large the document is. A definition past either bound is refused
+/// before any graph work is done.
+const PIPELINE_MAX_STEPS: usize = 512;
+/// See [`PIPELINE_MAX_STEPS`].
+const PIPELINE_MAX_STEP_DEPENDENCIES: usize = 4_096;
+
+/// [`PIPELINE_MAX_STEPS`] and [`PIPELINE_MAX_STEP_DEPENDENCIES`], so a test can pin the
+/// bound at the value this module enforces rather than repeating a literal.
+pub const fn pipeline_definition_bounds() -> (usize, usize) {
+    (PIPELINE_MAX_STEPS, PIPELINE_MAX_STEP_DEPENDENCIES)
+}
 
 /// The most records each of this service's paginated listings returns in one page,
 /// including when `MaxResults` is absent or larger.
@@ -429,6 +486,34 @@ impl Endpoint {
         }
         false
     }
+}
+
+/// A pipeline created by `CreatePipeline`, as `DescribePipeline` replays it and
+/// `DeletePipeline` retires it.
+///
+/// `removal_due_at` is the instant the clock owes the record's disappearance after a
+/// `DeletePipeline`; it is stored, never slept on, and materialised by
+/// [`ComAmazonawsSagemakerSagemakerState::settle_pipeline_deletions`].
+#[derive(Debug, Clone)]
+pub struct Pipeline {
+    pub name: String,
+    pub arn: String,
+    pub display_name: Option<String>,
+    pub definition: String,
+    pub description: Option<String>,
+    pub role_arn: String,
+    pub status: String,
+    pub parallelism_configuration: Option<ParallelismConfiguration>,
+    pub tags: Vec<Tag>,
+    /// The `ClientRequestToken` the creating call presented, so a retry of that very
+    /// call is completed "no more than one time" as the member documents.
+    pub client_request_token: String,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    /// When an execution of this pipeline last started. `None` until one has, which is
+    /// every pipeline here: this slice of the emulator runs no executions.
+    pub last_run_time: Option<SystemTime>,
+    pub removal_due_at: Option<SystemTime>,
 }
 
 /// A batch transform job created by `CreateTransformJob`, as `DescribeTransformJob`
@@ -917,6 +1002,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Keyed by `PipelineName`.
+    pub pipelines: BTreeMap<String, Pipeline>,
     /// Keyed by `TransformJobName`.
     pub transform_jobs: BTreeMap<String, TransformJob>,
     /// Keyed by `MlflowAppArn` — the app's ARN is its identity, since the model
@@ -970,6 +1057,27 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// Whether another pipeline fits, i.e. the store is below [`PIPELINE_QUOTA`].
+    pub fn pipelines_below_quota(&self) -> bool {
+        self.pipelines.len() < PIPELINE_QUOTA
+    }
+
+    /// Drop every pipeline whose removal the clock already owes.
+    ///
+    /// `DeletePipeline` starts an asynchronous removal: the pipeline reports
+    /// `PipelineStatus` `Deleting` (one of the two members the modelled `PipelineStatus`
+    /// enum carries) until [`PIPELINE_DELETED_AFTER`] has passed, after which it is gone.
+    /// That disappearance was due at `removal_due_at` whether or not anybody called, so
+    /// materialising it here is the one write a reporting operation may make: an observer
+    /// makes no difference to the result.
+    ///
+    /// Keeps whatever the clock does not owe yet, dropping the rest in one pass — no
+    /// caller needs the names it removed, so none is collected.
+    pub fn settle_pipeline_deletions(&mut self, now: SystemTime) {
+        self.pipelines
+            .retain(|_, pipeline| pipeline.removal_due_at.is_none_or(|at| now < at));
     }
 
     /// Whether another transform job fits, i.e. the store is below
@@ -1149,6 +1257,287 @@ pub fn record_state_change(
 /// service mints, for the resource kinds it owns.
 pub fn resource_arn(region: &str, kind: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("{kind}/{name}"))
+}
+
+/// Why SageMaker refuses this pipeline definition, or `None` when it accepts it.
+///
+/// A pipeline definition is a JSON document in the schema SageMaker Pipelines
+/// publishes: a `Version` (the only published one is [`PIPELINE_DEFINITION_VERSION`])
+/// and a `Steps` list whose entries each carry a `Name` and a `Type`, optionally
+/// depending on other steps of the same definition through `DependsOn`. The service
+/// resolves that dependency graph when the pipeline is written — not when it runs — so
+/// a definition is refused unless
+///
+/// * it parses as a JSON object carrying those two keys,
+/// * every step declares a name no other step in the definition declares,
+/// * every `DependsOn` entry names a step the definition declares, and the resulting
+///   graph is acyclic, and
+/// * it declares at most [`PIPELINE_MAX_STEPS`] steps and
+///   [`PIPELINE_MAX_STEP_DEPENDENCIES`] dependency edges between them, the two counts
+///   the walk's work is the product of — so validating a definition stays short whatever
+///   the megabyte the member's modelled length admits is filled with.
+///
+/// The returned text is the refusal's message; the caller renders it as the 400
+/// `ValidationException` that an unsatisfiable definition is refused with.
+pub fn pipeline_definition_violation(definition: &str) -> Option<String> {
+    let parsed = match ::serde_json::from_str::<::serde_json::Value>(definition) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Some(format!("PipelineDefinition is not valid JSON: {error}"));
+        }
+    };
+    let Some(document) = parsed.as_object() else {
+        return Some(
+            "PipelineDefinition must be a JSON object carrying the keys Version and Steps"
+                .to_string(),
+        );
+    };
+    match document.get("Version").and_then(::serde_json::Value::as_str) {
+        None => {
+            return Some(format!(
+                "PipelineDefinition is missing the required key Version, whose only \
+                 supported value is {PIPELINE_DEFINITION_VERSION}"
+            ));
+        }
+        Some(version) if version != PIPELINE_DEFINITION_VERSION => {
+            return Some(format!(
+                "PipelineDefinition declares the unsupported Version {version}; the only \
+                 supported value is {PIPELINE_DEFINITION_VERSION}"
+            ));
+        }
+        Some(_) => {}
+    }
+    let Some(steps) = document.get("Steps").and_then(::serde_json::Value::as_array) else {
+        return Some(
+            "PipelineDefinition is missing the required key Steps, a list of the pipeline's \
+             steps"
+                .to_string(),
+        );
+    };
+    if steps.is_empty() {
+        return Some(
+            "PipelineDefinition declares no steps: Steps must hold at least one step"
+                .to_string(),
+        );
+    }
+    // The cheap pre-check, before any graph work: the step list alone is already past
+    // the bound, so nothing below needs to look at it.
+    if steps.len() > PIPELINE_MAX_STEPS {
+        return Some(too_many_steps(steps.len()));
+    }
+
+    let mut declared = DeclaredSteps::default();
+    if let Some(violation) = collect_pipeline_steps(steps, 1, &mut declared) {
+        return Some(violation);
+    }
+    // Resolution and the cycle walk both reach a dependency through `by_name`, so each
+    // is O((steps + edges) log steps) over counts the two bounds above cap.
+    for step in &declared.steps {
+        for dependency in &step.depends_on {
+            if !declared.by_name.contains_key(dependency) {
+                return Some(format!(
+                    "step {} depends on step {dependency}, which this pipeline definition \
+                     does not declare",
+                    step.name
+                ));
+            }
+        }
+    }
+    first_pipeline_cycle(&declared).map(|cycle| {
+        format!(
+            "PipelineDefinition declares a circular dependency between its steps: {}",
+            cycle.join(" -> ")
+        )
+    })
+}
+
+/// The refusal for a definition declaring more steps than [`PIPELINE_MAX_STEPS`].
+fn too_many_steps(declared: usize) -> String {
+    format!(
+        "PipelineDefinition declares {declared} steps, more than the {PIPELINE_MAX_STEPS} \
+         steps one pipeline definition may hold"
+    )
+}
+
+/// One step of a pipeline definition, reduced to what the dependency graph is built
+/// from: the name it declares and the step names it depends on, borrowed from the parsed
+/// document so a large definition is not copied to walk it.
+struct PipelineStep<'a> {
+    name: &'a str,
+    depends_on: Vec<&'a str>,
+}
+
+/// Every step one definition declares, in declaration order, plus the index that makes
+/// a name lookup logarithmic instead of a scan of everything declared so far — the
+/// uniqueness check, dependency resolution and the cycle walk all go through it, and
+/// `edges` is the running total of `DependsOn` entries, which is bounded as it grows.
+#[derive(Default)]
+struct DeclaredSteps<'a> {
+    steps: Vec<PipelineStep<'a>>,
+    by_name: BTreeMap<&'a str, usize>,
+    edges: usize,
+}
+
+/// Walk `steps` (and the branches of any condition step among them) into `out`,
+/// answering the first violation of the per-step rules, if any.
+///
+/// A condition step's `IfSteps`/`ElseSteps` are steps of the same pipeline: they share
+/// the one step-name namespace and may depend on steps outside their branch, so the
+/// graph is built over all of them. SageMaker nests them under the step's `Arguments`;
+/// both placements are walked, so a definition written either way resolves the same.
+///
+/// The walk stops as soon as the definition is past [`PIPELINE_MAX_STEPS`] or
+/// [`PIPELINE_MAX_STEP_DEPENDENCIES`], so the work it does is bounded by those two
+/// counts rather than by the megabyte the member's modelled length admits.
+fn collect_pipeline_steps<'a>(
+    steps: &'a [::serde_json::Value],
+    depth: usize,
+    out: &mut DeclaredSteps<'a>,
+) -> Option<String> {
+    if depth > PIPELINE_MAX_STEP_DEPTH {
+        return Some(format!(
+            "PipelineDefinition nests steps more than {PIPELINE_MAX_STEP_DEPTH} levels deep"
+        ));
+    }
+    for step in steps {
+        let Some(member) = step.as_object() else {
+            return Some("every entry of Steps must be a JSON object".to_string());
+        };
+        let Some(name) = member
+            .get("Name")
+            .and_then(::serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            return Some("a step of PipelineDefinition is missing the required key Name".to_string());
+        };
+        let Some(step_type) = member.get("Type").and_then(::serde_json::Value::as_str) else {
+            return Some(format!(
+                "step {name} of PipelineDefinition is missing the required key Type"
+            ));
+        };
+        if out.steps.len() == PIPELINE_MAX_STEPS {
+            return Some(too_many_steps(out.steps.len() + 1));
+        }
+        if out.by_name.contains_key(name) {
+            return Some(format!(
+                "step name {name} is declared more than once; a pipeline definition's step \
+                 names must be unique"
+            ));
+        }
+        let mut depends_on = Vec::new();
+        match member.get("DependsOn") {
+            None | Some(::serde_json::Value::Null) => {}
+            Some(::serde_json::Value::Array(entries)) => {
+                if out.edges + entries.len() > PIPELINE_MAX_STEP_DEPENDENCIES {
+                    return Some(format!(
+                        "PipelineDefinition declares more than the \
+                         {PIPELINE_MAX_STEP_DEPENDENCIES} DependsOn entries one pipeline \
+                         definition may hold"
+                    ));
+                }
+                out.edges += entries.len();
+                for entry in entries {
+                    match entry.as_str() {
+                        Some(dependency) => depends_on.push(dependency),
+                        None => {
+                            return Some(format!(
+                                "step {name} declares a DependsOn entry that is not a step name"
+                            ));
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                return Some(format!(
+                    "step {name} declares DependsOn as something other than a list of step names"
+                ));
+            }
+        }
+        out.by_name.insert(name, out.steps.len());
+        out.steps.push(PipelineStep { name, depends_on });
+
+        // Only a condition step holds steps of its own, and only under the two branch
+        // keys the schema gives it: any other step's `Arguments` are its own payload,
+        // so a list that merely happens to be named `Steps` there is NOT walked as
+        // pipeline steps.
+        if step_type == PIPELINE_CONDITION_STEP_TYPE {
+            for branch in ["IfSteps", "ElseSteps"] {
+                let placements = [
+                    member.get(branch),
+                    member.get("Arguments").and_then(|args| args.get(branch)),
+                ];
+                for nested in placements
+                    .into_iter()
+                    .flatten()
+                    .filter_map(::serde_json::Value::as_array)
+                {
+                    if let Some(violation) = collect_pipeline_steps(nested, depth + 1, out) {
+                        return Some(violation);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The first cycle the steps' `DependsOn` edges form, as the step names along it, or
+/// `None` when the graph is acyclic.
+///
+/// A depth-first walk that carries its own stack rather than recursing, so a definition
+/// with a long dependency chain cannot exhaust the call stack, and that resolves each
+/// edge through the name index rather than scanning the steps. A dependency no step
+/// declares is skipped here: it is refused before this runs.
+fn first_pipeline_cycle(declared: &DeclaredSteps<'_>) -> Option<Vec<String>> {
+    /// Not yet visited.
+    const UNSEEN: u8 = 0;
+    /// On the current walk's path.
+    const ON_PATH: u8 = 1;
+    /// Visited, and every path out of it was walked.
+    const SETTLED: u8 = 2;
+
+    let steps = &declared.steps;
+    let mut colour = vec![UNSEEN; steps.len()];
+    for start in 0..steps.len() {
+        if colour[start] != UNSEEN {
+            continue;
+        }
+        colour[start] = ON_PATH;
+        let mut path: Vec<(usize, usize)> = vec![(start, 0)];
+        while let Some(&(node, cursor)) = path.last() {
+            let Some(dependency) = steps[node].depends_on.get(cursor) else {
+                colour[node] = SETTLED;
+                path.pop();
+                continue;
+            };
+            if let Some(frame) = path.last_mut() {
+                frame.1 += 1;
+            }
+            let Some(&next) = declared.by_name.get(dependency) else {
+                continue;
+            };
+            match colour[next] {
+                ON_PATH => {
+                    let from = path
+                        .iter()
+                        .position(|frame| frame.0 == next)
+                        .unwrap_or_default();
+                    let mut cycle: Vec<String> = path[from..]
+                        .iter()
+                        .map(|frame| steps[frame.0].name.to_string())
+                        .collect();
+                    cycle.push(steps[next].name.to_string());
+                    return Some(cycle);
+                }
+                UNSEEN => {
+                    colour[next] = ON_PATH;
+                    path.push((next, 0));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// An app's ARN: `...:app/<DomainId>/<owner>/<AppType>/<AppName>`.

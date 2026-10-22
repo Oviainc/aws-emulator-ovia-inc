@@ -7,6 +7,10 @@
 //! `DeleteApplication` all see one copy of each resource. The helpers below (identity
 //! minting, the IdC application ARN, the modelled projections and the pagination cursor
 //! codec) are shared by those handlers rather than duplicated per operation.
+//!
+//! The security requirement packs live here for the same reason:
+//! `CreateSecurityRequirementPack` and `GetSecurityRequirementPack` — and every pack
+//! operation implemented after them — read and write ONE copy of each pack record.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -41,6 +45,38 @@ pub const MAX_PAGE_SIZE: i32 = 100;
 /// set far above any plausible client's application count, so normal use never meets
 /// it, while the store a caller can grow stays bounded.
 pub const MAX_APPLICATIONS: usize = 1_000;
+
+/// The most security requirement packs this emulator stores for the account before
+/// `CreateSecurityRequirementPack` answers the service's
+/// `ServiceQuotaExceededException`.
+///
+/// CHOSEN, not cited: the real service's pack quota is not in the model. It is set far
+/// above any plausible client's pack count, so normal use never meets it, while the
+/// store a caller can grow stays bounded.
+pub const MAX_SECURITY_REQUIREMENT_PACKS: usize = 1_000;
+
+/// The `managementType` every pack this API creates carries.
+///
+/// Source: `CreateSecurityRequirementPack`'s own documentation — "Creates a *customer
+/// managed* security requirement pack" — and the `ManagementType` enum
+/// (`AWS_MANAGED | CUSTOMER_MANAGED`), whose other member describes packs AWS ships
+/// rather than ones a caller creates.
+pub const MANAGEMENT_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
+
+/// The `status` a pack created without one carries.
+///
+/// Source: the `status` member's documentation on `CreateSecurityRequirementPackInput`
+/// — "The status of the pack. Defaults to ENABLED if not provided."
+pub const PACK_STATUS_ENABLED: &str = "ENABLED";
+
+/// The other member of the `SecurityRequirementPackStatus` enum.
+pub const PACK_STATUS_DISABLED: &str = "DISABLED";
+
+/// Every value the `SecurityRequirementPackStatus` enum admits.
+///
+/// Source: `smithy_query(query="shape", shape="SecurityRequirementPackStatus")` —
+/// `["ENABLED", "DISABLED"]`.
+pub const PACK_STATUS_VALUES: [&str; 2] = [PACK_STATUS_ENABLED, PACK_STATUS_DISABLED];
 
 /// The prefix every `ListApplications` pagination cursor carries, so a token this
 /// service did not mint is refused instead of being read as a resume point.
@@ -100,6 +136,37 @@ impl Application {
     }
 }
 
+/// One stored security requirement pack: the named collection of security
+/// requirements `CreateSecurityRequirementPack` mints and every other pack operation
+/// reads.
+///
+/// `management_type`, `vendor_name` and `import_status` are the service's to choose,
+/// not the caller's: a pack this API creates is customer managed, so it carries no
+/// vendor, and it holds no import until `ImportSecurityRequirements` starts one.
+#[derive(Debug, Clone)]
+pub struct SecurityRequirementPack {
+    pub pack_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// `None` for a customer managed pack: the member documents it as "The vendor name
+    /// for AWS managed packs".
+    pub vendor_name: Option<String>,
+    /// One of the `ManagementType` enum values; always
+    /// [`MANAGEMENT_TYPE_CUSTOMER_MANAGED`] for a pack created through this API.
+    pub management_type: String,
+    /// One of [`PACK_STATUS_VALUES`].
+    pub status: String,
+    /// The `SecurityRequirementPackImportStatus` of the pack's last import, or `None`
+    /// while no import has been started for it.
+    pub import_status: Option<String>,
+    pub kms_key_id: Option<String>,
+    /// The tags supplied at create time, persisted so the tagging operations have
+    /// state to read once they are implemented.
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
 /// The identity minted for a new application: the three values that are the service's
 /// to choose rather than the caller's to supply.
 #[derive(Debug, Clone)]
@@ -123,6 +190,14 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// Monotonic counter behind every minted `applicationId`, so two
     /// `CreateApplication` calls are two distinct records.
     pub next_application_seq: u64,
+    /// Every stored security requirement pack, keyed by its `packId`. A `BTreeMap` for
+    /// the same reason as [`Self::applications`]: one stable order for
+    /// `ListSecurityRequirementPacks` to walk and to resume a cursor in.
+    pub security_requirement_packs: BTreeMap<String, SecurityRequirementPack>,
+    /// Monotonic counter behind every minted `packId`, so two
+    /// `CreateSecurityRequirementPack` calls are two distinct records even when they
+    /// carry byte-identical input.
+    pub next_security_requirement_pack_seq: u64,
 }
 
 impl ComAmazonawsSecurityagentSecurityagentState {
@@ -143,6 +218,21 @@ impl ComAmazonawsSecurityagentSecurityagentState {
             application_id,
             sequence,
         }
+    }
+
+    /// Mint the `packId` of a new security requirement pack.
+    ///
+    /// Drawn from the store's own monotonic counter while the store is locked, so two
+    /// calls — including two concurrent calls carrying the same `name` — get two
+    /// distinct ids and neither overwrites the other. The id is 32 lowercase hex
+    /// characters, the same opaque form as an `applicationId`: `SecurityRequirementPackId`
+    /// carries no `@pattern` or `@length` in the model, so the shape is this
+    /// emulator's to choose, and taking it from the counter makes the map's order the
+    /// creation order.
+    pub fn mint_security_requirement_pack_id(&mut self) -> String {
+        self.next_security_requirement_pack_seq =
+            self.next_security_requirement_pack_seq.wrapping_add(1);
+        format!("{:032x}", self.next_security_requirement_pack_seq)
     }
 }
 

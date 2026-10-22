@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetRepositoryPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetRepositoryPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetRepositoryPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores a repository policy document on the repository held in [`crate::state`] and
+//! reports what was stored. The document is persisted byte for byte — `GetRepositoryPolicy`
+//! hands back the same bytes — and it is accepted only when it parses as an IAM policy
+//! document (see [`parse_policy`]); anything else is refused as
+//! `InvalidParameterException`, which is the only client-input error this operation models.
+//!
+//! A document that would deny the policy-setting action to this registry's own account
+//! needs `force`: `force` is documented as "if the policy that you want to set on a
+//! repository policy would prevent you from setting another policy in the future, you must
+//! force the SetRepositoryPolicy operation". Once such a policy IS in place, the lockout is
+//! real — the next `SetRepositoryPolicy` call on that repository is refused, with or without
+//! `force`, until `DeleteRepositoryPolicy` removes it. That refusal is reported as
+//! `InvalidParameterException` for want of a better code: a denied call is not invalid
+//! input, but this service's model declares no access-denied shape, and every other code it
+//! declares would claim something untrue (a missing repository, a server fault). If the
+//! model ever gains one, that refusal is the line to change.
+//!
+//! The lockout is enforced on the policy-setting action ALONE, even when the stored `Deny`
+//! covers `ecr-public:*`: real IAM would deny the reads and the delete too, which would
+//! leave the repository's policy unreachable for the life of the process, with no console
+//! or support path to undo it as there is in the real service. `DeleteRepositoryPolicy` is
+//! therefore left as the one way back, and nothing else in this emulator evaluates
+//! authorization.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +178,401 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetRepositoryPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetRepositoryPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetRepositoryPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(server_error());
+        };
+
+        let mut store = state.lock();
+        if let Some(registry_id) = input.registry_id.as_deref() {
+            if !store.is_this_registry(registry_id) {
+                return Err(SetRepositoryPolicyErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid parameter at 'registryId' failed to satisfy constraint: \
+                             'Member must name the public registry of this account ({})'",
+                            store.registry_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        let registry_id = store.registry_id.clone();
+        let Some(repository) = store.repositories.get_mut(&input.repository_name) else {
+            return Err(SetRepositoryPolicyErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException {
+                    message: Some(format!(
+                        "The repository with name '{}' does not exist in the registry with id \
+                         '{registry_id}'",
+                        input.repository_name
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The registry and the repository are resolved first, as every reporting operation
+        // here resolves them; what is left to check is the document itself. Only a document
+        // that parses as an IAM policy is a repository policy — the modelled
+        // `@length(0..10240)` on `policyText` is already enforced at the boundary, so what
+        // remains is the grammar.
+        let Some(document) = parse_policy(&input.policy_text) else {
+            return Err(invalid_policy());
+        };
+
+        // A policy already on the repository that denies the policy-setting action to
+        // this account locks the repository's policy: that is exactly the future `force`
+        // warns about, so the call is refused however it is made.
+        let locked_out = repository
+            .policy_text
+            .as_deref()
+            .and_then(parse_policy)
+            .is_some_and(|current| current.denies_policy_management(&registry_id));
+        if locked_out {
+            return Err(SetRepositoryPolicyErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "The repository policy on the repository with name '{}' in the \
+                         registry with id '{registry_id}' denies \
+                         {POLICY_MANAGEMENT_ACTION} to this account, so the policy can no \
+                         longer be set; delete the repository policy first",
+                        input.repository_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The document being applied would deny the policy-setting action in the future,
+        // which `force` exists to acknowledge.
+        if document.denies_policy_management(&registry_id) && !input.force {
+            return Err(SetRepositoryPolicyErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "Invalid parameter at 'force' failed to satisfy constraint: 'Member \
+                         must be true because the policy would prevent \
+                         {POLICY_MANAGEMENT_ACTION} from being called on this repository in \
+                         the future'"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Stored verbatim: `policyText` is an opaque document, so the bytes a later read
+        // reports are the bytes this call supplied. The response is then read back out of
+        // the store, so it reports what was persisted and not what was asked for.
+        let stored = repository.policy_text.insert(input.policy_text).clone();
+        let repository_name = repository.name.clone();
+        drop(store);
+
+        Ok(SetRepositoryPolicyOutput {
+            registry_id: Some(registry_id),
+            repository_name: Some(repository_name),
+            policy_text: Some(stored),
+        })
+    }
+}
+
+/// The IAM action that sets a repository policy: this service's ARN namespace
+/// (`awsService$arnNamespace` = `ecr-public`, see [`crate::state::ARN_NAMESPACE`]) and the
+/// operation name, which is how every AWS API action is named.
+const POLICY_MANAGEMENT_ACTION: &str = "ecr-public:SetRepositoryPolicy";
+
+/// The modelled server fault for a state store this service could not reach.
+fn server_error() -> SetRepositoryPolicyError {
+    SetRepositoryPolicyErrorModeled::ServerException(ServerException {
+        message: Some("The ECR Public emulator could not reach its state store.".to_string()),
+    })
+    .into()
+}
+
+/// What the service answers for a `policyText` that is not a repository policy document.
+///
+/// One message for every grammar rule [`parse_policy`] checks: the service reports the
+/// parameter and that the document is not a valid repository policy, not which element of
+/// the document it tripped on.
+fn invalid_policy() -> SetRepositoryPolicyError {
+    SetRepositoryPolicyErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(
+            "Invalid parameter at 'PolicyText' failed to satisfy constraint: 'Invalid \
+             repository policy provided'"
+                .to_string(),
+        ),
+    })
+    .into()
+}
+
+/// A parsed repository policy: the statements that matter for deciding what the document
+/// denies. Everything else about the document is validated and then dropped, because the
+/// document itself is stored verbatim.
+#[derive(Debug, Clone)]
+pub struct PolicyDocument {
+    statements: Vec<PolicyStatement>,
+}
+
+/// One statement of a parsed policy document.
+#[derive(Debug, Clone)]
+struct PolicyStatement {
+    /// `true` when `Effect` is `Deny`.
+    deny: bool,
+    /// The `Action` patterns, or the `NotAction` patterns when [`Self::action_negated`].
+    actions: Vec<String>,
+    /// `true` when the statement carried `NotAction` instead of `Action`, which selects
+    /// every action EXCEPT the listed ones.
+    action_negated: bool,
+    /// The flattened `Principal` (or `NotPrincipal`) values.
+    principals: Vec<String>,
+    /// `true` when the statement carried `NotPrincipal`, which selects every principal
+    /// EXCEPT the listed ones.
+    principal_negated: bool,
+    /// `true` when the statement carried a `Condition`, so whether it applies depends on
+    /// request context this service does not evaluate.
+    conditional: bool,
+}
+
+impl PolicyDocument {
+    /// Whether this document denies [`POLICY_MANAGEMENT_ACTION`] to `account_id` with no
+    /// condition attached — i.e. whether it locks this repository's policy.
+    ///
+    /// A conditional `Deny` is not counted: whether it applies depends on the request
+    /// context of the future call, which is not knowable here.
+    pub fn denies_policy_management(&self, account_id: &str) -> bool {
+        self.statements.iter().any(|statement| {
+            statement.deny
+                && !statement.conditional
+                && statement.covers_action(POLICY_MANAGEMENT_ACTION)
+                && statement.covers_account(account_id)
+        })
+    }
+}
+
+impl PolicyStatement {
+    /// Whether this statement's action set contains `action`.
+    fn covers_action(&self, action: &str) -> bool {
+        let listed = self
+            .actions
+            .iter()
+            .any(|pattern| action_pattern_matches(pattern, action));
+        listed != self.action_negated
+    }
+
+    /// Whether this statement's principal set contains the account `account_id`: either
+    /// every principal (`*`), the bare account id, or an ARN whose account segment is it.
+    fn covers_account(&self, account_id: &str) -> bool {
+        let listed = self.principals.iter().any(|principal| {
+            principal == "*"
+                || principal == account_id
+                || arn_account(principal) == Some(account_id)
+        });
+        listed != self.principal_negated
+    }
+}
+
+/// The account-id segment of an ARN, or `None` when `principal` is not an ARN.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account-id>:<resource>`, so the account
+/// is the fifth colon-separated segment — compared as a whole segment, because the same
+/// digits may appear in a resource path that belongs to another account.
+fn arn_account(principal: &str) -> Option<&str> {
+    let mut segments = principal.split(':');
+    if segments.next()? != "arn" {
+        return None;
+    }
+    // Skip the partition, service and region segments; the next one is the account.
+    segments.nth(3)
+}
+
+/// Whether an IAM action pattern matches `action`.
+///
+/// An action pattern is an action name that may carry the IAM wildcards `*` (any run of
+/// characters) and `?` (any one character), and action names are matched
+/// case-insensitively. The matcher is written here because the pattern language is IAM's
+/// own, not a published glob dialect a crate implements.
+fn action_pattern_matches(pattern: &str, action: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let action: Vec<char> = action.to_ascii_lowercase().chars().collect();
+
+    // The classic two-cursor wildcard walk: `star` remembers where the last `*` was, so a
+    // mismatch after it resumes by letting that `*` swallow one more character.
+    let (mut p, mut a) = (0usize, 0usize);
+    let mut resume: Option<(usize, usize)> = None;
+    while a < action.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == action[a]) {
+            p += 1;
+            a += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            resume = Some((p, a));
+            p += 1;
+        } else if let Some((star, matched)) = resume {
+            p = star + 1;
+            a = matched + 1;
+            resume = Some((star, matched + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|c| *c == '*')
+}
+
+/// The policy document `text` describes, or `None` when it is not one.
+///
+/// The rules are the IAM policy language's own, as AWS documents the JSON policy grammar
+/// for a resource-based policy:
+///
+/// * the document is JSON, and a JSON object;
+/// * `Version`, when present, is one of the two published policy language versions;
+/// * `Id`, when present, is a string;
+/// * `Statement` is required, and is one statement object or a non-empty array of them;
+/// * a statement's `Effect` is required and is exactly `Allow` or `Deny`;
+/// * a statement names its actions with `Action` or `NotAction`, and its principals with
+///   `Principal` or `NotPrincipal` — a resource-based policy needs both — each a string or
+///   a non-empty array of strings (a principal may also be the documented map keyed by
+///   `AWS`/`Service`/`Federated`/`CanonicalUser`);
+/// * `Condition`, when present, is an object;
+/// * no other element is recognized, in the document or in a statement.
+fn parse_policy(text: &str) -> Option<PolicyDocument> {
+    let document: serde_json::Value = serde_json::from_str(text).ok()?;
+    let document = document.as_object()?;
+
+    for key in document.keys() {
+        if !matches!(key.as_str(), "Version" | "Id" | "Statement") {
+            return None;
+        }
+    }
+    if let Some(version) = document.get("Version") {
+        // The two published versions of the policy language.
+        if !matches!(version.as_str()?, "2008-10-17" | "2012-10-17") {
+            return None;
+        }
+    }
+    if let Some(id) = document.get("Id") {
+        id.as_str()?;
+    }
+
+    // Borrowed, not cloned: the document itself is stored verbatim by the caller, so the
+    // grammar check only reads it.
+    let statements: Vec<&serde_json::Value> = match document.get("Statement")? {
+        serde_json::Value::Array(statements) if !statements.is_empty() => {
+            statements.iter().collect()
+        }
+        statement @ serde_json::Value::Object(_) => vec![statement],
+        _ => return None,
+    };
+
+    statements
+        .into_iter()
+        .map(parse_statement)
+        .collect::<Option<Vec<_>>>()
+        .map(|statements| PolicyDocument { statements })
+}
+
+/// One statement of a policy document, or `None` when it is not a statement.
+fn parse_statement(statement: &serde_json::Value) -> Option<PolicyStatement> {
+    let statement = statement.as_object()?;
+    for key in statement.keys() {
+        if !matches!(
+            key.as_str(),
+            "Sid"
+                | "Effect"
+                | "Principal"
+                | "NotPrincipal"
+                | "Action"
+                | "NotAction"
+                | "Resource"
+                | "NotResource"
+                | "Condition"
+        ) {
+            return None;
+        }
+    }
+    if let Some(sid) = statement.get("Sid") {
+        sid.as_str()?;
+    }
+
+    let deny = match statement.get("Effect")?.as_str()? {
+        "Allow" => false,
+        "Deny" => true,
+        // `Effect` is a closed set of exactly two values.
+        _ => return None,
+    };
+
+    let (actions, action_negated) = match (statement.get("Action"), statement.get("NotAction")) {
+        (Some(actions), None) => (string_or_list(actions)?, false),
+        (None, Some(actions)) => (string_or_list(actions)?, true),
+        // Exactly one of the two names the actions a statement applies to.
+        _ => return None,
+    };
+
+    let (principals, principal_negated) =
+        match (statement.get("Principal"), statement.get("NotPrincipal")) {
+            (Some(principals), None) => (parse_principal(principals)?, false),
+            (None, Some(principals)) => (parse_principal(principals)?, true),
+            // A resource-based policy states who it applies to.
+            _ => return None,
+        };
+
+    let conditional = match statement.get("Condition") {
+        Some(condition) => {
+            condition.as_object()?;
+            true
+        }
+        None => false,
+    };
+
+    // `Resource` / `NotResource` are accepted and ignored: a repository policy is attached
+    // to one repository, which is the resource it applies to.
+    Some(PolicyStatement {
+        deny,
+        actions,
+        action_negated,
+        principals,
+        principal_negated,
+        conditional,
+    })
+}
+
+/// A policy element that is a string or a non-empty array of strings, flattened.
+fn string_or_list(value: &serde_json::Value) -> Option<Vec<String>> {
+    match value {
+        serde_json::Value::String(one) => Some(vec![one.clone()]),
+        serde_json::Value::Array(many) if !many.is_empty() => many
+            .iter()
+            .map(|entry| entry.as_str().map(str::to_string))
+            .collect(),
+        _ => None,
+    }
+}
+
+/// The principals a `Principal` / `NotPrincipal` element names, flattened.
+///
+/// The element is either the string `*` (every principal) or a map keyed by principal
+/// type (`AWS`, `Service`, `Federated`, `CanonicalUser`), each value a string or an array
+/// of strings.
+///
+/// A bare string is admitted ONLY for `*`, deliberately: the IAM JSON policy grammar
+/// gives the wildcard as the one principal that needs no type, and names every other
+/// principal under the type that says how to read it (an account or role ARN under `AWS`,
+/// a service principal under `Service`, and so on). A bare ARN would have to be assigned a
+/// type by guesswork, so it is refused instead — the test row "a Principal string other
+/// than the wildcard" pins that.
+fn parse_principal(value: &serde_json::Value) -> Option<Vec<String>> {
+    match value {
+        serde_json::Value::String(one) if one == "*" => Some(vec![one.clone()]),
+        serde_json::Value::Object(types) if !types.is_empty() => {
+            let mut principals = Vec::new();
+            for (kind, value) in types {
+                if !matches!(
+                    kind.as_str(),
+                    "AWS" | "Service" | "Federated" | "CanonicalUser"
+                ) {
+                    return None;
+                }
+                principals.extend(string_or_list(value)?);
+            }
+            Some(principals)
+        }
+        _ => None,
     }
 }

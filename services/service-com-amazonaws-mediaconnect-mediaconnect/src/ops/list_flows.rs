@@ -183,10 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_mintable_flow_arn(token) {
                 return Err(ListFlowsErrorModeled::BadRequestException(
                     BadRequestException {
-                        message: format!(
+                        message: crate::state::validation_failed_message(&format!(
                             "Invalid NextToken {token:?}. A pagination token must be one this \
                              service issued."
-                        ),
+                        )),
                     },
                 )
                 .into());
