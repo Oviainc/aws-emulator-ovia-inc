@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInvoiceUnit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInvoiceUnit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInvoiceUnit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the invoice unit from state, with the tags that were attached to it, and
+//! returns the ARN it removed. A later `GetInvoiceUnit` on that ARN is a
+//! `ResourceNotFoundException` and `ListInvoiceUnits` no longer reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInvoiceUnit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInvoiceUnitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInvoiceUnit"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteInvoiceUnitErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+        let client_token = input.client_token.as_deref();
+
+        // `@idempotent`: a replay of the delete (the same `ClientToken` against the same
+        // invoice unit) answers with the ARN the first call removed rather than reporting
+        // it missing. The same token against a DIFFERENT unit deletes that unit.
+        if let Some(arn) =
+            store.replayed_result(Self::NAME, &input.invoice_unit_arn, client_token)
+        {
+            return Ok(DeleteInvoiceUnitOutput {
+                invoice_unit_arn: Some(arn),
+            });
+        }
+
+        if store
+            .invoice_units
+            .remove(&input.invoice_unit_arn)
+            .is_none()
+        {
+            return Err(DeleteInvoiceUnitErrorModeled::ResourceNotFoundException(
+                crate::state::no_such_resource(&input.invoice_unit_arn),
+            )
+            .into());
+        }
+        store.resource_tags.remove(&input.invoice_unit_arn);
+
+        store.record_result(
+            Self::NAME,
+            &input.invoice_unit_arn,
+            client_token,
+            &input.invoice_unit_arn,
+        );
+        Ok(DeleteInvoiceUnitOutput {
+            invoice_unit_arn: Some(input.invoice_unit_arn),
+        })
     }
 }
