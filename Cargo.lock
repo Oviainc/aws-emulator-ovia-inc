@@ -8755,6 +8755,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -8778,6 +8779,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -8824,6 +8826,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -8847,6 +8850,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -8870,6 +8874,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -8893,6 +8898,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -8916,6 +8922,7 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",
@@ -13128,6 +13135,14 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "service-common"
+version = "0.1.0"
+dependencies = [
+ "aws-emulator-server",
+ "http",
 ]
 
 [[package]]

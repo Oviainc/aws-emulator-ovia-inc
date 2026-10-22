@@ -45,33 +45,6 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The service key `emulator_server::service_from_target` reads out of the
-/// `X-Amz-Target` header this service's awsJson1_1 operations carry: that reader takes
-/// the segment before the `.`, strips an `_<digits>` version suffix and lower-cases it,
-/// so `AWSMPMeteringService.<OperationName>` (`OPERATIONS.md`, "Request routing")
-/// normalises to this key — while each Marketplace sibling's own target normalises to a
-/// different one (`AWSMPEntitlementService.…`, `AWSMPCommerceService_v20200301.…`).
-const TARGET_SERVICE_KEY: &str = "awsmpmeteringservice";
-
-/// Whether `parts` names THIS service in its `X-Amz-Target` header.
-fn target_names_this_service(parts: &http::request::Parts) -> bool {
-    emulator_server::service_from_target(&parts.headers).as_deref() == Some(TARGET_SERVICE_KEY)
-}
-
-/// Whether `parts` addresses the ROOT path, which is where every request to an
-/// `awsJson1_1` service arrives: the protocol posts every operation to `/` and
-/// carries the operation name in `X-Amz-Target` rather than in the URI.
-///
-/// This is the same rule the framework's own discriminator
-/// (`emulator_server::can_handle_based_on_route_key_and_path`) applies through the
-/// `ROOT_PATH_SEGMENT` sentinel. It is spelled out here because this model carries no
-/// `smithy.api#http` binding at all, so `crate::ROUTE_PATH_SEGMENTS` is EMPTY — "no
-/// constraint" — and an unconstrained claim would swallow every peer that shares this
-/// service's signing name.
-fn claims_root_path(parts: &http::request::Parts) -> bool {
-    parts.uri.path().trim_start_matches('/').is_empty()
-}
-
 /// The `com-amazonaws-marketplacemetering-awsmpmeteringservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -101,29 +74,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // This service signs as `aws-marketplace` — a signing name every AWS
-        // Marketplace-family service SHARES while each serves its own endpoint
-        // (`metering.marketplace` here, `catalog.marketplace` for Marketplace
-        // Catalog, `entitlement.marketplace` for the Entitlement Service, …). The
-        // router's routing key comes from the SigV4 credential scope first, so all of
-        // them resolve to `aws-marketplace` and matching on the signing name ALONE
-        // makes every one of them claim every request — which the router answers
-        // `500 AmbiguousService`, leaving all of them unreachable.
+        // This service signs as `aws-marketplace` — a signing name it SHARES with
+        // every other AWS Marketplace-family service (Catalog, Reporting, Deployment,
+        // Discovery, Agreement, Entitlement), each serving its own endpoint
+        // (`metering.marketplace` here). The router's routing key comes from the SigV4
+        // credential scope first, so all of them resolve to `aws-marketplace` and
+        // matching on the signing name ALONE makes every one of them claim every
+        // request — which the router answers `500 AmbiguousService`.
         //
-        // So the claim is narrowed to this service's own wire surface. It speaks
-        // `awsJson1_1`, so every one of its requests is a `POST /` (see
-        // `claims_root_path`), which already leaves the REST peers' path spaces alone —
-        // and because its RPC peers (Agreement, the Entitlement Service) post to that
-        // same root path, the request must ALSO name this service in the header its
-        // protocol routes by: `X-Amz-Target: AWSMPMeteringService.<OperationName>`
-        // (`OPERATIONS.md`). A request carrying no such target names no operation of
-        // this service, so it is not this service's traffic.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) if key == self.entry.identity().signing_name() => {
-                claims_root_path(parts) && target_names_this_service(parts)
-            }
-            _ => false,
-        }
+        // So the claim is narrowed to this service's own modelled wire surface, by the
+        // one rule `service-common` states for every service under a shared signing
+        // name. This model is `awsJson1_1`, an RPC protocol: every operation posts to
+        // `/` and the target service is named out of band, in
+        // `X-Amz-Target: AWSMPMeteringService.<OperationName>` (`OPERATIONS.md`). Its
+        // path space is therefore `/` — which EVERY RPC peer under this signing name
+        // posts to, and which the generated `ROUTE_PATH_SEGMENTS` does not even publish
+        // for this model (it carries no `smithy.api#http` binding at all, so the list
+        // is EMPTY: "no constraint") — so `claims_request` claims a request only when
+        // the service that target NAMES is this one. A request carrying no such target
+        // names no operation of this service, so it is not this service's traffic.
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            Some(self.entry.identity().shape_id()),
+        )
     }
 
     fn override_operation(

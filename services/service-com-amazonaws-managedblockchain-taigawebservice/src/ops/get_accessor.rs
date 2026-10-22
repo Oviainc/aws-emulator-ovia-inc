@@ -162,13 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(accessor) = guard.accessors.get(&input.accessor_id) else {
             return Err(GetAccessorErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "accessor {} does not exist on this account",
-                        input.accessor_id
-                    )),
-                    resource_name: Some(input.accessor_id.clone()),
-                },
+                crate::state::not_found(crate::state::RESOURCE_ACCESSOR, &input.accessor_id),
             )
             .into());
         };

@@ -160,19 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
 
-        let Some(network) = guard.networks.get_mut(&input.network_id) else {
-            return Err(UpdateNodeErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "network {} does not exist on this account",
-                        input.network_id
-                    )),
-                    resource_name: Some(input.network_id.clone()),
-                },
-            )
-            .into());
-        };
-
+        // The NODE is the resource this operation was asked to update; the network and
+        // the member only scope the lookup, so the failure names the node whenever that
+        // node cannot be read — including when the network id names nothing stored.
+        //
         // `UpdateNodeInput$MemberId` is "The unique identifier of the member that owns
         // the node. Applies only to Hyperledger Fabric" — and, unlike
         // `GetNodeInput$MemberId`, `ListNodesInput$MemberId` and `DeleteNodeInput$MemberId`,
@@ -180,21 +171,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here only SCOPES the lookup: a node the named member does not own is not found
         // under it, exactly as an unknown node id is not, while a request that names no
         // member addresses the node by network and node id alone.
-        let found = network.nodes.get_mut(&input.node_id).filter(|node| {
-            input
-                .member_id
-                .as_deref()
-                .is_none_or(|member_id| node.member_id.as_deref() == Some(member_id))
-        });
+        let found = guard
+            .networks
+            .get_mut(&input.network_id)
+            .and_then(|network| network.nodes.get_mut(&input.node_id))
+            .filter(|node| {
+                input
+                    .member_id
+                    .as_deref()
+                    .is_none_or(|member_id| node.member_id.as_deref() == Some(member_id))
+            });
         let Some(node) = found else {
             return Err(UpdateNodeErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "node {} does not exist on network {}",
-                        input.node_id, input.network_id
-                    )),
-                    resource_name: Some(input.node_id.clone()),
-                },
+                crate::state::not_found(crate::state::RESOURCE_NODE, &input.node_id),
             )
             .into());
         };

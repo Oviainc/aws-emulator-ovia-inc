@@ -1,0 +1,15 @@
+[package]
+name = "service-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# `resolve_route_key` / `ROOT_PATH_SEGMENT`: the framework's own routing-key rule,
+# which this crate narrows rather than replaces.
+emulator-server = { workspace = true }
+http = { workspace = true }
+
+[lints]
+workspace = true

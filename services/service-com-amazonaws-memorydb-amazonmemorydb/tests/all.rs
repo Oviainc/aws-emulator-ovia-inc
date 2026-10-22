@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/engine_versions.rs"]
+mod engine_versions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

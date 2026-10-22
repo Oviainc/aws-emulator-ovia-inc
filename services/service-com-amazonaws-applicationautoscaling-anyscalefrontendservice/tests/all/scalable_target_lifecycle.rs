@@ -28,7 +28,7 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 ///
 /// `pub(crate)` so every suite in this test target drives the emulator the same way
 /// rather than growing a second harness (see `tests/all/tags.rs` and
-/// `tests/all/scheduled_action_lifecycle.rs`).
+/// `tests/all/scheduled_action_lifecycle.rs` and `tests/all/resource_tags.rs`).
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
@@ -188,7 +188,7 @@ async fn a_registered_target_is_described_from_what_was_persisted() {
             request["RoleARN"] = json!(role);
         }
         // One row also carries create-time tags, to prove they do not disturb the
-        // response; no implemented reader surfaces them yet.
+        // response; `resource_tags.rs` is where the tag surface itself is asserted.
         if row.namespace == "cassandra" {
             request["Tags"] = json!({"team": "search"});
         }

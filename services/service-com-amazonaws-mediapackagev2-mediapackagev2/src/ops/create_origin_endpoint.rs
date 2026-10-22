@@ -4,7 +4,11 @@
 //! IMPLEMENTED. Creates an origin endpoint under an existing channel and persists it in
 //! [`crate::state`], turning each submitted `Create*ManifestConfiguration` into the
 //! `Get*ManifestConfiguration` the service reports, with the egress URL it computes for
-//! that manifest. An unknown group or channel is a `ResourceNotFoundException`; an
+//! that manifest. The settings the service applies rather than the caller — the segment
+//! configuration, the startover window, the URI separator, the stream-name output mode
+//! and each manifest's window, URI path type and child-manifest URL encoding — are
+//! materialised here and stored, so they are reported on this response and on every
+//! later read. An unknown group or channel is a `ResourceNotFoundException`; an
 //! endpoint name already used on that channel is a `ConflictException`.
 //!
 //! Two rules the model states but cannot express as a member constraint are enforced
@@ -242,7 +246,7 @@ fn endpoint_output(
         created_at: endpoint.created_at,
         modified_at: endpoint.modified_at,
         description: endpoint.description.clone(),
-        startover_window_seconds: endpoint.startover_window_seconds,
+        startover_window_seconds: Some(endpoint.startover_window_seconds),
         hls_manifests: Some(endpoint.hls_manifests.clone()),
         low_latency_hls_manifests: Some(endpoint.low_latency_hls_manifests.clone()),
         dash_manifests: Some(endpoint.dash_manifests.clone()),
@@ -250,8 +254,8 @@ fn endpoint_output(
         force_endpoint_error_configuration: endpoint
             .force_endpoint_error_configuration
             .clone(),
-        uri_separator: endpoint.uri_separator.clone(),
-        stream_name_output_mode: endpoint.stream_name_output_mode.clone(),
+        uri_separator: Some(endpoint.uri_separator.clone()),
+        stream_name_output_mode: Some(endpoint.stream_name_output_mode.clone()),
         e_tag: Some(endpoint.etag.clone()),
         tags: Some(endpoint.tags.clone()),
     }
@@ -483,8 +487,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         let created_at = crate::state::now();
-        let arn =
-            crate::state::origin_endpoint_arn(&region, &group_name, &channel.name, &name);
+        let arn = crate::state::origin_endpoint_arn(&region, &group_name, &channel.name, &name);
+        // Server-applied too: an endpoint created without a startover window still has
+        // one, so the window is materialized here and stored.
+        let startover_window_seconds =
+            crate::state::materialized_startover_window_seconds(input.startover_window_seconds);
 
         let mut endpoint = crate::state::OriginEndpoint {
             name: name.clone(),
@@ -492,19 +499,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group_name: group_name.clone(),
             arn,
             container_type: input.container_type,
-            // `Segment` is required in the response but optional in the request, and the
-            // model declares no default for any of its members, so an omitted segment
-            // configuration materializes as the empty one rather than as invented values.
-            segment: input.segment.unwrap_or_default(),
+            // `Segment` is required in the response: the service applies its own
+            // segmentation settings to whatever the request left out and reports the
+            // result, so the materialized configuration is what is stored.
+            segment: crate::state::materialized_segment(input.segment),
             description: input.description,
-            startover_window_seconds: input.startover_window_seconds,
+            startover_window_seconds,
             hls_manifests,
             low_latency_hls_manifests,
             dash_manifests,
             mss_manifests,
             force_endpoint_error_configuration: input.force_endpoint_error_configuration,
-            uri_separator: input.uri_separator,
-            stream_name_output_mode: input.stream_name_output_mode,
+            // The URI separator and the stream-name output mode are server-applied too:
+            // every endpoint has one, whether or not the request named it.
+            uri_separator: crate::state::materialized_uri_separator(input.uri_separator),
+            stream_name_output_mode: crate::state::materialized_stream_name_output_mode(
+                input.stream_name_output_mode,
+            ),
             created_at,
             modified_at: created_at,
             reset_at: None,

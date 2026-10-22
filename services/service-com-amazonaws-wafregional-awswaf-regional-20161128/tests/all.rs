@@ -19,6 +19,8 @@ mod rule_lifecycle;
 mod sql_injection_match_set;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/web_acl_lifecycle.rs"]
+mod web_acl_lifecycle;
 #[path = "all/wire.rs"]
 mod wire;
 #[path = "all/xss_match_set_lifecycle.rs"]

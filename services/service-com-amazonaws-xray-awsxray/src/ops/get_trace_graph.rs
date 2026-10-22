@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTraceGraph
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTraceGraph`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTraceGraph::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Derives the topology of the NAMED traces from their stored segment
+//! documents, through the same derivation `GetServiceGraph` answers from
+//! ([`crate::state::service_graph`]) — with no time window, because the request
+//! names the traces rather than a timeframe.
+//!
+//! A trace id that is not stored is REFUSED with `InvalidRequestException`
+//! (400): unlike `BatchGetTraces`, whose output models `UnprocessedTraceIds`,
+//! this operation has nowhere to report an id it could not graph, so a graph
+//! that quietly left one out would claim the trace had no services.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +143,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTraceGraph` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTraceGraphErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTraceGraph"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTraceGraphErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray trace store is unavailable on this emulator engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `TraceIdList` carries no modelled bound, so the request is bounded
+        // here, by the same cap `BatchGetTraces` puts on a requested-id list.
+        if input.trace_ids.len() > crate::state::MAX_TRACE_IDS_PER_CALL {
+            return Err(refuse(format!(
+                "TraceIds carries {} ids; at most {} are accepted in one call",
+                input.trace_ids.len(),
+                crate::state::MAX_TRACE_IDS_PER_CALL
+            )));
+        }
+
+        let store = state.lock();
+        let mut traces = Vec::with_capacity(input.trace_ids.len());
+        for trace_id in &input.trace_ids {
+            let Some(trace) = store.traces.get(trace_id) else {
+                return Err(refuse(TRACE_ID_NOT_FOUND.to_string()));
+            };
+            traces.push(trace);
+        }
+
+        let services = crate::state::service_graph(traces, None);
+        let page = crate::state::page_service_graph(
+            &services,
+            input.next_token.as_deref(),
+            TRACE_GRAPH_PAGE_SIZE,
+        )
+        .map_err(refuse)?;
+
+        Ok(GetTraceGraphOutput {
+            services: Some(page.services),
+            next_token: page.next_token,
+        })
     }
+}
+
+/// How many `Service` values one page carries.
+///
+/// The model declares no page size for `GetTraceGraph`, so this is the
+/// emulator's: a `NextToken` is emitted only when the graph exceeded it, and
+/// resuming from that token returns the remainder.
+pub const TRACE_GRAPH_PAGE_SIZE: usize = 5;
+
+/// What a requested trace id that is not stored is refused with.
+pub const TRACE_ID_NOT_FOUND: &str = "Trace id not found";
+
+/// Refuse the request with the error this operation models for an invalid one.
+fn refuse(message: String) -> GetTraceGraphError {
+    GetTraceGraphErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
 }

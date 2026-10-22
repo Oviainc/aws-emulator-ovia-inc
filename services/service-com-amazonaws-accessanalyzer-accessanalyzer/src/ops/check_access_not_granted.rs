@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CheckAccessNotGranted
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CheckAccessNotGranted`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CheckAccessNotGranted::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Evaluates the `policyDocument` the request carries against the permissions in
+//! `access` and answers `PASS` when no statement of the policy may grant any of them,
+//! `FAIL` when one may — with the statements that may as the response's `reasons`.
+//!
+//! The decision is computed from the document, never from the request's shape. The
+//! document itself is read by the one policy parser this crate has —
+//! [`crate::ops::check_no_new_access::policy`], which owns the IAM grammar, the two
+//! policy flavors and every parse-time ceiling — and this operation asks a question of
+//! the parsed statements that no string-vs-pattern matcher can answer: the `actions` and
+//! `resources` a caller asks about are PATTERNS too, so a statement reaches the request
+//! when its `Action`/`Resource` patterns INTERSECT the caller's. That is what the
+//! [`intersect`] module adds.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +95,52 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// The one `policyDocument` parser this crate has: `CheckNoNewAccess` owns it as its
+// `pub mod policy` and it holds the IAM grammar, the two policy flavors and every
+// parse-time ceiling. Reusing it is what keeps this service from reading one document
+// format two ways; when `CheckNoPublicAccess` is implemented the module should move to a
+// crate-level home all three reach, rather than being copied.
+use crate::ops::check_no_new_access::policy;
+
+/// The `result` this operation answers when the policy may grant one of the requested
+/// permissions, and when it may not. Both are values of the model's
+/// `CheckAccessNotGrantedResult` enum, listed in this crate as
+/// [`super::types::CHECK_ACCESS_NOT_GRANTED_RESULT_VALUES`].
+const RESULT_FAIL: &str = "FAIL";
+/// See [`RESULT_FAIL`].
+const RESULT_PASS: &str = "PASS";
+
+/// The `message` reported beside [`RESULT_FAIL`], and beside [`RESULT_PASS`].
+///
+/// The service returns a fixed string per `result`, and this model STATES both of them,
+/// in `CheckAccessNotGranted`'s `smithy.api#examples` trait — so the strings are a
+/// requirement, not an example. Verify either with
+/// `grep 'grants access to perform one or more of the listed actions or resources' smithy-model/com-amazonaws-accessanalyzer-accessanalyzer.json`
+/// and `grep 'does not grant access to perform the listed actions or resources' …`
+/// (the model is a single line, so grep reports the file rather than the span). Note the
+/// two are NOT parallel: only the FAIL wording says "one or more of".
+const MESSAGE_FAIL: &str =
+    "The policy document grants access to perform one or more of the listed actions or resources.";
+/// The `message` reported beside [`RESULT_PASS`]; same source as [`MESSAGE_FAIL`].
+const MESSAGE_PASS: &str =
+    "The policy document does not grant access to perform the listed actions or resources.";
+
+/// This operation's name, mirroring the `NAME` the `impl Operation` below carries, for
+/// the log records on the request path.
+const OPERATION: &str = "CheckAccessNotGranted";
+
+/// How many `access` objects one request may carry: the model's own cap, from the
+/// `access` member's `@length {max: 1}` in
+/// `smithy_query(query="operation", operation="CheckAccessNotGranted")`.
+const MAX_ACCESS_ENTRIES: usize = 1;
+
+/// How many actions and resources one `access` object may carry: the model's own caps,
+/// from the `actions` and `resources` members' `@length {max: 100}` in
+/// `smithy_query(query="shape", shape="Access")`.
+const MAX_ACTIONS_PER_ACCESS: usize = 100;
+/// See [`MAX_ACTIONS_PER_ACCESS`].
+const MAX_RESOURCES_PER_ACCESS: usize = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +214,717 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CheckAccessNotGranted` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CheckAccessNotGrantedErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // This operation is `@readonly` and owns no resource: it answers from the policy
+        // document the request carries, so it neither reads nor writes this service's
+        // store and leaves nothing behind for a later caller to see. The engine and the
+        // request metadata stay bound, as every handler in this crate has them.
+        let _ = (ctx, &self.engine);
+        // The request path is recorded, with the sizes that drive the work but NOT the
+        // policy document itself (`policyDocument` is `@sensitive`).
+        ::tracing::debug!(
+            operation = OPERATION,
+            policy_type = %input.policy_type,
+            access_entries = input.access.len(),
+            policy_document_bytes = input.policy_document.len(),
+            "checking a policy document for the requested access"
+        );
+
+        // The model constrains `policyType` to the two flavors, so the boundary validator
+        // has already refused anything else; refusing it again is what keeps the handler
+        // from guessing a grammar.
+        let flavor = policy::Flavor::from_policy_type(&input.policy_type).ok_or_else(|| {
+            refuse_field(
+                "policyType",
+                format!(
+                    "policyType must be one of {}, but was {}",
+                    ACCESS_CHECK_POLICY_TYPE_VALUES.join(", "),
+                    input.policy_type
+                ),
+            )
+        })?;
+
+        // Every caller-driven factor of the work is bounded BEFORE any of it starts: the
+        // number of access objects and the actions and resources each names here, the
+        // document's own size and shape in `policy::parse`, the length of every pattern
+        // in `intersect::evaluable`, and finally one matching budget over their product.
+        if input.access.is_empty() {
+            return Err(refuse_field(
+                "access",
+                "access must name at least one access object".to_string(),
+            ));
+        }
+        if input.access.len() > MAX_ACCESS_ENTRIES {
+            return Err(refuse_field(
+                "access",
+                format!(
+                    "access must name at most {MAX_ACCESS_ENTRIES} access object(s), but named {}",
+                    input.access.len()
+                ),
+            ));
+        }
+
+        let document = policy::parse(&input.policy_document, "policyDocument", flavor)
+            .map_err(refuse_document)?;
+        intersect::evaluable(&document).map_err(refuse_matching)?;
+
+        // One matching budget for the whole request, charged before any table is sized,
+        // so what a single request can ask the matchers for is bounded however its
+        // factors are combined.
+        let mut budget = intersect::Budget::new();
+        // Each statement that may grant one of the requested permissions is a reason the
+        // check fails, reported once each in document order.
+        let mut reasons: Vec<ReasonSummary> = Vec::new();
+        let mut reported: ::std::collections::HashSet<i32> = ::std::collections::HashSet::new();
+        // The pattern a dimension the caller left empty stands for. Per the operation's
+        // documentation, naming only actions asks about those actions on ANY resource and
+        // naming only resources about ANY action on those resources, which is IAM's `*`.
+        let any = [intersect::ANY.to_string()];
+        for (position, access) in input.access.iter().enumerate() {
+            let named_actions = access.actions.as_deref().unwrap_or(&[]);
+            let named_resources = access.resources.as_slice();
+            if named_actions.is_empty() && named_resources.is_empty() {
+                return Err(refuse_field(
+                    "access",
+                    format!("access[{position}] must specify actions, resources, or both"),
+                ));
+            }
+            if named_actions.len() > MAX_ACTIONS_PER_ACCESS {
+                return Err(refuse_field(
+                    &format!("access[{position}].actions"),
+                    format!(
+                        "actions must name at most {MAX_ACTIONS_PER_ACCESS} actions, but named {}",
+                        named_actions.len()
+                    ),
+                ));
+            }
+            if named_resources.len() > MAX_RESOURCES_PER_ACCESS {
+                return Err(refuse_field(
+                    &format!("access[{position}].resources"),
+                    format!(
+                        "resources must name at most {MAX_RESOURCES_PER_ACCESS} resources, but named {}",
+                        named_resources.len()
+                    ),
+                ));
+            }
+            let actions: &[String] = if named_actions.is_empty() {
+                &any
+            } else {
+                named_actions
+            };
+            let resources: &[String] = if named_resources.is_empty() {
+                &any
+            } else {
+                named_resources
+            };
+            for (member, patterns) in [("actions", actions), ("resources", resources)] {
+                if let Some(oversized) = patterns
+                    .iter()
+                    .find(|pattern| pattern.chars().count() > intersect::MAX_PATTERN_CHARS)
+                {
+                    return Err(refuse_field(
+                        &format!("access[{position}].{member}"),
+                        format!(
+                            "each {member} entry must be at most {} characters, but one was {}",
+                            intersect::MAX_PATTERN_CHARS,
+                            oversized.chars().count()
+                        ),
+                    ));
+                }
+            }
+
+            let grants = intersect::granting(&document, actions, resources, &mut budget)
+                .await
+                .map_err(refuse_matching)?;
+            for grant in grants {
+                if !reported.insert(grant.statement.index) {
+                    continue;
+                }
+                reasons.push(ReasonSummary {
+                    description: Some(describe(grant.action, grant.resource)),
+                    statement_index: Some(grant.statement.index),
+                    statement_id: grant.statement.sid.clone(),
+                });
+            }
+        }
+        // No sort: the statements are walked in document order and each index is
+        // recorded at most once, so `reasons` is in statement order by construction.
+        ::tracing::debug!(
+            operation = OPERATION,
+            result = if reasons.is_empty() {
+                RESULT_PASS
+            } else {
+                RESULT_FAIL
+            },
+            reasons = reasons.len(),
+            "the policy check is decided"
+        );
+
+        if reasons.is_empty() {
+            Ok(CheckAccessNotGrantedOutput {
+                result: Some(RESULT_PASS.to_string()),
+                message: Some(MESSAGE_PASS.to_string()),
+                // No statement reaches the access, so there is no statement to point at.
+                reasons: None,
+            })
+        } else {
+            Ok(CheckAccessNotGrantedOutput {
+                result: Some(RESULT_FAIL.to_string()),
+                message: Some(MESSAGE_FAIL.to_string()),
+                reasons: Some(reasons),
+            })
+        }
+    }
+}
+
+/// Refuse the request with this operation's modelled `ValidationException` (HTTP 400):
+/// the message says what to fix and `fieldList` names the member, the way this service's
+/// other handlers report a field refusal.
+fn refuse_field(member: &str, message: String) -> CheckAccessNotGrantedError {
+    ::tracing::debug!(
+        operation = OPERATION,
+        member,
+        %message,
+        "refusing the request"
+    );
+    CheckAccessNotGrantedErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message,
+        }]),
+    })
+    .into()
+}
+
+/// Refuse the request over the `policyDocument` the parser would not take.
+///
+/// A document that is not JSON at all is a malformed PARAMETER (HTTP 400); one that is
+/// JSON but does not follow the IAM policy grammar, or that the parser will not evaluate,
+/// is an entity this check could not process (HTTP 422).
+///
+/// The log record carries the refusal's KIND and the member it blames, never the detail:
+/// the detail is built from the document, which is `@sensitive`, so it goes to the caller
+/// in the response and nowhere else.
+fn refuse_document(error: policy::EngineError) -> CheckAccessNotGrantedError {
+    let kind = error.kind();
+    let member = error.member().unwrap_or("policyDocument");
+    ::tracing::debug!(
+        operation = OPERATION,
+        kind,
+        member,
+        "refusing the policy document"
+    );
+    match error {
+        policy::EngineError::Unparseable { detail, .. } => {
+            CheckAccessNotGrantedErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: format!("policyDocument is not valid JSON: {detail}"),
+                },
+            )
+            .into()
+        }
+        policy::EngineError::Invalid { detail, .. }
+        | policy::EngineError::Unsupported { detail } => {
+            CheckAccessNotGrantedErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: format!("policyDocument could not be processed: {detail}"),
+                },
+            )
+            .into()
+        }
+    }
+}
+
+/// Refuse the request over what the MATCHING would take: a document whose patterns are
+/// longer than the matchers evaluate, or a check that needs more matching steps than one
+/// request may spend. Both are the emulator's own limits on an otherwise well-formed
+/// entity, so both answer HTTP 422.
+fn refuse_matching(error: intersect::MatchError) -> CheckAccessNotGrantedError {
+    ::tracing::debug!(
+        operation = OPERATION,
+        kind = error.kind(),
+        "refusing the policy check"
+    );
+    CheckAccessNotGrantedErrorModeled::UnprocessableEntityException(UnprocessableEntityException {
+        message: error.message,
+    })
+    .into()
+}
+
+/// The `reasons[].description` for a statement that may grant `action` on `resource`.
+///
+/// Built from the request, so it says which of the requested permissions the statement
+/// reaches; a dimension the caller left empty reads as "any", which is what it asked.
+fn describe(action: &str, resource: &str) -> String {
+    let action = if action == intersect::ANY {
+        "any action".to_string()
+    } else {
+        format!("the action {action}")
+    };
+    let resource = if resource == intersect::ANY {
+        "any resource".to_string()
+    } else {
+        format!("the resource {resource}")
+    };
+    format!("This statement may grant access to perform {action} on {resource}.")
+}
+
+/// Deciding which statements of a parsed policy may grant a permission the caller
+/// described with PATTERNS.
+///
+/// The document is already parsed by [`crate::ops::check_no_new_access::policy`]; what
+/// this module adds is the question `CheckAccessNotGranted` asks of it. A caller's
+/// `actions`/`resources` are patterns, not values ("Any strings that can be used as an
+/// action in an IAM policy", and a wildcard is allowed in a resource ARN's resource-id
+/// part), so the statement reaches the request when the two pattern LANGUAGES intersect
+/// — a question a string-vs-pattern matcher cannot answer, and one no maintained glob
+/// crate answers either.
+mod intersect {
+    use super::policy;
+
+    /// The pattern a dimension the caller left empty stands for: IAM's "any value".
+    pub const ANY: &str = "*";
+
+    /// The longest action or resource pattern this emulator will match, in characters.
+    ///
+    /// NOT a fidelity claim: neither `AccessCheckPolicyDocument` nor the action and
+    /// resource strings carry a modelled `@length`, so this is the emulator's own ceiling.
+    /// The matchers below are quadratic in the two pattern lengths, and this is what keeps
+    /// their tables a fixed size rather than one a request chooses. Real IAM actions and
+    /// ARNs are two orders of magnitude shorter.
+    pub const MAX_PATTERN_CHARS: usize = 1024;
+
+    /// How many matcher cells one request may fill before the check gives up.
+    ///
+    /// The statement count, the values per element and the document size are already
+    /// bounded by the parser; the requested actions and resources by the model's own caps.
+    /// The matching costs their PRODUCT, so one explicit budget bounds the whole request.
+    ///
+    /// Sized for the checks a real policy sends — an action or ARN of the length real ones
+    /// have (~64 characters) costs ~65 x 65 cells a match, so 100 actions plus 100
+    /// resources against a 256-statement document come to ~0.1 billion cells — and
+    /// deliberately NOT for the extreme the per-factor caps still allow: a request that
+    /// combines the largest counts with patterns an order of magnitude longer than any
+    /// real ARN is refused rather than given seconds of CPU. That ceiling is the
+    /// emulator's own, not a limit AWS publishes.
+    pub const MAX_MATCH_CELLS: u64 = 250_000_000;
+
+    /// How much matching the evaluation does between two yields to the runtime.
+    ///
+    /// Counted in charged cells rather than in values or statements, and checked BEFORE
+    /// each pattern match, so the work between two yield points is this quantum plus at
+    /// most the one match that crosses it (itself bounded by [`MAX_PATTERN_CHARS`]) —
+    /// whatever the shape of the document. A cancelled or timed-out request lands there
+    /// rather than at the end of the request.
+    const YIELD_EVERY_CELLS: u64 = 1_000_000;
+
+    /// Why a check could not be matched: either an entity the matchers will not take, or
+    /// one that needs more steps than a request may spend. Both are HTTP 422.
+    #[derive(Debug)]
+    pub struct MatchError {
+        /// What to tell the caller.
+        pub message: String,
+        /// Which limit was met, for a log record that carries no document content.
+        kind: &'static str,
+    }
+
+    impl MatchError {
+        /// Which limit was met.
+        pub fn kind(&self) -> &'static str {
+            self.kind
+        }
+    }
+
+    /// The matching work left for one request.
+    ///
+    /// Charged BEFORE any table is sized, so an exhausted budget refuses the request
+    /// rather than allocating for it.
+    #[derive(Debug)]
+    pub struct Budget {
+        remaining: u64,
+        /// Cells charged since the last yield, so the yields are spaced by WORK.
+        since_yield: u64,
+    }
+
+    impl Default for Budget {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Budget {
+        /// A full budget, for one request.
+        pub fn new() -> Self {
+            Self {
+                remaining: MAX_MATCH_CELLS,
+                since_yield: 0,
+            }
+        }
+
+        /// Take `cells` out of the budget, or refuse the request.
+        fn charge(&mut self, cells: u64) -> Result<(), MatchError> {
+            self.remaining = self.remaining.checked_sub(cells).ok_or_else(|| MatchError {
+                message: format!(
+                    "checking this policy takes more than this emulator's budget of {MAX_MATCH_CELLS} matching steps"
+                ),
+                kind: "budget",
+            })?;
+            self.since_yield = self.since_yield.saturating_add(cells);
+            Ok(())
+        }
+
+        /// Whether a yield quantum of matching has been done since the last yield.
+        fn quantum_done(&mut self) -> bool {
+            if self.since_yield >= YIELD_EVERY_CELLS {
+                self.since_yield = 0;
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    /// How many cells a table over two sequences of these lengths has. Saturating, so the
+    /// charge can never wrap into a small number.
+    fn cells(left: usize, right: usize) -> u64 {
+        (left as u64 + 1).saturating_mul(right as u64 + 1)
+    }
+
+    /// Is this parsed document one the matchers will evaluate?
+    ///
+    /// The parser bounds how MANY patterns a statement carries; this bounds how LONG each
+    /// one is, because the matchers are quadratic in that, and refuses an element that
+    /// names nothing — IAM will not process such a statement, so answering a confident
+    /// "grants nothing" for it would be wrong.
+    pub fn evaluable(document: &policy::Policy) -> Result<(), MatchError> {
+        for statement in &document.statements {
+            for (member, patterns) in [
+                ("Action", Some(&statement.actions)),
+                ("Resource", statement.resources.as_ref()),
+            ] {
+                let Some(patterns) = patterns else {
+                    continue;
+                };
+                let index = statement.index;
+                if patterns.values.is_empty() {
+                    return Err(MatchError {
+                        message: format!(
+                            "policyDocument could not be processed: statement {index}'s {member} element names at least one value"
+                        ),
+                        kind: "empty-element",
+                    });
+                }
+                if let Some(oversized) = patterns
+                    .values
+                    .iter()
+                    .find(|pattern| pattern.chars().count() > MAX_PATTERN_CHARS)
+                {
+                    return Err(MatchError {
+                        message: format!(
+                            "policyDocument could not be processed: statement {index}'s {member} element names a value of {} characters, more than the {MAX_PATTERN_CHARS} this emulator matches",
+                            oversized.chars().count()
+                        ),
+                        kind: "pattern-length",
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One requested permission a statement may grant: the statement, and the requested
+    /// action and resource it reaches — the first such pair, which is what the response's
+    /// `reasons[].description` is built from.
+    #[derive(Debug)]
+    pub struct Grant<'a> {
+        pub statement: &'a policy::Statement,
+        pub action: &'a str,
+        pub resource: &'a str,
+    }
+
+    /// The statements that may grant one of the requested permissions, in document order
+    /// and at most once each.
+    ///
+    /// The request is the cross product of `actions` and `resources`, but matching is
+    /// SEPARABLE — whether a statement reaches an action does not depend on which resource
+    /// is asked about — so each statement is matched against the requested actions and the
+    /// requested resources ONCE each (`|actions| + |resources|` matches, not
+    /// `|actions| * |resources|`) and the pairs are never materialised.
+    ///
+    /// An explicit `Deny` rules a pair out only when it applies unconditionally AND
+    /// reaches everything that pair stands for: a conditional `Deny`, or one narrower than
+    /// the request, leaves access the policy may still grant. A conditional `Allow` may
+    /// still grant, which is what the modelled `FAIL` ("might allow some or all") says.
+    ///
+    /// IAM matches actions case-insensitively; resource ARNs are matched as given.
+    pub async fn granting<'a>(
+        document: &'a policy::Policy,
+        actions: &'a [String],
+        resources: &'a [String],
+        budget: &mut Budget,
+    ) -> Result<Vec<Grant<'a>>, MatchError> {
+        // `denied[i * resources.len() + j]`: the pair (actions[i], resources[j]) is ruled
+        // out by an unconditional `Deny`. One grid of at most
+        // `MAX_ACTIONS_PER_ACCESS * MAX_RESOURCES_PER_ACCESS` bools, never a list of owned
+        // pairs.
+        budget.charge(cells(actions.len(), resources.len()))?;
+        let mut denied = vec![false; actions.len() * resources.len()];
+        for statement in &document.statements {
+            if statement.effect != policy::Effect::Deny || !statement.conditions.is_empty() {
+                continue;
+            }
+            let actions_denied = reached(Some(&statement.actions), actions, true, true, budget)
+                .await?;
+            if !actions_denied.iter().any(|denied| *denied) {
+                continue;
+            }
+            let resources_denied =
+                reached(statement.resources.as_ref(), resources, false, true, budget).await?;
+            budget.charge(cells(actions.len(), resources.len()))?;
+            for (i, action_denied) in actions_denied.iter().enumerate() {
+                if !action_denied {
+                    continue;
+                }
+                for (j, resource_denied) in resources_denied.iter().enumerate() {
+                    if *resource_denied {
+                        denied[i * resources.len() + j] = true;
+                    }
+                }
+            }
+        }
+
+        let mut grants = Vec::new();
+        for statement in &document.statements {
+            if statement.effect != policy::Effect::Allow {
+                continue;
+            }
+            let actions_reached =
+                reached(Some(&statement.actions), actions, true, false, budget).await?;
+            if !actions_reached.iter().any(|reached| *reached) {
+                continue;
+            }
+            let resources_reached =
+                reached(statement.resources.as_ref(), resources, false, false, budget).await?;
+            budget.charge(cells(actions.len(), resources.len()))?;
+            let granted = actions_reached
+                .iter()
+                .enumerate()
+                .filter(|(_, reached)| **reached)
+                .find_map(|(i, _)| {
+                    resources_reached
+                        .iter()
+                        .enumerate()
+                        .find_map(|(j, reached)| {
+                            (*reached && !denied[i * resources.len() + j]).then_some((i, j))
+                        })
+                });
+            if let Some((i, j)) = granted {
+                grants.push(Grant {
+                    statement,
+                    action: actions[i].as_str(),
+                    resource: resources[j].as_str(),
+                });
+            }
+        }
+        Ok(grants)
+    }
+
+    /// Which of `requested` an element reaches: every value it MAY hold, or — with `every`
+    /// set — every value it holds ALL of. `None` is an element the statement does not
+    /// carry, which constrains nothing.
+    async fn reached(
+        element: Option<&policy::Patterns>,
+        requested: &[String],
+        fold_case: bool,
+        every: bool,
+        budget: &mut Budget,
+    ) -> Result<Vec<bool>, MatchError> {
+        let mut reached = Vec::with_capacity(requested.len());
+        for value in requested {
+            reached.push(if every {
+                holds_all(element, value, fold_case, budget).await?
+            } else {
+                may_hold(element, value, fold_case, budget).await?
+            });
+        }
+        Ok(reached)
+    }
+
+    /// May a value the caller described with the pattern `requested` be in this element?
+    ///
+    /// Yields to the runtime whenever a [`YIELD_EVERY_CELLS`] quantum of matching has been
+    /// charged: the matchers are synchronous, so this is what keeps one request from
+    /// holding its worker thread for a long run of them.
+    async fn may_hold(
+        element: Option<&policy::Patterns>,
+        requested: &str,
+        fold_case: bool,
+        budget: &mut Budget,
+    ) -> Result<bool, MatchError> {
+        let Some(element) = element else {
+            return Ok(true);
+        };
+        if element.negated {
+            // Only an exclusion covering EVERY value `requested` stands for puts the
+            // request outside the element; otherwise some requested value is still in it.
+            for pattern in &element.values {
+                if budget.quantum_done() {
+                    ::tokio::task::yield_now().await;
+                }
+                if covers(pattern, requested, fold_case, budget)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        } else {
+            for pattern in &element.values {
+                if budget.quantum_done() {
+                    ::tokio::task::yield_now().await;
+                }
+                if intersects(pattern, requested, fold_case, budget)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    /// Does this element hold EVERY value the pattern `requested` stands for?
+    ///
+    /// An element the statement does not carry (`None`) constrains nothing, so a `Deny`
+    /// that names no `Resource` reaches every resource the request stands for: in a
+    /// resource policy the implicit resource is the one the policy is attached to, which
+    /// is the resource being asked about. Yields like [`may_hold`].
+    async fn holds_all(
+        element: Option<&policy::Patterns>,
+        requested: &str,
+        fold_case: bool,
+        budget: &mut Budget,
+    ) -> Result<bool, MatchError> {
+        let Some(element) = element else {
+            return Ok(true);
+        };
+        if element.negated {
+            for pattern in &element.values {
+                if budget.quantum_done() {
+                    ::tokio::task::yield_now().await;
+                }
+                if intersects(pattern, requested, fold_case, budget)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        } else {
+            for pattern in &element.values {
+                if budget.quantum_done() {
+                    ::tokio::task::yield_now().await;
+                }
+                if covers(pattern, requested, fold_case, budget)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    /// Do two IAM wildcard patterns have at least one string in common?
+    ///
+    /// `*` stands for any run of characters and `?` for exactly one, on BOTH sides, so the
+    /// question is whether the two pattern languages intersect rather than whether a
+    /// string matches a pattern. Both patterns are capped at [`MAX_PATTERN_CHARS`] and the
+    /// budget is charged for the whole table before anything is allocated.
+    fn intersects(
+        left: &str,
+        right: &str,
+        fold_case: bool,
+        budget: &mut Budget,
+    ) -> Result<bool, MatchError> {
+        let a: Vec<char> = left.chars().collect();
+        let b: Vec<char> = right.chars().collect();
+        budget.charge(cells(a.len(), b.len()))?;
+        // meet[i][j]: do the suffixes `a[i..]` and `b[j..]` have a common string? Held as
+        // two rolling rows rather than an (|a| + 1) x (|b| + 1) table, because row `i`
+        // needs only row `i + 1`: peak memory is O(|b|) whatever |a| is.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CheckAccessNotGranted"))
+        // `next` starts as row |a|: an exhausted pattern produces only the empty string,
+        // which the other side reaches only through `*`s.
+        let mut next = vec![false; b.len() + 1];
+        next[b.len()] = true;
+        for j in (0..b.len()).rev() {
+            next[j] = b[j] == '*' && next[j + 1];
+        }
+        let mut row = vec![false; b.len() + 1];
+        for i in (0..a.len()).rev() {
+            row[b.len()] = a[i] == '*' && next[b.len()];
+            for j in (0..b.len()).rev() {
+                // A `*` on either side matches the empty string, or absorbs the one
+                // character the other side's next element produces and stays available
+                // for the rest — so both orders of that choice are the same two options.
+                row[j] = if a[i] == '*' || b[j] == '*' {
+                    next[j] || row[j + 1]
+                } else {
+                    characters_meet(a[i], b[j], fold_case) && next[j + 1]
+                };
+            }
+            ::std::mem::swap(&mut row, &mut next);
+        }
+        // After the last swap `next` holds row 0 (and row 0 itself when `a` is empty).
+        Ok(next[0])
+    }
+
+    /// Is every string the pattern `narrow` matches also matched by the pattern `wide`?
+    ///
+    /// `narrow`'s elements are atoms `wide` has to absorb: only a `*` in `wide` can cover
+    /// a `*` in `narrow` (nothing else covers an unbounded run), and a `?` in `wide`
+    /// covers exactly one single-character atom. Bounded and charged like [`intersects`].
+    fn covers(
+        wide: &str,
+        narrow: &str,
+        fold_case: bool,
+        budget: &mut Budget,
+    ) -> Result<bool, MatchError> {
+        let w: Vec<char> = wide.chars().collect();
+        let n: Vec<char> = narrow.chars().collect();
+        budget.charge(cells(w.len(), n.len()))?;
+        // whole[i][j]: does `wide[i..]` match every string `narrow[j..]` produces? Two
+        // rolling rows again. `next` starts as row |w|: an exhausted `wide` matches the
+        // empty string only, so anything left of `narrow` (which can always produce one
+        // more character) escapes it.
+        let mut next = vec![false; n.len() + 1];
+        next[n.len()] = true;
+        let mut row = vec![false; n.len() + 1];
+        for i in (0..w.len()).rev() {
+            row[n.len()] = w[i] == '*' && next[n.len()];
+            for j in (0..n.len()).rev() {
+                row[j] = if w[i] == '*' {
+                    next[j] || row[j + 1]
+                } else if w[i] == '?' {
+                    n[j] != '*' && next[j + 1]
+                } else {
+                    n[j] != '*'
+                        && n[j] != '?'
+                        && same_character(w[i], n[j], fold_case)
+                        && next[j + 1]
+                };
+            }
+            ::std::mem::swap(&mut row, &mut next);
+        }
+        Ok(next[0])
+    }
+
+    /// Can one element of each pattern stand for the same character?
+    fn characters_meet(left: char, right: char, fold_case: bool) -> bool {
+        left == '?' || right == '?' || same_character(left, right, fold_case)
+    }
+
+    /// Are these the same character, folding ASCII case when the dimension is matched
+    /// case-insensitively?
+    fn same_character(left: char, right: char, fold_case: bool) -> bool {
+        if fold_case {
+            left.eq_ignore_ascii_case(&right)
+        } else {
+            left == right
+        }
     }
 }

@@ -45,6 +45,70 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The route key THIS service answers under, which is NOT the `events` key its model's
+/// `aws.auth#sigv4` name resolves to.
+///
+/// `CloudWatch Events` is the LEGACY `sdkId` of the service now called `EventBridge`,
+/// not a second endpoint beside it, and the two models publish one and the same wire
+/// identity — service shape `AWSEvents`, version `2015-10-07`, protocol `awsJson1_1`
+/// (hence `POST /` with the same `X-Amz-Target: AWSEvents.<Operation>`),
+/// `awsService.endpointPrefix` `events` and `aws.auth#sigv4` name `events`:
+/// `smithy_query(query="service_info")` on this model and on
+/// `services/service-com-amazonaws-eventbridge-awsevents/smithy-model/com-amazonaws-eventbridge-awsevents.json`
+/// differ only in `sdkId` (`CloudWatch Events` vs `EventBridge`). No signal in a request
+/// can tell them apart, so the `events` key has to be served by exactly ONE of them, and
+/// this model's 51 operations are a strict SUBSET of the EventBridge model's 57 (which
+/// adds `CreateEndpoint`, `DeleteEndpoint`, `DescribeEndpoint`, `ListEndpoints`,
+/// `UpdateEndpoint` and `UpdateEventBus`): the EventBridge service — the endpoint's
+/// current name, and the superset — owns `events`, so a client that signs for it loses
+/// no operation. Claiming `events` here as well would make the router answer
+/// `500 AmbiguousService`, a code that exists in no AWS model, for every request to
+/// either service.
+///
+/// This service therefore answers under the key the framework itself derives from an
+/// `aws.api#service` sdkId when a model carries no sigv4 name (`emulator-core-build-support`'s
+/// `read_service_info`: the sdkId lower-cased with its spaces removed), so the legacy
+/// model stays mounted, reachable and exercised by its own suite without ever contending
+/// for the `events` key.
+const OWN_SDK_ID_KEY: &str = "cloudwatchevents";
+
+/// The first URI path segment EVERY request to this service carries: the ROOT path.
+///
+/// This model is `awsJson1_1` and binds no `smithy.api#http` trait to any operation, so
+/// every request is `POST /` with `X-Amz-Target: AWSEvents.<Operation>` (the crate's
+/// `OPERATIONS.md`, "Wire protocol"). `emulator_server::ROOT_PATH_SEGMENT` is the
+/// framework's sentinel for exactly that path; claiming it rather than the generated
+/// EMPTY `ROUTE_PATH_SEGMENTS` (which claims every path under the key) keeps this
+/// service out of any other service's path space.
+const OWN_PATH_SEGMENTS: &[&str] = &[emulator_server::ROOT_PATH_SEGMENT];
+
+/// Whether the request these `parts` came from resolves to [`OWN_SDK_ID_KEY`] AND the one
+/// URI path this service's wire protocol publishes ([`OWN_PATH_SEGMENTS`]).
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable owner
+/// of that rule, and it is CALLED here rather than re-implemented: the request's route
+/// key must match the key passed AND its first URI path segment must be one of the
+/// segments passed, by exact segment equality.
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed only
+/// the request's parts, so the two things it reads — the URI and the headers — are
+/// re-presented to it as a bodiless request. It reads neither the body nor the method, so
+/// nothing it decides on is missing.
+fn claims_own_key_and_root_path(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        OWN_SDK_ID_KEY,
+        OWN_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-cloudwatchevents-awsevents` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +138,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // Delegated to the framework's own predicate — see
+        // [`claims_own_key_and_root_path`]: this model is the LEGACY `CloudWatch Events`
+        // alias of the service now called EventBridge, publishing the very same wire
+        // identity, so the generated `events` route key cannot tell the two apart. It is
+        // claimed by the EventBridge crate and this service answers under its OWN
+        // sdkId-derived key instead, so exactly one service claims every request.
+        claims_own_key_and_root_path(parts)
     }
 
     fn override_operation(

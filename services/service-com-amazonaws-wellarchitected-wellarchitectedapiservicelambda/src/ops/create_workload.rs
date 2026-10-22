@@ -229,24 +229,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let aws_regions = input.aws_regions.unwrap_or_default();
-        let non_aws_regions = input.non_aws_regions.unwrap_or_default();
-        // "Either AwsRegions, NonAwsRegions, or both must be specified when creating a
-        // workload." (CreateWorkload doc)
-        if aws_regions.is_empty() && non_aws_regions.is_empty() {
-            return Err(field_validation(
-                "AwsRegions",
-                "Either AwsRegions, NonAwsRegions, or both must be specified",
-            ));
-        }
         // "You also must specify ReviewOwner, even though the parameter is listed as not
-        // being required" (CreateWorkload doc).
+        // being required" (CreateWorkload doc). A member the request had to carry and did
+        // not is answered BEFORE any rule over the members it did carry: a caller told to
+        // fix a different member than the one it omitted corrects the wrong thing and
+        // never succeeds.
         let review_owner = match input.review_owner.filter(|owner| !owner.is_empty()) {
             Some(owner) => owner,
             None => {
-                return Err(field_validation("ReviewOwner", "Member must not be null"));
+                return Err(CreateWorkloadErrorModeled::ValidationException(
+                    crate::state::absent_member_exception(REVIEW_OWNER_MEMBER),
+                )
+                .into());
             }
         };
+
+        let aws_regions = input.aws_regions.unwrap_or_default();
+        let non_aws_regions = input.non_aws_regions.unwrap_or_default();
+        // "Either AwsRegions, NonAwsRegions, or both must be specified when creating a
+        // workload." (CreateWorkload doc). The rule spans BOTH members, so both are
+        // reported: a client that walks `Fields` to mark every offending member has to
+        // see each member it may satisfy the rule with.
+        if aws_regions.is_empty() && non_aws_regions.is_empty() {
+            return Err(CreateWorkloadErrorModeled::ValidationException(
+                crate::state::either_regions_exception(),
+            )
+            .into());
+        }
+        // A Region a workload claims to run in has to be a Region. Checked before any
+        // state is written, so the store never holds a workload the real service would
+        // have refused.
+        if let Some(exception) = crate::state::unknown_aws_region_exception(&aws_regions) {
+            return Err(CreateWorkloadErrorModeled::ValidationException(exception).into());
+        }
 
         // A profile or review template named here has to exist to be associated. Neither
         // resource can be created in this emulator yet (CreateProfile / CreateReviewTemplate
@@ -430,11 +445,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// failed and the constraint it violated — preferred over the scaffold's synthetic one
 /// because the modelled shape carries `Reason` and `Fields`, which a client reads.
 fn field_validation(member: &str, constraint: &str) -> CreateWorkloadError {
-    let (message, fields) = crate::state::validation_detail(member, constraint);
-    CreateWorkloadErrorModeled::ValidationException(ValidationException {
-        message,
-        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-        fields: Some(fields),
-    })
+    CreateWorkloadErrorModeled::ValidationException(crate::state::member_constraint_exception(
+        member, constraint,
+    ))
     .into()
 }
+
+/// The member this operation requires by documentation rather than by model
+/// (`CreateWorkloadInput$ReviewOwner`).
+const REVIEW_OWNER_MEMBER: &str = "ReviewOwner";

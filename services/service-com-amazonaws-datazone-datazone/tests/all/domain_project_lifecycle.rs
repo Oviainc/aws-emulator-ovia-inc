@@ -25,22 +25,26 @@ use std::sync::Arc;
 const SETTLED: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// One emulator: a single shared engine behind the DataZone service, driven over HTTP.
-struct Emulator {
+///
+/// `pub(crate)` because every suite in this test target drives the service the same
+/// way: a sibling suite (`tests/all/update_project.rs`) reuses this harness instead of
+/// copying it.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 /// What a call answered: the HTTP status, the parsed body (`Value::Null` for an empty
 /// one) and the wire error code when the answer was a failure.
-struct Answer {
-    status: u16,
-    body: Value,
-    error_code: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
+    pub(crate) error_code: String,
 }
 
 impl Answer {
     /// A member of the response body as a string, or `"<absent>"` so an assertion
     /// message says which member was missing.
-    fn s(&self, member: &str) -> String {
+    pub(crate) fn s(&self, member: &str) -> String {
         self.body
             .get(member)
             .and_then(Value::as_str)
@@ -50,7 +54,7 @@ impl Answer {
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(
@@ -62,7 +66,7 @@ impl Emulator {
     /// Send one request. The `Authorization` header carries a SigV4 credential scope,
     /// which is both how the router picks this service and where the handlers read the
     /// caller's region and principal from.
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
         let payload = body.map(|b| serde_json::to_vec(&b).expect("a JSON body serializes"));
         let mut request = http::Request::builder()
             .method(method)
@@ -119,7 +123,7 @@ impl Emulator {
 
     /// Create a domain and wait until it has settled to `AVAILABLE`, which is the
     /// precondition every project case needs.
-    async fn available_domain(&self, name: &str) -> String {
+    pub(crate) async fn available_domain(&self, name: &str) -> String {
         let created = self
             .call("POST", "/v2/domains", Some(json!({ "name": name })))
             .await;

@@ -208,10 +208,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "refused a report download"
             );
             return Err(GetReportErrorModeled::ValidationException(
-                // The caller's token is NOT echoed back: a 400 body need not repeat what
-                // the request already carried, and the modelled `resourceId` on the
-                // conflict below is the member that identifies a grant.
-                crate::state::invalid_token("termToken was not issued by GetTermForReport"),
+                // The service's own fixed invalid-token text, not the check that refused
+                // it: which internal lookup missed is a fact about the SERVER, and the
+                // caller's token is not echoed back either — the request carried it. The
+                // reason this refusal happened is on the log line above, where an
+                // operator reads it; the modelled `reason` tells a client it was a token.
+                crate::state::invalid_token(),
             )
             .into());
         };

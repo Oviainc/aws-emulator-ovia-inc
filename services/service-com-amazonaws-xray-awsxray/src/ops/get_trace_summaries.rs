@@ -97,6 +97,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// A modelled timestamp as floating point seconds of epoch time, the unit a
+// segment document's `start_time` / `end_time` use: the crate keeps ONE such
+// conversion, beside the state it converts for.
+use crate::state::epoch_seconds;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -291,20 +296,9 @@ fn unsupported(message: impl Into<String>) -> GetTraceSummariesError {
     .into()
 }
 
-/// A modelled timestamp as floating point seconds of epoch time, the unit a
-/// segment document's `start_time` / `end_time` use.
-fn epoch_seconds(timestamp: &::aws_smithy_types::DateTime) -> f64 {
-    #[allow(clippy::cast_precision_loss)]
-    let seconds = timestamp.secs() as f64;
-    seconds + f64::from(timestamp.subsec_nanos()) / 1_000_000_000.0
-}
-
-/// `ApproximateTime`: when this response was built.
+/// `ApproximateTime`: when this response was built, off the crate's one clock.
 fn now() -> ::aws_smithy_types::DateTime {
-    let seconds = ::std::time::SystemTime::now()
-        .duration_since(::std::time::UNIX_EPOCH)
-        .map_or(0.0, |since| since.as_secs_f64());
-    ::aws_smithy_types::DateTime::from_secs_f64(seconds)
+    ::aws_smithy_types::DateTime::from_secs_f64(crate::state::now_epoch_seconds())
 }
 
 /// Build one `TraceSummary` from a stored trace's segments.

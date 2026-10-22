@@ -5,8 +5,14 @@
 //! Every value the data-lake and subscriber operations answer with is read back out of
 //! the structs below, and every ARN is minted through the helpers here so that
 //! `CreateDataLake`/`CreateSubscriber` and the readers that follow them cannot drift.
+//!
+//! Beside those resources the store holds this service's AUTHORIZATION records: which
+//! signing principals Security Lake refuses ([`Admission`], keyed by
+//! [`caller_principal`]). They are read by the request-admission layer in
+//! `crate::service`, ahead of operation dispatch, so an unauthorized caller is answered
+//! without any resource being looked up.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -71,6 +77,22 @@ pub const MAX_DATA_LAKES: usize = 64;
 /// keeps calling; past the bound the call is refused instead. Deleting a subscriber frees
 /// its slot.
 pub const MAX_SUBSCRIBERS_PER_REGION: usize = 50;
+
+/// What this service's authorization layer decides about one request, for the principal
+/// that signed it.
+///
+/// Security Lake authorizes the CALLER, not the target: the decision is reached before
+/// the operation the request names runs, so it is the same whatever resource the request
+/// names and whether or not that resource exists. A refusal therefore tells a caller
+/// nothing about this account's state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Admission {
+    /// The principal may invoke the operation: dispatch proceeds to the handler.
+    #[default]
+    Admitted,
+    /// The principal may not: the request is refused before any resource lookup.
+    Unauthorized,
+}
 
 /// One Security Lake data lake, as this emulator holds it. One per Region.
 #[derive(Debug, Clone)]
@@ -178,9 +200,47 @@ pub struct ComAmazonawsSecuritylakeSecuritylakeState {
     /// Counter feeding [`ComAmazonawsSecuritylakeSecuritylakeState::new_subscriber_id`], so
     /// two ids minted in the same nanosecond still differ.
     subscriber_seq: u64,
+    /// The principals this service's authorization layer refuses, each the SigV4 access
+    /// key id a request presents ([`caller_principal`]).
+    ///
+    /// The emulator presents a single account (`::engine::emulator_account_id()`), which
+    /// administers this emulator's Security Lake, so a principal this set does NOT hold
+    /// is [`Admission::Admitted`] and a record here is what makes a caller a restricted
+    /// one — the same shape the `marketplacereporting` service's per-principal `access`
+    /// records take. Ordered, so a `Debug` of the store reads the same on every run.
+    unauthorized_principals: BTreeSet<String>,
 }
 
 impl ComAmazonawsSecuritylakeSecuritylakeState {
+    /// The authorization decision for `principal`, as the front door reaches it BEFORE
+    /// the operation the request names runs.
+    ///
+    /// It reads only the principal, so the answer is the same whatever the request
+    /// targets and whether or not that target exists.
+    pub fn admission(&self, principal: &str) -> Admission {
+        if self.unauthorized_principals.contains(principal) {
+            Admission::Unauthorized
+        } else {
+            Admission::Admitted
+        }
+    }
+
+    /// Refuse every later request signed by `principal`. `true` when this changed the
+    /// records — a principal already refused stays refused.
+    pub fn restrict_principal(&mut self, principal: impl Into<String>) -> bool {
+        self.unauthorized_principals.insert(principal.into())
+    }
+
+    /// Admit `principal` again. `true` when it had been refused.
+    pub fn permit_principal(&mut self, principal: &str) -> bool {
+        self.unauthorized_principals.remove(principal)
+    }
+
+    /// Every principal this service refuses, in order.
+    pub fn unauthorized_principals(&self) -> impl Iterator<Item = &str> + Clone {
+        self.unauthorized_principals.iter().map(String::as_str)
+    }
+
     /// Materialise every state change the CLOCK has already made due.
     ///
     /// Today that is exactly one: a data lake whose `INITIALIZED` -> `COMPLETED`
@@ -369,6 +429,22 @@ pub fn caller_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The principal a request presents: the SigV4 access key id in its `Authorization`
+/// header, which is the only caller identity a request carries. It is the key an
+/// authorization record is held under, and what
+/// [`ComAmazonawsSecuritylakeSecuritylakeState::admission`] decides on.
+///
+/// `authorization` is that header's value, absent for a request that carries none; the
+/// id is parsed by the vendored [`::engine::extract_akid`], the emulator's single parser
+/// for it, which attributes a request without a usable one to `"default"`.
+pub fn caller_principal(authorization: Option<&str>) -> String {
+    let mut headers = ::http::HeaderMap::new();
+    if let Some(value) = authorization.and_then(|value| ::http::HeaderValue::from_str(value).ok()) {
+        headers.insert(::http::header::AUTHORIZATION, value);
+    }
+    ::engine::extract_akid(&headers)
 }
 
 /// `arn:aws:securitylake:<region>:<account>:data-lake/default`.

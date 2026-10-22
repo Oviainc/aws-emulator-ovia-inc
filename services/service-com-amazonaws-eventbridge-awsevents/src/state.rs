@@ -19,7 +19,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{Rule as RuleSummary, Target, RULE_STATE_VALUES};
+use crate::ops::types::{
+    DeadLetterConfig, LogConfig, Rule as RuleSummary, Tag, Target, INCLUDE_DETAIL_VALUES,
+    LEVEL_VALUES, RULE_STATE_VALUES,
+};
 
 /// The event bus a request lands on when it names none.
 ///
@@ -50,6 +53,15 @@ pub const STORE_UNAVAILABLE: &str = "the eventbridge state store is unavailable"
 /// page; applying the same maximum to a request that omits `Limit` means one
 /// call can never serialize more than this many records.
 pub const MAX_LIST_PAGE: usize = 100;
+
+/// Largest number of event buses one account holds, the account's `default` bus
+/// included.
+///
+/// The EventBridge service quota "Event buses per account" (default 100). It is
+/// also what bounds the store: a `CreateEventBus` that would ADD a bus past it
+/// answers the modelled `LimitExceededException` instead of growing memory
+/// without limit.
+pub const MAX_EVENT_BUSES: usize = 100;
 
 /// Largest number of rules one event bus holds.
 ///
@@ -221,18 +233,45 @@ pub struct EventBus {
     pub name: String,
     pub description: Option<String>,
     pub created: SystemTime,
+    /// When the bus was last changed. Equal to [`Self::created`] until an
+    /// operation that changes the bus runs, so `LastModifiedTime` is never
+    /// earlier than `CreationTime`.
+    pub last_modified: SystemTime,
+    /// The KMS key `CreateEventBus` was given, if any: "If you do not specify a
+    /// customer managed key identifier, EventBridge uses an Amazon Web Services
+    /// owned key" (`CreateEventBus`'s `KmsKeyIdentifier`), and an owned key is
+    /// not reported back, so an absent member stays absent.
+    pub kms_key_identifier: Option<String>,
+    /// The dead-letter queue configuration, as it was stored.
+    pub dead_letter_config: Option<DeadLetterConfig>,
+    /// The logging configuration, as it was stored.
+    pub log_config: Option<LogConfig>,
+    /// The partner event source this bus is matched with, set only for a partner
+    /// event bus. Nothing in this emulator creates a partner event source yet,
+    /// so no stored bus carries one.
+    pub event_source_name: Option<String>,
+    /// The tags `CreateEventBus` was given, in the order they arrived, so the
+    /// tagging operations report back exactly what was stored.
+    pub tags: Vec<Tag>,
     /// Rules by name, so enumeration is deterministic and `ListRules` can
     /// resume after a page token.
     pub rules: BTreeMap<String, RuleRecord>,
 }
 
 impl EventBus {
-    /// A bus named `name`, created at `created`.
+    /// A bus named `name`, created at `created`: the account's `default` bus, and
+    /// the starting point `CreateEventBus` fills in from its request.
     pub fn new(name: &str, created: SystemTime) -> Self {
         Self {
             name: name.to_string(),
             description: None,
             created,
+            last_modified: created,
+            kms_key_identifier: None,
+            dead_letter_config: None,
+            log_config: None,
+            event_source_name: None,
+            tags: Vec::new(),
             rules: BTreeMap::new(),
         }
     }
@@ -430,27 +469,54 @@ pub fn rule_arn(region: &str, event_bus_name: &str, rule_name: &str) -> String {
 
 /// The bus name a request addresses.
 ///
-/// `EventBusNameOrArn` admits either a bare name or an event-bus ARN (its
-/// modelled pattern spells both out), so an ARN is reduced to the name after
-/// its last `/`; an absent or empty member means the account's `default` bus.
+/// `EventBusNameOrArn` admits either a bare name or an event-bus ARN — its
+/// modelled pattern spells both out:
+/// `^(arn:aws[\w-]*:events:[a-z]+-[a-z]+-[\w-]+:[0-9]{12}:event-bus\/)?[/\.\-_A-Za-z0-9]+$`
+/// — so an ARN is reduced to everything after its `event-bus/` resource-type
+/// segment. That is the whole remainder, NOT the text after the ARN's last `/`: a
+/// bus name may itself contain `/` (`EventBusName`'s pattern admits it, and a
+/// partner event bus name such as `aws.partner/example.com/1234/stream` is built
+/// from them), and cutting at the last `/` would address a different bus. An
+/// absent or empty member means the account's `default` bus.
 pub fn effective_bus_name(event_bus_name_or_arn: Option<&str>) -> String {
     let named = event_bus_name_or_arn
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or(DEFAULT_EVENT_BUS_NAME);
-    match named.strip_prefix("arn:") {
-        Some(_) => named
-            .rsplit('/')
-            .next()
-            .unwrap_or(DEFAULT_EVENT_BUS_NAME)
-            .to_string(),
-        None => named.to_string(),
+    match named.split_once(":event-bus/") {
+        Some((prefix, name)) if prefix.starts_with("arn:") && !name.is_empty() => name.to_string(),
+        _ => named.to_string(),
     }
 }
 
 /// Whether `value` names one of `RuleState`'s values.
 pub fn is_rule_state(value: &str) -> bool {
     RULE_STATE_VALUES.contains(&value)
+}
+
+/// Why a `LogConfig` is not one EventBridge accepts, or `None` when it is.
+///
+/// `LogConfig`'s two members are modelled enums — `IncludeDetail`
+/// (`INCLUDE_DETAIL_VALUES`) and `Level` (`LEVEL_VALUES`) — and the boundary
+/// validator does not narrow an enum-typed string to its values, so a value the
+/// enum does not admit is refused here rather than stored and later reported
+/// back as if EventBridge had accepted it. Written once, so `CreateEventBus` and
+/// (later) `UpdateEventBus` refuse the same values.
+pub fn log_config_violation(config: &LogConfig) -> Option<String> {
+    for (member, value, admitted) in [
+        ("IncludeDetail", config.include_detail.as_deref(), INCLUDE_DETAIL_VALUES),
+        ("Level", config.level.as_deref(), LEVEL_VALUES),
+    ] {
+        if let Some(value) = value {
+            if !admitted.contains(&value) {
+                return Some(format!(
+                    "Parameter LogConfig.{member} is not valid. Reason: {value:?} is not one of {}.",
+                    admitted.join(" | ")
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Why a `ScheduleExpression` is not one EventBridge accepts, or `None` when it

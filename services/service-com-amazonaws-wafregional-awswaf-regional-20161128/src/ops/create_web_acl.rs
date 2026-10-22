@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `WebACL` record in this service's state and answers the projection of what
+//! was stored, so `GetWebACL` reads back the same web ACL. The change token the request
+//! carries is consumed here, as it is by every mutating AWS WAF Classic call.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +192,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWebACL"))
+        // The region the minted `WebACLArn` names comes from the caller's SigV4
+        // credential scope; it is read before the store is locked.
+        let region = crate::state::region_of(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWebACLErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // `MetricName` "can contain only alphanumeric characters (A-Z, a-z, 0-9) ... It
+        // can't contain whitespace or metric names reserved for AWS WAF, including
+        // "All" and "Default_Action."" — anything outside that set is a disallowed
+        // name. `DefaultAction.Type` needs no check here: the modelled
+        // `WafActionType` enum (ALLOW, BLOCK, COUNT) is refused before this handler
+        // runs, and those three are exactly the values
+        // `WAFInvalidParameterException`'s documentation accepts for a created
+        // `WebACL`'s `DefaultAction`.
+        if !crate::state::metric_name_is_allowed(&input.metric_name) {
+            return Err(CreateWebACLErrorModeled::WAFDisallowedNameException(
+                WAFDisallowedNameException {
+                    // One fixed sentence per refusal class, carrying nothing of the
+                    // request — as AWS WAF Classic's messages do.
+                    message: Some(crate::state::MESSAGE_DISALLOWED_NAME.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Two resource limits bound the state one caller can grow: how many WebACL
+        // records the account holds, and how many tags one record retains. Both are
+        // checked while the same guard is held, before anything is stored.
+        let requested_tags = input.tags.as_ref().map_or(0, Vec::len);
+        if state.web_acls.len() >= crate::state::MAX_WEB_ACLS
+            || requested_tags > crate::state::MAX_TAGS_PER_RESOURCE
+        {
+            return Err(CreateWebACLErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The change-token protocol every mutating AWS WAF Classic call follows: the
+        // token must be one `GetChangeToken` minted and no other mutating call has
+        // used, since "each create, update, or delete request must use a unique change
+        // token".
+        if !state.consume_change_token(&input.change_token) {
+            return Err(CreateWebACLErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A fresh id per call: `ResourceName` carries no uniqueness constraint, so two
+        // WebACLs created with the same `Name` are two distinct resources, each stored
+        // under its own `WebACLId`.
+        let web_acl_id = state.mint_id();
+        let web_acl_arn = crate::state::web_acl_arn(&region, &web_acl_id);
+        // Tags are a key→value set, so a repeated key is one tag whose value is the
+        // last the request gave for it. The count was bounded above, and the modelled
+        // `TagKey`/`TagValue` lengths bound each entry, so the retained tag state per
+        // record is bounded.
+        let tags: std::collections::BTreeMap<String, String> = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+        // A new WebACL activates no rules: they arrive through `UpdateWebACL`.
+        let entry = crate::state::WebACLEntry::new(
+            web_acl_id.clone(),
+            input.name,
+            input.metric_name,
+            input.default_action.r#type,
+            web_acl_arn,
+            tags,
+        );
+        // The response is the projection of the record that was STORED, not of the
+        // request.
+        let web_acl = entry.to_modelled();
+        state.web_acls.insert(web_acl_id, entry);
+
+        Ok(CreateWebACLOutput {
+            web_acl: Some(web_acl),
+            change_token: Some(input.change_token),
+        })
     }
 }
