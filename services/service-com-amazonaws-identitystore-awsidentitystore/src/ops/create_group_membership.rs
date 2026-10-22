@@ -204,20 +204,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let member_key = crate::state::resource_key(member);
         if !store.users.contains_key(&member_key) {
             return Err(CreateGroupMembershipErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::ResourceKind::User, member),
+                crate::state::member_not_found(member),
             )
             .into());
         }
 
         // One membership per (group, member) pair: a repeat of a membership that
         // already exists violates that uniqueness claim rather than minting a second
-        // id for the same pair.
-        if let Some(existing) = store.membership_of(&group_key, &member_key) {
+        // id for the same pair. The conflict names the claim, not the membership that
+        // already holds the pair.
+        if store.membership_of(&group_key, &member_key).is_some() {
             return Err(CreateGroupMembershipErrorModeled::ConflictException(
-                crate::state::uniqueness_conflict(format!(
-                    "this member is already a member of group {group_key} (MembershipId {})",
-                    existing.membership_id
-                )),
+                crate::state::uniqueness_conflict(
+                    crate::state::UniquenessClaim::GroupMembership,
+                ),
             )
             .into());
         }

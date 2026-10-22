@@ -254,17 +254,6 @@ impl UserSelector {
         }
     }
 
-    /// Which identifier this selector used, for the not-found message: the identifier
-    /// and the attribute it named, never the value, which is `@sensitive` in every
-    /// form.
-    fn subject(&self) -> &'static str {
-        match self {
-            Self::UserName(_) => "UniqueAttribute userName",
-            Self::EmailValue(_) => "UniqueAttribute emails.value",
-            Self::ExternalId(..) => "ExternalId",
-        }
-    }
-
     /// The user `store` holds for this selector, or `None` when it holds none.
     ///
     /// The three lookups live in THIS file rather than in `state.rs`: they are reached
@@ -304,13 +293,11 @@ impl UserSelector {
 
     /// The modelled `ResourceNotFoundException` for a store that holds no such user:
     /// the shared shaping of that error, so this operation and `GetGroupId` answer one
-    /// form of it.
+    /// form of it — the resource class's resolve constant (`USER not found.`), with
+    /// nothing of the identifier that failed to resolve in it.
     fn not_found(&self) -> GetUserIdErrorModeled {
         GetUserIdErrorModeled::ResourceNotFoundException(
-            crate::state::not_found_by_alternate_identifier(
-                crate::state::ResourceKind::User,
-                self.subject(),
-            ),
+            crate::state::not_found_by_alternate_identifier(crate::state::ResourceKind::User),
         )
     }
 

@@ -179,10 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
         let not_found = || {
             GetGroupIdErrorModeled::ResourceNotFoundException(
-                crate::state::not_found_by_alternate_identifier(
-                    crate::state::ResourceKind::Group,
-                    lookup.subject(),
-                ),
+                crate::state::not_found_by_alternate_identifier(crate::state::ResourceKind::Group),
             )
         };
         let store = state.store(&input.identity_store_id).ok_or_else(not_found)?;
@@ -252,15 +249,6 @@ impl<'a> GroupLookup<'a> {
                     ))),
                 }
             }
-        }
-    }
-
-    /// Which identifier this lookup used, for the not-found message: the kind of
-    /// identifier, never the value, which is `@sensitive` in both forms.
-    fn subject(&self) -> &'static str {
-        match self {
-            Self::ExternalId { .. } => "ExternalId",
-            Self::DisplayName(_) => "UniqueAttribute displayName",
         }
     }
 
