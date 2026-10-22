@@ -178,13 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "You can only delete the service network if there is no service or VPC
         // associated with it" (the operation's own documentation).
+        //
+        // The refusal message is the fixed template AWS emits for this guard, over the
+        // identifier the request resolved to and nothing else: it reports WHICH kind of
+        // dependent still exists, never HOW MANY (the count is not part of what the
+        // service reports, only of what it decides on).
         let associated = store.associated_service_count(&id);
         if associated > 0 {
             return Err(DeleteServiceNetworkErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "service network {id} still has {associated} service association(s) and cannot be deleted"
-                    ),
+                    message: format!("ServiceNetwork {id} has service(s) associated"),
                     resource_id: id.clone(),
                     resource_type: crate::state::KIND_SERVICE_NETWORK.to_string(),
                 },

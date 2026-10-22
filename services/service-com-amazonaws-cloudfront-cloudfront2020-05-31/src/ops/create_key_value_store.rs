@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateKeyValueStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateKeyValueStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateKeyValueStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a key value store: allocates its UUID id, its ARN and its first version
+//! token, stores the submitted comment and tags, and reports the record it stored. The
+//! store starts `PROVISIONING`, and the clock owes it `READY`.
+//!
+//! A store NAME identifies one store for its whole life ("In your account, the key value
+//! store names must be unique"), so a name the store already holds is refused with
+//! `EntityAlreadyExists` rather than creating a second store.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +81,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::StoredKeyValueStore;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +159,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateKeyValueStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateKeyValueStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateKeyValueStore"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // "You can also import key value store data in JSON format from an S3 bucket by
+        // providing a valid ImportSource that you own." Importing means reading the S3
+        // object's contents into the store's DATA plane, which this emulator cannot do
+        // faithfully from here — so the request is answered honestly with the 501 rather
+        // than by creating a store whose contents were never imported.
+        if let Some(import_source) = &input.import_source {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: format!(
+                        "CreateKeyValueStore with an ImportSource ({} {}) is not implemented in \
+                         this emulator: the source object's contents are not loaded into the key \
+                         value store",
+                        import_source.source_type, import_source.source_arn
+                    ),
+                },
+            ));
+        }
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "In your account, the key value store names must be unique": a name identifies
+        // one store for its whole life, so a name the store already holds cannot name a
+        // second one. Checked BEFORE anything is minted.
+        if store.key_value_stores.contains_key(&input.name) {
+            return Err(CreateKeyValueStoreErrorModeled::EntityAlreadyExists(
+                crate::state::key_value_store_already_exists(&input.name),
+            )
+            .into());
+        }
+
+        // "The entity limit has been exceeded." The store grows only here and a key value
+        // store cannot be evicted (a later describe has to answer with what this create
+        // returned), so the bound is an entry count refused before the insert.
+        if store.key_value_stores.len() >= crate::state::MAX_KEY_VALUE_STORES {
+            return Err(CreateKeyValueStoreErrorModeled::EntityLimitExceeded(
+                EntityLimitExceeded {
+                    message: Some(format!(
+                        "This emulator holds at most {} key value stores; delete one before \
+                         creating another",
+                        crate::state::MAX_KEY_VALUE_STORES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.allocate_key_value_store_id();
+        let etag = store.next_etag();
+        let stored = StoredKeyValueStore {
+            arn: crate::state::key_value_store_arn(&id),
+            name: input.name.clone(),
+            id,
+            // `KeyValueStore$Comment` is required on the wire, so a create that named no
+            // comment reports the empty one rather than omitting the member.
+            comment: input.comment.unwrap_or_default(),
+            // A store CloudFront has just accepted is not provisioned yet, so it reports
+            // the transient status until the clock owes it the terminal one.
+            status: crate::state::KVS_STATUS_PROVISIONING.to_string(),
+            ready_due: now + crate::state::KVS_PROVISIONING_DELAY,
+            last_modified_time: now,
+            etag: etag.clone(),
+            // Held verbatim: a later read answers from this record, never from the
+            // request that is being served.
+            tags: input.tags,
+        };
+        let key_value_store = stored.to_key_value_store();
+        let location = crate::state::location_uri(
+            ctx.parts(),
+            &crate::state::key_value_store_path(&stored.name),
+        );
+        store.key_value_stores.insert(input.name, stored);
+
+        Ok(CreateKeyValueStoreOutput {
+            // "The resulting key value store."
+            key_value_store: Some(key_value_store),
+            // "The location of the resulting key value store."
+            location: Some(location),
+            // "The ETag in the resulting key value store" — the version token an
+            // `If-Match` against this store is checked against.
+            e_tag: Some(etag),
+        })
     }
 }

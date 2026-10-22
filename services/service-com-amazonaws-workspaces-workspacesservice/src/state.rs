@@ -8,6 +8,10 @@
 //! transitions live here rather than in one of the operation files because all
 //! four batch operations apply the same rules to the same records.
 //!
+//! It owns the connection-alias lifecycle on the same terms: one record per
+//! alias, the creation order `DescribeConnectionAliases` paginates over, and the
+//! two transitions `CreateConnectionAlias` and `DeleteConnectionAlias` start.
+//!
 //! It also owns the account-link records the six account-link operations share
 //! (`CreateAccountLinkInvitation`, `AcceptAccountLinkInvitation`,
 //! `RejectAccountLinkInvitation`, `DeleteAccountLinkInvitation`,
@@ -28,8 +32,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    AccountLink, ComputeType, RootStorage, Tag, UserStorage, Workspace, WorkspaceBundle,
-    WorkspaceProperties, WorkspaceRequest, COMPUTE_VALUES,
+    AccountLink, ComputeType, ConnectionAlias, RootStorage, Tag, UserStorage, Workspace,
+    WorkspaceBundle, WorkspaceProperties, WorkspaceRequest, COMPUTE_VALUES,
 };
 
 /// How long a lifecycle transition the clock owes stays in its transient state.
@@ -37,10 +41,12 @@ use crate::ops::types::{
 /// `CreateWorkspaces`, `StartWorkspaces`, `StopWorkspaces` and
 /// `TerminateWorkspaces` are documented as asynchronous: each returns while the
 /// WorkSpace is still in a transient state (`PENDING`, `STARTING`, `STOPPING`,
-/// `TERMINATING`). The span is deliberately non-zero so a caller that describes
-/// a WorkSpace straight after the call still observes that transient state, and
-/// short enough that a test settles quickly. It is a CHOSEN span, not a duration
-/// AWS documents.
+/// `TERMINATING`). `CreateConnectionAlias` and `DeleteConnectionAlias` are the
+/// same: the model's `ConnectionAliasState` carries the transient `CREATING` and
+/// `DELETING` beside the settled `CREATED`. The span is deliberately non-zero so
+/// a caller that describes a resource straight after the call still observes that
+/// transient state, and short enough that a test settles quickly. It is a CHOSEN
+/// span, not a duration AWS documents.
 pub const TRANSITION_DELAY: Duration = Duration::from_millis(300);
 
 /// The reserved `UserName` that marks a user-decoupled WorkSpace.
@@ -51,10 +57,11 @@ pub const TRANSITION_DELAY: Duration = Duration::from_millis(300);
 /// is `[UNDEFINED]` for user-decoupled WorkSpaces."
 pub const USER_DECOUPLED_USER_NAME: &str = "[UNDEFINED]";
 
-/// The page size `DescribeWorkspaces` uses when the caller sends no `Limit`.
+/// The page size a describe uses when the caller sends no `Limit`.
 ///
-/// The model caps `DescribeWorkspacesRequest$Limit` at 25 (`range 1..25`), so a
-/// request without one cannot be served a larger page either.
+/// The model caps both `DescribeWorkspacesRequest$Limit` and
+/// `DescribeConnectionAliasesRequest$Limit` at 25 (`range 1..25`), so a request
+/// without one cannot be served a larger page either.
 pub const DEFAULT_DESCRIBE_PAGE_SIZE: usize = 25;
 
 /// Per-item error code for a WorkSpace id that names no stored WorkSpace.
@@ -354,6 +361,117 @@ fn occupancy_key(directory_id: &str, user_name: &str, workspace_name: Option<&st
     }
 }
 
+/// The most connection aliases this emulator stores at once.
+///
+/// AWS caps connection aliases with an adjustable service quota and reports an
+/// exceeded cap as `ResourceLimitExceededException` ("Your resource limits have
+/// been exceeded"), which `CreateConnectionAlias` models. The NUMBER here is this
+/// emulator's own bound, not an AWS quota: it keeps an in-memory store that only
+/// a caller's delete ever shrinks from growing without end, and sits far above
+/// anything a test or a client script creates.
+pub const MAX_STORED_CONNECTION_ALIASES: usize = 500;
+
+/// The operational state of a stored connection alias.
+///
+/// `Creating`, `Created` and `Deleting` each render to a value of the model's
+/// `ConnectionAliasState` enum (see `CONNECTION_ALIAS_STATE_VALUES` in
+/// `ops::types`). That enum has no "deleted" value, because a deleted alias is
+/// not reported at all: `Removed` is the terminal state the clock moves a
+/// deleting alias to, and the record is dropped from the store as it is reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionAliasLifecycleState {
+    /// The alias is being created.
+    Creating,
+    /// The alias is ready to be associated with a directory.
+    Created,
+    /// The alias is being deleted.
+    Deleting,
+    /// The alias has been deleted; it is dropped from the store.
+    Removed,
+}
+
+impl ConnectionAliasLifecycleState {
+    /// The `ConnectionAliasState` value this state serializes as, or `None` for
+    /// the terminal state the model has no value for.
+    pub fn as_wire(self) -> Option<&'static str> {
+        match self {
+            Self::Creating => Some("CREATING"),
+            Self::Created => Some("CREATED"),
+            Self::Deleting => Some("DELETING"),
+            Self::Removed => None,
+        }
+    }
+}
+
+/// A connection-alias transition the clock owes: the state to move to, and when.
+#[derive(Debug, Clone, Copy)]
+struct PendingAliasTransition {
+    to: ConnectionAliasLifecycleState,
+    due: Instant,
+}
+
+/// One persisted connection alias.
+#[derive(Debug, Clone)]
+pub struct ConnectionAliasRecord {
+    /// Creation sequence number. The only ordering
+    /// `DescribeConnectionAliases` paginates over, so a page boundary is stable
+    /// across calls.
+    pub seq: u64,
+    pub alias_id: String,
+    /// The connection string exactly as the caller spelled it.
+    pub connection_string: String,
+    pub owner_account_id: String,
+    pub state: ConnectionAliasLifecycleState,
+    /// The tags `CreateConnectionAlias` associated with the alias.
+    pub tags: Vec<Tag>,
+    pub created: SystemTime,
+    pending: Option<PendingAliasTransition>,
+}
+
+impl ConnectionAliasRecord {
+    /// Enter `transient` now and owe `settled` once [`TRANSITION_DELAY`] elapses.
+    fn begin(
+        &mut self,
+        transient: ConnectionAliasLifecycleState,
+        settled: ConnectionAliasLifecycleState,
+    ) {
+        self.state = transient;
+        self.pending = Some(PendingAliasTransition {
+            to: settled,
+            due: Instant::now() + TRANSITION_DELAY,
+        });
+    }
+
+    /// Apply the owed transition if `now` has reached its due instant.
+    fn settle(&mut self, now: Instant) {
+        let Some(pending) = self.pending else {
+            return;
+        };
+        if now < pending.due {
+            return;
+        }
+        self.state = pending.to;
+        self.pending = None;
+    }
+
+    /// This record as the modelled `ConnectionAlias` structure.
+    ///
+    /// `Associations` stays absent: an association is created only by
+    /// `AssociateConnectionAlias`, which is still a scaffold stub, so no stored
+    /// alias has one to report. The model's `ConnectionAliasAssociationList` is
+    /// `len 1..25`, so "no associations" is the absent member rather than an
+    /// empty list.
+    pub fn to_connection_alias(&self) -> ConnectionAlias {
+        ConnectionAlias {
+            connection_string: Some(self.connection_string.clone()),
+            alias_id: Some(self.alias_id.clone()),
+            state: self.state.as_wire().map(str::to_string),
+            owner_account_id: Some(self.owner_account_id.clone()),
+            associations: None,
+        }
+    }
+}
+
 /// The page size `ListAccountLinks` reports when the caller sends no
 /// `MaxResults`.
 ///
@@ -459,6 +577,27 @@ impl AccountLinkRecord {
             &self.source_account_id
         }
     }
+}
+
+/// The key a connection string occupies in the store.
+///
+/// A fully qualified domain name is case-insensitive (RFC 4343), so two spellings
+/// that differ only in case name one connection string; the record keeps the
+/// spelling the caller sent.
+fn connection_string_key(connection_string: &str) -> String {
+    connection_string.to_lowercase()
+}
+
+/// Why a connection alias could not be created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionAliasCreateError {
+    /// A stored alias already holds this connection string.
+    AlreadyExists {
+        /// The alias that holds it.
+        alias_id: String,
+    },
+    /// The store already holds [`MAX_STORED_CONNECTION_ALIASES`] aliases.
+    LimitExceeded,
 }
 
 /// One persisted WorkSpace bundle.
@@ -575,12 +714,17 @@ fn catalog_user_capacity_gib(compute: &str) -> u32 {
 
 /// Per-service state for com-amazonaws-workspaces-workspacesservice. A handler reaches it through [`service_state`].
 ///
-/// The three maps below are one store with two indexes over it, so they are
-/// PRIVATE and every insert and removal goes through [`Self::insert_record`] /
-/// [`Self::remove_record`]: an index that outlived the record it points at would
-/// make a directory slot permanently unavailable. Readers use
+/// The first three maps below are one store with two indexes over it, so they
+/// are PRIVATE and every insert and removal goes through [`Self::insert_record`]
+/// / [`Self::remove_record`]: an index that outlived the record it points at
+/// would make a directory slot permanently unavailable. Readers use
 /// [`Self::workspace`], [`Self::workspace_count`] and
 /// [`Self::ordered_workspaces`].
+///
+/// The connection-alias maps are the same arrangement for a second resource,
+/// with [`Self::insert_alias_record`] / [`Self::remove_alias_record`] as the only
+/// writers and [`Self::connection_alias`], [`Self::connection_alias_count`] and
+/// [`Self::ordered_connection_aliases`] as the readers.
 ///
 /// The bundle store below is the same shape: one map plus an index by
 /// `BundleId`, both written only through [`Self::insert_bundle`]. A freshly
@@ -604,6 +748,21 @@ pub struct ComAmazonawsWorkspacesWorkspacesserviceState {
     /// Monotonic counter behind both the minted `WorkspaceId` and the creation
     /// order [`Self::ordered_workspaces`] reports.
     pub next_workspace_seq: u64,
+    /// Every stored connection alias, keyed by its `AliasId`. Never larger than
+    /// [`MAX_STORED_CONNECTION_ALIASES`].
+    connection_aliases: HashMap<String, ConnectionAliasRecord>,
+    /// Which `AliasId` holds each taken connection string (see
+    /// [`connection_string_key`]), so deciding whether a connection string is
+    /// taken costs one lookup rather than a scan of the whole store under the
+    /// shared lock.
+    connection_strings: HashMap<String, String>,
+    /// `AliasId` by creation sequence: the stable order
+    /// [`Self::ordered_connection_aliases`] reports, held sorted so no call has
+    /// to sort the store.
+    alias_order: BTreeMap<u64, String>,
+    /// Monotonic counter behind both the minted `AliasId` and the creation order
+    /// [`Self::ordered_connection_aliases`] reports.
+    pub next_connection_alias_seq: u64,
     /// Every stored account link by creation sequence: the stable order
     /// [`Self::ordered_account_links`] reports, held sorted so no call has to
     /// sort the store. Never larger than [`MAX_STORED_ACCOUNT_LINKS`].
@@ -649,6 +808,10 @@ impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
             occupancy: HashMap::new(),
             order: BTreeMap::new(),
             next_workspace_seq: 0,
+            connection_aliases: HashMap::new(),
+            connection_strings: HashMap::new(),
+            alias_order: BTreeMap::new(),
+            next_connection_alias_seq: 0,
             account_links: BTreeMap::new(),
             account_link_ids: HashMap::new(),
             next_account_link_seq: 0,
@@ -664,7 +827,8 @@ impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
 
 impl ComAmazonawsWorkspacesWorkspacesserviceState {
     /// Materialise every lifecycle transition the clock already owes, and drop
-    /// the WorkSpaces whose termination has completed.
+    /// the WorkSpaces whose termination and the connection aliases whose
+    /// deletion have completed.
     ///
     /// Due at the same instant whether or not anybody called, so a reporting
     /// operation may run it.
@@ -688,6 +852,19 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
             .collect();
         for workspace_id in completed {
             self.remove_record(&workspace_id);
+        }
+
+        for record in self.connection_aliases.values_mut() {
+            record.settle(now);
+        }
+        let deleted: Vec<String> = self
+            .connection_aliases
+            .values()
+            .filter(|record| record.state == ConnectionAliasLifecycleState::Removed)
+            .map(|record| record.alias_id.clone())
+            .collect();
+        for alias_id in deleted {
+            self.remove_alias_record(&alias_id);
         }
     }
 
@@ -904,6 +1081,123 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     fn next_seq(&mut self) -> u64 {
         self.next_workspace_seq += 1;
         self.next_workspace_seq
+    }
+
+    /// Every stored connection alias in creation order.
+    pub fn ordered_connection_aliases(&self) -> Vec<&ConnectionAliasRecord> {
+        self.alias_order
+            .values()
+            .filter_map(|alias_id| self.connection_aliases.get(alias_id))
+            .collect()
+    }
+
+    /// How many connection aliases are stored.
+    pub fn connection_alias_count(&self) -> usize {
+        self.connection_aliases.len()
+    }
+
+    /// The stored connection alias `alias_id` names, if any.
+    pub fn connection_alias(&self, alias_id: &str) -> Option<&ConnectionAliasRecord> {
+        self.connection_aliases.get(alias_id)
+    }
+
+    /// Create one connection alias for `connection_string`, or report why it
+    /// could not be created.
+    ///
+    /// The returned record is a snapshot of what was persisted, so the caller
+    /// can read the minted `AliasId` off it without holding the map borrow.
+    pub fn create_connection_alias(
+        &mut self,
+        connection_string: &str,
+        tags: Vec<Tag>,
+    ) -> Result<ConnectionAliasRecord, ConnectionAliasCreateError> {
+        // `CreateConnectionAliasRequest$ConnectionString`: "After you create a
+        // connection string, it is always associated to your Amazon Web Services
+        // account" — so a second alias cannot take a connection string a stored
+        // alias already holds.
+        let wanted = connection_string_key(connection_string);
+        if let Some(alias_id) = self.connection_strings.get(&wanted) {
+            return Err(ConnectionAliasCreateError::AlreadyExists {
+                alias_id: alias_id.clone(),
+            });
+        }
+
+        // The store is bounded: refuse rather than grow without end.
+        if self.connection_aliases.len() >= MAX_STORED_CONNECTION_ALIASES {
+            return Err(ConnectionAliasCreateError::LimitExceeded);
+        }
+
+        let seq = self.next_alias_seq();
+        let mut record = ConnectionAliasRecord {
+            seq,
+            // `ConnectionAliasId` is `^wsca-[0-9a-z]{8,63}$`; the sequence number
+            // alone decides the id, so no two aliases can share one.
+            alias_id: format!("wsca-{seq:08x}"),
+            connection_string: connection_string.to_string(),
+            owner_account_id: ::engine::emulator_account_id().to_string(),
+            state: ConnectionAliasLifecycleState::Creating,
+            tags,
+            created: SystemTime::now(),
+            pending: None,
+        };
+        // Creation is asynchronous: CREATING now, CREATED once the clock owes it.
+        record.begin(
+            ConnectionAliasLifecycleState::Creating,
+            ConnectionAliasLifecycleState::Created,
+        );
+        self.insert_alias_record(record.clone());
+        Ok(record)
+    }
+
+    /// Delete the connection alias named by `alias_id`.
+    ///
+    /// The alias enters `DELETING` and [`Self::settle`] drops it, together with
+    /// its hold on the connection string, once the clock owes it. Deleting is
+    /// accepted from every state this emulator stores, and a delete already
+    /// under way is accepted as a no-op; `None` means no stored alias carries
+    /// that id.
+    pub fn request_delete_connection_alias(
+        &mut self,
+        alias_id: &str,
+    ) -> Option<ConnectionAliasRecord> {
+        let record = self.connection_aliases.get_mut(alias_id)?;
+        if record.state != ConnectionAliasLifecycleState::Deleting {
+            record.begin(
+                ConnectionAliasLifecycleState::Deleting,
+                ConnectionAliasLifecycleState::Removed,
+            );
+        }
+        Some(record.clone())
+    }
+
+    /// Store `record` and point both alias indexes at it.
+    fn insert_alias_record(&mut self, record: ConnectionAliasRecord) {
+        self.connection_strings.insert(
+            connection_string_key(&record.connection_string),
+            record.alias_id.clone(),
+        );
+        self.alias_order.insert(record.seq, record.alias_id.clone());
+        self.connection_aliases
+            .insert(record.alias_id.clone(), record);
+    }
+
+    /// Drop the alias `alias_id` names and every index entry for it.
+    fn remove_alias_record(&mut self, alias_id: &str) {
+        if let Some(record) = self.connection_aliases.remove(alias_id) {
+            self.connection_strings
+                .remove(&connection_string_key(&record.connection_string));
+            self.alias_order.remove(&record.seq);
+        }
+    }
+
+    /// The next connection-alias creation sequence number.
+    ///
+    /// Strictly increasing and never reset, and the minted `AliasId` is a
+    /// function of it alone, so no sequence number — and no id — can repeat
+    /// within one run of the emulator.
+    fn next_alias_seq(&mut self) -> u64 {
+        self.next_connection_alias_seq += 1;
+        self.next_connection_alias_seq
     }
 
     // --- Account links ---------------------------------------------------
