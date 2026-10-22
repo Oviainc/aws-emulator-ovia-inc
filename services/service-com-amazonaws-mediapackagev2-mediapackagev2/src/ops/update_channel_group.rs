@@ -8,9 +8,6 @@
 //! concurrent racers on one entity tag resolve to exactly one winner and the rest get
 //! `ConflictException` (409, `CONFLICTING_OPERATION`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken".
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -178,11 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The conditional entity tag is bound to a header by the model, so it arrives on
         // the deserialized input: nothing else is needed from the request.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateChannelGroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -201,6 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `ETag` travels in `x-amzn-update-if-match` and is the caller's claim about
+        // which version of the resource it is updating: a presented tag that is not the
+        // committed one means somebody else committed first, which is what the model's
+        // `ConflictException` / `CONFLICTING_OPERATION` describes.
         if input
             .e_tag
             .as_deref()
@@ -212,8 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The description is the one editable member `UpdateChannelGroupRequest` binds;
-        // the name, the ARN and the egress domain are immutable.
+        // PUT semantics: the description is the one editable member
+        // `UpdateChannelGroupRequest` binds, so a request that omits it clears it; the
+        // name, the ARN and the egress domain are immutable, and the creation stamp and
+        // the tags are not this operation's input.
         group.description = input.description;
         group.commit(crate::state::now());
 
