@@ -185,7 +185,7 @@ impl Amp {
 /// carries `:` and `/`, and `/tags/{resourceArn}` is a single (non-greedy) label.
 /// Everything but the unreserved characters is encoded, so the value survives the
 /// server's percent-decode unchanged.
-fn encode_label(value: &str) -> String {
+pub(crate) fn encode_label(value: &str) -> String {
     value
         .chars()
         .map(|c| match c {

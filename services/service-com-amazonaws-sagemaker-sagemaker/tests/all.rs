@@ -17,6 +17,8 @@ mod app_image_config_registry;
 mod artifact_lineage;
 #[path = "all/code_repositories.rs"]
 mod code_repositories;
+#[path = "all/endpoint_config_deletion.rs"]
+mod endpoint_config_deletion;
 #[path = "all/inference_deployment_lifecycle.rs"]
 mod inference_deployment_lifecycle;
 #[path = "all/model_package_group_lifecycle.rs"]

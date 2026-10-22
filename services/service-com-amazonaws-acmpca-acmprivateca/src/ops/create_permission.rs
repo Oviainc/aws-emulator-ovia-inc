@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +180,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePermission"))
+        // Nothing here is read off the request's metadata: the CA a grant is made on is
+        // the one the request names by ARN, not one derived from the signed region.
+        let _ = ctx;
+        let arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(invalid_arn(crate::state::INVALID_ARN_MESSAGE.to_string()));
+        }
+
+        // `SourceAccount` is "The ID of the calling account"
+        // (`CreatePermissionRequest$SourceAccount`) and is reported back as "the ID of the
+        // account that assigned the permission" (`Permission$SourceAccount`), so a request
+        // that names none assigns the grant from the account the request was signed by —
+        // which for this emulator is the account every one of its ARNs carries.
+        let source_account = input
+            .source_account
+            .unwrap_or_else(|| ::emulator_server::emulator_account_id().to_string());
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePermissionErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // `certificate_authority_mut` materialises the CREATING -> PENDING_CERTIFICATE
+        // change the clock already owed, which came due at the same instant whether or
+        // not anybody called. A grant is about who may call the CA's issuance actions
+        // rather than about the CA's own certificate, so every status a CA of this
+        // emulator reaches accepts one; the modelled `InvalidStateException` is reserved
+        // for a CA that is no longer there to grant on.
+        let Some(record) = state.certificate_authority_mut(&arn, now) else {
+            return Err(not_found(format!(
+                "the certificate authority {arn} was not found"
+            )));
+        };
+
+        // One grant per (CA, principal, source account): a second call naming the same
+        // three answers the modelled refusal instead of recording a duplicate or
+        // silently replacing the actions the first call granted.
+        if record.permission(&input.principal, &source_account).is_some() {
+            return Err(CreatePermissionErrorModeled::PermissionAlreadyExistsException(
+                PermissionAlreadyExistsException {
+                    message: Some(format!(
+                        "a permission on {arn} for principal {} and source account \
+                         {source_account} already exists",
+                        input.principal
+                    )),
+                },
+            )
+            .into());
+        }
+        if record.permissions.len() >= crate::state::MAX_PERMISSIONS_PER_CA {
+            return Err(CreatePermissionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the quota of {} permissions for one certificate authority has been \
+                         exceeded",
+                        crate::state::MAX_PERMISSIONS_PER_CA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The granted actions are kept as the request ordered them: `ListPermissions`
+        // reports the grant, so what it reports is what was granted.
+        record.permissions.push(crate::state::PermissionRecord {
+            principal: input.principal,
+            source_account,
+            actions: input.actions,
+            created_at: now,
+        });
+
+        Ok(CreatePermissionOutput)
     }
+}
+
+/// "The requested Amazon Resource Name (ARN) does not refer to an existing resource."
+fn invalid_arn(message: String) -> CreatePermissionError {
+    CreatePermissionErrorModeled::InvalidArnException(InvalidArnException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy
+/// cannot be found."
+fn not_found(message: String) -> CreatePermissionError {
+    CreatePermissionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
 }

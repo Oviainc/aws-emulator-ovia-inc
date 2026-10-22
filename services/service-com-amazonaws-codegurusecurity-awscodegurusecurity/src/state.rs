@@ -252,9 +252,12 @@ pub struct ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     pub idempotency: HashMap<(String, String), String>,
     /// The account's `encryptionConfig.kmsKeyArn`, which decides the server-side
     /// encryption headers `CreateUploadUrl` requires for an upload. Absent until
-    /// UpdateAccountConfiguration (still scaffolded) sets one, which is why a minted
-    /// target carries no encryption header yet; that slice writes HERE rather than
-    /// adding a second copy of the configuration.
+    /// `UpdateAccountConfiguration` sets one — "By default, CodeGuru Security uses an
+    /// AWS-managed key for encryption" (`GetAccountConfigurationResponse$encryptionConfig`)
+    /// — and absent again once an update passes an `encryptionConfig` with no key. The
+    /// SINGLE copy of the configuration: `GetAccountConfiguration` reports it and
+    /// `CreateUploadUrl` derives an upload's encryption headers from it, so there is no
+    /// second copy to drift.
     pub encryption_kms_key_arn: Option<String>,
 }
 

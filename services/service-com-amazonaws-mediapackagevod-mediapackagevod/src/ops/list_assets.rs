@@ -76,14 +76,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The largest page `ListAssets` returns, and the page size a request that names no
-/// `MaxResults` gets: the maximum the model's `MaxResults` `range` trait allows
-/// (`min: 1, max: 1000`).
-const MAX_PAGE_SIZE: usize = 1000;
-
-/// The smallest page `ListAssets` returns: the minimum of that same `range` trait.
-const MIN_PAGE_SIZE: usize = 1;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -166,37 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A cursor this service did not issue cannot name a resume point.
-        let resume_after = match input.next_token.as_deref() {
-            None => None,
-            Some(token) => match crate::state::decode_page_token(token) {
-                Some(after) => Some(after),
-                None => {
-                    return Err(crate::scaffolded::UnprocessableEntity::member(
-                        "nextToken",
-                        "is not a cursor this service issued",
-                    )
-                    .into())
-                }
-            },
-        };
-        // `MaxResults` is modelled `range(min: 1, max: 1000)`, so the boundary
-        // validator already refuses anything outside it; this handler enforces the
-        // same bound itself rather than depending on that, and a request that names
-        // no `MaxResults` gets the largest page the model allows.
-        let page_size = match input.max_results {
-            None => MAX_PAGE_SIZE,
-            Some(max) => match usize::try_from(max) {
-                Ok(max) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&max) => max,
-                _ => {
-                    return Err(crate::scaffolded::UnprocessableEntity::member(
-                        "maxResults",
-                        format!("must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"),
-                    )
-                    .into())
-                }
-            },
-        };
+        // A cursor this listing did not issue cannot name a resume point.
+        let resume_after =
+            crate::state::resume_after(crate::state::LISTING_ASSETS, input.next_token.as_deref())?;
+        let page_size = crate::state::page_size(input.max_results)?;
 
         let state = store.lock();
         let group_filter = input.packaging_group_id.as_deref();
@@ -233,9 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A cursor only when something is left to read, so a caller that follows
         // tokens stops rather than asking for an empty page.
         let next_token = if matching.len() > page_records.len() {
-            page_records
-                .last()
-                .map(|last| crate::state::encode_page_token(&last.id))
+            page_records.last().map(|last| {
+                crate::state::encode_page_token(crate::state::LISTING_ASSETS, &last.id)
+            })
         } else {
             None
         };

@@ -2,7 +2,21 @@
 
 //! @op UntagResource
 //! Detaches the named tag keys from the stored resource share named by
-//! `resourceShareArn`, so a later `GetResourceShares` no longer reports them.
+//! `resourceShareArn`, so a later `GetResourceShares` no longer reports them, and
+//! answers with the tags it detached.
+//!
+//! ## `deletedTags`, a member added to this service's model
+//!
+//! The shipped model declares `UntagResourceResponse` with no members, while the
+//! recorded AWS responses in corpus `simparity-wire-aws-v1` answer the call with the
+//! tags it deleted (one entry per removed key, naming the key). A schema-driven
+//! serializer cannot emit a member the model does not declare, so `deletedTags`
+//! (target `TagList`) was ADDED to
+//! `smithy-model/com-amazonaws-ram-amazonresourcesharing.json`, exactly as
+//! `ResourceShareConfiguration$exclusiveAccountAccess` was before it. The RULE the
+//! handler implements is "a tag mutation reports what it changed": the response lists
+//! the keys the share actually carried and this call removed, so an untag that was a
+//! no-op is distinguishable from one that detached a tag.
 //!
 //! Exactly one of `resourceShareArn` and `resourceArn` may be named ("You must
 //! specify either resourceArn, or resourceShareArn, but not both"). `resourceArn`
@@ -243,10 +257,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A tag change is a change to the share, so it moves `lastUpdatedTime` -
         // but a call that names only keys the share never carried changes nothing,
         // so it leaves the stamp alone.
-        if share.remove_tags(&input.tag_keys) {
+        let removed = share.remove_tags(&input.tag_keys);
+        if !removed.is_empty() {
             share.last_updated_time = now;
         }
 
-        Ok(UntagResourceOutput {})
+        // What the call detached: one entry per key it named that the share actually
+        // carried. Only the key is reported - the pair is gone, so there is no value
+        // left in effect to report.
+        Ok(UntagResourceOutput {
+            deleted_tags: Some(
+                removed
+                    .into_iter()
+                    .map(|key| Tag {
+                        key: Some(key),
+                        value: None,
+                    })
+                    .collect(),
+            ),
+        })
     }
 }

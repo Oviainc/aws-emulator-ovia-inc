@@ -100,6 +100,21 @@ impl KeySource {
 /// depth.
 pub const MAX_ATTRIBUTE_DEPTH: usize = 32;
 
+/// The most bytes a KEY attribute's value may carry, by the role it plays in a key
+/// schema: "The maximum length of any partition key value is 2048 bytes" and "The
+/// maximum length of any sort key value is 1024 bytes" ("Service, Account, and Table
+/// Quotas" in the Amazon DynamoDB Developer Guide). A value past the limit for its
+/// role is refused before it reaches state, on the read path as well as the write
+/// path, because a key that cannot be stored cannot be looked up either.
+pub const MAX_PARTITION_KEY_BYTES: i64 = 2048;
+pub const MAX_SORT_KEY_BYTES: i64 = 1024;
+
+/// The most bytes a resource-based policy document may carry: "The maximum size
+/// supported for a resource-based policy document is 20 KB. DynamoDB counts
+/// whitespaces when calculating the size of a policy against this limit"
+/// (`PutResourcePolicy$Policy`).
+pub const MAX_RESOURCE_POLICY_BYTES: usize = 20 * 1024;
+
 /// The most tables this emulator will hold IN ONE REGION: "There is a soft account
 /// quota of 2,500 tables" (the `LimitExceededException` doc), a quota AWS applies per
 /// account and region. Reaching it answers that modelled error instead of growing
@@ -511,6 +526,42 @@ pub struct ItemKey {
     pub sort: Option<AttributeValueKey>,
 }
 
+/// The role one attribute plays in a key schema, and the documented size limit that
+/// goes with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyRole {
+    Partition,
+    Sort,
+}
+
+impl KeyRole {
+    /// The documented maximum size of a value in this role.
+    fn max_bytes(self) -> i64 {
+        match self {
+            Self::Partition => MAX_PARTITION_KEY_BYTES,
+            Self::Sort => MAX_SORT_KEY_BYTES,
+        }
+    }
+
+    /// How DynamoDB words the refusal of an oversize value in this role.
+    ///
+    /// The two roles have DIFFERENT wordings, both the service's own, both naming the
+    /// documented limit for the role — the partition-key one includes DynamoDB's own
+    /// missing space before the number, and the sort-key one speaks of the aggregate
+    /// because a table's range keys are sized together with its local indexes'.
+    fn oversize_message(self) -> String {
+        let limit = self.max_bytes();
+        match self {
+            Self::Partition => {
+                format!("Size of hashkey has exceeded the maximum size limit of{limit} bytes")
+            }
+            Self::Sort => format!(
+                "Aggregated size of all range keys has exceeded the size limit of {limit} bytes"
+            ),
+        }
+    }
+}
+
 /// A DynamoDB `N` attribute value, parsed into sign + significant digits + decimal
 /// exponent so that comparison is NUMERIC rather than textual.
 ///
@@ -526,16 +577,46 @@ pub struct NumberKey {
     digits: Vec<u8>,
 }
 
+/// Why an `N` attribute value's text is not a number DynamoDB stores.
+///
+/// Each variant names the RULE the text breaks rather than lumping every bad number
+/// into one refusal, so the `ValidationException` a caller gets names the violated
+/// concept ([`number_rejection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberFault {
+    /// Not a number at all: the text is not `[+-]?digits[.digits][eE[+-]?digits]`.
+    NotNumeric,
+    /// More significant digits than the documented 38.
+    Precision,
+    /// A magnitude above the documented exponent range.
+    Overflow,
+    /// A non-zero magnitude below the documented exponent range.
+    Underflow,
+    /// More digits of TEXT than this emulator accepts ([`MAX_NUMBER_TEXT_DIGITS`]).
+    TextTooLong,
+}
+
 impl NumberKey {
     /// Parse the textual form of an `N` attribute value, or `None` when it is not a
-    /// number at all.
+    /// value DynamoDB stores. Use [`Self::try_parse`] where the reason matters.
     pub fn parse(text: &str) -> Option<Self> {
+        Self::try_parse(text).ok()
+    }
+
+    /// Parse the textual form of an `N` attribute value, naming the rule a refused
+    /// text breaks.
+    pub fn try_parse(text: &str) -> Result<Self, NumberFault> {
         let (negative, unsigned) = match text.strip_prefix('-') {
             Some(rest) => (true, rest),
             None => (false, text.strip_prefix('+').unwrap_or(text)),
         };
         let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
-            Some(at) => (&unsigned[..at], unsigned[at + 1..].parse::<i32>().ok()?),
+            Some(at) => (
+                &unsigned[..at],
+                unsigned[at + 1..]
+                    .parse::<i32>()
+                    .map_err(|_| NumberFault::NotNumeric)?,
+            ),
             None => (unsigned, 0),
         };
         let (integral, fractional) = match mantissa.find('.') {
@@ -543,17 +624,17 @@ impl NumberKey {
             None => (mantissa, ""),
         };
         if integral.is_empty() && fractional.is_empty() {
-            return None;
+            return Err(NumberFault::NotNumeric);
         }
         if !integral.bytes().chain(fractional.bytes()).all(|b| b.is_ascii_digit()) {
-            return None;
+            return Err(NumberFault::NotNumeric);
         }
         // The TEXT is bounded before anything is normalised: the digits a longer one
         // carries cannot change which documented value it denotes, and the parsed
         // value's accounted size is computed from its significant digits, not its
         // text. Both terms come from the request.
         if integral.len().saturating_add(fractional.len()) > MAX_NUMBER_TEXT_DIGITS {
-            return None;
+            return Err(NumberFault::TextTooLong);
         }
         let mut digits: Vec<u8> = integral
             .bytes()
@@ -562,27 +643,47 @@ impl NumberKey {
             .collect();
         // The value is 0.<digits> * 10^point before normalisation: the decimal point
         // sits after the integral digits, shifted by the exponent. Both terms come
-        // from the request, so every step is checked: an out-of-range exponent
-        // answers `None`, which the callers turn into a ValidationException.
-        let mut point = i32::try_from(integral.len()).ok()?.checked_add(exponent)?;
+        // from the request, so every step is checked: an exponent that leaves the
+        // documented range is refused as an over- or underflow, whichever direction
+        // it left it in.
+        let shifted = i32::try_from(integral.len())
+            .ok()
+            .and_then(|len| len.checked_add(exponent));
+        let mut point = match shifted {
+            Some(point) => point,
+            None if exponent > 0 => return Err(NumberFault::Overflow),
+            None => return Err(NumberFault::Underflow),
+        };
         let leading_zeros = digits.iter().take_while(|digit| **digit == 0).count();
         digits.drain(..leading_zeros);
-        point = point.checked_sub(i32::try_from(leading_zeros).ok()?)?;
+        point = match i32::try_from(leading_zeros)
+            .ok()
+            .and_then(|zeros| point.checked_sub(zeros))
+        {
+            Some(point) => point,
+            None => return Err(NumberFault::Underflow),
+        };
         while digits.last() == Some(&0) {
             digits.pop();
         }
         if digits.is_empty() {
             // Every spelling of zero normalises to the same value, sign included.
-            return Some(Self {
+            return Ok(Self {
                 negative: false,
                 point: 0,
                 digits,
             });
         }
-        if digits.len() > MAX_SIGNIFICANT_DIGITS || !(MIN_POINT..=MAX_POINT).contains(&point) {
-            return None;
+        if digits.len() > MAX_SIGNIFICANT_DIGITS {
+            return Err(NumberFault::Precision);
         }
-        Some(Self {
+        if point > MAX_POINT {
+            return Err(NumberFault::Overflow);
+        }
+        if point < MIN_POINT {
+            return Err(NumberFault::Underflow);
+        }
+        Ok(Self {
             negative,
             point,
             digits,
@@ -992,6 +1093,11 @@ pub struct Table {
     pub pay_per_request_at: Option<SystemTime>,
     /// When the clock owes this table its removal, set by `DeleteTable`.
     pub removed_at: Option<SystemTime>,
+    /// The resource-based policy attached to this table, parsed once when it was
+    /// attached, or `None` while the table carries none. This is what the data plane
+    /// evaluates before it reads or writes an item, and what `GetResourcePolicy`
+    /// reports.
+    pub resource_policy: Option<AttachedPolicy>,
     pub items: BTreeMap<ItemKey, Item>,
     /// The summed size of `items`, kept current as items are written and removed.
     ///
@@ -1071,7 +1177,9 @@ impl Table {
     }
 
     /// Encode one key attribute, refusing a value whose type is not the one the
-    /// table declared for it.
+    /// table declared for it, whose `S`/`B` value is empty, or whose size is past the
+    /// documented limit for the role the attribute plays
+    /// ([`Self::check_key_limits`]).
     pub fn key_value(
         &self,
         attribute: &str,
@@ -1085,35 +1193,99 @@ impl Table {
                 "No AttributeDefinition was provided for key attribute {attribute}"
             ))
         })?;
-        match (declared, value) {
+        let encoded = match (declared, value) {
             // "The AttributeValue for a key attribute cannot contain an empty
             // string value" / an empty binary value: a key attribute's value
             // must be non-empty, however the table declared its type, and the
             // refusal names the key it was supplied for.
             ("S", AttributeValue::S(text)) if text.is_empty() => {
-                Err(empty_key_attribute(attribute, "string"))
+                return Err(empty_key_attribute(attribute, "string"))
             }
             ("B", AttributeValue::B(bytes)) if bytes.is_empty() => {
-                Err(empty_key_attribute(attribute, "binary"))
+                return Err(empty_key_attribute(attribute, "binary"))
             }
-            ("S", AttributeValue::S(text)) => Ok(AttributeValueKey::S(text.clone())),
-            ("B", AttributeValue::B(bytes)) => Ok(AttributeValueKey::B(bytes.clone())),
-            ("N", AttributeValue::N(text)) => NumberKey::parse(text)
-                .map(AttributeValueKey::N)
-                // A text longer than this emulator's own numeric-text limit is
-                // refused here too, so the message names that limit as well as the
-                // documented form.
-                .ok_or_else(|| not_a_number(text)),
-            (_, actual) => Err(RequestError::Validation(format!(
-                "Type mismatch for key {attribute} expected: {declared} actual: {}",
-                attribute_value_type(actual)
-            ))),
+            ("S", AttributeValue::S(text)) => AttributeValueKey::S(text.clone()),
+            ("B", AttributeValue::B(bytes)) => AttributeValueKey::B(bytes.clone()),
+            ("N", AttributeValue::N(text)) => AttributeValueKey::N(
+                // The numeric rules (38 significant digits, the documented exponent
+                // range, and this emulator's own numeric-text limit) are the same ones
+                // every `N` value in a request is held to; the refusal names the one
+                // this text broke.
+                NumberKey::try_parse(text).map_err(|fault| number_rejection(text, fault))?,
+            ),
+            (_, actual) => {
+                return Err(RequestError::Validation(format!(
+                    "Type mismatch for key {attribute} expected: {declared} actual: {}",
+                    attribute_value_type(actual)
+                )))
+            }
+        };
+        self.check_key_limits(attribute, value)?;
+        Ok(encoded)
+    }
+
+    /// The role `attribute` plays in a key schema of this table — its own, or one of
+    /// its global secondary indexes — if it plays one at all.
+    ///
+    /// The table's own schema is consulted first: an attribute that is this table's
+    /// sort key and some index's partition key is bounded as the sort key it is here.
+    fn key_role(&self, attribute: &str) -> Option<KeyRole> {
+        let role_in = |schema: &[KeySchemaElement]| {
+            schema
+                .iter()
+                .find(|element| element.attribute_name == attribute)
+                .map(|element| {
+                    if element.key_type == "HASH" {
+                        KeyRole::Partition
+                    } else {
+                        KeyRole::Sort
+                    }
+                })
+        };
+        role_in(&self.key_schema).or_else(|| {
+            self.global_secondary_indexes
+                .iter()
+                .find_map(|index| role_in(&index.key_schema))
+                .or_else(|| {
+                    self.local_secondary_indexes
+                        .iter()
+                        .find_map(|index| role_in(&index.key_schema))
+                })
+        })
+    }
+
+    /// Refuse a key attribute value past the documented key-value size limit.
+    ///
+    /// The limit is the one for the role the attribute plays in a key schema
+    /// ([`MAX_PARTITION_KEY_BYTES`] / [`MAX_SORT_KEY_BYTES`]). An attribute that is no
+    /// key at all is the item's own business and is not bounded here; a key's empty
+    /// `S`/`B` value is refused by [`Self::key_value`], which is the other half of the
+    /// documented key-value contract.
+    pub fn check_key_limits(
+        &self,
+        attribute: &str,
+        value: &AttributeValue,
+    ) -> Result<(), RequestError> {
+        let Some(role) = self.key_role(attribute) else {
+            return Ok(());
+        };
+        let size = attribute_value_size(value);
+        if size > role.max_bytes() {
+            return Err(RequestError::Validation(format!(
+                "One or more parameter values were invalid: {}",
+                role.oversize_message()
+            )));
         }
+        Ok(())
     }
 
     /// The primary key of an item being written: every key attribute the schema
     /// declares must be present, with its declared type. Non-key attributes are the
     /// item's own business.
+    ///
+    /// A missing key attribute is refused the way the service words it for an ITEM —
+    /// "One of the required keys was not given a value" — which is not how it words the
+    /// same gap in a `Key`-shaped member (see [`Self::key_of_key_map`]).
     pub fn key_of_item(&self, item: &Item) -> Result<ItemKey, RequestError> {
         self.key_from(item, KeySource::Item)
     }
@@ -1163,6 +1335,33 @@ impl Table {
             partition: partition.ok_or_else(|| KeySource::Key.mismatch())?,
             sort,
         })
+    }
+
+    /// Hold every INDEX key attribute the item carries to the same key-value limits.
+    ///
+    /// The documented limits are stated for a key attribute "for a table or index", and
+    /// an item that carries an index's key attributes is projected into that index, so
+    /// an oversize index key is refused on the same write the table's own key is
+    /// checked on. An item that does not carry the attribute is simply not projected
+    /// and is not checked for it.
+    pub fn check_index_key_limits(&self, item: &Item) -> Result<(), RequestError> {
+        let schemas = self
+            .global_secondary_indexes
+            .iter()
+            .map(|index| &index.key_schema)
+            .chain(
+                self.local_secondary_indexes
+                    .iter()
+                    .map(|index| &index.key_schema),
+            );
+        for schema in schemas {
+            for element in schema {
+                if let Some(value) = item.get(&element.attribute_name) {
+                    self.check_key_limits(&element.attribute_name, value)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The key attributes of a stored item, as the `Key`-shaped map
@@ -1533,6 +1732,8 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// An item operation on a table that is still `CREATING`, or already `DELETING`,
     /// is answered as if the table were not there: the `CreateTable` doc says "You
     /// can perform read and write operations only on an ACTIVE table".
+    ///
+    /// The refusal is the ITEM one ([`item_not_found`]), which names no table.
     pub fn active_table(
         &self,
         region: &str,
@@ -1733,6 +1934,10 @@ const TABLE_NAME_MEMBER_PATH: &str = "tableName";
 /// also provide the Amazon Resource Name (ARN) of the table in this parameter" —
 /// the `CreateTable$TableName` doc). Resolve either to the bare name, refusing a
 /// name outside the documented 3..=255 `[a-zA-Z0-9_.-]+` form.
+///
+/// A name outside that form is refused the way DynamoDB's request validator words a
+/// constraint violation ([`invalid_member`]), because that is what this check is: the
+/// member, the value and the constraint it broke.
 pub fn resolve_table_name(table_name: &str) -> Result<String, RequestError> {
     let name = match table_name.strip_prefix("arn:") {
         Some(rest) => rest
@@ -1948,6 +2153,159 @@ pub fn item_size(item: &Item) -> i64 {
     )
 }
 
+/// The `ValidationException` a bad `N` value earns, naming the rule its text breaks.
+///
+/// The clauses are DynamoDB's own for the documented rules — the precision one inside
+/// the validation envelope ([`validation_message`]) the service states it in, the
+/// magnitude ones as the standalone sentences the service answers them with. Only the
+/// numeric-text limit is this emulator's, and its message says so.
+pub fn number_rejection(text: &str, fault: NumberFault) -> RequestError {
+    match fault {
+        NumberFault::NotNumeric => RequestError::Validation(format!(
+            "One or more parameter values were invalid: The parameter cannot be converted to a \
+             numeric value: {}",
+            clipped(text)
+        )),
+        NumberFault::Precision => refused(format!(
+            "Attempting to store more than {MAX_SIGNIFICANT_DIGITS} significant digits in a Number"
+        )),
+        NumberFault::Overflow => RequestError::Validation(
+            "Number overflow. Attempting to store a number with magnitude larger than supported \
+             range"
+                .to_string(),
+        ),
+        NumberFault::Underflow => RequestError::Validation(
+            "Number underflow. Attempting to store a number with magnitude smaller than \
+             supported range"
+                .to_string(),
+        ),
+        NumberFault::TextTooLong => RequestError::Validation(format!(
+            "One or more parameter values were invalid: A Number may carry at most \
+             {MAX_NUMBER_TEXT_DIGITS} digits of text, this emulator's input-size limit"
+        )),
+    }
+}
+
+/// A request value echoed back in a refusal, bounded.
+///
+/// The text is the caller's, so a message that embedded all of it would grow with the
+/// request; the head of it is what identifies the offending value to a human.
+fn clipped(text: &str) -> String {
+    const KEEP: usize = 48;
+    if text.chars().count() <= KEEP {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(KEEP).collect();
+    format!("{head}…")
+}
+
+// THE DOCUMENTED VALUE RULES, which the canonicalizing walk below
+// ([`canonicalize_attribute_value`]) enforces as it goes. None of them is expressible
+// in the Smithy model, so the boundary validator passes a request that breaks them:
+//
+//   * a number carries at most 38 significant digits inside the documented exponent
+//     range ("Number: ... can have up to 38 digits of precision" — "Service, Account,
+//     and Table Quotas"), wherever it appears: an `N`, a member of an `NS`, or either
+//     nested in an `L` or `M`;
+//   * a set is not empty ("Set type attributes cannot be empty. Invalid Requests with
+//     empty values will be rejected with a ValidationException exception" — the
+//     `PutItem` doc);
+//   * a set's members are distinct ("the values within a set must be unique" and "No
+//     two elements can be equal" — the `AttributeValue$SS`/`NS`/`BS` docs and the
+//     Developer Guide's set rules), compared the way the type compares: `NS` members
+//     numerically, so `1` and `1.0` are one member.
+
+/// Which set type a value is, for the refusals whose wording differs between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetType {
+    String,
+    Number,
+    Binary,
+}
+
+impl SetType {
+    /// The clause DynamoDB refuses an EMPTY set of this type with — including the
+    /// double space where the service's template leaves the attribute path empty, and
+    /// the different sentence it uses for binary sets.
+    fn empty_clause(self) -> String {
+        match self {
+            Self::String => "An string set  may not be empty".to_string(),
+            Self::Number => "An number set  may not be empty".to_string(),
+            Self::Binary => "Binary sets should not be empty".to_string(),
+        }
+    }
+}
+
+/// Refuse an empty set, inside the same validation envelope ([`validation_message`])
+/// every other clause is stated in.
+fn check_set_not_empty(set_type: SetType, members: usize) -> Result<(), RequestError> {
+    if members == 0 {
+        return Err(refused(format!(
+            "One or more parameter values were invalid: {}",
+            set_type.empty_clause()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a set that lists one member twice.
+///
+/// The three set types have three wordings, each DynamoDB's own, so the rendered
+/// `collection` is the caller's:
+///
+/// * `SS`: `Input collection ["a", "a"] contains duplicates.`
+/// * `NS`: `Input collection contains duplicates.`
+/// * `BS`: `Input collection ["YQ==","YQ=="]of type BS contains duplicates.`
+///
+/// — down to the comma spacing each uses and the missing space after the bracket in
+/// the binary one.
+fn duplicate_set_member(collection: String) -> RequestError {
+    refused(format!(
+        "One or more parameter values were invalid: Input collection \
+         {collection}contains duplicates."
+    ))
+}
+
+/// The collection as the `SS` message echoes it: quoted members, `, `-separated.
+fn echoed_strings(values: &[String]) -> String {
+    format!(
+        "[{}] ",
+        joined(
+            values.iter().map(|member| format!("\"{}\"", clipped(member))),
+            ", "
+        )
+    )
+}
+
+/// The collection as the `BS` message echoes it: base64 members, `,`-separated, and the
+/// type named with no space after the bracket.
+fn echoed_blobs(values: &[Vec<u8>]) -> String {
+    format!(
+        "[{}]of type BS ",
+        joined(
+            values.iter().map(|member| format!(
+                "\"{}\"",
+                clipped(&::aws_smithy_types::base64::encode(member))
+            )),
+            ","
+        )
+    )
+}
+
+/// Join at most the first few rendered members, eliding the rest.
+///
+/// The set's length is the caller's choice, so a message that echoed every member
+/// would grow with the request.
+fn joined(members: impl Iterator<Item = String>, separator: &str) -> String {
+    const MAX_ECHOED_MEMBERS: usize = 8;
+    let mut rendered: Vec<String> = members.take(MAX_ECHOED_MEMBERS + 1).collect();
+    if rendered.len() > MAX_ECHOED_MEMBERS {
+        rendered.truncate(MAX_ECHOED_MEMBERS);
+        rendered.push("…".to_string());
+    }
+    rendered.join(separator)
+}
+
 /// Add up sizes without overflowing.
 fn sum_of(sizes: impl Iterator<Item = i64>) -> i64 {
     sizes.fold(0i64, i64::saturating_add)
@@ -1966,42 +2324,34 @@ fn number_size(text: &str) -> i64 {
     }
 }
 
-/// The `ValidationException` refusal for a text that denotes no number this store can
-/// hold: not a number at all, or outside the documented precision and exponent range
-/// (or longer than this emulator's own numeric-text limit, which the message names
-/// alongside them).
-fn not_a_number(text: &str) -> RequestError {
-    RequestError::Validation(format!(
-        "The parameter cannot be converted to a numeric value: {text} \
-         (a number must carry at most {MAX_SIGNIFICANT_DIGITS} significant \
-         digits, an exponent within 10^{MIN_POINT}..10^{MAX_POINT}, and at \
-         most {MAX_NUMBER_TEXT_DIGITS} digits of text, this emulator's \
-         input-size limit)"
-    ))
-}
-
-/// One `N` value's canonical stored text, or the refusal for a text that is not a
-/// number: DynamoDB stores the number, so a write normalises the lexeme ONCE here and
-/// every later read reports that form ([`NumberKey::canonical_text`]).
+/// One `N` value's canonical stored text, or the refusal for a text that denotes no
+/// number this store can hold — which names the rule the text broke
+/// ([`number_rejection`]), the way the service's own refusals do.
+///
+/// DynamoDB stores the number, so a write normalises the lexeme ONCE here and every
+/// later read reports that form ([`NumberKey::canonical_text`]).
 ///
 /// Crate-visible: the write path reaches it through [`canonicalize_item`], and a
 /// handler that needs one value canonicalized (an `UpdateItem` attribute, say) is in
 /// this crate too, so nothing outside it needs this.
 pub(crate) fn canonical_number_text(text: &str) -> Result<String, RequestError> {
-    NumberKey::parse(text)
+    NumberKey::try_parse(text)
         .map(|number| number.canonical_text())
-        .ok_or_else(|| not_a_number(text))
+        .map_err(|fault| number_rejection(text, fault))
 }
 
-/// Canonicalize every number inside one attribute value, and refuse a set that holds
-/// one value twice.
+/// Canonicalize every number inside one attribute value, and hold every set to the
+/// documented set rules.
 ///
-/// The rule is about the number TYPE, not about where a number sits, so this reaches
-/// the `N` of a scalar, every member of an `NS`, and every number nested in an `L` or
-/// an `M` at any depth. Set distinctness is checked AFTER canonicalization, so two
-/// spellings of one number are the duplicate member DynamoDB refuses rather than two
-/// members of the stored set. The walk is ITERATIVE, over an explicit stack, for the
-/// reason [`attribute_value_size`]'s is: how deeply a value nests is the caller's
+/// The rules are about the value TYPE, not about where a value sits, so this reaches
+/// the `N` of a scalar, every member of an `NS`, and every number or set nested in an
+/// `L` or an `M` at any depth: a number is refused unless it is one the documented
+/// precision and exponent range can hold ([`canonical_number_text`]), and a set is
+/// refused if it is empty ([`check_set_not_empty`]) or lists one value twice
+/// ([`duplicate_set_member`]). Set distinctness is checked AFTER canonicalization, so
+/// two spellings of one number are the duplicate member DynamoDB refuses rather than
+/// two members of the stored set. The walk is ITERATIVE, over an explicit stack, for
+/// the reason [`attribute_value_size`]'s is: how deeply a value nests is the caller's
 /// choice, so recursing on it would make stack use a function of the request.
 pub(crate) fn canonicalize_attribute_value(
     value: &mut AttributeValue,
@@ -2011,15 +2361,27 @@ pub(crate) fn canonicalize_attribute_value(
         match value {
             AttributeValue::N(text) => *text = canonical_number_text(text)?,
             AttributeValue::Ns(members) => {
+                check_set_not_empty(SetType::Number, members.len())?;
                 for member in members.iter_mut() {
                     *member = canonical_number_text(member)?;
                 }
-                require_distinct(members, "NS", String::clone)?;
+                if has_duplicate(members) {
+                    // The number-set wording names no members at all.
+                    return Err(duplicate_set_member(String::new()));
+                }
             }
-            AttributeValue::Ss(members) => require_distinct(members, "SS", String::clone)?,
-            AttributeValue::Bs(members) => require_distinct(members, "BS", |bytes| {
-                format!("a {}-byte value", bytes.len())
-            })?,
+            AttributeValue::Ss(members) => {
+                check_set_not_empty(SetType::String, members.len())?;
+                if has_duplicate(members) {
+                    return Err(duplicate_set_member(echoed_strings(members)));
+                }
+            }
+            AttributeValue::Bs(members) => {
+                check_set_not_empty(SetType::Binary, members.len())?;
+                if has_duplicate(members) {
+                    return Err(duplicate_set_member(echoed_blobs(members)));
+                }
+            }
             AttributeValue::L(members) => pending.extend(members.iter_mut()),
             AttributeValue::M(entries) => pending.extend(entries.values_mut()),
             AttributeValue::S(_)
@@ -2031,37 +2393,27 @@ pub(crate) fn canonicalize_attribute_value(
     Ok(())
 }
 
-/// Refuse a set whose members are not distinct: a set holds each of its values once,
-/// so a request naming one twice is a `ValidationException` rather than a stored
-/// duplicate. Members are compared as the values they are — numerically for `NS`,
-/// because its members are canonicalized first — and the check sorts BORROWED members,
-/// so it costs O(n log n) and copies nothing.
-fn require_distinct<T: Ord>(
-    members: &[T],
-    set_type: &str,
-    render: impl Fn(&T) -> String,
-) -> Result<(), RequestError> {
+/// Whether a set lists one value twice: a set holds each of its values once, so a
+/// request naming one twice is a `ValidationException` rather than a stored duplicate.
+///
+/// Members are compared as the values they are — numerically for `NS`, because its
+/// members are canonicalized first — and the check sorts BORROWED members, so it costs
+/// O(n log n) and copies nothing.
+fn has_duplicate<T: Ord>(members: &[T]) -> bool {
     let mut sorted: Vec<&T> = members.iter().collect();
     sorted.sort_unstable();
-    for pair in sorted.windows(2) {
-        if pair[0] == pair[1] {
-            return Err(RequestError::Validation(format!(
-                "Input collection contains duplicates: the {set_type} member {} appears \
-                 more than once",
-                render(pair[0])
-            )));
-        }
-    }
-    Ok(())
+    sorted.windows(2).any(|pair| pair[0] == pair[1])
 }
 
-/// Canonicalize every number in one item, which is what a write does before the item
-/// lands. A refusal names the attribute it came from, so a caller can find it.
+/// Canonicalize every number in one item and hold its values to the documented rules,
+/// which is what a write does before the item lands.
 ///
 /// The attributes are walked in NAME order rather than in the hash map's own order,
 /// and the walk STOPS at the first refusal: two identical requests are therefore
 /// refused with identical messages, and a refused item is left with the attributes
-/// after the failing one untouched.
+/// after the failing one untouched. The refusal is passed through as the value rule
+/// worded it, because that is how the service words these: its messages name the rule
+/// the value broke, not the attribute that carried it.
 pub fn canonicalize_item(item: &mut Item) -> Result<(), RequestError> {
     let mut names: Vec<String> = item.keys().cloned().collect();
     names.sort_unstable();
@@ -2069,14 +2421,7 @@ pub fn canonicalize_item(item: &mut Item) -> Result<(), RequestError> {
         let Some(value) = item.get_mut(&name) else {
             continue;
         };
-        if let Err(error) = canonicalize_attribute_value(value) {
-            return Err(match error {
-                RequestError::Validation(message) => {
-                    RequestError::Validation(format!("Invalid attribute {name}: {message}"))
-                }
-                other => other,
-            });
-        }
+        canonicalize_attribute_value(value)?;
     }
     Ok(())
 }
@@ -2245,3 +2590,412 @@ pub fn consumed_capacity(
         ..ConsumedCapacity::default()
     })
 }
+
+// ---------------------------------------------------------------------------
+// Resource-based policies
+// ---------------------------------------------------------------------------
+
+/// Why a resource-based policy document is not one this emulator can attach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyFault {
+    /// Past the documented size limit, carrying the size the request sent — the
+    /// modelled `LimitExceededException`.
+    TooLarge(usize),
+    /// Not a policy document at all, carrying what is wrong with it — a
+    /// `ValidationException`.
+    Invalid(String),
+}
+
+/// A resource-based policy attached to a table.
+///
+/// The document is kept verbatim, because `GetResourcePolicy` "returns the
+/// resource-based policy document attached to the resource ... in JSON format", and
+/// its statements are parsed ONCE here so evaluating a data-plane request never
+/// re-parses it. The document is capped at [`MAX_RESOURCE_POLICY_BYTES`] before it is
+/// parsed, which is what bounds the statements, values and patterns one request can
+/// ask the matcher below for.
+#[derive(Debug, Clone)]
+pub struct AttachedPolicy {
+    /// The document exactly as it was attached.
+    pub document: String,
+    /// The revision id, DERIVED from the document: "PutResourcePolicy is an idempotent
+    /// operation; running it multiple times on the same resource using the same policy
+    /// document will return the same revision id" (the `PutResourcePolicy` doc). A
+    /// different document therefore gets a different id, and the same one re-attached
+    /// gets the one it had.
+    pub revision_id: String,
+    /// When the clock owes this policy its application to the data plane.
+    ///
+    /// "PutResourcePolicy is an asynchronous operation" and "the policy application is
+    /// eventually consistent" (the `PutResourcePolicy` doc), so a request made straight
+    /// after the attach is still authorized as it was — while a policy that arrives
+    /// WITH the table is applied at once, because "when you attach a resource-based
+    /// policy while creating a table, the policy application is strongly consistent"
+    /// (`CreateTable$ResourcePolicy`). The attaching operation chooses which of the two
+    /// it is; nothing sleeps for the span.
+    pub effective_at: SystemTime,
+    /// The parsed statements, in document order.
+    statements: Vec<PolicyStatement>,
+}
+
+impl AttachedPolicy {
+    /// Parse `document` into the policy to attach, or say why it cannot be attached.
+    ///
+    /// `effective_at` is when the data plane starts honouring it (see the field).
+    pub fn attach(document: &str, effective_at: SystemTime) -> Result<Self, PolicyFault> {
+        if document.len() > MAX_RESOURCE_POLICY_BYTES {
+            return Err(PolicyFault::TooLarge(document.len()));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(document).map_err(|error| {
+            PolicyFault::Invalid(format!("Resource-based policy is not valid JSON: {error}"))
+        })?;
+        let object = parsed.as_object().ok_or_else(|| {
+            PolicyFault::Invalid("Resource-based policy must be a JSON object".to_string())
+        })?;
+        let listed: Vec<&serde_json::Value> = match object.get("Statement") {
+            Some(serde_json::Value::Array(list)) => list.iter().collect(),
+            Some(single @ serde_json::Value::Object(_)) => vec![single],
+            _ => {
+                return Err(PolicyFault::Invalid(
+                    "Resource-based policy must carry a Statement".to_string(),
+                ))
+            }
+        };
+        let mut statements = Vec::with_capacity(listed.len());
+        for statement in listed {
+            statements.push(PolicyStatement::parse(statement)?);
+        }
+        Ok(Self {
+            document: document.to_string(),
+            revision_id: policy_revision_id(document),
+            effective_at,
+            statements,
+        })
+    }
+
+    /// Whether this policy EXPLICITLY DENIES `action` on `resource_arn` to `caller`,
+    /// and whether the statement that denied it carried a `Condition` the emulator did
+    /// not evaluate.
+    ///
+    /// Only a Deny decides anything here. The caller is in the resource's own account —
+    /// the only account this emulator serves — so a resource-based policy's Allow
+    /// grants it nothing it does not already hold, while "an explicit deny in any
+    /// policy overrides any allow" (the IAM policy evaluation logic). A Deny that
+    /// matches the request is therefore the one outcome a resource policy changes.
+    pub fn denies(&self, caller: &str, action: &str, resource_arn: &str) -> Option<bool> {
+        self.statements
+            .iter()
+            .find(|statement| statement.denies(caller, action, resource_arn))
+            .map(PolicyStatement::conditioned)
+    }
+}
+
+/// The revision id of a policy document: a digest of the document, so the same
+/// document always gets the same id and a different one never does.
+fn policy_revision_id(document: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(document.as_bytes()))
+}
+
+/// One statement of a resource-based policy, reduced to what decides a request.
+#[derive(Debug, Clone)]
+struct PolicyStatement {
+    /// `Effect: Deny`. An Allow statement is parsed and kept so the document round
+    /// trips, but it changes no outcome (see [`AttachedPolicy::denies`]).
+    deny: bool,
+    principal: Selector,
+    action: Selector,
+    resource: Selector,
+    /// Whether the statement carries a `Condition`.
+    ///
+    /// A condition is matched against the REQUEST CONTEXT (the source VPC, the time of
+    /// day, a tag on the caller), and this emulator has no identity or network context
+    /// to supply, so it cannot evaluate one. A Deny that carries one is therefore
+    /// applied anyway — FAIL CLOSED: the emulator never serves a request the attached
+    /// policy might refuse, which is the error that matters for a policy whose whole
+    /// job is to refuse. The flag is kept so the refusal can say the condition was not
+    /// evaluated.
+    conditioned: bool,
+}
+
+impl PolicyStatement {
+    /// Parse one statement, refusing a document this emulator would otherwise store
+    /// and then not honour.
+    fn parse(value: &serde_json::Value) -> Result<Self, PolicyFault> {
+        let object = value.as_object().ok_or_else(|| {
+            PolicyFault::Invalid("Each Statement must be a JSON object".to_string())
+        })?;
+        let conditioned = object.contains_key("Condition");
+        let effect = object
+            .get("Effect")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                PolicyFault::Invalid(
+                    "Each Statement must carry an Effect of Allow or Deny".to_string(),
+                )
+            })?;
+        let deny = if effect.eq_ignore_ascii_case("Deny") {
+            true
+        } else if effect.eq_ignore_ascii_case("Allow") {
+            false
+        } else {
+            return Err(PolicyFault::Invalid(format!(
+                "Statement Effect must be Allow or Deny, got {}",
+                clipped(effect)
+            )));
+        };
+        // "Resource-based policies ... require a Principal" (the IAM user guide's
+        // policy grammar), so a statement without one is not a resource policy.
+        let principal = Selector::parse(object, "Principal", "NotPrincipal", principal_values)?
+            .ok_or_else(|| {
+                PolicyFault::Invalid(
+                    "Each Statement of a resource-based policy must carry a Principal".to_string(),
+                )
+            })?;
+        let action = Selector::parse(object, "Action", "NotAction", string_values)?.ok_or_else(
+            || PolicyFault::Invalid("Each Statement must carry an Action".to_string()),
+        )?;
+        // A resource-based policy is attached to ONE resource, so a statement that
+        // names no Resource applies to the resource it is attached to.
+        let resource = Selector::parse(object, "Resource", "NotResource", string_values)?
+            .unwrap_or_else(Selector::everything);
+        Ok(Self {
+            deny,
+            principal,
+            action,
+            resource,
+            conditioned,
+        })
+    }
+
+    /// Whether this statement denies the request.
+    ///
+    /// A `Condition` is not evaluated (see the field's doc) and does not stop a Deny
+    /// from applying.
+    fn denies(&self, caller: &str, action: &str, resource_arn: &str) -> bool {
+        self.deny
+            && self
+                .principal
+                .matches(|value| principal_names(value, caller))
+            && self.action.matches(|pattern| action_matches(pattern, action))
+            && self
+                .resource
+                .matches(|pattern| resource_matches(pattern, resource_arn))
+    }
+
+    /// Whether this statement's decision rests on a `Condition` the emulator did not
+    /// evaluate, so a refusal can say so.
+    fn conditioned(&self) -> bool {
+        self.conditioned
+    }
+}
+
+/// One statement element: the values it lists, and whether the statement applies to
+/// those values (`Action`) or to everything BUT them (`NotAction`).
+#[derive(Debug, Clone)]
+struct Selector {
+    values: Vec<String>,
+    negated: bool,
+}
+
+impl Selector {
+    /// Read `positive` or its `Not…` counterpart out of a statement. A statement that
+    /// carries both forms of one element is not a policy document.
+    fn parse(
+        object: &serde_json::Map<String, serde_json::Value>,
+        positive: &'static str,
+        negative: &'static str,
+        extract: fn(&serde_json::Value) -> Option<Vec<String>>,
+    ) -> Result<Option<Self>, PolicyFault> {
+        let (raw, negated) = match (object.get(positive), object.get(negative)) {
+            (Some(_), Some(_)) => {
+                return Err(PolicyFault::Invalid(format!(
+                    "A Statement may carry {positive} or {negative}, not both"
+                )))
+            }
+            (Some(value), None) => (value, false),
+            (None, Some(value)) => (value, true),
+            (None, None) => return Ok(None),
+        };
+        let values = extract(raw).ok_or_else(|| {
+            PolicyFault::Invalid(format!(
+                "{positive} must be a string, a list of strings, or a map of principal kinds"
+            ))
+        })?;
+        Ok(Some(Self { values, negated }))
+    }
+
+    /// The element a statement that names none of its own carries: everything.
+    fn everything() -> Self {
+        Self {
+            values: vec!["*".to_string()],
+            negated: false,
+        }
+    }
+
+    /// Whether the request's value satisfies this element, honouring the negation.
+    fn matches(&self, matched: impl Fn(&str) -> bool) -> bool {
+        self.values.iter().any(|value| matched(value)) != self.negated
+    }
+}
+
+/// A statement element given as a string or a list of strings.
+fn string_values(value: &serde_json::Value) -> Option<Vec<String>> {
+    match value {
+        serde_json::Value::String(text) => Some(vec![text.clone()]),
+        serde_json::Value::Array(list) => list
+            .iter()
+            .map(|entry| entry.as_str().map(str::to_string))
+            .collect(),
+        _ => None,
+    }
+}
+
+/// A `Principal` element: `"*"`, or a map from principal kind to one or more values.
+///
+/// A kind other than `AWS` — `Service`, `Federated`, `CanonicalUser` — names no IAM
+/// identity, so its values are kept WITH their kind and can match no caller rather
+/// than being silently dropped.
+fn principal_values(value: &serde_json::Value) -> Option<Vec<String>> {
+    match value {
+        serde_json::Value::String(_) | serde_json::Value::Array(_) => string_values(value),
+        serde_json::Value::Object(map) => {
+            let mut values = Vec::new();
+            for (kind, listed) in map {
+                let listed = string_values(listed)?;
+                if kind.eq_ignore_ascii_case("AWS") {
+                    values.extend(listed);
+                } else {
+                    values.extend(listed.into_iter().map(|value| format!("{kind}:{value}")));
+                }
+            }
+            Some(values)
+        }
+        _ => None,
+    }
+}
+
+/// The identity every request to this emulator carries: the root of the single account
+/// it serves.
+///
+/// The emulator verifies a request's signature but has no IAM identity behind the
+/// credential it was signed with, and it serves exactly one account (the store does not
+/// even key by account), so the one principal a policy can be evaluated against is
+/// that account's root.
+pub fn caller_principal() -> String {
+    ::engine::emulator_arn("iam", "", "root")
+}
+
+/// Whether a policy `Principal` value names the identity this emulator serves.
+///
+/// An ACCOUNT-level principal names the caller: `*`, a bare account id, or an
+/// `…:root` ARN. An identity-specific principal — a user, a role, an assumed role, a
+/// service — does not, because this emulator cannot tell which identity is calling.
+/// The account id itself is not compared: every resource here belongs to the one
+/// account whatever account id the document spells.
+fn principal_names(value: &str, caller: &str) -> bool {
+    if wildcard_match(value, caller) {
+        return true;
+    }
+    let account_id = value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_digit());
+    account_id || (value.starts_with("arn:") && value.ends_with(":root"))
+}
+
+/// Whether a policy `Action` value names the action being performed. IAM action names
+/// are case-insensitive.
+fn action_matches(pattern: &str, action: &str) -> bool {
+    wildcard_match(
+        &pattern.to_ascii_lowercase(),
+        &action.to_ascii_lowercase(),
+    )
+}
+
+/// Whether a policy `Resource` value names the resource the request names.
+///
+/// The partition, region and account segments of an ARN are not compared: this
+/// emulator serves one partition and one account, and a policy is attached to a table
+/// in a known region, so what distinguishes one resource from another here is the
+/// SERVICE and the resource path (`table/<name>`, `table/<name>/index/<index>`).
+fn resource_matches(pattern: &str, resource_arn: &str) -> bool {
+    if wildcard_match(pattern, resource_arn) {
+        return true;
+    }
+    match (arn_tail(pattern), arn_tail(resource_arn)) {
+        (Some(pattern), Some(actual)) => wildcard_match(&pattern, &actual),
+        _ => false,
+    }
+}
+
+/// The service and resource path of an ARN — `dynamodb:table/x` — or `None` when the
+/// value is not an ARN at all.
+fn arn_tail(arn: &str) -> Option<String> {
+    let mut fields = arn.strip_prefix("arn:")?.splitn(5, ':');
+    let (_partition, service) = (fields.next()?, fields.next()?);
+    let (_region, _account) = (fields.next()?, fields.next()?);
+    let resource = fields.next()?;
+    Some(format!("{service}:{resource}"))
+}
+
+/// IAM's glob matching: `*` stands for any run of characters and `?` for exactly one.
+///
+/// Iterative with a single backtrack point, so the work is bounded by the lengths of
+/// the two strings rather than by their structure; both come from a document already
+/// capped at [`MAX_RESOURCE_POLICY_BYTES`].
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let (mut at_pattern, mut at_value) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+    while at_value < value.len() {
+        if at_pattern < pattern.len()
+            && (pattern[at_pattern] == '?' || pattern[at_pattern] == value[at_value])
+        {
+            at_pattern += 1;
+            at_value += 1;
+        } else if at_pattern < pattern.len() && pattern[at_pattern] == '*' {
+            star = Some(at_pattern);
+            resume = at_value;
+            at_pattern += 1;
+        } else if let Some(at_star) = star {
+            at_pattern = at_star + 1;
+            resume += 1;
+            at_value = resume;
+        } else {
+            return false;
+        }
+    }
+    pattern[at_pattern..].iter().all(|glob| *glob == '*')
+}
+
+/// The `AccessDeniedException` message a data-plane request earns when the table's
+/// resource-based policy explicitly denies the caller that action, or `None` when
+/// nothing denies it.
+///
+/// `action` is the IAM action the operation performs (`dynamodb:GetItem`). A table
+/// with no policy attached — or one whose application is not due yet — denies nothing,
+/// which is why this is the whole check an operation makes.
+pub fn policy_denial(table: &Table, action: &str, now: SystemTime) -> Option<String> {
+    let policy = table.resource_policy.as_ref()?;
+    // A policy whose application is not due yet authorizes nothing: the attach was
+    // asynchronous (see `AttachedPolicy::effective_at`).
+    if now < policy.effective_at {
+        return None;
+    }
+    let caller = caller_principal();
+    let conditioned = policy.denies(&caller, action, &table.arn)?;
+    let mut message = format!(
+        "User: {caller} is not authorized to perform: {action} on resource: {} with an \
+         explicit deny in a resource-based policy",
+        table.arn
+    );
+    if conditioned {
+        // Say what was not evaluated rather than imply the condition matched.
+        message.push_str(
+            " (the statement carries a Condition, which this emulator does not evaluate: \
+             it refuses rather than serves what the policy may deny)",
+        );
+    }
+    Some(message)
+}
+

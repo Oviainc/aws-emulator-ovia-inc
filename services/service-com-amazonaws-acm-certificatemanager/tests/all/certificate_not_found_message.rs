@@ -25,12 +25,13 @@ use crate::certificate_lifecycle::{
 
 /// The implemented operations that resolve `CertificateArn` and model
 /// `ResourceNotFoundException`
-/// (`smithy_query(query="operation", operation="DescribeCertificate,DeleteCertificate,AddTagsToCertificate,ListTagsForCertificate")`).
+/// (`smithy_query(query="operation", operation="DescribeCertificate,DeleteCertificate,AddTagsToCertificate,ListTagsForCertificate,RevokeCertificate")`).
 const CERTIFICATE_LOOKUPS: &[&str] = &[
     "AddTagsToCertificate",
     "DeleteCertificate",
     "DescribeCertificate",
     "ListTagsForCertificate",
+    "RevokeCertificate",
 ];
 
 /// The `ResourceNotFoundException` sentence the rule requires for `arn`.
@@ -51,6 +52,11 @@ fn request_body(operation: &str, arn: &str) -> Value {
         // `Tags` is required and `TagList` has a minimum length of 1, so the request
         // has to carry one to reach the certificate lookup at all.
         body["Tags"] = json!([{ "Key": "env", "Value": "test" }]);
+    }
+    if operation == "RevokeCertificate" {
+        // `RevocationReason` is required, so the request has to carry a modelled value
+        // to reach the certificate lookup at all.
+        body["RevocationReason"] = json!("UNSPECIFIED");
     }
     body
 }

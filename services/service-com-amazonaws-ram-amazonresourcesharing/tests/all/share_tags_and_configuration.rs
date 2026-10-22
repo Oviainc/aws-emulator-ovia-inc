@@ -399,12 +399,17 @@ async fn a_tag_mutation_is_what_the_next_read_reports() {
                 status, 200,
                 "case {case:?}/step {index}: the mutation expected 200, got {status} with {body:?}"
             );
-            // Both operations model an output structure with no members, which the
-            // restJson1 protocol renders as an empty JSON object.
-            assert_eq!(
-                body,
-                json!({}),
-                "case {case:?}/step {index}: expected an empty object body, got {body:?}"
+            // A tag mutation reports what it changed; exactly what each one reports is
+            // pinned over its own table in `mutation_reports.rs`, so here the response
+            // only has to carry that report.
+            let member = match step {
+                TagStep::Add(_) => "tagsCreated",
+                TagStep::Remove(_) => "deletedTags",
+            };
+            assert!(
+                body.get(member).and_then(Value::as_array).is_some(),
+                "case {case:?}/step {index}: expected the mutation to report {member}, got \
+                 {body:?}"
             );
         }
 

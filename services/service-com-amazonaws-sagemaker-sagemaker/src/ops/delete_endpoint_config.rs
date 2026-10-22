@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEndpointConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEndpointConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEndpointConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the endpoint-configuration entry from `crate::state` and nothing
+//! else — every endpoint created from it stays in state, as the operation's model doc
+//! says ("It does not delete endpoints created using the configuration"). This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEndpointConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEndpointConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let arn = crate::state::resource_arn(
+            &crate::state::request_region(ctx),
+            "endpoint-config",
+            &input.endpoint_config_name,
+        );
+
+        // Only the configuration entry goes. The endpoints created from it snapshot their
+        // variants at `CreateEndpoint`, so this operation's doc — "It does not delete
+        // endpoints created using the configuration" — holds without touching
+        // `store.endpoints`. The doc's warning about deleting a configuration an endpoint
+        // is using is guidance to the caller ("you may lose visibility into the instance
+        // type the endpoint is using"), not a refusal: the delete is accepted either way.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEndpointConfig"))
+        // This operation models no errors, so a name nothing created is refused with the
+        // service-common `ValidationException` the sibling deletes use, naming the ARN it
+        // could not resolve.
+        let mut store = state.lock();
+        if store
+            .endpoint_configs
+            .remove(&input.endpoint_config_name)
+            .is_none()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Could not find endpoint configuration \"{arn}\"."
+            )));
+        }
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(DeleteEndpointConfigOutput)
     }
 }

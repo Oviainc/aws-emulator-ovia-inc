@@ -123,12 +123,15 @@ impl From<GetServiceNetworkErrorModeled> for GetServiceNetworkError {
     }
 }
 
-/// HTTP 404 for an identifier that names no persisted service network.
+/// HTTP 404 for an identifier that names no persisted service network, with AWS's
+/// not-found message construction over the submitted identifier
+/// ([`crate::state::ResourceKind::not_found_message`]).
 fn not_found(identifier: &str) -> GetServiceNetworkError {
+    const KIND: crate::state::ResourceKind = crate::state::ResourceKind::ServiceNetwork;
     GetServiceNetworkErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: format!("service network {identifier} not found"),
+        message: KIND.not_found_message(identifier),
         resource_id: identifier.to_string(),
-        resource_type: crate::state::KIND_SERVICE_NETWORK.to_string(),
+        resource_type: KIND.arn_kind().to_string(),
     })
     .into()
 }

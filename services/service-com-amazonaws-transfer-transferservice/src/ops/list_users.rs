@@ -167,6 +167,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        let guard = state.lock();
+
+        // The named resource is resolved FIRST — as `ListHostKeys` does for the same
+        // parent server — so a listing for a server that does not exist is a not-found
+        // whatever else the request carries.
+        if !guard.servers.contains_key(&input.server_id) {
+            return Err(st::not_found(
+                ListUsersErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        }
+
         let after = match input.next_token.as_deref() {
             Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
                 ListUsersErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
@@ -175,16 +188,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?),
             None => None,
         };
-
-        let guard = state.lock();
-
-        if !guard.servers.contains_key(&input.server_id) {
-            return Err(st::not_found(
-                ListUsersErrorModeled::ResourceNotFoundException(st::unknown_server(
-                    &input.server_id,
-                )),
-            ));
-        }
 
         // ONE range scan over this server's run of the user map: the records to render
         // come straight out of it, so no row is looked up a second time and no key is

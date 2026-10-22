@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketOwnershipControls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketOwnershipControls`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketOwnershipControls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates the request's `OwnershipControls` with the named bucket as its whole
+//! ownership controls, replacing whatever the bucket held, and answers the modelled 200
+//! with an empty body. `GetBucketOwnershipControls` reads the same state back.
 //!
 //! ## Shape of an operation
 //!
@@ -114,14 +109,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketOwnershipContro
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketOwnershipControlsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketOwnershipControls")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketOwnershipControls")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketOwnershipControls",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketOwnershipControlsErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -175,18 +178,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketOwnershipControls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketOwnershipControlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketOwnershipControls"))
+        // A write needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine
+            // that is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // this operation models no server-fault error to say so, so the scaffold's
+            // 501 carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketOwnershipControls",
+            ));
+        };
+
+        // The rules the request carried, each one its `ObjectOwnership` value, in document
+        // order. `OwnershipControls` is the @httpPayload and both it and
+        // `OwnershipControls$Rules` are required, so reaching here means the boundary
+        // parsed the container and refused any `ObjectOwnership` outside the enum's value
+        // set (BucketOwnerPreferred | ObjectWriter | BucketOwnerEnforced).
+        let rules: Vec<String> = input
+            .ownership_controls
+            .rules
+            .iter()
+            .map(|rule| rule.object_ownership.clone())
+            .collect();
+
+        // The bucket is looked up FIRST, so a request that names a bucket this emulator
+        // does not hold answers that rather than reporting whatever is wrong with controls
+        // the bucket could never have carried — the same order `PutBucketTagging` keeps.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(
+                PutBucketOwnershipControlsErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        };
+
+        // Both refusals are decided BEFORE anything is written, so a refused put leaves
+        // the bucket's current ownership controls exactly as they were.
+        if rules.is_empty() {
+            // The invariant this store keeps: ownership controls associated with a bucket
+            // name at least one rule, because `OwnershipControls$Rules` is a REQUIRED
+            // member and `GetBucketOwnershipControls` reports the container as its whole
+            // payload. The boundary validator refuses a container with no `<Rule>` for
+            // that missing required member before this handler runs, so this guard is what
+            // keeps the invariant true if a payload ever parses to an empty list instead.
+            // AWS refuses a payload that does not validate against the schema it publishes
+            // with `MalformedXML` (HTTP 400), a code this service's model declares no shape
+            // for, so it goes out through the unmodelled channel carrying the code and
+            // status a client branches on.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                MALFORMED_XML_STATUS,
+                "OwnershipControls.Rules names no Rule; ownership controls carry at least \
+                 one ObjectOwnership rule",
+            ));
+        }
+        if rules.len() > crate::state::MAX_OWNERSHIP_CONTROLS_RULES {
+            // The emulator's own ceiling on what one bucket's record may hold (the model
+            // bounds the list at neither end), so it is a refusal rather than a modelled
+            // failure: 400 `ValidationException`, the channel `CreateBucket` answers its
+            // unmodelled bucket-quota refusal through.
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "OwnershipControls.Rules carries {} rules, more than the {} this emulator \
+                 records for one bucket",
+                rules.len(),
+                crate::state::MAX_OWNERSHIP_CONTROLS_RULES
+            )));
+        }
+
+        // "Creates or modifies OwnershipControls for an Amazon S3 bucket" (this
+        // operation's own documentation): the payload is the complete container, so what
+        // it names becomes the bucket's ownership controls in full, whether the bucket had
+        // some already or none.
+        bucket.set_ownership_controls(rules);
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(PutBucketOwnershipControlsOutput)
     }
 }
+
+/// The HTTP status AWS answers `MalformedXML` with: 400, the status S3's error-responses
+/// list carries for it.
+const MALFORMED_XML_STATUS: u16 = 400;

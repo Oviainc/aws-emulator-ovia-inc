@@ -22,5 +22,9 @@ pub struct TagResourceInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.ram#TagResourceResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct TagResourceOutput {
+    /// The pairs the call attached, one per tag key the request named. The member was
+    /// added to this service's on-disk model from the recorded AWS responses; see the
+    /// handler's module docs.
+    pub tags_created: Option<Vec<Tag>>,
 }
 

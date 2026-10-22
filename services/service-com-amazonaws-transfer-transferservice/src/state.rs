@@ -29,9 +29,11 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
+    As2ConnectorConfig, ConnectorEgressConfig, ConnectorVpcLatticeEgressConfig,
     DescribedWebAppEndpointDetails, DescribedWebAppIdentityProviderDetails, EndpointDetails,
     HomeDirectoryMapEntry, IdentityProviderDetails, PosixProfile, ProtocolDetails, ProxyConfig,
-    ResourceNotFoundException, S3StorageOptions, SftpPortWithOptions, Tag, WebAppUnits,
+    ResourceNotFoundException, S3StorageOptions, SftpConnectorConfig, SftpPortWithOptions, Tag,
+    WebAppUnits,
     WorkflowDetails, WorkflowStep,
 };
 
@@ -298,6 +300,10 @@ pub const RESOURCE_TYPE_USER: &str = "User";
 /// `SshPublicKeyId`. Same convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_SSH_PUBLIC_KEY: &str = "SshPublicKey";
 
+/// `ResourceType` for the connector resource, addressed by its `ConnectorId`. Same
+/// convention as [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_CONNECTOR: &str = "Connector";
+
 /// `ResourceType` for the web app resource. Same convention as
 /// [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_WEB_APP: &str = "WebApp";
@@ -385,6 +391,48 @@ pub const MAX_HOST_KEYS_PER_SERVER: usize = 10;
 /// as well as in count. `DeleteSshPublicKey` releases one, `DeleteUser` all of them.
 pub const MAX_SSH_KEYS_PER_USER: usize = 10;
 
+// -----------------------------------------------------------------------------
+// Connectors
+// -----------------------------------------------------------------------------
+
+/// The `ConnectorEgressType` enum's values (`[SERVICE_MANAGED, VPC_LATTICE]`):
+/// `SERVICE_MANAGED` "uses Transfer Family managed NAT gateways", `VPC_LATTICE`
+/// "routes traffic through customer VPCs using VPC Lattice".
+pub const CONNECTOR_EGRESS_TYPE_SERVICE_MANAGED: &str = "SERVICE_MANAGED";
+pub const CONNECTOR_EGRESS_TYPE_VPC_LATTICE: &str = "VPC_LATTICE";
+
+/// `DescribedConnector.EgressType`'s modelled default (`@default("SERVICE_MANAGED")`):
+/// a connector created with no `EgressConfig` is "a connector without egress
+/// configuration", i.e. a service-managed one.
+pub const DEFAULT_CONNECTOR_EGRESS_TYPE: &str = CONNECTOR_EGRESS_TYPE_SERVICE_MANAGED;
+
+/// `DescribedConnector.Status`'s modelled default (`@default("ACTIVE")`), documented as
+/// "ready for operations".
+///
+/// This is the status a created connector carries: `CreateConnector` records the
+/// parameters of a connection and the connector is usable as soon as it answers, and
+/// the `ConnectorStatus` enum's other values describe a create or update still in
+/// flight (`PENDING`) or one that failed (`ERRORED`) — neither of which this emulator
+/// can enter, because a configuration it cannot hold is refused at the create call
+/// itself rather than recorded and then failed.
+pub const CONNECTOR_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `ConnectorVpcLatticeEgressConfig.PortNumber`'s documented default ("Defaults to 22
+/// if not specified"), which is also the SFTP port.
+pub const DEFAULT_VPC_LATTICE_PORT: i32 = 22;
+
+/// `SftpConnectorConfig.MaxConcurrentConnections`' documented default ("The default
+/// value is `1`"), which the model also carries as `@default(1)`.
+pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: i32 = 1;
+
+/// `SftpConnectorConfig.MaxConcurrentConnections`' documented maximum ("The maximum
+/// values is `5`").
+///
+/// The member's modelled `@range` carries only `min: 1`, so the boundary validator
+/// refuses 0 and below but not 6 and above: the upper bound lives in the member's own
+/// documentation, so it is checked by the create handler.
+pub const MAX_CONCURRENT_CONNECTIONS: i32 = 5;
+
 /// The not-found payload for the `resource_type` resource identified by `resource`.
 ///
 /// The identifier travels in `Resource` ALONE: `Message` is a fixed generic string
@@ -408,6 +456,12 @@ pub fn unknown_server(server_id: &str) -> ResourceNotFoundException {
 /// The not-found payload for a `UserName` the named server does not hold.
 pub fn unknown_user(user_name: &str) -> ResourceNotFoundException {
     resource_not_found(RESOURCE_TYPE_USER, user_name)
+}
+
+/// The not-found payload for a `ConnectorId` the store does not hold — never created,
+/// or already deleted.
+pub fn unknown_connector(connector_id: &str) -> ResourceNotFoundException {
+    resource_not_found(RESOURCE_TYPE_CONNECTOR, connector_id)
 }
 
 /// The not-found payload for a `WebAppId` the store does not hold — never created, or
@@ -1097,7 +1151,7 @@ pub struct Server {
     ///
     /// Computed at create time from a host key the emulator GENERATES for the server
     /// (as the service does for a server whose host key it manages) — see
-    /// [`mint_host_key_fingerprint`]. Never invented: it is the real fingerprint of
+    /// [`mint_host_key`]. Never invented: it is the real fingerprint of
     /// real key material.
     pub host_key_fingerprint: String,
     /// The log group structured logging is configured to publish to, or `None` when
@@ -1191,6 +1245,109 @@ impl Server {
             .flatten()
             .flatten()
             .any(|detail| detail.workflow_id == workflow_id)
+    }
+}
+
+/// One stored Transfer Family connector, keyed by `ConnectorId`.
+///
+/// A connector is a RECORD of the parameters of a connection to a partner's AS2 or
+/// SFTP endpoint. The emulator speaks neither protocol, so nothing here is a live
+/// connection; every member a reader reports is resolved once, when the connector is
+/// created, so no reader has to re-apply a default. Every connector operation reads
+/// this ONE record — the members a listing reports (`ListedConnector` is
+/// `{Arn, ConnectorId, Url}`) and the ones only `DescribeConnector` reports live
+/// together here rather than in a second map beside it.
+#[derive(Debug, Clone)]
+pub struct Connector {
+    /// The minted `"c-" + 17 hex` identifier (`ConnectorId` is `^c-([0-9a-f]{17})$`).
+    pub connector_id: String,
+    /// `arn:aws:transfer:<region>:<account>:connector/<ConnectorId>`, as
+    /// [`connector_arn`] builds it.
+    pub arn: String,
+    /// The partner endpoint, as supplied, when it names one.
+    ///
+    /// A blank `Url` names no endpoint (the member's `len 0..255` admits the empty
+    /// string), which is the reading [`ConnectorConfig::cross_member_violation`] gives
+    /// it too — so it is stored as absent, never as `""`. Absent exactly for a
+    /// `VPC_LATTICE` connector, whose `Url` the model documents as "must be null":
+    /// every other connector is refused without one.
+    pub url: Option<String>,
+    pub as2_config: Option<As2ConnectorConfig>,
+    /// The SFTP settings, with `MaxConcurrentConnections` already resolved at create
+    /// time by [`resolve_sftp_connector_config`].
+    pub sftp_config: Option<SftpConnectorConfig>,
+    pub access_role: String,
+    pub logging_role: Option<String>,
+    pub security_policy_name: Option<String>,
+    /// The VPC Lattice egress settings, with `PortNumber` resolved at create time by
+    /// [`resolve_connector_egress_config`]. `ConnectorEgressConfig` is a union with one
+    /// member, so the variant is carried by [`Self::egress_type`] and this holds the
+    /// settings themselves.
+    pub egress_config: Option<ConnectorVpcLatticeEgressConfig>,
+    pub egress_type: String,
+    pub ip_address_type: Option<String>,
+    pub status: String,
+    pub tags: Vec<Tag>,
+}
+
+/// The `EgressType` a connector created with `egress_config` has.
+///
+/// `ConnectorEgressConfig`'s only member is `VpcLattice`, so a request that carries an
+/// egress configuration is a `VPC_LATTICE` connector and one that carries none takes
+/// `EgressType`'s modelled default. Both the create handler's cross-member checks and
+/// the stored record read the type from here, so the two cannot disagree.
+pub fn connector_egress_type(egress_config: Option<&ConnectorEgressConfig>) -> &'static str {
+    match egress_config {
+        Some(_) => CONNECTOR_EGRESS_TYPE_VPC_LATTICE,
+        None => DEFAULT_CONNECTOR_EGRESS_TYPE,
+    }
+}
+
+/// The endpoint a connector's `Url` names, when it names one.
+///
+/// A blank value names no endpoint: `Url` is modelled `len 0..255`, so the empty
+/// string passes the boundary validator, and a connector that may not carry a URL at
+/// all must not report one either. Only the emptiness test ignores surrounding
+/// whitespace; a value that names an endpoint is kept exactly as the caller sent it.
+/// Both the cross-member check and the stored record read the member through here, so
+/// the two cannot disagree.
+pub fn connector_url(url: Option<&str>) -> Option<String> {
+    url.filter(|url| !url.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Resolve the `SftpConnectorConfig` a connector is stored with.
+///
+/// `MaxConcurrentConnections` is the one member the model documents a default for, so
+/// it is materialised HERE, once, at create time. The member is modelled non-optional
+/// with `@default(1)`, so a request that omits it arrives as the schema's default
+/// rather than as "absent", and its `@range{min: 1}` is refused at the boundary before
+/// a handler runs: the floor below is therefore belt-and-braces, for a value that
+/// reaches the store unset, and never a validation rule of its own.
+pub fn resolve_sftp_connector_config(requested: SftpConnectorConfig) -> SftpConnectorConfig {
+    SftpConnectorConfig {
+        max_concurrent_connections: if requested.max_concurrent_connections
+            >= DEFAULT_MAX_CONCURRENT_CONNECTIONS
+        {
+            requested.max_concurrent_connections
+        } else {
+            DEFAULT_MAX_CONCURRENT_CONNECTIONS
+        },
+        ..requested
+    }
+}
+
+/// Resolve the egress settings a `VPC_LATTICE` connector is stored with: the Resource
+/// Configuration as supplied, and `PortNumber` at its documented default when the
+/// request named none.
+pub fn resolve_connector_egress_config(
+    requested: ConnectorEgressConfig,
+) -> ConnectorVpcLatticeEgressConfig {
+    match requested {
+        ConnectorEgressConfig::VpcLattice(config) => ConnectorVpcLatticeEgressConfig {
+            port_number: Some(config.port_number.unwrap_or(DEFAULT_VPC_LATTICE_PORT)),
+            ..config
+        },
     }
 }
 
@@ -1459,6 +1616,18 @@ fn must_be_when(member: &str, requirement: &str, condition: &str) -> String {
     format!("{member} must be {requirement} when {condition}")
 }
 
+/// "exactly one of `<first>` and `<second>` must be specified" — two members the model
+/// documents as alternatives, exactly one of which configures the resource.
+fn exactly_one_of(first: &str, second: &str) -> String {
+    format!("exactly one of {first} and {second} must be specified")
+}
+
+/// "`<member>` must be at most `<maximum>`" — a member whose documented upper bound the
+/// model's own constraints do not carry.
+fn must_be_at_most(member: &str, maximum: i32) -> String {
+    format!("{member} must be at most {maximum}")
+}
+
 /// The server configuration a `CreateServer` (or `UpdateServer`) request resolves to:
 /// every member a documented cross-member requirement mentions, with the model's
 /// documented defaults ALREADY applied.
@@ -1642,6 +1811,78 @@ impl ServerConfig<'_> {
                     &format!("Protocols includes {PROTOCOL_AS2}"),
                 ));
             }
+        }
+
+        None
+    }
+}
+
+/// The connector configuration a `CreateConnector` request resolves to: every member a
+/// documented cross-member requirement mentions, with `EgressType` — which the rest are
+/// stated against — already resolved from `EgressConfig`.
+#[derive(Debug)]
+pub struct ConnectorConfig<'a> {
+    pub url: Option<&'a str>,
+    pub as2_config: Option<&'a As2ConnectorConfig>,
+    pub sftp_config: Option<&'a SftpConnectorConfig>,
+    pub egress_type: &'a str,
+}
+
+impl ConnectorConfig<'_> {
+    /// The first documented cross-member requirement this configuration violates,
+    /// worded as the refusal states it — `None` when it violates none.
+    ///
+    /// Every rule below is a sentence in this service's own model:
+    ///
+    /// * `CreateConnector` states "You must specify exactly one configuration object:
+    ///   either for AS2 (`As2Config`) or SFTP (`SftpConfig`)".
+    /// * `EgressConfig` "determines how traffic is routed from the connector to the
+    ///   SFTP server", and `ConnectorEgressType`'s `VPC_LATTICE` "routes traffic through
+    ///   customer VPCs" to that same SFTP server — so only an SFTP connector has one.
+    /// * `Url` states "When creating AS2 connectors or service-managed SFTP connectors
+    ///   (connectors without egress configuration), you must provide a URL to specify
+    ///   the remote server endpoint. For VPC Lattice type connectors, the URL must be
+    ///   null."
+    /// * `MaxConcurrentConnections` states "The maximum values is `5`" — a bound the
+    ///   member's `@range` does not carry (see [`MAX_CONCURRENT_CONNECTIONS`]).
+    pub fn cross_member_violation(&self) -> Option<String> {
+        if self.as2_config.is_some() == self.sftp_config.is_some() {
+            return Some(exactly_one_of("As2Config", "SftpConfig"));
+        }
+
+        let vpc_lattice = self.egress_type == CONNECTOR_EGRESS_TYPE_VPC_LATTICE;
+        if vpc_lattice && self.sftp_config.is_none() {
+            return Some(settable_only_when("EgressConfig", "SftpConfig is specified"));
+        }
+
+        // An empty `Url` names no endpoint — the same reading [`connector_url`] gives
+        // it when the connector is stored, and the one `Certificate` already gets in
+        // `ServerConfig::cross_member_violation`.
+        let endpoint_named = connector_url(self.url).is_some();
+        match (vpc_lattice, endpoint_named) {
+            (true, true) => {
+                return Some(forbidden_when(
+                    "Url",
+                    &format!("EgressType is {CONNECTOR_EGRESS_TYPE_VPC_LATTICE}"),
+                ))
+            }
+            (false, false) => {
+                return Some(required_when(
+                    "Url",
+                    &format!("EgressType is {CONNECTOR_EGRESS_TYPE_SERVICE_MANAGED}"),
+                ))
+            }
+            _ => {}
+        }
+
+        if self
+            .sftp_config
+            .is_some_and(|config| config.max_concurrent_connections > MAX_CONCURRENT_CONNECTIONS)
+        {
+            return Some(must_be_at_most(
+                "SftpConfig.MaxConcurrentConnections",
+                MAX_CONCURRENT_CONNECTIONS,
+            ));
         }
 
         None
@@ -1868,29 +2109,6 @@ fn resolve_workflow_step(mut step: WorkflowStep) -> WorkflowStep {
     step
 }
 
-/// One stored AS2 or SFTP connector, keyed by its `ConnectorId`.
-///
-/// Holds the members a LISTING reports — `ListedConnector` is `{Arn, ConnectorId,
-/// Url}` — each RESOLVED when the connector is written, so no reader re-derives one.
-/// A write operation that reports more of a connector than a listing does
-/// (`DescribeConnector`'s `AccessRole`, `SftpConfig`, `Status`, …) extends THIS record
-/// rather than adding a second map beside it.
-#[derive(Debug, Clone)]
-pub struct Connector {
-    /// The minted `"c-" + 17 hex` identifier (`ConnectorId` is `^c-([0-9a-f]{17})$`).
-    pub connector_id: String,
-    /// `arn:aws:transfer:<region>:<account>:connector/<ConnectorId>`, as
-    /// [`connector_arn`] builds it.
-    pub arn: String,
-    /// The partner's AS2 or SFTP endpoint, exactly as the write supplied it.
-    ///
-    /// `Option` because `Url`'s own documentation makes it absent for one class of
-    /// connector: "For VPC Lattice type connectors, the URL must be null." Its
-    /// modelled `len 0..255` also admits the empty string, which is a PRESENT url and
-    /// stays distinct from an absent one.
-    pub url: Option<String>,
-}
-
 /// Per-service state for com-amazonaws-transfer-transferservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsTransferTransferserviceState {
@@ -1924,8 +2142,10 @@ pub struct ComAmazonawsTransferTransferserviceState {
 impl ComAmazonawsTransferTransferserviceState {
     /// Mint the next `<prefix>-<17 hex digits>` identifier.
     ///
-    /// `ServerId` is `^s-([0-9a-f]{17})$`, `SshPublicKeyId` is `^key-[0-9a-f]{17}$`
-    /// and `ProfileId` is `^p-([0-9a-f]{17})$`, so all three are this shape;
+    /// `ServerId` is `^s-([0-9a-f]{17})$`, `SshPublicKeyId` is `^key-[0-9a-f]{17}$`,
+    /// `HostKeyId` is `^hostkey-[0-9a-f]{17}$`,
+    /// `ConnectorId` is `^c-([0-9a-f]{17})$` and `ProfileId` is `^p-([0-9a-f]{17})$`,
+    /// so all of them are this shape;
     /// `{:017x}` is exactly 17 lowercase hex digits for every
     /// counter value below 16^17, which a counter incremented once per created
     /// resource cannot reach.

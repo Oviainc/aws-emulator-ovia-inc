@@ -17,6 +17,8 @@ mod list_service_network_service_associations;
 mod listeners;
 #[path = "all/referential_integrity_conflict_messages.rs"]
 mod referential_integrity_conflict_messages;
+#[path = "all/resource_not_found_messages.rs"]
+mod resource_not_found_messages;
 #[path = "all/service_network_update_and_timestamps.rs"]
 mod service_network_update_and_timestamps;
 #[path = "all/state_roundtrip.rs"]

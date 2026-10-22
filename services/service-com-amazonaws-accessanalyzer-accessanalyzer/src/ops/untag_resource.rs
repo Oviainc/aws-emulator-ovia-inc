@@ -128,7 +128,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // `UntagResourceResponse` is a declared structure with NO members, so a successful
+    // untag has no content to report: 204, not the model's defaulted 200. See
+    // [`crate::state::NO_CONTENT_SUCCESS_STATUS`].
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,
