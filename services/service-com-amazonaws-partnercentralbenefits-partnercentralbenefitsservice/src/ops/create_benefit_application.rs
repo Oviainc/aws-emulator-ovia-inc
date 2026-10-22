@@ -318,6 +318,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at_millis: now,
             revision: 1,
             created_revision: 1,
+            // Nothing has recalled this application: it has not been submitted yet.
+            recall_client_token: None,
             associated_resources: input.associated_resources.unwrap_or_default(),
             partner_contacts: input.partner_contacts.unwrap_or_default(),
             file_details: input

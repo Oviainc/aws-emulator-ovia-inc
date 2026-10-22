@@ -111,6 +111,79 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// credential scope names no region, and ECR's ARNs and repository URIs are regional.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// One account setting of this registry: the setting's name, the values
+/// `PutAccountSetting` accepts for it, and the value the registry reports for it before
+/// anybody sets one.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountSettingSpec {
+    /// The name `GetAccountSetting`/`PutAccountSetting` address this setting by.
+    pub name: &'static str,
+    /// The values `PutAccountSetting` may set this setting to.
+    pub settable_values: &'static [&'static str],
+    /// The value this setting has until a `PutAccountSetting` changes it.
+    pub default_value: &'static str,
+}
+
+/// Every account setting this registry serves.
+///
+/// The names come from the model's own documentation of
+/// `PutAccountSettingRequest$name` ("The name of the account setting, such as
+/// `BASIC_SCAN_TYPE_VERSION`, `REGISTRY_POLICY_SCOPE`, or `BLOB_MOUNTING`") and the
+/// settable values from `PutAccountSettingRequest$value` ("Valid value for basic scan
+/// type: `AWS_NATIVE`. Valid values for registry policy scope: `V2`. Valid values for
+/// blob mounting: `ENABLED` or `DISABLED`"), read with
+/// `smithy_query(query="doc",shape="PutAccountSettingRequest",member="name"|"value")`.
+///
+/// Each default is the value of a registry nobody has configured. None of the three is
+/// stated by the model, which documents only what a caller may SET, so each is an
+/// inference with its reasoning below — and this constant is the single place to correct
+/// one if a recorded response ever contradicts it:
+///
+/// * `BASIC_SCAN_TYPE_VERSION` — `AWS_NATIVE` is the only version the model lets a
+///   caller set, so it is also the one in force before any call.
+/// * `REGISTRY_POLICY_SCOPE` — `V2` is the only scope the model lets a caller set, so
+///   the move to it is one-way and the scope a registry holds beforehand is the other
+///   one, `V1`.
+/// * `BLOB_MOUNTING` — settable either way and with no documented default, so this one
+///   is the weakest inference of the three: a feature nobody has asked for is taken to
+///   be `DISABLED`.
+pub const ACCOUNT_SETTINGS: &[AccountSettingSpec] = &[
+    AccountSettingSpec {
+        name: "BASIC_SCAN_TYPE_VERSION",
+        settable_values: &["AWS_NATIVE"],
+        default_value: "AWS_NATIVE",
+    },
+    AccountSettingSpec {
+        name: "BLOB_MOUNTING",
+        settable_values: &["ENABLED", "DISABLED"],
+        default_value: "DISABLED",
+    },
+    AccountSettingSpec {
+        name: "REGISTRY_POLICY_SCOPE",
+        settable_values: &["V2"],
+        default_value: "V1",
+    },
+];
+
+/// The setting `name` addresses, or [`Fault::InvalidParameter`] naming the member and
+/// the set it must come from.
+pub fn account_setting_spec(name: &str) -> Result<&'static AccountSettingSpec, Fault> {
+    ACCOUNT_SETTINGS
+        .iter()
+        .find(|spec| spec.name == name)
+        .ok_or_else(|| {
+            Fault::InvalidParameter(format!(
+                "Invalid parameter at 'name' failed to satisfy constraint: 'Member must \
+                 satisfy enum value set: [{}]'",
+                ACCOUNT_SETTINGS
+                    .iter()
+                    .map(|spec| spec.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+}
+
 /// The `LayerAvailability` of a blob the repository holds. The other two values the
 /// enum carries are not reachable from this store: `ARCHIVED` belongs to an image whose
 /// storage class is archive (`UpdateImageStorageClass`, still a 501 stub, is the only
@@ -443,6 +516,11 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// Repositories by name. A `BTreeMap` so every listing — and therefore every
     /// pagination token — has one deterministic order.
     pub repositories: BTreeMap<String, Repo>,
+    /// The account settings a `PutAccountSetting` has changed, by setting name. A name
+    /// absent from here is still readable — it reports its spec's
+    /// [`AccountSettingSpec::default_value`] — so a read never has to invent a value
+    /// and never has to write one.
+    pub account_settings: BTreeMap<String, String>,
     /// Repository creation templates by namespace prefix, keyed the way
     /// [`normalize_prefix`] spells that prefix. A `BTreeMap` for the same reason as
     /// `repositories`: one deterministic listing order, so a pagination token means the
@@ -491,6 +569,41 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
         self.repositories
             .get_mut(name)
             .ok_or_else(|| Fault::RepositoryNotFound(repository_not_found_message(name)))
+    }
+
+    /// The value of the account setting `name`: what was last set for it, or its
+    /// documented default while nothing has been. Reading one changes nothing.
+    pub fn account_setting(&self, name: &str) -> Result<String, Fault> {
+        let spec = account_setting_spec(name)?;
+        Ok(self
+            .account_settings
+            .get(spec.name)
+            .cloned()
+            .unwrap_or_else(|| spec.default_value.to_string()))
+    }
+
+    /// Set the account setting `name` to `value`, refusing a name this registry does
+    /// not serve and a value that setting does not take. Answers with the value the
+    /// store now holds for that setting, read back out of the map rather than echoed,
+    /// so a caller cannot report a value the store does not carry.
+    pub fn set_account_setting(&mut self, name: &str, value: &str) -> Result<String, Fault> {
+        let spec = account_setting_spec(name)?;
+        if !spec.settable_values.contains(&value) {
+            // The setting and the value come from the request, and "in this region" is
+            // the reason: a value this registry's region does not offer for that
+            // setting.
+            return Err(Fault::InvalidParameter(format!(
+                "You can't set '{}' to '{value}' in this region.",
+                spec.name
+            )));
+        }
+        self.account_settings
+            .insert(spec.name.to_string(), value.to_string());
+        Ok(self
+            .account_settings
+            .get(spec.name)
+            .cloned()
+            .unwrap_or_else(|| spec.default_value.to_string()))
     }
 
     /// The registry's replication configuration: the stored rules, which is the empty

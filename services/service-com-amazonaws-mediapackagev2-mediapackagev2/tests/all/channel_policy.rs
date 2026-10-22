@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end cover for the MediaPackageV2 channel resource policy
-//! (`PutChannelPolicy` / `GetChannelPolicy`), driven over HTTP through the same router
-//! the emulator boots.
+//! (`PutChannelPolicy` / `GetChannelPolicy` / `DeleteChannelPolicy`), driven over HTTP
+//! through the same router the emulator boots.
 //!
 //! The rules under test, each asserted over a SET of inputs rather than one recorded
 //! request:
@@ -24,6 +24,14 @@
 //! 7. `PolicyText` is bounded: `smithy_query(query="shape",shape="PolicyText")` gives
 //!    `length {max: 6144}`, so a document at the bound is accepted and one past it is
 //!    refused with `ValidationException` (400).
+//! 8. `DeleteChannelPolicy` detaches the policy (so the read then answers 404) and, since
+//!    the model declares no not-found error for it, succeeds again at every address whose
+//!    policy is already absent.
+//! 9. The policy is a SUB-RESOURCE: attaching or detaching one leaves the channel's own
+//!    record — ARN, ingest endpoints, timestamps, ETag — unchanged.
+//! 10. A multiview channel carries no policy of its own: the put is refused with
+//!     `ValidationException` (400) and `ValidationExceptionType`
+//!     `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED`, the type the model names for this case.
 
 use std::sync::Arc;
 
@@ -100,17 +108,35 @@ impl Emulator {
 
     /// Create a channel in `group`, panicking unless it was created.
     async fn given_channel(&self, group: &str, name: &str) {
-        let (status, body) = self
+        self.given_channel_with(group, name, json!({})).await;
+    }
+
+    /// Create a channel in `group` from `body`, panicking unless it was created — for a
+    /// channel that needs more than its name (a multiview channel carries an `InputType`
+    /// and a `MultiviewConfiguration`).
+    async fn given_channel_with(&self, group: &str, name: &str, body: Value) {
+        let mut body = body;
+        body["ChannelName"] = json!(name);
+        let (status, response) = self
             .call(
                 "POST",
                 &format!("/channelGroup/{group}/channel"),
-                Some(json!({"ChannelName": name})),
+                Some(body),
             )
             .await;
         assert_eq!(
             status, 200,
-            "setup: creating channel {name:?} in {group:?} got {body}"
+            "setup: creating channel {name:?} in {group:?} got {response}"
         );
+    }
+
+    async fn get_channel(&self, group: &str, channel: &str) -> (u16, Value) {
+        self.call(
+            "GET",
+            &format!("/channelGroup/{group}/channel/{channel}/"),
+            None,
+        )
+        .await
     }
 
     async fn delete_channel(&self, group: &str, channel: &str) -> (u16, Value) {
@@ -134,6 +160,15 @@ impl Emulator {
     async fn get_policy(&self, group: &str, channel: &str) -> (u16, Value) {
         self.call(
             "GET",
+            &format!("/channelGroup/{group}/channel/{channel}/policy"),
+            None,
+        )
+        .await
+    }
+
+    async fn delete_policy(&self, group: &str, channel: &str) -> (u16, Value) {
+        self.call(
+            "DELETE",
             &format!("/channelGroup/{group}/channel/{channel}/policy"),
             None,
         )
@@ -521,4 +556,142 @@ async fn the_policy_length_bound_is_enforced() {
         "case {} bytes: expected ValidationException, got {body}",
         POLICY_TEXT_MAX_LENGTH + 1
     );
+}
+
+/// RULE 8 — a delete detaches the policy, and succeeds again wherever the policy is
+/// already absent: the operation models no not-found error, so every row below is the
+/// state the call promises rather than a failure.
+#[tokio::test]
+async fn deleting_a_policy_is_effective_and_idempotent() {
+    let emulator = Emulator::new();
+    emulator.given_group("group-1").await;
+    emulator.given_channel("group-1", "channel-1").await;
+    emulator.given_channel("group-1", "never-had-one").await;
+
+    // Each document in the table is attached and then detached, so the delete is
+    // exercised over the same class of policies the round trip covers.
+    for (label, policy) in policy_cases() {
+        let (status, body) = emulator.put_policy("group-1", "channel-1", &policy).await;
+        assert_eq!(status, 200, "case {label:?}: put expected 200, got {body}");
+
+        let (status, body) = emulator.delete_policy("group-1", "channel-1").await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: delete expected 200, got {status} {body}"
+        );
+        let (status, body) = emulator.get_policy("group-1", "channel-1").await;
+        assert_eq!(
+            status, 404,
+            "case {label:?}: the policy must be gone after the delete, got {status} {body}"
+        );
+        assert_eq!(
+            error_type(&body),
+            "ResourceNotFoundException",
+            "case {label:?}: expected ResourceNotFoundException, got {body}"
+        );
+    }
+
+    let already_absent = [
+        ("a policy that was just deleted", "group-1", "channel-1"),
+        ("a channel that never had one", "group-1", "never-had-one"),
+        ("an unknown channel", "group-1", "absent-channel"),
+        ("an unknown channel group", "absent-group", "channel-1"),
+    ];
+    for (label, group, channel) in already_absent {
+        let (status, body) = emulator.delete_policy(group, channel).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected 200, got {status} {body}"
+        );
+    }
+}
+
+/// RULE 9 — the policy is a sub-resource, so putting and deleting one leaves the
+/// channel's own record exactly as it was.
+#[tokio::test]
+async fn attaching_or_detaching_a_policy_leaves_the_channel_record_unchanged() {
+    let emulator = Emulator::new();
+    emulator.given_group("group-1").await;
+    emulator.given_channel("group-1", "channel-1").await;
+    let (status, before) = emulator.get_channel("group-1", "channel-1").await;
+    assert_eq!(status, 200, "setup: reading the channel got {before}");
+
+    for (label, policy) in policy_cases() {
+        let (status, body) = emulator.put_policy("group-1", "channel-1", &policy).await;
+        assert_eq!(status, 200, "case {label:?}: put expected 200, got {body}");
+        assert_eq!(
+            emulator.get_channel("group-1", "channel-1").await.1,
+            before,
+            "case {label:?}: attaching a policy must not change the channel record"
+        );
+    }
+
+    assert_eq!(
+        emulator.delete_policy("group-1", "channel-1").await.0,
+        200,
+        "the delete must be accepted"
+    );
+    assert_eq!(
+        emulator.get_channel("group-1", "channel-1").await.1,
+        before,
+        "detaching a policy must not change the channel record"
+    );
+}
+
+/// RULE 10 — a multiview channel carries no policy of its own, which is the case the
+/// model's `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED` validation type names. The rows vary
+/// the number of source channels and the layouts, whose values come from the model's
+/// `MultiviewLayoutType` enum.
+#[tokio::test]
+async fn a_multiview_channel_cannot_carry_a_policy() {
+    let emulator = Emulator::new();
+    emulator.given_group("group-1").await;
+    for source in ["source-a", "source-b"] {
+        emulator
+            .given_channel_with("group-1", source, json!({"InputType": "CMAF"}))
+            .await;
+    }
+    let policy = json!({"Statement": [{"Effect": "Allow"}]}).to_string();
+
+    let cases = [
+        (
+            "two sources, one layout",
+            json!({"AvailableSources": ["source-a", "source-b"], "AvailableLayouts": ["LAYOUT_2EH"]}),
+        ),
+        (
+            "one source, two layouts",
+            json!({"AvailableSources": ["source-a"], "AvailableLayouts": ["LAYOUT_3PL", "LAYOUT_4E"]}),
+        ),
+    ];
+    for (index, (label, multiview)) in cases.into_iter().enumerate() {
+        let channel = format!("multiview-{index}");
+        emulator
+            .given_channel_with(
+                "group-1",
+                &channel,
+                json!({"InputType": "MULTIVIEW", "MultiviewConfiguration": multiview}),
+            )
+            .await;
+
+        let (status, body) = emulator.put_policy("group-1", &channel, &policy).await;
+        assert_eq!(
+            status, 400,
+            "case {label:?}: expected 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_type(&body),
+            "ValidationException",
+            "case {label:?}: expected ValidationException, got {body}"
+        );
+        assert_eq!(
+            member(&body, "ValidationExceptionType"),
+            "MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED",
+            "case {label:?}: expected the multiview validation type, got {body}"
+        );
+        let (status, body) = emulator.get_policy("group-1", &channel).await;
+        assert_eq!(
+            status, 404,
+            "case {label:?}: the refused put must have stored nothing, got {status} {body}"
+        );
+    }
 }
