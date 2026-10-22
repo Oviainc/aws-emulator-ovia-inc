@@ -58,7 +58,8 @@ impl Emulator {
     }
 
     /// As [`Emulator::call`], with extra request headers — a request-header-bound member
-    /// such as `ClientToken` (`x-amzn-client-token`) travels through here.
+    /// such as `ClientToken` (`x-amzn-client-token`) or the `ETag` precondition
+    /// (`x-amzn-update-if-match`) travels through here.
     pub(crate) async fn call_with_headers(
         &self,
         method: &str,
