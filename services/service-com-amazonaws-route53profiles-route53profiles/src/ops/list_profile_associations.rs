@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProfileAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProfileAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProfileAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the stored associations in a stable order, narrowed by the
+//! `profileId` and `resourceId` query filters.
 //!
 //! ## Shape of an operation
 //!
@@ -99,10 +92,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53profiles-route53
 // here — hence the `ListProfileAssociationsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53profiles#ListProfileAssociations")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53profiles#ListProfileAssociations",
+    extra_errors = ["InternalServiceErrorException"]
+)]
 #[derive(Debug)]
 pub enum ListProfileAssociationsErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServiceErrorException(InternalServiceErrorException),
     InvalidNextTokenException(InvalidNextTokenException),
     InvalidParameterException(InvalidParameterException),
     ThrottlingException(ThrottlingException),
@@ -160,18 +157,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProfileAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProfileAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProfileAssociations"))
+        // `@readonly`: paging a list never changes what a later caller sees.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListProfileAssociationsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some(crate::state::NO_STORE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // No token starts at the beginning; a token resumes strictly after the last
+        // association the page that issued it returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_next_token(TOKEN_MARKER, token).ok_or_else(|| {
+                    ListProfileAssociationsErrorModeled::InvalidNextTokenException(
+                        crate::state::invalid_next_token(token),
+                    )
+                })?,
+            ),
+        };
+
+        // `MaxResults` is modelled `range 1..100`, so the boundary validator has
+        // already refused anything outside it; an absent one pages at that maximum.
+        let page_size = crate::state::page_size(input.max_results);
+
+        let store = state.lock();
+        // A range query, not a scan: resuming costs O(log n) + O(page) rather than
+        // walking every stored association on each page.
+        let start = match resume_after.as_deref() {
+            Some(after) => ::std::ops::Bound::Excluded(after),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        // `profileId` and `resourceId` narrow the set BEFORE the page is cut, so a
+        // page is `MaxResults` matching associations rather than whatever matched
+        // within an unfiltered page.
+        let mut remaining = store
+            .profile_associations
+            .range::<str, _>((start, ::std::ops::Bound::Unbounded))
+            .map(|(_, association)| association)
+            .filter(|association| {
+                input
+                    .profile_id
+                    .as_deref()
+                    .is_none_or(|wanted| association.profile_id == wanted)
+                    && input
+                        .resource_id
+                        .as_deref()
+                        .is_none_or(|wanted| association.resource_id == wanted)
+            });
+
+        let page: Vec<&crate::state::ProfileAssociation> =
+            remaining.by_ref().take(page_size).collect();
+        // A token is emitted only when something is actually left to return.
+        let next_token = match page.last() {
+            Some(last) if remaining.next().is_some() => {
+                Some(crate::state::encode_next_token(TOKEN_MARKER, &last.id))
+            }
+            _ => None,
+        };
+
+        Ok(ListProfileAssociationsOutput {
+            profile_associations: Some(
+                page.into_iter()
+                    .map(crate::state::profile_association_shape)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
+
+/// The marker every token this operation issues carries, so a token it did not
+/// issue is recognisable rather than being read as some other resume point.
+/// Without it any hex-decodable string would be accepted as a continuation.
+const TOKEN_MARKER: &str = "ListProfileAssociations/1/";
