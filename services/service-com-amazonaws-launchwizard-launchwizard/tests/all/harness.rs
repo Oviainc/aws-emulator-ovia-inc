@@ -49,10 +49,17 @@ impl Harness {
     }
 
     pub async fn call(&self, path: &str, body: &Value) -> Reply {
+        self.send("POST", path, body).await
+    }
+
+    /// Dispatch one request with the given HTTP method and request target, so a suite
+    /// can reach an operation whose model binds it to something other than a POST with
+    /// a JSON payload (a `DELETE` with `@httpQuery` members, say).
+    pub async fn send(&self, method: &str, target: &str, body: &Value) -> Reply {
         let payload = serde_json::to_vec(body).expect("a test request body serializes");
         let request = http::Request::builder()
-            .method("POST")
-            .uri(format!("https://launchwizard.{REGION}.amazonaws.com{path}"))
+            .method(method)
+            .uri(format!("https://launchwizard.{REGION}.amazonaws.com{target}"))
             .header(
                 "authorization",
                 format!(
