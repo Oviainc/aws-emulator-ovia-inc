@@ -9,7 +9,9 @@
 //! recordsets in), the **container service** (a compute resource containers are
 //! deployed to), the **bucket** (an object-storage resource of the Lightsail
 //! object storage service) together with the **access keys** it grants
-//! programmatic access through, the append-only **operation log** every mutating call
+//! programmatic access through, the **managed relational database** (a MySQL or
+//! PostgreSQL database the service runs for the account), the append-only
+//! **operation log** every mutating call
 //! writes, and the service's static **Region catalog** — the Regions and
 //! Availability Zones `GetRegions` lists and every other operation validates a
 //! location against. Everything mutable in this module is reached through
@@ -79,6 +81,15 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The `resourceType` a bucket and its operations report, from the same modelled
 /// `ResourceType` enum.
 pub const RESOURCE_TYPE_BUCKET: &str = "Bucket";
+
+/// The `resourceType` a managed relational database and its operations report,
+/// from the same modelled `ResourceType` enum.
+pub const RESOURCE_TYPE_RELATIONAL_DATABASE: &str = "RelationalDatabase";
+
+/// The resource portion a managed relational database's ARN carries before its
+/// id. Mirrors the `Instance/<uuid>` form the modelled `Instance$arn`
+/// documentation shows, with this resource's own `ResourceType` value.
+pub const RELATIONAL_DATABASE_ARN_RESOURCE_PREFIX: &str = "RelationalDatabase/";
 
 /// The resource portion a bucket ARN carries before its id. Mirrors the
 /// `Instance/<uuid>` form the modelled `Instance$arn` documentation shows, with
@@ -229,21 +240,22 @@ pub const DISK_SNAPSHOT_STATE_PENDING: &str = "pending";
 /// See [`DISK_SNAPSHOT_STATE_PENDING`].
 pub const DISK_SNAPSHOT_STATE_COMPLETED: &str = "completed";
 
-/// A disk or disk-snapshot state the clock already owes a record.
+/// A state the clock already owes a resource whose state is a plain NAME: a
+/// block storage disk's `DiskState` value, a disk snapshot's
+/// `DiskSnapshotState` value, or a managed relational database's `state`.
 ///
-/// Separate from [`DueTransition`] because a disk's state — like a disk
-/// snapshot's — is a value of a modelled string enum (`DiskState`,
-/// `DiskSnapshotState`): a name with no numeric code, where an instance's is an
-/// EC2 `InstanceState` (a code and a name together).
+/// Separate from [`DueTransition`] because those states are names with no
+/// numeric code, where an instance's is an EC2 `InstanceState` (a code and a
+/// name together).
 #[derive(Debug, Clone, Copy)]
-pub struct DueDiskState {
+pub struct DueNamedState {
     /// Epoch milliseconds at which the change became (or becomes) due.
     pub at_ms: i64,
-    /// The state the disk settles into.
+    /// The state the resource settles into.
     pub state: &'static str,
 }
 
-impl DueDiskState {
+impl DueNamedState {
     /// The transition to `state`, due [`STATE_TRANSITION_MILLIS`] after `now_ms`.
     pub fn after(now_ms: i64, state: &'static str) -> Self {
         Self {
@@ -252,6 +264,17 @@ impl DueDiskState {
         }
     }
 }
+
+/// `RelationalDatabase$state` values this slice uses — "Describes the current
+/// state of the database", a plain string in the model with no enum behind it.
+///
+/// A Lightsail managed database is an Amazon RDS DB instance, and the member
+/// carries RDS's own DB instance status values: `creating` while the instance is
+/// being provisioned and `available` once it accepts connections (Amazon RDS
+/// User Guide, "Viewing DB instance status").
+pub const RELATIONAL_DATABASE_STATE_CREATING: &str = "creating";
+/// See [`RELATIONAL_DATABASE_STATE_CREATING`].
+pub const RELATIONAL_DATABASE_STATE_AVAILABLE: &str = "available";
 
 // ---------------------------------------------------------------------------
 // Operation log
@@ -279,6 +302,8 @@ pub const OPERATION_TYPE_CREATE_DOMAIN: &str = "CreateDomain";
 pub const OPERATION_TYPE_CREATE_BUCKET: &str = "CreateBucket";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE: &str = "CreateRelationalDatabase";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -325,6 +350,12 @@ pub const MAX_DOMAINS: usize = 500;
 /// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
 /// refused with the modelled `InvalidInputException`.
 pub const MAX_DISKS: usize = 500;
+
+/// The most managed relational databases this emulator will hold.
+///
+/// Emulator resource guard, NOT an AWS quota: a create that would exceed it is
+/// refused with the modelled `InvalidInputException`.
+pub const MAX_RELATIONAL_DATABASES: usize = 500;
 
 /// The most disk snapshots this emulator will hold.
 ///
@@ -2070,6 +2101,16 @@ pub const RELATIONAL_DATABASE_BUNDLE_SPECS: &[RelationalDatabaseBundleSpec] = &[
 pub const RELATIONAL_DATABASE_BUNDLE_PAGE_SIZE: usize = 20;
 
 impl RelationalDatabaseBundleSpec {
+    /// Whether this plan is a high-availability one: a database created on it
+    /// runs with a standby in a second Availability Zone.
+    ///
+    /// From the id's own form, documented on [`Self::bundle_id`]: a
+    /// high-availability plan carries an `ha` token after the size
+    /// (`micro_ha_1_0`), which the standard plan of the same size does not.
+    pub fn is_high_availability(&self) -> bool {
+        self.bundle_id.contains("_ha_")
+    }
+
     /// This plan as the modelled `RelationalDatabaseBundle`.
     pub fn view(&self) -> RelationalDatabaseBundle {
         RelationalDatabaseBundle {
@@ -2279,12 +2320,22 @@ impl RegionSpec {
     /// [`Self::availability_zone_letters`], each named `<region><letter>` and
     /// serving.
     pub fn availability_zones(&self) -> Vec<AvailabilityZone> {
-        self.availability_zone_letters
-            .chars()
-            .map(|letter| AvailabilityZone {
-                zone_name: Some(format!("{}{letter}", self.name)),
+        self.zone_names()
+            .into_iter()
+            .map(|zone_name| AvailabilityZone {
+                zone_name: Some(zone_name),
                 state: Some(AVAILABILITY_ZONE_STATE_AVAILABLE.to_string()),
             })
+            .collect()
+    }
+
+    /// The names of the Availability Zones this Region publishes, in the
+    /// catalog's order — the `<region><letter>` form
+    /// [`Self::availability_zone_letters`] documents.
+    pub fn zone_names(&self) -> Vec<String> {
+        self.availability_zone_letters
+            .chars()
+            .map(|letter| format!("{}{letter}", self.name))
             .collect()
     }
 
@@ -2500,6 +2551,20 @@ pub fn regions_view(
 /// no such Region.
 pub fn region_spec(name: &str) -> Option<&'static RegionSpec> {
     REGION_SPECS.iter().find(|spec| spec.name == name)
+}
+
+/// The catalog entry for the Region that publishes the Availability Zone `zone`,
+/// or `None` when no Region this service serves publishes it.
+///
+/// STRICTER than [`region_of_availability_zone`], which checks only that the
+/// zone is a `<region><letter>` for a Region the modelled `RegionName` enum
+/// admits: a letter the Region does not publish names no zone a resource can be
+/// created in, and this is what a caller that resolves a zone through
+/// `GetRegions` gets back.
+pub fn region_spec_of_availability_zone(zone: &str) -> Option<&'static RegionSpec> {
+    REGION_SPECS
+        .iter()
+        .find(|spec| spec.zone_names().iter().any(|name| name == zone))
 }
 
 /// The continent code of the Region `name`, or `None` when its geography prefix
@@ -2846,7 +2911,7 @@ pub struct StoredDisk {
     /// [`DISK_STATE_AVAILABLE`] or [`DISK_STATE_IN_USE`].
     pub state: &'static str,
     /// The state the clock owes this disk, while one is outstanding.
-    pub due: Option<DueDiskState>,
+    pub due: Option<DueNamedState>,
     /// The instance this disk is attached to, while one is. `AttachDisk` is what
     /// sets it; a newly created disk is attached to nothing.
     pub attached_to: Option<String>,
@@ -2955,7 +3020,7 @@ pub struct StoredDiskSnapshot {
     /// [`DISK_SNAPSHOT_STATE_COMPLETED`].
     pub state: &'static str,
     /// The state the clock owes this snapshot, while one is outstanding.
-    pub due: Option<DueDiskState>,
+    pub due: Option<DueNamedState>,
     /// What the snapshot was taken of.
     pub source: DiskSnapshotSource,
 }
@@ -3028,6 +3093,574 @@ impl StoredDomain {
             // that delegation is made in Route 53, which this emulator does not
             // serve, so there is no state to report.
             registered_domain_delegation_info: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Managed relational databases
+// ---------------------------------------------------------------------------
+
+/// The `parameterApplyStatus` a database whose parameters are all applied
+/// reports.
+///
+/// A Lightsail managed database is an Amazon RDS DB instance, and the member
+/// carries RDS's own parameter group status: `in-sync` means "the parameters are
+/// applied"; `UpdateRelationalDatabaseParameters` is what moves a database out of
+/// it.
+pub const PARAMETER_APPLY_STATUS_IN_SYNC: &str = "in-sync";
+
+/// The certificate authority a new database's server certificate is issued
+/// under, as `caCertificateIdentifier` reports it.
+///
+/// `rds-ca-rsa2048-g1` is the default certificate authority for a new DB
+/// instance ("Using SSL/TLS to encrypt a connection to a DB instance", Amazon
+/// RDS User Guide). It is a value AWS allocated — nothing computes it — so a
+/// single published name is the only honest source; it moves when the published
+/// default does.
+pub const RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIER: &str = "rds-ca-rsa2048-g1";
+
+/// The DNS suffix a Lightsail managed database's master endpoint carries.
+///
+/// A Lightsail managed database IS an Amazon RDS DB instance — which is why
+/// every member of the modelled `RelationalDatabase` is an RDS one — and AWS
+/// publishes its `masterEndpoint.address` under its own
+/// `rds.amazonaws.com` zone. That HOSTNAME is environment-specific and no
+/// caller may assume it, while the PROMISE the member makes is not:
+/// `RelationalDatabaseEndpoint$address` is "the DNS address of the database",
+/// so it must never be an address that sends the next client OUT of the
+/// emulator — the rule this crate already states for `Bucket$url` and a
+/// container service's public address. This emulator owns no DNS zone, so the
+/// address keeps the RDS SHAPE (`<db instance identifier>.<host label>.<region>`)
+/// under a suffix that belongs to the emulator and cannot resolve off-machine,
+/// exactly as a container service's private domain name does
+/// (`PRIVATE_DOMAIN_SUFFIX`, `<service name>.service.local`): `.local` is
+/// reserved for link-local multicast name resolution (RFC 6762 §3), so a name
+/// under it can never address a host off this machine. The labels are
+/// the database's own, so two databases never share an address.
+///
+/// This emulator serves no MySQL or PostgreSQL wire protocol on it, because the
+/// core's native listener (`engine.listeners().tcp`) is TLS-from-the-first-byte
+/// and neither engine's protocol begins with a TLS handshake. Everything the
+/// control plane owns — resolving the database, its state, its hardware, its
+/// credentials and its windows — is real.
+const RELATIONAL_DATABASE_ENDPOINT_SUFFIX: &str = "rds.lightsail.local";
+
+/// The prefix of the RDS DB instance identifier Lightsail gives a managed
+/// database: Lightsail names the underlying instance after itself rather than
+/// after the Lightsail resource, which is why a master endpoint begins `ls-`
+/// instead of with the database's own name.
+const RELATIONAL_DATABASE_INSTANCE_ID_PREFIX: &str = "ls-";
+
+/// How many characters the minted host label of a master endpoint carries: the
+/// 12-character DNS label RDS puts between the instance identifier and the
+/// region.
+const RELATIONAL_DATABASE_HOST_LABEL_LEN: usize = 12;
+
+/// The alphabet that host label is drawn from. A DNS label is
+/// case-insensitive and RDS renders this one in lowercase.
+const RELATIONAL_DATABASE_HOST_LABEL_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// The port a database of `engine` listens on: the engine's own default
+/// (MySQL `3306`, PostgreSQL `5432`), the ports RDS documents as the default for
+/// each engine under `CreateDBInstance$Port`.
+///
+/// Lightsail exposes no port parameter at all, so a database always listens on
+/// its engine's default.
+pub fn relational_database_port(engine: &str) -> i32 {
+    if engine.to_ascii_lowercase().contains("postgres") {
+        5432
+    } else {
+        3306
+    }
+}
+
+/// The ARN of the managed relational database `id` in `region`.
+pub fn relational_database_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{RELATIONAL_DATABASE_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The master endpoint address of a database whose underlying DB instance was
+/// minted as `id`, whose host label is `host_label`, in `region`. See
+/// [`RELATIONAL_DATABASE_ENDPOINT_SUFFIX`].
+pub fn relational_database_endpoint_address(id: &str, host_label: &str, region: &str) -> String {
+    format!(
+        "{RELATIONAL_DATABASE_INSTANCE_ID_PREFIX}{}.{host_label}.{region}.{RELATIONAL_DATABASE_ENDPOINT_SUFFIX}",
+        id.replace('-', "")
+    )
+}
+
+/// The Availability Zone a resource of `resource_name` is created in when the
+/// request names none, out of the zones `zones` its Region publishes.
+///
+/// DERIVED from the resource's own name rather than drawn per call, so the zone
+/// a resource was placed in is the same on every later read, and `None` when the
+/// Region publishes no zone at all.
+pub fn default_availability_zone(resource_name: &str, zones: &[String]) -> Option<String> {
+    let digest = Sha256::digest(resource_name.as_bytes());
+    let index = usize::from(digest[0]) % zones.len().max(1);
+    zones.get(index).cloned()
+}
+
+/// The zone a high-availability resource's standby runs in: the zone after
+/// `primary` in the Region's own zone order, wrapping — so it is never the
+/// primary's own zone, which is the point of a standby.
+///
+/// `None` when the Region publishes fewer than two zones, and then there is no
+/// second zone to fail over to.
+pub fn secondary_availability_zone(primary: &str, zones: &[String]) -> Option<String> {
+    if zones.len() < 2 {
+        return None;
+    }
+    let primary_index = zones.iter().position(|zone| zone == primary)?;
+    zones.get((primary_index + 1) % zones.len()).cloned()
+}
+
+/// The master-credential constraints one database engine imposes, from the
+/// modelled `CreateRelationalDatabase` input documentation, which states them per
+/// engine: `masterDatabaseName` ("Must contain 1 to 64 letters or numbers" for
+/// MySQL, 1 to 63 for PostgreSQL), `masterUsername` ("Must be 1 to 16 letters or
+/// numbers" for MySQL, 1 to 63 for PostgreSQL) and `masterUserPassword` ("Must
+/// contain from 8 to 41 characters" for MySQL, from 8 to 128 for PostgreSQL).
+#[derive(Debug, Clone, Copy)]
+pub struct MasterCredentialLimits {
+    /// The most characters `masterDatabaseName` may carry.
+    pub database_name_chars: usize,
+    /// The most characters `masterUsername` may carry.
+    pub username_chars: usize,
+    /// The fewest and the most characters `masterUserPassword` may carry.
+    pub password_chars: (usize, usize),
+}
+
+/// The limits [`MasterCredentialLimits`] states for `engine`.
+///
+/// The engine of a blueprint is the catalog's own
+/// [`RelationalDatabaseBlueprintSpec::engine`] value, so the PostgreSQL set is
+/// selected on that engine and every other engine the catalog serves is held to
+/// the MySQL set the modelled documentation gives first.
+pub fn master_credential_limits(engine: &str) -> MasterCredentialLimits {
+    if engine.to_ascii_lowercase().contains("postgres") {
+        MasterCredentialLimits {
+            database_name_chars: 63,
+            username_chars: 63,
+            password_chars: (8, 128),
+        }
+    } else {
+        MasterCredentialLimits {
+            database_name_chars: 64,
+            username_chars: 16,
+            password_chars: (8, 41),
+        }
+    }
+}
+
+/// Refuse `value` unless it is an identifier a database engine accepts for
+/// `member`: 1 to `max_chars` characters, beginning with a letter, the rest
+/// letters, digits or underscores.
+///
+/// Both `masterDatabaseName` and `masterUsername` carry that same rule in the
+/// modelled documentation ("Must begin with a letter. Subsequent characters can
+/// be letters, underscores, or digits (0-9)"), differing only in the length each
+/// engine allows. The engine's own reserved-word list is NOT checked here: it is
+/// the engine's, not the service's, and this slice carries no copy of it.
+pub fn validate_engine_identifier(
+    member: &str,
+    value: &str,
+    max_chars: usize,
+) -> Result<(), String> {
+    let length = value.chars().count();
+    if length == 0 || length > max_chars {
+        return Err(format!(
+            "{member} carries {length} characters, outside the 1 to {max_chars} this database \
+             engine accepts"
+        ));
+    }
+    if !value
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+    {
+        return Err(format!("{member} '{value}' must begin with a letter"));
+    }
+    if let Some(bad) = value
+        .chars()
+        .find(|character| !(character.is_ascii_alphanumeric() || *character == '_'))
+    {
+        return Err(format!(
+            "{member} '{value}' carries '{bad}': after the first character only letters, digits \
+             and underscores are accepted"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse `password` unless it is a master user password this service accepts:
+/// `min` to `max` characters of printable ASCII, none of them a space, a `/`, a
+/// `"` or an `@`.
+///
+/// From the modelled `masterUserPassword` documentation: "The password can
+/// include any printable ASCII character except "/", """, or "@". It cannot
+/// contain spaces", with the length bounds [`MasterCredentialLimits`] carries
+/// per engine.
+pub fn validate_master_user_password(
+    password: &str,
+    (min, max): (usize, usize),
+) -> Result<(), String> {
+    let length = password.chars().count();
+    if length < min || length > max {
+        return Err(format!(
+            "masterUserPassword carries {length} characters, outside the {min} to {max} this \
+             database engine accepts"
+        ));
+    }
+    if let Some(bad) = password.chars().find(|character| {
+        !character.is_ascii_graphic() || matches!(character, '/' | '"' | '@')
+    }) {
+        return Err(format!(
+            "masterUserPassword carries '{bad}': a password carries printable ASCII characters \
+             other than a space, '/', '\"' and '@'"
+        ));
+    }
+    Ok(())
+}
+
+/// Minutes in a day, and in a week: the clock a backup (daily) and a
+/// maintenance (weekly) window are measured on.
+const MINUTES_PER_DAY: i64 = 24 * 60;
+/// See [`MINUTES_PER_DAY`].
+const MINUTES_PER_WEEK: i64 = 7 * MINUTES_PER_DAY;
+
+/// The fewest minutes a backup or maintenance window may span, from the modelled
+/// `preferredBackupWindow` and `preferredMaintenanceWindow` documentation: "Must
+/// be at least 30 minutes."
+pub const MIN_WINDOW_MINUTES: i64 = 30;
+
+/// The days a weekly maintenance window may name, from the modelled
+/// `preferredMaintenanceWindow` documentation: "Valid days: Mon, Tue, Wed, Thu,
+/// Fri, Sat, Sun." Index 0 is Monday, the first day that list names.
+pub const MAINTENANCE_WINDOW_DAYS: &[&str] = &["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/// `hh24:mi` as a minute of the day, or `None` when it is not that form.
+fn minute_of_day(time: &str) -> Option<i64> {
+    let (hours, minutes) = time.split_once(':')?;
+    if hours.len() != 2 || minutes.len() != 2 {
+        return None;
+    }
+    let hours: i64 = hours.parse().ok()?;
+    let minutes: i64 = minutes.parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(hours * 60 + minutes)
+}
+
+/// A minute of the day as `hh24:mi`.
+fn render_time(minute_of_day: i64) -> String {
+    let minute_of_day = minute_of_day.rem_euclid(MINUTES_PER_DAY);
+    format!("{:02}:{:02}", minute_of_day / 60, minute_of_day % 60)
+}
+
+/// The day index `day` names in [`MAINTENANCE_WINDOW_DAYS`], compared without
+/// regard to case (the days are a presentation form, not an identifier).
+fn day_index(day: &str) -> Option<i64> {
+    MAINTENANCE_WINDOW_DAYS
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(day))
+        .and_then(|index| i64::try_from(index).ok())
+}
+
+/// One window as the half-open minute interval `[start, start + span)` on its
+/// own clock: minutes of the day for a daily window, minutes of the week for a
+/// weekly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowSpan {
+    /// The minute the window opens.
+    pub start: i64,
+    /// How many minutes it spans.
+    pub span: i64,
+}
+
+/// The daily window `window` describes, or a refusal naming `member` and the
+/// constraint it broke.
+///
+/// From the modelled `preferredBackupWindow` documentation: "Must be in the
+/// hh24:mi-hh24:mi format. Example: 16:00-16:30 … Must be at least 30 minutes."
+/// A window whose end precedes its start runs over midnight, which is why the
+/// span is taken on the daily clock.
+pub fn parse_daily_window(member: &str, window: &str) -> Result<WindowSpan, String> {
+    let (start, end) = window.split_once('-').ok_or_else(|| {
+        format!("{member} '{window}' is not in the hh24:mi-hh24:mi format (16:00-16:30)")
+    })?;
+    let start = minute_of_day(start).ok_or_else(|| {
+        format!("{member} '{window}' is not in the hh24:mi-hh24:mi format (16:00-16:30)")
+    })?;
+    let end = minute_of_day(end).ok_or_else(|| {
+        format!("{member} '{window}' is not in the hh24:mi-hh24:mi format (16:00-16:30)")
+    })?;
+    let span = (end - start).rem_euclid(MINUTES_PER_DAY);
+    if span < MIN_WINDOW_MINUTES {
+        return Err(format!(
+            "{member} '{window}' spans {span} minutes, fewer than the {MIN_WINDOW_MINUTES} a \
+             window must be"
+        ));
+    }
+    Ok(WindowSpan { start, span })
+}
+
+/// The weekly window `window` describes, or a refusal naming `member` and the
+/// constraint it broke.
+///
+/// From the modelled `preferredMaintenanceWindow` documentation: "Must be in the
+/// ddd:hh24:mi-ddd:hh24:mi format. Valid days: Mon, Tue, Wed, Thu, Fri, Sat,
+/// Sun. Must be at least 30 minutes. … Example: Tue:17:00-Tue:17:30".
+pub fn parse_weekly_window(member: &str, window: &str) -> Result<WindowSpan, String> {
+    let malformed = || {
+        format!(
+            "{member} '{window}' is not in the ddd:hh24:mi-ddd:hh24:mi format \
+             (Tue:17:00-Tue:17:30), with a day of [{}]",
+            MAINTENANCE_WINDOW_DAYS.join(", ")
+        )
+    };
+    let (start, end) = window.split_once('-').ok_or_else(malformed)?;
+    let minute_of_week = |point: &str| -> Option<i64> {
+        let (day, time) = point.split_once(':')?;
+        Some(day_index(day)? * MINUTES_PER_DAY + minute_of_day(time)?)
+    };
+    let start = minute_of_week(start).ok_or_else(malformed)?;
+    let end = minute_of_week(end).ok_or_else(malformed)?;
+    let span = (end - start).rem_euclid(MINUTES_PER_WEEK);
+    if span < MIN_WINDOW_MINUTES {
+        return Err(format!(
+            "{member} '{window}' spans {span} minutes, fewer than the {MIN_WINDOW_MINUTES} a \
+             window must be"
+        ));
+    }
+    Ok(WindowSpan { start, span })
+}
+
+/// The half-open minute ranges `window` covers on the daily clock, split where
+/// it runs over midnight so two windows can be compared range by range.
+///
+/// A window of at most a day covers at most two ranges, so the pair is returned
+/// as a fixed-size array — the second entry empty (`None`) for a window that
+/// does not cross midnight — rather than as an allocation.
+fn daily_ranges(window: WindowSpan) -> [Option<(i64, i64)>; 2] {
+    let start = window.start.rem_euclid(MINUTES_PER_DAY);
+    let span = window.span.min(MINUTES_PER_DAY);
+    if start + span <= MINUTES_PER_DAY {
+        [Some((start, start + span)), None]
+    } else {
+        [
+            Some((start, MINUTES_PER_DAY)),
+            Some((0, start + span - MINUTES_PER_DAY)),
+        ]
+    }
+}
+
+/// Whether the backup window `backup` and the maintenance window `maintenance`
+/// conflict, which the modelled `preferredBackupWindow` documentation forbids
+/// ("Must not conflict with the preferred maintenance window").
+///
+/// A backup window recurs EVERY day and a maintenance window on one day of the
+/// week, so they conflict when they overlap in time of day — whichever day the
+/// maintenance window names.
+pub fn windows_conflict(backup: WindowSpan, maintenance: WindowSpan) -> bool {
+    let maintenance = WindowSpan {
+        start: maintenance.start.rem_euclid(MINUTES_PER_DAY),
+        span: maintenance.span,
+    };
+    let maintenance_ranges = daily_ranges(maintenance);
+    daily_ranges(backup)
+        .into_iter()
+        .flatten()
+        .any(|(backup_lo, backup_hi)| {
+            maintenance_ranges
+                .into_iter()
+                .flatten()
+                .any(|(lo, hi)| backup_lo < hi && lo < backup_hi)
+        })
+}
+
+/// How many 30-minute slots a day holds, the candidates a defaulted window is
+/// drawn from.
+const WINDOW_SLOTS_PER_DAY: i64 = MINUTES_PER_DAY / MIN_WINDOW_MINUTES;
+
+/// How many slots the 8-hour block a defaulted window is selected from holds.
+const WINDOW_SLOTS_PER_BLOCK: i64 = 8 * 60 / MIN_WINDOW_MINUTES;
+
+/// The daily backup window a database gets when the request names none, as
+/// `hh24:mi-hh24:mi`.
+///
+/// From the modelled `preferredBackupWindow` documentation: "The default is a
+/// 30-minute window selected at random from an 8-hour block of time for each AWS
+/// Region." The slot is DERIVED from the database's own name rather than drawn
+/// per call, so every later read of the database reports the same window, and it
+/// is taken from the first 8-hour block of the day so the defaults of the two
+/// windows cannot conflict. When `avoid` is a maintenance window the caller
+/// named, the slot walks forward in 30-minute steps until it clears that window;
+/// `None` when the caller's window leaves no slot free at all.
+pub fn default_preferred_backup_window(
+    resource_name: &str,
+    avoid: Option<WindowSpan>,
+) -> Option<String> {
+    let digest = Sha256::digest(resource_name.as_bytes());
+    let slot = i64::from(digest[1]) % WINDOW_SLOTS_PER_BLOCK;
+    (0..WINDOW_SLOTS_PER_DAY).find_map(|step| {
+        let start = (slot + step).rem_euclid(WINDOW_SLOTS_PER_DAY) * MIN_WINDOW_MINUTES;
+        let candidate = WindowSpan {
+            start,
+            span: MIN_WINDOW_MINUTES,
+        };
+        let clear = avoid.is_none_or(|avoid| !windows_conflict(candidate, avoid));
+        clear.then(|| {
+            format!(
+                "{}-{}",
+                render_time(start),
+                render_time(start + MIN_WINDOW_MINUTES)
+            )
+        })
+    })
+}
+
+/// The weekly maintenance window a database gets when the request names none, as
+/// `ddd:hh24:mi-ddd:hh24:mi`.
+///
+/// From the modelled `preferredMaintenanceWindow` documentation: "The default is
+/// a 30-minute window selected at random from an 8-hour block of time for each
+/// AWS Region, occurring on a random day of the week." Both the day and the slot
+/// are DERIVED from the database's own name, so every later read reports the same
+/// window; the slot is taken from the second 8-hour block of the day and then
+/// walks forward in 30-minute steps until it clears `backup`, because the two
+/// windows may not conflict. `None` when the backup window leaves no slot free at
+/// all.
+pub fn default_preferred_maintenance_window(
+    resource_name: &str,
+    backup: WindowSpan,
+) -> Option<String> {
+    let digest = Sha256::digest(resource_name.as_bytes());
+    let day = i64::from(digest[2]) % 7;
+    let slot = WINDOW_SLOTS_PER_BLOCK + i64::from(digest[3]) % WINDOW_SLOTS_PER_BLOCK;
+    (0..WINDOW_SLOTS_PER_DAY).find_map(|step| {
+        let start = (slot + step).rem_euclid(WINDOW_SLOTS_PER_DAY) * MIN_WINDOW_MINUTES;
+        let candidate = WindowSpan {
+            start,
+            span: MIN_WINDOW_MINUTES,
+        };
+        let clear = !windows_conflict(backup, candidate);
+        clear.then(|| {
+            let day = MAINTENANCE_WINDOW_DAYS[usize::try_from(day).unwrap_or(0)];
+            // A 30-minute window never crosses midnight from this block, so both
+            // ends name the same day.
+            format!(
+                "{day}:{}-{day}:{}",
+                render_time(start),
+                render_time(start + MIN_WINDOW_MINUTES)
+            )
+        })
+    })
+}
+
+/// One stored managed relational database: every member `GetRelationalDatabase`
+/// reports, the master user password `GetRelationalDatabaseMasterUserPassword`
+/// answers with, and the clock-owed transition its state is waiting on.
+#[derive(Debug, Clone)]
+pub struct StoredRelationalDatabase {
+    /// The database name the request named, kept verbatim — it is this record's
+    /// store key and the `name` every read reports.
+    pub name: String,
+    pub arn: String,
+    pub support_code: String,
+    pub created_at_ms: i64,
+    pub location: StoredLocation,
+    pub tags: Vec<Tag>,
+    /// The blueprint the request named, resolved against the published catalog:
+    /// the engine and the version every read reports come from it.
+    pub blueprint: RelationalDatabaseBlueprintSpec,
+    /// The bundle the request named, resolved against the published catalog: the
+    /// hardware every read reports comes from it.
+    pub bundle: RelationalDatabaseBundleSpec,
+    pub master_database_name: String,
+    pub master_username: String,
+    /// The master user password the request carried, kept because
+    /// `GetRelationalDatabaseMasterUserPassword` answers with it (its own
+    /// operation, with its own issue); no member of `RelationalDatabase` exposes
+    /// it. Absent when the request carried none.
+    pub master_user_password: Option<String>,
+    pub preferred_backup_window: String,
+    pub preferred_maintenance_window: String,
+    pub publicly_accessible: bool,
+    pub backup_retention_enabled: bool,
+    /// The standby's Availability Zone, on a high-availability bundle only: "The
+    /// secondary database is used for failover support of a high availability
+    /// database."
+    pub secondary_availability_zone: Option<String>,
+    /// The master endpoint address, assigned at creation so every later read
+    /// reports the same one. See [`RELATIONAL_DATABASE_ENDPOINT_SUFFIX`].
+    pub endpoint_address: String,
+    /// The current state: [`RELATIONAL_DATABASE_STATE_CREATING`] or
+    /// [`RELATIONAL_DATABASE_STATE_AVAILABLE`].
+    pub state: &'static str,
+    /// The state the clock owes this database, while one is outstanding.
+    pub due: Option<DueNamedState>,
+}
+
+impl StoredRelationalDatabase {
+    /// This record as the modelled `RelationalDatabase`.
+    pub fn view(&self) -> crate::ops::types::RelationalDatabase {
+        crate::ops::types::RelationalDatabase {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            support_code: Some(self.support_code.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            location: Some(self.location.view()),
+            resource_type: Some(RESOURCE_TYPE_RELATIONAL_DATABASE.to_string()),
+            tags: Some(self.tags.clone()),
+            relational_database_blueprint_id: Some(self.blueprint.blueprint_id()),
+            relational_database_bundle_id: Some(self.bundle.bundle_id.to_string()),
+            master_database_name: Some(self.master_database_name.clone()),
+            hardware: Some(crate::ops::types::RelationalDatabaseHardware {
+                cpu_count: Some(self.bundle.cpu_count),
+                disk_size_in_gb: Some(self.bundle.disk_size_in_gb),
+                ram_size_in_gb: Some(self.bundle.ram_size_in_gb),
+            }),
+            state: Some(self.state.to_string()),
+            secondary_availability_zone: self.secondary_availability_zone.clone(),
+            backup_retention_enabled: Some(self.backup_retention_enabled),
+            // Nothing is mid-modification on a database this slice created:
+            // `UpdateRelationalDatabase` is what leaves a value pending, so there
+            // is nothing to report rather than an empty structure.
+            pending_modified_values: None,
+            engine: Some(self.blueprint.engine.to_string()),
+            engine_version: Some(self.blueprint.engine_version.to_string()),
+            // "The latest point in time to which the database can be restored":
+            // no automated backup has been taken yet — the first one is taken in
+            // the database's own backup window — so there is no such point.
+            latest_restorable_time: None,
+            master_username: Some(self.master_username.clone()),
+            parameter_apply_status: Some(PARAMETER_APPLY_STATUS_IN_SYNC.to_string()),
+            preferred_backup_window: Some(self.preferred_backup_window.clone()),
+            preferred_maintenance_window: Some(self.preferred_maintenance_window.clone()),
+            publicly_accessible: Some(self.publicly_accessible),
+            // The endpoint is announced once the database is serving: a database
+            // still being created accepts no connection, and reports no address
+            // to make one to.
+            master_endpoint: (self.state == RELATIONAL_DATABASE_STATE_AVAILABLE).then(|| {
+                crate::ops::types::RelationalDatabaseEndpoint {
+                    port: Some(relational_database_port(self.blueprint.engine)),
+                    address: Some(self.endpoint_address.clone()),
+                }
+            }),
+            // A list member is reported EMPTY rather than left out: no
+            // maintenance action is pending on a database this slice holds, and
+            // an absent member hands a typed caller a null where it iterates.
+            pending_maintenance_actions: Some(Vec::new()),
+            ca_certificate_identifier: Some(
+                RELATIONAL_DATABASE_CA_CERTIFICATE_IDENTIFIER.to_string(),
+            ),
         }
     }
 }
@@ -3772,6 +4405,10 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// `GetBuckets` walks a stable, total order and a page token can name the
     /// next bucket.
     pub buckets: BTreeMap<(String, String), StoredBucket>,
+    /// Every managed relational database, keyed by its name — the identifier
+    /// every database operation takes. A `BTreeMap` so `GetRelationalDatabases`
+    /// walks a stable, total order and a page token can name the next database.
+    pub relational_databases: BTreeMap<String, StoredRelationalDatabase>,
     /// Offset of the next address pair to hand out, so two instances never share
     /// a public or a private address within one process.
     next_address: u32,
@@ -3884,6 +4521,17 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.buckets.get(&(region.to_string(), name.to_string()))
     }
 
+    /// The managed relational database `name` names, for a reporting operation.
+    pub fn relational_database(&self, name: &str) -> Option<&StoredRelationalDatabase> {
+        self.relational_databases.get(name)
+    }
+
+    /// Store a newly created managed relational database.
+    pub fn insert_relational_database(&mut self, database: StoredRelationalDatabase) {
+        self.relational_databases
+            .insert(database.name.clone(), database);
+    }
+
     /// The bucket `name` names in `region`, for an operation the spec says
     /// mutates it — minting or withdrawing one of its access keys.
     ///
@@ -3922,6 +4570,31 @@ impl ComAmazonawsLightsailLightsail20161128State {
             .take(DOMAIN_TOKEN_LEN)
             .map(|byte| {
                 char::from(DOMAIN_TOKEN_ALPHABET[usize::from(*byte) % DOMAIN_TOKEN_ALPHABET.len()])
+            })
+            .collect()
+    }
+
+    /// The DNS label of one managed relational database's master endpoint: see
+    /// [`RELATIONAL_DATABASE_HOST_LABEL_LEN`].
+    ///
+    /// Draws from the SAME `next_id` counter [`Self::mint_uuid`] does, for the
+    /// reason [`Self::mint_domain_token`] gives, and is domain-separated by its
+    /// own label so a host label and a uuid of the same counter value differ.
+    pub fn mint_endpoint_host_label(&mut self) -> String {
+        self.next_id = self.next_id.wrapping_add(1);
+        let mut hasher = Sha256::new();
+        hasher.update(self.next_id.to_be_bytes());
+        hasher.update(process_seed().to_be_bytes());
+        hasher.update(b"relational-database-endpoint");
+        hasher
+            .finalize()
+            .iter()
+            .take(RELATIONAL_DATABASE_HOST_LABEL_LEN)
+            .map(|byte| {
+                char::from(
+                    RELATIONAL_DATABASE_HOST_LABEL_ALPHABET
+                        [usize::from(*byte) % RELATIONAL_DATABASE_HOST_LABEL_ALPHABET.len()],
+                )
             })
             .collect()
     }
@@ -4024,7 +4697,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     }
 
     /// Materialise every transition the clock had already made due at `now_ms`:
-    /// an instance, a disk or a disk snapshot settles into the state it was owed, a container service walks
+    /// an instance, a disk, a disk snapshot or a managed relational database
+    /// settles into the state it was owed, a container service walks
     /// into the phase it was owed (activating the deployment that was waiting),
     /// and an operation whose work is done settles into `Succeeded`.
     ///
@@ -4033,7 +4707,8 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// cannot show a caller anything a later caller would not also see.
     ///
     /// Every walk is bounded by [`MAX_INSTANCES`], [`MAX_DISKS`],
-    /// [`MAX_DISK_SNAPSHOTS`], [`MAX_CONTAINER_SERVICES`] and
+    /// [`MAX_DISK_SNAPSHOTS`], [`MAX_CONTAINER_SERVICES`],
+    /// [`MAX_RELATIONAL_DATABASES`] and
     /// [`MAX_OPERATION_HISTORY`], and a record drops out of the work as soon as
     /// it has nothing outstanding.
     fn advance_clock(&mut self, now_ms: i64) {
@@ -4060,6 +4735,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
         }
         for service in self.container_services.values_mut() {
             service.advance(now_ms);
+        }
+        for database in self.relational_databases.values_mut() {
+            let Some(due) = database.due else { continue };
+            if due.at_ms <= now_ms {
+                database.state = due.state;
+                database.due = None;
+            }
         }
         for operation in &mut self.operations {
             let Some(settles_at_ms) = operation.settles_at_ms else {

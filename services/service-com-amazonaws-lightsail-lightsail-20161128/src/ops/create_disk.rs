@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new disk is not usable yet: the clock owes it `available`, which
             // is why a read straight after this call still reports `pending`,
             // exactly as it does against AWS.
-            let due = crate::state::DueDiskState::after(now, crate::state::DISK_STATE_AVAILABLE);
+            let due = crate::state::DueNamedState::after(now, crate::state::DISK_STATE_AVAILABLE);
             store.insert_disk(crate::state::StoredDisk {
                 name: name.clone(),
                 arn: crate::state::disk_arn(region, &id),

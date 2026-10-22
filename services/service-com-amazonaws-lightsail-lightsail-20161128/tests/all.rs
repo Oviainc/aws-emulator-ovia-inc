@@ -47,5 +47,7 @@ mod region_catalog;
 mod relational_database_blueprints;
 #[path = "all/relational_database_bundles.rs"]
 mod relational_database_bundles;
+#[path = "all/relational_database_lifecycle.rs"]
+mod relational_database_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

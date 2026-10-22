@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRelationalDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRelationalDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts one managed relational database into this service's store under the
+//! database name the request names, on the blueprint (engine and version) and
+//! the bundle (hardware) it names, and answers the operation-log entry the
+//! insert appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRelationalDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -219,18 +216,285 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRelationalDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRelationalDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRelationalDatabase"))
+        // A managed database lives in ONE Availability Zone (with a standby in a
+        // second one on a high-availability bundle), so the Region it belongs to
+        // is the Region of the zone the request names — as it is for a block
+        // storage disk. The zone must be one that Region PUBLISHES (`GetRegions`
+        // is where a caller resolves it), so a zone letter no Region has is
+        // refused rather than stored, and the Region's own zone list is always
+        // the one a standby is placed from. A request that names no zone is
+        // served in the Region it was signed for, and the service picks the zone.
+        let (region, zones) = match &input.availability_zone {
+            Some(zone) => {
+                let spec =
+                    crate::state::region_spec_of_availability_zone(zone).ok_or_else(|| {
+                        invalid(format!(
+                            "availabilityZone '{zone}' is not an Availability Zone this service \
+                             publishes: it must be one of the zones GetRegions reports for a \
+                             region of [{}]",
+                            crate::state::region_names()
+                        ))
+                    })?;
+                (spec.name.to_string(), spec.zone_names())
+            }
+            None => {
+                let region = crate::state::request_region(ctx.parts());
+                let zones = crate::state::region_spec(&region)
+                    .map(crate::state::RegionSpec::zone_names)
+                    .unwrap_or_default();
+                (region, zones)
+            }
+        };
+
+        // `relationalDatabaseName`, `relationalDatabaseBlueprintId`,
+        // `relationalDatabaseBundleId`, `masterDatabaseName` and
+        // `masterUsername` are modelled `@required` members and the name carries
+        // the modelled pattern, so the centralized walk refused anything outside
+        // them before this body ran. What is left is what the model cannot
+        // express: the blueprint and the bundle must name entries this service
+        // publishes, the master credentials must satisfy the chosen engine's own
+        // constraints, the two time windows must be well formed and must not
+        // conflict, the caller-sized tag list must be within its bound, and the
+        // name must still be free. Each is checked BEFORE the first write, so a
+        // refused request creates nothing.
+        let blueprint =
+            crate::state::relational_database_blueprint(&input.relational_database_blueprint_id)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "relationalDatabaseBlueprintId '{}' is not a database blueprint this \
+                         service offers; use GetRelationalDatabaseBlueprints to list the \
+                         blueprint IDs you can specify ([{}])",
+                        input.relational_database_blueprint_id,
+                        crate::state::relational_database_blueprint_ids()
+                    ))
+                })?;
+        let bundle =
+            crate::state::relational_database_bundle_spec(&input.relational_database_bundle_id)
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "relationalDatabaseBundleId '{}' is not a database bundle this service \
+                         offers; use GetRelationalDatabaseBundles to list the bundle IDs you can \
+                         specify ([{}])",
+                        input.relational_database_bundle_id,
+                        crate::state::relational_database_bundle_ids(
+                            crate::state::RELATIONAL_DATABASE_BUNDLE_SPECS
+                        )
+                    ))
+                })?;
+
+        // The master credential rules are the ENGINE's, so they follow the
+        // blueprint the request named rather than being one fixed set.
+        let limits = crate::state::master_credential_limits(blueprint.engine);
+        crate::state::validate_engine_identifier(
+            "masterDatabaseName",
+            &input.master_database_name,
+            limits.database_name_chars,
+        )
+        .map_err(invalid)?;
+        crate::state::validate_engine_identifier(
+            "masterUsername",
+            &input.master_username,
+            limits.username_chars,
+        )
+        .map_err(invalid)?;
+        if let Some(password) = input.master_user_password.as_deref() {
+            crate::state::validate_master_user_password(password, limits.password_chars)
+                .map_err(invalid)?;
+        }
+
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        let name = input.relational_database_name.clone();
+        let (preferred_backup_window, preferred_maintenance_window) =
+            windows(&name, &input).map_err(invalid)?;
+
+        // The zone the request named, or the one the service picks for it out of
+        // the Region's own zones; a high-availability bundle also places a
+        // standby, which is what `secondaryAvailabilityZone` reports.
+        let availability_zone = match input.availability_zone.clone() {
+            Some(zone) => zone,
+            None => crate::state::default_availability_zone(&name, &zones).ok_or_else(|| {
+                invalid(format!(
+                    "the Region '{region}' this request is signed for publishes no Availability \
+                     Zone a database can be created in; name an availabilityZone of one of [{}]",
+                    crate::state::region_names()
+                ))
+            })?,
+        };
+        let secondary_availability_zone = bundle
+            .is_high_availability()
+            .then(|| crate::state::secondary_availability_zone(&availability_zone, &zones))
+            .flatten();
+
+        let location = crate::state::StoredLocation::zonal(&availability_zone, &region);
+        // "A value of true specifies a database that is available to resources
+        // outside of your Lightsail account": a database the request says nothing
+        // about is reachable only from the account's own resources, the narrower
+        // of the two the member describes.
+        let publicly_accessible = input.publicly_accessible.unwrap_or(false);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A database name addresses one database, so creating one this
+            // account already holds is refused rather than silently replacing a
+            // record that holds data.
+            if store.relational_database(&name).is_some() {
+                return Err(invalid(format!(
+                    "a relational database named '{name}' already exists"
+                )));
+            }
+            if store.relational_databases.len() >= crate::state::MAX_RELATIONAL_DATABASES {
+                return Err(invalid(format!(
+                    "creating a relational database would take this account past the {} this \
+                     emulator holds",
+                    crate::state::MAX_RELATIONAL_DATABASES
+                )));
+            }
+
+            let id = store.mint_uuid();
+            let host_label = store.mint_endpoint_host_label();
+            // A new database is not serving yet: the clock owes it `available`,
+            // which is why a read straight after this call still reports
+            // `creating` — and no master endpoint — exactly as it does against
+            // AWS.
+            let due = crate::state::DueNamedState::after(
+                now,
+                crate::state::RELATIONAL_DATABASE_STATE_AVAILABLE,
+            );
+            store.insert_relational_database(crate::state::StoredRelationalDatabase {
+                name: name.clone(),
+                arn: crate::state::relational_database_arn(&region, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags,
+                // The catalog entries resolved above, so the engine, the version
+                // and the hardware every read reports are the published ones
+                // rather than whatever the request spelled.
+                blueprint,
+                bundle,
+                master_database_name: input.master_database_name.clone(),
+                master_username: input.master_username.clone(),
+                master_user_password: input.master_user_password.clone(),
+                preferred_backup_window,
+                preferred_maintenance_window,
+                publicly_accessible,
+                // `UpdateRelationalDatabase$disableBackupRetention` exists to
+                // turn automated backup retention OFF, so a database is created
+                // with it on.
+                backup_retention_enabled: true,
+                secondary_availability_zone,
+                endpoint_address: crate::state::relational_database_endpoint_address(
+                    &id,
+                    &host_label,
+                    &region,
+                ),
+                state: crate::state::RELATIONAL_DATABASE_STATE_CREATING,
+                due: Some(due),
+            });
+            // `operations` is a list because other Lightsail creates act on
+            // several resources at once; `CreateRelationalDatabase` creates
+            // exactly one database, so it answers exactly one entry, left
+            // non-terminal until the provisioning the clock owes the database is
+            // due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_RELATIONAL_DATABASE,
+                crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
+                &name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(CreateRelationalDatabaseOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The backup and maintenance windows the database `name` is created with, or a
+/// refusal naming the member that is wrong and the constraint it broke.
+///
+/// A window the request names is kept verbatim, once it parses; a window it does
+/// not name is the service's own default for this database. The two MAY NOT
+/// conflict (`preferredBackupWindow`: "Must not conflict with the preferred
+/// maintenance window"), so a defaulted window is chosen clear of the other one
+/// and a request that names two conflicting windows is refused.
+fn windows(name: &str, input: &CreateRelationalDatabaseInput) -> Result<(String, String), String> {
+    let requested_maintenance = input
+        .preferred_maintenance_window
+        .as_deref()
+        .map(|window| {
+            crate::state::parse_weekly_window("preferredMaintenanceWindow", window)
+                .map(|span| (window.to_string(), span))
+        })
+        .transpose()?;
+
+    let backup_window = match input.preferred_backup_window.as_deref() {
+        Some(window) => {
+            crate::state::parse_daily_window("preferredBackupWindow", window)?;
+            window.to_string()
+        }
+        None => crate::state::default_preferred_backup_window(
+            name,
+            requested_maintenance.as_ref().map(|(_, span)| *span),
+        )
+        .ok_or_else(|| {
+            "preferredMaintenanceWindow leaves no 30-minute window of the day free for the daily \
+             backup window; name a preferredBackupWindow as well"
+                .to_string()
+        })?,
+    };
+    let backup_span = crate::state::parse_daily_window("preferredBackupWindow", &backup_window)?;
+
+    let maintenance_window = match requested_maintenance {
+        Some((window, span)) => {
+            if crate::state::windows_conflict(backup_span, span) {
+                return Err(format!(
+                    "preferredMaintenanceWindow '{window}' conflicts with the backup window \
+                     '{backup_window}': the daily backup window and the weekly maintenance \
+                     window may not overlap"
+                ));
+            }
+            window
+        }
+        None => crate::state::default_preferred_maintenance_window(name, backup_span).ok_or_else(
+            || {
+                "preferredBackupWindow leaves no 30-minute window of the day free for the weekly \
+                 maintenance window; name a preferredMaintenanceWindow as well"
+                    .to_string()
+            },
+        )?,
+    };
+
+    Ok((backup_window, maintenance_window))
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateRelationalDatabaseError {
+    CreateRelationalDatabaseErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateRelationalDatabaseError {
+    CreateRelationalDatabaseErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail relational database store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

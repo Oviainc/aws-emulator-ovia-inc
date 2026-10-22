@@ -289,8 +289,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // which is why a read straight after this call still reports
             // `pending` — "You may remount and use your disk while the snapshot
             // status is pending" — exactly as it does against AWS.
-            let due =
-                crate::state::DueDiskState::after(now, crate::state::DISK_SNAPSHOT_STATE_COMPLETED);
+            let due = crate::state::DueNamedState::after(
+                now,
+                crate::state::DISK_SNAPSHOT_STATE_COMPLETED,
+            );
             store.insert_disk_snapshot(crate::state::StoredDiskSnapshot {
                 name: name.clone(),
                 arn: crate::state::disk_snapshot_arn(&location.region_name, &id),
