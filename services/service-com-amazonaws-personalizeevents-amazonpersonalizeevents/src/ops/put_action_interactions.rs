@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutActionInteractions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutActionInteractions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutActionInteractions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Ingests a batch of action-interaction events into the action-interaction stream of
+//! the tracker the request names. The response body is empty (the modelled output is
+//! `Unit`), so the stored stream in [`crate::state`] is the whole result of the call.
+//!
+//! Same two documented rules as `PutEvents` — an omitted `eventId` is generated and an
+//! id the tracker has already seen is ingested once (`ActionInteraction$eventId`), and
+//! `properties` is a JSON string map that may not use one of the six reserved key names
+//! (case insensitive) — both refused with `InvalidInputException` (400). Unlike
+//! `PutEvents` this operation DOES model `ResourceNotFoundException`, so a `trackingId`
+//! that names no known tracker is refused with it (404) instead of being created, and a
+//! tracker marked in use answers the modelled `ResourceInUseException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +170,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutActionInteractions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutActionInteractionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutActionInteractions"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| invalid_input(crate::state::STORE_UNAVAILABLE))?;
+
+        let received_at = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Split the borrow by field, as `PutEvents` does: the stream is in
+        // `event_trackers` and the counter behind a generated `eventId` is a field of
+        // the store, and one pass needs both at once.
+        let crate::state::ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState {
+            event_trackers,
+            generated_event_ids,
+            ..
+        } = &mut *state;
+
+        // The target is resolved FIRST, as it is for the metadata puts: a request wrong
+        // about both its tracker and an interaction answers for the tracker, the
+        // stronger and more specific fault.
+        let tracker = event_trackers.get_mut(&input.tracking_id).ok_or_else(|| {
+            PutActionInteractionsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No event tracker with the tracking ID {} exists.",
+                        input.tracking_id
+                    )),
+                },
+            )
+        })?;
+        if tracker.in_use {
+            return Err(PutActionInteractionsErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "The event tracker with the tracking ID {} is in use.",
+                        input.tracking_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Validate every interaction BEFORE storing any of it: the call has one
+        // status, so a batch carrying one unusable interaction ingests none of it.
+        let mut validated = Vec::with_capacity(input.action_interactions.len());
+        for interaction in &input.action_interactions {
+            let properties = match interaction.properties.as_deref() {
+                Some(raw) => Some(
+                    crate::state::parse_properties("ActionInteraction.properties", raw, true)
+                        .map_err(invalid_input)?,
+                ),
+                None => None,
+            };
+            validated.push((interaction, properties));
+        }
+
+        for (interaction, properties) in validated {
+            let event_id = interaction
+                .event_id
+                .clone()
+                .unwrap_or_else(|| crate::state::generate_event_id(generated_event_ids));
+            if !tracker.claim_action_interaction_event_id(&event_id) {
+                // An interaction this tracker's action-interaction stream already holds
+                // under that id: the first one stands, this one is not a second record.
+                continue;
+            }
+            tracker
+                .push_action_interaction(crate::state::StoredActionInteraction {
+                    event_id,
+                    action_id: interaction.action_id.clone(),
+                    session_id: interaction.session_id.clone(),
+                    user_id: interaction.user_id.clone(),
+                    event_type: interaction.event_type.clone(),
+                    timestamp: interaction.timestamp,
+                    received_at,
+                    recommendation_id: interaction.recommendation_id.clone(),
+                    impression: interaction.impression.clone().unwrap_or_default(),
+                    properties,
+                });
+        }
+
+        Ok(PutActionInteractionsOutput)
     }
+}
+
+/// This operation's `InvalidInputException`, carrying `message`.
+///
+/// It is also what an unreachable store answers with: this operation models no server
+/// fault, and [`crate::state::service_state`] only answers `None` for an engine that is
+/// not the shared `InMemoryEngine` the router builds.
+fn invalid_input(message: impl Into<String>) -> PutActionInteractionsError {
+    PutActionInteractionsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
 }

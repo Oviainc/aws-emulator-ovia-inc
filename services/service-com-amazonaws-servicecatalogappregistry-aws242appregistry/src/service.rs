@@ -74,13 +74,29 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `servicecatalog` — a signing name it SHARES with Service
+        // Catalog itself
+        // (`services/service-com-amazonaws-servicecatalog-aws242servicecatalogservice`,
+        // sigv4Name `servicecatalog`, endpointPrefix `servicecatalog`, `awsJson1_1`),
+        // while this service's own endpoint is `servicecatalog-appregistry`. The router's
+        // routing key comes from the SigV4 credential scope first, so both services
+        // resolve to `servicecatalog` and matching on the signing name ALONE makes both
+        // claim every request — which the router answers `500 AmbiguousService` for.
+        //
+        // So the claim is narrowed to this service's own modelled wire surface, by the
+        // one rule `service-common` states for every service under a shared signing name.
+        // This model is `restJson1`, which binds every operation to a URI, so the
+        // discriminator is the model-derived path space the generated
+        // `ROUTE_PATH_SEGMENTS` publishes — `/applications/…`, `/attribute-groups/…`,
+        // `/configuration`, `/sync/…` and `/tags/…` — and the `None` below is what says
+        // "no RPC form of its own". Service Catalog's `POST /` awsJson1_1 traffic is then
+        // claimed by it alone.
+        service_common::claims_request(
+            parts,
+            self.entry.identity().signing_name(),
+            crate::ROUTE_PATH_SEGMENTS,
+            None,
+        )
     }
 
     fn override_operation(

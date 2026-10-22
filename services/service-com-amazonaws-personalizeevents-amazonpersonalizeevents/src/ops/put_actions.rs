@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutActions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutActions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutActions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Upserts a batch of action metadata records into the Actions dataset the request
+//! names. The response body is empty (the modelled output is `Unit`), so the stored
+//! records in [`crate::state`] are the whole result of the call.
+//!
+//! A repeated `actionId` REPLACES the record stored for it — the latest call for an id
+//! is that record, not a second one. The `datasetArn` must name a dataset this emulator
+//! knows (`ResourceNotFoundException`, 404, when it does not; `ResourceInUseException`,
+//! 409, when it is marked in use), and `properties` must be a JSON object
+//! (`InvalidInputException`, 400). Action metadata documents no reserved property keys —
+//! that rule belongs to the two event streams. The behaviour itself lives in
+//! `crate::state::put_metadata_records`, which `PutItems` and `PutUsers` share.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +165,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutActions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutActionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutActions"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutActionsErrorModeled::InvalidInputException(InvalidInputException {
+                message: Some(crate::state::STORE_UNAVAILABLE.to_string()),
+            })
+        })?;
+
+        let records: Vec<(&str, Option<&str>)> = input
+            .actions
+            .iter()
+            .map(|action| (action.action_id.as_str(), action.properties.as_deref()))
+            .collect();
+
+        crate::state::put_metadata_records(
+            &mut state.lock(),
+            &input.dataset_arn,
+            crate::state::MetadataKind::Actions,
+            "Action.properties",
+            &records,
+        )
+        .map_err(|failure| match failure {
+            crate::state::MetadataPutError::NotFound => {
+                PutActionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!("No dataset with the ARN {} exists.", input.dataset_arn)),
+                })
+            }
+            crate::state::MetadataPutError::InUse => {
+                PutActionsErrorModeled::ResourceInUseException(ResourceInUseException {
+                    message: Some(format!(
+                        "The dataset with the ARN {} is in use.",
+                        input.dataset_arn
+                    )),
+                })
+            }
+            crate::state::MetadataPutError::InvalidInput(message) => {
+                PutActionsErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(message),
+                })
+            }
+        })?;
+
+        Ok(PutActionsOutput)
     }
 }

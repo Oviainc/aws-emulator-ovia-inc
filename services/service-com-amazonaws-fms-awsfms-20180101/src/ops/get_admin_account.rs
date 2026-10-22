@@ -3,9 +3,18 @@
 //! @op GetAdminAccount
 //!
 //! Reports the Firewall Manager default administrator account that
-//! `AssociateAdminAccount` persisted, and the status of its role. A REPORTING
-//! operation: it writes nothing. With no association ever made there is no
-//! administrator resource to report, which is `ResourceNotFoundException`.
+//! `AssociateAdminAccount` persisted, and the status of its role. With no
+//! association ever made there is no administrator resource to report, which is
+//! `ResourceNotFoundException`.
+//!
+//! A REPORTING operation: the only write it makes is the one the CLOCK already
+//! made due — a disassociation `DisassociateAdminAccount` recorded, whose
+//! completion instant has passed, moves the role to `DELETED`
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::settle_admin_account`]).
+//! That transition was owed at this instant whether or not anybody called, so
+//! this read reports it rather than causing it; a disassociated account keeps
+//! being reported, with the `DELETED` role status, rather than disappearing from
+//! the answer.
 //!
 //! ## Shape of an operation
 //!
@@ -151,7 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // Materialise a disassociation the clock has already completed, so the role
+        // status reported here is the one that holds at this instant.
+        store.settle_admin_account();
         let Some(admin) = store.admin_account.as_ref() else {
             return Err(GetAdminAccountErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

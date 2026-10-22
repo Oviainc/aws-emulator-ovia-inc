@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTimeSeries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTimeSeries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the time series (data stream) of the stored asset
+//! property the request identifies, from the shared engine store (`crate::state`); this is
+//! the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTimeSeries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every asset property materialised by `CreateAsset` IS a data stream in IoT SiteWise's
+//! time-series store, so this read needs no second copy of one: the series' identity
+//! ([`crate::state::time_series_id`]), data type, alias and dates are all derived from the
+//! stored asset and its property, which is why reading one writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +189,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTimeSeries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTimeSeriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTimeSeries"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeTimeSeriesError::Modeled(
+                DescribeTimeSeriesErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+
+        // "To identify a time series, do one of the following: ... specify the alias of
+        // the time series. ... specify one of the following: The alias of the time
+        // series. The assetId and propertyId that identifies the asset property." — so
+        // EXACTLY one of the two identifying forms names the series, and either half of
+        // the pair on its own names nothing.
+        let (asset_label, property_label) = match (
+            input.asset_id.as_deref(),
+            input.property_id.as_deref(),
+            input.alias.as_deref(),
+        ) {
+            (Some(asset_label), Some(property_label), None) => {
+                (asset_label.to_string(), property_label.to_string())
+            }
+            (None, None, Some(alias)) => {
+                // An alias stands for the asset property it is bound to, resolved
+                // through the same index `GetAssetPropertyValue` and
+                // `BatchPutAssetPropertyValue` resolve aliases with.
+                store.property_alias_index.get(alias).cloned().ok_or_else(|| {
+                    not_found(format!("The time series {alias} could not be found."))
+                })?
+            }
+            _ => {
+                return Err(invalid_request(
+                    "Specify either alias, or assetId and propertyId.".to_string(),
+                ))
+            }
+        };
+
+        // `workspaceName` scopes the lookup to one SiteWise workspace. Workspaces are
+        // created by `CreateWorkspace`, which is still a scaffold stub here, so no
+        // workspace exists for a request to name and the one it names is absent. A
+        // request that identifies no series is still invalid first: the scope only
+        // narrows where a well-formed lookup is answered from.
+        if let Some(workspace) = input.workspace_name.as_deref() {
+            return Err(not_found(format!(
+                "The workspace {workspace} could not be found."
+            )));
+        }
+
+        // Both ids are modelled `CustomID`, so either can arrive as the raw UUID or as
+        // `externalId:<externalId>`; both forms name the one stored property.
+        let asset_id = store
+            .resolve_asset_id(&asset_label)
+            .ok_or_else(|| not_found(format!("The asset {asset_label} could not be found.")))?;
+        let asset = store
+            .assets
+            .get(&asset_id)
+            .ok_or_else(|| not_found(format!("The asset {asset_label} could not be found.")))?;
+        let property = asset.property(&property_label).ok_or_else(|| {
+            not_found(format!(
+                "The asset {asset_label} has no property {property_label}."
+            ))
+        })?;
+
+        // The series is the property's own: its data type is the property's, its alias
+        // is whatever alias the property is bound to (none, for a property no alias
+        // names), and it has existed since the asset materialised the property.
+        let time_series_id = crate::state::time_series_id(&asset.id, &property.id);
+        Ok(DescribeTimeSeriesOutput {
+            asset_id: Some(asset.id.clone()),
+            property_id: Some(property.id.clone()),
+            alias: property.alias.clone(),
+            data_type: property.data_type.clone(),
+            data_type_spec: property.data_type_spec.clone(),
+            time_series_creation_date: crate::state::to_date_time(asset.creation_date),
+            time_series_last_update_date: crate::state::to_date_time(asset.last_update_date),
+            time_series_arn: crate::state::time_series_arn(&region, &time_series_id),
+            time_series_id,
+            // Reported only for a lookup scoped to a workspace, which is refused above.
+            workspace_name: None,
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> DescribeTimeSeriesError {
+    DescribeTimeSeriesError::Modeled(
+        DescribeTimeSeriesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message,
+        }),
+    )
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> DescribeTimeSeriesError {
+    DescribeTimeSeriesError::Modeled(DescribeTimeSeriesErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }

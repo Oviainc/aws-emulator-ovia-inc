@@ -19,6 +19,8 @@ use service_com_amazonaws_firehose_firehose_20150804::{
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region the test's requests are signed for, so the ARNs they mint name it.
+///
+/// `pub(crate)` because every suite in this test crate signs for the same Region.
 pub(crate) const REGION: &str = "us-west-2";
 
 /// Long enough to cover the emulator's chosen `CREATING` -> `ACTIVE` /
@@ -27,6 +29,9 @@ pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(1_200);
 
 /// One emulator: the firehose service mounted on a single shared engine, plus the engine
 /// itself so a test can read the record buffer no operation exposes yet.
+///
+/// The whole test crate's harness: a sibling suite reaches it as
+/// `crate::delivery_stream_lifecycle::Emulator` rather than building a second one.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,

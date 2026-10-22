@@ -137,6 +137,16 @@ impl AssetRecord {
         }
     }
 
+    /// The asset property `label` names, resolved the way every `CustomID` member
+    /// is — the same lookup as [`AssetRecord::property_position`], for a caller
+    /// that wants the property rather than where it sits.
+    ///
+    /// `DescribeTimeSeries` models its `propertyId` as `CustomID`, so both forms
+    /// reach a handler and both must name the same stored property.
+    pub fn property(&self, label: &str) -> Option<&AssetProperty> {
+        self.properties.get(self.property_position(label)?)
+    }
+
     /// The asset's status as of `now`; see [`AssetModelRecord::status`].
     pub fn status(&self, now: SystemTime) -> AssetStatus {
         AssetStatus {
@@ -399,6 +409,36 @@ pub fn asset_model_arn(region: &str, asset_model_id: &str) -> String {
 /// The canonical ARN of an asset in `region`.
 pub fn asset_arn(region: &str, asset_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("asset/{asset_id}"))
+}
+
+/// The character joining the two ids a `TimeSeriesId` is built from; see
+/// [`time_series_id`].
+///
+/// A `.`, because the id is carried inside `timeSeriesArn` and the modelled `ARN`
+/// pattern is `^arn:aws(-cn|-us-gov)?:[a-zA-Z0-9-:\/_\.]+$` — a separator outside
+/// that character class would make every ARN this service reports violate a
+/// constraint its own model states.
+pub const TIME_SERIES_ID_SEPARATOR: char = '.';
+
+/// The `TimeSeriesId` of the time series (data stream) an asset property owns.
+///
+/// Every asset property IS a data stream in IoT SiteWise's time-series store, so
+/// the series it owns needs an id that is stable across reads and unique per
+/// `(assetId, propertyId)` pair. The modelled `TimeSeriesId` is 36..73 characters
+/// — one 36-character `ID`, or two of them joined by a single character — so the
+/// pair that owns the series names it, derived rather than minted: nothing has to
+/// be written on a read for the id to stay the same. Both ids are modelled `ID`s,
+/// whose pattern admits neither [`TIME_SERIES_ID_SEPARATOR`] nor any other
+/// character outside `[0-9a-f-]`, so one pair cannot be spelled as another.
+pub fn time_series_id(asset_id: &str, property_id: &str) -> String {
+    format!("{asset_id}{TIME_SERIES_ID_SEPARATOR}{property_id}")
+}
+
+/// The canonical ARN of a time series in `region`, in the form the
+/// `TimeSeriesSummary$timeSeriesArn` doc states:
+/// `arn:${Partition}:iotsitewise:${Region}:${Account}:time-series/${TimeSeriesId}`.
+pub fn time_series_arn(region: &str, time_series_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("time-series/{time_series_id}"))
 }
 
 /// The MQTT topic IoT SiteWise publishes one asset property's value updates to.

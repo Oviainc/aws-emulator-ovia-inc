@@ -162,13 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and TagOptionNotMigrated), so there is no faithful way to refuse a token
         // reused with different members, and inventing one would answer a code AWS
         // never sends here.
-        if let Some(existing) = state.idempotency.get(&input.idempotency_token).cloned() {
-            if let Some(portfolio) = state.portfolios.get(&existing) {
-                return Ok(CreatePortfolioOutput {
-                    portfolio_detail: Some(portfolio.detail()),
-                    tags: Some(portfolio.tag_list()),
-                });
-            }
+        if let Some(portfolio) = state.replayed_portfolio(&input.idempotency_token) {
+            return Ok(CreatePortfolioOutput {
+                portfolio_detail: Some(portfolio.detail()),
+                tags: Some(portfolio.tag_list()),
+            });
         }
 
         // The account's portfolio quota. Refused before anything is stored, so a
@@ -201,9 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `arn:${Partition}:catalog:${Region}:${Account}:portfolio/${PortfolioId}`.
         let arn = ::emulator_server::emulator_arn(
             "catalog",
-            &request_region(ctx),
+            &crate::state::request_region(ctx),
             &format!("portfolio/{id}"),
         );
+
         let portfolio = crate::state::Portfolio {
             id: id.clone(),
             arn,
@@ -217,20 +216,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let detail = portfolio.detail();
         let tag_list = portfolio.tag_list();
         state.portfolios.insert(id.clone(), portfolio);
-        state.idempotency.insert(input.idempotency_token, id);
+        state.remember_portfolio_token(input.idempotency_token, id);
 
         Ok(CreatePortfolioOutput {
             portfolio_detail: Some(detail),
             tags: Some(tag_list),
         })
     }
-}
-
-/// The region this request was signed for, which the minted ARN carries. Falls back
-/// to the emulator's default region for an unsigned request, which has no scope to
-/// read a region from.
-fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
-    ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
-        .map(|scope| scope.region)
-        .unwrap_or_else(|| "us-east-1".to_string())
 }

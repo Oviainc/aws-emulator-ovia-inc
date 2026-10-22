@@ -185,18 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `language` is an enum member, so only the values the model lists are a
-        // dictionary language. The boundary validator refuses the rest, and this is
-        // the same refusal for a request that reaches the handler regardless.
-        if !DICTIONARY_LANGUAGE_VALUES.contains(&input.language.as_str()) {
+        // Only the values the `DictionaryLanguage` enum lists are a dictionary
+        // language; the refusal itself lives in `crate::state` so this handler and
+        // `UpdateDictionary` answer it identically.
+        if let Some(message) = crate::state::invalid_language_message(&input.language) {
             return Err(CreateDictionaryErrorModeled::ValidationException(
-                ValidationException {
-                    message: format!(
-                        "'{}' is not a valid value for 'language'; it must be one of {}.",
-                        input.language,
-                        DICTIONARY_LANGUAGE_VALUES.join(", ")
-                    ),
-                },
+                ValidationException { message },
             )
             .into());
         }
@@ -236,12 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // entries rather than none at all.
             entries: input.entries.unwrap_or_default(),
             status: crate::state::DictionaryStatus::Creating,
-            // Nothing can reference a dictionary that did not exist a moment ago; a
-            // feed output starts referencing it later.
-            references: Vec::new(),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             transition_due_at: Some(due),
         };
+
+        // Which feeds reference a dictionary is derived from the feed store, and the
+        // id minted a moment ago is one nothing can name yet, so this list is empty by
+        // construction — it reads the derived fact rather than asserting it.
+        let references = state.feeds_referencing(&dictionary.id);
 
         // Built from the record that is about to be stored, so GetDictionary answers
         // with exactly these values.
@@ -250,8 +246,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: dictionary.id.clone(),
             name: dictionary.name.clone(),
             language: dictionary.language.clone(),
-            status: dictionary.status.as_wire().to_string(),
-            references: Some(dictionary.feed_references()),
+            status: dictionary.reported_status(&references).to_string(),
+            references: Some(references),
             tags: Some(dictionary.tag_map()),
         };
         state.dictionaries.insert(dictionary.id.clone(), dictionary);

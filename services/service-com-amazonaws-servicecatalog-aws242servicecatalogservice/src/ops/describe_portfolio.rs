@@ -143,7 +143,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(portfolio) = state.portfolios.get(&input.id) else {
             return Err(DescribePortfolioErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Portfolio {} not found.", input.id)),
+                    message: Some(format!(
+                        "There are no local or default portfolios with id {}",
+                        input.id
+                    )),
                 },
             )
             .into());

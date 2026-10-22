@@ -18,6 +18,10 @@
 //!   `NumberOfRecoveryPoints` is the count of what is stored;
 //! * a replayed `IdempotencyToken` returns the first job rather than a second;
 //! * a page is `MaxResults` items plus a cursor to the next one.
+//!
+//! The harness at the top of this module (the router, the one-request `call`
+//! and the small body readers) is `pub(crate)`, so a sibling suite in this test
+//! binary drives the same wire path instead of growing a second copy of it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,10 +50,11 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// `Cargo.toml` that declares it is not editable from here, so the `time`
 /// feature is not available. The handlers read the wall clock, so the wait has
 /// to be real either way.
-const PAST_SETTLE: Duration = Duration::from_millis(900);
+pub(crate) const PAST_SETTLE: Duration = Duration::from_millis(900);
 
 /// The alphabet the `BackupVaultName` pattern admits: `^[a-zA-Z0-9\-\_]{2,50}$`.
-const NAME_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+pub(crate) const NAME_ALPHABET: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
 
 /// Shared with the sibling suites in this target (`tests/all.rs` declares them
 /// as modules of one test crate), so there is ONE request harness for this
@@ -130,7 +135,7 @@ pub(crate) fn string_at(body: &Value, member: &str) -> String {
 /// A deterministic name of `length` characters drawn from [`NAME_ALPHABET`], so
 /// the length bound is exercised across the whole admitted alphabet rather than
 /// on one hand-picked spelling.
-fn name_of_length(length: usize) -> String {
+pub(crate) fn name_of_length(length: usize) -> String {
     (0..length)
         .map(|i| char::from(NAME_ALPHABET[(i * 7 + length) % NAME_ALPHABET.len()]))
         .collect()

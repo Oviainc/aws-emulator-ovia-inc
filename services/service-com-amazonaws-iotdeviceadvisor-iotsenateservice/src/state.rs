@@ -470,6 +470,28 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
         })
     }
 
+    /// Remove `keys` from the tags recorded for `arn` and report how many the call
+    /// actually removed.
+    ///
+    /// The counterpart of [`merge_tags`](Self::merge_tags). A key the resource does not
+    /// carry is simply absent afterwards too, so removing it is not an error and needs no
+    /// refusal. An ARN left with no tags keeps NO row at all, exactly as `merge_tags`
+    /// keeps none for an empty merge: [`tags_of`](Self::tags_of) must not be able to tell
+    /// "untagged down to nothing" from "never tagged".
+    pub fn remove_tags<'a>(&mut self, arn: &str, keys: impl IntoIterator<Item = &'a str>) -> usize {
+        let Some(tags) = self.tags.get_mut(arn) else {
+            return 0;
+        };
+        let removed = keys
+            .into_iter()
+            .filter(|key| tags.remove(*key).is_some())
+            .count();
+        if tags.is_empty() {
+            self.tags.remove(arn);
+        }
+        removed
+    }
+
     /// The tags recorded for `arn`, or `None` when it carries none — an absent `tags`
     /// member rather than an empty map.
     pub fn tags_of(&self, arn: &str) -> Option<std::collections::HashMap<String, String>> {
