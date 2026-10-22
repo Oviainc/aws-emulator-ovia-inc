@@ -149,6 +149,25 @@ impl Emulator {
             .await
     }
 
+    pub(crate) async fn update_app(&self, app_id: &str, request: &Value) -> Reply {
+        self.call("POST", &format!("/apps/{app_id}"), Some(request))
+            .await
+    }
+
+    pub(crate) async fn update_branch(
+        &self,
+        app_id: &str,
+        branch_name: &str,
+        request: &Value,
+    ) -> Reply {
+        self.call(
+            "POST",
+            &format!("/apps/{app_id}/branches/{branch_name}"),
+            Some(request),
+        )
+        .await
+    }
+
     /// Create an app and return its minted `appId`.
     pub(crate) async fn app_id_of_new_app(&self, name: &str) -> String {
         let reply = self.create_app(&json!({ "name": name })).await;
@@ -611,7 +630,9 @@ fn branch_cases() -> Vec<BranchCase> {
             display_name: "dev",
             ttl: "5",
             framework: Value::Null,
-            enable_auto_build: false,
+            // An omitted `enableAutoBuild` leaves the branch auto-building: the
+            // service's default, not the Rust type's zero.
+            enable_auto_build: true,
             environment_variables: Value::Null,
         },
         BranchCase {
@@ -643,7 +664,7 @@ fn branch_cases() -> Vec<BranchCase> {
             display_name: "beta-display",
             ttl: "5",
             framework: Value::Null,
-            enable_auto_build: false,
+            enable_auto_build: true,
             environment_variables: json!({ "A": "1", "B": "2" }),
         },
         BranchCase {
@@ -653,6 +674,9 @@ fn branch_cases() -> Vec<BranchCase> {
                 "stage": "PULL_REQUEST",
                 "enablePullRequestPreview": true,
                 "pullRequestEnvironmentName": "pr-env",
+                // The request decides the member in EITHER direction, so this row
+                // pins an explicit `false` against the service default of `true`.
+                "enableAutoBuild": false,
             }),
             stage: "PULL_REQUEST",
             display_name: "pr-7",
@@ -675,7 +699,7 @@ fn branch_cases() -> Vec<BranchCase> {
             display_name: "Experimental.1",
             ttl: "0",
             framework: Value::Null,
-            enable_auto_build: false,
+            enable_auto_build: true,
             environment_variables: Value::Null,
         },
     ]

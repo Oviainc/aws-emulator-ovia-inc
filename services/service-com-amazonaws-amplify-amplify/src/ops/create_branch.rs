@@ -255,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             create_time: created,
             update_time: created,
             environment_variables: input.environment_variables.unwrap_or_default(),
-            enable_auto_build: input.enable_auto_build.unwrap_or(false),
+            enable_auto_build: input.enable_auto_build.unwrap_or(DEFAULT_ENABLE_AUTO_BUILD),
             enable_skew_protection: input.enable_skew_protection,
             // A branch carries a custom domain once a domain association assigns it
             // one; a new branch has none.
@@ -304,6 +304,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// @required, so a branch created without one still has to carry a value from that
 /// closed set; `DEVELOPMENT` is the one that claims nothing about a deployment.
 const DEFAULT_STAGE: &str = "DEVELOPMENT";
+
+/// Whether a branch created without `enableAutoBuild` auto-builds on push.
+///
+/// `EnableAutoBuild` is modelled as a plain boolean with no `@default`
+/// (`smithy_query(query="shape",shape="Branch,EnableAutoBuild")`), so the default is
+/// the service's, not the Rust type's: Amplify connects a branch WITH continuous
+/// deployment on, and a recorded `CreateBranch` whose request omits the member comes
+/// back with `enableAutoBuild: true`. A request that carries the member still decides
+/// it, in either direction.
+const DEFAULT_ENABLE_AUTO_BUILD: bool = true;
 
 /// The content TTL, in seconds, a branch created without one carries.
 ///

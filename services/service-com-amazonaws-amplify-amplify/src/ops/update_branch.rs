@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBranch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBranch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBranch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -193,20 +184,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBranch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBranchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateBranchErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let updated_at = crate::state::now();
+        let mut store = state.lock();
+
+        // A branch only exists as part of an app, and `UpdateBranch` updates an
+        // EXISTING branch: an unknown app, or a branch name this app does not carry,
+        // is a 404 rather than a branch created on the way. The lookup goes through
+        // the app, so another app's branch of the same name is not reachable here,
+        // and the 404 names the entity that is actually absent: the app when the app
+        // itself is unknown, otherwise the branch.
+        let app = store.apps.get_mut(&input.app_id).ok_or_else(|| {
+            UpdateBranchErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        })?;
+        let branch = app.branches.get_mut(&input.branch_name).ok_or_else(|| {
+            UpdateBranchErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::BRANCH_ENTITY,
+                    &input.branch_name,
+                )),
+            })
+        })?;
+
+        // Every member the request CARRIES replaces the stored one; a member it omits
+        // is left as it was, so promoting a branch's `stage` does not reset the rest
+        // of its configuration. A map member is replaced WHOLESALE, not merged.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBranch"))
+        // Destructuring rather than reading `input.<member>` is deliberate: a member
+        // added to the model fails to compile here instead of being silently dropped.
+        let UpdateBranchInput {
+            app_id: _,
+            branch_name: _,
+            description,
+            framework,
+            stage,
+            enable_notification,
+            enable_auto_build,
+            enable_skew_protection,
+            environment_variables,
+            basic_auth_credentials,
+            enable_basic_auth,
+            enable_performance_mode,
+            build_spec,
+            ttl,
+            display_name,
+            enable_pull_request_preview,
+            pull_request_environment_name,
+            backend_environment_arn,
+            backend,
+            compute_role_arn,
+        } = input;
+
+        // The @required members of `Branch`: a supplied value replaces the stored one.
+        crate::state::apply(&mut branch.description, description);
+        crate::state::apply(&mut branch.framework, framework);
+        crate::state::apply(&mut branch.stage, stage);
+        crate::state::apply(&mut branch.display_name, display_name);
+        crate::state::apply(&mut branch.enable_notification, enable_notification);
+        crate::state::apply(&mut branch.enable_auto_build, enable_auto_build);
+        crate::state::apply(&mut branch.environment_variables, environment_variables);
+        crate::state::apply(&mut branch.enable_basic_auth, enable_basic_auth);
+        crate::state::apply(&mut branch.ttl, ttl);
+        crate::state::apply(
+            &mut branch.enable_pull_request_preview,
+            enable_pull_request_preview,
+        );
+
+        // The optional members of `Branch`: a supplied value replaces the stored one,
+        // and an omitted member leaves it alone — including when it is currently unset.
+        crate::state::apply_optional(&mut branch.enable_skew_protection, enable_skew_protection);
+        crate::state::apply_optional(&mut branch.basic_auth_credentials, basic_auth_credentials);
+        crate::state::apply_optional(&mut branch.enable_performance_mode, enable_performance_mode);
+        crate::state::apply_optional(&mut branch.build_spec, build_spec);
+        crate::state::apply_optional(
+            &mut branch.pull_request_environment_name,
+            pull_request_environment_name,
+        );
+        crate::state::apply_optional(&mut branch.backend_environment_arn, backend_environment_arn);
+        crate::state::apply_optional(&mut branch.backend, backend);
+        crate::state::apply_optional(&mut branch.compute_role_arn, compute_role_arn);
+
+        // `Branch$updateTime` is "a timestamp for the last updated time for a branch",
+        // so the record the caller reads back carries the instant of THIS call, while
+        // `createTime` keeps the instant the branch was created.
+        branch.update_time = updated_at;
+
+        // An update answers the record it just wrote, and `UpdateBranchRequest` carries
+        // no `tags` member — so the tag map in the answer is the BRANCH's, reported the
+        // way every read of the branch reports it (the empty map when it carries none).
+        // The projection fills it on the outgoing copy only; stored state is untouched.
+        Ok(UpdateBranchOutput {
+            branch: BranchProjection::reported(branch.clone()),
+        })
     }
 }

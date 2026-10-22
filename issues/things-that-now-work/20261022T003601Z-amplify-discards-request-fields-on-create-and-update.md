@@ -16,6 +16,24 @@ Issue-Commit: 7d2cd57c0bb94f32b894957a728316a26e29b449
 
 # Amplify discards request fields on create and update
 
+> ## Resolution
+>
+> All three causes are fixed. `UpdateApp` and `UpdateBranch` are implemented and
+> persist every member the request supplies (replacing an `environmentVariables` map
+> wholesale, leaving an omitted member untouched, bumping `updateTime`, answering 404
+> `NotFoundException` for a resource that does not exist), and `CreateBranch` takes
+> `enableAutoBuild` from the request, defaulting to the service's `true` when the
+> request omits it. Both updates answer through `AppProjection`/`BranchProjection`, so
+> a member the record has no value for — `framework` included — is reported as JSON
+> `null`, and the tag map they report is the resource's (neither request carries a
+> `tags` member).
+>
+> Keys closed: `GetApp $.app.environmentVariables.C`, `GetBranch $.branch.stage`,
+> `GetBranch $.branch.ttl`, `CreateBranch $.branch.enableAutoBuild`,
+> `CreateBranch $.branch.framework` (the last one by the record projection the
+> companion issue `…-amplify-app-and-branch-responses-misproject-modeled-members`
+> landed, which the two new handlers answer through).
+
 > _Note: this issue was identified against the code base at commit `7d2cd57c0bb94f32b894957a728316a26e29b449`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -200,20 +191,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAppErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the Amplify emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let updated_at = crate::state::now();
+        let mut store = state.lock();
+
+        // `UpdateApp` updates an EXISTING app, so an unknown `appId` is a 404 rather
+        // than an app created on the way.
+        let app = &mut store
+            .apps
+            .get_mut(&input.app_id)
+            .ok_or_else(|| {
+                UpdateAppErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::not_found_message(
+                        crate::state::APP_ENTITY,
+                        &input.app_id,
+                    )),
+                })
+            })?
+            .app;
+
+        // Every member the request CARRIES replaces the stored one; a member it omits
+        // is left as it was. That is what makes an update partial: a caller that sends
+        // one member does not reset the rest of the app's configuration.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApp"))
+        // A map or list member is replaced WHOLESALE rather than merged — the request
+        // carries the collection's new content, so an `environmentVariables` map with
+        // one entry leaves the app with exactly that one variable.
+        //
+        // Destructuring rather than reading `input.<member>` is deliberate: a member
+        // added to the model fails to compile here instead of being silently dropped.
+        let UpdateAppInput {
+            app_id: _,
+            name,
+            description,
+            platform,
+            compute_role_arn,
+            iam_service_role_arn,
+            environment_variables,
+            enable_branch_auto_build,
+            enable_branch_auto_deletion,
+            enable_basic_auth,
+            basic_auth_credentials,
+            custom_rules,
+            build_spec,
+            custom_headers,
+            enable_auto_branch_creation,
+            auto_branch_creation_patterns,
+            auto_branch_creation_config,
+            repository,
+            // `accessToken` / `oauthToken` are deliberately NOT persisted: both
+            // members document "The token is not stored.", and neither appears on
+            // `App`.
+            oauth_token: _,
+            access_token: _,
+            job_config,
+            cache_config,
+        } = input;
+
+        // The @required members of `App`: a supplied value replaces the stored one.
+        crate::state::apply(&mut app.name, name);
+        crate::state::apply(&mut app.description, description);
+        crate::state::apply(&mut app.platform, platform);
+        crate::state::apply(&mut app.repository, repository);
+        crate::state::apply(&mut app.environment_variables, environment_variables);
+        crate::state::apply(&mut app.enable_branch_auto_build, enable_branch_auto_build);
+        crate::state::apply(&mut app.enable_basic_auth, enable_basic_auth);
+
+        // The optional members of `App`: a supplied value replaces the stored one, and
+        // an omitted member leaves it alone — including when it is currently unset.
+        crate::state::apply_optional(&mut app.compute_role_arn, compute_role_arn);
+        crate::state::apply_optional(&mut app.iam_service_role_arn, iam_service_role_arn);
+        crate::state::apply_optional(
+            &mut app.enable_branch_auto_deletion,
+            enable_branch_auto_deletion,
+        );
+        crate::state::apply_optional(&mut app.basic_auth_credentials, basic_auth_credentials);
+        crate::state::apply_optional(&mut app.custom_rules, custom_rules);
+        crate::state::apply_optional(&mut app.build_spec, build_spec);
+        crate::state::apply_optional(&mut app.custom_headers, custom_headers);
+        crate::state::apply_optional(
+            &mut app.enable_auto_branch_creation,
+            enable_auto_branch_creation,
+        );
+        crate::state::apply_optional(
+            &mut app.auto_branch_creation_patterns,
+            auto_branch_creation_patterns,
+        );
+        crate::state::apply_optional(
+            &mut app.auto_branch_creation_config,
+            auto_branch_creation_config,
+        );
+        crate::state::apply_optional(&mut app.job_config, job_config);
+        crate::state::apply_optional(&mut app.cache_config, cache_config);
+
+        // `App$updateTime` is "a timestamp for when Amplify updated the application",
+        // so the record the caller reads back carries the instant of THIS call, while
+        // `createTime` keeps the instant the app was created.
+        app.update_time = updated_at;
+
+        // An update answers the record it just wrote, and `UpdateAppRequest` carries no
+        // `tags` member — so the tag map in the answer is the APP's, reported the way
+        // every read of the app reports it (the empty map when it carries none). The
+        // projection fills it on the outgoing copy only; stored state is untouched.
+        Ok(UpdateAppOutput {
+            app: AppProjection::reported(app.clone()),
+        })
     }
 }

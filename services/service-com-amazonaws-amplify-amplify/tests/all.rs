@@ -15,6 +15,8 @@
 mod app_branch_lifecycle;
 #[path = "all/app_branch_projection.rs"]
 mod app_branch_projection;
+#[path = "all/app_branch_updates.rs"]
+mod app_branch_updates;
 #[path = "all/branch_deletion_visibility.rs"]
 mod branch_deletion_visibility;
 #[path = "all/state_roundtrip.rs"]

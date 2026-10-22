@@ -175,15 +175,39 @@ pub fn page<T>(
     (records, None)
 }
 
+/// Replace a stored @required member when the request supplied one.
+///
+/// A partial update is "every member the request carries, and nothing else": an
+/// absent member is not a value, so it leaves the stored one as it was. Shared by
+/// `UpdateApp` and `UpdateBranch` so the two cannot drift on that rule.
+pub fn apply<T>(stored: &mut T, supplied: Option<T>) {
+    if let Some(value) = supplied {
+        *stored = value;
+    }
+}
+
+/// Replace a stored OPTIONAL member when the request supplied one.
+///
+/// The same rule as [`apply`], for a member that may legitimately be unset: an
+/// omitted member leaves the stored value alone rather than clearing it. Clearing a
+/// member is therefore NOT expressible by omission — a caller that wants a member
+/// emptied sends its empty value, which [`apply`] and this function store as given.
+pub fn apply_optional<T>(stored: &mut Option<T>, supplied: Option<T>) {
+    if supplied.is_some() {
+        *stored = supplied;
+    }
+}
+
 /// The `message` an Amplify `NotFoundException` carries for a resource the request
 /// addressed and this store does not hold.
 ///
 /// The text is built FROM THE REQUEST and is a complete sentence: the kind of entity,
 /// the identifier the request used for it, and `not found` closed by the
 /// sentence-terminating period. Every 404 in this crate is formatted through this one
-/// function, so `GetApp`, `DeleteApp`, `GetBranch`, `DeleteBranch`, `CreateBranch` and
-/// `ListBranches` cannot drift from one another — and an identifier is NEVER inspected
-/// here, so the message is the same construction whatever the request named.
+/// function, so `GetApp`, `DeleteApp`, `GetBranch`, `DeleteBranch`, `CreateBranch`,
+/// `ListBranches`, `UpdateApp` and `UpdateBranch` cannot drift from one another — and
+/// an identifier is NEVER inspected here, so the message is the same construction
+/// whatever the request named.
 pub fn not_found_message(entity: &str, identifier: &str) -> String {
     format!("{entity} {identifier} not found.")
 }
