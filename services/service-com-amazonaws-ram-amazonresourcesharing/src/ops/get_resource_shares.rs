@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceShares
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceShares`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the resource shares [`crate::state`] holds, filtered as the request
+//! asks and one `@paginated` page at a time.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceShares::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read: the only thing it writes is the `ASSOCIATING` -> `ASSOCIATED` move the
+//! clock already owed an association, which is due whether or not anybody calls.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +185,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceShares` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceSharesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceShares"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourceSharesErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the resource share store is unavailable".to_string(),
+            })
+        })?;
+
+        if !crate::ops::types::RESOURCE_OWNER_VALUES.contains(&input.resource_owner.as_str()) {
+            return Err(GetResourceSharesErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: format!(
+                        "resourceOwner must be one of [{}]",
+                        crate::ops::types::RESOURCE_OWNER_VALUES.join(", ")
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let requested_arns = input.resource_share_arns.clone().unwrap_or_default();
+        if let Some(why) = requested_arns
+            .iter()
+            .find_map(|arn| crate::state::share_arn_rejection("resourceShareArns entry", arn))
+            .or_else(|| {
+                input.permission_arn.as_deref().and_then(|arn| {
+                    (!crate::state::is_arn(arn))
+                        .then(|| "permissionArn is not an ARN".to_string())
+                })
+            })
+        {
+            return Err(GetResourceSharesErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+
+        let page_size = crate::state::page_size(input.max_results);
+        let start = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_share_cursor(token).ok_or_else(|| {
+                GetResourceSharesErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: "nextToken is not a pagination token issued by GetResourceShares"
+                            .to_string(),
+                    },
+                )
+            })?),
+        };
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_associations(now);
+
+        // An ARN the caller names explicitly must belong to a share this emulator
+        // holds; one that does not is the `UnknownResourceException` case, told apart
+        // from a malformed ARN above.
+        if let Some(unknown) = requested_arns
+            .iter()
+            .find(|arn| store.share(arn.as_str()).is_none())
+        {
+            return Err(GetResourceSharesErrorModeled::UnknownResourceException(
+                UnknownResourceException {
+                    message: format!("no resource share with the ARN '{unknown}' exists"),
+                },
+            )
+            .into());
+        }
+
+        let owner_is_self = input.resource_owner == crate::state::RESOURCE_OWNER_SELF;
+        let account = ::engine::emulator_account_id();
+        let tag_filters = input.tag_filters.clone().unwrap_or_default();
+
+        let mut resource_shares =
+            Vec::with_capacity(page_size.min(store.resource_shares.len()));
+        let mut next_token = None;
+        let mut remaining = match &start {
+            Some(arn) => store.resource_shares.range(arn.clone()..),
+            None => store.resource_shares.range::<String, _>(..),
+        };
+        for (arn, share) in remaining.by_ref() {
+            // `SELF` reports the shares this account shares with others; every share
+            // this emulator mints is one of those, so `OTHER-ACCOUNTS` reports the
+            // shares owned elsewhere - none, until a share arrives from outside.
+            if owner_is_self != (share.owning_account_id == account) {
+                continue;
+            }
+            if !requested_arns.is_empty() && !requested_arns.contains(arn) {
+                continue;
+            }
+            match input.resource_share_status.as_deref() {
+                // A share the caller asked for by status is reported in exactly that
+                // status, deleted ones included.
+                Some(status) => {
+                    if share.status != status {
+                        continue;
+                    }
+                }
+                // With no status asked for, a share `DeleteResourceShare` removed is
+                // gone.
+                None => {
+                    if share.is_deleted() {
+                        continue;
+                    }
+                }
+            }
+            if input
+                .name
+                .as_deref()
+                .is_some_and(|name| share.name != name)
+            {
+                continue;
+            }
+            if !crate::state::tags_match_filters(&share.tags, &tag_filters) {
+                continue;
+            }
+            if input
+                .permission_arn
+                .as_deref()
+                .is_some_and(|wanted| !share.permission_arns.iter().any(|arn| arn == wanted))
+            {
+                continue;
+            }
+            // No share carries a managed-permission VERSION: `CreateResourceShare`
+            // takes permission ARNs only, and the permission lifecycle that would
+            // record a version is not part of this slice. A request that filters on
+            // one therefore matches nothing, rather than being answered with shares
+            // whose version is unknown.
+            if input.permission_version.is_some() {
+                continue;
+            }
+            // The first share that does not fit becomes the next page's start, and
+            // only then is a `nextToken` emitted - the last page carries none.
+            if resource_shares.len() == page_size {
+                next_token = Some(crate::state::encode_share_cursor(arn));
+                break;
+            }
+            resource_shares.push(share.view());
+        }
+
+        Ok(GetResourceSharesOutput {
+            resource_shares: Some(resource_shares),
+            next_token,
+        })
     }
 }

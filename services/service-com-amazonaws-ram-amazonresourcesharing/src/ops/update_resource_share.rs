@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateResourceShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateResourceShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Changes a resource share held in [`crate::state`] and reports the stored record
+//! as it now stands.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateResourceShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Only the two members the model binds — `name` and `allowExternalPrincipals` — can
+//! change, and a call that names neither is refused: it would mutate nothing. A
+//! successful change bumps the share's `lastUpdatedTime` and carries a new name onto
+//! the associations that report it.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +176,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateResourceShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateResourceShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateResourceShare"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateResourceShareErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the resource share store is unavailable".to_string(),
+            })
+        })?;
+
+        if let Some(why) =
+            crate::state::share_arn_rejection("resourceShareArn", &input.resource_share_arn)
+        {
+            return Err(UpdateResourceShareErrorModeled::MalformedArnException(
+                MalformedArnException { message: why },
+            )
+            .into());
+        }
+        // The model binds exactly two mutable members on this operation, so a
+        // request that names neither asks for no change at all.
+        if input.name.is_none() && input.allow_external_principals.is_none() {
+            return Err(
+                UpdateResourceShareErrorModeled::MissingRequiredParameterException(
+                    MissingRequiredParameterException {
+                        message: "at least one of name or allowExternalPrincipals must be \
+                                  specified"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(why) = input
+            .name
+            .as_deref()
+            .and_then(crate::state::name_rejection)
+        {
+            return Err(UpdateResourceShareErrorModeled::InvalidParameterException(
+                InvalidParameterException { message: why },
+            )
+            .into());
+        }
+        if let Some(why) = input
+            .client_token
+            .as_deref()
+            .and_then(crate::state::client_token_rejection)
+        {
+            return Err(UpdateResourceShareErrorModeled::InvalidClientTokenException(
+                InvalidClientTokenException { message: why },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let now = store.tick();
+        store.settle_due_associations(now);
+
+        let fingerprint = crate::state::fingerprint(&[
+            &input.resource_share_arn,
+            input.name.as_deref().unwrap_or(""),
+            match input.allow_external_principals {
+                Some(true) => "allow=true",
+                Some(false) => "allow=false",
+                None => "allow=",
+            },
+        ]);
+
+        if let Some(token) = input.client_token.clone() {
+            if let Some(record) = store.client_token_record(Self::NAME, &token) {
+                if record.fingerprint != fingerprint {
+                    return Err(
+                        UpdateResourceShareErrorModeled::IdempotentParameterMismatchException(
+                            IdempotentParameterMismatchException {
+                                message: "clientToken was already used for an \
+                                          UpdateResourceShare request with different parameters"
+                                    .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // A repeat changes nothing, so the stored share keeps the
+                // `lastUpdatedTime` the first call gave it.
+                let arn = record.resource_share_arn.clone();
+                if let Some(share) = store.share(&arn) {
+                    return Ok(UpdateResourceShareOutput {
+                        resource_share: Some(share.view()),
+                        client_token: Some(token),
+                    });
+                }
+            }
+        }
+
+        let Some(share) = store.live_share_mut(&input.resource_share_arn) else {
+            return Err(UpdateResourceShareErrorModeled::UnknownResourceException(
+                UnknownResourceException {
+                    message: format!(
+                        "no resource share with the ARN '{}' exists",
+                        input.resource_share_arn
+                    ),
+                },
+            )
+            .into());
+        };
+        if let Some(name) = input.name.clone() {
+            share.name = name;
+        }
+        if let Some(allow_external_principals) = input.allow_external_principals {
+            share.allow_external_principals = allow_external_principals;
+        }
+        share.last_updated_time = now;
+        let view = share.view();
+        let name = share.name.clone();
+
+        // Every association reports the share's name, so a rename reaches them too.
+        store.rename_associations(&input.resource_share_arn, &name);
+
+        let client_token = match input.client_token {
+            Some(token) => token,
+            None => store.fresh_uuid(),
+        };
+        store.remember_client_token(
+            Self::NAME,
+            &client_token,
+            fingerprint,
+            input.resource_share_arn,
+        );
+
+        Ok(UpdateResourceShareOutput {
+            resource_share: Some(view),
+            client_token: Some(client_token),
+        })
     }
 }
