@@ -75,10 +75,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
         // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // name — and also one that names its ENDPOINT PREFIX, which the model
+        // gives as `data-signer` while the SigV4 signing name is `signer`. The
+        // default predicate only knows the signing name, so an anonymous request
+        // addressed at the service's own endpoint host
+        // (`data-signer.<region>.amazonaws.com`, where the routing key is the
+        // host's first label) would otherwise reach no service at all, even
+        // though it is addressed at exactly this one. A signed request still
+        // routes on the signing name, which the credential scope carries.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
+            Some(key) => key == self.entry.identity().signing_name() || key == ENDPOINT_PREFIX,
             None => false,
         }
     }
@@ -114,13 +120,36 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // modeled operation. This service models exactly ONE operation, and every one
+        // of its five input members is `@required` + `@httpQuery`, so the REST
+        // router's required-binding check rejects the only route it has whenever one
+        // of those query parameters is absent — and the protocol default would then
+        // answer 501 `NotImplemented`, claiming nobody implemented the operation when
+        // what actually happened is that the request left a required parameter out.
+        //
+        // A `GET /revocations` that failed to route is therefore a GetRevocationStatus
+        // missing required query parameters, and the service states it the way it
+        // states any other refusal of the model's own rules: 400 `ValidationException`
+        // naming each absent member. Anything else (another path, another method)
+        // keeps the framework's protocol-correct default.
+        let missing = missing_required_query_parameters(req)?;
+        let violations = missing
+            .into_iter()
+            .map(|member| aws_smithy_schema_server::Violation {
+                path: member.to_string(),
+                kind: aws_smithy_schema_server::ViolationKind::MissingRequiredMember,
+                value: None,
+            })
+            .collect();
+        // Rendered through the generated entry, so this refusal lands in the same
+        // envelope (and with the same wording) as one the boundary validator raises
+        // for a value that was present but out of bounds.
+        Some(
+            self.entry
+                .framework_error_response(aws_smithy_schema_server::ProtocolError::Invalid(
+                    violations,
+                )),
+        )
     }
 
     fn override_framework_error(
@@ -136,4 +165,82 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// This service's endpoint prefix, as the model gives it (`data-signer`) — distinct
+/// from its SigV4 signing name (`signer`), which the generated identity carries.
+/// `can_handle` claims a request that names either.
+pub const ENDPOINT_PREFIX: &str = "data-signer";
+
+/// The method of the one route this service's model binds (`GET /revocations`).
+const REVOCATIONS_METHOD: &str = "GET";
+/// The path of that route, as the single path segment it consists of. Compared the way
+/// the router compares it: `route_lookup` trims the path's leading and trailing `/`
+/// and splits the rest into segments, so `/revocations`, `/revocations/` and
+/// `//revocations//` are all that one segment and anything else is another route.
+const REVOCATIONS_PATH_SEGMENT: &str = "revocations";
+
+/// The wire names of `GetRevocationStatus`'s `@httpQuery`-bound input members, read off
+/// the generated input schema rather than written out here, so the model stays the one
+/// source of the names.
+///
+/// Every one of them is also `@required`
+/// (`smithy_query(query="operation",operation="GetRevocationStatus")` shows all five
+/// input members as `required` + `httpQuery`), which is exactly the set the REST
+/// router's generated required-binding table holds for this route — so a name here
+/// missing from a request is a name the router refused to match the route for.
+///
+/// `@required` itself cannot be read back at runtime, which is why the filter is on the
+/// query binding alone: `aws-smithy-schema` exposes no `required` accessor, and codegen
+/// does not carry the trait on a member's generic `TraitMap` either — it CONSUMES
+/// `@required` at generation time, to decide whether the Rust field is `Option<T>` and
+/// to build `Route::with_required` (`vendor/smithy-macros/src/lib.rs`). The model fact
+/// above is therefore enforced by test rather than by the type system: the
+/// `a_missing_required_query_parameter_is_a_validation_error` suite asserts a 400 for
+/// each of the five members omitted on its own, and a 200 for the complete request.
+fn required_query_parameters() -> impl Iterator<Item = &'static str> {
+    crate::ops::types::GET_REVOCATION_STATUS_INPUT_SCHEMA
+        .members()
+        .iter()
+        .filter_map(|member| member.http_query().map(|query| query.value()))
+}
+
+/// The required query parameters `req` leaves out, when `req` targets this service's
+/// one route and leaves any out; `None` when it targets another route, or carries them
+/// all (in which case it failed to route for some other reason and the framework's
+/// default wording stands).
+///
+/// A parameter counts as present when its NAME is on the query string, whatever value
+/// it carries, and the name is compared as the request spells it. That is precisely the
+/// test the router's own required-binding check applies — it reads raw `key[=value]`
+/// pairs (`parse_query_pairs`) and asks whether the name occurs
+/// (`required_binding_score`, `vendor/smithy-schema-server/src/rest_xml.rs`), with no
+/// percent-decoding of names on the routing path — so the two cannot disagree about
+/// which parameters a request supplied. A present-but-invalid value is not this
+/// function's business: the route then matches and the boundary validator refuses the
+/// value itself.
+fn missing_required_query_parameters(
+    req: &aws_smithy_runtime_api::http::Request,
+) -> Option<Vec<&'static str>> {
+    if req.method() != REVOCATIONS_METHOD {
+        return None;
+    }
+    // Parsed with `http::Uri` rather than by hand, so an absolute-form URI, an
+    // origin-form one, and the userinfo/port/fragment variants all yield the same path
+    // and query the router reads. A URI that does not parse is not this route's.
+    let uri: http::Uri = req.uri().parse().ok()?;
+    if uri.path().trim_matches('/') != REVOCATIONS_PATH_SEGMENT {
+        return None;
+    }
+
+    let query = uri.query().unwrap_or_default();
+    let supplied: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split_once('=').map_or(pair, |(name, _)| name))
+        .collect();
+    let missing: Vec<&'static str> = required_query_parameters()
+        .filter(|required| !supplied.contains(required))
+        .collect();
+    (!missing.is_empty()).then_some(missing)
 }
