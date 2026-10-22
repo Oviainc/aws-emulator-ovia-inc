@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateService
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateService`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateService::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: merges the supplied members into the persisted service record
+//! (see [`crate::state`]), bumps `UpdatedAt`, records the `UPDATE_SERVICE`
+//! operation whose id this call returns, and leaves the move back to `RUNNING`
+//! owed to the clock. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateService` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateService"))
+        use crate::state;
+
+        let invalid = |message: String| -> Self::Error {
+            UpdateServiceErrorModeled::InvalidRequestException(InvalidRequestException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = state::request_region(ctx);
+
+        let handle = state::service_state(&*self.engine).ok_or_else(|| {
+            Self::Error::from(UpdateServiceErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("this service's state is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = handle.lock();
+        store.settle_due(now);
+
+        let stored = store
+            .live_in(&region, &input.service_arn)
+            .ok_or_else(|| {
+                Self::Error::from(UpdateServiceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No App Runner service found for ARN {}",
+                            input.service_arn
+                        )),
+                    },
+                ))
+            })?
+            .clone();
+
+        // "You can't perform this action when the resource is in its current
+        // state" (`InvalidStateException`): an update needs a settled service,
+        // so a service with an operation still in flight refuses it.
+        if stored.status != state::SERVICE_RUNNING {
+            return Err(UpdateServiceErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(format!(
+                        "The service cannot be updated while its status is {}",
+                        stored.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let source_configuration = match input.source_configuration {
+            Some(supplied) => {
+                state::merge_source(&stored.source_configuration, supplied).map_err(invalid)?
+            }
+            None => stored.source_configuration.clone(),
+        };
+        let instance_configuration = match input.instance_configuration {
+            Some(supplied) => state::merge_instance(&stored.instance_configuration, supplied),
+            None => stored.instance_configuration.clone(),
+        };
+        let health_check_configuration = match input.health_check_configuration {
+            Some(supplied) => {
+                state::merge_health_check(&stored.health_check_configuration, supplied)
+            }
+            None => stored.health_check_configuration.clone(),
+        };
+        let network_configuration = match input.network_configuration {
+            Some(supplied) => state::merge_network(&stored.network_configuration, supplied),
+            None => stored.network_configuration.clone(),
+        };
+        state::validate_network(&network_configuration).map_err(invalid)?;
+        let observability_configuration = match input.observability_configuration {
+            Some(supplied) => {
+                state::validate_observability(&supplied).map_err(invalid)?;
+                Some(supplied)
+            }
+            None => stored.observability_configuration.clone(),
+        };
+        let auto_scaling_configuration_summary = match input.auto_scaling_configuration_arn {
+            Some(arn) => state::auto_scaling_summary(&region, Some(&arn)).map_err(invalid)?,
+            None => stored.auto_scaling_configuration_summary.clone(),
+        };
+
+        let operation_id = store.mint_operation_id(&format!(
+            "{}/{}",
+            state::OP_TYPE_UPDATE_SERVICE, input.service_arn
+        ));
+        let service = {
+            let record = store
+                .services
+                .get_mut(&input.service_arn)
+                .ok_or_else(|| {
+                    Self::Error::from(UpdateServiceErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No App Runner service found for ARN {}",
+                                input.service_arn
+                            )),
+                        },
+                    ))
+                })?;
+            record.source_configuration = source_configuration;
+            record.instance_configuration = instance_configuration;
+            record.health_check_configuration = health_check_configuration;
+            record.network_configuration = network_configuration;
+            record.observability_configuration = observability_configuration;
+            record.auto_scaling_configuration_summary = auto_scaling_configuration_summary;
+            record.updated_at = now;
+            // "This is an asynchronous operation": the update is in flight until
+            // the clock owes the service `RUNNING` again.
+            record.status = state::SERVICE_OPERATION_IN_PROGRESS.to_string();
+            record.pending = Some(state::PendingTransition {
+                due_at: now + state::OPERATION_SETTLE_DELAY,
+                to_status: state::SERVICE_RUNNING.to_string(),
+                operation_id: operation_id.clone(),
+            });
+            record.to_service()
+        };
+
+        store.record_operation(
+            &input.service_arn,
+            state::OP_TYPE_UPDATE_SERVICE,
+            operation_id.clone(),
+            now,
+        );
+        store.expect_due(now + state::OPERATION_SETTLE_DELAY);
+
+        Ok(UpdateServiceOutput {
+            service,
+            operation_id,
+        })
     }
 }
