@@ -256,6 +256,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             endpoint_details,
             tags: input.tags.unwrap_or_default(),
             web_app_id: web_app_id.clone(),
+            // `CreateWebApp` models no customization member: a new web app carries no
+            // title, logo or icon until `UpdateWebAppCustomization` assigns one.
+            customization: st::WebAppCustomization::default(),
         };
         guard.web_apps.insert(web_app_id.clone(), web_app);
         drop(guard);

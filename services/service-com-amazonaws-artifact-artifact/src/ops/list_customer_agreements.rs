@@ -8,7 +8,9 @@
 //! reported: a terminated one stays in the store and out of the answer.
 //!
 //! `@paginated(items: customerAgreements)`, so a page is cut at `maxResults` and
-//! `nextToken` carries the id the next page resumes at. `@readonly`: this handler only
+//! `nextToken` carries an OPAQUE cursor the next page resumes at
+//! ([`crate::state::customer_agreements_page_token`]) rather than a customer-agreement id.
+//! `@readonly`: this handler only
 //! READS — the API has no operation that creates, accepts or terminates a
 //! customer-agreement, so the set is built by the state's `Default`.
 //!
@@ -164,18 +166,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The token is the customer-agreement id the next page starts at, so anything
-        // that is not one was never issued by this operation. A token this service did
-        // not issue is refused with the service's one fixed invalid-token text, the same
-        // as every other token member.
-        if let Some(token) = input.next_token.as_deref() {
-            if !crate::state::is_customer_agreement_id(token) {
-                return Err(ListCustomerAgreementsErrorModeled::ValidationException(
-                    crate::state::invalid_token(),
-                )
-                .into());
-            }
-        }
+        // A `nextToken` is opaque: the only thing it has to be is one of THIS operation's
+        // own cursors. Anything that does not decode to one was never issued here — a bare
+        // customer-agreement id included — and is refused with the service's one fixed
+        // invalid-token text, the same as every other token member.
+        let resume_at = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => match crate::state::parse_customer_agreements_page_token(token) {
+                Some(position) => position,
+                None => {
+                    return Err(ListCustomerAgreementsErrorModeled::ValidationException(
+                        crate::state::invalid_token(),
+                    )
+                    .into())
+                }
+            },
+        };
 
         let region = crate::state::request_region(ctx.parts());
         let page_size = crate::state::page_size(input.max_results);
@@ -183,16 +189,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let mut customer_agreements = Vec::new();
         let mut next_token = None;
-        for (id, agreement) in &store.customer_agreements {
-            // Resume at the first id at or after the token, so a page is still served
-            // when the agreement the token named left the set meanwhile.
-            if input
-                .next_token
-                .as_deref()
-                .is_some_and(|token| id.as_str() < token)
-            {
-                continue;
-            }
+        let mut position = 0usize;
+        for agreement in store.customer_agreements.values() {
             // "List active customer-agreements applicable to calling identity": a
             // terminated agreement is persisted but not reported. Filtering BEFORE the
             // page-size check is what keeps a `nextToken` pointing at an agreement the
@@ -200,11 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !agreement.is_active() {
                 continue;
             }
+            // Resume at the cursor's position in this operation's own reported order, so
+            // a page is still served when the agreement it was cut after left the set.
+            if position < resume_at {
+                position += 1;
+                continue;
+            }
             if customer_agreements.len() >= page_size {
-                next_token = Some(id.clone());
+                next_token = Some(crate::state::customer_agreements_page_token(position));
                 break;
             }
             customer_agreements.push(agreement.to_summary(&region));
+            position += 1;
         }
 
         Ok(ListCustomerAgreementsOutput {

@@ -12,9 +12,10 @@
 //! Every case goes through the front door a client uses: `POST /` with
 //! `X-Amz-Target: SpencerFrontendService.<Operation>` and an `awsJson1_1` body
 //! (`OPERATIONS.md`, "Wire protocol"). An in-flight upload is not reportable by any
-//! implemented operation yet (`UploadLayerPart` and `CompleteLayerUpload` are 501 stubs
-//! with issues of their own), so the cases that need to see what was persisted read the
-//! record back from the store through the engine the router was built over.
+//! implemented operation (`CompleteLayerUpload` is a 501 stub with an issue of its own),
+//! so the cases that need to see what was persisted read the record back from the store
+//! through the engine the router was built over. The harness below is shared with the
+//! layer-part suite (`tests/all/layer_part_uploads.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -28,20 +29,21 @@ const TARGET_PREFIX: &str = "SpencerFrontendService";
 
 /// This registry's `registryId`: the canonical emulator account id
 /// (`engine::EMULATOR_ACCOUNT_ID`).
-const REGISTRY_ID: &str = "000000000000";
+pub(crate) const REGISTRY_ID: &str = "000000000000";
 
 /// This registry's alias, which `RegistryIdOrAlias` also admits in place of the account
 /// id (`state::DEFAULT_REGISTRY_ALIAS`).
-const REGISTRY_ALIAS: &str = "emulator";
+pub(crate) const REGISTRY_ALIAS: &str = "emulator";
 
-/// The ceiling on one layer part, from the model: `UploadLayerPart$layerPartBlob` is
-/// `@length(min: 0, max: 20971520)`
-/// (`smithy_query(query="operation", operation="UploadLayerPart")`). A `partSize` the
-/// client is told to send parts in therefore cannot exceed it.
-const MAX_LAYER_PART_BYTES: i64 = 20_971_520;
+/// The ceiling on one layer part, which the service reads from the model:
+/// `UploadLayerPart$layerPartBlob` is `@length(min: 0, max: 20971520)`
+/// (`smithy_query(query="operation", operation="UploadLayerPart")`), recorded once for
+/// the crate as [`state::MAX_LAYER_PART_BYTES`]. A `partSize` the client is told to send
+/// parts in therefore cannot exceed it.
+const MAX_LAYER_PART_BYTES: i64 = state::MAX_LAYER_PART_BYTES;
 
 /// A router with just this service mounted, plus the engine its state lives in.
-fn service_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn service_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The signature itself is not what these cases are about; the credential scope in
@@ -56,7 +58,11 @@ fn service_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -85,7 +91,12 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// A call that must succeed, returning its body.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &str) -> Value {
+pub(crate) async fn ok(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    case: &str,
+) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -95,17 +106,33 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &st
 }
 
 /// The modelled error code an `awsJson1_1` error body names.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"].as_str().unwrap_or_default().to_string()
 }
 
 /// The uploads the store holds, by upload id.
-fn stored_uploads(engine: &Arc<engine::InMemoryEngine>) -> BTreeMap<String, state::LayerUpload> {
+pub(crate) fn stored_uploads(
+    engine: &Arc<engine::InMemoryEngine>,
+) -> BTreeMap<String, state::LayerUpload> {
     state::service_state(&**engine)
         .expect("the ecr-public store is reachable from the engine the router was built over")
         .lock()
         .uploads
         .clone()
+}
+
+/// The layer bytes the store holds for ONE upload, or `None` when it holds no such
+/// upload: read under the lock so no other upload's bytes are copied.
+pub(crate) fn upload_bytes(
+    engine: &Arc<engine::InMemoryEngine>,
+    upload_id: &str,
+) -> Option<Vec<u8>> {
+    state::service_state(&**engine)
+        .expect("the ecr-public store is reachable from the engine the router was built over")
+        .lock()
+        .uploads
+        .get(upload_id)
+        .map(|upload| upload.received.clone())
 }
 
 /// Whether `candidate` has the layout the model gives `UploadId`:
@@ -125,7 +152,7 @@ fn is_upload_id(candidate: &str) -> bool {
 }
 
 /// Create the repository `name`, failing the case if the create does not succeed.
-async fn given_repository(router: &MultiServiceRouter, case: &str, name: &str) {
+pub(crate) async fn given_repository(router: &MultiServiceRouter, case: &str, name: &str) {
     ok(
         router,
         "CreateRepository",
@@ -395,6 +422,7 @@ async fn the_upload_past_the_cap_is_refused() {
                     repository_name: "capped".to_string(),
                     part_size: state::REPORTED_LAYER_PART_SIZE,
                     started_at: std::time::SystemTime::now(),
+                    received: Vec::new(),
                 },
             );
         }

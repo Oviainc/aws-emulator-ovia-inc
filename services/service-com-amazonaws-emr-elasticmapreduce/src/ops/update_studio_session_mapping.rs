@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStudioSessionMapping
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStudioSessionMapping`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStudioSessionMapping::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the session policy of the mapping the shared engine holds for the studio
+//! and identity the request names, so a later `GetStudioSessionMapping` reports the new
+//! policy and a later modification instant. A studio id no studio carries, a request
+//! naming neither or both of `IdentityId` and `IdentityName`, and an identity the
+//! studio is not mapped to are all refused with `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +168,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStudioSessionMapping` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStudioSessionMappingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStudioSessionMapping"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let refuse = |message: String| -> Self::Error {
+            UpdateStudioSessionMappingErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // "Either `IdentityName` or `IdentityId` must be specified, but not both."
+        let Some((_, _, identity)) = crate::state::session_mapping_identity(
+            input.identity_id.as_ref(),
+            input.identity_name.as_ref(),
+        ) else {
+            return Err(refuse(
+                "Either IdentityName or IdentityId must be specified, but not both".to_string(),
+            ));
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateStudioSessionMappingErrorModeled::InternalServerError(
+                    InternalServerError {},
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        if !store.studios.contains_key(&input.studio_id) {
+            return Err(refuse(format!(
+                "Studio id '{}' is not valid or does not exist.",
+                input.studio_id
+            )));
+        }
+
+        let key =
+            crate::state::session_mapping_key(&input.studio_id, &input.identity_type, &identity);
+        let Some(mapping) = store.studio_session_mappings.get_mut(&key) else {
+            return Err(refuse(format!(
+                "Studio '{}' has no session mapping for {} '{identity}'.",
+                input.studio_id, input.identity_type
+            )));
+        };
+
+        // Only the session policy changes; the identity and the creation instant are
+        // what the mapping was created with.
+        mapping.session_policy_arn = Some(input.session_policy_arn);
+        mapping.last_modified_time = Some(crate::state::timestamp(now));
+
+        Ok(UpdateStudioSessionMappingOutput)
     }
 }

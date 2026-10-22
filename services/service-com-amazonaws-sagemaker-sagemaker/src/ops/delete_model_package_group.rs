@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteModelPackageGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteModelPackageGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteModelPackageGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a model package group from this service's state, so a later
+//! `DescribeModelPackageGroup` reports it absent and the name becomes free again. A group
+//! that still holds registered model package versions is REFUSED rather than deleted: it
+//! is the container of those versions, and dropping it would orphan them.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +148,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteModelPackageGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteModelPackageGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteModelPackageGroup"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ModelPackageGroupName` is modelled `ArnOrName`: the caller may address the group
+        // by name or by its full ARN, and both name the same stored record — the same
+        // resolution `DescribeModelPackageGroup` performs.
+        let name = crate::state::name_from_arn_or_name(&input.model_package_group_name);
+
+        let mut store = state.lock();
+        let Some(group) = store.model_package_groups.get(name) else {
+            // Deleting a name no group is stored under is refused, never answered with an
+            // empty 200: a caller cannot tell that from a delete that removed something, so
+            // a cleanup loop could not tell whether the name was ever taken. The wording is
+            // `DescribeModelPackageGroup`'s, so one resolved identifier form reports the
+            // condition across this resource's operations.
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "model-package-group",
+                name,
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Model Package Group \"{arn}\" does not exist."
+            )));
+        };
+        let arn = group.arn.clone();
+
+        // The group is the CONTAINER of the versioned model packages registered into it
+        // (`ModelPackage::group_name`), so it cannot go while any version is still stored:
+        // those versions would be unreachable through the group they belong to, and a later
+        // create of the same name would adopt them. Recorded AWS classifies this refusal as
+        // a 400 `ValidationException` rather than as the modelled `ConflictException`.
+        let versions = store
+            .model_packages
+            .values()
+            .filter(|package| package.group_name.as_deref() == Some(name))
+            .count();
+        if versions > 0 {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Model Package Group \"{arn}\" cannot be deleted because it contains \
+                 {versions} model package version(s). Delete the model packages in the \
+                 group first."
+            )));
+        }
+
+        store.model_package_groups.remove(name);
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(DeleteModelPackageGroupOutput)
     }
 }

@@ -3,8 +3,8 @@
 //! @op ListReportVersions
 //! Enumerates every published version of ONE report as `ReportSummary`, in ascending
 //! version order. `@paginated(items: reports)`, so a page is cut at `maxResults` and
-//! `nextToken` carries the version number the next page resumes at. This handler only
-//! READS.
+//! `nextToken` carries an OPAQUE cursor naming the report and the version the next page
+//! resumes at (`crate::state::report_versions_token`). This handler only READS.
 //!
 //! The emulator models no IAM, so the modelled `AccessDeniedException` is never raised
 //! here: a pass is not a statement about an AWS-side authorisation decision.
@@ -169,15 +169,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The token names the report it was cut for and the version to resume at, so a
-        // token issued for another report, and a number a client made up, are both
-        // refused rather than honoured as an offset — with the service's one fixed
-        // invalid-token text, which does not say which of the two it was.
+        // The token is opaque, and it carries the report it was cut for, so a token
+        // issued for another report — and anything that does not decode to one of this
+        // operation's own cursors — is refused rather than honoured as an offset, with
+        // the service's one fixed invalid-token text, which does not say which it was.
         let resume_at = match input.next_token.as_deref() {
-            None => None,
+            None => 0usize,
             Some(token) => {
                 match crate::state::parse_report_versions_token(token, &input.report_id) {
-                    Some(version) => Some(version),
+                    Some(position) => position,
                     None => {
                         return Err(ListReportVersionsErrorModeled::ValidationException(
                             crate::state::invalid_token(),
@@ -201,17 +201,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut reports = Vec::with_capacity(page_size.min(report.versions.len()));
         let mut next_token = None;
-        for (version, record) in &report.versions {
-            // Resume at the first version at or after the token, so a page is still
-            // served when the version the token named was withdrawn meanwhile.
-            if resume_at.is_some_and(|resume| *version < resume) {
+        let mut position = 0usize;
+        for record in report.versions.values() {
+            // Resume at the cursor's POSITION in this operation's own ascending order, so
+            // a page is still served when the version the cursor was cut after was
+            // withdrawn meanwhile.
+            if position < resume_at {
+                position += 1;
                 continue;
             }
             if reports.len() >= page_size {
-                next_token = Some(crate::state::report_versions_token(&report.id, *version));
+                next_token = Some(crate::state::report_versions_token(&report.id, position));
                 break;
             }
             reports.push(report.to_summary(record, &region));
+            position += 1;
         }
 
         Ok(ListReportVersionsOutput {

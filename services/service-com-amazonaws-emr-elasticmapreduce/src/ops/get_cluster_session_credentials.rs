@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetClusterSessionCredentials
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetClusterSessionCredentials`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Resolves the cluster and then refuses, with the modelled `InvalidRequestException`,
+//! to issue credentials for an endpoint nothing serves.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetClusterSessionCredentials::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this operation returns is "temporary, HTTP basic credentials … used by a
+//! cluster with fine-grained access control activated", for connecting "to cluster
+//! endpoints that support username and password authentication" (its own model
+//! documentation). This emulator launches no cluster instances and serves no such
+//! endpoint, so there is no endpoint for a username and password to authenticate
+//! against: minting a pair here would be a credential for a service nothing runs.
+//! Both refusals are the one client error this operation models — a cluster id no
+//! cluster carries, and a cluster with no username/password endpoint — and they are
+//! told apart by their message, never by a 501.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +154,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetClusterSessionCredentials` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetClusterSessionCredentialsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetClusterSessionCredentials"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetClusterSessionCredentialsErrorModeled::InternalServerError(
+                InternalServerError {},
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The cluster is resolved first, so an id no cluster carries is refused as the
+        // client error it is rather than as a missing capability.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(
+                GetClusterSessionCredentialsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        error_code: None,
+                        message: Some(format!(
+                            "Cluster id '{}' is not valid or does not exist.",
+                            input.cluster_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The cluster exists, and it runs no instance and publishes no cluster
+        // endpoint that takes a username and password, so there is nothing for HTTP
+        // basic credentials to authenticate against. See this module's documentation.
+        Err(
+            GetClusterSessionCredentialsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster '{}' has no endpoint with fine-grained access control \
+                         activated, so no session credentials can be issued for it.",
+                        cluster.id
+                    )),
+                },
+            )
+            .into(),
+        )
     }
 }

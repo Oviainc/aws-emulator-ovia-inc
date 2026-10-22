@@ -18,11 +18,12 @@
 //!   from a monotonic counter, so a `BTreeMap` walk is a stable total order, which is
 //!   what a pagination token can index into without an entry being served twice or
 //!   skipped when another inquiry is created between pages.
-//! * `nextToken` is the inquiry id the next page RESUMES at, so the page starts at the
-//!   first id at or after it (an inquiry that left the store meanwhile does not strand
-//!   the page), and a token that is not an `InquiryId` was never issued by this
-//!   operation and is refused with the service's modelled invalid-token
-//!   `ValidationException`.
+//! * `nextToken` carries an OPAQUE cursor ([`crate::state::inquiries_page_token`]) over
+//!   that order rather than an inquiry id: the page starts at the first id at or after the
+//!   cursor (an inquiry that left the store meanwhile does not strand the page), and a
+//!   token that does not decode to one of THIS operation's cursors — a bare `InquiryId`
+//!   included — was never issued here and is refused with the service's modelled
+//!   invalid-token `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +174,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The token is the inquiry id the next page starts at, so anything that is not an
-        // `InquiryId` was never issued by this operation. A token this service did not
-        // issue is refused with the service's one fixed invalid-token text, the same as
-        // every other token member.
-        if let Some(token) = input.next_token.as_deref() {
-            if !crate::state::is_inquiry_id(token) {
-                return Err(ListComplianceInquiriesErrorModeled::ValidationException(
-                    crate::state::invalid_token(),
-                )
-                .into());
-            }
-        }
+        // A `nextToken` is opaque: the only thing it has to be is one of THIS operation's
+        // own cursors. Anything that does not decode to one was never issued here — a bare
+        // `InquiryId` included — and is refused with the service's one fixed invalid-token
+        // text, the same as every other token member.
+        let resume_at = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => match crate::state::parse_inquiries_page_token(token) {
+                Some(position) => position,
+                None => {
+                    return Err(ListComplianceInquiriesErrorModeled::ValidationException(
+                        crate::state::invalid_token(),
+                    )
+                    .into())
+                }
+            },
+        };
 
         let page_size = crate::state::page_size(input.max_results);
         let now = ::std::time::SystemTime::now();
@@ -193,18 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let capacity = page_size.min(store.inquiries.len());
         let mut compliance_inquiries = Vec::with_capacity(capacity);
         let mut next_token = None;
-        for (id, inquiry) in &mut store.inquiries {
-            // Resume at the first id at or after the token, so a page is still served
-            // when the inquiry the token named left the store meanwhile.
-            if input
-                .next_token
-                .as_deref()
-                .is_some_and(|token| id.as_str() < token)
-            {
+        let mut position = 0usize;
+        for inquiry in store.inquiries.values_mut() {
+            // Resume at the cursor's position in this operation's own reported order, so a
+            // page is still served when the inquiry it was cut after left the store.
+            if position < resume_at {
+                position += 1;
                 continue;
             }
             if compliance_inquiries.len() >= page_size {
-                next_token = Some(id.clone());
+                next_token = Some(crate::state::inquiries_page_token(position));
                 break;
             }
             // The only write a read may make: the transition the clock had already made
@@ -212,6 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the same inquiry at the same instant report the same status.
             inquiry.materialise(now);
             compliance_inquiries.push(inquiry.to_summary());
+            position += 1;
         }
 
         Ok(ListComplianceInquiriesOutput {

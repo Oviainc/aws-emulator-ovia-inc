@@ -542,7 +542,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get(token)
                 .and_then(|comment_id| repository.comments.get(comment_id))
             {
-                let unchanged = existing.content == input.content
+                // The token is judged against the request it was first accepted
+                // for, so a later edit of the comment does not turn a replay of
+                // that request into a mismatch.
+                let unchanged = existing.posted_content == input.content
                     && existing.comparison == comparison
                     && crate::state::location_key(existing.location.as_ref())
                         == crate::state::location_key(location.as_ref());
@@ -575,6 +578,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::CommentRecord {
             comment_id: crate::state::comment_id(&input.repository_name, sequence, now),
             content: input.content.clone(),
+            posted_content: input.content.clone(),
             in_reply_to: None,
             creation_date: now,
             last_modified_date: now,
@@ -583,6 +587,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_request_token: client_request_token.map(str::to_string),
             comparison,
             location,
+            // Reactions arrive through `PutCommentReaction`; a comment is posted
+            // with none.
+            reactions: std::collections::BTreeMap::new(),
             sequence,
         };
         if let Some(token) = client_request_token {

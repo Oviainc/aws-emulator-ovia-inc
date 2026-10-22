@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSessionEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSessionEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSessionEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports how a client reaches one STORED interactive session: the endpoint URL of the
+//! session the request names, and a freshly minted, time-limited authentication token
+//! for it ("Call this operation again when the authentication token expires to obtain a
+//! new token"). The session is the record [`crate::state`] holds — the one `StartSession`
+//! minted and `GetSession` reports — so nothing reported here is derived from the request
+//! beyond the two ids it uses to find that record.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +153,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSessionEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSessionEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSessionEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSessionEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the EMR Serverless application store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A report of the stored session's endpoint. The only write it performs on the
+        // store is materialising the state changes the clock already owed at this
+        // instant; the token it mints is handed to the caller and retained nowhere.
+        let record = store
+            .settled_mut(&input.application_id, now)
+            .ok_or_else(|| {
+                GetSessionEndpointErrorModeled::ResourceNotFoundException(
+                    crate::state::application_not_found(),
+                )
+            })?;
+        let session = record.sessions.get(&input.session_id).ok_or_else(|| {
+            GetSessionEndpointErrorModeled::ResourceNotFoundException(
+                crate::state::session_not_found(),
+            )
+        })?;
+
+        // "Use the endpoint and token to connect a client to the session": a session in
+        // a state it never leaves accepts no client, so it has no endpoint to connect
+        // to. The state judged is the one the session has SETTLED on, so a change the
+        // clock still owed never refuses a call the settled session admits.
+        if crate::state::is_terminal_session_state(&session.session.state) {
+            return Err(GetSessionEndpointErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Session {} is in {} state and has no endpoint to connect to",
+                        session.session.session_id, session.session.state
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Every id reported is the STORED session's own, never the request's.
+        let application_id = session.session.application_id.clone();
+        let session_id = session.session.session_id.clone();
+        let endpoint =
+            crate::state::session_endpoint_url(ctx.parts(), &region, &application_id, &session_id);
+        drop(store);
+
+        // A fresh token per call, which is what "Call this operation again when the
+        // authentication token expires to obtain a new token" asks of a client. Nothing
+        // in a service constructs a secret itself: the emulator's credential store mints
+        // it, and this operation reports it rather than inventing one.
+        let Some(auth_token) = crate::state::mint_session_auth_token(ctx.credential_store()) else {
+            return Err(GetSessionEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "no authentication token could be minted for the session".to_string(),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetSessionEndpointOutput {
+            application_id,
+            session_id,
+            endpoint,
+            auth_token,
+            auth_token_expires_at: crate::state::now_timestamp(crate::state::due_at(
+                now,
+                crate::state::SESSION_AUTH_TOKEN_VALIDITY,
+            )),
+        })
     }
 }

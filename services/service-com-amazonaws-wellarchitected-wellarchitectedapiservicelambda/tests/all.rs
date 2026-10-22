@@ -26,6 +26,9 @@ mod milestone_listing;
 #[path = "all/review_template_lifecycle.rs"]
 mod review_template_lifecycle;
 
+#[path = "all/share_invitations.rs"]
+mod share_invitations;
+
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 

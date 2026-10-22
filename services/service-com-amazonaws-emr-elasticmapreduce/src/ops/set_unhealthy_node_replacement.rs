@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetUnhealthyNodeReplacement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetUnhealthyNodeReplacement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetUnhealthyNodeReplacement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets `UnhealthyNodeReplacement` on every cluster the request names, so a later
+//! `DescribeCluster` reports the new value. Every id is resolved before anything is
+//! changed, so a request naming an unknown cluster changes nothing and is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +157,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetUnhealthyNodeReplacement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetUnhealthyNodeReplacementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetUnhealthyNodeReplacement"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // CHOSEN by analogy, not documented for this operation: EMR's `TerminateJobFlows`
+        // publishes "The maximum number of clusters allowed is 10" for the same kind of
+        // per-request batch of job flow ids, and this operation's own model publishes no
+        // bound at all. The same number caps this batch so neither pass below can be
+        // driven to arbitrary length while holding the shared lock; it is refused BEFORE
+        // the store is reached.
+        if input.job_flow_ids.len() > crate::state::MAX_TERMINATE_JOB_FLOW_IDS {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "JobFlowIds carries {} ids; at most {} clusters are allowed in one request",
+                input.job_flow_ids.len(),
+                crate::state::MAX_TERMINATE_JOB_FLOW_IDS
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SetUnhealthyNodeReplacementErrorModeled::InternalServerError(
+                InternalServerError {},
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // Resolve every id BEFORE changing anything, so a request naming one unknown
+        // id changes no cluster at all. This operation models no client error, so the
+        // refusal is the 400 `ValidationException` channel — the same one
+        // `TerminateJobFlows` answers an unknown job flow id with.
+        for job_flow_id in &input.job_flow_ids {
+            if !store.clusters.contains_key(job_flow_id) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Specified job flow ID not valid: '{job_flow_id}'"
+                )));
+            }
+        }
+
+        for job_flow_id in &input.job_flow_ids {
+            if let Some(cluster) = store.cluster_mut(job_flow_id, now) {
+                cluster.instances.unhealthy_node_replacement = input.unhealthy_node_replacement;
+            }
+        }
+        drop(store);
+
+        Ok(SetUnhealthyNodeReplacementOutput)
     }
 }

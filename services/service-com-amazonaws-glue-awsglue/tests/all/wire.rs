@@ -92,6 +92,23 @@ pub fn error_code(body: &Value) -> String {
         .to_string()
 }
 
+/// The names in a `GetTables` `TableList`, in the order the service returned them.
+///
+/// One copy, shared: every suite that pages over tables reads the list the same way.
+pub fn table_names(page: &Value) -> Vec<String> {
+    page["TableList"]
+        .as_array()
+        .expect("TableList is a list")
+        .iter()
+        .map(|table| {
+            table["Name"]
+                .as_str()
+                .expect("Table.Name is a string")
+                .to_string()
+        })
+        .collect()
+}
+
 /// Assert that every member of `sent` reappears, unchanged, on `got`. Recurses into
 /// nested structures so a member the server fills with its own default (an absent
 /// `Compressed`, say) is not read as a mismatch.

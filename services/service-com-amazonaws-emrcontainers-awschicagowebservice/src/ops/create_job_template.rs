@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateJobTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateJobTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a job template and persists it in [`crate::state`]: a fresh `ResourceIdString`
+//! id, the `JobTemplateArn` built from it, `createdAt = now` and the whole
+//! `jobTemplateData` tree the request carried, so `DescribeJobTemplate` and
+//! `ListJobTemplates` read it back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateJobTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `clientToken` is `@idempotencyToken`, so a token already spent on this operation does
+//! NOT mint a second template: the same request replayed — concurrently or later —
+//! answers with the template the first call minted, and the same token carrying a
+//! different request is refused with the modelled `ValidationException`
+//! ([`crate::state::job_template_fingerprint`] is what tells the two apart).
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +159,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateJobTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateJobTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateJobTemplate"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateJobTemplateError::Modeled(
+                CreateJobTemplateErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the job template store is unavailable".to_string()),
+                }),
+            )
+        })?;
+        let region = crate::state::request_region(ctx);
+        // Computed from the request BEFORE the store is locked: it depends on nothing in
+        // state, and the lock is what serialises racing creates that share one token.
+        let fingerprint = crate::state::job_template_fingerprint(
+            &input.name,
+            &input.job_template_data,
+            input.tags.as_ref(),
+            input.kms_key_arn.as_deref(),
+        );
+        let mut state = store.lock();
+        state.settle();
+
+        // `clientToken` is `@idempotencyToken`: a token already spent on this operation
+        // names the template the first call minted, so N racing identical creates all
+        // report ONE id and the store holds ONE template. The same token carrying a
+        // DIFFERENT request is not a replay — answering it with the first template would
+        // silently drop the parameters this call asked for — so it is refused.
+        let replayed = state
+            .replayed_idempotency(crate::state::CREATE_JOB_TEMPLATE_SCOPE, &input.client_token)
+            .cloned();
+        if let Some(existing) = replayed.and_then(|id| state.job_templates.get(&id)) {
+            if existing.request_fingerprint != fingerprint {
+                return Err(CreateJobTemplateErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "clientToken {} was already used to create job template {}, with different parameters",
+                            input.client_token, existing.id
+                        )),
+                    },
+                )
+                .into());
+            }
+            return Ok(CreateJobTemplateOutput {
+                id: Some(existing.id.clone()),
+                name: Some(existing.name.clone()),
+                arn: Some(existing.arn.clone()),
+                created_at: Some(crate::state::date_time(existing.created_at_millis)),
+            });
+        }
+
+        // The store is capped. A job template has no lifecycle state, so none of them is
+        // ever retired and there is nothing to reclaim: once every slot is taken the
+        // create is refused instead of growing the store without bound. The cap is the
+        // EMULATOR's own retention bound, not an AWS quota, so a test that drives the
+        // store to capacity sees an emulator-only condition reported through the only
+        // client error this operation models.
+        if !state.reserve_job_template() {
+            return Err(CreateJobTemplateErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "This emulator retains at most {} job templates; delete one and retry",
+                        crate::state::MAX_JOB_TEMPLATES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_id();
+        let sequence = state.id_counter;
+        let arn = crate::state::job_template_arn(&region, &id);
+        let created_at_millis = crate::state::now_millis();
+        // A job template is ready the moment it is stored: it holds `StartJobRun` values
+        // and provisions nothing, so it has no state member and owes the clock no
+        // transition.
+        let record = crate::state::JobTemplateRecord {
+            id: id.clone(),
+            name: input.name.clone(),
+            arn: arn.clone(),
+            created_at_millis,
+            tags: input.tags.unwrap_or_default(),
+            job_template_data: input.job_template_data,
+            // Persisted as submitted, not resolved against KMS: this emulator holds no
+            // keys, and nothing about the stored template is encrypted.
+            kms_key_arn: input.kms_key_arn,
+            client_token: input.client_token,
+            request_fingerprint: fingerprint,
+            sequence,
+        };
+        // `insert_job_template` is what writes the `(CreateJobTemplate, clientToken) ->
+        // id` entry the replay lookup above reads, in this same lock, so a record can
+        // never be stored without the token that minted it being spent.
+        state.insert_job_template(record);
+
+        Ok(CreateJobTemplateOutput {
+            id: Some(id),
+            name: Some(input.name),
+            arn: Some(arn),
+            created_at: Some(crate::state::date_time(created_at_millis)),
+        })
     }
 }
