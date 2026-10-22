@@ -4,7 +4,9 @@
 //!
 //! The Application records every application operation reads and writes live here, so
 //! `CreateApplication`, `GetApplication`, `ListApplications`, `UpdateApplication` and
-//! `DeleteApplication` all see one copy of each resource. The helpers below (identity
+//! `DeleteApplication` all see one copy of each resource. The target domain records
+//! live here for the same reason: `CreateTargetDomain` writes one and
+//! `BatchGetTargetDomains` reads that same record back. The helpers below (identity
 //! minting, the IdC application ARN, the modelled projections and the pagination cursor
 //! codec) are shared by those handlers rather than duplicated per operation.
 //!
@@ -21,8 +23,9 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    AWSResources, AgentSpace, ApplicationSummary, CodeReviewSettings, IdCConfiguration,
-    SecurityRequirementPackSummary,
+    AWSResources, AgentSpace, ApplicationSummary, CodeReviewSettings, DnsVerification,
+    HttpVerification, IdCConfiguration, SecurityRequirementPackSummary, TargetDomain,
+    VerificationDetails,
 };
 
 /// The region every value this service derives from the request's region carries when
@@ -53,6 +56,81 @@ pub const MAX_PAGE_SIZE: i32 = 100;
 /// set far above any plausible client's application count, so normal use never meets
 /// it, while the store a caller can grow stays bounded.
 pub const MAX_APPLICATIONS: usize = 1_000;
+
+/// The most target domains this emulator stores for the account before
+/// `CreateTargetDomain` answers the service's `ServiceQuotaExceededException`.
+///
+/// CHOSEN, not cited, for the same reason as [`MAX_APPLICATIONS`]: the real service's
+/// target domain quota is not in the model. It is set far above any plausible client's
+/// domain count, so normal use never meets it, while the store a caller can grow stays
+/// bounded.
+pub const MAX_TARGET_DOMAINS: usize = 1_000;
+
+/// The longest a `targetDomainName` may be.
+///
+/// NOT chosen: `targetDomainName` carries no `@length` in the model, but the operation
+/// registers a web domain, and a DNS name is at most 253 characters in presentation
+/// form (RFC 1035 §2.3.4 with RFC 1123 §2.1).
+pub const MAX_DOMAIN_NAME_LEN: usize = 253;
+
+/// The longest one dot-separated label of a `targetDomainName` may be — 63 characters
+/// (RFC 1035 §2.3.4).
+pub const MAX_DOMAIN_LABEL_LEN: usize = 63;
+
+/// The `DomainVerificationMethod` that verifies ownership through a DNS TXT record
+/// (source: `smithy_query(query="shape",shape="DomainVerificationMethod")`).
+pub const VERIFICATION_METHOD_DNS_TXT: &str = "DNS_TXT";
+
+/// The `DomainVerificationMethod` that verifies ownership through an HTTP route.
+pub const VERIFICATION_METHOD_HTTP_ROUTE: &str = "HTTP_ROUTE";
+
+/// The `DomainVerificationMethod` that verifies ownership by IP from a private VPC.
+pub const VERIFICATION_METHOD_PRIVATE_VPC: &str = "PRIVATE_VPC";
+
+/// Every value the `DomainVerificationMethod` enum admits, in the model's order
+/// (source: `smithy_query(query="shape",shape="DomainVerificationMethod")`), so a
+/// value outside the enum is refused rather than stored and read back as a method
+/// with no challenge.
+pub const VERIFICATION_METHOD_VALUES: [&str; 3] = [
+    VERIFICATION_METHOD_DNS_TXT,
+    VERIFICATION_METHOD_HTTP_ROUTE,
+    VERIFICATION_METHOD_PRIVATE_VPC,
+];
+
+/// The `TargetDomainStatus` a registered target domain carries until its ownership is
+/// verified (source: the `PENDING` value's own doc, "Domain verification is pending").
+///
+/// A target domain does NOT leave this status on a timer: the model documents that
+/// ownership is proven by a record the domain's owner publishes, which nothing inside
+/// this emulator can observe, so the status moves only when a verification call finds
+/// that proof.
+pub const TARGET_DOMAIN_STATUS_PENDING: &str = "PENDING";
+
+/// The label prefixed onto the domain to name the TXT record a `DNS_TXT` target
+/// domain's owner publishes.
+///
+/// CHOSEN, not cited: the model pins the record TYPE (`DNSRecordType` admits only
+/// `TXT`) and says the details carry "the name of the DNS record to create for
+/// verification", but not which label the real service picks. An underscore-prefixed
+/// label cannot collide with a hostname the domain already serves.
+const DNS_CHALLENGE_LABEL: &str = "_securityagent-challenge";
+
+/// The type of that record. NOT chosen: `DNSRecordType` admits exactly one value,
+/// `TXT` ("Currently, only TXT is supported").
+const DNS_CHALLENGE_RECORD_TYPE: &str = "TXT";
+
+/// The directory of the HTTP route an `HTTP_ROUTE` target domain's owner serves its
+/// token at; the token itself is the last segment, so two target domains never share
+/// one path.
+///
+/// CHOSEN, not cited: the model says the details carry "the HTTP route path where the
+/// verification token must be served" without pinning the path. It sits under the
+/// `/.well-known/` prefix reserved for exactly this kind of challenge (RFC 8615).
+const HTTP_CHALLENGE_ROUTE_PREFIX: &str = "/.well-known/securityagent-domain-verification";
+
+/// The domain-separation prefix hashed into every verification token, so a token can
+/// only ever stand for a target domain of this service.
+const VERIFICATION_TOKEN_CONTEXT: &str = "securityagent-domain-verification:";
 
 /// The most agent spaces this emulator stores for the account before
 /// `CreateAgentSpace` answers the service's `ServiceQuotaExceededException`.
@@ -267,6 +345,147 @@ pub struct ApplicationIdentity {
     pub sequence: u64,
 }
 
+/// One registered target domain: a web domain that must be verified before a pentest
+/// may target it.
+#[derive(Debug, Clone)]
+pub struct TargetDomainRecord {
+    pub target_domain_id: String,
+    /// The domain name the caller registered, as supplied.
+    pub domain_name: String,
+    /// The `DomainVerificationMethod` ownership is to be proven with.
+    pub verification_method: String,
+    /// The record's `TargetDomainStatus`.
+    pub verification_status: String,
+    pub verification_status_reason: Option<String>,
+    /// The token this service minted for the owner to publish. Stored, not recomputed
+    /// per read, so every projection of the record carries the same token.
+    pub verification_token: String,
+    /// The tags supplied at create time, persisted so the tagging operations have
+    /// state to read once they are implemented.
+    pub tags: BTreeMap<String, String>,
+    pub created_at: SystemTime,
+    /// When ownership was proven; `None` while the record is not `VERIFIED`.
+    pub verified_at: Option<SystemTime>,
+}
+
+impl TargetDomainRecord {
+    /// A newly registered target domain: `PENDING`, carrying the challenge its chosen
+    /// verification method requires and no verification time yet.
+    pub fn pending(
+        identity: TargetDomainIdentity,
+        domain_name: String,
+        verification_method: String,
+        tags: BTreeMap<String, String>,
+    ) -> Self {
+        let mut record = Self {
+            target_domain_id: identity.target_domain_id,
+            domain_name,
+            verification_method,
+            verification_status: TARGET_DOMAIN_STATUS_PENDING.to_string(),
+            verification_status_reason: None,
+            verification_token: identity.verification_token,
+            tags,
+            created_at: SystemTime::now(),
+            verified_at: None,
+        };
+        // The reason names the challenge, which is built from the minted token, so it
+        // is computed once the rest of the record exists.
+        record.verification_status_reason = Some(record.pending_status_reason());
+        record
+    }
+
+    /// The name of the TXT record a `DNS_TXT` target domain's owner publishes.
+    pub fn dns_record_name(&self) -> String {
+        format!("{DNS_CHALLENGE_LABEL}.{}", self.domain_name)
+    }
+
+    /// The path an `HTTP_ROUTE` target domain's owner serves the token at.
+    pub fn http_route_path(&self) -> String {
+        format!("{HTTP_CHALLENGE_ROUTE_PREFIX}/{}", self.verification_token)
+    }
+
+    /// Why this record is still `PENDING`: what the domain's owner has to do before a
+    /// verification call can find the proof.
+    fn pending_status_reason(&self) -> String {
+        match self.verification_method.as_str() {
+            VERIFICATION_METHOD_DNS_TXT => format!(
+                "Awaiting domain ownership verification: publish a {DNS_CHALLENGE_RECORD_TYPE} \
+                 record named {} whose value is the verification token",
+                self.dns_record_name()
+            ),
+            VERIFICATION_METHOD_HTTP_ROUTE => format!(
+                "Awaiting domain ownership verification: serve the verification token at \
+                 https://{}{}",
+                self.domain_name,
+                self.http_route_path()
+            ),
+            // The remaining enum member, `PRIVATE_VPC`, proves ownership by IP from
+            // inside the VPC that reaches the domain, so there is nothing to publish
+            // on the domain itself. No other value reaches a stored record:
+            // `verification_method_violation` refuses anything outside the enum before
+            // the record is created.
+            _ => "Awaiting domain ownership verification from the private VPC that reaches \
+                  this domain"
+                .to_string(),
+        }
+    }
+
+    /// The challenge this record's verification method requires, as the modelled
+    /// [`VerificationDetails`] shape.
+    ///
+    /// Exactly one of the per-method members is present, and only for a method that
+    /// has a challenge to publish: `PRIVATE_VPC` is verified by IP from the VPC, so it
+    /// carries the method alone.
+    pub fn verification_details(&self) -> VerificationDetails {
+        let mut details = VerificationDetails {
+            method: Some(self.verification_method.clone()),
+            dns_txt: None,
+            http_route: None,
+        };
+        match self.verification_method.as_str() {
+            VERIFICATION_METHOD_DNS_TXT => {
+                details.dns_txt = Some(DnsVerification {
+                    token: Some(self.verification_token.clone()),
+                    dns_record_name: Some(self.dns_record_name()),
+                    dns_record_type: Some(DNS_CHALLENGE_RECORD_TYPE.to_string()),
+                })
+            }
+            VERIFICATION_METHOD_HTTP_ROUTE => {
+                details.http_route = Some(HttpVerification {
+                    token: Some(self.verification_token.clone()),
+                    route_path: Some(self.http_route_path()),
+                })
+            }
+            // `PRIVATE_VPC` (the only other enum member a stored record can carry)
+            // publishes no challenge, so it keeps the method alone.
+            _ => {}
+        }
+        details
+    }
+
+    /// This target domain projected onto the modelled [`TargetDomain`] shape the reads
+    /// return: the stored record's own fields, never request input.
+    pub fn modelled(&self) -> TargetDomain {
+        TargetDomain {
+            target_domain_id: self.target_domain_id.clone(),
+            domain_name: self.domain_name.clone(),
+            verification_status: Some(self.verification_status.clone()),
+            verification_status_reason: self.verification_status_reason.clone(),
+            verification_details: Some(self.verification_details()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            verified_at: self.verified_at.map(::aws_smithy_types::DateTime::from),
+        }
+    }
+}
+
+/// The identity minted for a new target domain: the two values that are the service's
+/// to choose rather than the caller's to supply.
+#[derive(Debug, Clone)]
+pub struct TargetDomainIdentity {
+    pub target_domain_id: String,
+    pub verification_token: String,
+}
+
 /// Per-service state for com-amazonaws-securityagent-securityagent. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSecurityagentSecurityagentState {
@@ -278,6 +497,13 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// Monotonic counter behind every minted `applicationId`, so two
     /// `CreateApplication` calls are two distinct records.
     pub next_application_seq: u64,
+    /// Every registered target domain, keyed by its `targetDomainId`. A `BTreeMap` for
+    /// the same reason as [`Self::applications`]: one stable order for the reads that
+    /// walk the whole set.
+    pub target_domains: BTreeMap<String, TargetDomainRecord>,
+    /// Monotonic counter behind every minted `targetDomainId`, so two
+    /// `CreateTargetDomain` calls are two distinct records.
+    pub next_target_domain_seq: u64,
     /// Every stored agent space, keyed by its `agentSpaceId`. A `BTreeMap` for the
     /// same reason as [`Self::applications`]: one stable order for a list read to walk
     /// and to resume a cursor in.
@@ -315,6 +541,23 @@ impl ComAmazonawsSecurityagentSecurityagentState {
         }
     }
 
+    /// Mint the identity of a new target domain.
+    ///
+    /// The id is 32 lowercase hex characters drawn from the monotonic counter, so it is
+    /// unique within the process and the reads' ordering is the registration order. The
+    /// The token is derived from that id alone — never from request text — so it is
+    /// unique per record and carries nothing the caller sent. It is DETERMINISTIC by
+    /// design (a hash of the record's ordinal, so a test can recompute it); it is NOT
+    /// an unpredictable secret the way the real service's challenge token is.
+    pub fn mint_target_domain_identity(&mut self) -> TargetDomainIdentity {
+        self.next_target_domain_seq = self.next_target_domain_seq.wrapping_add(1);
+        let target_domain_id = format!("{:032x}", self.next_target_domain_seq);
+        TargetDomainIdentity {
+            verification_token: verification_token(&target_domain_id),
+            target_domain_id,
+        }
+    }
+
     /// Mint the `agentSpaceId` of a new agent space.
     ///
     /// Opaque to the caller — `AgentSpaceId` carries neither a `@pattern` nor a
@@ -340,6 +583,87 @@ impl ComAmazonawsSecurityagentSecurityagentState {
             self.next_security_requirement_pack_seq.wrapping_add(1);
         format!("{:032x}", self.next_security_requirement_pack_seq)
     }
+}
+
+/// The verification token the owner of a target domain publishes: the SHA-256 of the
+/// service-minted `targetDomainId` under a domain-separation prefix, hex-encoded.
+///
+/// Derived from the minted id rather than from the request, so it carries no caller
+/// text, is unique per record and is the same on every projection of that record.
+/// Because that id is the record's ordinal in this process, the token is a
+/// deterministic, test-reproducible value — emulator-grade, not an unpredictable
+/// secret: nothing here should be read as modelling the real challenge token's
+/// unforgeability.
+fn verification_token(target_domain_id: &str) -> String {
+    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(
+        format!("{VERIFICATION_TOKEN_CONTEXT}{target_domain_id}").as_bytes(),
+    );
+    hex::encode(digest)
+}
+
+/// Why `name` is not a domain name this service can register as a target domain, or
+/// `None` when it is one.
+///
+/// `targetDomainName` is a bare `String` in the model — no `@length`, no `@pattern` —
+/// so this rule is a CHOSEN refusal of input the model admits: what the operation
+/// registers is "a web domain", i.e. a DNS name, and a value that cannot name a domain
+/// could never be verified, so it is refused at the door instead of being stored.
+///
+/// A name is one when, ignoring the optional single trailing dot of the rooted form,
+/// it is at most [`MAX_DOMAIN_NAME_LEN`] bytes and made of non-empty dot-separated
+/// labels of at most [`MAX_DOMAIN_LABEL_LEN`] bytes drawn from letters, digits and
+/// hyphens, none of them starting or ending with a hyphen (RFC 1035 §2.3.1/§2.3.4 with
+/// RFC 1123 §2.1, which is also why an underscore label — legal in a DNS zone but not
+/// in a hostname — is not a web domain). Both bounds are measured in bytes, which is
+/// the unit the RFCs state them in and, for a name this rule accepts, the same as
+/// characters. The returned text is the constraint the value missed, for the refusal's
+/// `fieldList` entry.
+pub fn target_domain_name_violation(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("must not be empty".to_string());
+    }
+    // The rooted form `example.com.` names the same domain as `example.com`, so the
+    // one trailing dot is not part of the name being checked.
+    let name = name.strip_suffix('.').unwrap_or(name);
+    if name.len() > MAX_DOMAIN_NAME_LEN {
+        return Some(format!(
+            "must have length less than or equal to {MAX_DOMAIN_NAME_LEN}"
+        ));
+    }
+    for label in name.split('.') {
+        if label.is_empty() {
+            return Some("must not carry an empty label".to_string());
+        }
+        if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Some(
+                "must be a domain name built from letters, digits, hyphens and dots".to_string(),
+            );
+        }
+        if label.len() > MAX_DOMAIN_LABEL_LEN {
+            return Some(format!(
+                "must carry labels of at most {MAX_DOMAIN_LABEL_LEN} characters"
+            ));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Some("must not carry a label that starts or ends with a hyphen".to_string());
+        }
+    }
+    None
+}
+
+/// Why `method` is not a `DomainVerificationMethod` this service can act on, or `None`
+/// when it is one of [`VERIFICATION_METHOD_VALUES`].
+///
+/// The model declares the member as an enum, so a conforming client never sends
+/// anything else; checking it here means an unmodelled value is refused rather than
+/// stored and projected back as a method with no challenge to publish.
+pub fn verification_method_violation(method: &str) -> Option<String> {
+    (!VERIFICATION_METHOD_VALUES.contains(&method)).then(|| {
+        format!(
+            "must satisfy enum value set: [{}]",
+            VERIFICATION_METHOD_VALUES.join(", ")
+        )
+    })
 }
 
 /// The ARN of the IAM Identity Center application this emulator stands up for an

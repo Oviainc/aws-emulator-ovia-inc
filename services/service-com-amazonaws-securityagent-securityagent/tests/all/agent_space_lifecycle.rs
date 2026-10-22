@@ -22,7 +22,7 @@ use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::application_lifecycle::{call, emulator, member, ok};
+use crate::support::{call, emulator, member, ok};
 
 /// The members `CreateAgentSpace` takes from the request and every read of the agent
 /// space reports unchanged.

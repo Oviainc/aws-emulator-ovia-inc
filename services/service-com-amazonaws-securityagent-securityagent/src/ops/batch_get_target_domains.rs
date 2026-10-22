@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetTargetDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetTargetDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetTargetDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the stored target domains named by `targetDomainIds`, projecting each onto
+//! the modelled `TargetDomain` shape and reporting the ids the store does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -76,9 +70,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 // here — hence the `BatchGetTargetDomainsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#BatchGetTargetDomains")]
+//
+// `BatchGetTargetDomains` lists no errors of its own, so the one service-wide shape
+// this handler needs is widened in with `extra_errors`: `InternalServerException`
+// (HTTP 500). An id the store does not hold is NOT an error here — the output models a
+// `notFound` list for exactly that.
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#BatchGetTargetDomains",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum BatchGetTargetDomainsErrorModeled {
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -132,18 +135,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetTargetDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetTargetDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetTargetDomains"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetTargetDomainsErrorModeled::InternalServerException(InternalServerException {
+                message: "the target domain store is unavailable".to_string(),
+            })
+        })?;
+        // A read (`@readonly`): it resolves each id and projects the record, and writes
+        // nothing — a later caller sees exactly what it saw.
+        let state = state.lock();
+
+        // The caller's order is kept, so an id's answer is at the position it asked at;
+        // every id lands in exactly one of the two lists.
+        let mut target_domains = Vec::new();
+        let mut not_found = Vec::new();
+        for target_domain_id in &input.target_domain_ids {
+            match state.target_domains.get(target_domain_id) {
+                Some(record) => target_domains.push(record.modelled()),
+                None => not_found.push(target_domain_id.clone()),
+            }
+        }
+
+        Ok(BatchGetTargetDomainsOutput {
+            target_domains: Some(target_domains),
+            not_found: Some(not_found),
+        })
     }
 }

@@ -35,7 +35,7 @@ use service_com_amazonaws_securityagent_securityagent::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::application_lifecycle::{call, emulator, member};
+use crate::support::{call, emulator, member};
 
 /// `call`, requiring `expected` as the HTTP status and naming the case when it is not.
 ///
