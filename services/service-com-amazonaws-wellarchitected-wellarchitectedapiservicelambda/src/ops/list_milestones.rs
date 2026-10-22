@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMilestones
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMilestones`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMilestones::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the milestones recorded against one workload, in
+//! `MilestoneNumber` order, each projected to `MilestoneSummary`. The path `WorkloadId`
+//! is resolved by lookup — an id no workload carries is `ResourceNotFoundException`
+//! (404) — and a `NextToken` this service did not issue is `ValidationException` (400).
+//! Reporting only: the `NextToken` it emits carries the whole cursor, so listing never
+//! writes to state.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +149,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMilestones` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMilestonesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMilestones"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMilestonesErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        let page_size = crate::state::page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // A token is this service's own cursor, not a value a caller composes: it cannot
+        // be corrected, only obtained again, so the refusal is classified `CANNOT_PARSE`
+        // ("restart the pagination") rather than as a field rule to fix — and it still
+        // names the member whose value could not be decoded.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_milestone_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListMilestonesErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let store = state.lock();
+        // "List all milestones for an existing workload": the path id is resolved by this
+        // lookup, so an id no workload carries is the lookup's 404 whatever its syntax —
+        // never an empty page.
+        if !store.workloads.contains_key(&input.workload_id) {
+            return Err(ListMilestonesErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+            .into());
+        }
+
+        // Milestone numbers are handed out from 1 upwards and never reused, so the stored
+        // key order IS this service's list order and a cursor is a single number. It is
+        // start-EXCLUSIVE: the page resumes just past the last number already returned, so
+        // every milestone is enumerated exactly once across the pages.
+        let remaining: Vec<&crate::state::MilestoneRecord> = store
+            .milestones
+            .get(&input.workload_id)
+            .map(|milestones| {
+                milestones
+                    .range(cursor.map_or(i32::MIN.., |last| last.saturating_add(1)..))
+                    .map(|(_, record)| record)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let page = &remaining[..remaining.len().min(page_size)];
+        let next_token = match page.last() {
+            Some(last) if remaining.len() > page.len() => Some(
+                crate::state::encode_milestone_next_token(last.milestone_number),
+            ),
+            _ => None,
+        };
+        let milestone_summaries: Vec<MilestoneSummary> = page
+            .iter()
+            .map(|record| record.to_summary())
+            .collect();
+
+        Ok(ListMilestonesOutput {
+            workload_id: Some(input.workload_id),
+            milestone_summaries: Some(milestone_summaries),
+            next_token,
+        })
     }
 }

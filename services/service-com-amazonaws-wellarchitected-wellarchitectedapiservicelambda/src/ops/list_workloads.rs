@@ -150,14 +150,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
-        // for a full page, so the modelled maximum is the default. The clamp restates that
-        // bound in the handler, so the page size is in 1..=50 whatever reaches here.
-        let clamped = input
-            .max_results
-            .unwrap_or(MAX_RESULTS_CEILING)
-            .clamp(1, MAX_RESULTS_CEILING);
-        let page_size = usize::try_from(clamped)
-            .expect("MaxResults is clamped into 1..=50, which always fits in a usize");
+        // for a full page, so the modelled maximum is the default.
+        let page_size = crate::state::page_size(input.max_results);
 
         // An opaque token this service did not issue is a bad request, not an empty page.
         // A token is this service's own cursor, not a value a caller composes: it cannot
@@ -171,8 +165,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(ListWorkloadsErrorModeled::ValidationException(
                         crate::state::cannot_parse_exception(
-                            NEXT_TOKEN_MEMBER,
-                            INVALID_NEXT_TOKEN_MESSAGE,
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
                         ),
                     )
                     .into());
@@ -220,15 +214,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The largest page `ListWorkloads` serves, and the page size a request that omits
-/// `MaxResults` gets: the modelled `MaxResults` `@range(min: 1, max: 50)` maximum
-/// (`smithy_query(query="operation", operation="ListWorkloads")`).
-const MAX_RESULTS_CEILING: i32 = 50;
-
-/// What a `NextToken` this service did not issue is answered with. The token is this
-/// service's own opaque cursor, so the only thing a caller can do is start the
-/// pagination again — which is what `CANNOT_PARSE` tells it.
-const INVALID_NEXT_TOKEN_MESSAGE: &str = "The next token that was passed in is invalid.";
-
-/// The member an undecodable-token finding names (`ListWorkloadsInput$NextToken`).
-const NEXT_TOKEN_MEMBER: &str = "NextToken";
