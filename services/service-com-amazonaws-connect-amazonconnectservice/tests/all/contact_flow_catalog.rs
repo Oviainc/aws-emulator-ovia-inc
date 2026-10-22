@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connect_amazonconnectservice::state::{
-    CONTACT_FLOW_STATUS_PUBLISHED, CONTACT_FLOW_STATUS_SAVED,
+    CONTACT_FLOW_STATUS_PUBLISHED, CONTACT_FLOW_STATUS_SAVED, DEFAULT_CONTACT_FLOWS,
     LIST_CONTACT_FLOWS_DEFAULT_PAGE_SIZE,
 };
 
@@ -85,6 +85,25 @@ impl Connect {
                 .to_string(),
         )
     }
+}
+
+/// Every flow id the instance owns before this suite stores one: the default flows
+/// `CreateInstance` provisions, which a list rule has to account for because they are
+/// stored flows of the instance like any other.
+async fn default_flow_ids(connect: &Connect, instance_id: &str) -> BTreeSet<String> {
+    let (status, listed) = connect
+        .list_contact_flows(instance_id, None, None, &[])
+        .await;
+    assert_eq!(status, 200, "ListContactFlows of the defaults got {listed}");
+    let ids: BTreeSet<String> = ids_of(&listed["ContactFlowSummaryList"], "Id")
+        .into_iter()
+        .collect();
+    assert_eq!(
+        ids.len(),
+        DEFAULT_CONTACT_FLOWS.len(),
+        "a new instance owns the default flows, got {listed}"
+    );
+    ids
 }
 
 /// Walk `ListContactFlows` to exhaustion, returning every id seen and the page count.
@@ -161,6 +180,7 @@ async fn every_stored_flow_is_summarised_once_from_its_own_instance() {
         })
         .collect();
 
+    let defaults = default_flow_ids(&connect, &instance_id).await;
     let mut expected: Vec<(String, String, String, String, String)> = Vec::new();
     for (case, name, flow_type, sent, status) in &cases {
         let (id, arn) = connect
@@ -194,8 +214,9 @@ async fn every_stored_flow_is_summarised_once_from_its_own_instance() {
         .expect("ContactFlowSummaryList");
     assert_eq!(
         summaries.len(),
-        expected.len(),
-        "every stored flow is summarised exactly once, got {listed}"
+        expected.len() + defaults.len(),
+        "every stored flow — the instance's defaults and the ones created here — is \
+         summarised exactly once, got {listed}"
     );
 
     for (id, arn, name, flow_type, flow_status) in &expected {
@@ -223,28 +244,35 @@ async fn every_stored_flow_is_summarised_once_from_its_own_instance() {
         );
     }
 
-    // The other instance reports its own flow and nothing else.
+    // The other instance reports its own flow — and its own defaults — and nothing else.
     let (_, elsewhere) = connect.list_contact_flows(&other_id, None, None, &[]).await;
-    let names: Vec<String> = ids_of(&elsewhere["ContactFlowSummaryList"], "Name");
+    let names: BTreeSet<String> = ids_of(&elsewhere["ContactFlowSummaryList"], "Name")
+        .into_iter()
+        .collect();
+    let wanted: BTreeSet<String> = DEFAULT_CONTACT_FLOWS
+        .iter()
+        .map(|default| default.name.to_string())
+        .chain(["elsewhere".to_string()])
+        .collect();
     assert_eq!(
-        names,
-        vec!["elsewhere".to_string()],
+        names, wanted,
         "a list is scoped to its own instance, got {elsewhere}"
     );
 
-    // An instance with no flows reports an empty list, not a refusal.
-    let (empty_id, _) = connect.create_instance(connect_managed("empty")).await;
-    let (status, empty) = connect.list_contact_flows(&empty_id, None, None, &[]).await;
-    assert_eq!(status, 200, "an empty instance lists 200, got {empty}");
+    // An instance nobody has created a flow in reports exactly its default flows, not a
+    // refusal: the whole default inventory is covered by `instance_default_resources`.
+    let (fresh_id, _) = connect.create_instance(connect_managed("fresh")).await;
+    let (status, fresh) = connect.list_contact_flows(&fresh_id, None, None, &[]).await;
+    assert_eq!(status, 200, "a fresh instance lists 200, got {fresh}");
     assert_eq!(
-        empty["ContactFlowSummaryList"],
-        json!([]),
-        "an instance with no flows reports an empty list, got {empty}"
+        ids_of(&fresh["ContactFlowSummaryList"], "Id").len(),
+        DEFAULT_CONTACT_FLOWS.len(),
+        "a fresh instance reports its default flows, got {fresh}"
     );
     assert_eq!(
-        empty["NextToken"],
+        fresh["NextToken"],
         Value::Null,
-        "an empty list carries no NextToken, got {empty}"
+        "a single-page list carries no NextToken, got {fresh}"
     );
 }
 
@@ -322,7 +350,9 @@ async fn list_pages_cover_every_flow_exactly_once() {
         let connect = Connect::new();
         let (instance_id, _) = connect.create_instance(connect_managed("flows")).await;
 
-        let mut created: BTreeSet<String> = BTreeSet::new();
+        // The instance's default flows are stored flows too, so the pages must cover
+        // them beside the ones this row creates.
+        let mut created: BTreeSet<String> = default_flow_ids(&connect, &instance_id).await;
         for index in 0..population {
             let (id, _) = connect
                 .store_flow(
@@ -352,7 +382,8 @@ async fn list_pages_cover_every_flow_exactly_once() {
             seen, sorted,
             "case {case:?}: the pages must walk the store in id order, got {seen:?}"
         );
-        let expected_pages = page_size.map_or(1, |size| population.div_ceil(size as usize).max(1));
+        let expected_pages =
+            page_size.map_or(1, |size| created.len().div_ceil(size as usize).max(1));
         assert_eq!(
             pages, expected_pages,
             "case {case:?}: expected {expected_pages} pages, got {pages}"
@@ -368,8 +399,10 @@ async fn an_unpaginated_list_serves_the_documented_default_page_size() {
     let connect = Connect::new();
     let (instance_id, _) = connect.create_instance(connect_managed("flows")).await;
 
+    // One flow past the default page size in total, the instance's own default flows
+    // included: the rule is about the page size, so what matters is the population.
     let population = LIST_CONTACT_FLOWS_DEFAULT_PAGE_SIZE + 1;
-    for index in 0..population {
+    for index in 0..(population - DEFAULT_CONTACT_FLOWS.len()) {
         connect
             .store_flow(&instance_id, &format!("flow{index:04}"), "CONTACT_FLOW", None)
             .await;

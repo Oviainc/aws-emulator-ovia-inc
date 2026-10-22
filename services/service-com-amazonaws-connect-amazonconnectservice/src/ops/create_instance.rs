@@ -8,6 +8,12 @@
 //! repeated `ClientToken` returns the instance that token already minted rather than a
 //! second one.
 //!
+//! A created instance is a complete contact center, so this handler also provisions the
+//! resources an instance is born with — the default contact flows, the default
+//! `STANDARD` queue and the hours of operation that queue is attached to — through
+//! [`crate::state::seed_instance_defaults`], which is why `ListContactFlows` and
+//! `ListQueues` answer non-empty for an instance nobody has created anything in.
+//!
 //! The model marks only `IdentityManagementType` and the two call flags required, and
 //! states no conditional rule tying `InstanceAlias` or `DirectoryId` to a chosen
 //! identity-management type, so this handler refuses neither combination: a rule the
@@ -236,9 +242,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: crate::state::tags_in(input.tags),
             queues: ::std::collections::BTreeMap::new(),
             contact_flows: ::std::collections::BTreeMap::new(),
+            hours_of_operations: ::std::collections::BTreeMap::new(),
         };
 
         store.instances.insert(id.clone(), record);
+
+        // A created instance is a complete contact center, not an empty shell: it owns
+        // the default contact flows, the default STANDARD queue and the hours of
+        // operation that queue is attached to from the moment it exists, so a client
+        // that discovers a flow or a queue to route to finds the instance's own.
+        crate::state::seed_instance_defaults(&mut store, &id, now);
+
         if let Some(token) = client_token {
             store.client_tokens.insert(token, id.clone());
         }
