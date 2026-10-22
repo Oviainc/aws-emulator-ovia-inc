@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateModelCard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateModelCard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateModelCard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a model card in `crate::state` under its `ModelCardName` with
+//! version 1, minting the `ModelCardArn` from the request's region, and refuses a name
+//! already in use with the modelled `ConflictException`. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +149,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateModelCard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateModelCardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateModelCard"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `Content` must be "in model card JSON schema and provided as a string", and
+        // the model bounds only its length — so this structural claim is enforced here
+        // rather than by the boundary validator. This operation models no
+        // `ValidationException`, hence the synthetic one (HTTP 400), never a 501.
+        if !crate::state::is_model_card_content(&input.content) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "1 validation error detected: value for member Content must be in model \
+                 card JSON schema and provided as a string: it is not a JSON object.",
+            ));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let arn = crate::state::resource_arn(&region, "model-card", &input.model_card_name);
+        let now = ::std::time::SystemTime::now();
+        // Who the card records as its creator: the identity this request signed with.
+        let creator = crate::state::caller_user_context(ctx);
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller varying `ModelCardName` cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.model_cards_below_quota() {
+            return Err(CreateModelCardErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for model cards is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::MODEL_CARD_QUOTA,
+                        store.model_cards.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        // A name already in use is refused, never overwritten: otherwise the caller
+        // reads a 200 for a card it did not create and the card it did create is gone.
+        // The whole check-and-insert runs under the one store lock, so when two callers
+        // race on one name exactly one creates it and the other reads this conflict.
+        if store.model_cards.contains_key(&input.model_card_name) {
+            return Err(CreateModelCardErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Model Card with name {} already exists. Choose a different name.",
+                    input.model_card_name
+                )),
+            })
+            .into());
+        }
+
+        store.model_cards.insert(
+            input.model_card_name.clone(),
+            crate::state::ModelCard::new(
+                input.model_card_name.clone(),
+                arn.clone(),
+                input.tags.unwrap_or_default(),
+                crate::state::ModelCardVersion {
+                    version: crate::state::FIRST_MODEL_CARD_VERSION,
+                    content: input.content,
+                    status: input.model_card_status,
+                    security_config: input.security_config,
+                    creation_time: now,
+                    created_by: creator,
+                    last_modified_time: now,
+                    // Nothing has modified this version yet, so there is no identity to
+                    // report for one.
+                    last_modified_by: None,
+                },
+            ),
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateModelCardOutput {
+            model_card_arn: arn,
+        })
     }
 }

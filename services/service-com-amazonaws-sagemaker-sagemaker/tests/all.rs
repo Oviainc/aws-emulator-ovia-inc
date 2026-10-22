@@ -29,6 +29,8 @@ mod inference_deployment_lifecycle;
 mod lineage_action_lifecycle;
 #[path = "all/mlflow_app_lifecycle.rs"]
 mod mlflow_app_lifecycle;
+#[path = "all/model_card_governance.rs"]
+mod model_card_governance;
 #[path = "all/model_package_group_lifecycle.rs"]
 mod model_package_group_lifecycle;
 #[path = "all/model_package_registry.rs"]

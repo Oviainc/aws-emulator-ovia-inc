@@ -3,10 +3,11 @@
 //! Engine state for the com-amazonaws-sagemaker-sagemaker service.
 //!
 //! The inference-deployment lifecycle (model -> endpoint config -> endpoint) and the
-//! batch-transform jobs and the AI benchmarking control plane's workload
-//! configurations are kept here, in `BTreeMap`s keyed by the resource name AWS
-//! keys them by, so `ListModels` has one stable order to sort and paginate over and
-//! every `Describe*` replays exactly what the matching `Create*` stored. The Studio
+//! model-card governance resources, batch-transform jobs and the AI benchmarking
+//! control plane's workload configurations are kept here, in `BTreeMap`s keyed by the
+//! resource name AWS keys them by, so `ListModels` has one stable order to sort and
+//! paginate over and every `Describe*` replays exactly what the matching `Create*`
+//! stored. The Studio
 //! AppImageConfig registry and the Git repositories `CreateCodeRepository` registers
 //! are kept the same way, keyed by `AppImageConfigName` and `CodeRepositoryName`.
 //!
@@ -23,11 +24,11 @@ use crate::ops::types::{
     DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig, GitConfig, IamIdentity,
     InferenceExecutionConfig, InferenceSpecification, JupyterLabAppImageConfig,
     KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
-    ModelClientConfig, ModelLifeCycle, ModelMetrics, ModelPackageModelCard,
-    ModelPackageSecurityConfig, ModelPackageStatusDetails, ModelPackageStatusItem,
-    ModelPackageValidationSpecification, ProductionVariant, ProductionVariantSummary, ResourceSpec,
-    SourceAlgorithmSpecification, Tag, TransformInput, TransformOutput, TransformResources,
-    UserContext, VpcConfig,
+    ModelCardSecurityConfig, ModelClientConfig, ModelLifeCycle, ModelMetrics,
+    ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
+    ModelPackageStatusItem, ModelPackageValidationSpecification, ProductionVariant,
+    ProductionVariantSummary, ResourceSpec, SourceAlgorithmSpecification, Tag, TransformInput,
+    TransformOutput, TransformResources, UserContext, VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -98,6 +99,9 @@ pub const MODEL_PACKAGE_GROUP_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`]. Bounds the lineage-artifact store the same way, and is what
 /// `CreateArtifact` answers `ResourceLimitExceeded` past.
 pub const ARTIFACT_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`]. Bounds the model-card store, and is what `CreateModelCard`
+/// answers `ResourceLimitExceeded` past.
+pub const MODEL_CARD_QUOTA: usize = 1_000;
 
 /// The lineage group every lineage entity this account creates belongs to.
 ///
@@ -778,6 +782,9 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// name taken in one Region leaves it free in another. See [`Action`], at the end of
     /// this module with the rest of the lineage-action slice.
     pub actions: BTreeMap<String, Action>,
+    /// Keyed by `ModelCardName`. See [`ModelCard`], at the end of this module with the
+    /// rest of the model-card slice.
+    pub model_cards: BTreeMap<String, ModelCard>,
     /// Keyed by `AIWorkloadConfigName`. See [`AIWorkloadConfig`], at the end of this
     /// module with the rest of the AI-benchmarking workload-configuration slice.
     pub ai_workload_configs: BTreeMap<String, AIWorkloadConfig>,
@@ -891,6 +898,11 @@ impl ComAmazonawsSagemakerSagemakerState {
                 && package.name == name
                 && package.group_name.as_deref() == group
         })
+    }
+
+    /// Whether another model card fits, i.e. the store is below [`MODEL_CARD_QUOTA`].
+    pub fn model_cards_below_quota(&self) -> bool {
+        self.model_cards.len() < MODEL_CARD_QUOTA
     }
 }
 
@@ -1136,6 +1148,84 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// order against each other without going through a lossy float.
 pub fn timestamp_key(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
+}
+
+// ---------------------------------------------------------------------------
+// Model cards. `CreateModelCard` stores one here and `DescribeModelCard` replays it;
+// the store itself is `ComAmazonawsSagemakerSagemakerState::model_cards` above. Kept
+// together at the end of the file so a model-card change touches one span of it.
+// ---------------------------------------------------------------------------
+
+/// The version number a model card's FIRST version carries. `DescribeModelCard`'s
+/// `ModelCardVersion` is modelled as an `Integer` and the API's version history starts
+/// at one, so `CreateModelCard` stores version 1 and each `UpdateModelCard` appends the
+/// next integer.
+pub const FIRST_MODEL_CARD_VERSION: i32 = 1;
+
+/// One version of a model card, as `CreateModelCard` stores the first one and
+/// `DescribeModelCard` replays it.
+///
+/// A model card is versioned: `Content`, `ModelCardStatus` and `SecurityConfig` belong
+/// to a version, while the name, the ARN and the tags belong to the card.
+///
+/// `created_by` is stored when the version is created rather than rebuilt per read, so
+/// every later read reports the identity that actually created it; `last_modified_by`
+/// stays absent until a call modifies the version.
+#[derive(Debug, Clone)]
+pub struct ModelCardVersion {
+    pub version: i32,
+    pub content: String,
+    pub status: String,
+    pub security_config: Option<ModelCardSecurityConfig>,
+    pub creation_time: SystemTime,
+    pub created_by: UserContext,
+    pub last_modified_time: SystemTime,
+    pub last_modified_by: Option<UserContext>,
+}
+
+/// A model card created by `CreateModelCard`, with every version it has had.
+///
+/// `versions` is ordered by `version` ascending and is never empty: a card exists only
+/// once its first version does.
+#[derive(Debug, Clone)]
+pub struct ModelCard {
+    pub name: String,
+    pub arn: String,
+    pub tags: Vec<Tag>,
+    pub versions: Vec<ModelCardVersion>,
+}
+
+impl ModelCard {
+    /// A card holding exactly `first`, the version `CreateModelCard` minted.
+    pub fn new(name: String, arn: String, tags: Vec<Tag>, first: ModelCardVersion) -> Self {
+        Self {
+            name,
+            arn,
+            tags,
+            versions: vec![first],
+        }
+    }
+
+    /// The highest-numbered version — what a reader that names no version describes.
+    pub fn latest_version(&self) -> Option<&ModelCardVersion> {
+        self.versions.last()
+    }
+
+    /// The version numbered `version`, or `None` when the card never had it.
+    pub fn version(&self, version: i32) -> Option<&ModelCardVersion> {
+        self.versions.iter().find(|held| held.version == version)
+    }
+}
+
+/// Whether `content` can be a model card's `Content`.
+///
+/// `Content`'s own documentation says it "must be in model card JSON schema and provided
+/// as a string", so a value that is not even a JSON object is not a model card. The
+/// model constrains only the member's length, so the boundary validator passes such a
+/// value and the service refuses it. The schema's own required members are NOT checked
+/// here: this is the one structural claim the model's documentation makes.
+pub fn is_model_card_content(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content).is_ok_and(|parsed| parsed.is_object())
 }
 
 // ---------------------------------------------------------------------------
