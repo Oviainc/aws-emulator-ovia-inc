@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers an SAP application and PERSISTS it, so every later `GetApplication`,
+//! `ListApplications`, `StartApplication`, `StopApplication` and
+//! `DeregisterApplication` resolves the same record. The call is asynchronous in the
+//! real service: the application is returned `REGISTERING` and the `OperationId` names
+//! a stored `INPROGRESS` operation record that reaches `SUCCESS`
+//! [`crate::state::TRANSITION_SPAN`] later, materialised by the first request at or
+//! after that instant.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +164,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterApplicationErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.settle(now);
+
+        // `ApplicationType` is an enum in the model, so the boundary validator has
+        // already refused a value outside it; this re-states the refusal against the
+        // model's own catalogue (`APPLICATION_TYPE_VALUES`) so the handler never stores
+        // a type the API does not define.
+        if !APPLICATION_TYPE_VALUES.contains(&input.application_type.as_str()) {
+            return Err(RegisterApplicationErrorModeled::ValidationException(
+                crate::state::validation(format!(
+                    "ApplicationType must be one of {}, but was {}",
+                    APPLICATION_TYPE_VALUES.join(", "),
+                    input.application_type
+                )),
+            )
+            .into());
+        }
+
+        if state.applications.contains_key(&input.application_id) {
+            return Err(RegisterApplicationErrorModeled::ConflictException(
+                crate::state::conflict(format!(
+                    "An application with ID {} is already registered in this account and Region",
+                    input.application_id
+                )),
+            )
+            .into());
+        }
+
+        if state.applications.len() >= crate::state::MAX_APPLICATIONS {
+            // The emulator's own store ceiling, expressed with an error this operation
+            // models rather than by growing without bound.
+            return Err(RegisterApplicationErrorModeled::ConflictException(
+                crate::state::conflict(format!(
+                    "Cannot register application {}: this account and Region already hold {} applications",
+                    input.application_id,
+                    crate::state::MAX_APPLICATIONS
+                )),
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::application_arn(&region, &input.application_id);
+
+        // The emulator discovers nothing on the registered instances, so the only
+        // components an application has are the ones the registration described. A
+        // component is identified by the SID and type it was declared with, so two
+        // entries describing the same component are one component.
+        let mut components: Vec<String> = Vec::new();
+        for component in input.components_info.into_iter().flatten() {
+            let id = format!("{}-{}", component.sid, component.component_type);
+            if !components.contains(&id) {
+                components.push(id);
+            }
+        }
+
+        let application = crate::state::StoredApplication {
+            id: input.application_id.clone(),
+            app_type: input.application_type,
+            arn: arn.clone(),
+            // Nothing registers an AppRegistry application here; see the field's docs.
+            app_registry_arn: None,
+            status: crate::state::APPLICATION_STATUS_REGISTERING.to_string(),
+            discovery_status: crate::state::DISCOVERY_STATUS_REGISTERING.to_string(),
+            // `StatusMessage` explains a failed status; a registration under way has
+            // nothing to explain.
+            status_message: None,
+            components,
+            // Associating applications with one another is `UpdateApplicationSettings`'
+            // business, so a freshly registered application is associated with none.
+            associated_application_arns: Vec::new(),
+            last_updated: now,
+            sid: input.sid,
+            sap_instance_number: input.sap_instance_number,
+            instances: input.instances,
+            credentials: input.credentials.unwrap_or_default(),
+            database_arn: input.database_arn,
+            // Registration is asynchronous: the application becomes ACTIVATED with a
+            // SUCCESS discovery one `TRANSITION_SPAN` from now, and the first request at
+            // or after that instant reports it. Nothing sleeps.
+            pending: Some(crate::state::PendingTransition {
+                due_at: now + crate::state::TRANSITION_SPAN,
+                status: crate::state::APPLICATION_STATUS_ACTIVATED.to_string(),
+                discovery_status: crate::state::DISCOVERY_STATUS_SUCCESS.to_string(),
+            }),
+        };
+
+        if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
+            // Keyed by ARN, so the tagging APIs join on the same place.
+            state.tags_by_arn.insert(arn, tags);
+        }
+
+        let operation_id = state.record_operation(
+            crate::state::OPERATION_TYPE_REGISTER_APPLICATION,
+            &application,
+            // This call carries no parameters beyond the resource it names, which the
+            // record already reports as `ResourceId`/`ResourceArn`.
+            ::std::collections::HashMap::new(),
+            now,
+        );
+        let view = application.view();
+        state
+            .applications
+            .insert(input.application_id, application);
+
+        Ok(RegisterApplicationOutput {
+            application: Some(view),
+            operation_id: Some(operation_id),
+        })
     }
 }

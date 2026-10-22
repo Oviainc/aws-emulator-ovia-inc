@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPullTimeUpdateExclusions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPullTimeUpdateExclusions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports this registry's pull time update exclusion list — the IAM principal ARNs
+//! `RegisterPullTimeUpdateExclusion` stored — one page at a time, in the order the store
+//! holds them (by principal ARN), so a page boundary means the same thing on the next
+//! call. A pure read: it answers from
+//! `crate::state`'s `pull_time_update_exclusions` and writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPullTimeUpdateExclusions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +123,16 @@ impl From<ListPullTimeUpdateExclusionsErrorModeled> for ListPullTimeUpdateExclus
     }
 }
 
+/// A bad `nextToken` or `maxResults` is the shared pagination failure, reported through
+/// the `InvalidParameterException` this operation models.
+fn invalid_parameter(fault: crate::state::Fault) -> ListPullTimeUpdateExclusionsErrorModeled {
+    ListPullTimeUpdateExclusionsErrorModeled::InvalidParameterException(
+        InvalidParameterException {
+            message: Some(fault.message().to_string()),
+        },
+    )
+}
+
 /// The `ListPullTimeUpdateExclusions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,18 +169,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPullTimeUpdateExclusions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPullTimeUpdateExclusionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPullTimeUpdateExclusions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPullTimeUpdateExclusionsErrorModeled::ServerException(
+                ServerException {
+                    message: Some(
+                        "the ecr pull time update exclusion store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // The exclusion list belongs to the registry, and this emulator serves exactly
+        // one registry, so nothing in the request metadata selects which list to read.
+        let _ = ctx;
+
+        let store = state.lock();
+
+        // Keyed by principal ARN, which is the order the store holds the exclusions in,
+        // so the listing is stable across calls and a token resolves against live state.
+        let candidates: Vec<(String, String)> = store
+            .pull_time_update_exclusions
+            .keys()
+            .map(|arn| (arn.clone(), arn.clone()))
+            .collect();
+
+        let (page, next_token) =
+            crate::state::paginate(candidates, input.next_token.as_ref(), input.max_results)
+                .map_err(invalid_parameter)?;
+
+        Ok(ListPullTimeUpdateExclusionsOutput {
+            pull_time_update_exclusions: Some(page),
+            next_token,
+        })
     }
 }

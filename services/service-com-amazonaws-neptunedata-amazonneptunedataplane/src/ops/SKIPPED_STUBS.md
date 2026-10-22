@@ -20,6 +20,9 @@ handler returns an error, so it never has to construct a value.
 
 // SKIPPED: DeletePropertygraphStatistics — unsupported shape construct: operation 'DeletePropertygraphStatistics' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: DeleteSparqlStatistics — unsupported shape construct: operation 'DeleteSparqlStatistics' has a Unit/absent input, which the generator does not emit yet
-// SKIPPED: GetEngineStatus — unsupported shape construct: operation 'GetEngineStatus' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: GetPropertygraphStatistics — unsupported shape construct: operation 'GetPropertygraphStatistics' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: GetSparqlStatistics — unsupported shape construct: operation 'GetSparqlStatistics' has a Unit/absent input, which the generator does not emit yet
+
+Hand-authored since: `GetEngineStatus` was declined here for the same reason (a
+Unit/absent input) and is now hand-written in `ops/get_engine_status.rs`, which
+declares its own input type and schema. Use it as the pattern for the four above.

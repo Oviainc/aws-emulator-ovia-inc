@@ -106,16 +106,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the framework's default `ValidationException` names a shape this
         // service never declares. The status stays 400, which the protocol owns.
         //
-        // Both the code and the message are replaced together. Authentication
-        // refusals keep the framework's wording (`None`).
+        // Both the code and the message are replaced together: the message is
+        // this service's validation report (see
+        // `crate::state::validation_report`) — how many members failed, then
+        // one clause per member naming the member and the requirement it
+        // failed, with no rejected value echoed back. Authentication refusals
+        // keep the framework's wording (`None`).
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: "InvalidParameterValueException".to_string(),
-                message: violations
-                    .iter()
-                    .map(smithy_server_runtime::Violation::message)
-                    .collect::<Vec<_>>()
-                    .join("; "),
+                message: crate::state::validation_report(violations),
             }),
             _ => None,
         }

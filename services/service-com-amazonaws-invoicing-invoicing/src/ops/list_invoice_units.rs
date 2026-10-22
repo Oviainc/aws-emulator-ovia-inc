@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvoiceUnits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInvoiceUnits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInvoiceUnits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the invoice units in [`crate::state`] that match the request's `Filters`,
+//! one page of at most `MaxResults` at a time, with an opaque `NextToken` that resumes
+//! the walk where the page stopped.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +115,131 @@ impl From<ListInvoiceUnitsErrorModeled> for ListInvoiceUnitsError {
     }
 }
 
+/// `MaxResultsInteger` carries `@range(min: 1, max: 500)` and this request's
+/// `MaxResults` carries `@default: 500`, so a page never holds more than this many
+/// invoice units and an omitted `MaxResults` asks for this many.
+const MAX_PAGE_SIZE: usize = 500;
+
+/// What an opaque `NextToken` this operation minted decodes to, before the ARN the next
+/// page resumes at. It makes a token this operation did not mint recognisable rather
+/// than silently resuming from arbitrary bytes.
+const NEXT_TOKEN_PREFIX: &str = "invoice-units:";
+
+/// The `NextToken` that resumes the walk at `arn`.
+fn encode_next_token(arn: &str) -> String {
+    hex::encode(format!("{NEXT_TOKEN_PREFIX}{arn}"))
+}
+
+/// The ARN a caller's `NextToken` resumes at, or `None` when it asked for the first
+/// page. A token this operation did not mint is refused with the model's own
+/// `invalidNextToken` reason.
+fn decode_next_token(
+    token: Option<&str>,
+) -> Result<Option<String>, ListInvoiceUnitsErrorModeled> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    let resume = hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|plain| plain.strip_prefix(NEXT_TOKEN_PREFIX).map(str::to_string));
+    resume.map(Some).ok_or_else(|| {
+        // `invalidNextToken` is one of the model's `ValidationExceptionReason` values.
+        ListInvoiceUnitsErrorModeled::ValidationException(ValidationException {
+            message: Some("The NextToken provided is not valid".to_string()),
+            reason: Some("invalidNextToken".to_string()),
+            ..Default::default()
+        })
+    })
+}
+
+/// The caller's `Filters`, with each value list turned into a set ONCE per request.
+///
+/// A set rather than the caller's list because the walk tests every stored unit against
+/// every filter: with lists, one request would cost
+/// `units x stored accounts x filter values` string comparisons, all three
+/// caller-influenced. Here each test is one O(log n) set lookup, so the whole walk is
+/// bounded at `MAX_INVOICE_UNITS` (1000 units) x `RuleAccountIdList`'s modelled
+/// `@length` maximum (1000 stored accounts per rule) lookups — a stated product,
+/// whatever sizes the caller asks for — and the state guard is held only for that
+/// bounded work.
+#[derive(Debug, Default)]
+struct FilterSets<'f> {
+    names: Option<std::collections::BTreeSet<&'f str>>,
+    invoice_receivers: Option<std::collections::BTreeSet<&'f str>>,
+    accounts: Option<std::collections::BTreeSet<&'f str>>,
+    bill_source_accounts: Option<std::collections::BTreeSet<&'f str>>,
+}
+
+/// One filter's values as a lookup set, or `None` when that filter constrains nothing.
+///
+/// An empty value list constrains nothing, the same as an absent filter: a filter is
+/// "match any of these values", and the account lists carry `@length(min: 1)` so only
+/// `Names` can legally arrive empty. Treating it as a constraint that nothing satisfies
+/// would make an empty filter mean the opposite of an absent one for one member and not
+/// the others.
+fn value_set(values: Option<&[String]>) -> Option<std::collections::BTreeSet<&str>> {
+    let values = values?;
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.iter().map(String::as_str).collect())
+}
+
+impl<'f> FilterSets<'f> {
+    fn new(filters: Option<&'f Filters>) -> Self {
+        let Some(filters) = filters else {
+            return Self::default();
+        };
+        Self {
+            names: value_set(filters.names.as_deref()),
+            invoice_receivers: value_set(filters.invoice_receivers.as_deref()),
+            accounts: value_set(filters.accounts.as_deref()),
+            bill_source_accounts: value_set(filters.bill_source_accounts.as_deref()),
+        }
+    }
+
+    /// Whether `unit`, in the configuration `version`, satisfies every filter the caller
+    /// supplied. Filters of different types are AND-ed and the values within one filter
+    /// are OR-ed, as each filter member documents; `Accounts` matches either the invoice
+    /// receiver or a linked account of the rule.
+    fn matches(
+        &self,
+        unit: &crate::state::StoredInvoiceUnit,
+        version: &crate::state::InvoiceUnitVersion,
+    ) -> bool {
+        let name_matches = self
+            .names
+            .as_ref()
+            .is_none_or(|names| names.contains(unit.name.as_str()));
+        let receiver_matches = self
+            .invoice_receivers
+            .as_ref()
+            .is_none_or(|ids| ids.contains(unit.invoice_receiver.as_str()));
+        let account_matches = self.accounts.as_ref().is_none_or(|ids| {
+            ids.contains(unit.invoice_receiver.as_str())
+                || version
+                    .rule
+                    .linked_accounts
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|account| ids.contains(account.as_str()))
+        });
+        let bill_source_matches = self.bill_source_accounts.as_ref().is_none_or(|ids| {
+            version
+                .rule
+                .bill_source_accounts
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|account| ids.contains(account.as_str()))
+        });
+
+        name_matches && receiver_matches && account_matches && bill_source_matches
+    }
+}
+
 /// The `ListInvoiceUnits` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +276,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInvoiceUnits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInvoiceUnitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInvoiceUnits"))
+        let _ = ctx;
+
+        let resume_at = decode_next_token(input.next_token.as_deref())?;
+        // The boundary validator already refused a `MaxResults` outside `@range(1..500)`
+        // and the deserializer filled the `@default: 500` in, so this only guards the
+        // conversion.
+        let page_size = usize::try_from(input.max_results)
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        // Built once, before the walk: see [`FilterSets`] for the bound this puts on the
+        // matching work.
+        let filters = FilterSets::new(input.filters.as_ref());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInvoiceUnitsErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+        let store = state.lock();
+
+        let mut invoice_units = Vec::new();
+        let mut next_token = None;
+        // `invoice_units` is a BTreeMap keyed by ARN, so this walk is in one stable
+        // order and a token (the ARN the next page starts at) stays meaningful: the
+        // token is a POSITION in that order, so the resumed page seeks straight to it
+        // rather than re-walking the units the earlier pages already reported.
+        let page = match resume_at.as_deref() {
+            Some(from) => store.invoice_units.range(from.to_string()..),
+            None => store.invoice_units.range::<String, _>(..),
+        };
+        for unit in page.map(|(_, unit)| unit) {
+            // A unit that did not exist at `AsOf` is not part of the answer for that
+            // instant.
+            let Some(version) = unit.version_as_of(input.as_of.as_ref()) else {
+                continue;
+            };
+            if !filters.matches(unit, version) {
+                continue;
+            }
+            if invoice_units.len() == page_size {
+                next_token = Some(encode_next_token(&unit.arn));
+                break;
+            }
+            invoice_units.push(unit.to_invoice_unit(version));
+        }
+
+        Ok(ListInvoiceUnitsOutput {
+            invoice_units: Some(invoice_units),
+            next_token,
+        })
     }
 }

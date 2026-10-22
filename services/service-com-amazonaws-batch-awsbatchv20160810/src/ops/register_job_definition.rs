@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterJobDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterJobDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterJobDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts ONE job-definition revision into [`crate::state`] and answers from it:
+//! the revision is one past the highest revision stored for the name, and the ARN
+//! is `job-definition/<name>:<revision>`. `DescribeJobDefinitions` reads the same
+//! record back.
+//!
+//! A request the model admits but the service does not accept is refused with the
+//! modelled `ClientException` (HTTP 400), worded the way Batch's frontend words one
+//! ([`crate::state::client_exception_message`]), and nothing is stored. The rules
+//! applied are the ones this service's own model documents — among them the
+//! `executionRoleArn` doc, "For jobs that run on Fargate resources, you must provide
+//! an execution role", which is checked for EVERY container-properties object a job
+//! definition carries, not only the top-level one.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +206,233 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterJobDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterJobDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterJobDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterJobDefinitionErrorModeled::ServerException(ServerException {
+                message: Some("the job definition registry is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // The model types `jobDefinitionName` as a plain `String`, so the framework
+        // admits any text; the member's doc states the alphabet and the length.
+        if !crate::state::is_valid_job_definition_name(&input.job_definition_name) {
+            return Err(client_exception(&format!(
+                "jobDefinitionName must be up to {} letters, numbers, hyphens (-) and \
+                 underscores (_)",
+                crate::state::MAX_JOB_DEFINITION_NAME_LEN
+            )));
+        }
+
+        // A job definition describes its work exactly once: `JobDefinition`'s own
+        // docs say each of these members "can't be used in addition to" the others.
+        let declared: Vec<&str> = [
+            input.container_properties.as_ref().map(|_| "containerProperties"),
+            input.node_properties.as_ref().map(|_| "nodeProperties"),
+            input.ecs_properties.as_ref().map(|_| "ecsProperties"),
+            input.eks_properties.as_ref().map(|_| "eksProperties"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if declared.len() > 1 {
+            return Err(client_exception(&format!(
+                "only one of containerProperties, nodeProperties, ecsProperties and \
+                 eksProperties can be specified, but {} were",
+                declared.join(" and ")
+            )));
+        }
+
+        // "If no value is specified, it defaults to EC2" (`platformCapabilities`).
+        // The default decides which rules bind; what is STORED stays what the caller
+        // sent, so a read reports the request rather than a value nobody asked for.
+        let capabilities: Vec<&str> = match input.platform_capabilities.as_deref() {
+            Some(given) if !given.is_empty() => given.iter().map(String::as_str).collect(),
+            _ => vec![crate::state::PLATFORM_CAPABILITY_EC2],
+        };
+        let on_fargate = capabilities.contains(&crate::state::PLATFORM_CAPABILITY_FARGATE);
+        let on_managed_instances =
+            capabilities.contains(&crate::state::PLATFORM_CAPABILITY_MANAGED_INSTANCES);
+
+        // The `type` member's doc: "If the value is container, then one of the
+        // following is required: containerProperties, ecsProperties, or
+        // eksProperties. If the value is multinode, then nodeProperties is required."
+        let is_multinode = input.r#type == MULTINODE;
+        match input.r#type.as_str() {
+            CONTAINER => {
+                if input.container_properties.is_none()
+                    && input.ecs_properties.is_none()
+                    && input.eks_properties.is_none()
+                {
+                    return Err(client_exception(
+                        "containerProperties, ecsProperties or eksProperties is required for \
+                         job definitions of type container",
+                    ));
+                }
+            }
+            MULTINODE => {
+                if input.node_properties.is_none() {
+                    return Err(client_exception(
+                        "nodeProperties is required for job definitions of type multinode",
+                    ));
+                }
+            }
+            other => {
+                // The model's `JobDefinitionType` enum is enforced at the boundary, so
+                // this is unreachable through the wire; it refuses rather than storing
+                // a definition of a type no rule above covers.
+                return Err(client_exception(&format!(
+                    "type must be one of {}, not {other}",
+                    JOB_DEFINITION_TYPE_VALUES.join(", ")
+                )));
+            }
+        }
+
+        // "If the job is run on Fargate resources, then multinode isn't supported"
+        // (`type`); likewise `platformCapabilities`: jobs with MANAGED_INSTANCES "do
+        // not support multi-node parallel jobs".
+        if is_multinode && (on_fargate || on_managed_instances) {
+            return Err(client_exception(
+                "multinode job definitions aren't supported on Fargate or on Amazon ECS \
+                 Managed Instances",
+            ));
+        }
+
+        // "Jobs with the MANAGED_INSTANCES platform capability must use ecsProperties
+        // (not containerProperties)" (`platformCapabilities`).
+        if on_managed_instances && input.container_properties.is_some() {
+            return Err(client_exception(
+                "job definitions with the MANAGED_INSTANCES platform capability must use \
+                 ecsProperties, not containerProperties",
+            ));
+        }
+
+        // "If the job runs on Amazon EKS resources, then you must not specify
+        // platformCapabilities" / "you must not specify propagateTags"
+        // (`platformCapabilities`, `propagateTags`).
+        if input.eks_properties.is_some() {
+            if input.platform_capabilities.is_some() {
+                return Err(client_exception(
+                    "platformCapabilities must not be specified for Amazon EKS-based job \
+                     definitions",
+                ));
+            }
+            if input.propagate_tags.is_some() {
+                return Err(client_exception(
+                    "propagateTags must not be specified for Amazon EKS-based job definitions",
+                ));
+            }
+        }
+
+        // THE FARGATE EXECUTION ROLE: "For jobs that run on Fargate resources, you
+        // must provide an execution role" (`executionRoleArn`, on both
+        // `ContainerProperties` and `EcsTaskProperties`). It binds to every
+        // container-properties object the definition carries.
+        if on_fargate {
+            let roles = crate::state::execution_roles_of(
+                input.container_properties.as_ref(),
+                input.node_properties.as_ref(),
+                input.ecs_properties.as_ref(),
+            );
+            if roles
+                .iter()
+                .any(|role| role.is_none_or(str::is_empty))
+            {
+                return Err(client_exception(
+                    "executionRoleArn is required for Fargate jobs.",
+                ));
+            }
+        }
+
+        // "The minimum supported value is 0 and the maximum supported value is 9999"
+        // (`schedulingPriority`). The member targets a plain `Integer`, so the
+        // framework enforces no range.
+        if let Some(priority) = input.scheduling_priority {
+            if !(crate::state::MIN_SCHEDULING_PRIORITY..=crate::state::MAX_SCHEDULING_PRIORITY)
+                .contains(&priority)
+            {
+                return Err(client_exception(&format!(
+                    "schedulingPriority must be between {} and {}",
+                    crate::state::MIN_SCHEDULING_PRIORITY,
+                    crate::state::MAX_SCHEDULING_PRIORITY
+                )));
+            }
+        }
+
+        // "The minimum value for the timeout is 60 seconds" (`timeout`).
+        if let Some(seconds) = input.timeout.as_ref().and_then(|t| t.attempt_duration_seconds) {
+            if seconds < crate::state::MIN_ATTEMPT_DURATION_SECONDS {
+                return Err(client_exception(&format!(
+                    "timeout.attemptDurationSeconds must be at least {} seconds",
+                    crate::state::MIN_ATTEMPT_DURATION_SECONDS
+                )));
+            }
+        }
+
+        let mut store = state.lock();
+        // The store is in memory and every request adds to it, so the number of
+        // revisions it keeps is bounded; AWS enforces its own per-account quota and
+        // answers the same modelled error once an account reaches it.
+        if store.job_definitions.len() >= crate::state::MAX_JOB_DEFINITIONS {
+            return Err(client_exception(&format!(
+                "this emulator keeps at most {} job definition revisions",
+                crate::state::MAX_JOB_DEFINITIONS
+            )));
+        }
+
+        let revision = store.next_revision(&input.job_definition_name);
+        let arn =
+            crate::state::job_definition_arn(&region, &input.job_definition_name, revision);
+        // "The valid values are ECS (default) or EKS" (`containerOrchestrationType`):
+        // a definition orchestrates on EKS exactly when it carries `eksProperties`.
+        let orchestration_type = if input.eks_properties.is_some() {
+            crate::state::ORCHESTRATION_TYPE_EKS
+        } else {
+            crate::state::ORCHESTRATION_TYPE_ECS
+        };
+        let definition = JobDefinition {
+            job_definition_name: input.job_definition_name.clone(),
+            job_definition_arn: arn.clone(),
+            revision,
+            status: Some(crate::state::STATUS_ACTIVE.to_string()),
+            r#type: input.r#type,
+            scheduling_priority: input.scheduling_priority,
+            parameters: input.parameters,
+            retry_strategy: input.retry_strategy,
+            container_properties: input.container_properties,
+            timeout: input.timeout,
+            node_properties: input.node_properties,
+            tags: input.tags,
+            propagate_tags: input.propagate_tags,
+            platform_capabilities: input.platform_capabilities,
+            ecs_properties: input.ecs_properties,
+            eks_properties: input.eks_properties,
+            // "The valid values are ECS (default) or EKS"
+            // (`containerOrchestrationType`).
+            container_orchestration_type: Some(orchestration_type.to_string()),
+            consumable_resource_properties: input.consumable_resource_properties,
+        };
+        let key = (definition.job_definition_name.clone(), revision);
+        let output = RegisterJobDefinitionOutput {
+            job_definition_name: definition.job_definition_name.clone(),
+            job_definition_arn: arn,
+            revision,
+        };
+        store.job_definitions.insert(key, definition);
+        Ok(output)
     }
+}
+
+/// `JobDefinitionType` values, from the model's own enum
+/// (`super::types::JOB_DEFINITION_TYPE_VALUES`).
+const CONTAINER: &str = "container";
+/// See [`CONTAINER`].
+const MULTINODE: &str = "multinode";
+
+/// A refusal of a request this service understood but cannot accept: the modelled
+/// `ClientException` (HTTP 400), worded as Batch's frontend words one.
+fn client_exception(detail: &str) -> RegisterJobDefinitionError {
+    RegisterJobDefinitionErrorModeled::ClientException(ClientException {
+        message: Some(crate::state::client_exception_message(detail)),
+    })
+    .into()
 }
