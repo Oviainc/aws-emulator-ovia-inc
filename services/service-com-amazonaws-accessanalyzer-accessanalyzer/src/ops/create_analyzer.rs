@@ -249,7 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing has been analyzed yet, so neither `lastResourceAnalyzed` member is set.
             last_resource_analyzed: None,
             last_resource_analyzed_at: None,
-            tags: input.tags,
+            // An untagged create stores an EMPTY tag set, not an absent one: the
+            // analyzer's `tags` is a collection that always exists, and `GetAnalyzer`
+            // reports it as the `{}` the model's `TagsMap` describes.
+            tags: input.tags.unwrap_or_default(),
             configuration: input.configuration,
             archive_rules,
             archive_rule_tokens: crate::state::ClientTokens::default(),
