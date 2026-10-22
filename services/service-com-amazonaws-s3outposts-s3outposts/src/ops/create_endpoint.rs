@@ -194,11 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The endpoint hangs off an Outpost: one this caller owns, or one shared
-        // with it. An id that names neither is the modelled 404, whose message
-        // is the service constant `OutpostId`'s form selects.
+        // with it. An id that names neither is the modelled 404, carrying the
+        // one service constant for an Outpost that does not resolve.
         if !store.outposts.contains_key(&input.outpost_id) {
             return Err(CreateEndpointErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(&input.outpost_id),
+                crate::state::not_found(),
             )
             .into());
         }
