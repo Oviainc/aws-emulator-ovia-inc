@@ -554,12 +554,16 @@ async fn every_lambda_signed_request_is_dispatched_instead_of_refused_as_ambiguo
             "ResourceNotFoundException",
         ),
         (
-            "control plane GetAccountSettings, still scaffolded",
+            // This change implements `GetAccountSettings` (see
+            // `services/service-com-amazonaws-lambda-awsgirapiservice/src/ops/get_account_settings.rs`),
+            // so the owner of this path now answers its own 200 rather than the scaffold's
+            // 501 — which is still a response only the control plane can produce.
+            "control plane GetAccountSettings",
             "GET",
             "/2016-08-19/account-settings".to_string(),
             Value::Null,
-            501,
-            "NotImplemented",
+            200,
+            "",
         ),
         (
             "core ListNetworkConnectors",

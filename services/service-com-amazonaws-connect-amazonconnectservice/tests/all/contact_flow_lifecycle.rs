@@ -18,7 +18,7 @@ use hex::encode as hex_encode;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use super::instance_queue_lifecycle::{connect_managed, looks_like_a_uuid, Answer, Connect};
+use super::harness::{connect_managed, looks_like_a_uuid, Answer, Connect};
 
 /// Every `ContactFlowType` member, from `com.amazonaws.connect#ContactFlowType`
 /// (smithy_query(query="shape",shape="ContactFlowType")). A flow's `Type` is stored and

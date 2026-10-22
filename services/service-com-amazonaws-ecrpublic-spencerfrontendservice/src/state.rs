@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-ecrpublic-spencerfrontendservice service.
 //!
 //! This module owns the public registry the handlers in `src/ops/` share — its
-//! repositories and the images pushed into them — plus the few pieces of behaviour
+//! repositories and the images pushed into them, plus the in-flight layer uploads
+//! `InitiateLayerUpload` opens — plus the few pieces of behaviour
 //! that no single operation file can own on its own:
 //!
 //! * the ARN / URI forms every repository carries ([`StoredRepository`] is built once,
@@ -82,6 +83,45 @@ pub const MAX_IMAGES_PER_REPOSITORY: usize = 1_000;
 /// See [`MAX_REPOSITORIES`]. This one bounds `tag_index`, which grows by one entry per
 /// push that introduces an image tag the repository did not carry.
 pub const MAX_IMAGE_TAGS_PER_REPOSITORY: usize = 10_000;
+
+/// See [`MAX_REPOSITORIES`]. This one bounds [`ComAmazonawsEcrpublicSpencerfrontendserviceState::uploads`],
+/// which grows by one entry per `InitiateLayerUpload`. An upload a client opened and
+/// then abandoned is never reclaimed — [`LayerUpload::started_at`] records when the
+/// upload was opened, it is not an expiry the store acts on — so the registry needs a
+/// ceiling on how many in-flight layer uploads it holds at once. Past it the open is
+/// refused with the `ServerException` `InitiateLayerUpload` models: reaching the ceiling
+/// is this registry's own capacity, not a fault in the caller's request.
+pub const MAX_LAYER_UPLOADS: usize = 1_000;
+
+/// The `partSize` `InitiateLayerUpload` reports: the size, in bytes, the registry tells
+/// the client to send future layer parts in.
+///
+/// AWS publishes no single number for it — it is the registry's own answer, which is
+/// exactly why the client is told it rather than assuming one — so this is the
+/// emulator's choice, bounded by the only published constraint on a part: the model caps
+/// `UploadLayerPart$layerPartBlob` at 20971520 bytes, so a part of `partSize` bytes must
+/// fit under that cap.
+pub const REPORTED_LAYER_PART_SIZE: i64 = 10 * 1024 * 1024;
+
+/// One in-flight layer upload: what `InitiateLayerUpload` opened, addressed by the
+/// upload id it handed the client.
+///
+/// `UploadLayerPart` and `CompleteLayerUpload` are the operations that consume one (both
+/// still 501 stubs with issues of their own), so what is kept here is what opening the
+/// upload decided: which repository it is for, the part size the client was told to send
+/// parts in, and when it was opened.
+#[derive(Debug, Clone)]
+pub struct LayerUpload {
+    /// The repository the upload was opened against. An upload id is only valid for the
+    /// repository it was issued for, so every later call names both.
+    pub repository_name: String,
+    /// The `partSize` reported to the client when the upload was opened.
+    pub part_size: i64,
+    /// When `InitiateLayerUpload` opened it. Nothing reads it yet: the first operation
+    /// that does — `UploadLayerPart` or `CompleteLayerUpload`, each a 501 stub with its
+    /// own issue — is the one to decide whether an upload also expires with age.
+    pub started_at: SystemTime,
+}
 
 /// One image stored under a repository: what `PutImage` persisted, and everything
 /// `DescribeImages` reports about it.
@@ -235,6 +275,9 @@ pub struct ComAmazonawsEcrpublicSpencerfrontendserviceState {
     /// Repositories keyed by `repositoryName`, so `DescribeRepositories` pages in name
     /// order.
     pub repositories: BTreeMap<String, StoredRepository>,
+    /// In-flight layer uploads keyed by the `uploadId` `InitiateLayerUpload` minted, the
+    /// handle `UploadLayerPart` and `CompleteLayerUpload` address an upload by.
+    pub uploads: BTreeMap<String, LayerUpload>,
 }
 
 impl Default for ComAmazonawsEcrpublicSpencerfrontendserviceState {
@@ -243,6 +286,7 @@ impl Default for ComAmazonawsEcrpublicSpencerfrontendserviceState {
             registry_id: ::engine::EMULATOR_ACCOUNT_ID.to_string(),
             registry_alias: DEFAULT_REGISTRY_ALIAS.to_string(),
             repositories: BTreeMap::new(),
+            uploads: BTreeMap::new(),
         }
     }
 }

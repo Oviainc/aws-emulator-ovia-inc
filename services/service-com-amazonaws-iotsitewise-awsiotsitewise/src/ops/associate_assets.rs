@@ -296,7 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Asset hierarchies form a tree: an asset has at most one parent, so a child
         // that is already associated somewhere has to be disassociated before it can
         // be associated again.
-        if let Some((existing_parent, existing_hierarchy)) = parent_association(&store, &child_id) {
+        if let Some((existing_parent, existing_hierarchy)) = store.hierarchy_parent(&child_id) {
             return Err(invalid_request(format!(
                 "The asset {child_id} is already associated with the asset \
                  {existing_parent} through the hierarchy {existing_hierarchy}. \
@@ -319,7 +319,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !walked.insert(current.clone()) {
                 break;
             }
-            cursor = parent_association(&store, &current).map(|(parent, _)| parent.to_string());
+            cursor = store
+                .hierarchy_parent(&current)
+                .map(|(parent, _)| parent.to_string());
         }
 
         record_association(&mut store, &parent_id, &hierarchy_id, &child_id);
@@ -343,25 +345,6 @@ fn children_of<'a>(
         Some(children) => children.as_slice(),
         None => &[],
     }
-}
-
-/// The association `child_asset_id` is a child through, as
-/// `(parentAssetId, hierarchyId)`, or `None` when the asset is nobody's child.
-///
-/// Single-valued because this operation is the only thing that records an
-/// association and it refuses one for a child that already has a parent. It lives
-/// here rather than on the state struct because WHICH parent and WHICH hierarchy is
-/// what this operation's refusal reports; `ListAssets` only needs "is it a child"
-/// and asks its own predicate.
-fn parent_association<'a>(
-    store: &'a crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
-    child_asset_id: &str,
-) -> Option<(&'a str, &'a str)> {
-    store
-        .asset_hierarchy_children
-        .iter()
-        .find(|(_, children)| children.iter().any(|child| child == child_asset_id))
-        .map(|((parent, hierarchy), _)| (parent.as_str(), hierarchy.as_str()))
 }
 
 /// Record `child_asset_id` as a child of `parent_asset_id` under `hierarchy_id`,

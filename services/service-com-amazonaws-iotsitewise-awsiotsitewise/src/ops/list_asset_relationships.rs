@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAssetRelationships
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAssetRelationships`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAssetRelationships::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the asset-hierarchy relationships that lead
+//! from one asset to its root, read from the shared engine store (`crate::state`);
+//! this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAssetRelationships` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAssetRelationshipsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAssetRelationships"))
+        // Request metadata is not read: this operation reports stored ids only, and
+        // mints no ARN whose region it would have to come from.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal_failure("the IoT SiteWise store is unavailable"))?;
+
+        // `traversalType` is modelled as an enum, so the runtime has already refused
+        // every value outside it before this handler runs; the guard keeps the
+        // traversal below total instead of treating any value as PATH_TO_ROOT. It is
+        // answered before the store is locked: a refusal reads no state.
+        if input.traversal_type != TRAVERSAL_PATH_TO_ROOT {
+            return Err(invalid_request(format!(
+                "traversalType must be one of: {TRAVERSAL_PATH_TO_ROOT}."
+            )));
+        }
+
+        // REPORTING only: the relationships are derived from the association index the
+        // hierarchy operations write, so this call leaves the store exactly as it found
+        // it and a repeat of it answers the same.
+        let store = state.lock();
+
+        // The label is either the raw UUID or the `externalId:<externalId>` alias form.
+        let asset_id = store.resolve_asset_id(&input.asset_id).ok_or_else(|| {
+            not_found(crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET,
+                &input.asset_id,
+            ))
+        })?;
+
+        // PATH_TO_ROOT walks the hierarchy tree upwards from the asset: one HIERARCHY
+        // relationship per parent -> child edge between the asset and its root, the
+        // edge whose child is the asset named in the request first and the edge whose
+        // parent is the root last. An asset nobody is the parent of IS its own root, so
+        // it has no relationship to report. The visited set keeps the walk finite
+        // whatever the store holds.
+        let mut relationships: Vec<AssetRelationshipSummary> = Vec::new();
+        let mut walked: ::std::collections::HashSet<String> = ::std::collections::HashSet::new();
+        let mut cursor = asset_id;
+        while walked.insert(cursor.clone()) {
+            let Some((parent, _hierarchy)) = store.hierarchy_parent(&cursor) else {
+                break;
+            };
+            let parent = parent.to_string();
+            relationships.push(AssetRelationshipSummary {
+                hierarchy_info: Some(AssetHierarchyInfo {
+                    parent_asset_id: Some(parent.clone()),
+                    child_asset_id: Some(cursor),
+                }),
+                relationship_type: RELATIONSHIP_TYPE_HIERARCHY.to_string(),
+            });
+            cursor = parent;
+        }
+
+        // `nextToken` is this enumeration's resume point: the child asset id of the
+        // first relationship of the next page, hex-encoded so the token matches the
+        // modelled `^[A-Za-z0-9+/=]+$`. An asset has at most one parent, so a child id
+        // names exactly one edge of this path. A token whose resume point is not on
+        // this path is refused rather than answered with an empty page, which would
+        // report absence as success.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                relationships
+                    .iter()
+                    .position(|summary| child_asset_id(summary) == Some(resume.as_str()))
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime validates
+        // BEFORE this handler runs, so a value that arrives here is already in range
+        // and nothing is being coerced; `max(1)` only keeps the slice arithmetic below
+        // total. The default is the one AWS documents for this operation.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(relationships.len());
+
+        let next_token = relationships
+            .get(end)
+            .and_then(child_asset_id)
+            .map(|child| ::hex::encode(child.as_bytes()));
+        let asset_relationship_summaries = relationships[start..end].to_vec();
+
+        Ok(ListAssetRelationshipsOutput {
+            asset_relationship_summaries,
+            next_token,
+        })
     }
+}
+
+/// The `TraversalType` this operation walks: the asset's parents up to the root
+/// asset.
+///
+/// Read from the generated, model-synced `TRAVERSAL_TYPE_VALUES` table rather than
+/// restated here, so no hand-written copy of the enum can be left behind by a model
+/// refresh. This handler implements exactly the one traversal the model declares, so
+/// a refresh that adds another has to bring the code that walks it: the assertion
+/// below is the compile-time tripwire for that.
+const TRAVERSAL_PATH_TO_ROOT: &str = TRAVERSAL_TYPE_VALUES[0];
+const _: () = assert!(TRAVERSAL_TYPE_VALUES.len() == 1);
+
+/// The `AssetRelationshipType` every summary this operation reports carries: the two
+/// assets are related through an asset hierarchy, which is what makes `hierarchyInfo`
+/// present. Taken from the generated table for the same reason, with the same
+/// tripwire.
+const RELATIONSHIP_TYPE_HIERARCHY: &str = ASSET_RELATIONSHIP_TYPE_VALUES[0];
+const _: () = assert!(ASSET_RELATIONSHIP_TYPE_VALUES.len() == 1);
+
+/// The page size AWS documents for this operation when the caller gives no
+/// `maxResults`.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// The child asset of a relationship this operation built, which is the key its
+/// `nextToken` resumes from.
+fn child_asset_id(summary: &AssetRelationshipSummary) -> Option<&str> {
+    summary
+        .hierarchy_info
+        .as_ref()
+        .and_then(|info| info.child_asset_id.as_deref())
+}
+
+/// Decode a `nextToken` back into the child asset id it resumes from.
+fn decode_token(token: &str) -> Result<String, ListAssetRelationshipsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never issued.
+fn invalid_token() -> ListAssetRelationshipsError {
+    invalid_request("The nextToken is not a token this operation issued.".to_string())
+}
+
+/// HTTP 500 `InternalFailureException`: the store this operation reads is not there.
+fn internal_failure(message: &str) -> ListAssetRelationshipsError {
+    ListAssetRelationshipsErrorModeled::InternalFailureException(InternalFailureException {
+        message: message.to_string(),
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` for a label that names no stored asset.
+fn not_found(message: String) -> ListAssetRelationshipsError {
+    ListAssetRelationshipsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+    })
+    .into()
+}
+
+/// HTTP 400 `InvalidRequestException`: the request is well-formed but asks for an
+/// enumeration this operation cannot answer.
+fn invalid_request(message: String) -> ListAssetRelationshipsError {
+    ListAssetRelationshipsErrorModeled::InvalidRequestException(InvalidRequestException { message })
+        .into()
 }

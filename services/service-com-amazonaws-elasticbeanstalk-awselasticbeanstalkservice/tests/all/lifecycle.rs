@@ -5,9 +5,15 @@
 //!
 //! Every test here mounts this one service in the same `MultiServiceRouter` the
 //! production binary uses and speaks to it the way an AWS client does: a
-//! form-urlencoded `Action=…` body in, an XML envelope out. Nothing reaches into
-//! the store directly, so a create that does not persist, or a describe that
-//! answers from anything other than the store, fails these tests.
+//! form-urlencoded `Action=…` body in, an XML envelope out. Nothing in THIS
+//! suite reaches into the store directly, so a create that does not persist, or
+//! a describe that answers from anything other than the store, fails these
+//! tests.
+//!
+//! The harness ([`Emulator`], [`Answer`]) is `pub(crate)` so the other suites in
+//! this test target drive the emulator the same way instead of copying it;
+//! [`Emulator::store`] is there for a suite that has to seed a precondition no
+//! implemented operation can produce yet.
 //!
 //! The two helpers at the bottom — the form-value encoder and the element reader
 //! — are written here rather than taken from a crate ON PURPOSE: a dependency
@@ -41,14 +47,29 @@ pub(crate) const PAST_DUE: Duration = eb::state::STATUS_TRANSITION_SPAN.saturati
 /// production binary mounts it in, driven over HTTP.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The one shared engine the mounted service's handlers reach their store
+    /// through; see [`Emulator::store`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
-        router.register_service(eb::EmulatedService::new(engine));
-        Self { router }
+        router.register_service(eb::EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// This service's store inside the engine the mounted handlers use — the
+    /// same guard `crate::state::service_state` hands a handler.
+    ///
+    /// For a suite that has to SEED a precondition no implemented operation can
+    /// produce yet. The behaviour under test is still driven over HTTP; only the
+    /// starting state is written here.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<eb::ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState> {
+        eb::state::service_state(&*self.engine).expect("the shared engine carries this service's store")
     }
 
     /// Call `action` with `params`, signed for [`TEST_REGION`].

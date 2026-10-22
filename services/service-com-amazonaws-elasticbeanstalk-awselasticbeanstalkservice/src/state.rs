@@ -27,7 +27,8 @@ const DEFAULT_REGION: &str = "us-east-1";
 
 /// How long after the call that starts it a status change this service owes
 /// becomes due: `Launching` -> `Ready` after CreateEnvironment, `Terminating` ->
-/// `Terminated` after TerminateEnvironment.
+/// `Terminated` after TerminateEnvironment, `Aborting` -> `Ready` after
+/// AbortEnvironmentUpdate.
 ///
 /// The real service takes minutes, so this span is CHOSEN, not documented. It is
 /// deliberately non-zero: a caller that describes the environment straight after
@@ -45,6 +46,9 @@ pub const STATUS_READY: &str = "Ready";
 pub const STATUS_TERMINATING: &str = "Terminating";
 /// See [`STATUS_LAUNCHING`].
 pub const STATUS_TERMINATED: &str = "Terminated";
+/// See [`STATUS_LAUNCHING`]. "Aborting: Environment is in the process of
+/// aborting a deployment."
+pub const STATUS_ABORTING: &str = "Aborting";
 
 /// `EnvironmentHealth` values this service writes (modelled set:
 /// `crate::ops::types::ENVIRONMENT_HEALTH_VALUES`). `Grey` is the value the model
@@ -220,10 +224,13 @@ pub struct PendingStatus {
 }
 
 impl PendingStatus {
-    /// The move CreateEnvironment owes: `Launching` -> `Ready`, with the
-    /// environment reporting healthy once the launch completes ("Green:
-    /// Indicates the environment is healthy and fully functional").
-    pub fn launch_completion() -> Self {
+    /// The move an in-progress operation on a surviving environment owes once it
+    /// finishes: to `Ready` ("Environment is available to have an action
+    /// performed on it"), reporting healthy ("Green: Indicates the environment
+    /// is healthy and fully functional"). Both the launch CreateEnvironment
+    /// starts and the cancellation AbortEnvironmentUpdate starts end here, so
+    /// the two cannot drift apart.
+    pub fn completion_to_ready() -> Self {
         Self {
             due_at: Instant::now() + STATUS_TRANSITION_SPAN,
             status: STATUS_READY.to_string(),
@@ -286,6 +293,25 @@ impl Environment {
             // status at all rather than one of the running values.
             health_status: None,
         });
+    }
+
+    /// Start the cancellation of the in-progress update this environment
+    /// reports: the environment moves to `Aborting` ("Environment is in the
+    /// process of aborting a deployment"), stops reporting an abortable
+    /// operation — the one in flight is already being cancelled — and the
+    /// return to `Ready` is what the clock then owes, one
+    /// [`STATUS_TRANSITION_SPAN`] later.
+    ///
+    /// Health goes `Grey`/`Pending` for the duration, as the model documents
+    /// for an environment whose "health checks are suspended during an
+    /// UpdateEnvironment or RestartEnvironment request".
+    pub fn begin_abort(&mut self) {
+        self.status = STATUS_ABORTING.to_string();
+        self.health = HEALTH_GREY.to_string();
+        self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
+        self.abortable_operation_in_progress = false;
+        self.date_updated = now();
+        self.pending_status = Some(PendingStatus::completion_to_ready());
     }
 
     /// Apply the pending status change if the clock has already made it due.
@@ -467,6 +493,25 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
                 }
             }
         }
+    }
+}
+
+/// The message this service refuses a request with `InvalidParameterValue` for
+/// when the identifier it supplied names no stored environment, built from the
+/// request: it names the member the caller used and the value it carried, the
+/// way the real service's "No Environment found for EnvironmentName = '…'."
+/// does. Shared by every operation that takes the `EnvironmentId` /
+/// `EnvironmentName` either-or pair, so they cannot disagree.
+pub fn missing_environment_message(
+    environment_id: Option<&str>,
+    environment_name: Option<&str>,
+) -> String {
+    match (environment_id, environment_name) {
+        (Some(id), _) => format!("No Environment found for EnvironmentId = '{id}'."),
+        (None, Some(name)) => format!("No Environment found for EnvironmentName = '{name}'."),
+        // Neither supplied is a MissingRequiredParameter refusal, which every
+        // caller makes before reaching here.
+        (None, None) => "No Environment found.".to_string(),
     }
 }
 
