@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags STORED on the resource the request's `resourceArn` names.
+//! The model points that member at two resources (`@references` to
+//! `MonitorResource` and to `ProbeResource`), so the ARN is resolved against
+//! the ARNs the store minted for its monitors and their probes
+//! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::resolve_tagged_resource`]);
+//! an ARN no stored record carries is `ResourceNotFoundException`.
+//!
+//! `@readonly`: this handler takes no write at all. Unlike `GetMonitor` it does
+//! not even settle the clock's `PENDING` -> `ACTIVE` transition, because a
+//! monitor's tags do not depend on its state.
 //!
 //! ## Shape of an operation
 //!
@@ -145,20 +147,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // `resourceArn`'s `@length(20..2048)` and `@pattern("^arn:.*$")` are
+        // refused by the framework BEFORE this handler runs, so an ARN that
+        // reaches here is one the service could have minted.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the networkmonitor monitor store is unavailable".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        // An ARN that names no stored monitor and no stored probe names nothing
+        // whose tags could be reported — a deleted resource, or a well-formed
+        // ARN of another region, account or service.
+        let tags = store
+            .resolve_tagged_resource(&input.resource_arn)
+            .and_then(|resource| store.tags(&resource))
+            // Built straight from the borrowed stored map — the reported map IS
+            // the stored one, pair for pair.
+            .map(|stored| {
+                stored
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<::std::collections::HashMap<String, String>>()
+            });
+        let Some(tags) = tags else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no monitor or probe with ARN {} exists",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Read straight out of the stored record, so what this reports is what
+        // `GetMonitor` reports for the same resource. A resource carrying no
+        // tags reports an empty map, not an absent one.
+        Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }
 }

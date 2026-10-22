@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end coverage for `TagResource` and `UntagResource`.
+//! End-to-end coverage for the tagging slice: `ListTagsForResource`,
+//! `TagResource` and `UntagResource`.
 //!
 //! Every case drives real HTTP through the router, so what is asserted is the
 //! wire behaviour a `networkmonitor` SDK client sees. The rules under test:
@@ -9,6 +10,9 @@
 //!   resolves to the stored monitor or the stored probe that carries it, and to
 //!   nothing otherwise — an ARN no stored resource carries is HTTP 404
 //!   `ResourceNotFoundException`;
+//! * `ListTagsForResource` reports the tags STORED on that one resource,
+//!   whatever their number, keys or values, and is `@readonly`: reading tags
+//!   changes nothing a later caller sees;
 //! * `TagResource` adds exactly the pairs it names to that one resource's stored
 //!   tag map, overwriting the value of a key the resource already carries and
 //!   leaving every other key, and every other resource's tags, alone;
@@ -17,19 +21,25 @@
 //!   alone, and removing a key the resource does not carry is a no-op success
 //!   (the call is idempotent);
 //! * what is left is what every later read of the resource reports — here
-//!   `GetMonitor`'s `tags` for a monitor and its `probes[].tags` for a probe,
-//!   which is the same stored map the tagging call wrote;
+//!   `ListTagsForResource` and `GetMonitor`'s `tags` for a monitor, and
+//!   `probes[].tags` for a probe, which is the same stored map;
 //! * the resource's `modifiedAt` moves only when the call actually changed the
 //!   stored tag map.
 //!
-//! `ListTagsForResource` is still a scaffold with an issue of its own, and so is
-//! `GetProbe`, so the read-back here goes through `GetMonitor` (implemented),
-//! whose `probes` list IS the stored probe map. `tests/all/tagging.rs` reuses
-//! this suite's harness for the read paths beyond `GetMonitor`.
+//! The `ListTagsForResource` tables span the class each rule covers rather than
+//! one recorded tag set: the tag count (none, one, three, the modelled `TagMap`
+//! maximum of 200), the key and value lengths at the bounds the model declares,
+//! non-ASCII and URI-significant keys and values, and both resource kinds the
+//! model's `resourceArn` references (a monitor and a probe).
+//!
+//! `GetProbe` aside, the read-back here goes through `GetMonitor`, whose
+//! `probes` list IS the stored probe map, and through `ListTagsForResource`,
+//! which reads the same stored maps. `tests/all/tagging.rs` reuses this suite's
+//! harness for the read paths beyond `GetMonitor`.
 
 use std::sync::Arc;
 
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A SigV4 `Authorization` naming this service's signing name
@@ -44,6 +54,15 @@ const REGION: &str = "us-west-2";
 
 /// The one account id a generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = "000000000000";
+
+/// The `TagKey` maximum the model declares (`@length(min: 1, max: 128)`).
+const MAX_TAG_KEY_LEN: usize = 128;
+
+/// The `TagValue` maximum the model declares (`@length(min: 0, max: 256)`).
+const MAX_TAG_VALUE_LEN: usize = 256;
+
+/// The `TagMap` maximum the model declares (`@length(min: 0, max: 200)`).
+const MAX_TAGS: usize = 200;
 
 /// Which stored resource a case's `resourceArn` names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +187,41 @@ async fn delete_monitor(router: &MultiServiceRouter, name: &str) -> (u16, Value)
     call(router, "DELETE", &format!("/monitors/{name}"), None).await
 }
 
+async fn create_probe(router: &MultiServiceRouter, name: &str, body: &str) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        &format!("/monitors/{name}/probes"),
+        Some(body),
+    )
+    .await
+}
+
+async fn delete_probe(
+    router: &MultiServiceRouter,
+    name: &str,
+    probe_id: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "DELETE",
+        &format!("/monitors/{name}/probes/{probe_id}"),
+        None,
+    )
+    .await
+}
+
+/// `GET /tags/{resourceArn}` — `ListTagsForResource`.
+async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
+    call(
+        router,
+        "GET",
+        &format!("/tags/{}", encode_label(resource_arn)),
+        None,
+    )
+    .await
+}
+
 /// `DELETE /tags/{resourceArn}?tagKeys=..&tagKeys=..` — the `tagKeys` list is
 /// bound to `@httpQuery("tagKeys")`, so each key is its own query pair.
 async fn untag_resource(
@@ -200,8 +254,14 @@ fn source_arn() -> String {
     format!("arn:aws:ec2:{REGION}:{ACCOUNT}:subnet/subnet-0123456789abcdef0")
 }
 
+/// A monitor ARN in an arbitrary region and account, for the rows that differ
+/// from a stored ARN in exactly one field.
+fn monitor_arn_in(region: &str, account: &str, name: &str) -> String {
+    format!("arn:aws:networkmonitor:{region}:{account}:monitor/{name}")
+}
+
 fn monitor_arn(name: &str) -> String {
-    format!("arn:aws:networkmonitor:{REGION}:{ACCOUNT}:monitor/{name}")
+    monitor_arn_in(REGION, ACCOUNT, name)
 }
 
 /// The single probe a `GetMonitor` body reports.
@@ -217,6 +277,36 @@ pub(crate) fn only_probe(body: &Value) -> Value {
         "the fixture monitor carries exactly one probe, got {body:?}"
     );
     probes[0].clone()
+}
+
+/// The tags `GetMonitor` reports for the probe with this `probeId`.
+fn tags_of_probe(body: &Value, probe_id: &str) -> Value {
+    body.get("probes")
+        .and_then(Value::as_array)
+        .and_then(|probes| {
+            probes
+                .iter()
+                .find(|probe| string_at(probe, "probeId") == probe_id)
+        })
+        .and_then(|probe| probe.get("tags").cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// A deterministic string of `length` ASCII characters, for exercising a
+/// declared length bound rather than one hand-picked spelling.
+fn filler(length: usize, seed: u8) -> String {
+    (0..length)
+        .map(|i| char::from(b'a' + ((i as u8).wrapping_add(seed) % 26)))
+        .collect()
+}
+
+/// `count` distinct tag pairs, for exercising the tag COUNT dimension.
+fn many_tags(count: usize) -> Value {
+    let mut map = Map::new();
+    for i in 0..count {
+        map.insert(format!("key-{i:03}"), json!(format!("value-{i:03}")));
+    }
+    Value::Object(map)
 }
 
 /// Create a monitor carrying `monitor_tags` and one probe carrying
@@ -250,8 +340,324 @@ pub(crate) async fn fixture(
     )
 }
 
+/// A monitor's stored tags are what `ListTagsForResource` reports for its ARN,
+/// across the whole class of tag sets the model admits.
+#[tokio::test]
+async fn a_monitors_stored_tags_are_what_list_tags_for_resource_reports() {
+    // (case, monitorName, the tags the create assigns)
+    let cases: Vec<(&str, String, Value)> = vec![
+        (
+            "no tags at all",
+            "untagged".to_string(),
+            Value::Object(Map::new()),
+        ),
+        (
+            "the recorded shape: one tag",
+            "demo-monitor".to_string(),
+            json!({"team": "net"}),
+        ),
+        (
+            "three tags",
+            "three_tags".to_string(),
+            json!({"a": "1", "b": "2", "c": "3"}),
+        ),
+        (
+            "a value at the TagValue minimum length of 0",
+            "blank-value".to_string(),
+            json!({"blank": ""}),
+        ),
+        (
+            "a key at the TagKey maximum and a value at the TagValue maximum",
+            "bound-lengths".to_string(),
+            json!({ filler(MAX_TAG_KEY_LEN, 3): filler(MAX_TAG_VALUE_LEN, 7) }),
+        ),
+        (
+            "non-ASCII keys and values",
+            "unicode".to_string(),
+            json!({"équipe": "réseau", "チーム": "ネット"}),
+        ),
+        (
+            "a key and value carrying URI-significant characters",
+            "punctuated".to_string(),
+            json!({"path/like:key": "a value with spaces & /slashes/"}),
+        ),
+        (
+            "200 tags, the TagMap maximum",
+            "max_tags".to_string(),
+            many_tags(MAX_TAGS),
+        ),
+    ];
+
+    let router = router();
+    for (case, name, tags) in cases {
+        let body = json!({"monitorName": name, "tags": tags}).to_string();
+        let (status, created) = create_monitor(&router, &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: setup CreateMonitor should succeed, got {status} {created:?}"
+        );
+        let arn = string_at(&created, "monitorArn");
+        assert_eq!(
+            arn,
+            monitor_arn(&name),
+            "case {case:?}: expected the minted monitor ARN, got {created:?}"
+        );
+
+        let (status, listed) = list_tags(&router, &arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListTagsForResource 200, got {status} {listed:?}"
+        );
+        assert_eq!(
+            listed.get("tags"),
+            Some(&tags),
+            "case {case:?}: expected tags {tags:?}, got {listed:?}"
+        );
+
+        // The same stored record answers both reads, so the two can never
+        // disagree.
+        let (status, got) = get_monitor(&router, &name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: setup GetMonitor should succeed, got {status} {got:?}"
+        );
+        assert_eq!(
+            got.get("tags"),
+            Some(&tags),
+            "case {case:?}: GetMonitor must report the same tags, got {got:?}"
+        );
+    }
+}
+
+/// The other resource the model's `resourceArn` references: a probe. Its stored
+/// tags — the union `CreateProbe` assigns — are what `ListTagsForResource`
+/// reports for the probe's own ARN, and a probe ARN is answered from the probe,
+/// never from its monitor.
+#[tokio::test]
+async fn a_probes_stored_tags_are_what_list_tags_for_resource_reports() {
+    let router = router();
+    let (status, created) =
+        create_monitor(&router, r#"{"monitorName":"probe-host","tags":{"on":"monitor"}}"#).await;
+    assert_eq!(
+        status, 200,
+        "setup: CreateMonitor should succeed, got {status} {created:?}"
+    );
+    let host_arn = string_at(&created, "monitorArn");
+
+    // (case, the probe's `tags` member, the tags the probe ends up carrying)
+    let cases: Vec<(&str, String, Value)> = vec![
+        (
+            "a probe created with no tags",
+            String::new(),
+            Value::Object(Map::new()),
+        ),
+        (
+            "a probe created with two tags",
+            r#","tags":{"owner":"probe","tier":"edge"}"#.to_string(),
+            json!({"owner": "probe", "tier": "edge"}),
+        ),
+        (
+            "a probe tag count the model admits, 200",
+            format!(",\"tags\":{}", many_tags(MAX_TAGS)),
+            many_tags(MAX_TAGS),
+        ),
+    ];
+
+    for (case, tags_member, expected) in cases {
+        let body = format!(
+            r#"{{"probe":{{"sourceArn":"{}","destination":"10.0.0.9","protocol":"ICMP","packetSize":56{tags_member}}}}}"#,
+            source_arn()
+        );
+        let (status, probe) = create_probe(&router, "probe-host", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: setup CreateProbe should succeed, got {status} {probe:?}"
+        );
+        let probe_id = string_at(&probe, "probeId");
+        let probe_arn = string_at(&probe, "probeArn");
+
+        let (status, listed) = list_tags(&router, &probe_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListTagsForResource 200, got {status} {listed:?}"
+        );
+        assert_eq!(
+            listed.get("tags"),
+            Some(&expected),
+            "case {case:?}: expected tags {expected:?}, got {listed:?}"
+        );
+
+        // The probe's tags come from the probe record, which is the same record
+        // `GetMonitor` lists.
+        let (status, got) = get_monitor(&router, "probe-host").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: setup GetMonitor should succeed, got {status} {got:?}"
+        );
+        assert_eq!(
+            tags_of_probe(&got, &probe_id),
+            expected,
+            "case {case:?}: GetMonitor must list the same probe tags, got {got:?}"
+        );
+
+        // And the monitor's own tags are not the probe's: each ARN is answered
+        // from the resource it names.
+        let (status, monitor_listed) = list_tags(&router, &host_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListTagsForResource 200 for the monitor, got {status} {monitor_listed:?}"
+        );
+        assert_eq!(
+            monitor_listed.get("tags"),
+            Some(&json!({"on": "monitor"})),
+            "case {case:?}: the monitor ARN must report the monitor's tags, got {monitor_listed:?}"
+        );
+    }
+}
+
+/// An ARN no stored monitor and no stored probe carries is 404
+/// `ResourceNotFoundException` for `ListTagsForResource`, however it differs
+/// from a stored one.
+#[tokio::test]
+async fn listing_tags_for_an_arn_no_resource_carries_is_not_found() {
+    let router = router();
+    let (status, created) = create_monitor(&router, r#"{"monitorName":"present"}"#).await;
+    assert_eq!(
+        status, 200,
+        "setup: CreateMonitor should succeed, got {status} {created:?}"
+    );
+
+    // A monitor and a probe that exist, then are deleted: their ARNs stop
+    // naming anything.
+    let (status, doomed) = create_monitor(&router, r#"{"monitorName":"doomed"}"#).await;
+    assert_eq!(
+        status, 200,
+        "setup: CreateMonitor should succeed, got {status} {doomed:?}"
+    );
+    let doomed_arn = string_at(&doomed, "monitorArn");
+    let probe_body = format!(
+        r#"{{"probe":{{"sourceArn":"{}","destination":"2001:db8::1","protocol":"ICMP","packetSize":56,"tags":{{"k":"v"}}}}}}"#,
+        source_arn()
+    );
+    let (status, probe) = create_probe(&router, "doomed", &probe_body).await;
+    assert_eq!(
+        status, 200,
+        "setup: CreateProbe should succeed, got {status} {probe:?}"
+    );
+    let probe_arn = string_at(&probe, "probeArn");
+    let probe_id = string_at(&probe, "probeId");
+
+    // The probe's ARN resolves while the probe is stored.
+    let (status, listed) = list_tags(&router, &probe_arn).await;
+    assert_eq!(
+        status, 200,
+        "setup: the probe's ARN should resolve before the delete, got {status} {listed:?}"
+    );
+
+    let (status, body) = delete_probe(&router, "doomed", &probe_id).await;
+    assert_eq!(
+        status, 200,
+        "setup: DeleteProbe should succeed, got {status} {body:?}"
+    );
+    let (status, body) = delete_monitor(&router, "doomed").await;
+    assert_eq!(
+        status, 200,
+        "setup: DeleteMonitor should succeed, got {status} {body:?}"
+    );
+
+    // (case, the ARN to list tags for)
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "a monitor name that was never created",
+            monitor_arn("never-created"),
+        ),
+        ("a deleted monitor", doomed_arn),
+        ("a deleted probe", probe_arn),
+        (
+            "a probe id that was never minted",
+            format!(
+                "arn:aws:networkmonitor:{REGION}:{ACCOUNT}:probe/probe-000000000000000000000000"
+            ),
+        ),
+        (
+            "a stored monitor name in another region",
+            monitor_arn_in("eu-central-1", ACCOUNT, "present"),
+        ),
+        (
+            "a stored monitor name in another account",
+            monitor_arn_in(REGION, "111122223333", "present"),
+        ),
+        ("an ARN of another service entirely", source_arn()),
+        (
+            "a networkmonitor ARN of a resource type this service does not tag",
+            format!("arn:aws:networkmonitor:{REGION}:{ACCOUNT}:widget/present"),
+        ),
+    ];
+
+    for (case, arn) in cases {
+        let (status, body) = list_tags(&router, &arn).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404, got {status} {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+    }
+}
+
+/// `ListTagsForResource` is `@readonly`: reading tags changes nothing a later
+/// caller sees — not the tags, not the monitor's state, not its `modifiedAt`.
+#[tokio::test]
+async fn listing_tags_changes_nothing_a_later_caller_sees() {
+    let router = router();
+    let (status, created) =
+        create_monitor(&router, r#"{"monitorName":"readonly","tags":{"team":"net"}}"#).await;
+    assert_eq!(
+        status, 200,
+        "setup: CreateMonitor should succeed, got {status} {created:?}"
+    );
+    let arn = string_at(&created, "monitorArn");
+
+    let (status, before) = get_monitor(&router, "readonly").await;
+    assert_eq!(
+        status, 200,
+        "setup: GetMonitor should succeed, got {status} {before:?}"
+    );
+
+    let mut answers = Vec::new();
+    for _ in 0..3 {
+        let (status, listed) = list_tags(&router, &arn).await;
+        assert_eq!(
+            status, 200,
+            "case \"repeated read\": expected 200, got {status} {listed:?}"
+        );
+        answers.push(listed.get("tags").cloned().unwrap_or(Value::Null));
+    }
+    for (i, answer) in answers.iter().enumerate() {
+        assert_eq!(
+            answer,
+            &json!({"team": "net"}),
+            "case \"repeated read #{i}\": every read reports the stored tags, got {answer:?}"
+        );
+    }
+
+    let (status, after) = get_monitor(&router, "readonly").await;
+    assert_eq!(
+        status, 200,
+        "case \"read is not a write\": GetMonitor should succeed, got {status} {after:?}"
+    );
+    assert_eq!(
+        after, before,
+        "case \"read is not a write\": the monitor must be unchanged by the reads, got {after:?}"
+    );
+}
+
 /// `UntagResource` removes exactly the named keys from the resource the ARN
-/// names, and nothing else — read back through `GetMonitor`.
+/// names, and nothing else — read back through `ListTagsForResource` and
+/// `GetMonitor`, which report the same stored map.
 ///
 /// The table spans the class the rule covers: which KIND of resource the ARN
 /// names (monitor or probe), how many tags it starts with, how many keys the
@@ -262,93 +668,93 @@ async fn untag_resource_removes_exactly_the_named_keys() {
     let cases: Vec<Case> = vec![
         Case {
             case: "the recorded case: the one tag a monitor carries",
-            monitor_tags: serde_json::json!({"team": "net"}),
-            probe_tags: serde_json::json!({"role": "edge"}),
+            monitor_tags: json!({"team": "net"}),
+            probe_tags: json!({"role": "edge"}),
             target: Target::Monitor,
             removed: &["team"],
-            want_monitor_tags: serde_json::json!({}),
-            want_probe_tags: serde_json::json!({"role": "edge"}),
+            want_monitor_tags: json!({}),
+            want_probe_tags: json!({"role": "edge"}),
         },
         Case {
             case: "one key out of three on a monitor",
-            monitor_tags: serde_json::json!({"a": "1", "b": "2", "c": "3"}),
-            probe_tags: serde_json::json!({"role": "edge"}),
+            monitor_tags: json!({"a": "1", "b": "2", "c": "3"}),
+            probe_tags: json!({"role": "edge"}),
             target: Target::Monitor,
             removed: &["b"],
-            want_monitor_tags: serde_json::json!({"a": "1", "c": "3"}),
-            want_probe_tags: serde_json::json!({"role": "edge"}),
+            want_monitor_tags: json!({"a": "1", "c": "3"}),
+            want_probe_tags: json!({"role": "edge"}),
         },
         Case {
             case: "several keys in one call",
-            monitor_tags: serde_json::json!({"a": "1", "b": "2", "c": "3"}),
-            probe_tags: serde_json::json!({"role": "edge"}),
+            monitor_tags: json!({"a": "1", "b": "2", "c": "3"}),
+            probe_tags: json!({"role": "edge"}),
             target: Target::Monitor,
             removed: &["a", "c"],
-            want_monitor_tags: serde_json::json!({"b": "2"}),
-            want_probe_tags: serde_json::json!({"role": "edge"}),
+            want_monitor_tags: json!({"b": "2"}),
+            want_probe_tags: json!({"role": "edge"}),
         },
         Case {
             case: "every key a monitor carries",
-            monitor_tags: serde_json::json!({"a": "1", "b": "2"}),
-            probe_tags: serde_json::json!({"role": "edge"}),
+            monitor_tags: json!({"a": "1", "b": "2"}),
+            probe_tags: json!({"role": "edge"}),
             target: Target::Monitor,
             removed: &["a", "b"],
-            want_monitor_tags: serde_json::json!({}),
-            want_probe_tags: serde_json::json!({"role": "edge"}),
+            want_monitor_tags: json!({}),
+            want_probe_tags: json!({"role": "edge"}),
         },
         Case {
             case: "a key the monitor does not carry: removal is idempotent",
-            monitor_tags: serde_json::json!({"team": "net"}),
-            probe_tags: serde_json::json!({"role": "edge"}),
+            monitor_tags: json!({"team": "net"}),
+            probe_tags: json!({"role": "edge"}),
             target: Target::Monitor,
             removed: &["absent"],
-            want_monitor_tags: serde_json::json!({"team": "net"}),
-            want_probe_tags: serde_json::json!({"role": "edge"}),
+            want_monitor_tags: json!({"team": "net"}),
+            want_probe_tags: json!({"role": "edge"}),
         },
         Case {
             case: "the same key twice in one call",
-            monitor_tags: serde_json::json!({"team": "net", "keep": "me"}),
-            probe_tags: serde_json::json!({"role": "edge"}),
+            monitor_tags: json!({"team": "net", "keep": "me"}),
+            probe_tags: json!({"role": "edge"}),
             target: Target::Monitor,
             removed: &["team", "team"],
-            want_monitor_tags: serde_json::json!({"keep": "me"}),
-            want_probe_tags: serde_json::json!({"role": "edge"}),
+            want_monitor_tags: json!({"keep": "me"}),
+            want_probe_tags: json!({"role": "edge"}),
         },
         Case {
             case: "a monitor with no tags at all",
-            monitor_tags: serde_json::json!({}),
-            probe_tags: serde_json::json!({"role": "edge"}),
+            monitor_tags: json!({}),
+            probe_tags: json!({"role": "edge"}),
             target: Target::Monitor,
             removed: &["team"],
-            want_monitor_tags: serde_json::json!({}),
-            want_probe_tags: serde_json::json!({"role": "edge"}),
+            want_monitor_tags: json!({}),
+            want_probe_tags: json!({"role": "edge"}),
         },
         Case {
             case: "a probe's own tag, by its probe ARN",
-            monitor_tags: serde_json::json!({"team": "net"}),
-            probe_tags: serde_json::json!({"role": "edge", "owner": "probe"}),
+            monitor_tags: json!({"team": "net"}),
+            probe_tags: json!({"role": "edge", "owner": "probe"}),
             target: Target::Probe,
             removed: &["role"],
-            want_monitor_tags: serde_json::json!({"team": "net"}),
-            want_probe_tags: serde_json::json!({"owner": "probe"}),
+            want_monitor_tags: json!({"team": "net"}),
+            want_probe_tags: json!({"owner": "probe"}),
         },
         Case {
             case: "every tag a probe carries",
-            monitor_tags: serde_json::json!({"team": "net"}),
-            probe_tags: serde_json::json!({"role": "edge", "owner": "probe"}),
+            monitor_tags: json!({"team": "net"}),
+            probe_tags: json!({"role": "edge", "owner": "probe"}),
             target: Target::Probe,
             removed: &["owner", "role"],
-            want_monitor_tags: serde_json::json!({"team": "net"}),
-            want_probe_tags: serde_json::json!({}),
+            want_monitor_tags: json!({"team": "net"}),
+            want_probe_tags: json!({}),
         },
         Case {
             case: "a key the probe does not carry, and one the MONITOR carries",
-            monitor_tags: serde_json::json!({"team": "net"}),
-            probe_tags: serde_json::json!({"role": "edge"}),
+            monitor_tags: json!({"team": "net"}),
+            probe_tags: json!({"role": "edge"}),
             target: Target::Probe,
             removed: &["absent", "team"],
-            want_monitor_tags: serde_json::json!({"team": "net"}),
-            want_probe_tags: serde_json::json!({"role": "edge"}),
+            want_monitor_tags: json!({"team": "net"}),
+            want_probe_tags: json!({"role": "edge"}),
         },
     ];
 
@@ -366,8 +772,8 @@ async fn untag_resource_removes_exactly_the_named_keys() {
         let name = format!("untag-{index}");
         let (monitor_arn, probe_arn) = fixture(&router, &name, &monitor_tags, &probe_tags).await;
         let resource_arn = match target {
-            Target::Monitor => monitor_arn,
-            Target::Probe => probe_arn,
+            Target::Monitor => monitor_arn.clone(),
+            Target::Probe => probe_arn.clone(),
         };
 
         let (status, body) = untag_resource(&router, &resource_arn, removed).await;
@@ -391,6 +797,29 @@ async fn untag_resource_removes_exactly_the_named_keys() {
             probe.get("tags"),
             Some(&want_probe),
             "case {case:?}: expected probe tags {want_probe}, got {probe:?}"
+        );
+
+        // `ListTagsForResource` reads the same stored maps, so it reports what
+        // the removal left on each resource.
+        let (status, listed_monitor) = list_tags(&router, &monitor_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListTagsForResource 200, got {status} {listed_monitor:?}"
+        );
+        assert_eq!(
+            listed_monitor.get("tags"),
+            Some(&want_monitor),
+            "case {case:?}: expected the monitor's listed tags {want_monitor}, got {listed_monitor:?}"
+        );
+        let (status, listed_probe) = list_tags(&router, &probe_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListTagsForResource 200, got {status} {listed_probe:?}"
+        );
+        assert_eq!(
+            listed_probe.get("tags"),
+            Some(&want_probe),
+            "case {case:?}: expected the probe's listed tags {want_probe}, got {listed_probe:?}"
         );
     }
 }
@@ -660,8 +1089,8 @@ async fn tagging_an_arn_no_resource_carries_is_not_found() {
     let (live_monitor_arn, live_probe_arn) = fixture(
         &router,
         "untag-404",
-        &serde_json::json!({"team": "net"}),
-        &serde_json::json!({"role": "edge"}),
+        &json!({"team": "net"}),
+        &json!({"role": "edge"}),
     )
     .await;
 
@@ -669,8 +1098,8 @@ async fn tagging_an_arn_no_resource_carries_is_not_found() {
     let (deleted_monitor_arn, _) = fixture(
         &router,
         "untag-deleted",
-        &serde_json::json!({"team": "net"}),
-        &serde_json::json!({"role": "edge"}),
+        &json!({"team": "net"}),
+        &json!({"role": "edge"}),
     )
     .await;
     let (status, body) = delete_monitor(&router, "untag-deleted").await;
@@ -692,15 +1121,17 @@ async fn tagging_an_arn_no_resource_carries_is_not_found() {
         ("a monitor that was deleted", deleted_monitor_arn),
         (
             "a probe id that was never minted",
-            format!("arn:aws:networkmonitor:{REGION}:{ACCOUNT}:probe/probe-000000000000000000000000"),
+            format!(
+                "arn:aws:networkmonitor:{REGION}:{ACCOUNT}:probe/probe-000000000000000000000000"
+            ),
         ),
         (
             "the monitor's ARN in another region",
-            format!("arn:aws:networkmonitor:eu-west-1:{ACCOUNT}:monitor/untag-404"),
+            monitor_arn_in("eu-west-1", ACCOUNT, "untag-404"),
         ),
         (
             "the monitor's ARN under another account",
-            format!("arn:aws:networkmonitor:{REGION}:111122223333:monitor/untag-404"),
+            monitor_arn_in(REGION, "111122223333", "untag-404"),
         ),
         (
             "a probe ARN naming the monitor instead of the probe",
@@ -743,7 +1174,7 @@ async fn tagging_an_arn_no_resource_carries_is_not_found() {
     assert_eq!(status, 200, "expected GetMonitor 200, got {status} {got:?}");
     assert_eq!(
         got.get("tags"),
-        Some(&serde_json::json!({"team": "net"})),
+        Some(&json!({"team": "net"})),
         "a refused tagging call must not touch the monitor's tags, got {got:?}"
     );
     assert_eq!(
@@ -753,7 +1184,7 @@ async fn tagging_an_arn_no_resource_carries_is_not_found() {
     );
     assert_eq!(
         only_probe(&got).get("tags"),
-        Some(&serde_json::json!({"role": "edge"})),
+        Some(&json!({"role": "edge"})),
         "a refused tagging call must not touch the probe's tags, got {got:?}"
     );
 }
@@ -766,8 +1197,8 @@ async fn modified_at_moves_only_when_a_key_was_removed() {
     let (monitor_arn, _) = fixture(
         &router,
         "untag-modified",
-        &serde_json::json!({"team": "net"}),
-        &serde_json::json!({"role": "edge"}),
+        &json!({"team": "net"}),
+        &json!({"role": "edge"}),
     )
     .await;
 

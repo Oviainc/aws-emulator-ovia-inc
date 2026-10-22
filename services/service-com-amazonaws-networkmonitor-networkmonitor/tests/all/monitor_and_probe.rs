@@ -971,10 +971,10 @@ async fn an_unstored_resource_is_reported_as_not_found() {
 /// The operations this crate implements answer from state; the ones still
 /// scaffolded must answer 501 rather than an empty 200.
 ///
-/// `UpdateMonitor`, `TagResource` and `UntagResource` are no longer among them:
-/// all three are implemented, and `tests/all/update_monitor.rs`,
-/// `tests/all/tagging.rs` and `tests/all/resource_tags.rs` assert what they do.
-/// Nor is `GetProbe`, which
+/// `UpdateMonitor`, `TagResource`, `UntagResource` and `ListTagsForResource`
+/// are no longer among them: all four are implemented, and
+/// `tests/all/update_monitor.rs`, `tests/all/tagging.rs` and
+/// `tests/all/resource_tags.rs` assert what they do. Nor is `GetProbe`, which
 /// `tests/all/monitor_lifecycle_and_front_door.rs` asserts.
 ///
 /// A fixer implementing one of the rows below deletes that row in the same
@@ -985,24 +985,18 @@ async fn the_unimplemented_operations_still_answer_501() {
     let router = router();
     let (status, _) = create_monitor(&router, r#"{"monitorName":"still-stubbed"}"#).await;
     assert_eq!(status, 200, "setup: CreateMonitor should succeed");
-    let arn = format!("arn:aws:networkmonitor:{REGION}:{ACCOUNT}:monitor/still-stubbed");
-    let encoded_arn = arn.replace(':', "%3A").replace('/', "%2F");
 
     // (case, method, path, body)
     let cases: Vec<(&str, &str, String, Option<String>)> = vec![
-        // `UpdateMonitor` used to be a row here; it is implemented now, and its
-        // behaviour is pinned by `tests/all/update_monitor.rs`.
+        // `UpdateMonitor` used to be a row here, and so were the three tagging
+        // operations; they are implemented now, and their behaviour is pinned by
+        // `tests/all/update_monitor.rs`, `tests/all/tagging.rs` and
+        // `tests/all/resource_tags.rs`.
         (
             "UpdateProbe",
             "PATCH",
             format!("/monitors/still-stubbed/probes/probe-{}", "a".repeat(21)),
             Some(r#"{"packetSize":56}"#.to_string()),
-        ),
-        (
-            "ListTagsForResource",
-            "GET",
-            format!("/tags/{encoded_arn}"),
-            None,
         ),
     ];
 

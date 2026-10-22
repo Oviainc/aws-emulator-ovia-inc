@@ -584,6 +584,27 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
         None
     }
 
+    /// The tag map stored on one resolved resource, for reporting.
+    ///
+    /// The same single map [`Self::tags_mut`] hands a tagging write, so what
+    /// `ListTagsForResource` reports and what `GetMonitor` reports for the same
+    /// resource can never disagree.
+    pub fn tags(&self, resource: &TaggedResource) -> Option<&BTreeMap<String, String>> {
+        match resource {
+            TaggedResource::Monitor { monitor_name } => {
+                self.monitors.get(monitor_name).map(|monitor| &monitor.tags)
+            }
+            TaggedResource::Probe {
+                monitor_name,
+                probe_id,
+            } => self
+                .monitors
+                .get(monitor_name)
+                .and_then(|monitor| monitor.probes.get(probe_id))
+                .map(|probe| &probe.tags),
+        }
+    }
+
     /// The tag map stored on one resolved resource, for writing.
     ///
     /// There is ONE tag map per resource — the same one `GetMonitor` reports —
