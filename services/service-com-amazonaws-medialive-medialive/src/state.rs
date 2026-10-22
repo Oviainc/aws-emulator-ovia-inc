@@ -22,7 +22,11 @@
 //! group and one [`EventBridgeRuleTemplateGroupRecord`] per created eventbridge
 //! rule template group, each keyed by its minted `Id` and carrying the region it
 //! was created in, so a group's name is unique "within the scope of a resource
-//! type in a specific region" (the `Name` member's own documentation).
+//! type in a specific region" (the `Name` member's own documentation). The
+//! eventbridge rule TEMPLATES those groups hold live here too: one
+//! [`EventBridgeRuleTemplateRecord`] per created template, carrying the id of
+//! the group its `GroupIdentifier` resolved to, so a template reports the group
+//! it belongs to out of state rather than out of the request.
 //!
 //! Every value a channel-, input-, input-security-group-, SdiSource-,
 //! signal-map- or template-group-shaped response carries is either stored
@@ -69,6 +73,24 @@ pub use alarm_template_groups::{
 };
 
 pub(crate) use alarm_template_groups::alarm_template_group_output;
+
+/// The eventbridge rule TEMPLATE slice: its record, its bounds, its refusal, the
+/// store's methods and its output projection, in one module of its own for the
+/// same reason as [`alarm_template_groups`]. What stays in this file is the part
+/// the rest of the state needs: the store members on
+/// [`ComAmazonawsMedialiveMedialiveState`] and the per-region token key every
+/// monitor template resource shares.
+pub mod event_bridge_rule_templates;
+
+pub use event_bridge_rule_templates::{
+    is_event_target_arn, is_event_type, EventBridgeRuleTemplateRecord,
+    EventBridgeRuleTemplateRefusal, NewEventBridgeRuleTemplate,
+    EVENT_BRIDGE_RULE_TEMPLATE_EVENT_TYPES, MAX_EVENT_BRIDGE_RULE_TEMPLATES,
+    MAX_EVENT_BRIDGE_RULE_TEMPLATE_TARGETS, MAX_EVENT_BRIDGE_RULE_TEMPLATE_TOKENS,
+    MAX_EVENT_TARGET_ARN_LEN,
+};
+
+pub(crate) use event_bridge_rule_templates::event_bridge_rule_template_output;
 
 /// The `ChannelState` enum values this slice uses, spelled exactly as the model
 /// declares them (`smithy_query(query="shape", shape="ChannelState")`:
@@ -650,6 +672,20 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// -> the group it created, so a retry returns that group instead of a
     /// second one. PRIVATE for the same reason as [`Self::channel_tokens`].
     event_bridge_rule_template_group_tokens: IdempotencyTokens,
+    /// Every eventbridge rule template that exists, keyed by its minted `Id`. A
+    /// `BTreeMap` so a later `ListEventBridgeRuleTemplates` walks it in id order
+    /// on every call.
+    ///
+    /// PRIVATE, so the group resolution, the name-uniqueness rule, the cap and
+    /// the mint stay invariants of
+    /// [`Self::insert_event_bridge_rule_template`] rather than of each handler.
+    event_bridge_rule_templates: BTreeMap<String, EventBridgeRuleTemplateRecord>,
+    /// Mint counter behind [`Self::mint_event_bridge_rule_template_id`].
+    next_event_bridge_rule_template_id: u64,
+    /// `CreateEventBridgeRuleTemplate`'s `RequestId` (`@idempotencyToken`), keyed
+    /// per region by [`template_group_token_key`] -> the template it created.
+    /// PRIVATE for the same reason as [`Self::channel_tokens`].
+    event_bridge_rule_template_tokens: IdempotencyTokens,
     /// Every signal map that exists, keyed by its minted `Id`, in mint order for
     /// the same reason as [`Self::channels`].
     pub signal_maps: BTreeMap<String, SignalMapRecord>,
@@ -2121,7 +2157,8 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 // `ComAmazonawsMedialiveMedialiveState` above.
 // ---------------------------------------------------------------------------
 
-/// The key a template-group token map uses, for both group resources.
+/// The key a monitor template token map uses — both group resources and the
+/// eventbridge rule templates inside them.
 ///
 /// A `RequestId` is idempotent for the regional endpoint it was presented to, so
 /// the region is part of the key: two regions using the same token each keep

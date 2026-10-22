@@ -690,36 +690,33 @@ async fn an_alarm_write_never_happens_under_this_services_lock() {
     );
 }
 
-/// Every value of the model's `MetricType` enum mints alarms.
+/// Every value of the model's `MetricType` enum mints alarms, on a dimension it is
+/// published FOR.
 ///
 /// The predefined-metric catalog is what turns a `PredefinedMetricType` into a metric to
 /// alarm on, and a type with no row in it would be ACCEPTED by the configuration check and
 /// then mint nothing — a 200 that provisions nothing, the very symptom this issue is
 /// about. So the catalog's coverage is pinned here against the model's own value list
-/// rather than trusted.
+/// rather than trusted: every metric type has to publish at least one scalable dimension,
+/// and a policy for it on that dimension has to mint the alarms that drive it.
 #[tokio::test]
 async fn every_modelled_metric_type_mints_alarms() {
     use service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::ops::types::shared_types::METRIC_TYPE_VALUES;
+    use service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::state::{
+        predefined_metric_dimensions, predefined_metric_target_range,
+    };
 
     let emulator = Emulator::empty();
-    emulator.create_provisioned_table("orders", 4, 4).await;
-    let target = json!({
-        "ServiceNamespace": "dynamodb",
-        "ResourceId": "table/orders",
-        "ScalableDimension": "dynamodb:table:ReadCapacityUnits",
-    });
-    let mut registration = target.clone();
-    registration["MinCapacity"] = json!(1);
-    registration["MaxCapacity"] = json!(10);
-    let (status, body) = emulator
-        .call("RegisterScalableTarget", registration)
-        .await;
-    assert_eq!(
-        status, 200,
-        "case \"setup\": expected RegisterScalableTarget to answer 200, got {status} {body:?}"
-    );
 
     for metric_type in METRIC_TYPE_VALUES {
+        // A metric describes the dimensions its own service publishes it for; one that
+        // publishes none could never drive a policy.
+        let dimensions = predefined_metric_dimensions(metric_type).unwrap_or_default();
+        let dimension = *dimensions.first().unwrap_or_else(|| {
+            panic!("case {metric_type:?}: expected the catalog to publish a scalable dimension")
+        });
+        let target = emulator.given_target(dimension, 1, 10).await;
+
         let mut specification = json!({"PredefinedMetricType": metric_type});
         // The one metric type that names a resource beside the scalable target, and
         // therefore cannot be put without one.
@@ -728,11 +725,16 @@ async fn every_modelled_metric_type_mints_alarms() {
                 "app/my-load-balancer/50dc6c495c0c9188/targetgroup/my-targets/73e2d6bc24d8a067"
             );
         }
+        // A target value inside the window the metric publishes, where it publishes one.
+        let target_value = match predefined_metric_target_range(metric_type) {
+            Some((low, high)) => (low + high) / 2.0,
+            None => 50.0,
+        };
         let mut request = target.clone();
         request["PolicyName"] = json!(format!("track-{metric_type}"));
         request["PolicyType"] = json!("TargetTrackingScaling");
         request["TargetTrackingScalingPolicyConfiguration"] = json!({
-            "TargetValue": 50.0,
+            "TargetValue": target_value,
             "PredefinedMetricSpecification": specification,
         });
         let (status, body) = emulator.call("PutScalingPolicy", request).await;
@@ -894,24 +896,22 @@ async fn a_policy_configuration_that_cannot_be_evaluated_is_refused_and_mints_no
     // A customised specification that is only a metric math query names no single series,
     // so the alarms that would drive the policy cannot be materialised: AWS accepts the
     // form, so it is answered with the scaffold's 501 rather than a 200 that provisions
-    // nothing.
-    let (status, body) = emulator
-        .call(
-            "PutScalingPolicy",
-            json!({"PolicyName": "tracker", "ServiceNamespace": "dynamodb",
-                   "ResourceId": "table/orders",
-                   "ScalableDimension": "dynamodb:table:ReadCapacityUnits",
-                   "PolicyType": "TargetTrackingScaling",
-                   "TargetTrackingScalingPolicyConfiguration": {
-                       "TargetValue": 40.0,
-                       "CustomizedMetricSpecification": {
-                           "Metrics": [{
-                               "Id": "m1",
-                               "Expression": "SUM(METRICS())",
-                               "ReturnData": true,
-                           }]}}}),
-        )
-        .await;
+    // nothing. Put on an ECS service, because a customized metric is not a signal a
+    // DynamoDB capacity dimension can be scaled from at all.
+    let ecs_target = emulator.given_target("ecs:service:DesiredCount", 1, 20).await;
+    let mut query = ecs_target;
+    query["PolicyName"] = json!("tracker");
+    query["PolicyType"] = json!("TargetTrackingScaling");
+    query["TargetTrackingScalingPolicyConfiguration"] = json!({
+        "TargetValue": 40.0,
+        "CustomizedMetricSpecification": {
+            "Metrics": [{
+                "Id": "m1",
+                "Expression": "SUM(METRICS())",
+                "ReturnData": true,
+            }]},
+    });
+    let (status, body) = emulator.call("PutScalingPolicy", query).await;
     assert_eq!(
         status, 501,
         "case \"a metric math query\": expected HTTP 501, got {status} {body:?}"

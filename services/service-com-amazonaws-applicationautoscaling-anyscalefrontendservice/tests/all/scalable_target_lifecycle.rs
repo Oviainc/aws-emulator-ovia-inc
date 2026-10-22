@@ -17,7 +17,7 @@
 
 use serde_json::{json, Value};
 
-use super::emulator::{error_code, Emulator, ACCOUNT, REGION};
+use super::emulator::{error_code, service_linked_role_suffix, Emulator, ACCOUNT, REGION};
 
 /// The DynamoDB tables this suite's `dynamodb` rows register a scalable target on.
 ///
@@ -111,6 +111,20 @@ const TARGET_CATALOG: &[TargetRow] = &[
     },
 ];
 
+/// The predefined metric a scalable dimension's own service publishes for it, for the rows
+/// that put a target-tracking policy on a dimension they choose.
+fn predefined_metric_of(dimension: &str) -> &'static str {
+    match dimension {
+        "dynamodb:table:ReadCapacityUnits" | "dynamodb:index:ReadCapacityUnits" => {
+            "DynamoDBReadCapacityUtilization"
+        }
+        "dynamodb:table:WriteCapacityUnits" | "dynamodb:index:WriteCapacityUnits" => {
+            "DynamoDBWriteCapacityUtilization"
+        }
+        other => panic!("case {other:?}: this suite publishes no metric for it"),
+    }
+}
+
 #[tokio::test]
 async fn a_registered_target_is_described_from_what_was_persisted() {
     let emulator = Emulator::with_tables(TABLES).await;
@@ -176,11 +190,13 @@ async fn a_registered_target_is_described_from_what_was_persisted() {
             "case {case:?}: expected Describe to return the ARN Register minted, got {target:?}"
         );
 
-        // An omitted RoleARN resolves to the service-linked role for the namespace.
+        // An omitted RoleARN resolves to the service-linked role for the namespace, whose
+        // name carries the resource type that namespace scales.
         let expected_role = row.role.map(ToString::to_string).unwrap_or_else(|| {
             format!(
-                "arn:aws:iam::{ACCOUNT}:role/aws-service-role/{}.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling",
-                row.namespace
+                "arn:aws:iam::{ACCOUNT}:role/aws-service-role/{}.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{}",
+                row.namespace,
+                service_linked_role_suffix(row.namespace)
             )
         });
         assert_eq!(
@@ -998,25 +1014,37 @@ async fn describe_policies_pages_and_filters_by_resource_and_dimension() {
                 status, 200,
                 "case {resource_id:?}/{dimension:?}: expected 200, got {status} {body:?}"
             );
-            for policy_name in ["p-one", "p-two"] {
-                let (status, body) = emulator
-                    .call(
-                        "PutScalingPolicy",
-                        json!({
-                            "PolicyName": policy_name,
-                            "ServiceNamespace": namespace,
-                            "ResourceId": resource_id,
-                            "ScalableDimension": dimension,
-                            "PolicyType": "TargetTrackingScaling",
-                            "TargetTrackingScalingPolicyConfiguration": {
-                                "TargetValue": 50.0,
-                                "PredefinedMetricSpecification": {
-                                    "PredefinedMetricType": "DynamoDBReadCapacityUtilization"
-                                },
-                            },
-                        }),
-                    )
-                    .await;
+            // Two policies per target. AWS allows more than one, but not two that track
+            // the same metric, so one is the tracker of the metric this dimension
+            // publishes and the other is a step policy.
+            let tracker = json!({
+                "PolicyName": "p-one",
+                "ServiceNamespace": namespace,
+                "ResourceId": resource_id,
+                "ScalableDimension": dimension,
+                "PolicyType": "TargetTrackingScaling",
+                "TargetTrackingScalingPolicyConfiguration": {
+                    "TargetValue": 50.0,
+                    "PredefinedMetricSpecification": {
+                        "PredefinedMetricType": predefined_metric_of(dimension)
+                    },
+                },
+            });
+            let stepper = json!({
+                "PolicyName": "p-two",
+                "ServiceNamespace": namespace,
+                "ResourceId": resource_id,
+                "ScalableDimension": dimension,
+                "PolicyType": "StepScaling",
+                "StepScalingPolicyConfiguration": {
+                    "AdjustmentType": "ChangeInCapacity",
+                    "StepAdjustments": [
+                        {"MetricIntervalLowerBound": 0.0, "ScalingAdjustment": 1},
+                    ],
+                },
+            });
+            for (policy_name, request) in [("p-one", tracker), ("p-two", stepper)] {
+                let (status, body) = emulator.call("PutScalingPolicy", request).await;
                 assert_eq!(
                     status, 200,
                     "case {resource_id:?}/{dimension:?}/{policy_name:?}: expected 200, got {status} {body:?}"
@@ -1212,16 +1240,26 @@ async fn delete_and_deregister_are_observable_and_refuse_a_second_time() {
         "case \"register\": expected 200, got {status} {body:?}"
     );
 
-    for policy_name in ["keep-me", "delete-me"] {
-        let mut request = target.clone();
-        request["PolicyName"] = json!(policy_name);
-        request["PolicyType"] = json!("TargetTrackingScaling");
-        request["TargetTrackingScalingPolicyConfiguration"] = json!({
-            "TargetValue": 50.0,
-            "PredefinedMetricSpecification": {
-                "PredefinedMetricType": "DynamoDBReadCapacityUtilization"
-            },
-        });
+    // Two policies on one target. AWS allows more than one, but not two that track the
+    // SAME metric, and this dimension publishes exactly one target-tracking metric — so
+    // the second policy is a step policy rather than a second tracker of that metric.
+    let mut tracker = target.clone();
+    tracker["PolicyName"] = json!("keep-me");
+    tracker["PolicyType"] = json!("TargetTrackingScaling");
+    tracker["TargetTrackingScalingPolicyConfiguration"] = json!({
+        "TargetValue": 50.0,
+        "PredefinedMetricSpecification": {
+            "PredefinedMetricType": "DynamoDBReadCapacityUtilization"
+        },
+    });
+    let mut stepper = target.clone();
+    stepper["PolicyName"] = json!("delete-me");
+    stepper["PolicyType"] = json!("StepScaling");
+    stepper["StepScalingPolicyConfiguration"] = json!({
+        "AdjustmentType": "ChangeInCapacity",
+        "StepAdjustments": [{"MetricIntervalLowerBound": 0.0, "ScalingAdjustment": 1}],
+    });
+    for (policy_name, request) in [("keep-me", tracker), ("delete-me", stepper)] {
         let (status, body) = emulator.call("PutScalingPolicy", request).await;
         assert_eq!(
             status, 200,
