@@ -158,12 +158,84 @@ pub fn generated_service_id(n: usize) -> String {
     format!("svc-{n}")
 }
 
-/// A Region code legal under the model's `Region` member pattern
-/// `^[a-z]{2}(-[a-z]{1,10}){1,2}-[1-9]$` (`smithy_query(query="shape", shape="RegionsList")`).
-pub fn generated_region(n: usize) -> String {
-    let first = char::from(b'a' + (n / 26) as u8);
-    let second = char::from(b'a' + (n % 26) as u8);
-    format!("eu-{first}{second}-1")
+/// The alphabet a generated `Service` segment is drawn from: the characters
+/// `Service`'s `@pattern ^[a-z0-9]+(-[a-z0-9]+)*$` admits inside a segment
+/// (`smithy_query(query="shape", shape="ServiceList")`).
+const SEGMENT_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+/// The `n`-th generated `Service` identifier: 1 to 3 hyphen-separated segments of
+/// 1 to 8 characters drawn from [`SEGMENT_ALPHABET`], so the sequence walks
+/// segment COUNT, segment LENGTH and character class together and every value
+/// stays inside the member's `@pattern` and its `@length(1, 64)`.
+///
+/// Deterministic: `n` alone decides the value, so a failing case names itself and
+/// no seed is involved. This and [`legal_region`] are the crate's ONE pair of
+/// model-pattern generators — a suite that needs a legal value draws it here
+/// rather than inventing its own idea of what the pattern admits.
+pub fn legal_service(n: usize) -> String {
+    let segments = n % 3 + 1;
+    (0..segments)
+        .map(|segment| {
+            let length = (n + segment) % 8 + 1;
+            (0..length)
+                .map(|position| {
+                    let index = (n * 7 + segment * 13 + position * 5) % SEGMENT_ALPHABET.len();
+                    char::from(SEGMENT_ALPHABET[index])
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<String>>()
+        .join("-")
+}
+
+/// The `n`-th generated `Region` code, under the member's own
+/// `@pattern ^[a-z]{2}(-[a-z]{1,10}){1,2}-[1-9]$`
+/// (`smithy_query(query="shape", shape="RegionsList")`): two leading letters, one
+/// or two middle segments of 1 to 10 letters, and a trailing digit 1-9.
+pub fn legal_region(n: usize) -> String {
+    let letter = |value: usize| char::from(b'a' + (value % 26) as u8);
+    let middles = n % 2 + 1;
+    let middle: Vec<String> = (0..middles)
+        .map(|segment| {
+            let length = (n + segment) % 10 + 1;
+            (0..length).map(|position| letter(n + segment + position)).collect()
+        })
+        .collect();
+    format!(
+        "{}{}-{}-{}",
+        letter(n),
+        letter(n + 1),
+        middle.join("-"),
+        n % 9 + 1
+    )
+}
+
+/// `^[a-z0-9]+(-[a-z0-9]+)*$` and `@length(1, 64)`, transcribed by hand: a
+/// generated row is only evidence about a rule if it really is a value the model
+/// admits, so a suite checks the generator's output before sending it.
+pub fn is_legal_service(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value.split('-').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
+}
+
+/// `^[a-z]{2}(-[a-z]{1,10}){1,2}-[1-9]$`, transcribed by hand.
+pub fn is_legal_region(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    if !(3..=4).contains(&parts.len()) {
+        return false;
+    }
+    let head_ok = parts[0].len() == 2 && parts[0].bytes().all(|b| b.is_ascii_lowercase());
+    let middles_ok = parts[1..parts.len() - 1].iter().all(|segment| {
+        (1..=10).contains(&segment.len()) && segment.bytes().all(|b| b.is_ascii_lowercase())
+    });
+    let tail_ok = parts[parts.len() - 1].len() == 1
+        && parts[parts.len() - 1].bytes().all(|b| b.is_ascii_digit() && b != b'0');
+    head_ok && middles_ok && tail_ok
 }
 
 pub fn strings(values: &[&str]) -> Value {

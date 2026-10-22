@@ -9,7 +9,7 @@
 //! this suite asserts only that the parts of one answer agree, on a couple of
 //! rows from different constraint classes. The harness is `crate::wire`.
 
-use crate::wire::{build_router, generated_region, update_customizations};
+use crate::wire::{build_router, legal_region, update_customizations};
 use serde_json::{json, Value};
 
 /// The error code a body-constraint refusal names. The front door refuses the
@@ -26,7 +26,7 @@ const BODY_MEMBERS: &[&str] = &["accountColor", "visibleServices", "visibleRegio
 /// header code, the same code in the body, and a member-free message.
 #[tokio::test]
 async fn a_body_refusal_carries_one_code_in_the_header_and_the_body() {
-    let over_bound_regions: Vec<String> = (0..101).map(generated_region).collect();
+    let over_bound_regions: Vec<String> = (0..101).map(legal_region).collect();
     let cases: Vec<(&str, Value)> = vec![
         ("colour outside the enum", json!({"accountColor": "chartreuse"})),
         (
