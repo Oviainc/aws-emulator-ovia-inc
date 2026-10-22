@@ -26,6 +26,9 @@ mod channel_schedule;
 #[path = "all/cloud_watch_alarm_template_groups.rs"]
 mod cloud_watch_alarm_template_groups;
 
+#[path = "all/error_envelope.rs"]
+mod error_envelope;
+
 #[path = "all/event_bridge_rule_template_groups.rs"]
 mod event_bridge_rule_template_groups;
 
