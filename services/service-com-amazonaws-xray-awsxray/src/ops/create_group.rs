@@ -184,6 +184,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And a comparison whose operands cannot be compared at all is refused
+        // HERE too, not only where the expression is evaluated
+        // (`crate::state::filter`): an expression that can never be true for any
+        // trace is a mistake in the request, and a group may not store one.
+        if let Err(error) = crate::state::filter::operand_check(
+            input.filter_expression.as_deref().unwrap_or_default(),
+        ) {
+            return Err(CreateGroupErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(error.message),
+                },
+            )
+            .into());
+        }
+
         // "Notifications may only be enabled on a group with InsightsEnabled set
         // to true" (`InsightsConfiguration` on this operation's input), decided
         // against the record this call would store — the same rule `UpdateGroup`

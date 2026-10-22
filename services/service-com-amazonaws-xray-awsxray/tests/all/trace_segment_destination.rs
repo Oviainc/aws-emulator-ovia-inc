@@ -36,7 +36,7 @@ use service_com_amazonaws_xray_awsxray::state::{
     DESTINATION_STATUS_PENDING,
 };
 
-use super::trace_ingest_and_groups::{Answer, Xray};
+use super::xray_wire::{Answer, Xray};
 
 /// Long enough that the `PENDING` -> `ACTIVE` move the clock owes is certainly
 /// due, without encoding a second duration of its own.
