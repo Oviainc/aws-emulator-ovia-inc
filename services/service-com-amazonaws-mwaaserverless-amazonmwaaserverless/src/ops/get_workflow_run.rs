@@ -8,6 +8,11 @@
 //! same instant whether or not anybody called (see `crate::state::WorkflowRun::settle`).
 //! It moves no status, consumes no quota and bumps no counter because the run was read.
 //!
+//! The entity this operation resolves is the RUN, so neither a workflow nor a run the
+//! store does not hold resolves one: both are the modelled `ResourceNotFoundException`
+//! naming the run, answered with the status the recorded service answers it with (see
+//! `crate::state::unresolved`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,26 +191,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = SystemTime::now();
         let mut store = state.lock();
 
+        // The run is what this operation resolves: a workflow the store does not hold
+        // holds no run either, so both misses are the same failure to the caller.
+        let unresolved_run = || {
+            crate::state::lookup_miss(GetWorkflowRunErrorModeled::ResourceNotFoundException(
+                crate::state::unresolved(
+                    crate::state::UnresolvedEntity::WorkflowRun,
+                    &input.run_id,
+                ),
+            ))
+        };
         let workflow = store
             .workflows
             .get_mut(&input.workflow_arn)
-            .ok_or_else(|| {
-                GetWorkflowRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("No workflow found for {}", input.workflow_arn),
-                    resource_id: input.workflow_arn.clone(),
-                    resource_type: "workflow".to_string(),
-                })
-            })?;
-        let run = workflow.runs.get_mut(&input.run_id).ok_or_else(|| {
-            GetWorkflowRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "Workflow {} has no run {}",
-                    input.workflow_arn, input.run_id
-                ),
-                resource_id: input.run_id.clone(),
-                resource_type: "workflow-run".to_string(),
-            })
-        })?;
+            .ok_or_else(unresolved_run)?;
+        let run = workflow
+            .runs
+            .get_mut(&input.run_id)
+            .ok_or_else(unresolved_run)?;
 
         // The ONE write a read may make: the transition the clock already owed.
         run.settle(now);

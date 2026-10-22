@@ -10,6 +10,12 @@
 //! `ErrorMessage` that says exactly that (`crate::state::NO_AIRFLOW_ENGINE`). No status
 //! is ever reported for work that ran.
 //!
+//! To start a run this operation must resolve the workflow VERSION to run — the one
+//! the request names, else the workflow's latest — so a workflow or a version the
+//! store does not hold is the modelled `ResourceNotFoundException` naming that
+//! version, answered with the status the recorded service answers it with (see
+//! `crate::state::unresolved`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,13 +208,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let fingerprint = request_fingerprint(&input);
         let mut store = state.lock();
 
-        let workflow = store.workflows.get(&input.workflow_arn).ok_or_else(|| {
-            StartWorkflowRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("No workflow found for {}", input.workflow_arn),
-                resource_id: input.workflow_arn.clone(),
-                resource_type: "workflow".to_string(),
-            })
-        })?;
+        // The version this run would execute: the one the request names, else the
+        // workflow's latest. It is the entity THIS operation has to resolve, so a
+        // workflow the store does not hold and a version it does not hold are the
+        // same failure to the caller.
+        let requested = input.workflow_version.as_deref();
+        let unresolved_version = || {
+            crate::state::lookup_miss(StartWorkflowRunErrorModeled::ResourceNotFoundException(
+                crate::state::unresolved(
+                    crate::state::UnresolvedEntity::version_for(requested),
+                    requested.unwrap_or(&input.workflow_arn),
+                ),
+            ))
+        };
+
+        let workflow = store
+            .workflows
+            .get(&input.workflow_arn)
+            .ok_or_else(unresolved_version)?;
         let run_count = workflow.runs.len();
 
         // A repeated @idempotencyToken replays the run it already started. Checked
@@ -247,24 +264,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Run the requested version, defaulting to the workflow's latest.
-        let requested = input.workflow_version.as_deref();
         let version = store
             .workflows
             .get(&input.workflow_arn)
             .and_then(|workflow| workflow.version(requested))
-            .ok_or_else(|| {
-                StartWorkflowRunErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: format!(
-                            "Workflow {} has no version {}",
-                            input.workflow_arn,
-                            requested.unwrap_or("<latest>")
-                        ),
-                        resource_id: input.workflow_arn.clone(),
-                        resource_type: "workflow-version".to_string(),
-                    },
-                )
-            })?
+            .ok_or_else(unresolved_version)?
             .version
             .clone();
 

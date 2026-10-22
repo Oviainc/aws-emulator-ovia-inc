@@ -34,14 +34,14 @@ const ECHOED_MEMBERS: &[&str] = &[
 ];
 
 /// One emulator, reached exactly the way the production router reaches it.
-struct Harness {
+pub(crate) struct Harness {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
     region: &'static str,
 }
 
 impl Harness {
-    fn new(region: &'static str) -> Self {
+    pub(crate) fn new(region: &'static str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -54,7 +54,11 @@ impl Harness {
     }
 
     /// Call one operation over the wire and return its status and parsed body.
-    async fn call(&self, operation: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+    pub(crate) async fn call(
+        &self,
+        operation: &str,
+        body: serde_json::Value,
+    ) -> (u16, serde_json::Value) {
         let payload = serde_json::to_vec(&body).expect("serialize the request body");
         let request = http::Request::builder()
             .method("POST")
@@ -81,7 +85,7 @@ impl Harness {
 
     /// How many runs the STORE holds for a workflow — the only way to show that a
     /// repeated `ClientToken` created nothing while `ListWorkflowRuns` is still a stub.
-    fn stored_run_count(&self, workflow_arn: &str) -> usize {
+    pub(crate) fn stored_run_count(&self, workflow_arn: &str) -> usize {
         self.engine
             .state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>()
             .lock()
@@ -143,7 +147,7 @@ fn is_run_id(run_id: &str) -> bool {
 }
 
 /// A valid IAM role ARN for the emulator's own account, as `RoleARN` models it.
-fn role_arn() -> String {
+pub(crate) fn role_arn() -> String {
     "arn:aws:iam::000000000000:role/mwaa-serverless-exec".to_string()
 }
 
@@ -342,7 +346,7 @@ async fn create_mints_a_modelled_workflow_and_get_reads_every_member_back() {
 }
 
 #[tokio::test]
-async fn an_unknown_workflow_is_not_found_and_a_duplicate_name_conflicts() {
+async fn an_unknown_workflow_is_refused_and_a_duplicate_name_conflicts() {
     let harness = Harness::new("eu-west-1");
 
     // Pattern-valid ARNs the store has never held.
@@ -355,8 +359,8 @@ async fn an_unknown_workflow_is_not_found_and_a_duplicate_name_conflicts() {
             .call("GetWorkflow", serde_json::json!({"WorkflowArn": arn}))
             .await;
         assert_eq!(
-            status, 404,
-            "case {arn:?}: expected ResourceNotFoundException (404), got {status} {body:?}"
+            status, 400,
+            "case {arn:?}: expected a 400 lookup miss, got {status} {body:?}"
         );
         assert!(
             body["__type"]
@@ -736,7 +740,7 @@ async fn a_started_run_is_persisted_and_read_back_with_its_override_parameters()
             );
         }
 
-        // An id the workflow does not hold is not found, whatever its form.
+        // An id the workflow does not hold resolves no run, whatever its form.
         for unknown in ["doesnotexist", "run-0000000000000000", "a.b-c_d"] {
             let (status, body) = harness
                 .call(
@@ -745,8 +749,8 @@ async fn a_started_run_is_persisted_and_read_back_with_its_override_parameters()
                 )
                 .await;
             assert_eq!(
-                status, 404,
-                "case {case:?}/{unknown:?}: expected ResourceNotFoundException (404), got \
+                status, 400,
+                "case {case:?}/{unknown:?}: expected a 400 lookup miss, got \
                  {status} {body:?}"
             );
         }
@@ -841,7 +845,7 @@ async fn a_run_leaves_its_non_terminal_status_when_the_clock_makes_the_change_du
 }
 
 #[tokio::test]
-async fn starting_a_run_is_idempotent_and_an_unknown_workflow_is_not_found() {
+async fn starting_a_run_is_idempotent_and_an_unknown_workflow_is_refused() {
     let harness = Harness::new("us-east-1");
     let (_, created) = harness
         .call(
@@ -909,19 +913,20 @@ async fn starting_a_run_is_idempotent_and_an_unknown_workflow_is_not_found() {
         )
         .await;
     assert_eq!(
-        status, 404,
-        "expected ResourceNotFoundException (404) for an unknown workflow, got {status} {body:?}"
+        status, 400,
+        "expected a 400 lookup miss for an unknown workflow, got {status} {body:?}"
     );
 
+    // A `WorkflowVersion` of the modelled form (`^[a-z0-9]{32}$`) the workflow never had.
     let (status, body) = harness
         .call(
             "StartWorkflowRun",
-            serde_json::json!({"WorkflowArn": arn, "WorkflowVersion": "nosuchversion"}),
+            serde_json::json!({"WorkflowArn": arn, "WorkflowVersion": "0".repeat(32)}),
         )
         .await;
     assert_eq!(
-        status, 404,
-        "expected ResourceNotFoundException (404) for an unknown version, got {status} {body:?}"
+        status, 400,
+        "expected a 400 lookup miss for an unknown version, got {status} {body:?}"
     );
 }
 
@@ -984,8 +989,8 @@ async fn delete_removes_the_workflow_its_versions_and_its_runs() {
             .call("GetWorkflow", serde_json::json!({"WorkflowArn": arn}))
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: GetWorkflow after a delete must be 404, got {status}"
+            status, 400,
+            "case {case:?}: GetWorkflow after a delete must be 400, got {status}"
         );
         let (status, _) = harness
             .call(
@@ -994,8 +999,8 @@ async fn delete_removes_the_workflow_its_versions_and_its_runs() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: a versioned GetWorkflow after a delete must be 404, got {status}"
+            status, 400,
+            "case {case:?}: a versioned GetWorkflow after a delete must be 400, got {status}"
         );
         let (status, _) = harness
             .call(
@@ -1004,8 +1009,8 @@ async fn delete_removes_the_workflow_its_versions_and_its_runs() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: GetWorkflowRun after a delete must be 404, got {status}"
+            status, 400,
+            "case {case:?}: GetWorkflowRun after a delete must be 400, got {status}"
         );
         let (status, listed) = harness
             .call("ListWorkflows", serde_json::json!({"MaxResults": 100}))
@@ -1021,8 +1026,8 @@ async fn delete_removes_the_workflow_its_versions_and_its_runs() {
             .call("DeleteWorkflow", serde_json::json!({"WorkflowArn": arn}))
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: deleting an unknown ARN must be 404, got {status}"
+            status, 400,
+            "case {case:?}: deleting an unknown ARN must be 400, got {status}"
         );
         assert_eq!(
             harness.stored_run_count(&arn),
@@ -1146,7 +1151,7 @@ async fn deleting_one_named_version_keeps_the_workflow_until_no_version_is_left(
             )
             .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: the deleted version must be gone, got {status}"
         );
 
@@ -1166,7 +1171,7 @@ async fn deleting_one_named_version_keeps_the_workflow_until_no_version_is_left(
             .call("GetWorkflow", serde_json::json!({"WorkflowArn": arn}))
             .await;
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {case:?}: a workflow with no version left must be gone, got {status}"
         );
     }

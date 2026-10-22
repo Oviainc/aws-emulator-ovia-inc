@@ -7,7 +7,9 @@
 //! deleted" — so a named version removes that one version (promoting the newest one
 //! left when it was the latest) and the workflow record itself goes only when no
 //! version of it remains, taking its runs with it. An ARN (or a version) the store does
-//! not hold is a `ResourceNotFoundException`.
+//! not hold is the modelled `ResourceNotFoundException`, answered with the status the
+//! recorded service answers it with and naming the entity that did not resolve (see
+//! `crate::state::unresolved`).
 //!
 //! ## Shape of an operation
 //!
@@ -183,12 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
+        // A reference that resolves to nothing is a lookup miss, and the entity THIS
+        // operation resolves is the workflow itself.
         let workflow = store.workflows.get(&input.workflow_arn).ok_or_else(|| {
-            DeleteWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("No workflow found for {}", input.workflow_arn),
-                resource_id: input.workflow_arn.clone(),
-                resource_type: "workflow".to_string(),
-            })
+            crate::state::lookup_miss(DeleteWorkflowErrorModeled::ResourceNotFoundException(
+                crate::state::unresolved(
+                    crate::state::UnresolvedEntity::Workflow,
+                    &input.workflow_arn,
+                ),
+            ))
         })?;
 
         // `WorkflowVersion` is documented as "Optional. The specific version of the
@@ -199,15 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let deleted_version = workflow
             .version(requested)
             .ok_or_else(|| {
-                DeleteWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!(
-                        "Workflow {} has no version {}",
-                        input.workflow_arn,
-                        requested.unwrap_or("<latest>")
+                crate::state::lookup_miss(
+                    DeleteWorkflowErrorModeled::ResourceNotFoundException(
+                        crate::state::unresolved(
+                            crate::state::UnresolvedEntity::version_for(requested),
+                            requested.unwrap_or(&input.workflow_arn),
+                        ),
                     ),
-                    resource_id: input.workflow_arn.clone(),
-                    resource_type: "workflow-version".to_string(),
-                })
+                )
             })?
             .version
             .clone();

@@ -4,7 +4,9 @@
 //! IMPLEMENTED: reports a persisted workflow from this service's store
 //! (`crate::state`). A read NEVER changes what a later caller sees. The optional
 //! `WorkflowVersion` selects the immutable version record to report; an ARN (or a
-//! version) the store does not hold is a `ResourceNotFoundException`.
+//! version) the store does not hold is the modelled `ResourceNotFoundException`,
+//! answered with the status the recorded service answers it with and naming the
+//! entity that did not resolve (see `crate::state::unresolved`).
 //!
 //! ## Shape of an operation
 //!
@@ -212,25 +214,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let store = state.lock();
 
+        // A reference that resolves to nothing is a lookup miss, and the entity THIS
+        // operation resolves is the workflow itself.
         let workflow = store.workflows.get(&input.workflow_arn).ok_or_else(|| {
-            GetWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("No workflow found for {}", input.workflow_arn),
-                resource_id: input.workflow_arn.clone(),
-                resource_type: "workflow".to_string(),
-            })
+            crate::state::lookup_miss(GetWorkflowErrorModeled::ResourceNotFoundException(
+                crate::state::unresolved(
+                    crate::state::UnresolvedEntity::Workflow,
+                    &input.workflow_arn,
+                ),
+            ))
         })?;
 
         let requested = input.workflow_version.as_deref();
         let record = workflow.version(requested).ok_or_else(|| {
-            GetWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "Workflow {} has no version {}",
-                    input.workflow_arn,
-                    requested.unwrap_or("<latest>")
+            crate::state::lookup_miss(GetWorkflowErrorModeled::ResourceNotFoundException(
+                crate::state::unresolved(
+                    crate::state::UnresolvedEntity::version_for(requested),
+                    requested.unwrap_or(&input.workflow_arn),
                 ),
-                resource_id: input.workflow_arn.clone(),
-                resource_type: "workflow-version".to_string(),
-            })
+            ))
         })?;
         let snapshot = &record.snapshot;
 

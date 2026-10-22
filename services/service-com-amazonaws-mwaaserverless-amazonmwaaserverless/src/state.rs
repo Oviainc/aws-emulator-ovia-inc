@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Code, DefinitionS3Location, EncryptionConfiguration, LoggingConfiguration,
-    NetworkConfiguration,
+    NetworkConfiguration, ResourceNotFoundException,
 };
 
 /// The region used in minted ARNs when the request carries no usable SigV4
@@ -429,6 +429,86 @@ pub fn decode_page_token(kind: &str, token: &str) -> Option<String> {
     let rest = decoded.strip_prefix(PAGE_TOKEN_PREFIX)?;
     let (token_kind, key) = rest.split_once('\u{1f}')?;
     (token_kind == kind).then(|| key.to_string())
+}
+
+/// The HTTP status this service answers a resource-lookup miss with.
+///
+/// The model gives `ResourceNotFoundException` `@httpError 404`
+/// (`smithy_query shape=ResourceNotFoundException`), but the recorded service answers
+/// a lookup for a workflow/version/run it does not hold with **HTTP 400** carrying
+/// that same shape (fixture `mwaa-serverless-resource-not-found-errors`: GetWorkflow,
+/// DeleteWorkflow, StartWorkflowRun and GetWorkflowRun each answer
+/// `400 ResourceNotFoundException`). The recording is what a client sees, so the
+/// shape keeps its modelled identity and only the status is overridden, through
+/// [`crate::scaffolded::Scaffolded::ModeledWithStatus`].
+pub const LOOKUP_MISS_STATUS: u16 = 400;
+
+/// The entity an operation could not resolve.
+///
+/// The refusal names the entity THAT OPERATION had to resolve to do its work, which
+/// is why `StartWorkflowRun` reports the missing workflow VERSION and `GetWorkflowRun`
+/// the missing RUN for the very same absent workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnresolvedEntity {
+    /// The workflow a `WorkflowArn` names.
+    Workflow,
+    /// The workflow's latest version, selected when a request names no
+    /// `WorkflowVersion`.
+    LatestWorkflowVersion,
+    /// The version a `WorkflowVersion` names.
+    NamedWorkflowVersion,
+    /// The run a `RunId` names.
+    WorkflowRun,
+}
+
+impl UnresolvedEntity {
+    /// The version entity a request selects: the one it named, or the latest.
+    pub fn version_for(requested: Option<&str>) -> Self {
+        if requested.is_some() {
+            Self::NamedWorkflowVersion
+        } else {
+            Self::LatestWorkflowVersion
+        }
+    }
+
+    /// What the refusal says. Entity-level and free of request values, so a client
+    /// can tell "workflow absent" from "no version to run" from "run absent".
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Workflow => "Resource not found",
+            Self::LatestWorkflowVersion => "Unable to find latest version",
+            Self::NamedWorkflowVersion => "Unable to find the requested version",
+            Self::WorkflowRun => "Workflow run not found",
+        }
+    }
+
+    /// The `ResourceType` the refusal reports for this entity.
+    pub fn resource_type(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::LatestWorkflowVersion | Self::NamedWorkflowVersion => "workflow-version",
+            Self::WorkflowRun => "workflow-run",
+        }
+    }
+}
+
+/// The modelled payload for a reference that resolves to nothing: the entity-level
+/// message, plus the `ResourceId`/`ResourceType` the shape requires.
+///
+/// Every handler in this service funnels its lookup misses through here (wrapped by
+/// [`lookup_miss`]), so one status and one vocabulary cover them all.
+pub fn unresolved(entity: UnresolvedEntity, resource_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: entity.message().to_string(),
+        resource_id: resource_id.to_string(),
+        resource_type: entity.resource_type().to_string(),
+    }
+}
+
+/// Serve a lookup miss the way the recorded service does: the modelled
+/// `ResourceNotFoundException` the handler built, with [`LOOKUP_MISS_STATUS`].
+pub fn lookup_miss<E>(error: E) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::modeled_with_status(error, LOOKUP_MISS_STATUS)
 }
 
 /// A `SystemTime` as the modelled `TimestampValue`.
