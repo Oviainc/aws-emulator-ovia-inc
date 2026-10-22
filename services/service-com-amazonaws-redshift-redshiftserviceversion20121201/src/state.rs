@@ -42,6 +42,37 @@ pub const DEFAULT_DB_NAME: &str = "dev";
 /// — "Only version 1.0 is currently available. Example: 1.0".
 pub const DEFAULT_CLUSTER_VERSION: &str = "1.0";
 
+/// `ClusterType` for a cluster of two or more compute nodes.
+pub const CLUSTER_TYPE_MULTI_NODE: &str = "multi-node";
+/// `ClusterType` for a cluster that is its own single node.
+pub const CLUSTER_TYPE_SINGLE_NODE: &str = "single-node";
+
+/// Every `ClusterType` this service offers, in the documented order.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="ClusterType")` — "Valid Values: multi-node | single-node".
+pub const ORDERABLE_CLUSTER_TYPES: [&str; 2] = [CLUSTER_TYPE_MULTI_NODE, CLUSTER_TYPE_SINGLE_NODE];
+
+/// Every node type this service offers, in the documented order.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="NodeType")` — "Valid Values: dc2.large | dc2.8xlarge | rg.large |
+/// rg.xlarge | rg.4xlarge | rg.12xlarge | ra3.large | ra3.xlplus | ra3.4xlarge |
+/// ra3.16xlarge". The identical sentence appears on
+/// `ModifyClusterMessage$NodeType`, so one list serves both.
+pub const ORDERABLE_NODE_TYPES: [&str; 10] = [
+    "dc2.large",
+    "dc2.8xlarge",
+    "rg.large",
+    "rg.xlarge",
+    "rg.4xlarge",
+    "rg.12xlarge",
+    "ra3.large",
+    "ra3.xlplus",
+    "ra3.4xlarge",
+    "ra3.16xlarge",
+];
+
 /// The port the Redshift database engine listens on when the request names none.
 pub const DEFAULT_PORT: i32 = 5439;
 
@@ -654,6 +685,22 @@ pub fn master_password_secret_arn(cluster_identifier: &str, region: &str) -> Str
     )
 }
 
+/// The Availability Zones of one Region, in name order.
+///
+/// A Region's zones are `<region><suffix>`; the emulator presents three, which
+/// is the smallest count AWS publishes for a Region, so every zone name it hands
+/// out has the shape a caller parses. Derived from the Region alone, so the same
+/// Region always reports the same zones.
+pub fn region_availability_zones(region: &str) -> Vec<String> {
+    ZONE_SUFFIXES
+        .iter()
+        .map(|suffix| format!("{region}{suffix}"))
+        .collect()
+}
+
+/// The suffixes [`region_availability_zones`] appends to a Region name.
+const ZONE_SUFFIXES: [char; 3] = ['a', 'b', 'c'];
+
 /// The Availability Zone Redshift picks when the request names none.
 ///
 /// Source: `smithy_query(query="doc", shape="CreateClusterMessage",
@@ -662,9 +709,9 @@ pub fn master_password_secret_arn(cluster_identifier: &str, region: &str) -> Str
 /// is derived from the cluster identifier rather than drawn per run, so it is
 /// stable across reads.
 pub fn default_availability_zone(cluster_identifier: &str, region: &str) -> String {
-    const ZONE_SUFFIXES: [char; 3] = ['a', 'b', 'c'];
-    let index = digest_byte(&format!("az/{cluster_identifier}")) as usize % ZONE_SUFFIXES.len();
-    format!("{region}{}", ZONE_SUFFIXES[index])
+    let zones = region_availability_zones(region);
+    let index = digest_byte(&format!("az/{cluster_identifier}")) as usize % zones.len();
+    zones[index].clone()
 }
 
 /// The 30-minute weekly maintenance window Redshift assigns when the request
@@ -766,19 +813,20 @@ pub fn resolve_cluster_shape(
     current: Option<(&str, i32)>,
 ) -> Result<(String, i32), String> {
     let kind = match requested_type {
-        Some("single-node") => "single-node",
-        Some("multi-node") => "multi-node",
+        Some(CLUSTER_TYPE_SINGLE_NODE) => CLUSTER_TYPE_SINGLE_NODE,
+        Some(CLUSTER_TYPE_MULTI_NODE) => CLUSTER_TYPE_MULTI_NODE,
         Some(other) => {
             return Err(format!(
-                "Invalid value for ClusterType: '{other}'. Valid Values: multi-node | single-node"
+                "Invalid value for ClusterType: '{other}'. Valid Values: {}",
+                ORDERABLE_CLUSTER_TYPES.join(" | ")
             ))
         }
         // No `ClusterType`: a modify keeps the stored shape, and a create lets
         // the node count (default 1) say which shape is being asked for.
         None => match current {
             Some((stored, _)) => stored,
-            None if requested_nodes.unwrap_or(1) > 1 => "multi-node",
-            None => "single-node",
+            None if requested_nodes.unwrap_or(1) > 1 => CLUSTER_TYPE_MULTI_NODE,
+            None => CLUSTER_TYPE_SINGLE_NODE,
         },
     };
     // A node count the request does not name: "When cluster type is specified as
@@ -788,7 +836,7 @@ pub fn resolve_cluster_shape(
     // many, since "multi-node, the NumberOfNodes parameter is required".
     let nodes = match (requested_nodes, kind, current) {
         (Some(nodes), _, _) => nodes,
-        (None, "single-node", _) => 1,
+        (None, CLUSTER_TYPE_SINGLE_NODE, _) => 1,
         (None, _, Some((stored_kind, stored_nodes))) if stored_kind == kind => stored_nodes,
         (None, _, _) => {
             return Err(
@@ -796,12 +844,12 @@ pub fn resolve_cluster_shape(
             )
         }
     };
-    if kind == "single-node" && nodes != 1 {
+    if kind == CLUSTER_TYPE_SINGLE_NODE && nodes != 1 {
         return Err(format!(
             "Invalid value for NumberOfNodes: {nodes}. A single-node cluster has exactly 1 node."
         ));
     }
-    if kind == "multi-node" && nodes < 2 {
+    if kind == CLUSTER_TYPE_MULTI_NODE && nodes < 2 {
         return Err(format!(
             "Invalid value for NumberOfNodes: {nodes}. A multi-node cluster must have at least 2 nodes."
         ));
