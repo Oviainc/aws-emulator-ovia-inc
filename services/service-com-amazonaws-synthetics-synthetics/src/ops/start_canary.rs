@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCanary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCanary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCanary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the canary's schedule and opens a run record for it.
 //!
 //! ## Shape of an operation
 //!
@@ -67,6 +59,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
+
+use crate::state::{
+    new_uuid, CanaryRunState, CanaryState, StoredRun, RUN_SETTLE, STORE_UNAVAILABLE,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -139,18 +136,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCanary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCanaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCanary"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartCanaryError::from(StartCanaryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(STORE_UNAVAILABLE.to_string()),
+                },
+            ))
+        })?;
+
+        let now = SystemTime::now();
+        let mut guard = state.lock();
+        guard.settle(now);
+        let canary = guard.canaries.get_mut(&input.name).ok_or_else(|| {
+            StartCanaryError::from(StartCanaryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Canary {} not found", input.name)),
+                },
+            ))
+        })?;
+
+        // A canary that is already running has nothing to start, and one with an
+        // operation still in flight (it is still being provisioned, started, stopped,
+        // updated or deleted) conflicts with that operation.
+        if canary.state == CanaryState::Running || canary.state.operation_in_progress() {
+            return Err(StartCanaryErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Canary {} cannot be started while it is in state {}",
+                    canary.name,
+                    canary.state.as_wire()
+                )),
+            })
+            .into());
+        }
+
+        canary.state = CanaryState::Running;
+        canary.state_reason = None;
+        canary.state_reason_code = None;
+        canary.last_started = Some(now);
+        // The record observably changed, so its modification instant advances with it.
+        canary.last_modified = now;
+        // Newest run first, the order the run history is reported in; the history is kept
+        // within its retained-run bound.
+        let run = StoredRun {
+            id: new_uuid(),
+            name: canary.name.clone(),
+            state: CanaryRunState::Running,
+            state_reason: None,
+            state_reason_code: None,
+            started: now,
+            completed: None,
+            // The run's outcome is owed by the clock, not by another call.
+            outcome_due: Some(now + RUN_SETTLE),
+            artifact_s3_location: canary.artifact_s3_location.clone(),
+        };
+        canary.begin_run(run);
+
+        Ok(StartCanaryOutput {})
     }
 }

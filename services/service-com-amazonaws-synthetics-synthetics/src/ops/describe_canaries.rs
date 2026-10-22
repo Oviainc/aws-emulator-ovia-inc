@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCanaries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCanaries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCanaries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the canaries this service's store holds.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +82,67 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::collections::BTreeSet;
+use std::time::SystemTime;
+
+use crate::state::STORE_UNAVAILABLE;
+
+/// `DescribeCanariesRequest$MaxResults`: "If you omit this parameter, the default of 20
+/// is used." (which is also the member's modelled maximum).
+const DEFAULT_MAX_RESULTS: usize = 20;
+
+/// The modelled maximum length of `Token`, which both the input and the output
+/// `NextToken` target.
+const MAX_TOKEN_LEN: usize = 252;
+
+/// A page token that resumes at a canary NAME: exact across inserts and deletes, because
+/// the page boundary is a key in the ordered store rather than a position in it.
+///
+/// Three characters, so the shortest legal canary name (one character) still yields a
+/// token at the modelled minimum length of 4.
+const TOKEN_NAME_PREFIX: &str = "nm#";
+
+/// A page token that resumes at an OFFSET, used for the one case a name cannot be carried
+/// in a token: a name so long that prefix + name would exceed [`MAX_TOKEN_LEN`] (a canary
+/// name may be up to 255 characters).
+const TOKEN_OFFSET_PREFIX: &str = "ix#";
+
+/// Where a page starts within the ordered, filtered canary list.
+enum PageStart {
+    /// Resume at the first canary whose name is at or after this one.
+    Name(String),
+    /// Resume at this position.
+    Offset(usize),
+}
+
+/// The token that resumes the next page after `offset` entries, whose first entry is
+/// `next_name`.
+fn encode_token(offset: usize, next_name: &str) -> String {
+    if TOKEN_NAME_PREFIX.len() + next_name.len() <= MAX_TOKEN_LEN {
+        format!("{TOKEN_NAME_PREFIX}{next_name}")
+    } else {
+        format!("{TOKEN_OFFSET_PREFIX}{offset}")
+    }
+}
+
+/// Read a token this operation issued. Anything else is a bad request, not an empty page.
+///
+/// The payload of a name token is checked against `CanaryName`'s own modelled constraints
+/// (`len 1..255, pattern ^[0-9a-z_\-]+$`), the only thing this operation ever puts there,
+/// so a forged token is refused rather than resuming at an arbitrary key.
+fn decode_token(token: &str) -> Option<PageStart> {
+    if let Some(name) = token.strip_prefix(TOKEN_NAME_PREFIX) {
+        let legal_canary_name = (1..=255).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'_' || b == b'-');
+        return legal_canary_name.then(|| PageStart::Name(name.to_string()));
+    }
+    token
+        .strip_prefix(TOKEN_OFFSET_PREFIX)
+        .and_then(|offset| offset.parse().ok())
+        .map(PageStart::Offset)
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -160,18 +213,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCanaries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCanariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCanaries"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeCanariesError::from(DescribeCanariesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(STORE_UNAVAILABLE.to_string()),
+                },
+            ))
+        })?;
+
+        let start = match input.next_token.as_deref() {
+            None => PageStart::Offset(0),
+            Some(token) => decode_token(token).ok_or_else(|| {
+                DescribeCanariesError::from(DescribeCanariesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some("NextToken is not a token this operation issued".to_string()),
+                    },
+                ))
+            })?,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            // At least one entry per page, independently of the boundary validator: a
+            // page size of zero would return nothing while still emitting a token, so a
+            // client loop would never terminate.
+            .max(1);
+        let filter: Option<BTreeSet<&str>> = input
+            .names
+            .as_ref()
+            .map(|names| names.iter().map(String::as_str).collect());
+
+        let mut guard = state.lock();
+        // Only what the clock already owed: a canary that finished provisioning, a run
+        // whose outcome came due. Paging changes nothing else about the store.
+        guard.settle(SystemTime::now());
+
+        // The store is name-ordered, so this list has a total, stable order and a page
+        // boundary in it means the same thing on the next call.
+        let matching: Vec<&crate::state::StoredCanary> = guard
+            .canaries
+            .values()
+            .filter(|canary| {
+                filter
+                    .as_ref()
+                    .is_none_or(|names| names.contains(canary.name.as_str()))
+            })
+            .collect();
+
+        let from = match &start {
+            PageStart::Offset(offset) => (*offset).min(matching.len()),
+            PageStart::Name(name) => matching
+                .iter()
+                .position(|canary| canary.name.as_str() >= name.as_str())
+                .unwrap_or(matching.len()),
+        };
+        let until = from.saturating_add(page_size).min(matching.len());
+        let canaries: Vec<Canary> = matching[from..until]
+            .iter()
+            .map(|canary| canary.to_canary())
+            .collect();
+        // A token only when entries actually remain, so a client stops paging.
+        let next_token = matching
+            .get(until)
+            .map(|next| encode_token(until, &next.name));
+
+        Ok(DescribeCanariesOutput {
+            canaries: Some(canaries),
+            next_token,
+        })
     }
 }
