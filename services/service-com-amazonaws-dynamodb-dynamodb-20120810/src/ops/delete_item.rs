@@ -10,6 +10,13 @@
 //! Conditional deletes (`ConditionExpression`, the legacy `Expected`) are refused
 //! with the scaffold's 501 and filed as their own gap issue.
 //!
+//! `ReturnConsumedCapacity=INDEXES` reports the capacity the delete consumed on the
+//! table AND on each secondary index the removed item reached, and
+//! `ReturnItemCollectionMetrics=SIZE` reports the item collection the delete touched —
+//! both computed from the stored table by [`crate::state::Table::write_capacity`] and
+//! [`crate::state::Table::item_collection_metrics`], so a delete that removed no item
+//! fans out to no index and a table with no local secondary index reports no metrics.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -300,6 +307,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        let report_item_collection = crate::state::returns_item_collection_metrics(
+            input.return_item_collection_metrics.as_deref(),
+        )
+        .map_err(lift)?;
+
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let key = {
@@ -310,17 +322,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .delete_item(&region, &name, now, &key)
             .map_err(lift)?;
 
-        let size = removed.as_ref().map_or(0, crate::state::item_size);
+        // Both figures are read back from the table the delete ran against, so the
+        // capacity fan-out and the item-collection size are computed from stored state:
+        // the indexes charged are the ones the REMOVED item reached, and a delete that
+        // found no item touched none of them.
+        let table = store.active_table(&region, &name, now).map_err(lift)?;
+        let capacity = table.write_capacity(removed.as_ref(), None);
+        let item_collection_metrics =
+            report_item_collection.then(|| table.item_collection_metrics(&input.key));
+
         Ok(DeleteItemOutput {
             attributes: if return_old { removed } else { None },
-            consumed_capacity: crate::state::consumed_capacity(
+            consumed_capacity: crate::state::consumed_write_capacity(
                 input.return_consumed_capacity.as_deref(),
                 &name,
-                crate::state::write_capacity_units(size),
+                &capacity,
             ),
-            // ItemCollectionMetrics is reported only for a table that has a local
-            // secondary index, which this slice does not create.
-            item_collection_metrics: None,
+            item_collection_metrics: item_collection_metrics.flatten(),
         })
     }
 }

@@ -3,7 +3,10 @@
 //! @op DescribeExecution
 //! IMPLEMENTED: a REPORTING operation. It answers from the Execution record
 //! `StartExecution` stored, materialising only the terminal status the clock has
-//! already made due.
+//! already made due. The redrive projection (`redriveStatus`, `redriveStatusReason`,
+//! `redriveCount`, `redriveDate`) is read from that same record and from the ONE
+//! eligibility predicate `RedriveExecution` itself reads, so this report cannot
+//! disagree with what that call does.
 //!
 //! A request this operation cannot serve is refused with one of the operation's own
 //! modelled errors; it never answers 501.
@@ -244,10 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        let now = crate::state::now();
         let mut store = state.lock();
         // The one write a report may make: the terminal status was owed at the instant
         // the clock made it due, whether or not anybody described the execution.
-        store.settle(crate::state::now());
+        store.settle(now);
 
         let Some(execution) = store.executions.get(&input.execution_arn) else {
             return Err(DescribeExecutionErrorModeled::ExecutionDoesNotExist(
@@ -280,8 +284,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `inputDetails`/`outputDetails` say whether the data itself is included: it
-        // is, because the stored execution carries it.
+        // is, because the stored execution carries it ("Indicates whether input or
+        // output was included in the response. Always true for API calls.").
         let included = Some(CloudWatchEventsExecutionDataDetails { included: true });
+
+        // The redrive projection: `redriveStatus` is `REDRIVABLE` exactly when
+        // `RedriveExecution` would redrive this execution now, `NOT_REDRIVABLE`
+        // otherwise, and `redriveStatusReason` carries the documented reason only in
+        // the second case. Both come from the ONE predicate `RedriveExecution`
+        // itself reads, so what this reports cannot disagree with what that call
+        // does. `REDRIVABLE_BY_MAP_RUN` belongs to an execution a Map Run
+        // dispatched, and no Map Run can dispatch one in this emulator.
+        let (redrive_status, redrive_status_reason) =
+            match store.not_redrivable_reason(execution, now) {
+                Some(reason) => (
+                    crate::state::REDRIVE_STATUS_NOT_REDRIVABLE.to_string(),
+                    Some(reason.to_string()),
+                ),
+                None => (crate::state::REDRIVE_STATUS_REDRIVABLE.to_string(), None),
+            };
+
         Ok(DescribeExecutionOutput {
             execution_arn: execution.arn.clone(),
             state_machine_arn: execution.state_machine_arn.clone(),
@@ -300,9 +322,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state_machine_version_arn: None,
             state_machine_alias_arn: None,
             redrive_count: Some(execution.redrive_count),
-            redrive_date: None,
-            redrive_status: None,
-            redrive_status_reason: None,
+            redrive_date: execution.redrive_date.map(crate::state::to_date_time),
+            redrive_status: Some(redrive_status),
+            redrive_status_reason,
         })
     }
 }

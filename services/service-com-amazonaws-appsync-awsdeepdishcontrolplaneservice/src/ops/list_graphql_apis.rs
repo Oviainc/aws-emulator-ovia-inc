@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.max_results,
         ) else {
             return Err(ListGraphqlApisErrorModeled::BadRequestException(BadRequestException {
-                message: Some("nextToken does not name a page of this list".to_string()),
+                message: Some(crate::state::INVALID_PAGINATION_TOKEN_MESSAGE.to_string()),
                 ..Default::default()
             })
             .into());
