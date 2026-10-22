@@ -9,15 +9,22 @@
 //! [`ClusterRecord::to_cluster`], [`ClusterRecord::to_summary`],
 //! [`StepRecord::to_step`] and [`StepRecord::to_summary`]. No handler builds one of
 //! those shapes from its own input.
+//!
+//! Beside the clusters sits the account's single block public access configuration
+//! ([`BlockPublicAccessRecord`]), which always exists: it starts as the documented
+//! account default, `PutBlockPublicAccessConfiguration` replaces it whole, and
+//! `GetBlockPublicAccessConfiguration` reports it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Application, BootstrapActionConfig, Cluster, ClusterStateChangeReason, ClusterStatus,
-    ClusterSummary, ClusterTimeline, Configuration, Ec2InstanceAttributes, HadoopStepConfig,
+    Application, BlockPublicAccessConfiguration, BlockPublicAccessConfigurationMetadata,
+    BootstrapActionConfig, Cluster, ClusterStateChangeReason, ClusterStatus, ClusterSummary,
+    ClusterTimeline, Configuration, Ec2InstanceAttributes, HadoopStepConfig,
     JobFlowInstancesConfig, KerberosAttributes, ManagedScalingPolicy, MonitoringConfiguration,
-    OSRelease, PlacementGroupConfig, SimplifiedApplication, Step, StepConfig, StepStatus,
+    OSRelease, PlacementGroupConfig, PortRange, SimplifiedApplication, Step, StepConfig,
+    StepStatus,
     StepSummary, StepTimeline, Tag,
 };
 
@@ -128,6 +135,41 @@ pub const DEFAULT_STEP_CONCURRENCY_LEVEL: i32 = 1;
 /// See [`DEFAULT_STEP_CONCURRENCY_LEVEL`].
 pub const MAX_STEP_CONCURRENCY_LEVEL: i32 = 256;
 
+/// The account-wide default for `BlockPublicSecurityGroupRules`: "By default, the value
+/// is `false` for accounts that have created Amazon EMR clusters before July 2019. For
+/// accounts created after this, the default is `true`."
+/// (`BlockPublicAccessConfiguration$BlockPublicSecurityGroupRules` doc, Smithy model.)
+/// This emulator's account created no cluster before July 2019, so it takes the later
+/// default.
+pub const DEFAULT_BLOCK_PUBLIC_SECURITY_GROUP_RULES: bool = true;
+
+/// The port the account-wide default permits publicly: "By default, Port 22, which is
+/// used for SSH access to the cluster Amazon EC2 instances, is in the list of
+/// `PermittedPublicSecurityGroupRuleRanges`."
+/// (`BlockPublicAccessConfiguration$PermittedPublicSecurityGroupRuleRanges` doc, Smithy
+/// model.)
+pub const DEFAULT_PERMITTED_PUBLIC_PORT: i32 = 22;
+
+/// `com.amazonaws.emr#Port`'s published bounds, which `PortRange$MinRange` and
+/// `PortRange$MaxRange` both target: `range { min: -1, max: 65535 }` (Smithy model).
+pub const PORT_MIN: i32 = -1;
+/// See [`PORT_MIN`].
+pub const PORT_MAX: i32 = 65535;
+
+/// How many ranges an exception list may carry, and the cap on everything one
+/// `PutBlockPublicAccessConfiguration` stores.
+///
+/// DERIVED, not documented: a permitted range covers at least one of the
+/// [`PORT_MIN`]..=[`PORT_MAX`] ports and the ranges may not overlap, so a list longer
+/// than the port space necessarily repeats a port and can be refused by its length
+/// alone — before any per-element work is done. The same number caps the entries of a
+/// stored configuration as a whole (ranges, nested configurations and properties
+/// entries), so one `Put` cannot make every later `GetBlockPublicAccessConfiguration`
+/// clone and serialise an arbitrarily large body.
+pub const MAX_PERMITTED_PUBLIC_RANGES: usize = (PORT_MAX - PORT_MIN + 1) as usize;
+/// See [`MAX_PERMITTED_PUBLIC_RANGES`].
+pub const MAX_CONFIGURATION_ENTRIES: usize = MAX_PERMITTED_PUBLIC_RANGES;
+
 /// Width of the uppercase base-36 body of a minted `j-`/`s-` id.
 const ID_BODY_WIDTH: usize = 13;
 
@@ -156,19 +198,40 @@ pub const MAX_SECURITY_CONFIGURATIONS: usize = 1_000;
 /// `clusters` is keyed by cluster id, and a minted id is the zero-padded base-36
 /// rendering of a monotonic sequence, so the map's key order IS creation order and
 /// every listing is deterministic.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsEmrElasticmapreduceState {
     pub clusters: BTreeMap<String, ClusterRecord>,
     pub next_cluster_seq: u64,
     /// One counter for every step of every cluster, so a step id is unique
     /// service-wide rather than only within its own cluster.
     pub next_step_seq: u64,
+    /// The ONE block public access configuration of this account and Region, which
+    /// always exists: `PutBlockPublicAccessConfiguration` REPLACES it and
+    /// `GetBlockPublicAccessConfiguration` reports it.
+    pub block_public_access: BlockPublicAccessRecord,
     /// Security configurations keyed by NAME: a security configuration "is stored in
     /// the service and can be specified when a cluster is created"
     /// (`CreateSecurityConfiguration` doc, Smithy model) by that name alone, so the
     /// name is its identity. Keying the map by it is what makes the name unique and
     /// what gives every listing a deterministic, name-ordered sequence.
     pub security_configurations: BTreeMap<String, SecurityConfigurationRecord>,
+}
+
+/// The account's default configuration is in place before any caller puts one, so the
+/// state starts out holding it rather than an absent one — exactly what
+/// `GetBlockPublicAccessConfiguration` reports for an account that has never called
+/// `PutBlockPublicAccessConfiguration`. Its `CreationDateTime` is fixed when this store
+/// is first reached and never moves again, so repeated reads report the same instant.
+impl Default for ComAmazonawsEmrElasticmapreduceState {
+    fn default() -> Self {
+        Self {
+            clusters: BTreeMap::new(),
+            next_cluster_seq: 0,
+            next_step_seq: 0,
+            block_public_access: BlockPublicAccessRecord::account_default(SystemTime::now()),
+            security_configurations: BTreeMap::new(),
+        }
+    }
 }
 
 impl ComAmazonawsEmrElasticmapreduceState {
@@ -232,6 +295,91 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .map(|scope| scope.region)
         .filter(|region| !region.is_empty())
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The account's block public access configuration, with the metadata EMR keeps beside
+/// it: "Properties that describe the Amazon Web Services principal that created the
+/// `BlockPublicAccessConfiguration` using the `PutBlockPublicAccessConfiguration` action
+/// as well as the date and time that the configuration was created. Each time a
+/// configuration for block public access is updated, Amazon EMR updates this metadata."
+/// (`BlockPublicAccessConfigurationMetadata` doc, Smithy model.)
+///
+/// The configuration is held as the wire shape the caller supplied, VERBATIM: a `Put`
+/// replaces the whole configuration, so what a later `Get` reports is what was put —
+/// an absent exception list stays absent, an empty one stays empty, and every port
+/// bound keeps the value it was given.
+#[derive(Debug, Clone)]
+pub struct BlockPublicAccessRecord {
+    pub configuration: BlockPublicAccessConfiguration,
+    pub creation_date_time: SystemTime,
+    pub created_by_arn: String,
+}
+
+impl BlockPublicAccessRecord {
+    /// The configuration an account has before anybody puts one: block public access on,
+    /// with Port 22 permitted. See [`DEFAULT_BLOCK_PUBLIC_SECURITY_GROUP_RULES`] and
+    /// [`DEFAULT_PERMITTED_PUBLIC_PORT`].
+    ///
+    /// No caller created it, so the principal it names is the account itself rather
+    /// than an invented user.
+    pub fn account_default(at: SystemTime) -> Self {
+        Self {
+            configuration: BlockPublicAccessConfiguration {
+                block_public_security_group_rules: DEFAULT_BLOCK_PUBLIC_SECURITY_GROUP_RULES,
+                permitted_public_security_group_rule_ranges: Some(vec![PortRange {
+                    min_range: DEFAULT_PERMITTED_PUBLIC_PORT,
+                    max_range: Some(DEFAULT_PERMITTED_PUBLIC_PORT),
+                }]),
+                classification: None,
+                configurations: None,
+                properties: None,
+            },
+            creation_date_time: at,
+            created_by_arn: ::engine::emulator_arn("iam", "", "root"),
+        }
+    }
+
+    /// What `PutBlockPublicAccessConfiguration` stored, under the principal that called
+    /// it.
+    pub fn put(
+        configuration: BlockPublicAccessConfiguration,
+        created_by_arn: String,
+        at: SystemTime,
+    ) -> Self {
+        Self {
+            configuration,
+            creation_date_time: at,
+            created_by_arn,
+        }
+    }
+
+    /// The wire `BlockPublicAccessConfigurationMetadata` for this record.
+    pub fn to_metadata(&self) -> BlockPublicAccessConfigurationMetadata {
+        BlockPublicAccessConfigurationMetadata {
+            creation_date_time: timestamp(self.creation_date_time),
+            created_by_arn: self.created_by_arn.clone(),
+        }
+    }
+}
+
+/// The IAM principal this request was signed by: what a configuration it writes records
+/// as having created it.
+///
+/// The emulator models no identity store beyond the access key id a request is signed
+/// with, which is exactly what names the caller here; it is reduced to the characters an
+/// access key id can hold, and an unsigned request is the account's `default` user.
+pub fn caller_arn(parts: &::http::request::Parts) -> String {
+    let filtered: String = ::engine::extract_akid(&parts.headers)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(128)
+        .collect();
+    let user = if filtered.is_empty() {
+        "default"
+    } else {
+        filtered.as_str()
+    };
+    ::engine::emulator_arn("iam", "", &format!("user/{user}"))
 }
 
 // ---------------------------------------------------------------------------
