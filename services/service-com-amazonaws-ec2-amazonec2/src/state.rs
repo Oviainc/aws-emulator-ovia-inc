@@ -53,6 +53,12 @@
 //! be validated against [`availability_zones_in_region`] rather than against a second zone
 //! list.
 //!
+//! A fact of a VPC that the modelled [`Vpc`] shape carries no member for is stored beside
+//! it under the same id rather than on it:
+//! [`ComAmazonawsEc2Amazonec2State::vpc_attributes`] holds the `VpcAttributeName`
+//! attributes `ModifyVpcAttribute` sets and `DescribeVpcAttribute` reports, so those two
+//! operations and `CreateVpc`'s defaults cannot disagree about one VPC.
+//!
 //! ## Launch templates
 //!
 //! [`ComAmazonawsEc2Amazonec2State::launch_templates`] holds the account's launch
@@ -731,6 +737,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::materialize_due_transitions`] applies it once the clock has passed it; a VPC
     /// AWS returns ready (the account's default VPC) never has an entry here.
     pub vpc_available_at: BTreeMap<String, Instant>,
+    /// The per-VPC attributes `DescribeVpcAttribute` reports and `ModifyVpcAttribute`
+    /// sets, by `VpcId`.
+    ///
+    /// The modelled [`Vpc`] shape carries no member for any of them — no describe of a
+    /// VPC reports them — so they live beside the VPC record keyed by the same id, the
+    /// way [`Self::vpc_available_at`] does. Every VPC this store holds has an entry:
+    /// [`Self::insert_vpc`] writes one at the values AWS gives a VPC on creation
+    /// ([`VpcAttributes::for_vpc`]), so a describe never has to invent a default for a
+    /// VPC nobody has modified.
+    pub vpc_attributes: BTreeMap<String, VpcAttributes>,
     /// Every subnet the account holds, by `SubnetId`, as the modelled [`Subnet`] shape
     /// itself — so a member a writer sets round-trips through `DescribeSubnets` without a
     /// field-by-field copy. Ordered by id, which is the order the describe reports and
@@ -782,6 +798,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             next_private_ip: 0,
             vpcs: BTreeMap::new(),
             vpc_available_at: BTreeMap::new(),
+            vpc_attributes: BTreeMap::new(),
             subnets: BTreeMap::new(),
             images: BTreeMap::new(),
             security_groups: BTreeMap::new(),
@@ -908,7 +925,28 @@ impl ComAmazonawsEc2Amazonec2State {
         };
         self.add_stored_bytes(tag_list_bytes(vpc.tags.as_deref().unwrap_or_default()));
         self.vpcs.insert(vpc_id.clone(), vpc);
+        // The attributes the VPC starts life with, written here rather than by each
+        // writer so `DescribeVpcAttribute` reads the same defaults whichever operation
+        // created the VPC.
+        self.vpc_attributes
+            .insert(vpc_id.clone(), VpcAttributes::for_vpc(is_default));
         vpc_id
+    }
+
+    /// The attributes of one VPC, read the way `DescribeVpcAttribute` reads them: the
+    /// stored entry, or the creation defaults for a VPC whose entry predates this field.
+    ///
+    /// A READ ONLY — a VPC missing an entry is not given one here, so describing a VPC's
+    /// attributes cannot change what a later caller sees.
+    pub fn vpc_attributes_of(&self, vpc_id: &str) -> Option<VpcAttributes> {
+        let vpc = self.vpcs.get(vpc_id)?;
+        Some(self.vpc_attributes.get(vpc_id).copied().unwrap_or_else(|| {
+            // Unreachable while every writer goes through `insert_vpc`, which stores an
+            // entry. The fallback reads the VPC's OWN `IsDefault` rather than assuming a
+            // non-default VPC, so a VPC without an entry is still reported with the
+            // defaults AWS gives a VPC of that kind.
+            VpcAttributes::for_vpc(vpc.is_default.unwrap_or(false))
+        }))
     }
 
     /// Insert a subnet, and answer the `SubnetId` it was given.
@@ -2890,6 +2928,75 @@ pub const TENANCY_DEDICATED: &str = "dedicated";
 
 /// The `ResourceType` a `CreateVpc` tag specification may name: the VPC it creates.
 pub const RESOURCE_TYPE_VPC: &str = "vpc";
+
+// ---------------------------------------------------------------------------
+// The attributes of a VPC (`VpcAttributeName`)
+// ---------------------------------------------------------------------------
+
+/// The `VpcAttributeName` enum's `enableDnsHostnames` member.
+///
+/// Named here so the handlers and [`VpcAttributes`] spell one attribute one way; the
+/// generated catalog of every member is `crate::ops::types::VPC_ATTRIBUTE_NAME_VALUES`,
+/// which `DescribeVpcAttribute` validates its `Attribute` against and the crate's tests
+/// pin these three constants to.
+pub const VPC_ATTRIBUTE_ENABLE_DNS_HOSTNAMES: &str = "enableDnsHostnames";
+
+/// The `VpcAttributeName` enum's `enableDnsSupport` member (see
+/// [`VPC_ATTRIBUTE_ENABLE_DNS_HOSTNAMES`] for the generated catalog these come from).
+pub const VPC_ATTRIBUTE_ENABLE_DNS_SUPPORT: &str = "enableDnsSupport";
+
+/// The `VpcAttributeName` enum's `enableNetworkAddressUsageMetrics` member (see
+/// [`VPC_ATTRIBUTE_ENABLE_DNS_HOSTNAMES`] for the generated catalog these come from).
+pub const VPC_ATTRIBUTE_ENABLE_NETWORK_ADDRESS_USAGE_METRICS: &str =
+    "enableNetworkAddressUsageMetrics";
+
+/// The attributes of one VPC: one field per `VpcAttributeName` member, which is exactly
+/// the set `DescribeVpcAttribute` reports and `ModifyVpcAttribute` sets.
+///
+/// Held in [`ComAmazonawsEc2Amazonec2State::vpc_attributes`] rather than on the modelled
+/// [`Vpc`] shape, which carries no member for any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VpcAttributes {
+    /// `enableDnsSupport`: "whether the DNS resolution is supported for the VPC"
+    /// (`ModifyVpcAttributeRequest$EnableDnsSupport`).
+    pub enable_dns_support: bool,
+    /// `enableDnsHostnames`: "whether the instances launched in the VPC get DNS
+    /// hostnames" (`ModifyVpcAttributeRequest$EnableDnsHostnames`).
+    pub enable_dns_hostnames: bool,
+    /// `enableNetworkAddressUsageMetrics`: "whether Network Address Usage metrics are
+    /// enabled for your VPC"
+    /// (`ModifyVpcAttributeRequest$EnableNetworkAddressUsageMetrics`).
+    pub enable_network_address_usage_metrics: bool,
+}
+
+impl VpcAttributes {
+    /// The attributes a VPC is created with.
+    ///
+    /// Amazon VPC User Guide, "DNS attributes in your VPC": `enableDnsSupport` is `true`
+    /// for a default VPC and for a VPC you create, while `enableDnsHostnames` is `true`
+    /// for a default VPC and `false` for a VPC you create. Network Address Usage metrics
+    /// are a VPC feature a caller turns on, so they start off.
+    pub fn for_vpc(is_default: bool) -> Self {
+        Self {
+            enable_dns_support: true,
+            enable_dns_hostnames: is_default,
+            enable_network_address_usage_metrics: false,
+        }
+    }
+
+    /// The value of the attribute `attribute` names, or `None` when that is not a
+    /// `VpcAttributeName` member.
+    pub fn value_of(&self, attribute: &str) -> Option<bool> {
+        match attribute {
+            VPC_ATTRIBUTE_ENABLE_DNS_HOSTNAMES => Some(self.enable_dns_hostnames),
+            VPC_ATTRIBUTE_ENABLE_DNS_SUPPORT => Some(self.enable_dns_support),
+            VPC_ATTRIBUTE_ENABLE_NETWORK_ADDRESS_USAGE_METRICS => {
+                Some(self.enable_network_address_usage_metrics)
+            }
+            _ => None,
+        }
+    }
+}
 
 /// `Ipv6AddressAttribute` of a block advertised on the internet from AWS.
 pub const IPV6_ADDRESS_PUBLIC: &str = "public";
