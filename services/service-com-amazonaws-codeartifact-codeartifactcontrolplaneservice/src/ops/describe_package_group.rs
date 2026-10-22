@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePackageGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePackageGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePackageGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored `PackageGroupDescription` of a package group in a domain. A pure
+//! read: the arn, pattern, `createdTime`, contact info and description are the record
+//! `CreatePackageGroup` stored, and the `parent` and each restriction's `effectiveMode`
+//! are resolved against the groups the domain holds AT THIS CALL — so adding an
+//! intermediate group is visible here without rewriting anything.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +149,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePackageGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePackageGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePackageGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribePackageGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(DescribePackageGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Domain not found. Domain '{}' owned by account '{}' does not exist.",
+                        input.domain,
+                        input
+                            .domain_owner
+                            .as_deref()
+                            .unwrap_or(::engine::emulator_account_id())
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some("domain".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `resourceType` is unset: `ResourceType` models only `domain`, `repository`,
+        // `package`, `package-version` and `asset`, so there is no enum value for a
+        // package group to report.
+        let Some(description) = domain.package_group_description(&input.package_group) else {
+            return Err(DescribePackageGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "Package group not found. Package group '{}' in domain '{}' owned by account '{}' does not exist.",
+                        input.package_group, domain.name, domain.owner
+                    ),
+                    resource_id: Some(input.package_group.clone()),
+                    resource_type: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribePackageGroupOutput {
+            package_group: Some(description),
+        })
     }
 }
