@@ -1,29 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `ListDocumentClassifiers`: the page it serves over the custom
-//! document-classifier records this service persists.
+//! Comprehend's custom document-classifier family:
+//! `CreateDocumentClassifier`, `DescribeDocumentClassifier`,
+//! `StopTrainingDocumentClassifier`, `DeleteDocumentClassifier` and
+//! `ListDocumentClassifiers`.
 //!
-//! The rule under test, over a SET of records rather than one: the operation
-//! reports every persisted classifier projected into `DocumentClassifierProperties`
-//! in creation order — reversed when `SubmitTimeAfter` is the filter, as that
-//! member's own documentation states — narrowed by the single filtering parameter
-//! the request set, truncated at `MaxResults`, with a `NextToken` that resumes
-//! exactly after the last item of the page and no token on the last one. More than
-//! one filtering parameter is refused with `InvalidFilterException`, and a token
-//! this service never issued with `InvalidRequestException`.
+//! RULE: a classifier is a resource the create mints an ARN for and persists, the
+//! reads report back exactly what was persisted (plus the status the clock already
+//! owed it), and an ARN no classifier was created under — or whose classifier a
+//! completed deletion removed — is answered with `ResourceNotFoundException`.
 //!
-//! The seeded table is what makes it a rule rather than one example: its rows
-//! differ along everything the projection and the filter generalise over — the
-//! `ModelStatus` each record carries, the language, the mode, a named version
-//! versus none, which optional members are set at all, and the submission instant.
+//! Each suite asserts that over a SET of creations: the rows differ along which
+//! optional members are present, the training data format, whether the creation names
+//! a version, and the classifier mode. The issue's single nonexistent ARN is ONE row
+//! of the not-found table.
 //!
-//! `CreateDocumentClassifier` is still a scaffold stub (it is cause 3 of
-//! `issues/things-that-do-not-work/20261022T171625Z-comprehend-answers-http-501-notimplemented-for-batchdetectentities-the.md`),
-//! so these suites seed the records through the crate's own state API — the SAME
-//! store, reached the same way, that the handler reads — and then drive
-//! `ListDocumentClassifiers` over the wire.
+//! The `ListDocumentClassifiers` suites in the second half of this file assert the
+//! page rule over a SET of seeded records: the operation reports every persisted
+//! classifier projected into `DocumentClassifierProperties` in creation order —
+//! reversed when `SubmitTimeAfter` is the filter, as that member's own documentation
+//! states — narrowed by the single filtering parameter the request set, truncated at
+//! `MaxResults`, with a `NextToken` that resumes exactly after the last item of the
+//! page and no token on the last one. More than one filtering parameter is refused
+//! with `InvalidFilterException`, and a token this service never issued with
+//! `InvalidRequestException`. Those rows differ along everything the projection and
+//! the filter generalise over — the `ModelStatus` each record carries, the language,
+//! the mode, a named version versus none, which optional members are set at all, and
+//! the submission instant.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+// `std::thread::sleep`, not `tokio::time::sleep`: the workspace's shared `tokio`
+// carries no `time` feature, so there is no timer driver. It is safe here only
+// because every call below is awaited sequentially on a current-thread runtime with
+// nothing in the background.
+use std::thread::sleep;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_comprehend_comprehend_20171127::ops::types::{
@@ -35,6 +45,232 @@ use service_com_amazonaws_comprehend_comprehend_20171127::state::{
 };
 
 use crate::comprehend_client::{error_code, Comprehend, ACCOUNT_ID, REGION};
+
+/// The order a classifier's `ModelStatus` may only move forward along when nobody
+/// stops it.
+///
+/// The terminal status of a started training is `IN_ERROR`, not `TRAINED`: training
+/// means reading the labelled documents from the Amazon S3 location
+/// `InputDataConfig` names and fitting a model on them, and this emulator serves no
+/// object storage and runs no training, so nothing is read and nothing is fitted.
+const LIFECYCLE: &[&str] = &["SUBMITTED", "TRAINING", "IN_ERROR"];
+
+/// The status a started training reaches, as `MODEL_STATUS_VALUES` spells it.
+const TERMINAL_STATUS: &str = "IN_ERROR";
+
+/// Longest a suite waits for the clock to owe a classifier its next status. The
+/// spans in `crate::state` total well under a second; this leaves ample head-room on
+/// a loaded machine.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A `CreateDocumentClassifier` body per case, differing along every member the
+/// operation persists.
+fn creation(case: &str) -> Value {
+    match case {
+        "every optional member set" => json!({
+            "DocumentClassifierName": "every-member-classifier",
+            "VersionName": "v1",
+            "DataAccessRoleArn": "arn:aws:iam::123456789012:role/ComprehendRole",
+            "LanguageCode": "en",
+            "Mode": "MULTI_LABEL",
+            "InputDataConfig": {
+                "DataFormat": "COMPREHEND_CSV",
+                "S3Uri": "s3://bucket/training/",
+                "TestS3Uri": "s3://bucket/test/",
+                "LabelDelimiter": "|",
+            },
+            "OutputDataConfig": {
+                "S3Uri": "s3://bucket/out/",
+                "KmsKeyId": "arn:aws:kms:eu-west-1:000000000000:key/abcd-1234",
+            },
+            "VolumeKmsKeyId": "1234abcd-12ab-34cd-56ef-1234567890ab",
+            "ModelKmsKeyId": "arn:aws:kms:eu-west-1:000000000000:key/beef-5678",
+            "VpcConfig": {
+                "SecurityGroupIds": ["sg-0123456789abcdef0"],
+                "Subnets": ["subnet-0123456789abcdef0"],
+            },
+            "ModelPolicy": "{\"Version\":\"2012-10-17\",\"Statement\":[]}",
+            "Tags": [{ "Key": "team", "Value": "research" }, { "Key": "cost-centre" }],
+        }),
+        "only the required members" => json!({
+            "DocumentClassifierName": "minimal-classifier",
+            "DataAccessRoleArn": "arn:aws:iam::210987654321:role/path/to/OtherRole",
+            "LanguageCode": "ja",
+            "InputDataConfig": { "S3Uri": "s3://other-bucket/corpus/" },
+        }),
+        _ => json!({
+            "DocumentClassifierName": "augmented-manifest-classifier",
+            "DataAccessRoleArn": "arn:aws:iam::000000000000:role/Third",
+            "LanguageCode": "es",
+            "InputDataConfig": {
+                "DataFormat": "AUGMENTED_MANIFEST",
+                "AugmentedManifests": [{
+                    "S3Uri": "s3://third/manifest.jsonl",
+                    "AttributeNames": ["label"],
+                    "Split": "TRAIN",
+                }],
+            },
+        }),
+    }
+}
+
+/// The cases [`creation`] builds.
+const CREATION_CASES: &[&str] = &[
+    "every optional member set",
+    "only the required members",
+    "an augmented-manifest training set",
+];
+
+/// Create a classifier and return its ARN.
+async fn create(comprehend: &Comprehend, case: &str, body: &Value) -> String {
+    let output = comprehend.ok("CreateDocumentClassifier", body).await;
+    output["DocumentClassifierArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a DocumentClassifierArn, got {output}"))
+        .to_string()
+}
+
+/// The properties `DescribeDocumentClassifier` reports for `arn`.
+async fn describe(comprehend: &Comprehend, arn: &str) -> Value {
+    let output = comprehend
+        .ok(
+            "DescribeDocumentClassifier",
+            &json!({ "DocumentClassifierArn": arn }),
+        )
+        .await;
+    output["DocumentClassifierProperties"].clone()
+}
+
+#[tokio::test]
+async fn a_created_classifier_is_persisted_and_described_from_the_store() {
+    let comprehend = Comprehend::new();
+
+    for case in CREATION_CASES {
+        let body = creation(case);
+        let arn = create(&comprehend, case, &body).await;
+
+        // The ARN form the output member's own pattern states, with the region the
+        // request was signed for: `document-classifier/<name>`, plus
+        // `/version/<VersionName>` when the creation named a version.
+        let name = body["DocumentClassifierName"].as_str().unwrap_or_default();
+        let expected = match body["VersionName"].as_str() {
+            Some(version) => format!(
+                "arn:aws:comprehend:{REGION}:{ACCOUNT_ID}:document-classifier/{name}/version/\
+                 {version}"
+            ),
+            None => format!("arn:aws:comprehend:{REGION}:{ACCOUNT_ID}:document-classifier/{name}"),
+        };
+        assert_eq!(arn, expected, "case {case:?}: unexpected classifier ARN");
+
+        let properties = describe(&comprehend, &arn).await;
+        assert_eq!(
+            properties["DocumentClassifierArn"].as_str(),
+            Some(arn.as_str()),
+            "case {case:?}: Describe reported a different ARN: {properties}"
+        );
+
+        // Every member the creation was called with comes back unchanged.
+        for member in [
+            "LanguageCode",
+            "InputDataConfig",
+            "OutputDataConfig",
+            "DataAccessRoleArn",
+            "VolumeKmsKeyId",
+            "ModelKmsKeyId",
+            "VpcConfig",
+            "VersionName",
+        ] {
+            let submitted = body.get(member).cloned().unwrap_or(Value::Null);
+            let reported = properties.get(member).cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                reported, submitted,
+                "case {case:?}: Describe must report the {member} Create was called with, \
+                 got {reported} for {submitted}"
+            );
+        }
+
+        // `Mode` is optional on the request and defaults to MULTI_CLASS, which the
+        // service documents; the reported value is always the one trained.
+        let expected_mode = body["Mode"].as_str().unwrap_or("MULTI_CLASS");
+        assert_eq!(
+            properties["Mode"].as_str(),
+            Some(expected_mode),
+            "case {case:?}: expected Mode {expected_mode:?}, got {properties}"
+        );
+
+        assert!(
+            MODEL_STATUS_VALUES.contains(&properties["Status"].as_str().unwrap_or_default()),
+            "case {case:?}: unexpected Status in {properties}"
+        );
+        assert!(
+            properties["SubmitTime"].as_f64().is_some_and(|t| t > 0.0),
+            "case {case:?}: expected a populated SubmitTime, got {properties}"
+        );
+        // Nothing was trained, so the metrics of a fitted model are absent rather
+        // than invented, and `Tags` is not a member of the properties shape.
+        assert!(
+            properties.get("ClassifierMetadata").is_none(),
+            "case {case:?}: no classifier was trained, so no ClassifierMetadata may be \
+             reported, got {properties}"
+        );
+        assert!(
+            properties.get("Tags").is_none(),
+            "case {case:?}: DocumentClassifierProperties models no Tags member, got \
+             {properties}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_reads_refuse_an_arn_no_classifier_was_created_under() {
+    let comprehend = Comprehend::new();
+    // One real classifier, so the refusal is about the ARN and not about an empty
+    // store.
+    let live = create(
+        &comprehend,
+        "seed",
+        &creation("only the required members"),
+    )
+    .await;
+
+    for operation in [
+        "DescribeDocumentClassifier",
+        "StopTrainingDocumentClassifier",
+        "DeleteDocumentClassifier",
+    ] {
+        // Rows that differ along what is wrong with the ARN: an unknown name, a
+        // version of a classifier that has none, another region, another account.
+        for arn in [
+            format!("arn:aws:comprehend:{REGION}:{ACCOUNT_ID}:document-classifier/does-not-exist"),
+            format!("{live}/version/v9"),
+            format!(
+                "arn:aws:comprehend:us-east-2:{ACCOUNT_ID}:document-classifier/minimal-classifier"
+            ),
+            format!("arn:aws:comprehend:{REGION}:111122223333:document-classifier/minimal-classifier"),
+        ] {
+            let (status, body) = comprehend
+                .call(operation, &json!({ "DocumentClassifierArn": arn }))
+                .await;
+            assert_eq!(
+                status, 404,
+                "case {operation} with {arn:?}: expected 404, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {operation} with {arn:?}: expected ResourceNotFoundException, got {body}"
+            );
+        }
+    }
+}
+
+// --- `ListDocumentClassifiers`: the page it serves over the same records ---------
+//
+// The suites below seed classifier records through the crate's own state API — the
+// SAME store, reached the same way, that the handler reads — rather than through
+// `CreateDocumentClassifier`, because a seeded record can carry a `ModelStatus`,
+// a submission instant and a metrics block that no creation this emulator performs
+// ever reaches (nothing is trained, so no record created here is ever `TRAINED`).
 
 /// How far apart two seeded submissions are, so each record has its own instant
 /// for the submit-time filters to select on.
@@ -52,6 +288,19 @@ fn base_time() -> SystemTime {
         .as_secs()
         - 3_600;
     UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+/// Hold a seeded record at the non-terminal status it stands for.
+///
+/// `DocumentClassifier::submitted` derives the instants the clock owes the next
+/// status change at from `SubmitTime`, which these rows deliberately set in the past
+/// so the submit-time filters have something to select on — and a transition already
+/// due is one every read materialises. A record seeded to STAND for a classifier
+/// still `SUBMITTED` or still `TRAINING` therefore has its due instants moved clear
+/// of now, which is what a classifier submitted a moment ago would carry.
+fn hold_status(record: &mut DocumentClassifier) {
+    record.training_due_at = SystemTime::now() + Duration::from_secs(3_600);
+    record.terminal_due_at = record.training_due_at + Duration::from_secs(3_600);
 }
 
 /// The classifier records every suite below seeds, oldest first.
@@ -114,13 +363,14 @@ fn seeded_records(base: SystemTime) -> Vec<DocumentClassifier> {
 
     // Row 2: the leanest record there is — no version, no data configuration, no
     // security members, and a status that has trained nothing yet.
-    let submitted = DocumentClassifier::submitted(
+    let mut submitted = DocumentClassifier::submitted(
         0,
         document_classifier_arn(REGION, "minimal", None),
         "minimal".to_string(),
         "ja".to_string(),
         base + SUBMISSION_GAP,
     );
+    hold_status(&mut submitted);
 
     // Row 3: a model mid-training, carrying a version whose name is punctuated
     // differently and only the input side of its configuration.
@@ -133,6 +383,7 @@ fn seeded_records(base: SystemTime) -> Vec<DocumentClassifier> {
     );
     training.version_name = Some("2026-04".to_string());
     training.status = "TRAINING".to_string();
+    hold_status(&mut training);
     training.training_start_time = Some(base + 2 * SUBMISSION_GAP + Duration::from_secs(3));
     training.input_data_config = Some(DocumentClassifierInputDataConfig {
         data_format: Some("AUGMENTED_MANIFEST".to_string()),
@@ -387,6 +638,47 @@ async fn an_account_with_no_classifiers_lists_nothing() {
 }
 
 #[tokio::test]
+async fn one_name_and_version_names_one_classifier() {
+    let comprehend = Comprehend::new();
+
+    // The same name twice is refused; the same name under a different version is a
+    // different classifier, as the `VersionName` documentation says ("must be unique
+    // among all models with the same classifier name").
+    let mut body = creation("only the required members");
+    create(&comprehend, "first creation", &body).await;
+
+    let (status, response) = comprehend.call("CreateDocumentClassifier", &body).await;
+    assert_eq!(
+        status, 400,
+        "case \"same name again\": expected 400, got {status}: {response}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "ResourceInUseException",
+        "case \"same name again\": expected ResourceInUseException, got {response}"
+    );
+
+    for version in ["v1", "v2"] {
+        body["VersionName"] = json!(version);
+        let arn = create(&comprehend, version, &body).await;
+        assert!(
+            arn.ends_with(&format!("/version/{version}")),
+            "case {version:?}: expected a versioned ARN, got {arn:?}"
+        );
+        let (status, response) = comprehend.call("CreateDocumentClassifier", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {version:?} again: expected 400, got {status}: {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ResourceInUseException",
+            "case {version:?} again: expected ResourceInUseException, got {response}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn every_persisted_classifier_is_reported_from_the_store() {
     let comprehend = Comprehend::new();
     let seeded = seed(&comprehend, base_time());
@@ -465,6 +757,119 @@ async fn max_results_outside_the_modelled_range_is_refused() {
 }
 
 #[tokio::test]
+async fn repeating_a_client_request_token_returns_the_first_classifier() {
+    let comprehend = Comprehend::new();
+
+    for case in CREATION_CASES {
+        let mut body = creation(case);
+        body["ClientRequestToken"] = json!(format!("tok-{}", case.replace(' ', "-")));
+
+        let first = create(&comprehend, case, &body).await;
+        let repeated = comprehend.ok("CreateDocumentClassifier", &body).await;
+        assert_eq!(
+            repeated["DocumentClassifierArn"].as_str(),
+            Some(first.as_str()),
+            "case {case:?}: a repeated ClientRequestToken must return the first ARN, got \
+             {repeated}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_creation_that_points_the_training_at_nothing_is_refused() {
+    let comprehend = Comprehend::new();
+
+    // The data the model documents as required for each `DataFormat`:
+    // `COMPREHEND_CSV` (the default when none is named) needs `S3Uri`, and
+    // `AUGMENTED_MANIFEST` needs `AugmentedManifests`.
+    let rows: &[(&str, Value, bool)] = &[
+        ("no DataFormat and no S3Uri", json!({}), false),
+        (
+            "COMPREHEND_CSV without S3Uri",
+            json!({ "DataFormat": "COMPREHEND_CSV", "TestS3Uri": "s3://bucket/test/" }),
+            false,
+        ),
+        (
+            "AUGMENTED_MANIFEST without AugmentedManifests",
+            json!({ "DataFormat": "AUGMENTED_MANIFEST", "S3Uri": "s3://bucket/training/" }),
+            false,
+        ),
+        (
+            "AUGMENTED_MANIFEST with an empty AugmentedManifests",
+            json!({ "DataFormat": "AUGMENTED_MANIFEST", "AugmentedManifests": [] }),
+            false,
+        ),
+        (
+            "the default DataFormat with an S3Uri",
+            json!({ "S3Uri": "s3://bucket/training/" }),
+            true,
+        ),
+        (
+            "COMPREHEND_CSV with an S3Uri",
+            json!({ "DataFormat": "COMPREHEND_CSV", "S3Uri": "s3://bucket/training/" }),
+            true,
+        ),
+        (
+            "AUGMENTED_MANIFEST with a manifest",
+            json!({
+                "DataFormat": "AUGMENTED_MANIFEST",
+                "AugmentedManifests": [{
+                    "S3Uri": "s3://bucket/manifest.jsonl",
+                    "AttributeNames": ["label"],
+                }],
+            }),
+            true,
+        ),
+        (
+            "a native-document training set",
+            json!({
+                "DocumentType": "SEMI_STRUCTURED_DOCUMENT",
+                "Documents": { "S3Uri": "s3://bucket/natives/" },
+            }),
+            true,
+        ),
+    ];
+
+    for (index, (case, input_data_config, accepted)) in rows.iter().enumerate() {
+        let body = json!({
+            "DocumentClassifierName": format!("input-config-{index}"),
+            "DataAccessRoleArn": "arn:aws:iam::123456789012:role/ComprehendRole",
+            "LanguageCode": "en",
+            "InputDataConfig": input_data_config,
+        });
+        let (status, response) = comprehend.call("CreateDocumentClassifier", &body).await;
+
+        if *accepted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200, got {status}: {response}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status}: {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                "InvalidRequestException",
+                "case {case:?}: expected InvalidRequestException, got {response}"
+            );
+            // A refused creation mints nothing: the name is still free, which a
+            // creation that DOES carry training data proves by succeeding under it.
+            let mut retry = body.clone();
+            retry["InputDataConfig"] = json!({ "S3Uri": "s3://bucket/training/" });
+            let (retry_status, retry_response) =
+                comprehend.call("CreateDocumentClassifier", &retry).await;
+            assert_eq!(
+                retry_status, 200,
+                "case {case:?}: a refused creation must leave the name free, got \
+                 {retry_status}: {retry_response}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_submit_time_after_page_is_served_newest_first() {
     let comprehend = Comprehend::new();
     let base = base_time();
@@ -498,6 +903,306 @@ async fn a_submit_time_after_page_is_served_newest_first() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn a_creation_carrying_more_tags_than_a_resource_can_hold_is_refused() {
+    let comprehend = Comprehend::new();
+
+    // The bound the `TooManyTagsException` documentation states ("50 tags per
+    // resource"): at it, and one past it.
+    for count in [0usize, 1, 50, 51] {
+        let mut body = creation("only the required members");
+        body["DocumentClassifierName"] = json!(format!("tagged-{count}"));
+        body["Tags"] = Value::Array(
+            (0..count)
+                .map(|index| json!({ "Key": format!("k{index}"), "Value": format!("v{index}") }))
+                .collect(),
+        );
+        let (status, response) = comprehend.call("CreateDocumentClassifier", &body).await;
+
+        if count > 50 {
+            assert_eq!(
+                status, 400,
+                "case {count} tags: expected 400, got {status}: {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                "TooManyTagsException",
+                "case {count} tags: expected TooManyTagsException, got {response}"
+            );
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {count} tags: expected 200, got {status}: {response}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_status_only_moves_forward_and_ends_in_the_modelled_failure() {
+    let comprehend = Comprehend::new();
+    let arn = create(
+        &comprehend,
+        "lifecycle",
+        &creation("only the required members"),
+    )
+    .await;
+
+    // The first read, taken straight after the call, still sees the transient state.
+    let first = describe(&comprehend, &arn).await;
+    assert_eq!(
+        first["Status"].as_str(),
+        Some("SUBMITTED"),
+        "case \"first read\": expected SUBMITTED, got {first}"
+    );
+    assert!(
+        first["EndTime"].is_null() && first["TrainingStartTime"].is_null(),
+        "case \"first read\": a classifier that has not started training has neither a \
+         TrainingStartTime nor an EndTime, got {first}"
+    );
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut highest = 0usize;
+    let started = Instant::now();
+    loop {
+        let properties = describe(&comprehend, &arn).await;
+        let status = properties["Status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let rank = LIFECYCLE
+            .iter()
+            .position(|known| *known == status)
+            .unwrap_or_else(|| panic!("case \"lifecycle\": unexpected status {status:?}"));
+        assert!(
+            rank >= highest,
+            "case \"lifecycle\": status went backwards to {status:?} after {seen:?}"
+        );
+        highest = rank;
+        if seen.last().map(String::as_str) != Some(status.as_str()) {
+            seen.push(status.clone());
+        }
+        if status != "SUBMITTED" {
+            assert!(
+                properties["TrainingStartTime"]
+                    .as_f64()
+                    .is_some_and(|t| t > 0.0),
+                "case \"lifecycle\": a classifier that started training carries a \
+                 TrainingStartTime, got {properties}"
+            );
+        }
+        if status == TERMINAL_STATUS {
+            for member in ["EndTime", "TrainingEndTime"] {
+                assert!(
+                    properties[member].as_f64().is_some_and(|t| t > 0.0),
+                    "case \"lifecycle\": a terminal classifier carries a {member}, got \
+                     {properties}"
+                );
+            }
+            // The reason the training could not be performed, naming the location it
+            // was pointed at.
+            let message = properties["Message"].as_str().unwrap_or_default();
+            for expected in ["s3://other-bucket/corpus/", "no object storage"] {
+                assert!(
+                    message.contains(expected),
+                    "case \"lifecycle\": expected the failure Message to mention \
+                     {expected:?}, got {message:?}"
+                );
+            }
+            break;
+        }
+        assert!(
+            properties["Message"].is_null(),
+            "case \"lifecycle\": a classifier whose training has not ended carries no \
+             Message, got {properties}"
+        );
+        assert!(
+            started.elapsed() < SETTLE_TIMEOUT,
+            "case \"lifecycle\": the classifier never reached {TERMINAL_STATUS}; statuses \
+             seen: {seen:?}"
+        );
+        sleep(Duration::from_millis(40));
+    }
+
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("SUBMITTED"),
+        "case \"lifecycle\": expected the first status to be SUBMITTED, saw {seen:?}"
+    );
+    assert_eq!(
+        seen.last().map(String::as_str),
+        Some(TERMINAL_STATUS),
+        "case \"lifecycle\": expected the last status to be {TERMINAL_STATUS}, saw {seen:?}"
+    );
+
+    // A read never moves a settled classifier on: two reads agree.
+    let once = describe(&comprehend, &arn).await;
+    let twice = describe(&comprehend, &arn).await;
+    assert_eq!(
+        once, twice,
+        "case \"terminal reads\": reading a settled classifier changed it: {once} then \
+         {twice}"
+    );
+}
+
+#[tokio::test]
+async fn stopping_training_ends_the_classifier_in_stopped() {
+    let comprehend = Comprehend::new();
+    let arn = create(&comprehend, "stop", &creation("only the required members")).await;
+
+    // An empty 200 is what the operation documents for the stop itself.
+    let stopped = comprehend
+        .ok(
+            "StopTrainingDocumentClassifier",
+            &json!({ "DocumentClassifierArn": arn }),
+        )
+        .await;
+    assert!(
+        stopped.is_null() || stopped == json!({}),
+        "case \"stop\": the operation answers 200 with an empty body, got {stopped}"
+    );
+
+    let started = Instant::now();
+    loop {
+        let properties = describe(&comprehend, &arn).await;
+        let status = properties["Status"].as_str().unwrap_or_default();
+        assert!(
+            matches!(status, "STOP_REQUESTED" | "STOPPED"),
+            "case \"stop\": a stopped classifier never trains on, got {properties}"
+        );
+        if status == "STOPPED" {
+            assert!(
+                properties["Message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("request of the caller")),
+                "case \"stop\": expected the Message to name the caller's stop, got \
+                 {properties}"
+            );
+            break;
+        }
+        assert!(
+            started.elapsed() < SETTLE_TIMEOUT,
+            "case \"stop\": the classifier never reached STOPPED"
+        );
+        sleep(Duration::from_millis(40));
+    }
+
+    // Stopping twice is not an error, and does not move a stopped classifier.
+    let before = describe(&comprehend, &arn).await;
+    comprehend
+        .ok(
+            "StopTrainingDocumentClassifier",
+            &json!({ "DocumentClassifierArn": arn }),
+        )
+        .await;
+    let after = describe(&comprehend, &arn).await;
+    assert_eq!(
+        before, after,
+        "case \"stop again\": a second stop changed a stopped classifier: {before} then \
+         {after}"
+    );
+}
+
+#[tokio::test]
+async fn a_classifier_is_deleted_only_once_its_training_has_ended() {
+    let comprehend = Comprehend::new();
+    let arn = create(
+        &comprehend,
+        "delete",
+        &creation("only the required members"),
+    )
+    .await;
+
+    // "Only those classifiers that are in terminated states will be deleted": a
+    // classifier whose training is still running is in use.
+    let (status, body) = comprehend
+        .call(
+            "DeleteDocumentClassifier",
+            &json!({ "DocumentClassifierArn": arn }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case \"delete while training\": expected 400, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceInUseException",
+        "case \"delete while training\": expected ResourceInUseException, got {body}"
+    );
+
+    // Once the training has ended, the delete is accepted, the classifier reports
+    // DELETING, and the record is gone once the clock owes its removal.
+    let started = Instant::now();
+    loop {
+        let properties = describe(&comprehend, &arn).await;
+        if properties["Status"].as_str() == Some(TERMINAL_STATUS) {
+            break;
+        }
+        assert!(
+            started.elapsed() < SETTLE_TIMEOUT,
+            "case \"delete\": the classifier never reached {TERMINAL_STATUS}, got \
+             {properties}"
+        );
+        sleep(Duration::from_millis(40));
+    }
+    let deleted = comprehend
+        .ok(
+            "DeleteDocumentClassifier",
+            &json!({ "DocumentClassifierArn": arn }),
+        )
+        .await;
+    assert!(
+        deleted.is_null() || deleted == json!({}),
+        "case \"delete\": the operation answers 200 with an empty body, got {deleted}"
+    );
+
+    let started = Instant::now();
+    loop {
+        let (status, body) = comprehend
+            .call(
+                "DescribeDocumentClassifier",
+                &json!({ "DocumentClassifierArn": arn }),
+            )
+            .await;
+        if status == 404 {
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case \"delete then read\": expected ResourceNotFoundException, got {body}"
+            );
+            break;
+        }
+        assert_eq!(
+            status, 200,
+            "case \"delete then read\": expected 200 or 404, got {status}: {body}"
+        );
+        assert_eq!(
+            body["DocumentClassifierProperties"]["Status"].as_str(),
+            Some("DELETING"),
+            "case \"delete then read\": a classifier being deleted reports DELETING, got \
+             {body}"
+        );
+        assert!(
+            started.elapsed() < SETTLE_TIMEOUT,
+            "case \"delete then read\": the classifier was never removed"
+        );
+        sleep(Duration::from_millis(40));
+    }
+
+    // The name is free again once the record is gone.
+    let recreated = create(
+        &comprehend,
+        "recreate after delete",
+        &creation("only the required members"),
+    )
+    .await;
+    assert_eq!(
+        recreated, arn,
+        "case \"recreate after delete\": the freed name must mint the same ARN again"
+    );
 }
 
 /// "Returns only classifiers submitted before/after the specified time": a record

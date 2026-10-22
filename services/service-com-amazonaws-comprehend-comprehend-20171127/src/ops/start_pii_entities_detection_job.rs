@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartPiiEntitiesDetectionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartPiiEntitiesDetectionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartPiiEntitiesDetectionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Validates the documented `Mode`/`RedactionConfig` precondition,
+//! then mints the job's id and ARN, persists the whole submitted record in
+//! [`crate::state`] and answers `SUBMITTED`. A repeated `ClientRequestToken`
+//! resolves to the job it already created instead of creating a second one.
+//!
+//! A refused request mints NOTHING: the record is only inserted once every
+//! precondition holds, so a rejected submission leaves no job for
+//! `DescribePiiEntitiesDetectionJob` or `ListPiiEntitiesDetectionJobs` to report.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +112,33 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{
+    AnalysisJob, JobFamily, JobOutcome, JobSubmission, SubmissionKey, PROCESSING_SPAN, QUEUE_SPAN,
+};
+
+/// The family every job this operation creates belongs to.
+const FAMILY: JobFamily = JobFamily::PiiEntitiesDetection;
+
+/// The analysis a PII entities detection job's run would carry out, for the reason a
+/// job of a family this emulator does not run ends `FAILED`
+/// ([`crate::state::unperformed_run_message`]).
+const ANALYSIS: &str = "PII entity detection";
+
+/// The `Mode` whose output is a redacted copy of each document, and which therefore
+/// needs a `RedactionConfig` saying what to redact and how.
+const REDACTION_MODE: &str = "ONLY_REDACTION";
+
+/// The `LanguageCode` values a PII entities detection job accepts.
+///
+/// From the modelled member documentation of
+/// `StartPiiEntitiesDetectionJobRequest$LanguageCode`: "Enter the language code for
+/// English (en) or Spanish (es)." Every other value the `LanguageCode` enum names is
+/// refused with this operation's `InvalidRequestException` — it models no
+/// `UnsupportedLanguageException`.
+const PII_LANGUAGES: &[&str] = &["en", "es"];
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -185,18 +212,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartPiiEntitiesDetectionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartPiiEntitiesDetectionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartPiiEntitiesDetectionJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartPiiEntitiesDetectionJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The service store is unavailable. Retry your request.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // The tag bound every Comprehend resource shares, stated once in
+        // `crate::state`; only the exception wrapper is this operation's own.
+        let tags = input.tags.unwrap_or_default();
+        if let Some(message) = crate::state::too_many_tags_message(&tags) {
+            return Err(
+                StartPiiEntitiesDetectionJobErrorModeled::TooManyTagsException(
+                    TooManyTagsException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The mode's own precondition, from `RedactionConfig`'s documentation: it "is
+        // required if you set the Mode parameter to ONLY_REDACTION. In that case, you
+        // must provide a RedactionConfig definition that includes the PiiEntityTypes
+        // parameter." A request asking for redaction without saying WHAT to redact
+        // cannot be carried out, so no job is minted for it.
+        if input.mode == REDACTION_MODE {
+            let entity_types = input
+                .redaction_config
+                .as_ref()
+                .and_then(|config| config.pii_entity_types.as_ref());
+            if entity_types.is_none_or(|types| types.is_empty()) {
+                return Err(
+                    StartPiiEntitiesDetectionJobErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(format!(
+                                "INPUT_CONFIG_INVALID_FOR_MODE: A RedactionConfig definition \
+                                 that includes the PiiEntityTypes parameter is required for \
+                                 PII detection requests that set the Mode parameter to \
+                                 {REDACTION_MODE}."
+                            )),
+                            reason: None,
+                            detail: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Membership of the `LanguageCode` enum is enforced at the boundary; which of
+        // its values a PII job accepts is documented in prose only, so it is enforced
+        // here.
+        if !PII_LANGUAGES.contains(&input.language_code.as_str()) {
+            return Err(
+                StartPiiEntitiesDetectionJobErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "LanguageCode '{}' is not supported for PII entity detection. \
+                             Enter one of: {}.",
+                            input.language_code,
+                            PII_LANGUAGES.join(", ")
+                        )),
+                        reason: None,
+                        detail: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = SystemTime::now();
+        // The submission's identity, beside its token: what makes a second call a
+        // RETRY of this one rather than a new job (see `state::JobSubmission`). This
+        // family's `Mode` and `RedactionConfig` are part of it, so the same token
+        // re-sent asking for a different mode is a different submission.
+        let request_digest = JobSubmission {
+            family: FAMILY,
+            job_name: input.job_name.as_deref(),
+            input_data_config: &input.input_data_config,
+            output_data_config: &input.output_data_config,
+            language_code: Some(&input.language_code),
+            data_access_role_arn: &input.data_access_role_arn,
+            // The PII family's input models neither a volume key nor a VPC
+            // configuration.
+            volume_kms_key_id: None,
+            vpc_config: None,
+            tags: &tags,
+            mode: Some(&input.mode),
+            redaction_config: input.redaction_config.as_ref(),
+        }
+        .digest();
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is `@idempotencyToken`: the same token re-submitted
+        // with the same request names the job it already created, which is what an
+        // SDK retrying a submission needs to make "did my first attempt land?"
+        // answerable. A request that carries none is a fresh submission, as the
+        // member's documentation says, and so is the same token carrying a
+        // DIFFERENT request: the pair identifies the submission, and the model
+        // declares no error for a token reused on another request.
+        if let Some(token) = input.client_request_token.as_ref() {
+            let key = SubmissionKey {
+                family: FAMILY,
+                client_request_token: token.clone(),
+                request_digest: request_digest.clone(),
+            };
+            if let Some(existing) = store.replayed_job_id(&key) {
+                if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, existing)) {
+                    // Report the status the clock already owed this job, so a
+                    // retried token and a Describe an instant apart cannot disagree.
+                    job.settle(now);
+                    return Ok(StartPiiEntitiesDetectionJobOutput {
+                        job_id: Some(job.job_id.clone()),
+                        job_arn: Some(job.job_arn.clone()),
+                        job_status: Some(job.job_status.clone()),
+                    });
+                }
+            }
+        }
+
+        let (seq, job_id) = store.mint_job_id(now);
+        let job_arn = ::emulator_server::emulator_arn(
+            "comprehend",
+            &region,
+            &format!("{}/{job_id}", FAMILY.arn_resource_type()),
+        );
+        // The run this emulator cannot perform: reading the documents from Amazon S3
+        // and writing the redacted copy or the offsets back. The outcome is recorded
+        // with the job, so `settle` reveals the modelled failure and its reason once
+        // the clock owes the transition, rather than a status nothing earned.
+        let terminal_outcome = JobOutcome::failed(crate::state::unperformed_run_message(
+            ANALYSIS,
+            &input.input_data_config,
+            &input.output_data_config,
+        ));
+        let job = AnalysisJob {
+            seq,
+            job_id: job_id.clone(),
+            job_arn: job_arn.clone(),
+            job_name: input.job_name,
+            job_status: "SUBMITTED".to_string(),
+            message: None,
+            submit_time: now,
+            end_time: None,
+            in_progress_due_at: now + QUEUE_SPAN,
+            terminal_due_at: now + QUEUE_SPAN + PROCESSING_SPAN,
+            stopped_due_at: None,
+            terminal_outcome: Some(terminal_outcome),
+            input_data_config: input.input_data_config,
+            output_data_config: input.output_data_config,
+            language_code: Some(input.language_code),
+            data_access_role_arn: input.data_access_role_arn,
+            // The PII family's input models neither a volume key nor a VPC
+            // configuration, so this record carries neither.
+            volume_kms_key_id: None,
+            vpc_config: None,
+            tags,
+            client_request_token: input.client_request_token,
+            mode: Some(input.mode),
+            redaction_config: input.redaction_config,
+            request_digest,
+        };
+        let job_status = job.job_status.clone();
+        store.insert_analysis_job(FAMILY, job);
+
+        Ok(StartPiiEntitiesDetectionJobOutput {
+            job_id: Some(job_id),
+            job_arn: Some(job_arn),
+            job_status: Some(job_status),
+        })
     }
 }
