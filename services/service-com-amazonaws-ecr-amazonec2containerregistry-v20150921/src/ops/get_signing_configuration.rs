@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSigningConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSigningConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSigningConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the registry's signing configuration out of [`crate::state`]: the record
+//! `PutSigningConfiguration` stored, with this registry's account id beside it. A
+//! registry that has no signing configuration — none was ever stored, or the last one was
+//! deleted — is refused with `SigningConfigurationNotFoundException`. This is a reporting
+//! operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +139,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSigningConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSigningConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSigningConfiguration"))
+        // Nothing in the request selects what is reported: this emulator serves exactly
+        // one registry — its own account's — and a registry holds at most one signing
+        // configuration.
+        let _ = (input, ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSigningConfigurationErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // "The specified signing configuration was not found. This occurs when attempting
+        // to retrieve or delete a signing configuration that does not exist."
+        let Some(configuration) = store.signing_configuration.clone() else {
+            return Err(
+                GetSigningConfigurationErrorModeled::SigningConfigurationNotFoundException(
+                    SigningConfigurationNotFoundException {
+                        message: Some(crate::state::signing_configuration_not_found_message()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetSigningConfigurationOutput {
+            registry_id: Some(crate::state::registry_id().to_string()),
+            signing_configuration: Some(configuration),
+        })
     }
 }

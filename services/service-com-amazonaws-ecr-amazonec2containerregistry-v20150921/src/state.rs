@@ -11,7 +11,8 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     EncryptionConfiguration, ImageDetail, ImageIdentifier, ImageScanningConfiguration,
-    ImageTagMutabilityExclusionFilter, Repository, RepositoryScanningConfiguration, Tag,
+    ImageTagMutabilityExclusionFilter, Repository, RepositoryScanningConfiguration,
+    SigningConfiguration, Tag,
 };
 
 /// `CreateRepository`'s documented default: "If this parameter is omitted, the default
@@ -288,6 +289,12 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// Repositories by name. A `BTreeMap` so every listing — and therefore every
     /// pagination token — has one deterministic order.
     pub repositories: BTreeMap<String, Repo>,
+    /// The registry's signing configuration, which `PutSigningConfiguration` creates or
+    /// replaces and `GetSigningConfiguration` reports. There is at most one per registry
+    /// and this emulator serves one registry, so it is a single optional record rather
+    /// than a map: `None` is a registry that has none, which is what
+    /// `SigningConfigurationNotFoundException` reports.
+    pub signing_configuration: Option<SigningConfiguration>,
     /// The registry's pull time update exclusion list: the IAM principal ARN of every
     /// principal whose image pulls ECR does not record a pull time for, mapped to when
     /// its exclusion was registered. Keyed by the ARN — one exclusion per principal is
@@ -316,6 +323,16 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
 pub fn repository_not_found_message(name: &str) -> String {
     format!(
         "The repository with name '{name}' does not exist in the registry with id '{}'",
+        registry_id()
+    )
+}
+
+/// The wording ECR uses when the registry carries no signing configuration — the state
+/// `SigningConfigurationNotFoundException` documents: "attempting to retrieve or delete a
+/// signing configuration that does not exist".
+pub fn signing_configuration_not_found_message() -> String {
+    format!(
+        "The registry with id '{}' does not have an associated signing configuration",
         registry_id()
     )
 }

@@ -19,5 +19,7 @@ mod repository_image_lifecycle;
 mod resource_tags;
 #[path = "all/scanning_configuration.rs"]
 mod scanning_configuration;
+#[path = "all/signing_configuration.rs"]
+mod signing_configuration;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
