@@ -9,9 +9,11 @@
 //! deploys a solution version trained with a PERSONALIZED_ACTIONS recipe." Every
 //! action id and score comes from the registry in [`crate::state`]:
 //!
-//! 1. `campaignArn` is resolved against the registry (404 when unknown) and the
+//! 1. `campaignArn` is resolved against the registry (400 "does not exist or is not
+//!    active yet" when it resolves to nothing — see
+//!    [`crate::state::Denied::unresolvable`]) and the
 //!    campaign must deploy a `PERSONALIZED_ACTIONS` solution version — otherwise 400.
-//! 2. `filterArn` is resolved too (404 when unknown) and its expression, bound to
+//! 2. `filterArn` is resolved the same way (400 when unknown) and its expression, bound to
 //!    `filterValues`, decides which stored Actions-catalog entries are candidates.
 //! 3. Each candidate's score is [`crate::state::scoring::relevance`] of its STORED
 //!    `base_score` and the request's `userId`, so an identical request returns an
@@ -156,10 +158,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
 
         // 1. The campaign. `campaignArn` carries no `@required` in the model, but it
-        //    is "the campaign to use for getting action recommendations" — without it
-        //    there is nothing to recommend from.
+        //    is "the campaign to use for getting action recommendations" — a request
+        //    that gives no campaign ARN gives this operation nothing to recommend
+        //    from, and the refusal reports the ARN it WAS given (see
+        //    [`invalid_campaign_arn`]).
         let Some(campaign_arn) = registry::present(input.campaign_arn.as_deref()) else {
-            return Err(invalid("campaignArn is required."));
+            return Err(invalid_campaign_arn(input.campaign_arn.as_deref()));
         };
         let campaign = guard.campaign(campaign_arn).map_err(deny)?.clone();
         if campaign.recipe_type != RecipeType::PersonalizedActions {
@@ -234,6 +238,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The refusal for a request whose `campaignArn` names no campaign at all.
+///
+/// The message is BUILT FROM THE REQUEST: it reports the campaign ARN the request
+/// gave, and an absent member gave the JSON `null`. `campaignArn` is the only resource
+/// this operation can recommend from and it carries no `@required` trait, so the
+/// boundary cannot refuse its absence and this handler is where it is refused — as
+/// `InvalidInputException` (HTTP 400), the invalid-input channel every unusable
+/// resource reference on the inference path goes through.
+fn invalid_campaign_arn(given: Option<&str>) -> GetActionRecommendationsError {
+    invalid(format!(
+        "The given campaign ARN is invalid: {}",
+        given.unwrap_or("null")
+    ))
+}
+
 /// The modelled `InvalidInputException` (HTTP 400): "Provide a valid value for the
 /// field or parameter."
 fn invalid(message: impl Into<String>) -> GetActionRecommendationsError {
@@ -243,19 +262,10 @@ fn invalid(message: impl Into<String>) -> GetActionRecommendationsError {
     .into()
 }
 
-/// The modelled `ResourceNotFoundException` (HTTP 404): "The specified resource does
-/// not exist."
-fn not_found(message: impl Into<String>) -> GetActionRecommendationsError {
-    GetActionRecommendationsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(message.into()),
-    })
-    .into()
-}
-
 /// Lift a registry refusal into this operation's error channel.
+///
+/// Every refusal the registry produces is the invalid-input channel (see
+/// [`Denied`]), so this is where that channel's HTTP 400 is chosen for this operation.
 fn deny(denied: Denied) -> GetActionRecommendationsError {
-    match denied {
-        Denied::NotFound(message) => not_found(message),
-        Denied::Invalid(message) => invalid(message),
-    }
+    invalid(denied.message())
 }

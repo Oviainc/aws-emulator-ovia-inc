@@ -1048,7 +1048,7 @@ async fn operations_outside_this_slice_still_answer_501() {
             "UntagResource",
             json!({ "ResourceARN": arn, "TagKeys": ["env"] }),
         ),
-        ("ListHypervisors", json!({})),
+        ("ListVirtualMachines", json!({})),
         (
             "PutMaintenanceStartTime",
             json!({ "GatewayArn": arn, "HourOfDay": 2, "MinuteOfHour": 0, "DayOfWeek": 1 }),

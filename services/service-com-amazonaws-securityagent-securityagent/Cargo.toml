@@ -21,15 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Opaque list pagination cursors: the resume-at record id (an applicationId or a
-# packId), hex-encoded.
+# Opaque list pagination cursors (the resume-at record id: an applicationId or a
+# packId) and target domain verification tokens, hex-encoded.
 hex = { workspace = true }
+# SHA-256 behind each target domain's verification token, derived from its minted id.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

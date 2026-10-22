@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes tags from a stored MSK resource: exactly the keys `TagKeys` names are
+//! dropped from the resource's stored tag set, and a key the resource does not
+//! carry is no error — removing a tag is idempotent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `ResourceArn` that is not an MSK resource ARN is a `BadRequestException`; a
+//! well-formed one this endpoint's region holds no resource for is a
+//! `NotFoundException`. Existence is settled BEFORE the keys are checked, so an ARN
+//! that names nothing is answered the same way whatever keys it lists.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +166,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        // Resolved exactly as `TagResource` resolves it, through the one shared
+        // lookup, so the two operations answer the same ARN the same way.
+        let tags = match state.resource_tags_mut_in(&region, &input.resource_arn) {
+            Ok(tags) => tags,
+            Err(crate::state::TagTargetRejected::NotAnArn) => {
+                return Err(
+                    UntagResourceErrorModeled::BadRequestException(BadRequestException {
+                        invalid_parameter: Some("ResourceArn".to_string()),
+                        message: Some(format!(
+                            "{} is not a valid Amazon MSK resource ARN.",
+                            input.resource_arn
+                        )),
+                    })
+                    .into(),
+                );
+            }
+            Err(crate::state::TagTargetRejected::NoSuchResource) => {
+                return Err(
+                    UntagResourceErrorModeled::NotFoundException(NotFoundException {
+                        invalid_parameter: None,
+                        message: Some(crate::state::TAGGING_NOT_FOUND_MESSAGE.to_string()),
+                    })
+                    .into(),
+                );
+            }
+        };
+
+        // Checked before the first removal, for the same reason `TagResource`
+        // checks before the first insert: a refused request removes nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // The model states these rules for THIS member — `TagKeys` is the shape
+        // whose own documentation carries them — so a key outside them is a
+        // malformed `TagKeys`, not a key that happens to be absent: no such key
+        // can ever have been stored (the writers refuse it), and a key under the
+        // `aws:` prefix is one the model says a caller "can't edit or delete".
+        // Refusing it is therefore the documented rule, not extra strictness,
+        // and it is the same decision the write side makes about the same value.
+        if let Some(reason) = input
+            .tag_keys
+            .iter()
+            .find_map(|key| crate::state::tag_key_violation(key.as_str()))
+        {
+            return Err(
+                UntagResourceErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("TagKeys".to_string()),
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
+        // Only the named keys go, and a key the resource does not carry is not an
+        // error: removing a tag twice leaves the same tag set as removing it once.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+        Ok(UntagResourceOutput)
     }
 }

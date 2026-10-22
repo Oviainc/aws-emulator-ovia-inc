@@ -44,9 +44,18 @@ pub const ARN_SERVICE: &str = "s3files";
 /// to read one from (an unsigned call still routes by endpoint host).
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// `maxResults` ceiling and documented default, from the `@range(1, 100)` and
-/// `@default(100)` on `ListFileSystemsRequest$maxResults`.
+/// The `maxResults` value every listing in this model documents as its default, from
+/// the `@default(100)` on each `maxResults` member.
+pub const DEFAULT_MAX_RESULTS: i32 = 100;
+
+/// `maxResults` ceiling for the listings whose member is `@range(1, 100)`:
+/// `ListFileSystemsRequest$maxResults` and `ListMountTargetsRequest$maxResults`.
 pub const MAX_RESULTS_LIMIT: i32 = 100;
+
+/// `maxResults` ceiling for `ListAccessPoints`, whose
+/// `ListAccessPointsRequest$maxResults` is `@range(1, 1000)` — a different bound from
+/// [`MAX_RESULTS_LIMIT`], so each listing passes its own to [`page_of`].
+pub const MAX_RESULTS_LIMIT_ACCESS_POINTS: i32 = 1_000;
 
 /// How many file systems this emulator will hold.
 ///
@@ -290,8 +299,8 @@ impl ComAmazonawsS3filesS3filesState {
         ordered
     }
 
-    /// The ids of the access points bound to `file_system_id`, in creation order.
-    pub fn access_point_ids_of(&self, file_system_id: &str) -> Vec<String> {
+    /// The access points bound to `file_system_id`, in creation order.
+    pub fn access_points_in_order(&self, file_system_id: &str) -> Vec<&AccessPoint> {
         let mut ordered: Vec<&AccessPoint> = self
             .access_points
             .values()
@@ -299,6 +308,11 @@ impl ComAmazonawsS3filesS3filesState {
             .collect();
         ordered.sort_by_key(|access_point| access_point.sequence);
         ordered
+    }
+
+    /// The ids of the access points bound to `file_system_id`, in creation order.
+    pub fn access_point_ids_of(&self, file_system_id: &str) -> Vec<String> {
+        self.access_points_in_order(file_system_id)
             .into_iter()
             .map(|access_point| access_point.access_point_id.clone())
             .collect()
@@ -528,20 +542,22 @@ pub fn decode_cursor(next_token: Option<&str>) -> Result<u64, MalformedCursor> {
 }
 
 /// Take the page of `ordered` (sorted by sequence number) that follows `after`, at most
-/// `max_results` items long.
+/// `max_results` items long, where `max_results_limit` is the `@range` maximum the
+/// calling operation's own `maxResults` member declares.
 ///
-/// `maxResults` is `@range(1, 100)` with `@default(100)`, so the boundary validator has
-/// already refused anything outside the range; a request that named none arrives as the
-/// out-of-range 0, which takes the documented default.
+/// Each `maxResults` is `@range(1, <limit>)` with `@default(100)`, so the boundary
+/// validator has already refused anything outside the range; a request that named none
+/// arrives as the out-of-range 0, which takes the documented default.
 pub fn page_of<T>(
     ordered: impl IntoIterator<Item = (u64, T)>,
     after: u64,
     max_results: i32,
+    max_results_limit: i32,
 ) -> Page<T> {
-    let limit = if (1..=MAX_RESULTS_LIMIT).contains(&max_results) {
+    let limit = if (1..=max_results_limit).contains(&max_results) {
         max_results as usize
     } else {
-        MAX_RESULTS_LIMIT as usize
+        DEFAULT_MAX_RESULTS.min(max_results_limit) as usize
     };
     let mut items = Vec::new();
     let mut last_sequence = after;

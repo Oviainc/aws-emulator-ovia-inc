@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHoursOfOperations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHoursOfOperations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHoursOfOperations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the instance's stored hours of operation onto `HoursOfOperationSummary`, in
+//! hours-of-operation-id order, one `MaxResults`-sized page at a time. An unknown
+//! instance is a 404, and a `NextToken` this service did not issue is a 400. Reporting
+//! only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHoursOfOperations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHoursOfOperationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHoursOfOperations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListHoursOfOperationsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Amazon Connect store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListHoursOfOperationsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some("NextToken is not a token this service issued".to_string()),
+                        reason: None,
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        let store = state.lock();
+        let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
+            ListHoursOfOperationsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Instance not found: {}", input.instance_id)),
+                },
+            )
+        })?;
+
+        let entries: Vec<(String, HoursOfOperationSummary)> = instance
+            .hours_of_operations
+            .iter()
+            .map(|(id, hours)| (id.clone(), hours.to_summary()))
+            .collect();
+        drop(store);
+
+        let (summaries, next_token) = crate::state::paginate(
+            entries,
+            cursor.as_deref(),
+            input.max_results,
+            crate::state::LIST_HOURS_OF_OPERATIONS_DEFAULT_PAGE_SIZE,
+        );
+
+        Ok(ListHoursOfOperationsOutput {
+            hours_of_operation_summary_list: Some(summaries),
+            next_token,
+        })
     }
 }

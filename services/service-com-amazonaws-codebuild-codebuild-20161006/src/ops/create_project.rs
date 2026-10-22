@@ -262,8 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags,
             created: Some(created),
             last_modified: Some(created),
-            // Written by CreateWebhook / UpdateProjectVisibility, both still
-            // scaffolded, so a freshly created project carries neither.
+            // Written by CreateWebhook / UpdateProjectVisibility, so a freshly
+            // created project carries neither: a webhook is connected by its own
+            // call, and `projectVisibility` is set below.
             webhook: None,
             vpc_config: input.vpc_config,
             // `badgeEnabled` is the input flag; `badge` is the stored view of it. No

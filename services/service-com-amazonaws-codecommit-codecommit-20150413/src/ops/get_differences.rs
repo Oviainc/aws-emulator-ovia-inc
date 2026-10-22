@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDifferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDifferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: compares the tree snapshots of the two commits the specifiers name,
+//! both read out of `crate::state`, and reports one `Difference` per path whose blob
+//! or mode differs between them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDifferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Where the model leaves a choice, this handler's chosen reading is: a path given
+//! for only one of `beforePath`/`afterPath` limits BOTH sides (the model documents
+//! that the two paths limit the results and that an absent pair means every path,
+//! but not what one alone does), and entries are paired by their position relative
+//! to that path, which is what lets `beforePath` name a folder's previous name.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +115,58 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeMap, BTreeSet};
+
+/// `changeType` values the model's `ChangeTypeEnum` declares
+/// (`smithy_query(query="shape",shape="ChangeTypeEnum")`).
+const CHANGE_TYPE_ADDED: &str = "A";
+const CHANGE_TYPE_MODIFIED: &str = "M";
+const CHANGE_TYPE_DELETED: &str = "D";
+
+/// The part of `path` that lies below `path_filter`: the empty string when the
+/// filter names that very file, the remainder when the filter names a folder the
+/// file sits under, and `None` when the path is outside the filter altogether.
+///
+/// With no filter every path keys on itself, so a path on one side pairs with the
+/// same path on the other. With a filter the key is relative to it, so a folder
+/// compared under its previous name (`beforePath`) pairs entry by entry with the
+/// same folder under its current name (`afterPath`).
+fn relative_key(path_filter: Option<&str>, path: &str) -> Option<String> {
+    match path_filter {
+        None => Some(path.to_string()),
+        Some(filter) if path == filter => Some(String::new()),
+        Some(filter) => path
+            .strip_prefix(filter)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(str::to_string),
+    }
+}
+
+/// One side of a difference: the blob a tree snapshot holds at a path, as the
+/// modeled `BlobMetadata`. `mode` is the numeric git file mode code that shape
+/// documents, not the `FileModeTypeEnum` name `GetFile` reports.
+fn blob_metadata(path: &str, entry: &crate::state::FileEntry) -> BlobMetadata {
+    BlobMetadata {
+        blob_id: Some(entry.blob_id.clone()),
+        path: Some(path.to_string()),
+        mode: Some(crate::state::git_mode(&entry.file_mode).to_string()),
+    }
+}
+
+/// The entries of one tree snapshot that the path filter admits, keyed by their
+/// position relative to that filter.
+fn keyed_entries<'tree>(
+    files: &'tree BTreeMap<String, crate::state::FileEntry>,
+    path_filter: Option<&str>,
+) -> BTreeMap<String, (&'tree str, &'tree crate::state::FileEntry)> {
+    files
+        .iter()
+        .filter_map(|(path, entry)| {
+            relative_key(path_filter, path).map(|key| (key, (path.as_str(), entry)))
+        })
+        .collect()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -198,18 +250,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDifferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDifferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDifferences"))
+        let _ = ctx;
+        // "A non-zero, non-negative integer used to limit the number of returned
+        // results" (`MaxResults`): anything else is not a page size.
+        if let Some(max_results) = input.max_results {
+            if max_results <= 0 {
+                return Err(GetDifferencesErrorModeled::InvalidMaxResultsException(
+                    InvalidMaxResultsException {
+                        message: Some(format!(
+                            "the maximum number of results {max_results} is not valid: expected a non-zero, non-negative integer"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A path limits the results to that file, or to the folder's entries. An
+        // absent (or empty) path means every path, and a path that cannot name an
+        // entry in a tree is refused. A path given for only one side limits BOTH:
+        // the other side would otherwise contribute its whole tree, which is not
+        // "limiting the results to this path". A folder may be written with a
+        // trailing separator (`dir/`), which addresses the same folder as `dir`.
+        let normalize = |raw: &Option<String>| -> Result<Option<String>, Self::Error> {
+            match raw.as_deref().map(|raw| raw.trim_end_matches('/')) {
+                None => Ok(None),
+                Some(raw) => match crate::state::normalize_path(raw) {
+                    Ok(path) => Ok(Some(path)),
+                    Err(crate::state::PathProblem::Missing) => Ok(None),
+                    Err(crate::state::PathProblem::Invalid) => Err(
+                        GetDifferencesErrorModeled::InvalidPathException(InvalidPathException {
+                            message: Some(format!("the path {raw} is not valid")),
+                        })
+                        .into(),
+                    ),
+                },
+            }
+        };
+        let before_path = normalize(&input.before_path)?;
+        let after_path = normalize(&input.after_path)?;
+        let before_filter = before_path.clone().or_else(|| after_path.clone());
+        let after_filter = after_path.clone().or(before_path);
+
+        // `afterCommitSpecifier` is required, so the boundary already refused an
+        // absent one; a blank one names no commit. `beforeCommitSpecifier` is
+        // optional, and a blank one is the same as leaving it out.
+        let after_specifier = input.after_commit_specifier.trim();
+        if after_specifier.is_empty() {
+            return Err(GetDifferencesErrorModeled::CommitRequiredException(
+                CommitRequiredException {
+                    message: Some("a commit was not specified".to_string()),
+                },
+            )
+            .into());
+        }
+        let before_specifier = input
+            .before_commit_specifier
+            .as_deref()
+            .map(str::trim)
+            .filter(|specifier| !specifier.is_empty());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+        let repository = store.repositories.get(&input.repository_name).ok_or_else(|| {
+            GetDifferencesErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(format!(
+                        "the repository {} does not exist",
+                        input.repository_name
+                    )),
+                },
+            )
+        })?;
+
+        let commit_does_not_exist = |specifier: &str| {
+            GetDifferencesErrorModeled::CommitDoesNotExistException(CommitDoesNotExistException {
+                message: Some(format!(
+                    "the commit {specifier} does not exist in the repository {}",
+                    input.repository_name
+                )),
+            })
+        };
+        let after_commit = repository
+            .resolve_commit(after_specifier)
+            .ok_or_else(|| commit_does_not_exist(after_specifier))?;
+        let before_commit = match before_specifier {
+            Some(specifier) => Some(
+                repository
+                    .resolve_commit(specifier)
+                    .ok_or_else(|| commit_does_not_exist(specifier))?,
+            ),
+            None => None,
+        };
+
+        // With no `beforeCommitSpecifier`, "all changes before the
+        // afterCommitSpecifier value are shown": the comparison runs against an
+        // empty tree, so every file the after commit holds is an addition.
+        let empty_tree: BTreeMap<String, crate::state::FileEntry> = BTreeMap::new();
+        let before_files = before_commit.map_or(&empty_tree, |commit| &commit.files);
+        let before_entries = keyed_entries(before_files, before_filter.as_deref());
+        let after_entries = keyed_entries(&after_commit.files, after_filter.as_deref());
+
+        // A path was given and names an entry in neither commit: there is nothing
+        // to limit the results to.
+        if (before_filter.is_some() || after_filter.is_some())
+            && before_entries.is_empty()
+            && after_entries.is_empty()
+        {
+            let path = after_filter.or(before_filter).unwrap_or_default();
+            return Err(GetDifferencesErrorModeled::PathDoesNotExistException(
+                PathDoesNotExistException {
+                    message: Some(format!("the path {path} does not exist")),
+                },
+            )
+            .into());
+        }
+
+        // One difference per path the two snapshots disagree about, ordered by that
+        // path so paging over the result is stable.
+        let keys: BTreeSet<&String> = before_entries.keys().chain(after_entries.keys()).collect();
+        let mut differences: Vec<Difference> = Vec::new();
+        for key in keys {
+            let difference = match (before_entries.get(key), after_entries.get(key)) {
+                (Some((before, before_entry)), Some((after, after_entry))) => {
+                    // Same bytes, same mode, same path: the file did not change.
+                    if before_entry.blob_id == after_entry.blob_id
+                        && before_entry.file_mode == after_entry.file_mode
+                        && before == after
+                    {
+                        continue;
+                    }
+                    Difference {
+                        before_blob: Some(blob_metadata(before, before_entry)),
+                        after_blob: Some(blob_metadata(after, after_entry)),
+                        change_type: Some(CHANGE_TYPE_MODIFIED.to_string()),
+                    }
+                }
+                (None, Some((after, after_entry))) => Difference {
+                    before_blob: None,
+                    after_blob: Some(blob_metadata(after, after_entry)),
+                    change_type: Some(CHANGE_TYPE_ADDED.to_string()),
+                },
+                (Some((before, before_entry)), None) => Difference {
+                    before_blob: Some(blob_metadata(before, before_entry)),
+                    after_blob: None,
+                    change_type: Some(CHANGE_TYPE_DELETED.to_string()),
+                },
+                // A key comes from one side or the other, so this cannot happen.
+                (None, None) => continue,
+            };
+            differences.push(difference);
+        }
+
+        // The continuation token is the offset of the next difference in that
+        // order; the whole comparison is a pure function of stored state, so the
+        // next page picks up exactly where this one stopped.
+        let start = match input.next_token.as_deref() {
+            None => 0usize,
+            Some(token) => token
+                .parse::<usize>()
+                .ok()
+                .filter(|offset| *offset <= differences.len())
+                .ok_or_else(|| {
+                    GetDifferencesErrorModeled::InvalidContinuationTokenException(
+                        InvalidContinuationTokenException {
+                            message: Some(format!("the continuation token {token} is not valid")),
+                        },
+                    )
+                })?,
+        };
+        // Without `MaxResults` every remaining difference is returned: the model
+        // declares no default page size, and a repository's tree is bounded by
+        // `crate::state::MAX_FILES_PER_TREE`.
+        let page = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(usize::MAX);
+        let end = differences.len().min(start.saturating_add(page));
+        let next_token = (end < differences.len()).then(|| end.to_string());
+
+        Ok(GetDifferencesOutput {
+            differences: Some(differences[start..end].to_vec()),
+            next_token,
+        })
     }
 }

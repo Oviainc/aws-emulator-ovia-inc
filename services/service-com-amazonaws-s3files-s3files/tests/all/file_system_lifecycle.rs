@@ -39,7 +39,7 @@ pub(crate) const REGION: &str = "eu-west-2";
 
 /// The canonical emulator account id every ARN carries
 /// (`engine::emulator_account_id()`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The provisioning span the service itself uses, so the transient-status assertion is
 /// tied to the implementation's own constant rather than to a copy of it.
@@ -144,7 +144,7 @@ pub(crate) async fn call(
 /// shape the model's `FileSystemId` (`fs-[0-9a-f]{17,40}`) and `AccessPointId`
 /// (`fsap-[0-9a-f]{17,40}`) patterns accept (smithy_query: shape FileSystemId /
 /// AccessPointId).
-fn is_minted_id(prefix: &str, value: &str) -> bool {
+pub(crate) fn is_minted_id(prefix: &str, value: &str) -> bool {
     let Some(hex) = value.strip_prefix(prefix) else {
         return false;
     };
@@ -155,7 +155,7 @@ fn is_minted_id(prefix: &str, value: &str) -> bool {
 /// model's pattern
 /// `^(arn:aws[-a-z]*:s3files:[0-9a-z-:]+:file-system/fs-[0-9a-f]{17,40})$` plus the
 /// canonical emulator account id and the region the request was signed for.
-fn file_system_arn_prefix() -> String {
+pub(crate) fn file_system_arn_prefix() -> String {
     format!("arn:aws:s3files:{REGION}:{ACCOUNT}:file-system/")
 }
 
@@ -184,7 +184,7 @@ pub(crate) async fn created_file_system_id(
 }
 
 /// `CreateAccessPoint` under `file_system_id`.
-async fn create_access_point(
+pub(crate) async fn create_access_point(
     router: &MultiServiceRouter,
     file_system_id: &str,
     extra: Value,
@@ -200,7 +200,7 @@ async fn create_access_point(
 
 /// The same body with `keys` dropped, so two answers can be compared on everything the
 /// clock does not move.
-fn without(value: &Value, keys: &[&str]) -> Value {
+pub(crate) fn without(value: &Value, keys: &[&str]) -> Value {
     let mut copy = value.clone();
     if let Some(members) = copy.as_object_mut() {
         for key in keys {
@@ -212,7 +212,7 @@ fn without(value: &Value, keys: &[&str]) -> Value {
 
 /// Every `LifeCycleState` value a freshly created resource may be reported in: the
 /// transient one, or the settled one when the provisioning span has already elapsed.
-fn assert_lifecycle_state(case: &str, status: &str) {
+pub(crate) fn assert_lifecycle_state(case: &str, status: &str) {
     assert!(
         status == "creating" || status == "available",
         "case {case:?}: a created resource is `creating` until the clock owes it \

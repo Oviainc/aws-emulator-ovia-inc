@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Checked BEFORE the state lock is taken: these depend on the request
         // alone, so the registry mutex is held only for the state-dependent work.
         //
-        // The three ceilings come first, so the loops below — and every later
+        // The two list ceilings come first, so the loops below — and every later
         // read of the record they produce — walk a bounded request. A replicator
         // stores both its cluster list and its replication list, and every reader
         // resolves each replication against the cluster list, so a create with
@@ -207,11 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.replication_info_list.len(),
                 crate::state::MAX_FLOWS_PER_REPLICATOR,
             ),
-            (
-                "Tags",
-                input.tags.as_ref().map_or(0, std::collections::HashMap::len),
-                crate::state::MAX_TAGS_PER_REPLICATOR,
-            ),
         ] {
             if submitted > ceiling {
                 return Err(CreateReplicatorErrorModeled::BadRequestException(
@@ -224,6 +219,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+        }
+
+        // `Tags` goes through the ONE admission check every tag write uses, so a
+        // tag set this create accepts is exactly one `TagResource` would accept
+        // on the same replicator a moment later: the per-resource count ceiling
+        // plus the key and value rules the model states. Against an empty stored
+        // set, because the replicator this request would mint carries no tags
+        // yet; a refused create registers nothing.
+        if let Some(reason) = crate::state::tag_write_violation(
+            &std::collections::BTreeMap::new(),
+            input
+                .tags
+                .iter()
+                .flatten()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        ) {
+            return Err(
+                CreateReplicatorErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("Tags".to_string()),
+                    message: Some(reason),
+                })
+                .into(),
+            );
         }
 
         // A `KafkaClusters` entry that names neither an Amazon MSK cluster nor an

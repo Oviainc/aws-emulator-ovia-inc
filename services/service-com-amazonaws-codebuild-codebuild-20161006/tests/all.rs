@@ -31,3 +31,5 @@ mod sandbox_sessions;
 mod source_credentials;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/webhook_lifecycle.rs"]
+mod webhook_lifecycle;

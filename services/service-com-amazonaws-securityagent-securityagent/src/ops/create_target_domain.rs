@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTargetDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTargetDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTargetDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a target domain: validates the domain name, mints the domain's identity
+//! and verification token, stores a `PENDING` record carrying the challenge the chosen
+//! verification method requires, and answers with that record.
 //!
 //! ## Shape of an operation
 //!
@@ -91,9 +86,25 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 // here — hence the `CreateTargetDomainError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#CreateTargetDomain")]
+//
+// `CreateTargetDomain` lists no errors of its own, so the three service-wide shapes
+// this handler needs are widened in with `extra_errors`: `ValidationException`
+// (HTTP 400, for a `targetDomainName` that is not a domain name),
+// `ServiceQuotaExceededException` (HTTP 402, "The request exceeds a service quota")
+// and `InternalServerException` (HTTP 500).
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#CreateTargetDomain",
+    extra_errors = [
+        "InternalServerException",
+        "ServiceQuotaExceededException",
+        "ValidationException"
+    ]
+)]
 #[derive(Debug)]
 pub enum CreateTargetDomainErrorModeled {
+    InternalServerException(InternalServerException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -109,6 +120,22 @@ impl From<CreateTargetDomainErrorModeled> for CreateTargetDomainError {
     fn from(modeled: CreateTargetDomainErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// The service's `ValidationException` (HTTP 400) refusing `member` because its value
+/// missed `violation`.
+///
+/// The summary names the member and the constraint it missed, and `fieldList` carries
+/// the same pair, so a client can fix the request from either.
+fn refusal(member: &str, violation: String) -> CreateTargetDomainError {
+    CreateTargetDomainErrorModeled::ValidationException(ValidationException {
+        message: format!("Member {member} {violation}"),
+        field_list: Some(vec![ValidationExceptionField {
+            path: member.to_string(),
+            message: violation,
+        }]),
+    })
+    .into()
 }
 
 /// The `CreateTargetDomain` operation.
@@ -147,18 +174,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTargetDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTargetDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTargetDomain"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTargetDomainErrorModeled::InternalServerException(InternalServerException {
+                message: "the target domain store is unavailable".to_string(),
+            })
+        })?;
+
+        // `targetDomainName` is an unconstrained `String` in the model, so the boundary
+        // validator passed any text; what this operation registers is a web domain, so
+        // a value that is not a DNS name is refused here rather than stored.
+        if let Some(violation) =
+            crate::state::target_domain_name_violation(&input.target_domain_name)
+        {
+            return Err(refusal("targetDomainName", violation));
+        }
+
+        // The method is a modelled enum, so a conforming client always sends one of
+        // its members; a value outside the enum is refused rather than stored and read
+        // back as a method with no challenge to publish.
+        if let Some(violation) =
+            crate::state::verification_method_violation(&input.verification_method)
+        {
+            return Err(refusal("verificationMethod", violation));
+        }
+
+        let mut state = state.lock();
+
+        // Every target domain is a stored record, so the number of them a caller can
+        // register is bounded, as it is on the real service: past the quota this
+        // operation answers the service's own `ServiceQuotaExceededException` (HTTP 402)
+        // instead of growing the store without end.
+        if state.target_domains.len() >= crate::state::MAX_TARGET_DOMAINS {
+            return Err(
+                CreateTargetDomainErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The request would exceed the maximum number of target domains ({}) \
+                             for this account",
+                            crate::state::MAX_TARGET_DOMAINS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A fresh identity per call: the id and the verification token are the
+        // service's to choose, so two calls are two distinct registrations whatever the
+        // inputs were. The model gives this operation no idempotency token and no
+        // conflict error, and every other target domain operation addresses the record
+        // by its `targetDomainId`, so the domain name is not an alternate key.
+        let identity = state.mint_target_domain_identity();
+        let record = crate::state::TargetDomainRecord::pending(
+            identity,
+            input.target_domain_name,
+            input.verification_method,
+            // Persisted at create time so the tagging operations have state to read.
+            input.tags.unwrap_or_default().into_iter().collect(),
+        );
+        let projected = record.modelled();
+        state
+            .target_domains
+            .insert(record.target_domain_id.clone(), record);
+
+        // Answered from the stored record's own projection, so this response and a
+        // later read of the same id carry the same values.
+        Ok(CreateTargetDomainOutput {
+            target_domain_id: projected.target_domain_id,
+            domain_name: projected.domain_name,
+            // `TargetDomain` makes the status optional while this output requires it;
+            // a stored record always carries one, so the projection always fills it.
+            verification_status: projected.verification_status.expect(
+                "a stored target domain always carries a status, so its projection does too",
+            ),
+            verification_status_reason: projected.verification_status_reason,
+            verification_details: projected.verification_details,
+            created_at: projected.created_at,
+            // A domain whose ownership is not proven yet has no verification time, and
+            // nothing inside this emulator can observe the owner publishing the
+            // challenge, so this stays absent until a verification call finds it.
+            verified_at: projected.verified_at,
+        })
     }
 }
+

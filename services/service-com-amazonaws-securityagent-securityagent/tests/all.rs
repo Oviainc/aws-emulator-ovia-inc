@@ -21,3 +21,9 @@ mod security_requirement_pack;
 mod security_requirement_packs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+// Not a suite of its own: the wire harness every suite shares, reached as
+// `crate::support`. It is declared here because every file under `tests/all/` must be.
+#[path = "all/support.rs"]
+mod support;
+#[path = "all/target_domain_registration.rs"]
+mod target_domain_registration;

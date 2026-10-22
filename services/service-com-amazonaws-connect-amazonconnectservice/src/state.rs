@@ -15,7 +15,8 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ContactFlow, ContactFlowSummary, HoursOfOperationConfig, HoursOfOperationTimeSlice, Instance,
+    ContactFlow, ContactFlowSummary, HoursOfOperation, HoursOfOperationConfig,
+    HoursOfOperationSummary, HoursOfOperationTimeSlice, HoursOfOperationsIdentifier, Instance,
     InstanceSummary, OutboundCallerConfig, OutboundEmailConfig, Queue, QueueSummary,
 };
 
@@ -58,6 +59,11 @@ pub const LIST_QUEUES_DEFAULT_PAGE_SIZE: usize = 1000;
 /// per page. The default MaxResult size is 100."
 pub const LIST_CONTACT_FLOWS_DEFAULT_PAGE_SIZE: usize = 100;
 
+/// The page size `ListHoursOfOperations` uses when the caller sends no `MaxResults`:
+/// the value its own `MaxResults` member documents — "The maximum number of results to
+/// return per page. The default MaxResult size is 100."
+pub const LIST_HOURS_OF_OPERATIONS_DEFAULT_PAGE_SIZE: usize = 100;
+
 /// How many instances the registry holds before `CreateInstance` refuses with the
 /// modelled `ServiceQuotaExceededException`.
 ///
@@ -94,6 +100,11 @@ pub const CONTACT_FLOW_SAVED_ALIAS: &str = "$SAVED";
 /// modelled `LimitExceededException`. The emulator's own bound on the store, for the
 /// reason [`INSTANCE_QUOTA`] gives; released by deleting the instance.
 pub const CONTACT_FLOWS_PER_INSTANCE_QUOTA: usize = 1_000;
+
+/// How many hours of operation one instance holds before `CreateHoursOfOperation`
+/// refuses with the modelled `LimitExceededException`. The emulator's own bound on the
+/// store, for the reason [`INSTANCE_QUOTA`] gives; released by deleting the instance.
+pub const HOURS_OF_OPERATIONS_PER_INSTANCE_QUOTA: usize = 1_000;
 
 /// One entry of the default inventory a new instance is provisioned with: a flow's
 /// name and the modelled `ContactFlowType` it carries.
@@ -268,7 +279,8 @@ pub struct InstanceRecord {
     pub contact_flows: BTreeMap<String, ContactFlowRecord>,
     /// This instance's hours of operation, keyed by hours-of-operation id. The queues
     /// of the instance name one of these through their `HoursOfOperationId`, which is
-    /// why the default queue's hours live here rather than beside it.
+    /// why the default queue's hours live here rather than beside it. Bounded by
+    /// [`HOURS_OF_OPERATIONS_PER_INSTANCE_QUOTA`].
     pub hours_of_operations: BTreeMap<String, HoursOfOperationRecord>,
 }
 
@@ -333,6 +345,35 @@ impl InstanceRecord {
             .values()
             .find(|flow| flow.name == name)
             .map(|flow| flow.id.as_str())
+    }
+
+    /// The id of this instance's hours of operation called `name`, if it has one. An
+    /// hours-of-operation name is unique within an instance, which is what makes a
+    /// same-name create a duplicate.
+    pub fn hours_of_operation_id_named(&self, name: &str) -> Option<&str> {
+        self.hours_of_operations
+            .values()
+            .find(|hours| hours.name == name)
+            .map(|hours| hours.id.as_str())
+    }
+
+    /// The modelled `HoursOfOperation` shape `DescribeHoursOfOperation` returns, with
+    /// every stored parent reference resolved against this instance's own records (the
+    /// modelled `HoursOfOperationsIdentifier` carries the parent's name and ARN beside
+    /// its id, and both live on the parent's record rather than on the child's).
+    pub fn hours_of_operation_detail(&self, id: &str) -> Option<HoursOfOperation> {
+        let record = self.hours_of_operations.get(id)?;
+        let parents: Vec<HoursOfOperationsIdentifier> = record
+            .parent_ids
+            .iter()
+            .filter_map(|parent_id| self.hours_of_operations.get(parent_id))
+            .map(|parent| HoursOfOperationsIdentifier {
+                name: parent.name.clone(),
+                id: parent.id.clone(),
+                arn: Some(parent.arn.clone()),
+            })
+            .collect();
+        Some(record.to_hours_of_operation(parents))
     }
 
     /// This instance's flow named by a `ContactFlowId` path label.
@@ -418,9 +459,15 @@ pub struct HoursOfOperationRecord {
     pub arn: String,
     pub name: String,
     pub description: Option<String>,
+    /// The time zone as given, kept verbatim: the modelled `TimeZone` is an
+    /// unconstrained string, so the store is what any later read reports.
     pub time_zone: String,
     /// The modelled `HoursOfOperationConfigList`: one entry per covered day.
     pub config: Vec<HoursOfOperationConfig>,
+    /// The ids named by `ParentHoursOfOperationConfigs`, in the order given. The name
+    /// and ARN a read reports for each one are read off the parent's own record, so
+    /// renaming a parent cannot leave a stale copy behind.
+    pub parent_ids: Vec<String>,
     pub tags: BTreeMap<String, String>,
     pub last_modified_time: SystemTime,
     pub last_modified_region: String,
@@ -484,6 +531,52 @@ impl ContactFlowRecord {
     }
 }
 
+impl HoursOfOperationRecord {
+    /// The modelled `HoursOfOperationSummary` shape `ListHoursOfOperations` returns.
+    pub fn to_summary(&self) -> HoursOfOperationSummary {
+        HoursOfOperationSummary {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            last_modified_time: Some(to_date_time(self.last_modified_time)),
+            last_modified_region: Some(self.last_modified_region.clone()),
+        }
+    }
+
+    /// The modelled `HoursOfOperation` shape `DescribeHoursOfOperation` returns.
+    /// `parents` is this record's parent references already resolved; see
+    /// [`InstanceRecord::hours_of_operation_detail`], which is how a handler reaches it.
+    pub fn to_hours_of_operation(
+        &self,
+        parents: Vec<HoursOfOperationsIdentifier>,
+    ) -> HoursOfOperation {
+        HoursOfOperation {
+            hours_of_operation_id: Some(self.id.clone()),
+            hours_of_operation_arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            time_zone: Some(self.time_zone.clone()),
+            config: Some(self.config.clone()),
+            // An hours of operation with no parent reports no `ParentHoursOfOperations`
+            // member at all rather than an empty list.
+            parent_hours_of_operations: if parents.is_empty() {
+                None
+            } else {
+                Some(parents)
+            },
+            tags: tags_out(&self.tags),
+            last_modified_time: Some(to_date_time(self.last_modified_time)),
+            last_modified_region: Some(self.last_modified_region.clone()),
+        }
+    }
+}
+
+/// `<instance ARN>/operating-hours/<id>`: the hours-of-operation ARN form Connect's own
+/// IAM resource types document, so it is derived from the instance that holds it.
+pub fn hours_of_operation_arn(instance_arn: &str, hours_of_operation_id: &str) -> String {
+    format!("{instance_arn}/operating-hours/{hours_of_operation_id}")
+}
+
 /// Provision the resources a new instance is born with, into the instance `instance_id`
 /// of `store`: the default contact flows ([`DEFAULT_CONTACT_FLOWS`]), the default
 /// `STANDARD` queue(s) ([`DEFAULT_QUEUE_NAMES`]) and the default hours of operation
@@ -521,11 +614,14 @@ pub fn seed_instance_defaults(
         hours_id.clone(),
         HoursOfOperationRecord {
             id: hours_id.clone(),
-            arn: format!("{instance_arn}/operating-hours/{hours_id}"),
+            arn: hours_of_operation_arn(&instance_arn, &hours_id),
             name: DEFAULT_HOURS_OF_OPERATION_NAME.to_string(),
             description: Some(DEFAULT_HOURS_OF_OPERATION_DESCRIPTION.to_string()),
             time_zone: DEFAULT_HOURS_OF_OPERATION_TIME_ZONE.to_string(),
             config: default_hours_of_operation_config(),
+            // The default hours of operation stands alone: no parent is provisioned
+            // with it, so a read reports no `ParentHoursOfOperations`.
+            parent_ids: Vec::new(),
             tags: BTreeMap::new(),
             last_modified_time: now,
             last_modified_region: region.clone(),

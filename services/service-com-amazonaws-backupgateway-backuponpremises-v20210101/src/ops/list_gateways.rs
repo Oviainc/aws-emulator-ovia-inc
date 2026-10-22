@@ -151,16 +151,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not issue is refused, never quietly treated as "start from the top".
         let after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
-                ListGatewaysErrorModeled::ValidationException(ValidationException {
-                    error_code: None,
-                    message: Some(
-                        "Value at 'NextToken' failed to satisfy constraint: the token must be \
-                         one a previous ListGateways response returned"
-                            .to_string(),
-                    ),
-                })
-            })?),
+            Some(token) => Some(
+                crate::state::decode_page_token(token, crate::state::GATEWAY_RESOURCE_TYPE)
+                    .ok_or_else(|| {
+                        ListGatewaysErrorModeled::ValidationException(ValidationException {
+                            error_code: None,
+                            message: Some(
+                                "Value at 'NextToken' failed to satisfy constraint: the token \
+                                 must be one a previous ListGateways response returned"
+                                    .to_string(),
+                            ),
+                        })
+                    })?,
+            ),
         };
 
         // `MaxResults` caps the page, but the SERVER caps it too: the model gives
@@ -177,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListGatewaysOutput {
             gateways: Some(
-                page.gateways
+                page.items
                     .iter()
                     .map(crate::state::StoredGateway::summary)
                     .collect(),

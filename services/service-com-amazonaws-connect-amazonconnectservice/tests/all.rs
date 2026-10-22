@@ -17,6 +17,8 @@ mod contact_flow_catalog;
 mod contact_flow_lifecycle;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/hours_of_operation_lifecycle.rs"]
+mod hours_of_operation_lifecycle;
 #[path = "all/instance_default_resources.rs"]
 mod instance_default_resources;
 #[path = "all/instance_queue_lifecycle.rs"]

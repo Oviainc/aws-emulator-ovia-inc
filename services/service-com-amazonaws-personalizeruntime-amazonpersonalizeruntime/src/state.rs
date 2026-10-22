@@ -13,12 +13,16 @@
 //! writes to the registry; the one value a call mints is its own `recommendationId`
 //! (see [`ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState::issue_recommendation_id`]).
 //!
-//! An ARN this registry does not hold is `ResourceNotFoundException` ("The specified
-//! resource does not exist", HTTP 404) for all three operations, so **a missing
+//! A well-formed resource ARN this registry does not hold is
+//! `InvalidInputException` (HTTP 400) with the message `<arn> does not exist or is
+//! not active yet.` for all three operations — the inference data plane cannot tell a
+//! resource that was never created from one that was created but has not reached
+//! ACTIVE, so it refuses both through the INVALID-INPUT channel (see
+//! [`Denied::unresolvable`]). A missing
 //! [`campaigns`](ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState::campaigns) /
 //! [`recommenders`](ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState::recommenders) /
 //! [`filters`](ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState::filters)
-//! entry is the single source of truth for that error**.
+//! entry is the single source of truth for that refusal.
 //!
 //! # The registration seam, and the rule it follows
 //!
@@ -421,21 +425,25 @@ impl ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState {
         id
     }
 
-    /// The registered campaign under `arn`, or [`Denied::NotFound`].
+    /// The registered campaign under `arn`, or [`Denied::unresolvable`].
     pub fn campaign(&self, arn: &str) -> Result<&Campaign, Denied> {
-        self.campaigns.get(arn).ok_or_else(|| Denied::not_found(arn))
+        self.campaigns
+            .get(arn)
+            .ok_or_else(|| Denied::unresolvable(arn))
     }
 
-    /// The registered recommender under `arn`, or [`Denied::NotFound`].
+    /// The registered recommender under `arn`, or [`Denied::unresolvable`].
     pub fn recommender(&self, arn: &str) -> Result<&Recommender, Denied> {
         self.recommenders
             .get(arn)
-            .ok_or_else(|| Denied::not_found(arn))
+            .ok_or_else(|| Denied::unresolvable(arn))
     }
 
-    /// The registered filter under `arn`, or [`Denied::NotFound`].
+    /// The registered filter under `arn`, or [`Denied::unresolvable`].
     pub fn filter(&self, arn: &str) -> Result<&Filter, Denied> {
-        self.filters.get(arn).ok_or_else(|| Denied::not_found(arn))
+        self.filters
+            .get(arn)
+            .ok_or_else(|| Denied::unresolvable(arn))
     }
 
     /// The filter named by `arn` (when the request named one), bound to this
@@ -454,36 +462,48 @@ impl ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState {
         let stored = self.filter(arn)?;
         filter::bind(&stored.parsed, entity, filter_values)
             .map(Some)
-            .map_err(Denied::Invalid)
+            .map_err(Denied::invalid)
     }
 }
 
-/// Why a runtime request cannot be served, in the two shapes this service models.
+/// Why a runtime request cannot be served.
 ///
 /// Lives here rather than in a handler because the registry lookups all three
-/// operations share are what produce it; each handler lifts it into its own
-/// generated error enum.
+/// operations share are what produce it; each handler lifts it into its own generated
+/// error enum.
+///
+/// ONE channel, not two: everything the inference plane refuses a request for — an ARN
+/// it cannot resolve, a member outside a documented bound, a filter expression it
+/// cannot bind — is `InvalidInputException` (HTTP 400, "Provide a valid value for the
+/// field or parameter."). The `ResourceNotFoundException` (404) all three operations
+/// also model stays expressible through each handler's generated error enum, but no
+/// registry refusal produces it: see [`Denied::unresolvable`] for why an unresolvable
+/// resource is the invalid-input channel.
 #[derive(Debug, Clone)]
-pub enum Denied {
-    /// `ResourceNotFoundException` (HTTP 404): "The specified resource does not
-    /// exist."
-    NotFound(String),
-    /// `InvalidInputException` (HTTP 400): "Provide a valid value for the field or
-    /// parameter."
-    Invalid(String),
-}
+pub struct Denied(String);
 
 impl Denied {
-    /// The 404 for an ARN the registry does not hold.
-    pub fn not_found(arn: &str) -> Self {
-        Self::NotFound(format!("Resource {arn} does not exist."))
+    /// A refusal stating `message`.
+    pub fn invalid(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+
+    /// The refusal for a well-formed resource ARN the registry cannot resolve to an
+    /// ACTIVE campaign, recommender or filter.
+    ///
+    /// It is the INVALID-INPUT channel (`InvalidInputException`, HTTP 400), not the
+    /// not-found one: the inference plane serves a resource only once it is ACTIVE and
+    /// cannot distinguish "never created" from "created, not ACTIVE yet" — which is
+    /// why the message states both alternatives, and why `filterArn`'s own
+    /// documentation warns "When using this parameter, be sure the filter resource is
+    /// ACTIVE." The ARN in the message is the one the request named.
+    pub fn unresolvable(arn: &str) -> Self {
+        Self::invalid(format!("{arn} does not exist or is not active yet."))
     }
 
     /// The refusal's message.
     pub fn message(&self) -> &str {
-        match self {
-            Self::NotFound(message) | Self::Invalid(message) => message,
-        }
+        &self.0
     }
 }
 
@@ -499,7 +519,7 @@ pub fn effective_num_results(
     max: usize,
 ) -> Result<usize, Denied> {
     if requested < 0 {
-        return Err(Denied::Invalid(format!(
+        return Err(Denied::invalid(format!(
             "Value '{requested}' at 'numResults' failed to satisfy constraint: Member must have \
              value greater than or equal to 0"
         )));
@@ -509,7 +529,7 @@ pub fn effective_num_results(
         return Ok(default);
     }
     if requested > max {
-        return Err(Denied::Invalid(format!(
+        return Err(Denied::invalid(format!(
             "Value '{requested}' at 'numResults' failed to satisfy constraint: Member must have \
              value less than or equal to {max}"
         )));
@@ -523,6 +543,39 @@ pub fn catalog_columns(items: &[Item]) -> BTreeSet<String> {
         .iter()
         .flat_map(|item| item.attributes.keys().cloned())
         .collect()
+}
+
+/// Whether the request asks for metadata in recommendations at all.
+///
+/// This reads the REQUEST only — it is the condition in "If you are including metadata
+/// in recommendations, the maximum is 50. Otherwise, the maximum is 500."
+/// (`GetPersonalizedRankingRequest$inputList` / `GetRecommendationsRequest$numResults`
+/// docs), which decides a bound before any resource is resolved. A map that names no
+/// column asks for nothing, exactly as [`requested_metadata_columns`] reports it.
+pub fn asks_for_metadata(metadata_columns: Option<&HashMap<String, Vec<String>>>) -> bool {
+    metadata_columns.is_some_and(|columns| columns.values().any(|names| !names.is_empty()))
+}
+
+/// The maximum a request's result or input list may carry, from the one doc sentence
+/// that states both: [`MAX_NUM_RESULTS_WITH_METADATA`] when the request includes
+/// metadata, [`MAX_NUM_RESULTS`] otherwise.
+pub fn metadata_bounded_max(asks_for_metadata: bool) -> usize {
+    if asks_for_metadata {
+        MAX_NUM_RESULTS_WITH_METADATA
+    } else {
+        MAX_NUM_RESULTS
+    }
+}
+
+/// The refusal for a list member carrying more entries than the documented maximum
+/// that applies to this request: `Length of '<member>' cannot be greater than <max>`.
+///
+/// The message is built from the request — the member the caller sent and the bound
+/// that applies to it — so it states the rule rather than any one request's size.
+pub fn too_long(member: &str, max: usize) -> Denied {
+    Denied::invalid(format!(
+        "Length of '{member}' cannot be greater than {max}"
+    ))
 }
 
 /// The metadata columns a request asked for, validated against the resolved
@@ -544,7 +597,7 @@ pub fn requested_metadata_columns(
     let mut requested: Option<&Vec<String>> = None;
     for (dataset, columns) in metadata_columns {
         if dataset != METADATA_DATASET_ITEMS {
-            return Err(Denied::Invalid(format!(
+            return Err(Denied::invalid(format!(
                 "Value '{dataset}' at 'metadataColumns' failed to satisfy constraint: the map key \
                  must be {METADATA_DATASET_ITEMS}"
             )));
@@ -555,14 +608,14 @@ pub fn requested_metadata_columns(
         return Ok(None);
     };
     if requested.len() > MAX_METADATA_COLUMNS {
-        return Err(Denied::Invalid(format!(
+        return Err(Denied::invalid(format!(
             "Value '{}' at 'metadataColumns' failed to satisfy constraint: at most \
              {MAX_METADATA_COLUMNS} columns can be provided",
             requested.len()
         )));
     }
     if !metadata_enabled {
-        return Err(Denied::Invalid(
+        return Err(Denied::invalid(
             "metadataColumns was provided but metadata in recommendations is not enabled for this \
              resource"
                 .to_string(),
@@ -571,7 +624,7 @@ pub fn requested_metadata_columns(
     let mut columns: Vec<String> = Vec::new();
     for column in requested {
         if !columns_in_catalog.contains(column) {
-            return Err(Denied::Invalid(format!(
+            return Err(Denied::invalid(format!(
                 "Value '{column}' at 'metadataColumns' failed to satisfy constraint: the column is \
                  not in the Items dataset"
             )));

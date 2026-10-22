@@ -279,11 +279,16 @@ fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str, Re
             },
         ),
         (
+            // Implemented: it answers the modelled `NotFoundException` (404) for a flow
+            // ARN this store does not hold.
             "UpdateFlowOutput",
             "PUT",
             format!("/v1/flows/{FLOW_ARN}/outputs/{OUTPUT_ARN}"),
             "{}",
-            Reached::ScaffoldedStub,
+            Reached::ModelledError {
+                status: 404,
+                code: "NotFoundException",
+            },
         ),
         (
             "UpdateBridgeSource",
@@ -293,11 +298,16 @@ fn dispatch_table() -> Vec<(&'static str, &'static str, String, &'static str, Re
             Reached::ScaffoldedStub,
         ),
         (
+            // Implemented: it answers the modelled `NotFoundException` (404) for a flow
+            // ARN this store does not hold.
             "RemoveFlowOutput",
             "DELETE",
             format!("/v1/flows/{FLOW_ARN}/outputs/{OUTPUT_ARN}"),
             "",
-            Reached::ScaffoldedStub,
+            Reached::ModelledError {
+                status: 404,
+                code: "NotFoundException",
+            },
         ),
     ]
 }

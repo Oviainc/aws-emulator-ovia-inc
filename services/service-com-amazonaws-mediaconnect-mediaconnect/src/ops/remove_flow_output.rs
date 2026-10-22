@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveFlowOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveFlowOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes ONE output from an existing flow and PERSISTS the removal in [`crate::state`]:
+//! the output record the flow held is dropped from [`crate::state::StoredFlow::outputs`],
+//! so DescribeFlow stops reporting it and its name is free for a later AddFlowOutputs
+//! again.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveFlowOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An output is addressed by the `OutputArn` the service minted for it (the ARN
+//! AddFlowOutputs / CreateFlow answered with) WITHIN the flow the request names — an
+//! output ARN belongs to exactly one flow, so an ARN no output of that flow carries
+//! addresses nothing that "exist[s] in the system" and is refused with the modelled
+//! `NotFoundException`, exactly as an unknown flow ARN is.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +86,19 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources
+/// in the request does not exist in the system" — the flow or the output `identifier`
+/// addressed, in this service's not-found envelope ([`crate::state::not_found_message`]).
+///
+/// The identifier is whichever of the request's two ARNs resolved nothing, so a caller
+/// can tell a flow this service does not hold from an output that flow does not have.
+fn not_found(identifier: &str) -> RemoveFlowOutputError {
+    RemoveFlowOutputErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +172,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveFlowOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveFlowOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing in this operation's answer depends on request metadata: both ARNs are
+        // `@httpLabel`s the deserializer already put on `input`, and the response is read
+        // back out of the stored flow.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RemoveFlowOutputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect flow store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The status change the clock already owes this flow is materialised before the
+        // flow is read, exactly as AddFlowOutputs and the reporting operations do it.
+        store.settle_due_transitions(now);
+
+        // This operation removes an output from "an existing flow", addressed by its own
+        // ARN.
+        let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
+            return Err(not_found(&input.flow_arn));
+        };
+
+        // The output removed is the one of THIS flow's outputs that carries the requested
+        // ARN. `Output.OutputArn` is unique per output, so at most one position matches;
+        // an output ARN of some other flow, or of an output already removed, resolves
+        // nothing here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveFlowOutput"))
+        // "This request can be made only on an output that does not have an entitlement
+        // associated with it": an entitled output is the one MediaConnect creates on the
+        // SUBSCRIBER's flow from an entitlement another account granted, and it is the
+        // only output carrying `Output.EntitlementArn`. Nothing in this emulator
+        // materialises one — `AddOutputRequest` has no entitlement member, and
+        // GrantFlowEntitlements writes entitlements on the granting flow rather than
+        // outputs on another account's flow — so every output this store holds is one
+        // without an entitlement, and there is no entitled output here to refuse.
+        let Some(position) = flow
+            .outputs
+            .iter()
+            .position(|output| output.output_arn == input.output_arn)
+        else {
+            return Err(not_found(&input.output_arn));
+        };
+        let removed = flow.outputs.remove(position);
+
+        // "The ARN of the flow that the output was removed from" and "the ARN of the
+        // output that was removed" — both read out of the STORE rather than echoed from
+        // the request, so the response can only name what this call actually removed.
+        // Removing an output moves nothing else about the flow: its status is left as it
+        // was, because no clock owes a change for a removed output.
+        Ok(RemoveFlowOutputOutput {
+            flow_arn: Some(flow.flow_arn.clone()),
+            output_arn: Some(removed.output_arn),
+        })
     }
 }

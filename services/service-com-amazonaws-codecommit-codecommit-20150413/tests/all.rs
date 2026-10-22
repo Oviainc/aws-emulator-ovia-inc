@@ -23,6 +23,8 @@ mod commit_reads;
 mod compared_commit_comments;
 #[path = "all/default_branch.rs"]
 mod default_branch;
+#[path = "all/differences.rs"]
+mod differences;
 #[path = "all/file_commit_history.rs"]
 mod file_commit_history;
 #[path = "all/folder_listing.rs"]

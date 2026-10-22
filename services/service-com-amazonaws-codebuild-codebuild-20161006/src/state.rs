@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-codebuild-codebuild-20161006 service.
 //!
 //! Every implemented CodeBuild operation computes its answer from the records
-//! here: `CreateProject` writes a [`Project`], `StartBuild` writes a
+//! here: `CreateProject` writes a [`Project`], `CreateWebhook` writes that
+//! project's [`crate::ops::types::Webhook`], `StartBuild` writes a
 //! [`StoredBuild`], `StartBuildBatch` writes a [`StoredBuildBatch`],
 //! `StartSandbox` writes a [`StoredSandbox`] and `StopSandbox` ends one,
 //! `CreateReportGroup` writes a [`StoredReportGroup`],
@@ -161,6 +162,59 @@ pub const MAX_IDEMPOTENCY_TOKENS: usize = 10_000;
 /// here. AWS documents no count limit (it limits the combined size of a build's
 /// environment instead), and this is far above any real buildspec's variable set.
 pub const MAX_ENVIRONMENT_VARIABLES: usize = 1_000;
+
+/// The source types a project must have for `CreateWebhook` to connect repository
+/// events to it.
+///
+/// CodeBuild documents the operation as enabling a rebuild "every time a code change
+/// is pushed to the repository" for "an existing CodeBuild build project that has its
+/// source code stored in a GitHub or Bitbucket repository", and `ScopeConfiguration`
+/// extends the same surface to GitLab and GitLab Self Managed. A project whose source
+/// is none of these (`CODECOMMIT`, `CODEPIPELINE`, `S3`, `NO_SOURCE`) has no provider
+/// that sends repository events, so there is nothing to connect — the sole exception
+/// being a runner webhook, see [`RUNNER_WEBHOOK_BUILD_TYPE`].
+pub const WEBHOOK_SOURCE_TYPES: &[&str] = &[
+    "BITBUCKET",
+    "GITHUB",
+    "GITHUB_ENTERPRISE",
+    "GITLAB",
+    "GITLAB_SELF_MANAGED",
+];
+
+/// The one `WebhookBuildType` that is NOT a repository-event webhook.
+///
+/// AWS documents it on `CreateWebhookInput$buildType`: "RUNNER_BUILDKITE_BUILD is only
+/// available for NO_SOURCE source type projects configured for Buildkite runner
+/// builds" — so this build type requires [`RUNNER_WEBHOOK_SOURCE_TYPE`] and is the only
+/// way a `NO_SOURCE` project takes a webhook.
+pub const RUNNER_WEBHOOK_BUILD_TYPE: &str = "RUNNER_BUILDKITE_BUILD";
+
+/// The source type a runner webhook's project has — see [`RUNNER_WEBHOOK_BUILD_TYPE`].
+pub const RUNNER_WEBHOOK_SOURCE_TYPE: &str = "NO_SOURCE";
+
+/// The source type whose webhooks CodeBuild creates for the caller rather than handing
+/// back values to register by hand.
+///
+/// AWS documents `manualCreation` as "only available for GitHub webhooks".
+pub const MANUAL_CREATION_SOURCE_TYPE: &str = "GITHUB";
+
+/// The source type that carries no webhook `secret`.
+///
+/// AWS documents it on `Webhook$secret`: "A Bitbucket webhook does not support
+/// `secret`."
+pub const SECRETLESS_WEBHOOK_SOURCE_TYPE: &str = "BITBUCKET";
+
+/// The `WebhookFilter$type` every filter group must carry at least one of. AWS
+/// documents it on `filterGroups`: "At least one WebhookFilter in the array must
+/// specify EVENT as its type."
+pub const EVENT_WEBHOOK_FILTER_TYPE: &str = "EVENT";
+
+/// Characters in a webhook secret this emulator mints.
+///
+/// THE LENGTH IS THIS EMULATOR'S: AWS documents no length for `Webhook$secret` beyond
+/// `@length(min: 1)`, only that it is "the secret token of the associated repository",
+/// so a fixed, comfortably long value is chosen rather than derived from anything.
+const WEBHOOK_SECRET_LEN: usize = 40;
 
 /// Entries one `BatchGetSandboxes` request may ask for.
 ///
@@ -1004,7 +1058,8 @@ pub fn datetime(millis: i64) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_millis(millis)
 }
 
-/// A build's unique identifier — the UUID AWS puts after `<projectName>:`.
+/// A build's unique identifier — the UUID AWS puts after `<projectName>:`, and
+/// (through [`webhook_payload_url`]) the opaque token in a webhook's payload URL.
 ///
 /// Derived by [`derived_uuid`] from the project, the `buildNumber` just allocated
 /// for it under the state lock, and the instant it started, so no two builds of a
@@ -1109,6 +1164,58 @@ pub fn project_arn(region: &str, name: &str) -> String {
 /// `arn:aws:codebuild:<region>:<account>:build/<id>`.
 pub fn build_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("build/{id}"))
+}
+
+/// The CodeBuild endpoint a project's webhook events are sent to, as
+/// `Webhook$payloadUrl` reports it: the regional CodeBuild webhook endpoint carrying
+/// the opaque token that identifies this webhook, in AWS's `?t=<token>&v=1` form.
+///
+/// The token is DERIVED, not drawn from a generator: an RFC 9562 version-8 UUID over
+/// the values that already make a webhook unique — the account, the region, the project
+/// it belongs to and the instant it was created — through the same
+/// [`build_uuid`] construction a build id uses. So two webhooks never share a payload
+/// URL, re-reading the stored webhook reports the same URL, and nothing about the URL
+/// is read back out of the request.
+pub fn webhook_payload_url(region: &str, project_name: &str, created_millis: i64) -> String {
+    // The project name goes through the digest rather than into the URL, so the token
+    // stays opaque the way AWS's does.
+    let token = build_uuid(
+        &format!(
+            "{}:{region}:webhook:{project_name}",
+            ::emulator_server::emulator_account_id()
+        ),
+        0,
+        created_millis,
+    );
+    format!("https://codebuild.{region}.amazonaws.com/webhooks?t={token}&v=1")
+}
+
+/// A fresh webhook secret, for a webhook whose provider supports one.
+///
+/// The value is a secret handed to a caller — the repository provider signs its
+/// payloads with it — but it is NOT a credential of this emulator and must never be
+/// accepted as one. Nothing in a service may construct a secret itself, so the value is
+/// cut from a secret minted by the one component that generates secrets, the emulator's
+/// credential store, which is then removed from that store again: the caller gets the
+/// secret, the emulator keeps no credential it would accept, and nothing accumulates
+/// per call. Only the alphanumeric characters of that secret are kept, the way a
+/// provider's webhook secret reads.
+///
+/// `None` when the store minted no secret, or one with fewer than
+/// [`WEBHOOK_SECRET_LEN`] usable characters, which leaves the operation to refuse
+/// rather than report a value it made up.
+pub fn mint_webhook_secret(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let secret: String = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(WEBHOOK_SECRET_LEN)
+        .collect();
+    // The webhook secret is not a credential of this emulator; see above.
+    let _ = store.delete(&minted.id);
+    (secret.chars().count() == WEBHOOK_SECRET_LEN).then_some(secret)
 }
 
 /// `arn:aws:codebuild:<region>:<account>:build-batch/<id>`.

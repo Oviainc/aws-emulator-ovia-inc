@@ -13,6 +13,11 @@
 //! (`s3DestinationConfiguration` and `icebergDestinationConfiguration` are documented
 //! as mutually exclusive, and a channel has to deliver somewhere).
 //!
+//! The `Tags` the request carries go through the same admission check a later
+//! `TagResource` on the channel uses ([`crate::state::tag_write_violation`]): a key
+//! or value outside the documented rules, or more tags than a resource may carry,
+//! is a `BadRequestException` and the channel is not created.
+//!
 //! Authentication and authorization are NOT this handler's business: the emulator
 //! verifies every request signature centrally (see `AGENTS.md`), so the modelled
 //! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
@@ -228,6 +233,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "Exactly one of s3DestinationConfiguration and \
                          icebergDestinationConfiguration must be specified, not {destinations}."
                     )),
+                })
+                .into(),
+            );
+        }
+
+        // The tag rules apply wherever a caller supplies tags, so the set a
+        // create carries goes through the same admission check `TagResource`
+        // uses — against an empty stored set, because the channel this request
+        // would mint carries no tags yet. A refused create registers nothing.
+        if let Some(reason) = crate::state::tag_write_violation(
+            &std::collections::BTreeMap::new(),
+            input
+                .tags
+                .iter()
+                .flatten()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        ) {
+            return Err(
+                CreateChannelErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("Tags".to_string()),
+                    message: Some(reason),
                 })
                 .into(),
             );

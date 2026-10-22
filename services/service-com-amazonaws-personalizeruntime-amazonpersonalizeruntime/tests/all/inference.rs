@@ -462,7 +462,7 @@ async fn metadata_requests_outside_the_documented_rules_are_refused() {
 }
 
 #[tokio::test]
-async fn an_unregistered_arn_is_resource_not_found_for_every_operation() {
+async fn an_unregistered_arn_is_invalid_input_for_every_operation() {
     let emulator = seeded();
 
     let rows: [(&str, &str, Value); 7] = [
@@ -531,8 +531,8 @@ async fn an_unregistered_arn_is_resource_not_found_for_every_operation() {
         let (status, code) = emulator.err(route, body).await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case}: expected 404 ResourceNotFoundException, got {status} {code}"
+            (400, "InvalidInputException"),
+            "case {case}: expected 400 InvalidInputException, got {status} {code}"
         );
     }
 }
@@ -1431,8 +1431,8 @@ async fn an_empty_registry_recommends_nothing_and_invents_no_campaign() {
         .await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "ResourceNotFoundException"),
-        "a campaign nobody created does not exist, expected 404 ResourceNotFoundException, \
+        (400, "InvalidInputException"),
+        "a campaign nobody created resolves to nothing, expected 400 InvalidInputException, \
          got {status} {code}"
     );
 

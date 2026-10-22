@@ -20,9 +20,12 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — which operation serves a request. EDITED HERE: the key and
+//!   the handler stay the generated table's, but each operation is served through
+//!   [`StatedPerOperation`], which states a refused request the way this service states
+//!   it and, ahead of that, answers a query value that cannot be converted to its
+//!   member's modelled type through [`query_coercion`] — a deserialization failure, not
+//!   a constraint violation.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -56,6 +59,7 @@
 //! renderings this service does not share with the framework (an unanchored
 //! `@pattern`, an enum value set in the service's declared order).
 
+pub mod query_coercion;
 mod validation;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -355,6 +359,20 @@ where
             // The definition is read, used and dropped inside each statement:
             // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the
             // await below would make this future non-`Send`.
+            //
+            // A query value that cannot be CONVERTED to the modelled type of its member
+            // is refused FIRST, because deserialization precedes constraint validation:
+            // such a value never becomes a value at all, so there are no violations to
+            // state and no handler to run. The framework would otherwise report that
+            // conversion failure as a constraint violation (`ValidationException`,
+            // lowercase `message`), which is a different error class, a different
+            // remediation for the caller and a different SDK error type — see
+            // [`query_coercion`] for the whole argument and for the refusal this answers
+            // instead. The operation's own `O::INPUT_SCHEMA` is what says which of its
+            // members are convertible scalars bound to the query string.
+            if let Some(message) = query_coercion::refusal_for(O::INPUT_SCHEMA, req) {
+                return query_coercion::serialization_exception(&message);
+            }
             let refused = violations_of::<O>(svc.definition().protocol(), req);
             if let Some(stated) = validation::refusal(O::NAME, &refused) {
                 return svc
@@ -407,9 +425,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // NOT a re-route: the key is the one the generated table's own protocol
         // resolves, and the operation it names is the one served — wrapped in
         // `StatedPerOperation` so a refused request names the violated member by its
-        // path from that operation's input shape, the way this service names it. A key
-        // the model does not name resolves to `None` here exactly as it does in the
-        // generated table, so the router's routing-error path is unchanged.
+        // path from that operation's input shape, the way this service names it, and so
+        // that a query value it cannot convert is answered by `query_coercion` ahead of
+        // that. A key the model does not name resolves to `None` here exactly as it does
+        // in the generated table, so the router's routing-error path is unchanged.
         let key = self.entry.protocol().routing_key(req).ok()?;
         self.stated.get(key)
     }

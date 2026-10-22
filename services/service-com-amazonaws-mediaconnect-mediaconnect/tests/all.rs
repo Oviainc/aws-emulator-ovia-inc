@@ -29,9 +29,13 @@ mod flow_projection;
 mod gateway_lifecycle;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
+#[path = "all/remove_flow_output.rs"]
+mod remove_flow_output;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_flow.rs"]
 mod update_flow;
+#[path = "all/update_flow_output.rs"]
+mod update_flow_output;

@@ -14,11 +14,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AddMediaStreamRequest, AddOutputRequest, EncodingConfig, Encryption, Entitlement,
-    FailoverConfig, Flow, FlowTransitEncryption, Fmtp, Gateway, GatewayNetwork,
-    GrantEntitlementRequest, ListedFlow, ListedGateway, Maintenance, MediaStream,
-    MediaStreamAttributes, MonitoringConfig, NdiConfig, Output, Source, Transport, VpcInterface,
-    VpcInterfaceAttachment,
+    AddMediaStreamRequest, AddOutputRequest, DestinationConfiguration, EncodingConfig,
+    EncodingParameters, Encryption, Entitlement, FailoverConfig, Flow, FlowTransitEncryption, Fmtp,
+    Gateway, GatewayNetwork, GrantEntitlementRequest, Interface, ListedFlow, ListedGateway,
+    Maintenance, MediaStream, MediaStreamAttributes, MediaStreamOutputConfiguration,
+    MediaStreamOutputConfigurationRequest, MonitoringConfig, NdiConfig, Output, Source, Transport,
+    VpcInterface, VpcInterfaceAttachment,
 };
 
 /// The `Status` enum the model declares for a flow
@@ -448,6 +449,12 @@ pub struct StoredOutput {
     pub output_status: Option<String>,
     pub vpc_interface_attachment: Option<VpcInterfaceAttachment>,
     pub transport: Option<Transport>,
+    /// `Output.MediaStreamOutputConfigurations` — "the configuration for each media stream
+    /// that is associated with the output", as
+    /// [`materialise_media_stream_output_configurations`] materialised the request's.
+    /// `None` for an output that is associated with no media stream, so the member is
+    /// absent rather than an empty list.
+    pub media_stream_output_configurations: Option<Vec<MediaStreamOutputConfiguration>>,
     /// The router integration state the request that added this output asked for, or
     /// `None` when it asked for none — see [`reported_router_integration_state`], which
     /// is what turns this into the state the output REPORTS.
@@ -490,6 +497,13 @@ impl StoredOutput {
                     .unwrap_or_else(|| STATUS_ENABLED.to_string()),
             ),
             vpc_interface_attachment: request.vpc_interface_attachment.clone(),
+            media_stream_output_configurations: request
+                .media_stream_output_configurations
+                .as_deref()
+                .filter(|configurations| !configurations.is_empty())
+                .map(|configurations| {
+                    materialise_media_stream_output_configurations(configurations, suffix)
+                }),
             router_integration_state: request.router_integration_state.clone(),
             router_integration_transit_encryption: request
                 .router_integration_transit_encryption
@@ -532,9 +546,61 @@ impl StoredOutput {
             output_status: self.output_status.clone(),
             vpc_interface_attachment: self.vpc_interface_attachment.clone(),
             transport: self.transport.clone(),
+            media_stream_output_configurations: self.media_stream_output_configurations.clone(),
             ..Output::default()
         }
     }
+}
+
+/// Materialise the `MediaStreamOutputConfigurationRequest`s a request carries into the
+/// `MediaStreamOutputConfiguration`s the output record keeps.
+///
+/// The crate's ONE materialisation of that request shape: CreateFlow's and
+/// AddFlowOutputs' `Outputs` reach it through [`StoredOutput::from_add_request`] and
+/// UpdateFlowOutput applies it to the output it updates, so one request shape always
+/// becomes the same stored record.
+///
+/// The request and the stored shape mirror each other member for member except
+/// `DestinationConfiguration$OutboundIp`, which has no counterpart in the request shape
+/// and is REQUIRED on the stored one: it is "the IP address that the receiver requires in
+/// order to establish a connection with the flow", so the SERVICE assigns it, from the
+/// same documentation-range egress pool a flow's `EgressIp` is drawn from
+/// ([`assigned_egress_ip`]) and keyed by the ARN counter value `suffix` of the call that
+/// materialised the association. It is stored, so every later read reports the same
+/// address.
+pub fn materialise_media_stream_output_configurations(
+    requests: &[MediaStreamOutputConfigurationRequest],
+    suffix: u64,
+) -> Vec<MediaStreamOutputConfiguration> {
+    let outbound_ip = assigned_egress_ip(suffix);
+    requests
+        .iter()
+        .map(|request| MediaStreamOutputConfiguration {
+            media_stream_name: request.media_stream_name.clone(),
+            encoding_name: request.encoding_name.clone(),
+            encoding_parameters: request.encoding_parameters.as_ref().map(|parameters| {
+                EncodingParameters {
+                    compression_factor: parameters.compression_factor,
+                    encoder_profile: parameters.encoder_profile.clone(),
+                }
+            }),
+            destination_configurations: request.destination_configurations.as_ref().map(
+                |configurations| {
+                    configurations
+                        .iter()
+                        .map(|configuration| DestinationConfiguration {
+                            destination_ip: configuration.destination_ip.clone(),
+                            destination_port: configuration.destination_port,
+                            interface: Interface {
+                                name: configuration.interface.name.clone(),
+                            },
+                            outbound_ip: outbound_ip.clone(),
+                        })
+                        .collect()
+                },
+            ),
+        })
+        .collect()
 }
 
 /// A media stream of a stored flow: the modelled `MediaStream` the flow reports, plus

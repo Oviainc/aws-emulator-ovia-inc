@@ -8,13 +8,14 @@
 //!
 //! 1. **Resolve the resource.** Exactly one of `campaignArn` / `recommenderArn`
 //!    identifies what to recommend from; an ARN the registry does not hold is
-//!    `ResourceNotFoundException` (404). A campaign whose solution version was
+//!    `InvalidInputException` (400), "does not exist or is not active yet" (see
+//!    [`crate::state::Denied::unresolvable`]). A campaign whose solution version was
 //!    trained with `PERSONALIZED_RANKING` or `PERSONALIZED_ACTIONS` is served by
 //!    another operation, so it is `InvalidInputException` (400) here.
 //! 2. **Check the personalization input the resolved resource needs** — "USER_PERSONALIZATION
 //!    - userId required, itemId not used RELATED_ITEMS - itemId required, userId not
 //!    used", and for a recommender the input its domain use case requires.
-//! 3. **Filter.** `filterArn` is resolved against the registry (404 when unknown) and
+//! 3. **Filter.** `filterArn` is resolved against the registry (400 when unknown) and
 //!    its expression, bound to `filterValues`, decides which stored catalog entries
 //!    are candidates at all.
 //! 4. **Score and order.** Each candidate's score is [`crate::state::scoring::relevance`]
@@ -217,17 +218,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // 3. How much metadata was asked for, which is also what bounds `numResults`.
+        //    The BOUND is keyed off the request alone — the same predicate
+        //    `GetPersonalizedRanking` bounds `inputList` with, so one request means one
+        //    bound in both operations — while the columns themselves are validated
+        //    against the resolved resource and its catalog.
+        let max_num_results = registry::metadata_bounded_max(registry::asks_for_metadata(
+            input.metadata_columns.as_ref(),
+        ));
         let metadata_columns = registry::requested_metadata_columns(
             input.metadata_columns.as_ref(),
             resolved.metadata_enabled,
             &registry::catalog_columns(&resolved.items),
         )
         .map_err(deny)?;
-        let max_num_results = if metadata_columns.is_some() {
-            registry::MAX_NUM_RESULTS_WITH_METADATA
-        } else {
-            registry::MAX_NUM_RESULTS
-        };
         let num_results = registry::effective_num_results(
             input.num_results,
             registry::DEFAULT_NUM_RESULTS,
@@ -477,19 +480,10 @@ fn invalid(message: impl Into<String>) -> GetRecommendationsError {
     .into()
 }
 
-/// The modelled `ResourceNotFoundException` (HTTP 404): "The specified resource does
-/// not exist."
-fn not_found(message: impl Into<String>) -> GetRecommendationsError {
-    GetRecommendationsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(message.into()),
-    })
-    .into()
-}
-
 /// Lift a registry refusal into this operation's error channel.
+///
+/// Every refusal the registry produces is the invalid-input channel (see
+/// [`Denied`]), so this is where that channel's HTTP 400 is chosen for this operation.
 fn deny(denied: Denied) -> GetRecommendationsError {
-    match denied {
-        Denied::NotFound(message) => not_found(message),
-        Denied::Invalid(message) => invalid(message),
-    }
+    invalid(denied.message())
 }

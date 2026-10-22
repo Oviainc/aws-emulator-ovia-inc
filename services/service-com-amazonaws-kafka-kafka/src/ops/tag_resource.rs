@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds tags to a stored MSK resource. The tag set lives on the resource record
+//! itself, so a tag written here is reported by every reader of that resource
+//! (`ListTagsForResource`, and `DescribeCluster`/`ListClusters` for a cluster), and
+//! a key already present has its value overwritten rather than duplicated.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `ResourceArn` that is not an MSK resource ARN is a `BadRequestException`; a
+//! well-formed one this endpoint's region holds no resource for is a
+//! `NotFoundException`. Existence is settled BEFORE the tag keys are checked, so an
+//! ARN that names nothing is answered the same way whatever its tag map holds. The
+//! tag set a write would leave behind is admitted by
+//! [`crate::state::tag_write_violation`], so neither a single call nor a run of them
+//! can push a resource past the documented per-resource tag ceiling.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +163,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        // The resource is resolved first: a tagging call against an ARN this
+        // region holds nothing for is refused as a miss whatever its tag map
+        // contains.
+        let tags = match state.resource_tags_mut_in(&region, &input.resource_arn) {
+            Ok(tags) => tags,
+            Err(crate::state::TagTargetRejected::NotAnArn) => {
+                return Err(
+                    TagResourceErrorModeled::BadRequestException(BadRequestException {
+                        invalid_parameter: Some("ResourceArn".to_string()),
+                        message: Some(format!(
+                            "{} is not a valid Amazon MSK resource ARN.",
+                            input.resource_arn
+                        )),
+                    })
+                    .into(),
+                );
+            }
+            Err(crate::state::TagTargetRejected::NoSuchResource) => {
+                return Err(
+                    TagResourceErrorModeled::NotFoundException(NotFoundException {
+                        invalid_parameter: None,
+                        message: Some(crate::state::TAGGING_NOT_FOUND_MESSAGE.to_string()),
+                    })
+                    .into(),
+                );
+            }
+        };
+
+        // Every key, every value and the RESULTING tag count are checked before
+        // the first insert, so a refused request writes nothing and the stored
+        // tag set cannot grow past the documented per-resource ceiling however
+        // many calls a caller makes.
+        if let Some(reason) = crate::state::tag_write_violation(
+            tags,
+            input
+                .tags
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        ) {
+            return Err(
+                TagResourceErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("Tags".to_string()),
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
+        // A key already present has its value overwritten; the keys the request
+        // does not name are left alone.
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+        Ok(TagResourceOutput)
     }
 }

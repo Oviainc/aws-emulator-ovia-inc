@@ -26,93 +26,12 @@ use service_com_amazonaws_securityagent_securityagent::state::{
     MANAGEMENT_TYPE_CUSTOMER_MANAGED, MAX_SECURITY_REQUIREMENT_PACKS, PACK_STATUS_ENABLED,
     PACK_STATUS_VALUES,
 };
-use service_com_amazonaws_securityagent_securityagent::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// One answer from the emulator.
-struct Answer {
-    status: u16,
-    /// The wire error code: restJson1 carries it in the `x-amzn-errortype` header and
-    /// in the body's `__type` discriminator. Empty on a success.
-    error_code: String,
-    body: Value,
-}
-
-/// A router carrying only this service, over ONE shared engine — the same
-/// `EmulatedService::new(engine)` seam `core/router` mounts.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // Signatures are the emulator front door's concern, not this service's; these
-    // cases drive unsigned requests whose credential scope still names the service.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// `POST /<operation>` with `body` as the JSON payload.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
-    let region = "us-east-1";
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!(
-            "https://securityagent.{region}.amazonaws.com/{operation}"
-        ))
-        .header("host", format!("securityagent.{region}.amazonaws.com"))
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEXAMPLE/20260101/{region}/securityagent/aws4_request, \
-                 SignedHeaders=host, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let header_code = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    let raw = response.into_body();
-    let body = if raw.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&raw).unwrap_or_else(|e| {
-            panic!(
-                "{operation} answered a body that is not JSON ({e}): {}",
-                String::from_utf8_lossy(&raw)
-            )
-        })
-    };
-    let error_code = if header_code.is_empty() {
-        body.get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string()
-    } else {
-        header_code
-    };
-    // Both renderings may carry a namespace or a URI prefix; a client matches on the
-    // shape name.
-    let error_code = error_code
-        .rsplit(['#', '/', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    Answer {
-        status,
-        error_code,
-        body,
-    }
-}
+// The wire harness — the router over one shared engine, and the signed `POST
+// /<Operation>` call — lives in `crate::support`, shared by every suite in this test
+// target rather than copied per suite.
+use crate::support::{call, emulator, member};
 
 /// `call`, requiring `expected` and naming the case when it is not.
 async fn expect_status(
@@ -148,11 +67,6 @@ async fn get(router: &MultiServiceRouter, pack_id: &str, case: &str) -> Value {
         case,
     )
     .await
-}
-
-/// A string member of a payload, or `None` when it is absent.
-fn member(payload: &Value, name: &str) -> Option<String> {
-    payload.get(name).and_then(Value::as_str).map(str::to_string)
 }
 
 /// The `packId` a create answered.
