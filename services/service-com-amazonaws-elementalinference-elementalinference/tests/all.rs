@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/dictionary_lifecycle.rs"]
 mod dictionary_lifecycle;
+#[path = "all/dictionary_mutation.rs"]
+mod dictionary_mutation;
 #[path = "all/error_contract.rs"]
 mod error_contract;
 #[path = "all/error_message_rule.rs"]

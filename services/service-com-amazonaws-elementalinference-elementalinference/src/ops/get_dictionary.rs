@@ -176,6 +176,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle_due_transitions(std::time::Instant::now());
 
+        // Which feeds reference this dictionary is DERIVED from the feed store, so a
+        // feed whose subtitling output names it makes it REFERENCED here with that
+        // feed's id in `references`.
+        let references = state.feeds_referencing(&input.id);
+
         let Some(dictionary) = state.dictionaries.get(&input.id) else {
             return Err(GetDictionaryErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -190,8 +195,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: dictionary.id.clone(),
             name: dictionary.name.clone(),
             language: dictionary.language.clone(),
-            status: dictionary.status.as_wire().to_string(),
-            references: Some(dictionary.feed_references()),
+            status: dictionary.reported_status(&references).to_string(),
+            references: Some(references),
             tags: Some(dictionary.tag_map()),
         })
     }
