@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartProtectedQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartProtectedQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartProtectedQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a protected query against a PERSISTED membership and answers out of the
+//! stored record, so `GetProtectedQuery` reports exactly what this call returned.
+//!
+//! Every resource check reads state: the membership must exist, the collaboration it
+//! joined must still exist, and the calling account must hold the `CAN_QUERY` ability
+//! the collaboration granted it. The members the SERVICE decides are derived from state
+//! too — the result configuration falls back to the membership's stored default
+//! (`crate::state::protected_query_result_configuration`) and the query-compute payer to
+//! the collaboration's payer candidate (`crate::state::query_compute_payer`).
+//!
+//! The query itself is NOT executed: Clean Rooms runs SQL over the configured tables a
+//! collaboration associates, and this emulator serves the control plane only, with no
+//! analytics data plane. So the accepted query enters `SUBMITTED` and the clock owes it
+//! the modelled failure state with a reason that says exactly that
+//! (`crate::state::PROTECTED_QUERY_FAILURE_CODE`), rather than a fabricated `SUCCESS`
+//! with results nothing computed.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +166,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartProtectedQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartProtectedQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartProtectedQuery"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(StartProtectedQueryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let caller = st::caller_account_id().to_string();
+        let membership_id = input.membership_identifier;
+
+        let mut store = state.lock();
+
+        let Some(membership) = store.memberships.get(&membership_id).cloned() else {
+            return Err(StartProtectedQueryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("membership {membership_id} not found"),
+                    resource_id: membership_id,
+                    resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A query runs inside the collaboration the membership joined, so a membership
+        // left behind by a deleted collaboration has nothing to run against.
+        let Some(record) = store
+            .collaborations
+            .get(&membership.collaboration_id)
+            .cloned()
+        else {
+            return Err(StartProtectedQueryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "collaboration {} of membership {membership_id} not found",
+                        membership.collaboration_id
+                    ),
+                    resource_id: membership.collaboration_id,
+                    resource_type: st::RESOURCE_TYPE_COLLABORATION.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Running a query is the `CAN_QUERY` ability the collaboration granted: the
+        // model's `MemberAbility` catalog (CAN_QUERY | CAN_RECEIVE_RESULTS |
+        // CAN_RUN_JOB | CAN_EXPORT_QUERY_ANALYSIS_LOG) names it, and
+        // `QueryComputePaymentConfig$isResponsible` calls its holder "the member who
+        // can query". An account without it cannot start one.
+        let can_query = record
+            .grant_for(&caller)
+            .is_some_and(|grant| grant.member_abilities.iter().any(|a| a == st::ABILITY_CAN_QUERY));
+        if !can_query {
+            return Err(StartProtectedQueryErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(format!(
+                        "account {caller} does not hold the {} ability in collaboration {}",
+                        st::ABILITY_CAN_QUERY, record.id
+                    )),
+                    reason: Some(st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // `ProtectedQuerySQLParameters` carries the SQL either inline (`queryString`)
+        // or by reference (`analysisTemplateArn`); both members are optional in the
+        // shape, so a request that names neither, or both, identifies no single query
+        // to run and is refused instead of recorded.
+        let sql_parameters = input.sql_parameters;
+        let has_query_string = sql_parameters
+            .query_string
+            .as_deref()
+            .is_some_and(|sql| !sql.trim().is_empty());
+        let has_template = sql_parameters
+            .analysis_template_arn
+            .as_deref()
+            .is_some_and(|arn| !arn.is_empty());
+        if has_query_string == has_template {
+            let detail = if has_query_string {
+                "names both queryString and analysisTemplateArn"
+            } else {
+                "names neither queryString nor analysisTemplateArn"
+            };
+            return Err(StartProtectedQueryErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "sqlParameters {detail}; exactly one of them identifies the query to run"
+                    )),
+                    reason: Some(st::VALIDATION_REASON_INVALID_QUERY.to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "sqlParameters".to_string(),
+                        message: format!(
+                            "{detail}; exactly one of them identifies the query to run"
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // A named payer has to be an account of this collaboration: the cost cannot be
+        // assigned to an account the collaboration does not hold.
+        if let Some(payer) = input
+            .query_compute_payer_account_id
+            .as_deref()
+            .filter(|payer| record.grant_for(payer).is_none())
+        {
+            return Err(StartProtectedQueryErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "account {payer} is not a member of collaboration {}",
+                        record.id
+                    )),
+                    reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "queryComputePayerAccountId".to_string(),
+                        message: format!(
+                            "account {payer} is not a member of collaboration {}",
+                            record.id
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // Last, AFTER the resource and request checks, so an unknown membership still
+        // answers 404 and a bad request still answers 400 at the cap: this store grows
+        // by one query per call and holds it for the life of the process, so past the
+        // cap the service answers the quota error it models (`st::MAX_PROTECTED_QUERIES`
+        // is the emulator's own bound).
+        if store.protected_queries.len() >= st::MAX_PROTECTED_QUERIES {
+            return Err(
+                StartProtectedQueryErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "the number of protected queries would exceed the limit of {}",
+                            st::MAX_PROTECTED_QUERIES
+                        ),
+                        quota_name: "ProtectedQueries".to_string(),
+                        quota_value: st::MAX_PROTECTED_QUERIES as f64,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let started_at = ::std::time::SystemTime::now();
+        let id = st::new_uuid();
+        let query = ProtectedQuery {
+            id: id.clone(),
+            membership_id: membership.id.clone(),
+            membership_arn: membership.arn.clone(),
+            create_time: ::aws_smithy_types::DateTime::from(started_at),
+            sql_parameters: Some(sql_parameters),
+            // The clock owes this query its terminal status; until then it is the
+            // query the service has accepted but not finished.
+            status: st::PROTECTED_QUERY_STATUS_SUBMITTED.to_string(),
+            result_configuration: st::protected_query_result_configuration(
+                input.result_configuration,
+                &membership,
+            ),
+            // Nothing has run, so there is no duration to report and no result to
+            // point at; the settled failure explains why.
+            statistics: None,
+            result: None,
+            error: None,
+            // Differential privacy applies to the analysis rules of the tables a query
+            // reads, and this emulator holds none, so a query reports no parameters.
+            differential_privacy: None,
+            compute_configuration: st::effective_compute_configuration(input.compute_configuration),
+            query_compute_payer_account_id: input
+                .query_compute_payer_account_id
+                .or_else(|| st::query_compute_payer(&record)),
+        };
+
+        store.protected_queries.insert(
+            id.clone(),
+            st::ProtectedQueryRecord {
+                query,
+                terminal_due: Some(started_at + st::PROTECTED_QUERY_SETTLE_DELAY),
+            },
+        );
+        store.protected_query_order.push(id.clone());
+
+        // Answer out of the STORED record, so this response cannot differ from what
+        // GetProtectedQuery reports for the same query.
+        let Some(record) = store.protected_queries.get(&id) else {
+            return Err(StartProtectedQueryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!("protected query {id} was not persisted")),
+                },
+            )
+            .into());
+        };
+        Ok(StartProtectedQueryOutput {
+            protected_query: record.query.clone(),
+        })
     }
 }

@@ -18,16 +18,20 @@
 //! operations page deterministically and a pagination token stays valid across calls.
 
 use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    Collaboration, CollaborationSummary, DataEncryptionMetadata, MLMemberAbilities,
-    MemberSpecification, Membership, MembershipJobComputePaymentConfig, MembershipMLPaymentConfig,
-    MembershipModelInferencePaymentConfig, MembershipModelTrainingPaymentConfig,
-    MembershipPaymentConfiguration, MembershipProtectedJobResultConfiguration,
+    Collaboration, CollaborationSummary, ComputeConfiguration, DataEncryptionMetadata,
+    MLMemberAbilities, MemberSpecification, Membership, MembershipJobComputePaymentConfig,
+    MembershipMLPaymentConfig, MembershipModelInferencePaymentConfig,
+    MembershipModelTrainingPaymentConfig, MembershipPaymentConfiguration,
+    MembershipProtectedJobResultConfiguration, MembershipProtectedQueryOutputConfiguration,
     MembershipProtectedQueryResultConfiguration, MembershipQueryComputePaymentConfig,
     MembershipSummary, MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration,
+    ProtectedQuery, ProtectedQueryError, ProtectedQueryOutputConfiguration,
+    ProtectedQueryResultConfiguration, WorkerComputeConfiguration,
 };
 
 /// The ARN service segment and the SigV4 signing name for Clean Rooms, from
@@ -76,6 +80,38 @@ pub const DEFAULT_ANALYTICS_ENGINE: &str = "SPARK";
 /// the creator assigned nobody is accepted as not-responsible.
 pub const DEFAULT_ML_IS_RESPONSIBLE: bool = false;
 
+/// `ProtectedQueryStatus` values this slice produces (model shape
+/// `ProtectedQueryStatus`: SUBMITTED | STARTED | CANCELLED | CANCELLING | FAILED |
+/// SUCCESS | TIMED_OUT). A started query is SUBMITTED until the clock settles it, and
+/// FAILED is the only terminal status this emulator can reach — see
+/// [`PROTECTED_QUERY_FAILURE_CODE`].
+pub const PROTECTED_QUERY_STATUS_SUBMITTED: &str = "SUBMITTED";
+/// See [`PROTECTED_QUERY_STATUS_SUBMITTED`].
+pub const PROTECTED_QUERY_STATUS_FAILED: &str = "FAILED";
+
+/// How long after `StartProtectedQuery` the clock owes the query its terminal status.
+///
+/// AWS publishes no duration for a protected query's run, so this span is CHOSEN: 500
+/// ms, inside this project's 250-750 ms band for a transition the clock owes. It is
+/// deliberately non-zero, so a caller that reads the query straight after starting it
+/// still sees it SUBMITTED, and the due instant is stored rather than slept on.
+pub const PROTECTED_QUERY_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// The `ProtectedQueryError.code` a settled query carries.
+///
+/// Clean Rooms executes a protected query against the configured tables a
+/// collaboration associates; this emulator serves the Clean Rooms CONTROL plane only
+/// and has no analytics data plane to run SQL on, so no protected query can be
+/// executed. The run is therefore not performed and the query ends in the modelled
+/// failure state ([`PROTECTED_QUERY_STATUS_FAILED`]) with an error that says exactly
+/// that — never in a fabricated SUCCESS with results nothing computed.
+pub const PROTECTED_QUERY_FAILURE_CODE: &str = "QUERY_EXECUTION_UNAVAILABLE";
+
+/// The `ProtectedQueryError.message` that goes with [`PROTECTED_QUERY_FAILURE_CODE`].
+pub const PROTECTED_QUERY_FAILURE_MESSAGE: &str =
+    "this emulator serves the Clean Rooms control plane only: it has no analytics data \
+     plane, so the protected query was accepted and recorded but never executed";
+
 /// `MembershipStatus` values this slice produces (model shape `MembershipStatus`:
 /// ACTIVE | REMOVED | COLLABORATION_DELETED).
 pub const MEMBERSHIP_STATUS_ACTIVE: &str = "ACTIVE";
@@ -99,9 +135,18 @@ pub const RESOURCE_TYPE_MEMBERSHIP: &str = "MEMBERSHIP";
 /// `ConflictExceptionReason`: ALREADY_EXISTS | SUBRESOURCES_EXIST | INVALID_STATE).
 pub const CONFLICT_REASON_ALREADY_EXISTS: &str = "ALREADY_EXISTS";
 
+/// The only `AccessDeniedExceptionReason` the model declares (model shape
+/// `AccessDeniedExceptionReason`: INSUFFICIENT_PERMISSIONS).
+pub const ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS: &str = "INSUFFICIENT_PERMISSIONS";
+
 /// `ValidationExceptionReason` for a member value that failed validation (model shape
 /// `ValidationExceptionReason`).
 pub const VALIDATION_REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
+/// `ValidationExceptionReason` for SQL parameters that name no query to run (model
+/// shape `ValidationExceptionReason`: FIELD_VALIDATION_FAILED | INVALID_CONFIGURATION |
+/// INVALID_QUERY | IAM_SYNCHRONIZATION_DELAY).
+pub const VALIDATION_REASON_INVALID_QUERY: &str = "INVALID_QUERY";
 
 /// The largest `members` list `CreateCollaboration` accepts.
 ///
@@ -130,6 +175,14 @@ pub const MAX_COLLABORATIONS: usize = 5_000;
 
 /// See [`MAX_COLLABORATIONS`].
 pub const MAX_MEMBERSHIPS: usize = 5_000;
+
+/// The largest number of protected queries the store holds, for the same reason as
+/// [`MAX_COLLABORATIONS`]: `StartProtectedQuery` is the only operation that adds one,
+/// every one it adds lives for the life of the process so `GetProtectedQuery` can still
+/// answer for it, and past the cap the service answers the
+/// `ServiceQuotaExceededException` (HTTP 402) `StartProtectedQuery` declares. The
+/// number is the EMULATOR's own bound, not a published AWS default.
+pub const MAX_PROTECTED_QUERIES: usize = 5_000;
 
 /// A collaboration exactly as its creator declared it.
 #[derive(Debug, Clone)]
@@ -196,6 +249,18 @@ impl CollaborationRecord {
     }
 }
 
+/// A protected query as `StartProtectedQuery` recorded it, plus the terminal status the
+/// clock owes it.
+#[derive(Debug, Clone)]
+pub struct ProtectedQueryRecord {
+    /// The modelled shape, stored as-is: every one of its members is absolute, so a
+    /// read reports it without deriving anything.
+    pub query: ProtectedQuery,
+    /// When the clock owes this query its terminal status, or `None` once that
+    /// transition has been materialized. See [`PROTECTED_QUERY_SETTLE_DELAY`].
+    pub terminal_due: Option<SystemTime>,
+}
+
 /// Per-service state for com-amazonaws-cleanrooms-awsbastioncontrolplaneservicelambda. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
@@ -214,6 +279,10 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// Tags by resource ARN, shared by collaboration and membership ARNs so a later
     /// TagResource/ListTagsForResource slice has one place to read and write.
     pub tags: HashMap<String, HashMap<String, String>>,
+    /// Protected queries by `ProtectedQuery.id`.
+    pub protected_queries: HashMap<String, ProtectedQueryRecord>,
+    /// Protected query ids in start order — the order a listing pages in.
+    pub protected_query_order: Vec<String>,
 }
 
 /// Shorthand for this service's state struct.
@@ -318,6 +387,43 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             membership_arn: membership.map(|m| m.arn.clone()),
             analytics_engine: Some(record.analytics_engine.clone()),
         })
+    }
+
+    /// Materialize every protected-query transition the CLOCK already owes at `now`.
+    ///
+    /// A query's terminal status falls due [`PROTECTED_QUERY_SETTLE_DELAY`] after the
+    /// call that started it, whether or not anybody calls again, so a reporting
+    /// operation applies the ones already owed before it answers. It changes nothing
+    /// that is not yet due: a caller reading a query inside that span sees it
+    /// SUBMITTED.
+    pub fn settle_protected_queries(&mut self, now: SystemTime) {
+        for record in self.protected_queries.values_mut() {
+            if record.terminal_due.is_none_or(|due| due > now) {
+                continue;
+            }
+            record.terminal_due = None;
+            record.query.status = PROTECTED_QUERY_STATUS_FAILED.to_string();
+            // The run was never performed, so the query carries the failure's reason
+            // and NO statistics or result: there is no duration to report for work
+            // nothing did.
+            record.query.error = Some(ProtectedQueryError {
+                code: PROTECTED_QUERY_FAILURE_CODE.to_string(),
+                message: PROTECTED_QUERY_FAILURE_MESSAGE.to_string(),
+            });
+        }
+    }
+
+    /// The protected query `query_id`, but only when the membership that started it is
+    /// `membership_id`: a query is addressed under its own membership, so one
+    /// membership never reads another's query.
+    pub fn protected_query(
+        &self,
+        membership_id: &str,
+        query_id: &str,
+    ) -> Option<&ProtectedQueryRecord> {
+        self.protected_queries
+            .get(query_id)
+            .filter(|record| record.query.membership_id == membership_id)
     }
 }
 
@@ -517,6 +623,98 @@ fn materialize_ml_payment_config(
             },
         )),
     }
+}
+
+/// The account that pays for a collaboration's query compute costs.
+///
+/// `QueryComputePaymentConfig$isResponsible` documents the rule: the creator configures
+/// payer candidates ("One or more members can be configured as payer candidates for
+/// query compute costs"), and "if the collaboration creator hasn't specified anyone as
+/// the member paying for query compute costs, then the member who can query is the
+/// default payer". So the payer is the first account the creator configured as
+/// responsible for query compute, else the first account granted
+/// [`ABILITY_CAN_QUERY`], in declaration order (the creator, then the `members` list)
+/// — and `None` when the collaboration configured neither, which leaves the optional
+/// member absent rather than guessed.
+pub fn query_compute_payer(record: &CollaborationRecord) -> Option<String> {
+    let accounts: Vec<String> = ::std::iter::once(record.creator_account_id.clone())
+        .chain(record.members.iter().map(|m| m.account_id.clone()))
+        .collect();
+    let configured = accounts.iter().find(|account| {
+        record.grant_for(account).is_some_and(|grant| {
+            grant
+                .payment_configuration
+                .is_some_and(|payment| payment.query_compute.is_responsible)
+        })
+    });
+    if let Some(account) = configured {
+        return Some(account.clone());
+    }
+    accounts.into_iter().find(|account| {
+        record.grant_for(account).is_some_and(|grant| {
+            grant
+                .member_abilities
+                .iter()
+                .any(|ability| ability == ABILITY_CAN_QUERY)
+        })
+    })
+}
+
+/// The `WorkerComputeConfiguration$type` a worker compute configuration runs at when
+/// the caller names none: the model declares `default: "CR.1X"` on that member (an
+/// `addedDefault`, so the client may omit it), out of the `WorkerComputeType` catalog
+/// CR.1X | CR.4X | CR.8X.
+pub const DEFAULT_WORKER_COMPUTE_TYPE: &str = "CR.1X";
+
+/// The `WorkerComputeConfiguration$number` of workers a configuration runs with when
+/// the caller names none: the model declares `default: 16` on that member, inside its
+/// `range 2..1024`.
+pub const DEFAULT_WORKER_COMPUTE_NUMBER: i32 = 16;
+
+/// The compute configuration a protected query runs with.
+///
+/// A caller that named no compute configuration selected none, and the member stays
+/// absent. A caller that named a `worker` configuration gets the one in force: each of
+/// its optional members is materialized at the default the model declares for it
+/// ([`DEFAULT_WORKER_COMPUTE_TYPE`], [`DEFAULT_WORKER_COMPUTE_NUMBER`]), so a later
+/// read reports the compute the query runs on rather than an absent member.
+pub fn effective_compute_configuration(
+    requested: Option<ComputeConfiguration>,
+) -> Option<ComputeConfiguration> {
+    let ComputeConfiguration::Worker(worker) = requested?;
+    Some(ComputeConfiguration::Worker(WorkerComputeConfiguration {
+        r#type: Some(
+            worker
+                .r#type
+                .unwrap_or_else(|| DEFAULT_WORKER_COMPUTE_TYPE.to_string()),
+        ),
+        number: Some(worker.number.unwrap_or(DEFAULT_WORKER_COMPUTE_NUMBER)),
+        properties: worker.properties,
+    }))
+}
+
+/// Where a protected query's results are written: the configuration the request
+/// carried, else the membership's stored `defaultResultConfiguration` — documented on
+/// `CreateMembershipInput$defaultResultConfiguration` as "the default protected query
+/// result configuration" — projected onto the query-side shape. `None` when the request
+/// named none and the membership holds no default.
+pub fn protected_query_result_configuration(
+    requested: Option<ProtectedQueryResultConfiguration>,
+    membership: &Membership,
+) -> Option<ProtectedQueryResultConfiguration> {
+    requested.or_else(|| {
+        let default = membership.default_result_configuration.as_ref()?;
+        // `MembershipProtectedQueryOutputConfiguration` declares one member, `s3`, and
+        // it is the same shape the query-side union's `s3` member targets.
+        let output_configuration = match &default.output_configuration {
+            MembershipProtectedQueryOutputConfiguration::S3(s3) => {
+                ProtectedQueryOutputConfiguration::S3(s3.clone())
+            }
+        };
+        Some(ProtectedQueryResultConfiguration {
+            output_configuration,
+        })
+    })
 }
 
 /// Everything a new `Membership` is built from: the ids minted for it, the stored
