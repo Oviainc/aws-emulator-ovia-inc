@@ -1,27 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation's LISTING is not written yet — it answers
-//! HTTP 501 `NotImplemented` for every request that gets past the filter check below,
-//! and asserts NOTHING about the readiness-rule catalog `ListRules` reports. Implement
-//! it here — this is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this service's BUILT-IN readiness-rule catalog — the rules Route 53
+//! Application Recovery Controller evaluates for each supported resource type. The
+//! catalog is service-owned reference data, identical in every account and not
+//! something a caller creates, so this operation consults no per-account state; it is a
+//! reporting operation and writes nothing.
 //!
-//! WHAT IS IMPLEMENTED HERE: the `ResourceType` FILTER'S VALIDATION, and nothing else.
-//! A filter value outside the resource types this API documents
-//! ([`crate::state::SUPPORTED_RESOURCE_TYPES`]) names no type this service has rules
-//! for, so it is refused with the service-common `ValidationException` (400) instead of
-//! being silently ignored — a request that cannot be answered is a bad request, not an
-//! unwritten one. The LISTING itself still answers 501: the readiness-rule catalog
-//! (rule ids and descriptions) is AWS data this service's model does not carry, so
-//! there is nothing here to compute it from and an invented rule id would be worse than
-//! a 501. That part is what the filed `ListRules` scaffold issue covers, which is why
-//! the marker line above stays.
+//! `resourceType` narrows the answer to one resource type, and an unsupported value is
+//! REFUSED (a 400 `ValidationException`) rather than answered with an empty catalog, so
+//! a caller cannot mistake a typo'd filter for "this type has no rules". `maxResults`
+//! bounds the page and the `nextToken` it answers with resumes the walk where the page
+//! stopped, through the same cursor codec the account-scoped lists use.
+//!
+//! The `resourceType` filter is validated against the resource types this API supports
+//! ([`crate::state::SUPPORTED_RESOURCE_TYPES`], the set every readiness rule below
+//! applies to) BEFORE the listing: a value outside it names no type this service has
+//! rules for, so it is refused with the service-common `ValidationException` (400)
+//! instead of being silently ignored — a filter honoured for supported values and
+//! dropped for unsupported ones would hand back the whole catalog for a typo.
+//!
+//! FIDELITY NOTE on the catalog's text: the rule IDS and DESCRIPTIONS in
+//! [`BUILTIN_RULES`] are this emulator's own, not a transcription of AWS's — neither
+//! this service's Smithy model nor any recording carries them, so there is nothing to
+//! transcribe. The resource types they apply to ARE the documented ones, the ids are
+//! stable and unique and the entries satisfy the modelled lengths, so a caller that
+//! enumerates the catalog by type sees the real shape of the answer; a caller that
+//! branches on a concrete AWS rule id will not find it. Transcribe the real ids here if
+//! a recording or AWS document for the catalog is ever sourced.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +96,263 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use ::std::collections::BTreeMap;
+use ::std::sync::OnceLock;
+
+/// One entry of the built-in readiness-rule catalog: which resource type the rule
+/// applies to, the rule's id and what it asserts about the resource.
+///
+/// Mirrors the modelled `ListRulesOutput` shape
+/// (`smithy_query(query="shape", shape="ListRulesOutput")`: `ResourceType`
+/// `__stringMax64`, `RuleId` `__stringMax64`, `RuleDescription` `__stringMax256`, all
+/// three required).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BuiltinRule {
+    resource_type: &'static str,
+    rule_id: &'static str,
+    rule_description: &'static str,
+}
+
+impl BuiltinRule {
+    /// This entry as one `ListRulesOutput` member of a `ListRules` answer.
+    fn to_output(self) -> ListRulesOutput2 {
+        ListRulesOutput2 {
+            resource_type: self.resource_type.to_string(),
+            rule_description: self.rule_description.to_string(),
+            rule_id: self.rule_id.to_string(),
+        }
+    }
+}
+
+/// The built-in readiness rules, one or more per supported resource type.
+///
+/// SOURCE OF THE RESOURCE TYPES: [`crate::state::SUPPORTED_RESOURCE_TYPES`], the twenty
+/// values `ResourceSetType`'s own documentation enumerates
+/// (`smithy_query(query="doc", shape="CreateResourceSetRequest", member="ResourceSetType")`)
+/// — `AWS::ApiGateway::Stage` through `AWS::Route53RecoveryReadiness::DNSTargetResource`,
+/// which is also the set the `resourceType` filter accepts. Every one of them is covered
+/// here: a resource set may be created for any of them and a readiness check over it is
+/// evaluated by rules of that type, so a type with no rule would make `ListRules` report
+/// an empty catalog for a type the filter accepts.
+///
+/// SOURCE OF THE IDS AND DESCRIPTIONS: neither the Smithy model nor the recording
+/// carries the catalog's text (the model documents only the three members above), so the
+/// ids and descriptions below are THIS EMULATOR'S catalog rather than a transcription of
+/// AWS's. They are what a catalog must be to be usable: stable across calls, unique,
+/// within the modelled lengths, and each description says what the rule asserts about
+/// the resource. Nothing here is derived from a request.
+///
+/// Kept sorted by `(resource_type, rule_id)`, which is also the order a page walks and
+/// the order a cursor resumes in.
+const BUILTIN_RULES: &[BuiltinRule] = &[
+    BuiltinRule {
+        resource_type: "AWS::ApiGateway::Stage",
+        rule_id: "ApiGatewayStageDeployment",
+        rule_description: "The API Gateway stage has an active deployment.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::ApiGateway::Stage",
+        rule_id: "ApiGatewayStageThrottleQuota",
+        rule_description: "The API Gateway stage's request rate is within its throttling limits.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::ApiGatewayV2::Stage",
+        rule_id: "ApiGatewayV2StageDeployment",
+        rule_description: "The API Gateway V2 stage has an active deployment.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::ApiGatewayV2::Stage",
+        rule_id: "ApiGatewayV2StageThrottleQuota",
+        rule_description:
+            "The API Gateway V2 stage's request rate is within its throttling limits.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::AutoScaling::AutoScalingGroup",
+        rule_id: "AutoScalingGroupInServiceInstances",
+        rule_description:
+            "The Auto Scaling group has at least its desired capacity of in-service instances.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::AutoScaling::AutoScalingGroup",
+        rule_id: "AutoScalingGroupMaxSizeQuota",
+        rule_description:
+            "The Auto Scaling group's maximum size leaves room to scale out in this Region.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::CloudWatch::Alarm",
+        rule_id: "CloudWatchAlarmStateNotInAlarm",
+        rule_description: "The CloudWatch alarm is not in the ALARM state.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::DynamoDB::Table",
+        rule_id: "DynamoDbTableCapacityQuota",
+        rule_description:
+            "The DynamoDB table's provisioned or on-demand capacity is within its quota.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::DynamoDB::Table",
+        rule_id: "DynamoDbTableReplicaActive",
+        rule_description: "Every replica of the DynamoDB table reports the ACTIVE status.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::DynamoDB::Table",
+        rule_id: "DynamoDbTableStatusActive",
+        rule_description: "The DynamoDB table reports the ACTIVE status.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::EC2::CustomerGateway",
+        rule_id: "CustomerGatewayStateAvailable",
+        rule_description: "The customer gateway reports the available state.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::EC2::VPC",
+        rule_id: "VpcStateAvailable",
+        rule_description: "The VPC reports the available state.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::EC2::VPC",
+        rule_id: "VpcSubnetCapacity",
+        rule_description:
+            "The VPC's subnets have free IP addresses left in every Availability Zone it spans.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::EC2::VPNConnection",
+        rule_id: "VpnConnectionStateAvailable",
+        rule_description: "The VPN connection reports the available state.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::EC2::VPNConnection",
+        rule_id: "VpnConnectionTunnelsUp",
+        rule_description: "At least one tunnel of the VPN connection reports the UP status.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::EC2::VPNGateway",
+        rule_id: "VpnGatewayAttachedToVpc",
+        rule_description: "The virtual private gateway is attached to a VPC.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::EC2::VPNGateway",
+        rule_id: "VpnGatewayStateAvailable",
+        rule_description: "The virtual private gateway reports the available state.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::EC2::Volume",
+        rule_id: "EbsVolumeAttachmentAttached",
+        rule_description: "The EBS volume is attached to an instance.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::EC2::Volume",
+        rule_id: "EbsVolumeStateAvailableOrInUse",
+        rule_description: "The EBS volume reports the available or in-use state.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::ElasticLoadBalancing::LoadBalancer",
+        rule_id: "LoadBalancerHealthyInstances",
+        rule_description: "The Classic Load Balancer has at least one instance reporting InService.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::ElasticLoadBalancingV2::LoadBalancer",
+        rule_id: "LoadBalancerV2HealthyTargets",
+        rule_description:
+            "Every target group of the load balancer has at least one healthy target.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::ElasticLoadBalancingV2::LoadBalancer",
+        rule_id: "LoadBalancerV2StateActive",
+        rule_description: "The load balancer reports the active state.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::Lambda::Function",
+        rule_id: "LambdaFunctionConcurrencyQuota",
+        rule_description:
+            "The Lambda function's concurrency is within the account's concurrent-execution quota.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::Lambda::Function",
+        rule_id: "LambdaFunctionNotThrottled",
+        rule_description: "The Lambda function is not reporting throttled invocations.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::MSK::Cluster",
+        rule_id: "MskClusterBrokerCount",
+        rule_description:
+            "The MSK cluster has all of its configured broker nodes reporting healthy.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::MSK::Cluster",
+        rule_id: "MskClusterStateActive",
+        rule_description: "The MSK cluster reports the ACTIVE state.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::RDS::DBCluster",
+        rule_id: "RdsDbClusterInstanceCount",
+        rule_description: "The DB cluster has all of its configured instances available.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::RDS::DBCluster",
+        rule_id: "RdsDbClusterStatusAvailable",
+        rule_description: "The DB cluster reports the available status.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::Route53::HealthCheck",
+        rule_id: "Route53HealthCheckStatusHealthy",
+        rule_description: "The Route 53 health check reports the healthy status.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::Route53RecoveryReadiness::DNSTargetResource",
+        rule_id: "DnsTargetResourceHealthCheckHealthy",
+        rule_description:
+            "The health check associated with the DNS target resource reports healthy.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::Route53RecoveryReadiness::DNSTargetResource",
+        rule_id: "DnsTargetResourceRecordSetExists",
+        rule_description:
+            "The DNS target resource's record set exists in the hosted zone and resolves.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::SNS::Subscription",
+        rule_id: "SnsSubscriptionConfirmed",
+        rule_description: "The SNS subscription is confirmed and not pending confirmation.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::SNS::Topic",
+        rule_id: "SnsTopicSubscriptionCount",
+        rule_description: "The SNS topic has at least one confirmed subscription.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::SQS::Queue",
+        rule_id: "SqsQueueDeadLetterTarget",
+        rule_description: "The SQS queue's redrive policy names a reachable dead-letter queue.",
+    },
+    BuiltinRule {
+        resource_type: "AWS::SQS::Queue",
+        rule_id: "SqsQueueOldestMessageAge",
+        rule_description:
+            "The age of the oldest message in the SQS queue is within the readiness threshold.",
+    },
+];
+
+/// The sort key a rule occupies in a page: its resource type, then its id — so a page
+/// groups a type's rules together and a cursor resumes at a key rather than an index.
+fn catalog_key(rule: &BuiltinRule) -> String {
+    format!("{}#{}", rule.resource_type, rule.rule_id)
+}
+
+/// The whole catalog, keyed by [`catalog_key`], built ONCE for the process.
+///
+/// The cursor codec pages over a map, and the catalog never changes, so the keys are
+/// formatted once rather than on every request.
+fn catalog() -> &'static BTreeMap<String, BuiltinRule> {
+    static CATALOG: OnceLock<BTreeMap<String, BuiltinRule>> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        BUILTIN_RULES
+            .iter()
+            .map(|rule| (catalog_key(rule), *rule))
+            .collect()
+    })
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -161,9 +425,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // No state is read: the readiness-rule catalog is the SERVICE's own reference
+        // data, the same in every account and unaffected by anything a caller creates,
+        // so there is no per-account record to consult. `ctx` carries request metadata
+        // only, and this operation needs none of it.
         let _ = (ctx, &self.engine);
-        // A `ResourceType` filter is validated BEFORE the listing: the value must name
-        // a resource type this API supports, whatever the listing then answers.
+
+        // A `ResourceType` filter is validated BEFORE the listing: the value must name a
+        // resource type this API supports, because an unsupported one names no type the
+        // service has rules for — a bad request, not a type that happens to carry none.
         if let Some(resource_type) = input.resource_type.as_deref() {
             crate::state::validate_resource_type("resourceType", resource_type).map_err(
                 |message| {
@@ -173,8 +443,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )?;
         }
-        // The rule catalog itself is not implemented — see the module header. Implement
-        // it here, then delete the SCAFFOLDED marker at the top of this file.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRules"))
+
+        // The page the caller asked for, over the rules the filter admits. The shared
+        // cursor codec pages over a map, so a `nextToken` this operation mints resumes
+        // the same way one from the account-scoped lists does — and a token this service
+        // did not mint is refused the same way too. An unfiltered call pages over the
+        // process-wide catalog; a filtered one over that type's slice of it.
+        let filtered: Option<BTreeMap<String, BuiltinRule>> =
+            input.resource_type.as_deref().map(|wanted| {
+                catalog()
+                    .iter()
+                    .filter(|(_, rule)| rule.resource_type == wanted)
+                    .map(|(key, rule)| (key.clone(), *rule))
+                    .collect()
+            });
+        let selected: &BTreeMap<String, BuiltinRule> =
+            filtered.as_ref().unwrap_or_else(|| catalog());
+
+        let page = crate::state::page(selected, input.max_results, input.next_token.as_deref())
+            .map_err(|message| {
+                ListRulesErrorModeled::ValidationException(ValidationException {
+                    message: Some(message),
+                })
+            })?;
+
+        Ok(ListRulesOutput {
+            rules: Some(page.records.iter().map(|rule| rule.to_output()).collect()),
+            next_token: page.next_token,
+        })
     }
 }

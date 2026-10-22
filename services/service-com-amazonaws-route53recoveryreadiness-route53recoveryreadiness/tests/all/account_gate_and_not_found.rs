@@ -752,10 +752,9 @@ async fn tags_written_through_tag_resource_are_reported_and_removed() {
 /// refused as invalid. The supported rows cover every entry of the documented catalog,
 /// including entries the issue did not cite.
 ///
-/// The LISTING itself is still the scaffold's 501 — the readiness-rule catalog is AWS
-/// data this service's model does not carry, and it is what the filed `ListRules`
-/// scaffold issue covers — so a supported filter is asserted to reach that 501 rather
-/// than a refusal.
+/// The LISTING itself is now implemented (see `builtin_readiness_rules.rs` for the
+/// catalog's own rules), so a supported filter is asserted to answer HTTP 200 with a
+/// non-empty list carrying only that resource type, rather than the former scaffold 501.
 #[tokio::test]
 async fn list_rules_refuses_a_resource_type_filter_the_api_does_not_support() {
     let emulator = Emulator::new();
@@ -791,17 +790,33 @@ async fn list_rules_refuses_a_resource_type_filter_the_api_does_not_support() {
         let reply = emulator
             .send("GET", &format!("/rules?resourceType={value}"), None)
             .await;
-        assert_ne!(
-            reply.status, 400,
-            "case {case:?}: a documented resource type must not be refused, got {} / {}",
-            reply.status, reply.body
-        );
         assert_eq!(
-            reply.status, 501,
-            "case {case:?}: the rule catalog is not implemented, so a supported filter \
-             must reach the scaffold's 501, got {} / {}",
+            reply.status, 200,
+            "case {case:?}: a documented resource type must be answered, got {} / {}",
             reply.status, reply.body
         );
+        let rules = reply
+            .field("rules")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected a rules array, got {}",
+                    reply.body
+                )
+            });
+        assert!(
+            !rules.is_empty(),
+            "case {case:?}: expected at least one built-in rule for a documented resource type"
+        );
+        for rule in &rules {
+            assert_eq!(
+                rule.get("resourceType").and_then(Value::as_str),
+                Some(*value),
+                "case {case:?}: every reported rule must carry the filtered resource type, \
+                 got {rule}"
+            );
+        }
     }
 }
 
