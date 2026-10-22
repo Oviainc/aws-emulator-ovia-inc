@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannelGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannelGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Updates one channel group's description and reports the group as it is
+//! now stored, so a later `GetChannelGroup` returns the same bytes. It carries the SAME
+//! conditional-update contract `UpdateChannel` does: `x-amzn-update-if-match` is a
+//! precondition compared against committed state under one hold of the store lock, so N
+//! concurrent racers on one entity tag resolve to exactly one winner and the rest get
+//! `ConflictException` (409, `CONFLICTING_OPERATION`).
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannelGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +180,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannelGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannelGroup"))
+        // The conditional entity tag is bound to a header by the model, so it arrives on
+        // the deserialized input: nothing else is needed from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateChannelGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // ONE hold of the lock covers the precondition check and the write.
+        let mut store = state.lock();
+
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(UpdateChannelGroupErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::ChannelGroup.not_found(),
+            )
+            .into());
+        };
+
+        if input
+            .e_tag
+            .as_deref()
+            .is_some_and(|presented| presented != group.etag)
+        {
+            return Err(UpdateChannelGroupErrorModeled::ConflictException(
+                crate::state::conflicting_operation(),
+            )
+            .into());
+        }
+
+        // The description is the one editable member `UpdateChannelGroupRequest` binds;
+        // the name, the ARN and the egress domain are immutable.
+        group.description = input.description;
+        group.commit(crate::state::now());
+
+        Ok(UpdateChannelGroupOutput {
+            channel_group_name: group.name.clone(),
+            arn: group.arn.clone(),
+            egress_domain: group.egress_domain.clone(),
+            created_at: group.created_at,
+            modified_at: group.modified_at,
+            description: group.description.clone(),
+            e_tag: Some(group.etag.clone()),
+            tags: Some(group.tags.clone()),
+        })
     }
 }

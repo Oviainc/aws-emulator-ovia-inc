@@ -9,6 +9,9 @@
 //! by level, each missing level answering its own fixed `ResourceNotFoundException` (404)
 //! sentence.
 //!
+//! This policy is also what gates the endpoint's EGRESS data plane: see `crate::service`
+//! for how an anonymous manifest fetch is evaluated against it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -195,7 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Each level of the address is resolved on its own, because the service words a
-        // not-found by the resource type that is missing.
+        // not-found by the resource type that is missing. Every sentence comes from the
+        // shared builders in `crate::state`, so the wording is decided in ONE place.
         let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
             return Err(
                 PutOriginEndpointPolicyErrorModeled::ResourceNotFoundException(

@@ -345,6 +345,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The request's own fingerprint: every member it carried EXCEPT the token that
         // identifies the attempt.
         let tags = input.tags.clone().unwrap_or_default();
+        // A create's tag map is the same unbounded-growth site `TagResource` is, so it is
+        // judged against the same bounds before anything is stored.
+        if let Some(rejection) = crate::state::tag_bounds_rejection(&tags) {
+            return Err(CreateOriginEndpointErrorModeled::ValidationException(rejection).into());
+        }
         let fingerprint = crate::state::request_fingerprint(&[
             input.channel_group_name.clone(),
             input.channel_name.clone(),
@@ -503,6 +508,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at,
             modified_at: created_at,
             reset_at: None,
+            // The create is commit 1. See `state::ChannelGroup::version`.
+            version: 1,
             // Computed from the finished record below, so the tag covers everything the
             // endpoint is made of.
             etag: String::new(),
@@ -510,8 +517,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             client_token: input.client_token,
             fingerprint,
             // An endpoint is created with no resource policy attached; one arrives only
-            // through `PutOriginEndpointPolicy`.
+            // through `PutOriginEndpointPolicy`, so nothing is authorized against its
+            // egress data plane yet.
             policy: None,
+            // And with no harvest job against it yet.
+            harvest_jobs: ::std::collections::BTreeMap::new(),
         };
         endpoint.etag = crate::state::origin_endpoint_etag(&endpoint);
         channel.origin_endpoints.insert(name.clone(), endpoint);

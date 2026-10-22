@@ -27,11 +27,12 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     CdnAuthConfiguration, ConflictException, CreateDashManifestConfiguration,
     CreateHlsManifestConfiguration, CreateLowLatencyHlsManifestConfiguration,
-    CreateMssManifestConfiguration, ForceEndpointErrorConfiguration,
+    CreateMssManifestConfiguration, Destination, ForceEndpointErrorConfiguration,
     GetDashManifestConfiguration, GetHlsManifestConfiguration,
-    GetLowLatencyHlsManifestConfiguration, GetMssManifestConfiguration, IngestEndpoint,
-    InputSwitchConfiguration, MultiviewConfiguration, OutputHeaderConfiguration,
-    ResourceNotFoundException, Segment, ValidationException,
+    GetLowLatencyHlsManifestConfiguration, GetMssManifestConfiguration, HarvestedManifests,
+    HarvesterScheduleConfiguration, IngestEndpoint, InputSwitchConfiguration,
+    MultiviewConfiguration, OutputHeaderConfiguration, ResourceNotFoundException, Segment,
+    ValidationException,
 };
 
 /// The signing name (and ARN service namespace) of this service, from the model's
@@ -149,11 +150,367 @@ pub const MAX_MANIFESTS_PER_ORIGIN_ENDPOINT: usize = 100;
 /// can serve nothing at all. A request below it is refused with `ValidationException`.
 pub const MIN_MANIFESTS_PER_ORIGIN_ENDPOINT: usize = 1;
 
+/// The most harvest jobs one origin endpoint holds at once.
+///
+/// `harvest_jobs` grows by one record per `CreateHarvestJob` and never shrinks (a
+/// finished job stays readable), so without a ceiling its entry COUNT is set by how many
+/// requests a caller makes. AWS bounds the same thing with an adjustable service quota
+/// that is not in the model, so this number is the EMULATOR's own bound, refused with the
+/// `ServiceQuotaExceededException` the model declares for exactly this case.
+pub const MAX_HARVEST_JOBS_PER_ORIGIN_ENDPOINT: usize = 100;
+
+/// The most ingested objects one channel's data plane retains, and the most bytes one of
+/// them may carry.
+///
+/// An ingest `PUT` is caller-driven, so both the object COUNT and each object's SIZE are
+/// bounded here rather than by how much an encoder pushes. Past either bound the write is
+/// refused rather than recorded.
+pub const MAX_INGESTED_OBJECTS_PER_CHANNEL: usize = 64;
+/// See [`MAX_INGESTED_OBJECTS_PER_CHANNEL`].
+pub const MAX_INGESTED_OBJECT_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most bytes the ingest data plane retains across EVERY channel together.
+///
+/// The two bounds above are per channel, and the channel count is itself caller-driven
+/// ([`MAX_CHANNEL_GROUPS`] x [`MAX_CHANNELS_PER_GROUP`]), so their product is not a bound
+/// on the store: this is. It is sized for a developer machine rather than derived from
+/// the per-channel ceilings, and a `PUT` that would push the retained total past it is
+/// refused rather than recorded — nothing is evicted, because an encoder's content is not
+/// this emulator's to drop silently.
+pub const MAX_INGESTED_BYTES: usize = 64 * 1024 * 1024;
+
+/// What [`ComAmazonawsMediapackagev2Mediapackagev2State::record_ingested_object`] did, so
+/// the data plane answers each outcome without re-deriving it — and cannot reach the
+/// stored case without having gone through both bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestOutcome {
+    /// The object was recorded against the channel.
+    Recorded,
+    /// The group or the channel the path names does not resolve; nothing was written.
+    NoSuchChannel,
+    /// The channel already holds [`MAX_INGESTED_OBJECTS_PER_CHANNEL`] distinct objects.
+    ObjectCountReached,
+    /// Recording this object would push the whole store past [`MAX_INGESTED_BYTES`].
+    StoreFull,
+}
+
+// ---------------------------------------------------------------------------
+// Rejection bodies this service's shared refusal layer does not already own.
+//
+// The not-found, duplicate-create, children-attached and policy-not-found sentences all
+// come from `ResourceKind::not_found`, `children_attached`, `resource_already_exists` and
+// `policy_not_found` further down this file, so no handler words one of its own. What is
+// declared here is only what those do not cover: the conditional-update conflict, the
+// `HarvestJobStatus` values and the `ValidationExceptionType` values the harvest-job and
+// pagination rules answer with.
+// ---------------------------------------------------------------------------
+
+/// The one sentence for a conditional update whose `x-amzn-update-if-match` entity tag is
+/// not the committed one — the loser of a concurrent update.
+pub const CONFLICTING_OPERATION_MESSAGE: &str = "MediaPackage can't process your request \
+    because another operation changed this resource. Read the resource again to get its \
+    current entity tag and then try again";
+
+/// `HarvestJobStatus` values, from the model's `HarvestJobStatus` enum
+/// (`HARVEST_JOB_STATUS_VALUES` in `ops::types`).
+pub const HARVEST_JOB_QUEUED: &str = "QUEUED";
+/// See [`HARVEST_JOB_QUEUED`].
+pub const HARVEST_JOB_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`HARVEST_JOB_QUEUED`].
+pub const HARVEST_JOB_CANCELLED: &str = "CANCELLED";
+/// See [`HARVEST_JOB_QUEUED`].
+pub const HARVEST_JOB_FAILED: &str = "FAILED";
+/// See [`HARVEST_JOB_QUEUED`].
+pub const HARVEST_JOB_COMPLETED: &str = "COMPLETED";
+
+/// `ValidationExceptionType` values this crate answers with, from the model's
+/// `ValidationExceptionType` enum (`VALIDATION_EXCEPTION_TYPE_VALUES` in `ops::types`).
+pub const VALIDATION_END_TIME_EARLIER_THAN_START_TIME: &str = "END_TIME_EARLIER_THAN_START_TIME";
+/// See [`VALIDATION_END_TIME_EARLIER_THAN_START_TIME`].
+pub const VALIDATION_HARVEST_JOB_INELIGIBLE_FOR_CANCELLATION: &str =
+    "HARVEST_JOB_INELIGIBLE_FOR_CANCELLATION";
+/// See [`VALIDATION_END_TIME_EARLIER_THAN_START_TIME`].
+pub const VALIDATION_INVALID_HARVEST_JOB_DURATION: &str = "INVALID_HARVEST_JOB_DURATION";
+/// See [`VALIDATION_END_TIME_EARLIER_THAN_START_TIME`].
+pub const VALIDATION_HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT: &str =
+    "HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT";
+/// See [`VALIDATION_END_TIME_EARLIER_THAN_START_TIME`].
+pub const VALIDATION_INVALID_PAGINATION_TOKEN: &str = "INVALID_PAGINATION_TOKEN";
+
+/// The 409 for a conditional update that lost the race: the entity tag the caller
+/// presented is no longer the committed one.
+pub fn conflicting_operation() -> ConflictException {
+    ConflictException {
+        message: Some(CONFLICTING_OPERATION_MESSAGE.to_string()),
+        conflict_exception_type: Some("CONFLICTING_OPERATION".to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The tagging front end's own rejections.
+//
+// `TagResource` / `UntagResource` / `ListTagsForResource` model only
+// `ValidationException`, but MediaPackage answers them from a tagging front end that
+// refuses a malformed `ResourceArn` as `BadRequestException` and an absent resource as
+// `NotFoundException` — the codes the recorded behaviour shows, and the codes a client
+// branches on. Both are 4xx client errors: a caller that passed a bad ARN must be told
+// to fix it, never handed a retryable server fault.
+// ---------------------------------------------------------------------------
+
+/// The wire error code for a `ResourceArn` that is not a syntactically valid ARN.
+pub const INVALID_ARN_CODE: &str = "BadRequestException";
+
+/// The sentence that accompanies [`INVALID_ARN_CODE`] — a property of the ARN's SYNTAX,
+/// so it names nothing from the request.
+pub const INVALID_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
+
+/// The wire error code for a well-formed `ResourceArn` naming a resource that is absent.
+pub const RESOURCE_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The sentence that accompanies [`RESOURCE_NOT_FOUND_CODE`].
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str =
+    "The resource arn you provided does not name a resource that exists";
+
+/// The most tags one resource carries, and so the most entries a resource's tag map can
+/// ever hold.
+///
+/// A tag map grows by one entry per distinct caller-chosen KEY and shrinks only on an
+/// explicit `UntagResource`, so without a ceiling its size is set by how many requests a
+/// caller makes. AWS bounds it with the tag quota it publishes for every taggable
+/// resource — 50 tags per resource — and refuses a request past it, which is what this
+/// constant is. The model puts no `@length` on `TagMap`, so the boundary validator does
+/// not enforce it and the handlers do.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The most characters a tag KEY may carry — AWS's published tag-key limit of 128
+/// characters, which the model's `TagMap` does not express either.
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// The most characters a tag VALUE may carry — AWS's published tag-value limit of 256
+/// characters.
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// Refuse `tags` when it is past the tag bounds above, reporting the modelled rejection.
+///
+/// `tags` is the tag map the resource would be left HOLDING, not just the one the request
+/// carried, so a `TagResource` that merges into an existing map is judged on the merged
+/// result. Called before anything is written, so a refused request leaves the resource's
+/// tags exactly as they were.
+///
+/// `ValidationExceptionType` enumerates no tag-quota member
+/// (`VALIDATION_EXCEPTION_TYPE_VALUES` in `ops::types`), so the discriminator is left
+/// unset rather than claiming a reason the service does not name for this case; the
+/// message states which bound was exceeded and the bound's value.
+pub fn tag_bounds_rejection(tags: &HashMap<String, String>) -> Option<ValidationException> {
+    let refuse = |message: String| {
+        Some(ValidationException {
+            message: Some(message),
+            validation_exception_type: None,
+        })
+    };
+    if tags.len() > MAX_TAGS_PER_RESOURCE {
+        return refuse(format!(
+            "A resource carries at most {MAX_TAGS_PER_RESOURCE} tags; the request would \
+             leave it with {}",
+            tags.len()
+        ));
+    }
+    for (key, value) in tags {
+        if key.chars().count() > MAX_TAG_KEY_CHARS {
+            return refuse(format!(
+                "A tag key carries at most {MAX_TAG_KEY_CHARS} characters; one in the \
+                 request carries {}",
+                key.chars().count()
+            ));
+        }
+        if value.chars().count() > MAX_TAG_VALUE_CHARS {
+            return refuse(format!(
+                "A tag value carries at most {MAX_TAG_VALUE_CHARS} characters; one in the \
+                 request carries {}",
+                value.chars().count()
+            ));
+        }
+    }
+    None
+}
+
+/// The tag map a resource holding `current` would be left with after `submitted` is
+/// merged into it, which is what [`tag_bounds_rejection`] has to judge.
+///
+/// Assigning a tag whose key is already there REPLACES that tag's value rather than
+/// adding an entry, so the merged map is the union of the keys.
+pub fn merged_tags(
+    current: &HashMap<String, String>,
+    submitted: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = current.clone();
+    merged.extend(
+        submitted
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    merged
+}
+
 /// Per-service state for com-amazonaws-mediapackagev2-mediapackagev2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediapackagev2Mediapackagev2State {
     /// Every channel group, keyed by its name — the group's primary identifier.
     pub channel_groups: BTreeMap<String, ChannelGroup>,
+}
+
+impl ComAmazonawsMediapackagev2Mediapackagev2State {
+    /// The tags of the resource `target` names, or `None` when this emulator holds no
+    /// such resource.
+    ///
+    /// Tags live on the resource itself, so this walks the one containment hierarchy the
+    /// store keeps rather than keeping a second index beside it.
+    pub fn tags_of(&self, target: &TaggedResource) -> Option<&HashMap<String, String>> {
+        match target {
+            TaggedResource::ChannelGroup { group } => Some(&self.channel_groups.get(group)?.tags),
+            TaggedResource::Channel { group, channel } => {
+                Some(&self.channel_groups.get(group)?.channels.get(channel)?.tags)
+            }
+            TaggedResource::OriginEndpoint {
+                group,
+                channel,
+                endpoint,
+            } => Some(
+                &self
+                    .channel_groups
+                    .get(group)?
+                    .channels
+                    .get(channel)?
+                    .origin_endpoints
+                    .get(endpoint)?
+                    .tags,
+            ),
+        }
+    }
+
+    /// Apply `mutate` to the tags of the resource `target` names and COMMIT the change
+    /// (new `ModifiedAt`, new entity tag), reporting whether the resource was there.
+    ///
+    /// `false` means nothing was written: the resource the ARN names does not exist.
+    pub fn with_tags_mut(
+        &mut self,
+        target: &TaggedResource,
+        at: ::aws_smithy_types::DateTime,
+        mutate: impl FnOnce(&mut HashMap<String, String>),
+    ) -> bool {
+        match target {
+            TaggedResource::ChannelGroup { group } => {
+                let Some(group) = self.channel_groups.get_mut(group) else {
+                    return false;
+                };
+                mutate(&mut group.tags);
+                group.commit(at);
+                true
+            }
+            TaggedResource::Channel { group, channel } => {
+                let Some(channel) = self
+                    .channel_groups
+                    .get_mut(group)
+                    .and_then(|group| group.channels.get_mut(channel))
+                else {
+                    return false;
+                };
+                mutate(&mut channel.tags);
+                channel.commit(at);
+                true
+            }
+            TaggedResource::OriginEndpoint {
+                group,
+                channel,
+                endpoint,
+            } => {
+                let Some(endpoint) = self
+                    .channel_groups
+                    .get_mut(group)
+                    .and_then(|group| group.channels.get_mut(channel))
+                    .and_then(|channel| channel.origin_endpoints.get_mut(endpoint))
+                else {
+                    return false;
+                };
+                mutate(&mut endpoint.tags);
+                endpoint.commit(at);
+                true
+            }
+        }
+    }
+
+    /// The origin endpoint an egress request addresses, or `None` when any level of the
+    /// path does not resolve.
+    pub fn endpoint_at(&self, target: &EgressTarget) -> Option<&OriginEndpoint> {
+        self.channel_groups
+            .get(&target.group)?
+            .channels
+            .get(&target.channel)?
+            .origin_endpoints
+            .get(&target.endpoint)
+    }
+
+    /// The channel an ingest request addresses, or `None` when the group or the channel
+    /// does not resolve.
+    pub fn channel_at_mut(&mut self, target: &IngestTarget) -> Option<&mut Channel> {
+        self.channel_groups
+            .get_mut(&target.group)?
+            .channels
+            .get_mut(&target.channel)
+    }
+
+    /// How many bytes the ingest data plane is retaining across every channel.
+    ///
+    /// Summed from the store rather than tracked in a counter beside it: a counter can
+    /// drift from the map it describes (a channel delete drops a whole map of objects at
+    /// once), and this walk is bounded by the declared ceilings — at most
+    /// [`MAX_CHANNEL_GROUPS`] x [`MAX_CHANNELS_PER_GROUP`] x
+    /// [`MAX_INGESTED_OBJECTS_PER_CHANNEL`] lengths to add up — so it cannot be made
+    /// expensive by a caller either.
+    pub fn retained_ingested_bytes(&self) -> usize {
+        self.channel_groups
+            .values()
+            .flat_map(|group| group.channels.values())
+            .flat_map(|channel| channel.ingested_objects.values())
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Record one ingested object against the channel the path names, reporting what
+    /// happened.
+    ///
+    /// Both store bounds are judged HERE, under the caller's single hold of the store
+    /// lock, so the decision and the write cannot be interleaved with another push: the
+    /// per-channel object count ([`MAX_INGESTED_OBJECTS_PER_CHANNEL`]) and the store-wide
+    /// retained bytes ([`MAX_INGESTED_BYTES`]), counting the bytes a REPLACED object
+    /// gives back. Nothing is written unless the answer is [`IngestOutcome::Recorded`].
+    ///
+    /// `body` is already clamped to [`MAX_INGESTED_OBJECT_BYTES`] by the caller, which is
+    /// what keeps a single push from being read into memory unbounded.
+    pub fn record_ingested_object(
+        &mut self,
+        target: &IngestTarget,
+        body: Vec<u8>,
+    ) -> IngestOutcome {
+        let retained = self.retained_ingested_bytes();
+        let Some(channel) = self.channel_at_mut(target) else {
+            return IngestOutcome::NoSuchChannel;
+        };
+        let replaced = channel
+            .ingested_objects
+            .get(&target.object)
+            .map_or(0, Vec::len);
+        if replaced == 0
+            && channel.ingested_objects.len() >= MAX_INGESTED_OBJECTS_PER_CHANNEL
+        {
+            return IngestOutcome::ObjectCountReached;
+        }
+        if retained - replaced + body.len() > MAX_INGESTED_BYTES {
+            return IngestOutcome::StoreFull;
+        }
+        channel.ingested_objects.insert(target.object.clone(), body);
+        IngestOutcome::Recorded
+    }
 }
 
 /// A persisted channel group: the top-level resource that owns the DNS every channel
@@ -166,6 +523,12 @@ pub struct ChannelGroup {
     pub description: Option<String>,
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: ::aws_smithy_types::DateTime,
+    /// How many times this group has been committed, starting at 1 for the create.
+    ///
+    /// Part of [`ChannelGroup::recompute_etag`]'s input, which is what makes every
+    /// commit produce a DIFFERENT entity tag even when it writes the same values: a
+    /// conditional update that lost a race must find the tag it presented stale.
+    pub version: u64,
     pub etag: String,
     pub tags: HashMap<String, String>,
     /// The `ClientToken` the create that minted this group carried, if any — what an
@@ -175,6 +538,29 @@ pub struct ChannelGroup {
     /// carrying the same token can be told apart from a changed one.
     pub fingerprint: String,
     pub channels: BTreeMap<String, Channel>,
+}
+
+impl ChannelGroup {
+    /// Recompute this group's entity tag from its own content.
+    ///
+    /// The single place the group's ETag is derived, so the create path and every update
+    /// path agree on what the tag is a function of.
+    pub fn recompute_etag(&mut self) {
+        self.etag = etag(&[
+            self.arn.clone(),
+            self.egress_domain.clone(),
+            self.description.clone().unwrap_or_default(),
+            self.version.to_string(),
+            tag_fingerprint(&self.tags),
+        ]);
+    }
+
+    /// Commit a change: bump the version, stamp `modified_at`, and derive the new ETag.
+    pub fn commit(&mut self, at: ::aws_smithy_types::DateTime) {
+        self.version = self.version.saturating_add(1);
+        self.modified_at = at;
+        self.recompute_etag();
+    }
 }
 
 /// A persisted channel: the input side of the pipeline, with the ingest endpoints a
@@ -198,6 +584,8 @@ pub struct Channel {
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: ::aws_smithy_types::DateTime,
     pub reset_at: Option<::aws_smithy_types::DateTime>,
+    /// See [`ChannelGroup::version`].
+    pub version: u64,
     pub etag: String,
     pub tags: HashMap<String, String>,
     /// The `ClientToken` the create that minted this channel carried, if any.
@@ -213,7 +601,57 @@ pub struct Channel {
     /// with the channel. `None` is what makes `GetChannelPolicy` on a never-attached
     /// policy a 404, and `DeleteChannelPolicy` what puts it back.
     pub policy: Option<String>,
+    /// What the channel's ingest data plane has accepted, keyed by the request path the
+    /// contributing encoder `PUT` it to. Bounded by
+    /// [`MAX_INGESTED_OBJECTS_PER_CHANNEL`] / [`MAX_INGESTED_OBJECT_BYTES`].
+    ///
+    /// Ingested content is not a channel member either, so it stays out of the ETag for
+    /// the same reason the policy does.
+    pub ingested_objects: BTreeMap<String, Vec<u8>>,
     pub origin_endpoints: BTreeMap<String, OriginEndpoint>,
+}
+
+impl Channel {
+    /// Recompute this channel's entity tag from its own content. See
+    /// [`ChannelGroup::recompute_etag`].
+    pub fn recompute_etag(&mut self) {
+        self.etag = etag(&[
+            self.arn.clone(),
+            self.description.clone().unwrap_or_default(),
+            self.input_type.clone().unwrap_or_default(),
+            self.output_locking_mode.clone().unwrap_or_default(),
+            // The APPLIED switching and CMSD-header state is part of the channel's
+            // content, so a channel that differs only in it has a different ETag. Each
+            // member is rendered explicitly — `mqcs`/`publish` as 0 or 1, an absent
+            // preferred input as the empty string — rather than through a derived `Debug`.
+            format!(
+                "{}/{}/{}",
+                u8::from(
+                    self.input_switch_configuration
+                        .mqcs_input_switching
+                        .unwrap_or_default()
+                ),
+                self.input_switch_configuration
+                    .preferred_input
+                    .map(|preferred| preferred.to_string())
+                    .unwrap_or_default(),
+                u8::from(
+                    self.output_header_configuration
+                        .publish_mqcs
+                        .unwrap_or_default()
+                ),
+            ),
+            self.version.to_string(),
+            tag_fingerprint(&self.tags),
+        ]);
+    }
+
+    /// Commit a change. See [`ChannelGroup::commit`].
+    pub fn commit(&mut self, at: ::aws_smithy_types::DateTime) {
+        self.version = self.version.saturating_add(1);
+        self.modified_at = at;
+        self.recompute_etag();
+    }
 }
 
 /// A persisted origin endpoint: the output side, holding the manifests whose URLs
@@ -244,6 +682,8 @@ pub struct OriginEndpoint {
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: ::aws_smithy_types::DateTime,
     pub reset_at: Option<::aws_smithy_types::DateTime>,
+    /// See [`ChannelGroup::version`].
+    pub version: u64,
     pub etag: String,
     pub tags: HashMap<String, String>,
     /// The `ClientToken` the create that minted this endpoint carried, if any.
@@ -255,8 +695,12 @@ pub struct OriginEndpoint {
     /// The policy is a sub-resource of the endpoint rather than a resource of its own —
     /// `Put*` replaces it wholesale, `Get*` reports it and `Delete*` detaches it — so it
     /// is persisted ON the endpoint: deleting the endpoint takes its policy with it, and
-    /// no second map can disagree about which policy an endpoint carries.
+    /// no second map can disagree about which policy an endpoint carries. It is also what
+    /// gates the endpoint's egress data plane (see `crate::service`), and being a
+    /// sub-resource it takes no part in the endpoint's ETag.
     pub policy: Option<EndpointPolicy>,
+    /// Every harvest job created against this endpoint, keyed by job name.
+    pub harvest_jobs: BTreeMap<String, HarvestJobRecord>,
 }
 
 /// A policy attached to an origin endpoint: the policy document, plus the optional CDN
@@ -266,6 +710,118 @@ pub struct OriginEndpoint {
 pub struct EndpointPolicy {
     pub policy: String,
     pub cdn_auth_configuration: Option<CdnAuthConfiguration>,
+}
+
+impl OriginEndpoint {
+    /// Commit a change. See [`ChannelGroup::commit`].
+    ///
+    /// The tag is derived by [`origin_endpoint_etag`], the ONE place an endpoint's ETag
+    /// comes from, so the tag a create reports, the tag an update rotates and the tag a
+    /// tag change rotates are the same function of the same resource.
+    pub fn commit(&mut self, at: ::aws_smithy_types::DateTime) {
+        self.version = self.version.saturating_add(1);
+        self.modified_at = at;
+        self.etag = origin_endpoint_etag(self);
+    }
+}
+
+/// How long a harvest job stays `QUEUED` before the clock owes it `IN_PROGRESS`.
+///
+/// AWS does not publish this latency, so it is the EMULATOR's own span, inside the
+/// 250–750 ms band the project fixes for a transition a call starts: a caller that polls
+/// straight after `CreateHarvestJob` still observes `QUEUED`.
+const HARVEST_JOB_QUEUED_MILLIS: i64 = 400;
+
+/// What a harvest job reports once its scheduled window has passed.
+///
+/// This emulator runs no harvester: nothing reads the endpoint's segments and nothing is
+/// written to the S3 destination, so the job cannot complete. It therefore ends in the
+/// model's own failure status with a reason that says exactly that, rather than reporting
+/// a `COMPLETED` export that never happened.
+pub const HARVESTER_UNAVAILABLE_MESSAGE: &str = "This emulator does not run the MediaPackage \
+    harvester, so no content was exported to the harvest destination";
+
+/// A persisted harvest job: an export of an origin endpoint's content to S3.
+#[derive(Debug, Clone)]
+pub struct HarvestJobRecord {
+    pub name: String,
+    pub group_name: String,
+    pub channel_name: String,
+    pub endpoint_name: String,
+    pub arn: String,
+    pub description: Option<String>,
+    pub harvested_manifests: HarvestedManifests,
+    pub schedule_configuration: HarvesterScheduleConfiguration,
+    pub destination: Destination,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub modified_at: ::aws_smithy_types::DateTime,
+    /// When the clock owes this job its `QUEUED` -> `IN_PROGRESS` transition.
+    pub in_progress_at: ::aws_smithy_types::DateTime,
+    /// See [`ChannelGroup::version`].
+    pub version: u64,
+    pub etag: String,
+    pub tags: HashMap<String, String>,
+}
+
+impl HarvestJobRecord {
+    /// Recompute this job's entity tag from its own content.
+    pub fn recompute_etag(&mut self) {
+        self.etag = etag(&[
+            self.arn.clone(),
+            self.status.clone(),
+            self.description.clone().unwrap_or_default(),
+            self.version.to_string(),
+            tag_fingerprint(&self.tags),
+        ]);
+    }
+
+    /// Commit a change. See [`ChannelGroup::commit`].
+    pub fn commit(&mut self, at: ::aws_smithy_types::DateTime) {
+        self.version = self.version.saturating_add(1);
+        self.modified_at = at;
+        self.recompute_etag();
+    }
+
+    /// Whether this job has reached a status it can no longer leave.
+    pub fn is_terminal(&self) -> bool {
+        self.status == HARVEST_JOB_CANCELLED
+            || self.status == HARVEST_JOB_FAILED
+            || self.status == HARVEST_JOB_COMPLETED
+    }
+
+    /// Materialise the status changes the CLOCK already owed this job by `at`.
+    ///
+    /// Called by the reporting operations as well as the mutating ones, because each of
+    /// these transitions was due at the same instant whether or not anybody read the job:
+    /// `QUEUED` -> `IN_PROGRESS` once [`HARVEST_JOB_QUEUED_MILLIS`] has passed, and
+    /// `IN_PROGRESS` -> `FAILED` once the window the CALLER scheduled has ended (see
+    /// [`HARVESTER_UNAVAILABLE_MESSAGE`]).
+    pub fn materialise_due_transitions(&mut self, at: ::aws_smithy_types::DateTime) {
+        if self.status == HARVEST_JOB_QUEUED
+            && at.as_secs_f64() >= self.in_progress_at.as_secs_f64()
+        {
+            self.status = HARVEST_JOB_IN_PROGRESS.to_string();
+            self.commit(at);
+        }
+        if self.status == HARVEST_JOB_IN_PROGRESS
+            && at.as_secs_f64() >= self.schedule_configuration.end_time.as_secs_f64()
+        {
+            self.status = HARVEST_JOB_FAILED.to_string();
+            self.error_message = Some(HARVESTER_UNAVAILABLE_MESSAGE.to_string());
+            self.commit(at);
+        }
+    }
+}
+
+/// The instant a harvest job created at `created_at` is owed `IN_PROGRESS`.
+pub fn harvest_job_in_progress_at(
+    created_at: ::aws_smithy_types::DateTime,
+) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_secs_f64(
+        created_at.as_secs_f64() + (HARVEST_JOB_QUEUED_MILLIS as f64 / 1000.0),
+    )
 }
 
 /// The input-switch configuration a channel is stored with.
@@ -409,6 +965,241 @@ pub fn origin_endpoint_arn(region: &str, group: &str, channel: &str, endpoint: &
     )
 }
 
+/// The ARN of a harvest job, which nests under its origin endpoint's resource path.
+pub fn harvest_job_arn(
+    region: &str,
+    group: &str,
+    channel: &str,
+    endpoint: &str,
+    job: &str,
+) -> String {
+    ::engine::emulator_arn(
+        SIGNING_NAME,
+        region,
+        &format!(
+            "channelGroup/{group}/channel/{channel}/originEndpoint/{endpoint}/harvestJob/{job}"
+        ),
+    )
+}
+
+/// Which resource a `TagArn` names.
+///
+/// The three taggable levels of the hierarchy, in the resource-path form the `*_arn`
+/// builders above produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    ChannelGroup {
+        group: String,
+    },
+    Channel {
+        group: String,
+        channel: String,
+    },
+    OriginEndpoint {
+        group: String,
+        channel: String,
+        endpoint: String,
+    },
+}
+
+/// The resource a tagging `ResourceArn` names, or `None` when the string is not a
+/// syntactically valid ARN for a resource of THIS service.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account>:<resource>` — six
+/// colon-separated fields, the first literally `arn` — and this service's resource path
+/// is `channelGroup/<g>[/channel/<c>[/originEndpoint/<e>]]`. Anything else cannot name a
+/// MediaPackage resource, which is a different failure from naming one that is absent:
+/// the caller has to fix the ARN rather than create the resource.
+pub fn parse_tag_arn(arn: &str) -> Option<TaggedResource> {
+    let mut fields = arn.splitn(6, ':');
+    let (Some("arn"), Some(partition), Some(service), Some(_region), Some(_account), Some(resource)) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    if partition.is_empty() || service != SIGNING_NAME {
+        return None;
+    }
+    let segments: Vec<&str> = resource.split('/').collect();
+    if segments.iter().any(|segment| segment.is_empty()) {
+        return None;
+    }
+    match segments.as_slice() {
+        ["channelGroup", group] => Some(TaggedResource::ChannelGroup {
+            group: (*group).to_string(),
+        }),
+        ["channelGroup", group, "channel", channel] => Some(TaggedResource::Channel {
+            group: (*group).to_string(),
+            channel: (*channel).to_string(),
+        }),
+        ["channelGroup", group, "channel", channel, "originEndpoint", endpoint] => {
+            Some(TaggedResource::OriginEndpoint {
+                group: (*group).to_string(),
+                channel: (*channel).to_string(),
+                endpoint: (*endpoint).to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether `policy` lets an UNAUTHENTICATED caller perform `action`.
+///
+/// An anonymous request is the `*` principal, so a statement reaches it only by naming
+/// `*` as its principal. `Deny` wins over `Allow`, as in IAM. Used by the egress data
+/// plane, where the endpoint's resource policy is the only thing that can authorize a
+/// player with no credentials.
+///
+/// This evaluator understands `Effect`, `Action`, `Principal` and `Resource` only, so it
+/// fails CLOSED on anything else: a statement carrying a member it cannot evaluate
+/// ([`UNEVALUATED_STATEMENT_MEMBERS`] — `Condition`, `NotAction`, `NotPrincipal`,
+/// `NotResource`) never GRANTS, because honouring a conditional `Allow` as an
+/// unconditional one would authorize a fetch on a condition nothing checked. A `Deny`
+/// carrying one still denies, which is the closed side there too.
+///
+/// `resource` is the ARN of the resource the request addresses, which a statement's
+/// `Resource` is matched against: a statement that names no `Resource` applies to the
+/// resource its policy is attached to, which is what a resource policy means.
+pub fn policy_allows_anonymous(policy: &str, action: &str, resource: &str) -> bool {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+        return false;
+    };
+    let statements: Vec<&::serde_json::Value> = match parsed.get("Statement") {
+        Some(::serde_json::Value::Array(list)) => list.iter().collect(),
+        Some(single @ ::serde_json::Value::Object(_)) => vec![single],
+        _ => return false,
+    };
+    let matching = |statement: &::serde_json::Value, effect: &str| {
+        statement.get("Effect").and_then(::serde_json::Value::as_str) == Some(effect)
+            && statement_names_action(statement, action)
+            && statement_names_anonymous_principal(statement)
+            && statement_names_resource(statement, resource)
+    };
+    if statements
+        .iter()
+        .any(|statement| matching(statement, "Deny"))
+    {
+        return false;
+    }
+    statements.iter().any(|statement| {
+        matching(statement, "Allow") && !carries_unevaluated_member(statement)
+    })
+}
+
+/// The statement members [`policy_allows_anonymous`] cannot evaluate, and so refuses to
+/// grant past.
+///
+/// Each of them narrows or inverts what a statement reaches, so ignoring one would widen
+/// the grant: a `Condition` makes the `Allow` conditional, and the `Not*` forms match
+/// everything OUTSIDE the value they name.
+const UNEVALUATED_STATEMENT_MEMBERS: &[&str] =
+    &["Condition", "NotAction", "NotPrincipal", "NotResource"];
+
+/// Whether a statement carries a member this evaluator does not understand.
+fn carries_unevaluated_member(statement: &::serde_json::Value) -> bool {
+    UNEVALUATED_STATEMENT_MEMBERS
+        .iter()
+        .any(|member| statement.get(member).is_some())
+}
+
+/// Whether a statement's `Resource` covers `resource`.
+///
+/// A statement that names no `Resource` applies to the resource its policy is attached
+/// to, so it covers the addressed one. A statement that DOES name one covers the request
+/// only when a named pattern matches the addressed ARN, under the wildcards IAM allows in
+/// a resource pattern ([`arn_pattern_matches`]).
+fn statement_names_resource(statement: &::serde_json::Value, resource: &str) -> bool {
+    let Some(declared) = statement.get("Resource") else {
+        return true;
+    };
+    let patterns = match declared {
+        ::serde_json::Value::String(one) => vec![one.as_str()],
+        ::serde_json::Value::Array(list) => {
+            list.iter().filter_map(::serde_json::Value::as_str).collect()
+        }
+        _ => return false,
+    };
+    patterns
+        .iter()
+        .any(|pattern| arn_pattern_matches(pattern, resource))
+}
+
+/// Whether an IAM resource pattern matches `value`.
+///
+/// IAM resource patterns take two wildcards: `*` for any run of characters (including
+/// none) and `?` for exactly one. The match is anchored at both ends, and `*` backtracks,
+/// so a pattern with several of them matches the way IAM's does.
+fn arn_pattern_matches(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let (mut at_pattern, mut at_value) = (0usize, 0usize);
+    // Where the most recent `*` was, and how much of the value it had consumed, so a
+    // failed match can give it one more character and try again.
+    let mut star: Option<(usize, usize)> = None;
+    while at_value < value.len() {
+        let literal = at_pattern < pattern.len()
+            && (pattern[at_pattern] == '?' || pattern[at_pattern] == value[at_value]);
+        if literal {
+            at_pattern += 1;
+            at_value += 1;
+        } else if at_pattern < pattern.len() && pattern[at_pattern] == '*' {
+            star = Some((at_pattern, at_value));
+            at_pattern += 1;
+        } else if let Some((star_pattern, star_value)) = star {
+            at_pattern = star_pattern + 1;
+            at_value = star_value + 1;
+            star = Some((star_pattern, star_value + 1));
+        } else {
+            return false;
+        }
+    }
+    // The value is exhausted, so what is left of the pattern may only be wildcards that
+    // match nothing.
+    pattern[at_pattern..].iter().all(|glob| *glob == '*')
+}
+
+/// Whether a statement's `Action` covers `action`, honouring the `*` wildcard IAM allows
+/// both on its own and as a trailing one (`service:*`).
+fn statement_names_action(statement: &::serde_json::Value, action: &str) -> bool {
+    let Some(declared) = statement.get("Action") else {
+        return false;
+    };
+    let names = match declared {
+        ::serde_json::Value::String(one) => vec![one.as_str()],
+        ::serde_json::Value::Array(list) => {
+            list.iter().filter_map(::serde_json::Value::as_str).collect()
+        }
+        _ => return false,
+    };
+    names.iter().any(|name| match name.strip_suffix('*') {
+        Some(prefix) => action.starts_with(prefix),
+        None => name.eq_ignore_ascii_case(action),
+    })
+}
+
+/// Whether a statement's `Principal` names everyone — the only principal an anonymous
+/// request can match. IAM writes it either as the bare string `"*"` or as a map whose
+/// values are `"*"` (`{"AWS": "*"}`).
+fn statement_names_anonymous_principal(statement: &::serde_json::Value) -> bool {
+    let is_everyone = |value: &::serde_json::Value| match value {
+        ::serde_json::Value::String(one) => one == "*",
+        ::serde_json::Value::Array(list) => list
+            .iter()
+            .any(|entry| entry.as_str() == Some("*")),
+        _ => false,
+    };
+    match statement.get("Principal") {
+        Some(::serde_json::Value::Object(map)) => map.values().any(is_everyone),
+        Some(value) => is_everyone(value),
+        None => false,
+    }
+}
+
 /// The egress domain a channel group is given: the host every manifest URL beneath it
 /// is served from, so all of the group's channels and endpoints share one DNS name.
 ///
@@ -425,7 +1216,126 @@ pub fn egress_domain(region: &str, group: &str) -> String {
 /// The ingest host for a group, derived from the SAME domain egress is served from —
 /// the guarantee the service makes is that both sides of a group share its DNS.
 fn ingest_domain(egress_domain: &str) -> String {
-    egress_domain.replacen(".egress.", ".ingest.", 1)
+    egress_domain.replacen(EGRESS_HOST_LABEL, INGEST_HOST_LABEL, 1)
+}
+
+/// The label that marks a hostname as this service's EGRESS data plane, as
+/// [`egress_domain`] builds it.
+const EGRESS_HOST_LABEL: &str = ".egress.";
+
+/// The label that marks a hostname as this service's INGEST data plane, as
+/// [`ingest_domain`] builds it.
+const INGEST_HOST_LABEL: &str = ".ingest.";
+
+/// Which half of this service's data plane a hostname addresses.
+///
+/// The control plane is reached at `mediapackagev2.<region>.amazonaws.com`, whose first
+/// label names the service; the data plane is reached at the per-group hostnames
+/// [`egress_domain`] and [`ingest_domain`] build, whose first label is opaque. Those
+/// hostnames are the ones this service PUBLISHES in `EgressDomain` and in a channel's
+/// `IngestEndpoints[].Url`, so recognising them is how a request to a published URL
+/// reaches the service that published it instead of the control-plane resolver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataPlane {
+    /// A contributing encoder pushing content to a channel.
+    Ingest,
+    /// A player fetching content from an origin endpoint.
+    Egress,
+}
+
+/// The half of the data plane `host` addresses, or `None` for any other hostname
+/// (the control-plane endpoint included).
+pub fn data_plane_of_host(host: &str) -> Option<DataPlane> {
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    if !host.contains(&format!(".{SIGNING_NAME}.")) {
+        return None;
+    }
+    if host.contains(INGEST_HOST_LABEL) {
+        return Some(DataPlane::Ingest);
+    }
+    if host.contains(EGRESS_HOST_LABEL) {
+        return Some(DataPlane::Egress);
+    }
+    None
+}
+
+/// What an egress request path names: the endpoint whose policy gates it, plus the
+/// object beneath that endpoint.
+///
+/// The path is the one [`manifest_url`] builds: `/out/v1/<group>/<channel>/<endpoint>/…`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressTarget {
+    pub group: String,
+    pub channel: String,
+    pub endpoint: String,
+    /// Everything after the endpoint — the manifest or segment being fetched.
+    pub object: String,
+}
+
+/// The endpoint and object an egress path names, or `None` when the path is not one this
+/// service publishes.
+pub fn parse_egress_path(path: &str) -> Option<EgressTarget> {
+    let rest = path.strip_prefix("/out/v1/")?;
+    let mut segments = rest.splitn(4, '/');
+    let (Some(group), Some(channel), Some(endpoint), Some(object)) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    if [group, channel, endpoint, object]
+        .iter()
+        .any(|segment| segment.is_empty())
+    {
+        return None;
+    }
+    Some(EgressTarget {
+        group: group.to_string(),
+        channel: channel.to_string(),
+        endpoint: endpoint.to_string(),
+        object: object.to_string(),
+    })
+}
+
+/// What an ingest request path names: the channel the content is being pushed to.
+///
+/// The path is the one [`ingest_endpoints`] builds:
+/// `/in/v1/<group>/<index>/<channel>/…`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestTarget {
+    pub group: String,
+    pub channel: String,
+    /// Everything after the channel — what the encoder is writing.
+    pub object: String,
+}
+
+/// The channel an ingest path names, or `None` when the path is not one this service
+/// publishes.
+pub fn parse_ingest_path(path: &str) -> Option<IngestTarget> {
+    let rest = path.strip_prefix("/in/v1/")?;
+    let mut segments = rest.splitn(4, '/');
+    let (Some(group), Some(_index), Some(channel), Some(object)) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    if [group, channel, object]
+        .iter()
+        .any(|segment| segment.is_empty())
+    {
+        return None;
+    }
+    Some(IngestTarget {
+        group: group.to_string(),
+        channel: channel.to_string(),
+        object: object.to_string(),
+    })
 }
 
 /// The redundant pair of ingest endpoints a channel is created with, derived from the
@@ -746,11 +1656,9 @@ pub fn idempotent_parameter_mismatch_message(client_token: &str) -> String {
 // =============================================================================
 
 /// One kind of resource in mediapackagev2's containment hierarchy: channel group ->
-/// channel -> origin endpoint.
+/// channel -> origin endpoint -> harvest job.
 ///
-/// The variants are the `ResourceTypeNotFound` enum values the model declares for the
-/// three resources this emulator persists (the model also declares `HARVEST_JOB`, whose
-/// operations are still scaffolded).
+/// The variants are the `ResourceTypeNotFound` enum values the model declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceKind {
     /// The top-level resource, which owns channels.
@@ -759,6 +1667,8 @@ pub enum ResourceKind {
     Channel,
     /// An origin endpoint on a channel.
     OriginEndpoint,
+    /// A harvest job on an origin endpoint.
+    HarvestJob,
 }
 
 impl ResourceKind {
@@ -769,6 +1679,7 @@ impl ResourceKind {
             Self::ChannelGroup => "CHANNEL_GROUP",
             Self::Channel => "CHANNEL",
             Self::OriginEndpoint => "ORIGIN_ENDPOINT",
+            Self::HarvestJob => "HARVEST_JOB",
         }
     }
 
@@ -778,6 +1689,7 @@ impl ResourceKind {
             Self::ChannelGroup => "channel group",
             Self::Channel => "channel",
             Self::OriginEndpoint => "origin endpoint",
+            Self::HarvestJob => "harvest job",
         }
     }
 
@@ -1310,6 +2222,10 @@ pub fn origin_endpoint_etag(endpoint: &OriginEndpoint) -> String {
         endpoint.uri_separator.clone(),
         endpoint.stream_name_output_mode.clone(),
         tag_fingerprint(&endpoint.tags),
+        // The commit count, so a commit that writes the same values still rotates the
+        // tag — which is what a conditional update that lost a race needs. See
+        // [`ChannelGroup::version`].
+        endpoint.version.to_string(),
     ])
 }
 
@@ -1612,6 +2528,87 @@ mod tests {
                 "case {refused:?}: expected to be refused as a policy document"
             );
         }
+    }
+
+    #[test]
+    fn an_arn_pattern_matches_the_way_iam_resource_patterns_do() {
+        // `*` is any run of characters (including none) and `?` is exactly one; the match
+        // is anchored at both ends.
+        let arn = "arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/g/channel/c\
+                   /originEndpoint/e";
+        for pattern in [
+            arn,
+            "*",
+            "arn:aws:mediapackagev2:*",
+            "arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/g/channel/c*",
+            "arn:*:mediapackagev2:*:*:channelGroup/g/*/originEndpoint/e",
+            "arn:aws:mediapackagev2:us-west-?:000000000000:channelGroup/g/channel/c\
+             /originEndpoint/e",
+        ] {
+            assert!(
+                arn_pattern_matches(pattern, arn),
+                "case {pattern:?}: expected it to match {arn}"
+            );
+        }
+        for pattern in [
+            "arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/g/channel/c\
+             /originEndpoint/other",
+            "arn:aws:s3:*",
+            "arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/g",
+            // `?` is exactly one character, so it cannot swallow a whole Region.
+            "arn:aws:mediapackagev2:?:000000000000:channelGroup/g/channel/c\
+             /originEndpoint/e",
+        ] {
+            assert!(
+                !arn_pattern_matches(pattern, arn),
+                "case {pattern:?}: expected it NOT to match {arn}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_anonymous_grant_needs_an_effect_an_action_a_principal_and_a_reachable_resource() {
+        let arn = "arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/g/channel/c\
+                   /originEndpoint/e";
+        let action = "mediapackagev2:GetObject";
+        let statement = |members: &str| format!("{{\"Statement\":[{members}]}}");
+
+        for granting in [
+            r#"{"Effect":"Allow","Principal":"*","Action":"mediapackagev2:GetObject"}"#,
+            r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["mediapackagev2:*"]}"#,
+            r#"{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}"#,
+        ] {
+            assert!(
+                policy_allows_anonymous(&statement(granting), action, arn),
+                "case {granting:?}: expected an anonymous grant"
+            );
+        }
+        for refusing in [
+            // A named principal is not the anonymous one.
+            r#"{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},
+                 "Action":"mediapackagev2:GetObject"}"#,
+            // A different action.
+            r#"{"Effect":"Allow","Principal":"*","Action":"mediapackagev2:PutObject"}"#,
+            // A resource this request does not address.
+            r#"{"Effect":"Allow","Principal":"*","Action":"mediapackagev2:GetObject",
+                 "Resource":"arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/other"}"#,
+            // A member the evaluator cannot judge: it must not grant past it.
+            r#"{"Effect":"Allow","Principal":"*","Action":"mediapackagev2:GetObject",
+                 "Condition":{"Bool":{"aws:SecureTransport":"true"}}}"#,
+            r#"{"Effect":"Deny","Principal":"*","Action":"mediapackagev2:GetObject"}"#,
+        ] {
+            assert!(
+                !policy_allows_anonymous(&statement(refusing), action, arn),
+                "case {refusing:?}: expected no anonymous grant"
+            );
+        }
+        // Deny beats Allow, whichever order they are written in.
+        let both = r#"{"Effect":"Allow","Principal":"*","Action":"mediapackagev2:GetObject"},
+             {"Effect":"Deny","Principal":"*","Action":"mediapackagev2:GetObject"}"#;
+        assert!(
+            !policy_allows_anonymous(&statement(both), action, arn),
+            "a Deny of the same action must beat the Allow"
+        );
     }
 
     #[test]

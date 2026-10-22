@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelHarvestJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelHarvestJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Moves one in-progress harvest job to `CANCELLED`, which a later
+//! `GetHarvestJob` reports. A job that has already reached a terminal status cannot be
+//! cancelled and is refused `ValidationException` (400) with `ValidationExceptionType`
+//! `HARVEST_JOB_INELIGIBLE_FOR_CANCELLATION`. `x-amzn-update-if-match` is honoured as a
+//! precondition here too, with the same single-serialization-point rule `UpdateChannel`
+//! documents.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelHarvestJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +161,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelHarvestJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelHarvestJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelHarvestJob"))
+        // The conditional entity tag is bound to a header by the model, so it arrives on
+        // the deserialized input: nothing else is needed from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CancelHarvestJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(CancelHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::ChannelGroup.not_found(),
+            )
+            .into());
+        };
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(CancelHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::Channel.not_found(),
+            )
+            .into());
+        };
+        let Some(endpoint) = channel.origin_endpoints.get_mut(&input.origin_endpoint_name)
+        else {
+            return Err(CancelHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::OriginEndpoint.not_found(),
+            )
+            .into());
+        };
+        let Some(job) = endpoint.harvest_jobs.get_mut(&input.harvest_job_name) else {
+            return Err(CancelHarvestJobErrorModeled::ResourceNotFoundException(
+                crate::state::ResourceKind::HarvestJob.not_found(),
+            )
+            .into());
+        };
+
+        let at = crate::state::now();
+        // What the clock owed first: cancelling judges the status the job HAS at this
+        // instant, not the one it was last written with.
+        job.materialise_due_transitions(at);
+
+        if input
+            .e_tag
+            .as_deref()
+            .is_some_and(|presented| presented != job.etag)
+        {
+            return Err(CancelHarvestJobErrorModeled::ConflictException(
+                crate::state::conflicting_operation(),
+            )
+            .into());
+        }
+        if job.is_terminal() {
+            return Err(CancelHarvestJobErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "The harvest job has already reached a terminal status and cannot be \
+                         cancelled"
+                            .to_string(),
+                    ),
+                    validation_exception_type: Some(
+                        crate::state::VALIDATION_HARVEST_JOB_INELIGIBLE_FOR_CANCELLATION
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        job.status = crate::state::HARVEST_JOB_CANCELLED.to_string();
+        job.commit(at);
+
+        Ok(CancelHarvestJobOutput {})
     }
 }

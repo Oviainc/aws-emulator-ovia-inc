@@ -161,11 +161,15 @@ pub fn validate_tag_set(tags: &[BucketTag]) -> Result<(), TagSetRejection> {
 }
 
 /// One general purpose bucket this emulator holds.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Bucket {
     /// The Region the bucket lives in — what `HeadBucket` reports as
     /// `x-amz-bucket-region` and what decides the form of `CreateBucket`'s `Location`.
     pub region: String,
+    /// The bucket policy `PutBucketPolicy` attached, verbatim, or `None` while the
+    /// bucket has none. A bucket is created WITHOUT a policy, which is what makes
+    /// `GetBucketPolicy` answer `NoSuchBucketPolicy` until one is put.
+    pub policy: Option<String>,
     /// The bucket's tag set, in the order the tagging request carried it.
     ///
     /// Private, and empty when no tag set is associated with the bucket: "no tags" and
@@ -216,8 +220,8 @@ impl ComAmazonawsS3Amazons3State {
     }
 
     /// The bucket named `name` for writing, or `None` when this emulator holds no such
-    /// bucket — so a subresource write (a tag set, say) refuses a name that is not a
-    /// bucket instead of creating one.
+    /// bucket — so a subresource write (a policy or a tag set) refuses a name that is not
+    /// a bucket instead of creating one.
     pub fn bucket_mut(&mut self, name: &str) -> Option<&mut Bucket> {
         self.buckets.get_mut(name)
     }
@@ -238,13 +242,77 @@ impl ComAmazonawsS3Amazons3State {
             name.to_string(),
             Bucket {
                 region: region.to_string(),
-                // A fresh bucket carries no tags; `PutBucketTagging` is what associates a
-                // tag set with it.
+                // A fresh bucket carries no policy and no tags; `PutBucketPolicy` and
+                // `PutBucketTagging` are what associate those subresources with it.
+                policy: None,
                 tags: Vec::new(),
             },
         );
         BucketCreation::Created
     }
+}
+
+// ---------------------------------------------------------------------------
+// The error codes S3's bucket subresource operations answer with.
+//
+// `PutBucketPolicy`, `GetBucketPolicy`, `PutBucketTagging` and `GetBucketTagging`
+// declare NO errors in the model, yet S3 answers each of these on them, so they are
+// returned through `scaffolded::Scaffolded::unmodeled`.
+// ---------------------------------------------------------------------------
+
+/// "The specified bucket does not exist."
+pub const NO_SUCH_BUCKET_CODE: &str = "NoSuchBucket";
+/// See [`NO_SUCH_BUCKET_CODE`].
+pub const NO_SUCH_BUCKET_MESSAGE: &str = "The specified bucket does not exist";
+/// "The bucket policy does not exist."
+pub const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";
+/// See [`NO_SUCH_BUCKET_POLICY_CODE`].
+pub const NO_SUCH_BUCKET_POLICY_MESSAGE: &str = "The bucket policy does not exist";
+/// "The policy must be a valid JSON policy document."
+pub const MALFORMED_POLICY_CODE: &str = "MalformedPolicy";
+/// See [`MALFORMED_POLICY_CODE`].
+pub const MALFORMED_POLICY_MESSAGE: &str =
+    "Policy must be a JSON policy document with a non-empty Statement list, each statement \
+     carrying an Effect of Allow or Deny and an Action";
+
+/// The most bytes a bucket policy may carry, and so the most one bucket's policy record
+/// can hold.
+///
+/// `PutBucketPolicy$Policy` is the `@httpPayload`, a plain string with no `@length` in
+/// the model, so without a ceiling one request could park an arbitrarily large document
+/// in the store — once per bucket, up to [`MAX_BUCKETS_PER_ACCOUNT`]. AWS bounds it with
+/// the bucket-policy limit it publishes, 20 KB, and refuses a longer document.
+pub const MAX_BUCKET_POLICY_BYTES: usize = 20 * 1024;
+
+/// Whether `policy` is a policy document S3 accepts on `PutBucketPolicy`.
+///
+/// The grammar an IAM resource policy has to satisfy: a JSON object carrying a
+/// `Statement` that is a non-empty list of objects (or a single statement object), each
+/// with an `Effect` of exactly `Allow` or `Deny` and an `Action`. A `Policy` that is not
+/// even JSON fails here first, which is what `MalformedPolicy` reports.
+pub fn is_valid_policy_document(policy: &str) -> bool {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+        return false;
+    };
+    let Some(object) = parsed.as_object() else {
+        return false;
+    };
+    let Some(statement) = object.get("Statement") else {
+        return false;
+    };
+    let statements: Vec<&::serde_json::Value> = match statement {
+        ::serde_json::Value::Array(list) => list.iter().collect(),
+        single @ ::serde_json::Value::Object(_) => vec![single],
+        _ => return false,
+    };
+    !statements.is_empty()
+        && statements.iter().all(|statement| {
+            let Some(statement) = statement.as_object() else {
+                return false;
+            };
+            let effect = statement.get("Effect").and_then(::serde_json::Value::as_str);
+            matches!(effect, Some("Allow") | Some("Deny")) && statement.contains_key("Action")
+        })
 }
 
 /// The Region a `CreateBucket` request places its bucket in, from the

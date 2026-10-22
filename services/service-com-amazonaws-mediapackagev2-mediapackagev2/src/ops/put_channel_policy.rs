@@ -6,10 +6,11 @@
 //!
 //! The policy document is validated before anything is stored (a document that is not an
 //! IAM policy is a 400 `ValidationException` with `ValidationExceptionType`
-//! `INVALID_POLICY`), and the parent chain is resolved first (404
-//! `ResourceNotFoundException`), so a refused request leaves the store untouched. A
-//! multiview channel carries no policy of its own, which the model's
-//! `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED` validation type names.
+//! `INVALID_POLICY`), and the parent chain is resolved before that store too (404
+//! `ResourceNotFoundException` with the service's fixed per-resource sentence), so a
+//! refused request leaves the store untouched. A multiview channel carries no policy of
+//! its own, which the model's `MULTIVIEW_CHANNEL_POLICY_NOT_ALLOWED` validation type
+//! names.
 //!
 //! ## Shape of an operation
 //!
@@ -184,7 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The document is checked before the store is touched, so a refused policy
-        // leaves whatever policy the channel already had in place.
+        // leaves whatever policy the channel already had in place. Every refusal in this
+        // handler comes from the shared builders in `crate::state`, so the service's
+        // wording is decided in ONE place rather than per operation.
         if !crate::state::is_policy_document(&input.policy) {
             return Err(PutChannelPolicyErrorModeled::ValidationException(
                 crate::state::validation_failed(

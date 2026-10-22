@@ -41,6 +41,50 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
+//! ## The data plane
+//!
+//! MediaPackage publishes two kinds of hostname. The CONTROL plane is
+//! `mediapackagev2.<region>.amazonaws.com`, whose first label names the service, and
+//! that is what the framework's route key resolves. The DATA plane is the per-group
+//! hostnames this service mints and hands out — `EgressDomain` on a channel group, and
+//! `IngestEndpoints[].Url` on a channel — whose first label is an opaque digest. Those
+//! URLs are announced to encoders and players as live endpoints, so a request to one has
+//! to reach THIS service rather than the control-plane resolver, which cannot name a
+//! service from an opaque label and answers `404 UnknownService`.
+//!
+//! Two seams carry it, and nothing else changes:
+//!
+//! - [`Service::can_handle`] also claims a request whose `Host` is one of those
+//!   published hostnames ([`crate::state::data_plane_of_host`]), which is what routes it
+//!   here at all.
+//! - [`Service::override_routing_error`] serves it. A data-plane request names no
+//!   modelled operation by construction (`/out/v1/…`, `/in/v1/…` are not in the model),
+//!   so the router reaches exactly this seam for it — past the input-validation gate
+//!   below, which only fronts the modelled operations — and reaches it BEFORE
+//!   authentication, which is what lets an anonymous player be answered at all.
+//!
+//! What the data plane enforces:
+//!
+//! - EGRESS (`GET`/`HEAD /out/v1/<group>/<channel>/<endpoint>/<object>`) is gated by the
+//!   origin endpoint's resource policy, against the action that method needs
+//!   (`mediapackagev2:GetObject` for a `GET`, `mediapackagev2:GetHeadObject` for a
+//!   `HEAD`). With no policy granting it to the `*` principal the fetch is `403` with an
+//!   access-denied body; with the grant in
+//!   place the fetch is authorized and the object is looked up, which answers `404` while
+//!   no content has been packaged for it. Those are the two states a player branches on,
+//!   and the resource policy is the only grant this emulator can evaluate: it performs no
+//!   IAM identity-policy evaluation, so an authorization that would come from a caller's
+//!   identity policy is not one it can honour.
+//! - INGEST (`PUT`/`POST /in/v1/<group>/<index>/<channel>/<object>`) requires a SigV4
+//!   credential: MediaPackage returns no credential for ingest, so an unauthenticated push
+//!   is `403` with an access-denied body. Whether a credential that IS present carries a
+//!   valid signature is the emulator's own business — the emulator verifies every request
+//!   signature and a service never checks signatures itself — so this handler does not
+//!   re-verify it; a credentialed push is recorded against the channel, within the three
+//!   bounds the store declares: the per-object size, the per-channel object count, and the
+//!   store-wide retained bytes (`state::MAX_INGESTED_BYTES`), since the channel count is
+//!   itself caller-driven.
+//!
 //! ## Why this file validates input
 //!
 //! MediaPackage's `ValidationException` is modelled with TWO members — `Message` and
@@ -73,9 +117,10 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema_server::constraints::{validate, Violation};
 use aws_smithy_schema_server::ProtocolError;
+use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext, Refusal,
     Refused, ServerHttpProtocol, Service,
@@ -89,6 +134,15 @@ const VALIDATION_EXCEPTION_STATUS: u16 = 400;
 /// `x-amzn-errortype`.
 const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
 
+/// The content type the data plane answers its own (non-modelled) responses with.
+const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// The body of a data-plane refusal with no grant behind it.
+///
+/// One sentence, carrying nothing from the request: what a caller branches on is the
+/// `403` and this text, and the service does not echo the resource it would not serve.
+const ACCESS_DENIED_MESSAGE: &str = "Access denied";
+
 /// The `com-amazonaws-mediapackagev2-mediapackagev2` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -96,6 +150,12 @@ const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the data plane is served from [`Service::override_routing_error`],
+    /// which is not an operation and so has no `self.engine` of its own; it must read and
+    /// write the one store the control-plane operations use, not a second copy.
+    engine: Arc<Eng>,
     /// The input-validation gate for each modelled operation, keyed by the routing key
     /// the protocol resolves for it (the operation's own `NAME`). Built once, in `new`.
     input_validation: HashMap<&'static str, Box<dyn ErasedOperation>>,
@@ -107,7 +167,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
             input_validation: input_validation_gates::<Eng>(),
         }
     }
@@ -303,13 +364,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        // A request whose resolved route key is this service's signing name is the
+        // control plane, exactly as the framework's default claims it.
+        if smithy_server_runtime::resolve_route_key(parts)
+            .is_some_and(|key| key == self.entry.identity().signing_name())
+        {
+            return true;
         }
+        // And a request addressed to one of the data-plane hostnames this service
+        // PUBLISHES, whose opaque first label no route key can name. See the module
+        // docs: without this the router answers `404 UnknownService` for a URL this
+        // service handed out.
+        request_host(parts).is_some_and(|host| {
+            crate::state::data_plane_of_host(host).is_some()
+        })
     }
 
     fn override_operation(
@@ -321,7 +389,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // refused with the MODELLED `ValidationException` (both members set) instead of
         // the framework's generic 400 envelope. The gate then hands every request the
         // model accepts to the generated operation, which the routing table still owns;
-        // a request that names no modelled operation resolves as it always did.
+        // a request that names no modelled operation — a data-plane URL, say — resolves as
+        // it always did, which is what leaves it to `override_routing_error`.
         let key = self.entry.protocol().routing_key(req).ok()?;
         let gate = self.input_validation.get(key)?;
         Some(gate.as_ref())
@@ -359,13 +428,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // modeled operation. A data-plane request is exactly that case by
+        // construction, so this is where the published ingest and egress URLs are
+        // served. Anything else keeps the framework's protocol-correct default.
+        let host = req.headers().get("host").or_else(|| authority_of(req.uri()))?;
+        match crate::state::data_plane_of_host(host)? {
+            crate::state::DataPlane::Egress => Some(self.serve_egress(req)),
+            crate::state::DataPlane::Ingest => Some(self.serve_ingest(req)),
+        }
     }
 
     fn override_framework_error(
@@ -381,6 +451,232 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
+    /// Serve one request to a published EGRESS URL.
+    ///
+    /// The origin endpoint's resource policy decides, against the action the request's
+    /// method needs ([`egress_action`]): without a grant to the `*` principal the fetch is
+    /// refused `403`, and the refusal is the same whether the endpoint is absent or merely
+    /// ungranted, so a caller cannot probe for endpoints it may not read. With the grant
+    /// the fetch is authorized and the object is resolved, which is `404` while nothing
+    /// has been packaged for it.
+    fn serve_egress(&self, req: &RtRequest) -> RtResponse {
+        if !matches!(req.method(), "GET" | "HEAD") {
+            return error_response(
+                405,
+                "MethodNotAllowed",
+                "The egress data plane serves GET and HEAD",
+            );
+        }
+        let Some(target) = crate::state::parse_egress_path(request_path(req.uri())) else {
+            return error_response(
+                404,
+                "NotFound",
+                "The requested path is not an egress path this service publishes",
+            );
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return error_response(
+                500,
+                "InternalServerException",
+                "the MediaPackageV2 store is unavailable",
+            );
+        };
+        let store = state.lock();
+        let granted = store.endpoint_at(&target).is_some_and(|endpoint| {
+            endpoint.policy.as_ref().is_some_and(|attached| {
+                crate::state::policy_allows_anonymous(
+                    &attached.policy,
+                    egress_action(req.method()),
+                    // The resource the request addresses, which a statement's `Resource`
+                    // is matched against: the endpoint the published URL names.
+                    &endpoint.arn,
+                )
+            })
+        });
+        if !granted {
+            return error_response(403, "AccessDenied", ACCESS_DENIED_MESSAGE);
+        }
+        // Authorized, and there is nothing to serve: this emulator runs no packager, so
+        // no egress object exists for an endpoint however much has been ingested. The
+        // answer is the honest one for a data plane — no such object — not a synthesised
+        // manifest.
+        error_response(
+            404,
+            "NotFound",
+            "No content is available at this origin endpoint yet",
+        )
+    }
+
+    /// Serve one request to a published INGEST URL.
+    ///
+    /// MediaPackage returns no credential for ingest, so an unauthenticated push is
+    /// refused `403`. A push that DOES carry a SigV4 credential is recorded against the
+    /// channel, bounded by [`crate::state::MAX_INGESTED_OBJECTS_PER_CHANNEL`] and
+    /// [`crate::state::MAX_INGESTED_OBJECT_BYTES`].
+    fn serve_ingest(&self, req: &RtRequest) -> RtResponse {
+        if !matches!(req.method(), "PUT" | "POST") {
+            return error_response(
+                405,
+                "MethodNotAllowed",
+                "The ingest data plane serves PUT and POST",
+            );
+        }
+        if !carries_sigv4_credential(req) {
+            return error_response(403, "AccessDenied", ACCESS_DENIED_MESSAGE);
+        }
+        let Some(target) = crate::state::parse_ingest_path(request_path(req.uri())) else {
+            return error_response(
+                404,
+                "NotFound",
+                "The requested path is not an ingest path this service publishes",
+            );
+        };
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return error_response(
+                500,
+                "InternalServerException",
+                "the MediaPackageV2 store is unavailable",
+            );
+        };
+        let body = req.body().bytes().unwrap_or_default();
+        if body.len() > crate::state::MAX_INGESTED_OBJECT_BYTES {
+            return error_response(
+                413,
+                "RequestEntityTooLarge",
+                "The ingested object is larger than this emulator retains",
+            );
+        }
+        let mut store = state.lock();
+        // Both store bounds are judged under this one hold of the lock, so two concurrent
+        // pushes cannot both see room that only one of them has.
+        match store.record_ingested_object(&target, body.to_vec()) {
+            crate::state::IngestOutcome::Recorded => {}
+            crate::state::IngestOutcome::NoSuchChannel => {
+                return error_response(
+                    404,
+                    "NotFound",
+                    "The requested path is not an ingest path this service publishes",
+                );
+            }
+            crate::state::IngestOutcome::ObjectCountReached => {
+                return error_response(
+                    507,
+                    "InsufficientStorage",
+                    "This channel already holds as many ingested objects as this emulator \
+                     retains",
+                );
+            }
+            crate::state::IngestOutcome::StoreFull => {
+                return error_response(
+                    507,
+                    "InsufficientStorage",
+                    "This emulator is already retaining as many ingested bytes as it holds",
+                );
+            }
+        }
+        let mut resp = RtResponse::new(
+            StatusCode::try_from(200u16).expect("200 is a valid status"),
+            SdkBody::empty(),
+        );
+        resp.headers_mut().insert("content-length", "0");
+        resp
+    }
+}
+
+/// The action an anonymous player needs on an origin endpoint to fetch its content with
+/// `GET`. It is the action MediaPackage's own endpoint-policy examples grant.
+const EGRESS_GET_ACTION: &str = "mediapackagev2:GetObject";
+
+/// The action a `HEAD` of the same object needs, which those examples grant separately:
+/// a policy may allow the metadata read without allowing the body.
+const EGRESS_HEAD_ACTION: &str = "mediapackagev2:GetHeadObject";
+
+/// The action an egress request of this method is authorized against.
+fn egress_action(method: &str) -> &'static str {
+    match method {
+        "HEAD" => EGRESS_HEAD_ACTION,
+        _ => EGRESS_GET_ACTION,
+    }
+}
+
+/// Whether the request presents a SigV4 credential at all — in the `Authorization`
+/// header a signed SDK request carries, or in the `X-Amz-Credential` query parameter a
+/// presigned URL carries.
+///
+/// Only PRESENCE is read. Whether the signature over that credential is correct is the
+/// emulator's own check, never a service's.
+fn carries_sigv4_credential(req: &RtRequest) -> bool {
+    if req
+        .headers()
+        .get("authorization")
+        .is_some_and(|value| value.contains("Credential="))
+    {
+        return true;
+    }
+    request_query(req.uri())
+        .split('&')
+        .any(|pair| pair.starts_with("X-Amz-Credential="))
+}
+
+/// The `Host` header of a buffered request, or the URI authority when the request is
+/// HTTP/2 (which carries `:authority` on the URI instead of a `Host` header).
+fn request_host(parts: &http::request::Parts) -> Option<&str> {
+    match parts.headers.get("host").and_then(|host| host.to_str().ok()) {
+        Some(host) => Some(host),
+        None => parts.uri.authority().map(http::uri::Authority::as_str),
+    }
+}
+
+/// The authority of an absolute request URI, or `None` when the URI is origin-form.
+fn authority_of(uri: &str) -> Option<&str> {
+    let (_scheme, rest) = uri.split_once("://")?;
+    Some(match rest.find('/') {
+        Some(path_start) => &rest[..path_start],
+        None => rest,
+    })
+}
+
+/// The path component of a request URI, with any scheme, authority and query removed.
+fn request_path(uri: &str) -> &str {
+    // The query is dropped FIRST: a query VALUE may carry `://`, which a scheme scan over
+    // the whole URI would mistake for the authority.
+    let without_query = uri.split('?').next().unwrap_or(uri);
+    match without_query.split_once("://") {
+        Some((_scheme, authority_and_path)) => match authority_and_path.find('/') {
+            Some(path_start) => &authority_and_path[path_start..],
+            None => "/",
+        },
+        None => without_query,
+    }
+}
+
+/// The query component of a request URI: everything after the first `?`.
+fn request_query(uri: &str) -> &str {
+    match uri.find('?') {
+        Some(mark) => &uri[mark + 1..],
+        None => "",
+    }
+}
+
+/// One data-plane error response: the status, the code in `x-amzn-errortype`, and a JSON
+/// body carrying the reason.
+///
+/// The data plane is plain HTTPS rather than a modelled operation, so it answers in its
+/// own small envelope instead of the service's restJson1 one. The message is built from
+/// constants, never from the request.
+fn error_response(status: u16, code: &str, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({ "message": message, "code": code }).to_string();
+    let mut resp = RtResponse::new(
+        StatusCode::try_from(status).expect("the status is a constant of this module"),
+        SdkBody::from(body),
+    );
+    resp.headers_mut().insert("content-type", JSON_CONTENT_TYPE);
+    resp.headers_mut()
+        .insert("x-amzn-errortype", code.to_string());
+    resp
 }
 
 #[cfg(test)]
