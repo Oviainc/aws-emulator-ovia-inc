@@ -10,7 +10,8 @@
 //! * a statement's reported rows, counters and column metadata are what the SQL
 //!   engine actually produced for the SQL that was submitted;
 //! * `ColumnMetadata.typeName` is the database-specific name of the column's
-//!   declared type;
+//!   declared type, and for a column with no declared type the name of the
+//!   narrowest type that holds every value the column produced;
 //! * the statement a `ExecuteStatement` creates is visible to `DescribeStatement`,
 //!   `GetStatementResult`, `ListStatements` and `CancelStatement`;
 //! * `ListStatements` enumerates newest-first, honours each filter and resumes
@@ -380,20 +381,124 @@ async fn column_metadata_reports_the_declared_type_of_each_column() {
     }
 }
 
+/// The published range of Redshift's 4-byte `INTEGER` (`int4`), from the Amazon
+/// Redshift *Data types* documentation
+/// (<https://docs.aws.amazon.com/redshift/latest/dg/c_Supported_data_types.html>):
+/// "INTEGER, INT, INT4 — Signed four-byte integer — -2147483648 to +2147483647".
+/// A value past either end needs `BIGINT` (`int8`), whose range is
+/// -9223372036854775808 to +9223372036854775807.
+const INT4_MIN: i64 = -2_147_483_648;
+const INT4_MAX: i64 = 2_147_483_647;
+
 /// A column with no declared type — an expression such as `SELECT 1` — reports
-/// the type of the value the engine produced for it.
+/// the type of the value the engine produced for it, and an INTEGER value takes
+/// the NARROWEST Redshift integer type whose published range holds it: `int4`
+/// inside the `INTEGER` range, `int8` past it. That is how a Redshift
+/// (PostgreSQL-derived) integer constant is typed, which is why a bare integer
+/// literal is an `int4` column and not an `int8` one.
+///
+/// The rows span what the rule generalises over: the value's type (integer, real,
+/// text, binary, NULL), its sign and magnitude (both published `int4` bounds and
+/// one past each), and whether the column is a literal or a computed expression.
 #[tokio::test]
 async fn an_expression_column_reports_the_type_of_the_value_it_produced() {
-    let cases = [
-        ("SELECT 1 AS c", "int8"),
-        ("SELECT 1.25 AS c", "float8"),
-        ("SELECT 'text' AS c", "varchar"),
-        ("SELECT x'00ff' AS c", "varbyte"),
+    let cases: Vec<(String, Option<&str>)> = vec![
+        ("SELECT 1 AS c".to_string(), Some("int4")),
+        ("SELECT 0 AS c".to_string(), Some("int4")),
+        ("SELECT -7 AS c".to_string(), Some("int4")),
+        // Each published bound of the INTEGER range, and one step past it.
+        (format!("SELECT {INT4_MAX} AS c"), Some("int4")),
+        (format!("SELECT {INT4_MIN} AS c"), Some("int4")),
+        (format!("SELECT {} AS c", INT4_MAX + 1), Some("int8")),
+        (format!("SELECT {} AS c", INT4_MIN - 1), Some("int8")),
+        (format!("SELECT {} AS c", i64::MAX), Some("int8")),
+        // A computed integer expression is typed by the value it produces, the
+        // same way a literal is — including one whose operands fit `int4` and
+        // whose result does not.
+        ("SELECT 2 + 3 AS c".to_string(), Some("int4")),
+        (
+            format!("SELECT {INT4_MAX} + 1 AS c"),
+            Some("int8"),
+        ),
+        ("SELECT 1.25 AS c".to_string(), Some("float8")),
+        ("SELECT -1.25 AS c".to_string(), Some("float8")),
+        ("SELECT 'text' AS c".to_string(), Some("varchar")),
+        ("SELECT x'00ff' AS c".to_string(), Some("varbyte")),
+        // A NULL says nothing about the column's type, so none is reported
+        // rather than one being guessed.
+        ("SELECT NULL AS c".to_string(), None),
     ];
 
     let emulator = Emulator::new();
     for (sql, expected) in cases {
-        let id = emulator.run(sql).await;
+        let id = emulator.run(&sql).await;
+        let fetched = emulator.ok("GetStatementResult", &json!({"Id": id})).await;
+        let columns = list(&fetched, "ColumnMetadata");
+        assert_eq!(
+            columns.len(),
+            1,
+            "case {sql}: expected one column, got {fetched}"
+        );
+        let column = &columns[0];
+        match expected {
+            Some(type_name) => assert_eq!(
+                column["typeName"], type_name,
+                "case {sql}: expected typeName {type_name}, got {column}"
+            ),
+            None => assert!(
+                column["typeName"].is_null(),
+                "case {sql}: a column of NULLs reports no typeName, got {column}"
+            ),
+        }
+        // Every Redshift integer type is signed, and none of them is a character
+        // type — the flags a client reads beside `typeName`.
+        if matches!(expected, Some("int4" | "int8")) {
+            assert!(
+                flag(column, "isSigned"),
+                "case {sql}: an integer column is signed, got {column}"
+            );
+            assert!(
+                !flag(column, "isCaseSensitive"),
+                "case {sql}: an integer column is not case-sensitive, got {column}"
+            );
+        }
+    }
+}
+
+/// An inferred column type has to hold EVERY value the column carried, so a
+/// column whose values are all inside the `INTEGER` range is `int4` and one
+/// single value past that range makes the whole column `int8` — whichever row it
+/// arrives in.
+#[tokio::test]
+async fn an_inferred_integer_column_widens_to_hold_every_value_it_carries() {
+    let past_int4 = INT4_MAX + 1;
+    let cases: Vec<(String, &str)> = vec![
+        (
+            format!("SELECT 1 AS c UNION ALL SELECT 2 UNION ALL SELECT {INT4_MAX}"),
+            "int4",
+        ),
+        // The wide value arrives last: the first row's type must not be the
+        // column's answer.
+        (
+            format!("SELECT 1 AS c UNION ALL SELECT {past_int4}"),
+            "int8",
+        ),
+        // ... and first.
+        (
+            format!("SELECT {past_int4} AS c UNION ALL SELECT 1"),
+            "int8",
+        ),
+        // A leading NULL says nothing, so the type comes from the values after it.
+        (
+            format!("SELECT NULL AS c UNION ALL SELECT {past_int4}"),
+            "int8",
+        ),
+        ("SELECT NULL AS c UNION ALL SELECT 1".to_string(), "int4"),
+    ];
+
+    let emulator = Emulator::new();
+    for (sql, expected) in cases {
+        let id = emulator.run(&sql).await;
         let fetched = emulator.ok("GetStatementResult", &json!({"Id": id})).await;
         let columns = list(&fetched, "ColumnMetadata");
         assert_eq!(

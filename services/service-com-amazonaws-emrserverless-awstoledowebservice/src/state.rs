@@ -13,8 +13,9 @@
 //! `ListApplications` inventory drops it — see [`is_live_application_state`]), and
 //! `StartJobRun` / `GetJobRun` / `ListJobRuns` / `CancelJobRun` work on the job runs it
 //! owns. An interactive session lives inside one application the same way a job run
-//! does: `StartSession` mints a [`SessionRecord`] on the application it names and
-//! `GetSession` reports it.
+//! does: `StartSession` mints a [`SessionRecord`] on the application it names,
+//! `GetSession` reports it and `GetSessionEndpoint` hands a client the endpoint of that
+//! stored session together with a freshly minted, time-limited authentication token.
 //!
 //! Two things here move with the CLOCK rather than with a call, and both are stored as a
 //! due instant that the next read materialises (nothing sleeps): the stages a submitted
@@ -136,6 +137,20 @@ pub const JOB_RUN_STAGE_TRANSITION: Duration = Duration::from_millis(750);
 /// generate it. To access the application UI after that hour elapses, you must invoke
 /// the API again to generate a new URL."
 pub const DASHBOARD_URL_VALIDITY: Duration = Duration::from_secs(60 * 60);
+
+/// How long the authentication token `GetSessionEndpoint` mints stays usable.
+///
+/// The operation documents that the token it returns is "time-limited" and that a client
+/// must "Call this operation again when the authentication token expires to obtain a new
+/// token", but names no span, so the emulator CHOOSES this one — deliberately not zero,
+/// so a client that reads `authTokenExpiresAt` straight after the call sees a token it
+/// can still use. It matches the one validity this service does document for a credential
+/// it hands a client, [`DASHBOARD_URL_VALIDITY`].
+pub const SESSION_AUTH_TOKEN_VALIDITY: Duration = Duration::from_secs(60 * 60);
+
+/// `EndpointUrl`'s modelled `@length(min: 1, max: 256)`, which every URL
+/// `GetSessionEndpoint` reports stays inside.
+pub const ENDPOINT_URL_MAX_LENGTH: usize = 256;
 
 /// The longest span this emulator ever holds a resource in a transient state for,
 /// whatever a request asks.
@@ -1298,6 +1313,52 @@ pub fn job_run_dashboard_url(
          ?attempt={attempt}&authToken={}",
         grant.token
     )
+}
+
+/// A fresh authentication token for connecting a client to one interactive session's
+/// endpoint, for `GetSessionEndpoint`.
+///
+/// The token authenticates to the SESSION endpoint, not to this emulator, so it must
+/// never be accepted as a SigV4 credential — but it is still a secret handed to a
+/// caller, and nothing in a service may construct a secret itself. It is therefore
+/// minted by the one component that generates secrets, the emulator's credential store,
+/// and then removed from that store again: the caller gets the secret, the emulator
+/// keeps no credential it would accept, and nothing accumulates per call.
+///
+/// `None` when the store minted no session-token secret, which leaves the operation to
+/// refuse rather than report a token it made up.
+pub fn mint_session_auth_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(str::to_string);
+    // The token is not a credential of this emulator; see above.
+    let _ = store.delete(&minted.id);
+    token
+}
+
+/// The URL a client connects to one interactive session on: the endpoint this request
+/// reached the emulator on, and the path of the session it names.
+///
+/// The emulator serves no interactive session data plane — it runs no Spark statement —
+/// so the URL names a path on the endpoint the caller is already talking to rather than
+/// a session host nothing here answers for. It is derived from the STORED session's own
+/// ids, so every call for one session reports the same endpoint.
+pub fn session_endpoint_url(
+    parts: &::http::request::Parts,
+    region: &str,
+    application_id: &str,
+    session_id: &str,
+) -> String {
+    let path = format!("/applications/{application_id}/sessions/{session_id}/connect");
+    let url = format!("{}{path}", request_endpoint(parts, region));
+    if url.chars().count() <= ENDPOINT_URL_MAX_LENGTH {
+        return url;
+    }
+    // A request that reached the emulator on an authority long enough to push the URL
+    // past `EndpointUrl`'s bound is answered with the regional endpoint, whose length no
+    // request can influence.
+    format!("https://{ARN_NAMESPACE}.{region}.amazonaws.com{path}")
 }
 
 /// The endpoint this request arrived on, falling back to the public EMR Serverless

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDiskFromSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDiskFromSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts one block storage disk restored from a disk snapshot this account holds
+//! into this service's store, under the disk name the request names, in the zone it
+//! names and at the size it asks for — never below the snapshotted volume's — and
+//! answers the operation-log entry the insert appended. The snapshot itself is only
+//! read.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDiskFromSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +194,282 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDiskFromSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDiskFromSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDiskFromSnapshot"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: the new disk's region is the region of the availability
+        // zone the request names, not the one the request signed for.
+        let _ = ctx;
+
+        // `diskName`, `availabilityZone` and `sizeInGb` are modelled `@required`
+        // members and every pattern on this input is a modelled constraint, so
+        // the centralized walk refused anything outside them before this body
+        // ran. What is left is what the model cannot express: the zone must name
+        // a zone this service serves, the size must be within the range
+        // Lightsail creates a disk in and no smaller than the snapshotted
+        // volume, the add-ons must be ones a disk can carry, exactly one source
+        // must be named, the automatic-snapshot members must be used only with
+        // that source, the source must be a resource this account holds and the
+        // new disk's name must not already be taken. Every one of those is
+        // checked BEFORE the first write, so a refused request creates nothing.
+        let region = crate::state::region_of_availability_zone(&input.availability_zone)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "availabilityZone '{}' is not a zone of a Lightsail region: it must be \
+                     a region name followed by a zone letter, for one of [{}]",
+                    input.availability_zone,
+                    crate::state::region_names()
+                ))
+            })?;
+        if !(crate::state::MIN_DISK_SIZE_IN_GB..=crate::state::MAX_DISK_SIZE_IN_GB)
+            .contains(&input.size_in_gb)
+        {
+            return Err(invalid(format!(
+                "sizeInGb must be between {} and {} GB, got {}",
+                crate::state::MIN_DISK_SIZE_IN_GB,
+                crate::state::MAX_DISK_SIZE_IN_GB,
+                input.size_in_gb
+            )));
+        }
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+        // The same add-on conversion `CreateDisk` goes through, so a disk this
+        // operation creates carries exactly the add-ons one created directly can.
+        let add_ons = crate::state::disk_add_ons_from_requests(
+            &input.disk_name,
+            &input.add_ons.clone().unwrap_or_default(),
+        )
+        .map_err(invalid)?;
+        let source = requested_source(&input)?;
+
+        let name = input.disk_name;
+        let availability_zone = input.availability_zone;
+        let location = crate::state::StoredLocation::zonal(&availability_zone, region);
+        let size_in_gb = input.size_in_gb;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A disk name addresses one disk, so restoring onto one this account
+            // already holds is refused rather than silently replacing the record
+            // an instance may already be using.
+            if store.disk(&name).is_some() {
+                return Err(invalid(format!("a disk named '{name}' already exists")));
+            }
+            if store.disks.len() >= crate::state::MAX_DISKS {
+                return Err(invalid(format!(
+                    "creating a disk would take this account past the {} this emulator \
+                     holds",
+                    crate::state::MAX_DISKS
+                )));
+            }
+
+            // The snapshotted volume the new disk is a copy of. The snapshot's
+            // own record is the source of truth for its size and its region;
+            // nothing here reads the disk the snapshot was taken of, which may
+            // have been resized or deleted since.
+            let (snapshot_name, snapshot_region, snapshot_size_in_gb) = match &source {
+                RequestedSource::Snapshot(requested) => {
+                    let snapshot = store.disk_snapshot(requested).ok_or_else(|| {
+                        not_found(crate::state::RESOURCE_TYPE_DISK_SNAPSHOT, requested)
+                    })?;
+                    (
+                        snapshot.name.clone(),
+                        snapshot.location.region_name.clone(),
+                        snapshot.size_in_gb,
+                    )
+                }
+                // An AUTOMATIC snapshot is one the `AutoSnapshot` add-on takes on
+                // the daily schedule a disk carries. This store holds none — the
+                // add-on records the hour it would run at and nothing takes a
+                // copy — so, once the source disk is known to exist, there is no
+                // automatic snapshot of it to restore from and the request is
+                // refused with the service's `DoesNotExist` envelope rather than
+                // answered with a disk restored from nothing.
+                RequestedSource::AutoSnapshot { disk_name, date } => {
+                    store
+                        .disk(disk_name)
+                        .ok_or_else(|| not_found(crate::state::RESOURCE_TYPE_DISK, disk_name))?;
+                    return Err(crate::scaffolded::Scaffolded::does_not_exist(format!(
+                        "no automatic snapshot of the Disk {disk_name} is available to \
+                         restore ({date}): this account has taken none"
+                    )));
+                }
+            };
+            // A snapshot belongs to the region it was taken in, and only that
+            // region's Lightsail endpoint can restore it: moving one between
+            // regions is what `CopySnapshot` is for.
+            if snapshot_region != region {
+                return Err(invalid(format!(
+                    "diskSnapshotName '{snapshot_name}' is a snapshot of region \
+                     {snapshot_region}, which cannot be restored into availabilityZone \
+                     '{availability_zone}' of region {region}"
+                )));
+            }
+            // A restored volume holds every block the snapshot captured, so it
+            // cannot be smaller than the volume that was snapshotted; a larger
+            // size is accepted and the extra space is the new disk's.
+            if size_in_gb < snapshot_size_in_gb {
+                return Err(invalid(format!(
+                    "sizeInGb {size_in_gb} is smaller than the {snapshot_size_in_gb} GB \
+                     volume disk snapshot '{snapshot_name}' captured: a disk restored from \
+                     a snapshot must be at least as large as the snapshotted volume"
+                )));
+            }
+
+            let id = store.mint_uuid();
+            // A restored disk is not usable yet: the clock owes it `available`,
+            // which is why a read straight after this call still reports
+            // `pending`, exactly as it does against AWS.
+            let due = crate::state::DueNamedState::after(now, crate::state::DISK_STATE_AVAILABLE);
+            store.insert_disk(crate::state::StoredDisk {
+                name: name.clone(),
+                arn: crate::state::disk_arn(region, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags,
+                add_ons,
+                // The caller's size, which the checks above hold to at least the
+                // snapshotted volume's.
+                size_in_gb,
+                state: crate::state::DISK_STATE_PENDING,
+                due: Some(due),
+                // Nothing is using the disk yet: `AttachDisk` is what attaches it
+                // to an instance and names the path it is mounted at.
+                attached_to: None,
+                path: None,
+            });
+            // `operations` is a list because other Lightsail creates act on
+            // several resources at once; `CreateDiskFromSnapshot` creates exactly
+            // one disk, so it answers exactly one entry, left non-terminal until
+            // the restore the clock owes the disk is due.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_DISK_FROM_SNAPSHOT,
+                crate::state::RESOURCE_TYPE_DISK,
+                &name,
+                &location,
+                Some(due.at_ms),
+            );
+            Ok(CreateDiskFromSnapshotOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The snapshot the request asked to restore: exactly one of the two mutually
+/// exclusive sources the modelled input admits, resolved against the store once
+/// the request is known to name one.
+enum RequestedSource {
+    /// A manual snapshot, named by `diskSnapshotName`.
+    Snapshot(String),
+    /// An AUTOMATIC snapshot of `disk_name`, addressed either by the
+    /// `restoreDate` the request carried or by the latest restorable one — which
+    /// `date` reports as the modelled `useLatestRestorableAutoSnapshot`
+    /// documentation words it.
+    AutoSnapshot { disk_name: String, date: String },
+}
+
+/// The source `input` names, or the refusal its combination of members earns.
+///
+/// The modelled documentation states each rule enforced here: `diskSnapshotName`
+/// and `sourceDiskName` "are mutually exclusive"; `restoreDate` and
+/// `useLatestRestorableAutoSnapshot` "are mutually exclusive"; and both of the
+/// latter are to be defined "only when creating a new disk from an automatic
+/// snapshot", which is what `sourceDiskName` names the source of. A restore of
+/// nothing is not a restore, so naming neither source is refused too.
+fn requested_source(
+    input: &CreateDiskFromSnapshotInput,
+) -> Result<RequestedSource, CreateDiskFromSnapshotError> {
+    let wants_latest = input.use_latest_restorable_auto_snapshot == Some(true);
+    if let Some(restore_date) = &input.restore_date {
+        if !crate::state::is_auto_snapshot_date(restore_date) {
+            return Err(invalid(format!(
+                "restoreDate '{restore_date}' must be specified in YYYY-MM-DD format"
+            )));
+        }
+        if wants_latest {
+            return Err(invalid(
+                "restoreDate and useLatestRestorableAutoSnapshot are mutually exclusive: \
+                 name the date of the automatic snapshot to restore, or ask for the latest \
+                 restorable one, but not both"
+                    .to_string(),
+            ));
+        }
+    }
+    match (&input.disk_snapshot_name, &input.source_disk_name) {
+        (Some(snapshot_name), None) => {
+            if input.restore_date.is_some() || wants_latest {
+                return Err(invalid(
+                    "restoreDate and useLatestRestorableAutoSnapshot are to be defined only \
+                     when creating a new disk from an automatic snapshot, which \
+                     sourceDiskName names the source of, not together with \
+                     diskSnapshotName"
+                        .to_string(),
+                ));
+            }
+            Ok(RequestedSource::Snapshot(snapshot_name.clone()))
+        }
+        (None, Some(disk_name)) => match (&input.restore_date, wants_latest) {
+            (Some(restore_date), false) => Ok(RequestedSource::AutoSnapshot {
+                disk_name: disk_name.clone(),
+                date: restore_date.clone(),
+            }),
+            (None, true) => Ok(RequestedSource::AutoSnapshot {
+                disk_name: disk_name.clone(),
+                date: "the latest restorable automatic snapshot".to_string(),
+            }),
+            _ => Err(invalid(
+                "sourceDiskName names the source disk of an automatic snapshot, so one of \
+                 restoreDate or useLatestRestorableAutoSnapshot must be defined with it"
+                    .to_string(),
+            )),
+        },
+        (Some(_), Some(_)) => Err(invalid(
+            "diskSnapshotName and sourceDiskName are mutually exclusive: name the disk \
+             snapshot to restore, or the source disk of the automatic snapshot to restore, \
+             but not both"
+                .to_string(),
+        )),
+        (None, None) => Err(invalid(
+            "one of diskSnapshotName or sourceDiskName must be defined: a disk is created \
+             from a manual snapshot of a disk, or from an automatic snapshot of one"
+                .to_string(),
+        )),
+    }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateDiskFromSnapshotError {
+    CreateDiskFromSnapshotErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The source the request named is not a resource this account holds:
+/// Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name.
+fn not_found(resource_type: &str, name: &str) -> CreateDiskFromSnapshotError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateDiskFromSnapshotError {
+    CreateDiskFromSnapshotErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail disk store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

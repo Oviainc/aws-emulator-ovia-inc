@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVolumes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVolumes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVolumes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the EBS volumes [`crate::state`] holds, narrowed by `VolumeIds`
+//! and the documented filters and paged by `MaxResults`/`NextToken`. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,360 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVolumes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVolumesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            decode_page_token, encode_page_token, invalid_pagination_token, require_known_volume,
+            require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS,
+            MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE,
+            MAX_RESOURCE_IDS,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let requested_ids = input.volume_ids.clone().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "VolumeIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+        // The model declares no `@range` on `MaxResults`, so the handler is the only place
+        // a page size can be bounded — and an unbounded one is how a caller asks for the
+        // whole store in one answer.
+        if input.max_results.is_some_and(|max_results| max_results < 1) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for maxResults. It must be at least 1",
+                input.max_results.unwrap_or_default()
+            )));
+        }
+        if input
+            .max_results
+            .is_some_and(|max_results| usize::try_from(max_results).unwrap_or(0) > MAX_PAGE_SIZE)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for maxResults. It must be at most {MAX_PAGE_SIZE}",
+                input.max_results.unwrap_or_default()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored volumes and the model
+        // bounds none of them, so the request-controlled factors are capped here, before
+        // any work proportional to them is done — and their PRODUCT is charged to one
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // volume would have matched it, so an unsupported filter can never read as "no
+        // results".
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                Scaffolded::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "The token returned from a previous paginated request" — anything else is
+        // refused rather than read as an id, and it is refused before any other member is
+        // looked at, so whether a bogus token is caught never depends on the rest of the
+        // request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(invalid_pagination_token)?),
+        };
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // "Describes the specified EBS volumes": an id that names no volume of the account
+        // is an error, not an absent row — a malformed one before an unknown one.
+        for volume_id in &requested_ids {
+            require_known_volume(&store, volume_id)?;
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every named volume
+        // resolved: the flag asks whether the request WOULD have succeeded, so one that
+        // would have been refused is refused with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "If this parameter is set to true, the output includes resources that are
+        // managed by Amazon Web Services services"
+        // (`DescribeVolumesRequest$IncludeManagedResources`): no volume this emulator
+        // stores is managed by a service (`CreateVolume` reports no `Operator`), so every
+        // stored volume is reported either way and the flag narrows nothing.
+        let _ = input.include_managed_resources;
+
+        // The `creating` -> `available` move the clock already owed each volume is
+        // observed here, not written: `view_at` derives the state from the stored due
+        // instant, so this read changes nothing a later caller sees — and the `status`
+        // filter therefore compares against the state the caller is shown.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVolumes"))
+        // Every comparison is charged to ONE budget, so the PRODUCT of stored volumes,
+        // filters, values, held values and value length is bounded however the caller
+        // combines them — which is also what bounds how long this holds the state lock.
+        let now = ::std::time::Instant::now();
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<CreateVolumeOutput> = Vec::new();
+        for record in store.volumes.values() {
+            if budget.exhausted() {
+                break;
+            }
+            // The id narrowing is read off the stored record, so a volume the request did
+            // not name costs no projection and no comparison at all.
+            if !requested_ids.is_empty()
+                && !requested_ids
+                    .iter()
+                    .any(|id| record.view.volume_id.as_deref() == Some(id.as_str()))
+            {
+                continue;
+            }
+            let volume = record.view_at(now);
+            if matches_every_filter(&volume, &selectors, &mut budget) {
+                selected.push(volume);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or page with MaxResults"
+            )));
+        }
+
+        // Page in `VolumeId` order, which the cursor below names a position in. The store
+        // is an ordered map, so its iteration order already satisfies this sort; doing it
+        // here establishes the invariant the cursor depends on at the point of use.
+        selected.sort_by(|left, right| left.volume_id.cmp(&right.volume_id));
+
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected
+                .partition_point(|volume| volume.volume_id.as_deref().unwrap_or_default() < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // A request that names no page size gets the largest page this service serves, so
+        // the `NextToken` path behaves the same whether or not a page size was asked for.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // A token only when a volume follows this page: "To get the next page of items,
+        // make another request with the token returned in the output".
+        let next_token = page
+            .get(limit)
+            .and_then(|volume| volume.volume_id.as_deref())
+            .map(encode_page_token);
+
+        Ok(DescribeVolumesOutput {
+            volumes: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
     }
+}
+
+/// The filter names this operation documents, from `DescribeVolumesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeVolumesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather
+/// than listed here. Every entry must be answered by [`filter_values`].
+const VOLUME_FILTERS: [&str; 19] = [
+    "attachment.attach-time",
+    "attachment.delete-on-termination",
+    "attachment.device",
+    "attachment.instance-id",
+    "attachment.status",
+    "availability-zone",
+    "availability-zone-id",
+    "create-time",
+    "encrypted",
+    "fast-restored",
+    "multi-attach-enabled",
+    "operator.managed",
+    "operator.principal",
+    "size",
+    "snapshot-id",
+    "status",
+    "tag-key",
+    "volume-id",
+    "volume-type",
+];
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
+/// the filter value" (`DescribeVolumesRequest$Filters`).
+const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
+/// selects on.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    VOLUME_FILTERS.contains(&name).then_some(name)
+}
+
+/// A boolean attribute as a filter value compares against it: the wire rendering of the
+/// member, `true` or `false`. A member that is not set carries no value for the filter to
+/// match, like any other absent attribute.
+fn boolean_values(value: Option<bool>) -> Vec<::std::borrow::Cow<'static, str>> {
+    value
+        .map(|set| ::std::borrow::Cow::Borrowed(if set { "true" } else { "false" }))
+        .into_iter()
+        .collect()
+}
+
+/// The values the EC2 filter `name` compares against this volume.
+///
+/// A filter naming an attribute this volume does not carry compares against NO values, so
+/// it selects nothing — which is the answer for every `attachment.*` filter here, an
+/// unattached volume having no attachment, and for `operator.*`, no volume this emulator
+/// stores being service-managed. `name` is a name [`canonical_filter_name`] resolved.
+fn filter_values<'a>(
+    volume: &'a CreateVolumeOutput,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return volume
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let attachments = || volume.attachments.iter().flatten();
+    let operator = || volume.operator.as_ref();
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "attachment.attach-time" => attachments()
+            .filter_map(|attachment| attachment.attach_time)
+            .map(|attach_time| Cow::Owned(attach_time.to_string()))
+            .collect(),
+        "attachment.delete-on-termination" => attachments()
+            .flat_map(|attachment| boolean_values(attachment.delete_on_termination))
+            .collect(),
+        "attachment.device" => attachments()
+            .filter_map(|attachment| attachment.device.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "attachment.instance-id" => attachments()
+            .filter_map(|attachment| attachment.instance_id.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "attachment.status" => attachments()
+            .filter_map(|attachment| attachment.state.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "availability-zone" => text(volume.availability_zone.as_deref()),
+        "availability-zone-id" => text(volume.availability_zone_id.as_deref()),
+        "create-time" => volume
+            .create_time
+            .map(|create_time| Cow::Owned(create_time.to_string()))
+            .into_iter()
+            .collect(),
+        "encrypted" => boolean_values(volume.encrypted),
+        "fast-restored" => boolean_values(volume.fast_restored),
+        "multi-attach-enabled" => boolean_values(volume.multi_attach_enabled),
+        "operator.managed" => boolean_values(operator().and_then(|operator| operator.managed)),
+        "operator.principal" => {
+            text(operator().and_then(|operator| operator.principal.as_deref()))
+        }
+        "size" => volume
+            .size
+            .map(|size| Cow::Owned(size.to_string()))
+            .into_iter()
+            .collect(),
+        "snapshot-id" => text(volume.snapshot_id.as_deref()),
+        // "`status` - The state of the volume" (`DescribeVolumesRequest$Filters`): the
+        // member the model calls `State` and the wire calls `status`.
+        "status" => text(volume.state.as_deref()),
+        "tag-key" => volume
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "volume-id" => text(volume.volume_id.as_deref()),
+        "volume-type" => text(volume.volume_type.as_deref()),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// Does `volume` satisfy every filter?
+///
+/// "If you specify multiple filters, the filters are joined with an AND" (`Filter`), and
+/// within one filter "if you specify multiple values for a filter, the values are joined
+/// with an OR" (`Filter$Values`) — each value matched case-sensitively, with EC2's own
+/// `*`/`?` wildcards, by the pattern the value was compiled into. So a filter carrying no
+/// value at all matches nothing, there being no value for the attribute to match.
+///
+/// Every comparison is charged to `budget`, so one request's filtering cannot cost more
+/// than the ceiling however it combines filters, values and value length; once the budget
+/// is gone every further comparison answers "no match" and the caller is told the answer
+/// is incomplete.
+fn matches_every_filter(
+    volume: &CreateVolumeOutput,
+    selectors: &[crate::state::CompiledFilter],
+    budget: &mut crate::state::MatchBudget,
+) -> bool {
+    selectors.iter().all(|filter| {
+        let held = filter_values(volume, &filter.name);
+        filter
+            .patterns
+            .iter()
+            .any(|pattern| held.iter().any(|value| pattern.matches_within(value, budget)))
+    })
 }

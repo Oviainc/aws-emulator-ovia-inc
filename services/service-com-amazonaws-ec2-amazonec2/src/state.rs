@@ -65,6 +65,16 @@
 //! [`ComAmazonawsEc2Amazonec2State::launch_template_id_for_name`] because the API lets a
 //! caller name either.
 //!
+//! ## EBS volumes
+//!
+//! [`ComAmazonawsEc2Amazonec2State::volumes`] holds the account's EBS volumes as
+//! [`VolumeRecord`]s: the modelled [`VolumeView`] (`com.amazonaws.ec2#Volume`) every
+//! operation that reports one answers with, plus the instant the clock owes the volume its
+//! `creating` -> `available` move — the one member of the view that is a fact of the
+//! volume's age rather than of the request, and so derived on read instead of stored.
+//! Keyed by `VolumeId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
+//! are kept in, so a pagination token can name the id the next page starts at.
+//!
 //! ## AMIs: the published catalog, plus whatever a writer stores
 //!
 //! [`ComAmazonawsEc2Amazonec2State::images`] holds the AMIs the account can see as the
@@ -108,11 +118,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
-    EbsBlockDevice, GroupIdentifier, INSTANCE_TYPE_VALUES, Image, Instance, InstanceState,
-    InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES, LaunchTemplate, Monitoring,
-    OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch, RequestLaunchTemplateData,
-    RunInstancesOutput, SecurityGroup, StateReason, Subnet, Tag, UserIdGroupPair, Vpc,
-    VpcCidrBlockAssociation, VpcCidrBlockState,
+    CreateVolumeOutput, EbsBlockDevice, GroupIdentifier, INSTANCE_TYPE_VALUES, Image, Instance,
+    InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
+    LaunchTemplate, Monitoring, OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch,
+    RequestLaunchTemplateData, RunInstancesOutput, SecurityGroup, StateReason, Subnet, Tag,
+    UserIdGroupPair, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -510,6 +520,28 @@ pub const INVALID_GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
 /// EC2's error code for a pagination token this service did not issue.
 pub const INVALID_PAGINATION_TOKEN: &str = "InvalidPaginationToken";
 
+/// EC2's error code for a request that named a volume id this account holds no EBS
+/// volume for.
+pub const INVALID_VOLUME_ID_NOT_FOUND: &str = "InvalidVolume.NotFound";
+
+/// EC2's error code for a volume id that is not shaped like one, answered BEFORE the
+/// id is looked up — the same ordering `require_known_instance` keeps for instances.
+pub const INVALID_VOLUME_ID_MALFORMED: &str = "InvalidVolumeID.Malformed";
+
+/// EC2's error code for a request that named a snapshot id this account holds no
+/// snapshot for.
+pub const INVALID_SNAPSHOT_ID_NOT_FOUND: &str = "InvalidSnapshot.NotFound";
+
+/// EC2's error code for a snapshot id that is not shaped like one, answered BEFORE the
+/// id is looked up — the same ordering `require_known_volume` keeps for a volume id.
+pub const INVALID_SNAPSHOT_ID_MALFORMED: &str = "InvalidSnapshotID.Malformed";
+
+/// EC2's error code for a request that would take the account past its EBS volume
+/// quota. A ceiling on what is STORED is a quota, not something the request got wrong,
+/// so it is answered with the quota code an SDK classifies as one rather than with
+/// `InvalidParameterValue`.
+pub const VOLUME_LIMIT_EXCEEDED: &str = "VolumeLimitExceeded";
+
 /// EC2's error code for a failure of the emulator itself, never for anything a request
 /// carries: a 5xx is retryable to an SDK's retry classifier.
 pub const INTERNAL_ERROR: &str = "InternalError";
@@ -725,6 +757,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of generated resource-id suffixes, so an id is unique within a
     /// run and deterministic across runs.
     pub id_counter: u64,
+    /// Every EBS volume the account holds, by `VolumeId` — see the module docs. Ordered
+    /// by id, which is the order `DescribeVolumes` reports and pages over.
+    pub volumes: BTreeMap<String, VolumeRecord>,
+    /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
+    /// same request answers with that volume instead of creating a second one.
+    pub volume_client_tokens: HashMap<String, String>,
 }
 
 /// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
@@ -750,6 +788,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             launch_templates: BTreeMap::new(),
             launch_template_client_tokens: HashMap::new(),
             id_counter: 0,
+            volumes: BTreeMap::new(),
+            volume_client_tokens: HashMap::new(),
         };
         let default_vpc = state.insert_vpc(
             DEFAULT_VPC_CIDR_BLOCK,
@@ -2531,6 +2571,274 @@ pub fn dry_run_operation<E>() -> crate::scaffolded::Scaffolded<E> {
         412,
         "Request would have succeeded, but DryRun flag is set.",
     )
+}
+
+// =============================================================================
+// EBS volumes
+// =============================================================================
+
+/// The `Volume` shape, under the name the scaffold generated for it.
+///
+/// `com.amazonaws.ec2#Volume` is both `CreateVolume`'s output shape and the member
+/// type of `DescribeVolumes`'s `Volumes` list, so the generator emitted it once under
+/// the output name. This alias lets the code read as the model does, the same way
+/// [`ReservationView`] does for `Reservation`.
+pub type VolumeView = CreateVolumeOutput;
+
+/// A volume that is being created and cannot be attached yet: `VolumeState`'s
+/// `creating` (`smithy_query(query="shape",shape="VolumeState")`).
+pub const VOLUME_STATE_CREATING: &str = "creating";
+
+/// A created volume that is not attached to an instance: `VolumeState`'s `available`.
+pub const VOLUME_STATE_AVAILABLE: &str = "available";
+
+/// The volume type `CreateVolume` uses when the request names none: "Default: gp2"
+/// (`CreateVolumeRequest$VolumeType`).
+pub const DEFAULT_VOLUME_TYPE: &str = "gp2";
+
+/// The one resource type `CreateVolume`'s `TagSpecifications` can name: "The tags to
+/// apply to the volume during creation" (`CreateVolumeRequest$TagSpecifications`).
+pub const VOLUME_TAGGABLE_RESOURCE: &str = "volume";
+
+/// How many EBS volumes this emulator stores before `CreateVolume` is refused.
+///
+/// CHOSEN, like [`MAX_STORED_INSTANCES`] and for the same reason: nothing in this
+/// emulator reclaims a stored volume, so the store needs a ceiling that is not the
+/// process's memory. It is well above any published per-Region volume quota a test
+/// would exercise.
+///
+/// A count ceiling is not a memory bound on its own — see [`MAX_STORED_BYTES`] — so the
+/// caller-chosen bytes of each volume are charged against that budget too
+/// ([`volume_payload_bytes`]).
+pub const MAX_STORED_VOLUMES: usize = 4096;
+
+/// The longest `KmsKeyId` `CreateVolume` accepts.
+///
+/// AWS KMS bounds a key identifier — a key id, an alias, or either as an ARN — at 2048
+/// characters (`KeyId` in the AWS KMS API Reference). The EC2 model declares no
+/// `@length` on the member, so the handler is the only place the bound can exist, and
+/// without one a single request could store an arbitrarily long string per volume.
+pub const MAX_KMS_KEY_ID_CHARS: usize = 2048;
+
+/// The size range, in GiB, each volume type accepts, as `(type, min, max)`.
+///
+/// Source: `CreateVolumeRequest$Size` — "Valid sizes: gp2: 1 - 16,384 GiB gp3: 1 -
+/// 65,536 GiB io1: 4 - 16,384 GiB io2: 4 - 65,536 GiB st1 and sc1: 125 - 16,384 GiB
+/// standard: 1 - 1024 GiB". Every value of the modelled `VolumeType` enum
+/// ([`crate::ops::types::VOLUME_TYPE_VALUES`]) appears exactly once.
+pub const VOLUME_SIZE_RANGES: [(&str, i32, i32); 7] = [
+    ("gp2", 1, 16_384),
+    ("gp3", 1, 65_536),
+    ("io1", 4, 16_384),
+    ("io2", 4, 65_536),
+    ("sc1", 125, 16_384),
+    ("st1", 125, 16_384),
+    ("standard", 1, 1_024),
+];
+
+/// The size range `volume_type` accepts, or `None` for a type the model does not
+/// publish one for.
+pub fn volume_size_range(volume_type: &str) -> Option<(i32, i32)> {
+    VOLUME_SIZE_RANGES
+        .iter()
+        .find(|(name, _, _)| *name == volume_type)
+        .map(|(_, min, max)| (*min, *max))
+}
+
+/// The IOPS range each volume type that provisions IOPS accepts, as
+/// `(type, min, max)`.
+///
+/// Source: `CreateVolumeRequest$Iops` — "Required for io1 and io2 volumes. Optional
+/// for gp3 volumes. Omit for all other volume types. Valid ranges: gp3: 3,000
+/// (default) - 80,000 IOPS io1: 100 - 64,000 IOPS io2: 100 - 256,000 IOPS". A type
+/// absent from this table takes no `Iops` at all.
+pub const VOLUME_IOPS_RANGES: [(&str, i32, i32); 3] =
+    [("gp3", 3_000, 80_000), ("io1", 100, 64_000), ("io2", 100, 256_000)];
+
+/// The IOPS range `volume_type` accepts, or `None` for a type that takes none.
+pub fn volume_iops_range(volume_type: &str) -> Option<(i32, i32)> {
+    VOLUME_IOPS_RANGES
+        .iter()
+        .find(|(name, _, _)| *name == volume_type)
+        .map(|(_, min, max)| (*min, *max))
+}
+
+/// The volume types `Iops` is REQUIRED for: "Required for io1 and io2 volumes"
+/// (`CreateVolumeRequest$Iops`) — and the same two types Multi-Attach is supported
+/// with: "This parameter is supported with io1 and io2 volumes only"
+/// (`CreateVolumeRequest$MultiAttachEnabled`).
+pub const PROVISIONED_IOPS_VOLUME_TYPES: [&str; 2] = ["io1", "io2"];
+
+/// The IOPS a `gp3` volume gets when the request names none: "gp3: 3,000 (default)"
+/// (`CreateVolumeRequest$Iops`).
+pub const DEFAULT_GP3_IOPS: i32 = 3_000;
+
+/// The one volume type `Throughput` applies to: "Supported for gp3 volumes only. Omit
+/// for all other volume types" (`CreateVolumeRequest$Throughput`).
+pub const THROUGHPUT_VOLUME_TYPE: &str = "gp3";
+
+/// The throughput range a `gp3` volume accepts, in MiB/s: "Valid Range: 125 - 2000
+/// MiB/s" (`CreateVolumeRequest$Throughput`).
+pub const GP3_THROUGHPUT_RANGE: (i32, i32) = (125, 2_000);
+
+/// The throughput a `gp3` volume gets when the request names none: the bottom of
+/// [`GP3_THROUGHPUT_RANGE`], which is what AWS provisions by default.
+pub const DEFAULT_GP3_THROUGHPUT: i32 = GP3_THROUGHPUT_RANGE.0;
+
+/// One stored EBS volume: the modelled [`VolumeView`] every operation that reports
+/// one answers with, plus the instant the clock owes it its `creating` ->
+/// `available` move.
+///
+/// The view holds no `State`: the state is a fact of the volume's age, so
+/// [`VolumeRecord::view_at`] derives it rather than letting two writers store two
+/// different words for it.
+#[derive(Debug, Clone)]
+pub struct VolumeRecord {
+    /// The volume as the model shapes it, with `State` left for `view_at` to fill.
+    pub view: VolumeView,
+    /// The instant from which this volume's `creating` -> `available` move is due.
+    /// Monotonic ([`Instant`]), because it is only ever compared against the clock
+    /// and never reported, so a wall-clock adjustment cannot move a volume back to
+    /// `creating`.
+    pub available_at: Instant,
+}
+
+impl VolumeRecord {
+    /// This volume as of `now`: the stored view with the `State` the clock has
+    /// reached. A read observes the transition the clock already owed without
+    /// writing anything.
+    pub fn view_at(&self, now: Instant) -> VolumeView {
+        let mut view = self.view.clone();
+        view.state = Some(self.state_at(now).to_string());
+        view
+    }
+
+    /// The volume's `VolumeState` at `now`.
+    pub fn state_at(&self, now: Instant) -> &'static str {
+        if now < self.available_at {
+            VOLUME_STATE_CREATING
+        } else {
+            VOLUME_STATE_AVAILABLE
+        }
+    }
+
+    /// This volume as `CreateVolume` reports it: [`VolumeRecord::view_at`] without
+    /// the members the model says that operation does not return — "This parameter
+    /// is not returned by CreateVolume" on `Attachments`, `FastRestored` and
+    /// `SseType`.
+    pub fn create_response(&self, now: Instant) -> VolumeView {
+        VolumeView {
+            attachments: None,
+            fast_restored: None,
+            sse_type: None,
+            ..self.view_at(now)
+        }
+    }
+}
+
+/// The caller-chosen bytes one stored volume holds: its tags, the KMS key the request
+/// named and the `ClientToken` the token map keeps for it. Everything else on the record
+/// — the id, the ARN, the account, the zone, the sizes and the states — is derived by
+/// this module or bounded by the model, so it is fixed-size.
+///
+/// The ONE definition of that charge: `CreateVolume` asks it before the write and charges
+/// exactly it, and a removal path must give back the same number.
+pub fn volume_payload_bytes(
+    tags: &[Tag],
+    kms_key_id: Option<&str>,
+    client_token: Option<&str>,
+) -> usize {
+    tag_list_bytes(tags)
+        .saturating_add(kms_key_id.map_or(0, str::len))
+        .saturating_add(client_token.map_or(0, str::len))
+}
+
+/// Whether `id` is a well-formed EBS volume id.
+///
+/// A volume id is `vol-` followed by 8 or 17 lowercase hexadecimal digits — the short
+/// and the long id form, as the model's own `^vol-([0-9a-f]{8}|[0-9a-f]{17})$` style
+/// id patterns read. EC2 answers `InvalidVolumeID.Malformed` for anything else,
+/// BEFORE it looks the id up.
+pub fn volume_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("vol-") else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse a volume id the request named that this service cannot resolve: a malformed
+/// one before an unknown one, the way the service orders the two.
+pub fn require_known_volume<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    volume_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if !volume_id_is_well_formed(volume_id) {
+        return Err(crate::scaffolded::Scaffolded::service_error(
+            INVALID_VOLUME_ID_MALFORMED,
+            400,
+            format!("Invalid id: '{volume_id}'"),
+        ));
+    }
+    if !store.volumes.contains_key(volume_id) {
+        return Err(invalid_volume_id_not_found(volume_id));
+    }
+    Ok(())
+}
+
+/// Refuse a request that named a volume id no volume of the account has, the way EC2
+/// does: HTTP 400 `InvalidVolume.NotFound`.
+pub fn invalid_volume_id_not_found<E>(volume_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_VOLUME_ID_NOT_FOUND,
+        400,
+        format!("The volume '{volume_id}' does not exist."),
+    )
+}
+
+/// Refuse a request that named a snapshot id no snapshot of the account has, the way
+/// EC2 does: HTTP 400 `InvalidSnapshot.NotFound`.
+pub fn invalid_snapshot_id_not_found<E>(snapshot_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SNAPSHOT_ID_NOT_FOUND,
+        400,
+        format!("The snapshot '{snapshot_id}' does not exist."),
+    )
+}
+
+/// Whether `id` is a well-formed EBS snapshot id: `snap-` followed by 8 or 17 lowercase
+/// hexadecimal digits — the short and the long id form, as the model's own
+/// `^snap-([0-9a-f]{8}|[0-9a-f]{17})$` style id patterns read.
+pub fn snapshot_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("snap-") else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse a snapshot id the request named that this service cannot resolve: a malformed
+/// one is answered as malformed, and a well-formed one as not found — the way the
+/// service orders the two, and the same ordering [`require_known_volume`] keeps.
+pub fn unresolvable_snapshot_id<E>(snapshot_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    if snapshot_id_is_well_formed(snapshot_id) {
+        return invalid_snapshot_id_not_found(snapshot_id);
+    }
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SNAPSHOT_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{snapshot_id}'"),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_STORED_VOLUMES`]: HTTP 400
+/// `VolumeLimitExceeded`, EC2's own volumes-per-Region quota code.
+pub fn volume_limit_exceeded<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(VOLUME_LIMIT_EXCEEDED, 400, message)
 }
 
 /// The Region this request was signed for, from its SigV4 credential scope; the

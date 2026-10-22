@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStudio
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStudio`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates an EMR Studio in the shared engine from the network, role and storage the
+//! request names, and answers with the studio id EMR minted and the studio's access
+//! URL, so a later `DescribeStudio` reports the same studio.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStudio::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! EMR resolves a Studio's network, role and backup location BEFORE creating anything,
+//! and refuses the request with `InvalidRequestException` — creating no studio — when
+//! one of them cannot name an existing resource: a `VpcId`, `SubnetIds` entry or
+//! security group id outside the form Amazon EC2 gives those resources
+//! ([`crate::state::is_ec2_resource_id`]), more subnets than a Studio may have, a
+//! `DefaultS3Location` that is not an Amazon S3 URI, an empty `ServiceRole`, or IAM
+//! authentication with no `UserRole` to log users in as.
 //!
 //! ## Shape of an operation
 //!
@@ -206,18 +208,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStudio` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStudioErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStudio"))
+        use crate::state::{
+            auth_mode, is_ec2_resource_id, is_s3_location, MAX_STUDIOS, MAX_STUDIO_SUBNETS,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        // Every refusal below is the one client error this operation models, and each
+        // one is taken BEFORE anything is stored, so a refused create leaves no studio.
+        let refuse = |message: String| -> Self::Error {
+            CreateStudioErrorModeled::InvalidRequestException(InvalidRequestException {
+                error_code: None,
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // "A list of subnet IDs to associate with the Amazon EMR Studio. A Studio can
+        // have a maximum of 5 subnets." (`CreateStudio$SubnetIds` doc.)
+        if input.subnet_ids.is_empty() || input.subnet_ids.len() > MAX_STUDIO_SUBNETS {
+            return Err(refuse(format!(
+                "SubnetIds carries {} subnets; a Studio has 1 to {MAX_STUDIO_SUBNETS} subnets",
+                input.subnet_ids.len()
+            )));
+        }
+        if !is_ec2_resource_id("vpc", &input.vpc_id) {
+            return Err(refuse(format!(
+                "VpcId '{}' does not name a VPC in this account",
+                input.vpc_id
+            )));
+        }
+        for subnet_id in &input.subnet_ids {
+            if !is_ec2_resource_id("subnet", subnet_id) {
+                return Err(refuse(format!(
+                    "SubnetIds entry '{subnet_id}' does not name a subnet in this account"
+                )));
+            }
+        }
+        for (member, group_id) in [
+            ("WorkspaceSecurityGroupId", &input.workspace_security_group_id),
+            ("EngineSecurityGroupId", &input.engine_security_group_id),
+        ] {
+            if !is_ec2_resource_id("sg", group_id) {
+                return Err(refuse(format!(
+                    "{member} '{group_id}' does not name a security group in this account"
+                )));
+            }
+        }
+
+        // "The Amazon S3 location to back up Amazon EMR Studio Workspaces and notebook
+        // files." (`CreateStudio$DefaultS3Location` doc.)
+        if !is_s3_location(&input.default_s3_location) {
+            return Err(refuse(format!(
+                "DefaultS3Location '{}' is not an Amazon S3 location",
+                input.default_s3_location
+            )));
+        }
+
+        // "The IAM role that the Amazon EMR Studio assumes."
+        // (`CreateStudio$ServiceRole` doc.) `XmlString` admits the empty string, which
+        // names no role.
+        if input.service_role.trim().is_empty() {
+            return Err(refuse(
+                "ServiceRole is empty, so it names no IAM role".to_string(),
+            ));
+        }
+
+        // "A Studio only requires a UserRole when you use IAM authentication."
+        // (`Studio$UserRole` doc.)
+        let user_role = input.user_role.filter(|role| !role.trim().is_empty());
+        if input.auth_mode == auth_mode::IAM && user_role.is_none() {
+            return Err(refuse(
+                "AuthMode IAM requires a UserRole for users logged in to the Studio"
+                    .to_string(),
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateStudioErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR studio store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // An account holds a bounded number of Studios, so a caller cannot grow the
+        // store without limit; past the quota the create is refused and nothing is
+        // stored.
+        if store.studios.len() >= MAX_STUDIOS {
+            return Err(refuse(format!(
+                "This account already holds {MAX_STUDIOS} EMR Studios, which is the maximum"
+            )));
+        }
+
+        let studio_id = store.mint_studio_id();
+        let url = crate::state::studio_url(&region, &studio_id);
+        let studio = Studio {
+            studio_id: Some(studio_id.clone()),
+            studio_arn: Some(crate::state::studio_arn(&region, &studio_id)),
+            name: Some(input.name),
+            description: input.description,
+            auth_mode: Some(input.auth_mode),
+            vpc_id: Some(input.vpc_id),
+            subnet_ids: Some(input.subnet_ids),
+            service_role: Some(input.service_role),
+            user_role,
+            workspace_security_group_id: Some(input.workspace_security_group_id),
+            engine_security_group_id: Some(input.engine_security_group_id),
+            url: Some(url.clone()),
+            creation_time: Some(crate::state::timestamp(now)),
+            default_s3_location: Some(input.default_s3_location),
+            idp_auth_url: input.idp_auth_url,
+            idp_relay_state_parameter_name: input.idp_relay_state_parameter_name,
+            // An empty `Tags` list is the same as none: report the member only when
+            // the studio actually carries tags.
+            tags: input.tags.filter(|tags| !tags.is_empty()),
+            idc_instance_arn: input.idc_instance_arn,
+            trusted_identity_propagation_enabled: input.trusted_identity_propagation_enabled,
+            idc_user_assignment: input.idc_user_assignment,
+            encryption_key_arn: input.encryption_key_arn,
+        };
+
+        // What is answered is what was stored, so a caller sees exactly what a later
+        // `DescribeStudio` reports.
+        store.studios.insert(studio_id.clone(), studio);
+
+        Ok(CreateStudioOutput {
+            studio_id: Some(studio_id),
+            url: Some(url),
+        })
     }
 }

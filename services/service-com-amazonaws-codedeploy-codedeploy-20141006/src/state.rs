@@ -42,6 +42,10 @@ pub const DEPLOYMENT_STATUS_CREATED: &str = "Created";
 pub const DEPLOYMENT_STATUS_IN_PROGRESS: &str = "InProgress";
 /// See [`DEPLOYMENT_STATUS_CREATED`].
 pub const DEPLOYMENT_STATUS_SUCCEEDED: &str = "Succeeded";
+/// See [`DEPLOYMENT_STATUS_CREATED`]. The terminal status of a deployment whose
+/// deployment group resolved no target to deploy to; see
+/// [`deployment_target_count`].
+pub const DEPLOYMENT_STATUS_FAILED: &str = "Failed";
 /// See [`DEPLOYMENT_STATUS_CREATED`]: the status a deployment a caller stopped
 /// holds.
 pub const DEPLOYMENT_STATUS_STOPPED: &str = "Stopped";
@@ -58,9 +62,23 @@ pub const DEPLOYMENT_STATUS_STOPPED: &str = "Stopped";
 pub fn deployment_is_terminal(status: &str) -> bool {
     matches!(
         status,
-        DEPLOYMENT_STATUS_SUCCEEDED | "Failed" | DEPLOYMENT_STATUS_STOPPED
+        DEPLOYMENT_STATUS_SUCCEEDED | DEPLOYMENT_STATUS_FAILED | DEPLOYMENT_STATUS_STOPPED
     )
 }
+
+/// The `ErrorCode` a deployment that found nothing to deploy to carries
+/// (`smithy_query(query="shape",shape="ErrorCode")` lists it; the AWS CodeDeploy
+/// User Guide's "Error codes" documents `NO_INSTANCES` as "no instances were
+/// found in your deployment group").
+pub const ERROR_CODE_NO_INSTANCES: &str = "NO_INSTANCES";
+
+/// The characters a minted deployment-id suffix is drawn from, and how many of
+/// them one carries: CodeDeploy's `d-XXXXXXXXX` deployment ids.
+const DEPLOYMENT_ID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+/// See [`DEPLOYMENT_ID_ALPHABET`].
+const DEPLOYMENT_ID_SUFFIX_LEN: usize = 9;
+/// See [`DEPLOYMENT_ID_ALPHABET`].
+const DEPLOYMENT_ID_PREFIX: &str = "d-";
 
 /// What a handler answers when the engine it was constructed with is not the
 /// shared in-memory store.
@@ -122,6 +140,26 @@ pub const MAX_DEPLOYMENT_GROUPS_PER_APPLICATION: usize = 1_000;
 /// is applied as RETENTION: creating a deployment past it drops the oldest
 /// deployments, oldest first, so a caller cannot grow the store without limit.
 pub const MAX_DEPLOYMENT_HISTORY: usize = 500;
+
+/// How many tag groups one `ec2TagSet` / `onPremisesTagSet` may hold, the bound
+/// `TagSetListLimitExceededException` answers.
+///
+/// The model states the figure: that error is "The number of tag groups included
+/// in the tag set list exceeded the maximum allowed limit of 3"
+/// (`smithy_query(query="shape",shape="TagSetListLimitExceededException")`).
+pub const MAX_TAG_SET_GROUPS: usize = 3;
+
+/// How many tag filters ONE selector list of a deployment group may hold —
+/// `ec2TagFilters`, `onPremisesInstanceTagFilters`, or one group of either tag
+/// set.
+///
+/// CodeDeploy states the figure for a tag type in
+/// `InvalidTargetInstancesException` ("The limit of 10 tags for a tag type was
+/// exceeded"). Enforcing it is also what bounds the work of resolving a
+/// deployment's targets: every filter a group holds is matched against the tags
+/// of every registered on-premises instance, so an unbounded filter list would
+/// be unbounded work on each `CreateDeployment`.
+pub const MAX_TAG_FILTERS_PER_LIST: usize = 10;
 
 /// How many application revisions one application's registry keeps.
 ///
@@ -360,6 +398,10 @@ pub struct Deployment {
     pub starts_at_ms: i64,
     /// See [`Deployment::starts_at_ms`].
     pub completes_at_ms: i64,
+    /// How many deployment targets the deployment group resolved for this
+    /// deployment, which is what decides its terminal status; see
+    /// [`deployment_target_count`] and [`terminal_status`].
+    pub target_count: usize,
     /// Whether this deployment terminates the instances of the original (blue)
     /// environment after traffic routing: true only for a blue/green deployment
     /// whose group chose the `TERMINATE` action, which is also exactly when the
@@ -622,7 +664,7 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
 
     /// Materialise every deployment transition that was already due at `now_ms`:
     /// `Created` -> `InProgress` once it was owed a start, then `InProgress` ->
-    /// `Succeeded` once it was owed completion.
+    /// its terminal status ([`terminal_status`]) once it was owed completion.
     ///
     /// This is the one write a reporting operation performs: each transition was
     /// owed by the clock at this instant whether or not anybody called, so
@@ -662,7 +704,7 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                 && deployment.complete_time_ms.is_none()
                 && deployment.completes_at_ms <= now_ms
             {
-                deployment.status = DEPLOYMENT_STATUS_SUCCEEDED.to_string();
+                deployment.status = terminal_status(deployment.target_count).to_string();
                 deployment.complete_time_ms = Some(deployment.completes_at_ms);
             }
             deployment.complete_time_ms.is_none()
@@ -819,14 +861,15 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
     /// Mint a `d-XXXXXXXXX` deployment id: the `d-` prefix and nine characters
     /// from CodeDeploy's uppercase-alphanumeric deployment-id alphabet.
     pub fn mint_deployment_id(&mut self) -> String {
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let digest = self.digest("deployment");
         let suffix: String = digest
             .iter()
-            .take(9)
-            .map(|byte| ALPHABET[usize::from(*byte) % ALPHABET.len()] as char)
+            .take(DEPLOYMENT_ID_SUFFIX_LEN)
+            .map(|byte| {
+                DEPLOYMENT_ID_ALPHABET[usize::from(*byte) % DEPLOYMENT_ID_ALPHABET.len()] as char
+            })
             .collect();
-        format!("d-{suffix}")
+        format!("{DEPLOYMENT_ID_PREFIX}{suffix}")
     }
 
     /// The bytes every minted id is cut from: this store's monotonic counter
@@ -947,6 +990,194 @@ pub fn default_deployment_config_for(compute_platform: &str) -> &'static str {
         "ECS" => "CodeDeployDefault.ECSAllAtOnce",
         _ => "CodeDeployDefault.OneAtATime",
     }
+}
+
+/// Whether `id` is shaped like a deployment id at all.
+///
+/// CodeDeploy mints deployment ids as `d-` plus nine characters of its
+/// uppercase-alphanumeric alphabet (see
+/// [`ComAmazonawsCodedeployCodedeploy20141006State::mint_deployment_id`]), and
+/// the model puts no `@pattern` on `DeploymentId`
+/// (`smithy_query(query="shape",shape="DeploymentId")`), so the format a request
+/// must satisfy is the one the service itself issues. Anything else is not an id
+/// of anything and is what `InvalidDeploymentIdException` describes: an
+/// operation taking a `deploymentId` gates the FORMAT before it looks the
+/// deployment up, so "that is not an id" and "no deployment has that id" stay
+/// two different answers to a client that branches on them.
+pub fn deployment_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(DEPLOYMENT_ID_PREFIX) else {
+        return false;
+    };
+    suffix.len() == DEPLOYMENT_ID_SUFFIX_LEN
+        && suffix
+            .bytes()
+            .all(|byte| DEPLOYMENT_ID_ALPHABET.contains(&byte))
+}
+
+/// How much of a caller-supplied value a refusal message quotes back.
+///
+/// A refusal that names the value the caller sent is what lets them fix it, but
+/// `DeploymentId` carries no modelled length, so the value is bounded here
+/// rather than echoed whole.
+const ECHOED_VALUE_CHARS: usize = 64;
+
+/// A caller-supplied value as a refusal message quotes it: itself when short,
+/// else its first [`ECHOED_VALUE_CHARS`] characters and an ellipsis.
+pub fn echoed(value: &str) -> String {
+    let mut shown: String = value.chars().take(ECHOED_VALUE_CHARS).collect();
+    if shown.chars().count() < value.chars().count() {
+        shown.push('…');
+    }
+    shown
+}
+
+/// The refusal message every operation answers `InvalidDeploymentIdException`
+/// with, so the operations that gate the same format cannot word it differently.
+/// It quotes the id the caller sent, bounded by [`echoed`].
+pub fn malformed_deployment_id_message(deployment_id: &str) -> String {
+    format!(
+        "Specified DeploymentId is not in the valid format: {}",
+        echoed(deployment_id)
+    )
+}
+
+/// How many deployment targets `group` selects, as this emulator can resolve
+/// them.
+///
+/// CodeDeploy resolves a deployment's targets from its deployment group, and a
+/// deployment that resolves none runs to `Failed` rather than reporting success
+/// for a revision that reached nothing (the AWS CodeDeploy User Guide's "Error
+/// codes" gives that failure the [`ERROR_CODE_NO_INSTANCES`] code). What this
+/// emulator can resolve, per compute platform
+/// (`smithy_query(query="shape",shape="ComputePlatform")`):
+///
+/// * `ECS`: the group's `ecsServices` — one target per cluster/service pair.
+/// * `Lambda`: a Lambda deployment has exactly one target, the function the
+///   revision's AppSpec names — whatever the revision holds, there is one of
+///   them — so a Lambda group never resolves none.
+/// * `Server` (EC2/on-premises): the instances the group selects. The instances
+///   this emulator HOLDS are the on-premises ones registered with it, so they
+///   are resolved from that registry through the group's
+///   `onPremisesInstanceTagFilters` and `onPremisesTagSet` (see
+///   [`group_selects_instance`]). An `ec2TagFilter`, an `ec2TagSet` or an Auto
+///   Scaling group names EC2 inventory, which CodeDeploy's state does not keep
+///   and which this emulator reads from no other service, so those selectors
+///   resolve nothing.
+pub fn deployment_target_count(
+    state: &ComAmazonawsCodedeployCodedeploy20141006State,
+    group: &DeploymentGroup,
+) -> usize {
+    match group.compute_platform.as_str() {
+        "ECS" => group.ecs_services.len(),
+        // Lambda: one target per deployment; see the note above.
+        "Lambda" => 1,
+        // Server (EC2/on-premises), which is what `computePlatform` holds here
+        // when it is neither of the two above — the member is the modelled enum
+        // Server | Lambda | ECS. A value outside that enum could not reach the
+        // store, and would resolve nothing either: a platform this emulator
+        // cannot target has no targets to report.
+        _ => state
+            .on_premises_instance_order
+            .iter()
+            .filter_map(|name| state.on_premises_instances.get(name))
+            // A deregistered instance keeps its record but is no longer part of
+            // the fleet, so a deployment cannot target it.
+            .filter(|instance| instance.is_registered())
+            .filter(|instance| group_selects_instance(group, &instance.tags))
+            .count(),
+    }
+}
+
+/// Whether a deployment group selects an on-premises instance carrying `tags`.
+///
+/// The two on-premises selectors a group can carry work as the AWS CodeDeploy
+/// User Guide's "Tagging instances for deployments" describes: a
+/// `onPremisesInstanceTagFilters` list includes an instance that matches ANY of
+/// its filters, while an `onPremisesTagSet` includes one that matches at least
+/// one filter in EVERY one of its groups. A group carrying neither selects no
+/// on-premises instance at all.
+fn group_selects_instance(group: &DeploymentGroup, tags: &[Tag]) -> bool {
+    let by_filters = group
+        .on_premises_instance_tag_filters
+        .iter()
+        .any(|filter| tag_filter_matches(filter, tags));
+    let by_tag_set = group
+        .on_premises_tag_set
+        .as_ref()
+        .and_then(|set| set.on_premises_tag_set_list.as_ref())
+        .is_some_and(|groups| {
+            !groups.is_empty()
+                && groups.iter().all(|filters| {
+                    filters
+                        .iter()
+                        .any(|filter| tag_filter_matches(filter, tags))
+                })
+        });
+    by_filters || by_tag_set
+}
+
+/// Whether any of `tags` satisfies one on-premises tag filter.
+///
+/// `TagFilterType` (`smithy_query(query="shape",shape="TagFilterType")`:
+/// KEY_ONLY | VALUE_ONLY | KEY_AND_VALUE) says WHICH of the filter's members has
+/// to match: `KEY_AND_VALUE` needs BOTH, so a filter asking for it while naming
+/// only one of them describes no tag and selects nothing. A filter that states no
+/// type can only mean the members it does name, and one that names neither
+/// member selects nothing either.
+fn tag_filter_matches(filter: &TagFilter, tags: &[Tag]) -> bool {
+    let key_matches = |tag: &Tag| filter.key.is_some() && tag.key == filter.key;
+    let value_matches = |tag: &Tag| filter.value.is_some() && tag.value == filter.value;
+    match filter.r#type.as_deref() {
+        Some("KEY_ONLY") => tags.iter().any(key_matches),
+        Some("VALUE_ONLY") => tags.iter().any(value_matches),
+        Some("KEY_AND_VALUE") => {
+            filter.key.is_some()
+                && filter.value.is_some()
+                && tags.iter().any(|tag| key_matches(tag) && value_matches(tag))
+        }
+        // A filter that states no type: the members it does name.
+        _ => {
+            (filter.key.is_some() || filter.value.is_some())
+                && tags.iter().any(|tag| {
+                    (filter.key.is_none() || key_matches(tag))
+                        && (filter.value.is_none() || value_matches(tag))
+                })
+        }
+    }
+}
+
+/// The terminal status a deployment with `target_count` targets reaches:
+/// `Succeeded` when its revision had somewhere to go, `Failed` when the
+/// deployment group resolved nothing to deploy to.
+fn terminal_status(target_count: usize) -> &'static str {
+    if target_count == 0 {
+        DEPLOYMENT_STATUS_FAILED
+    } else {
+        DEPLOYMENT_STATUS_SUCCEEDED
+    }
+}
+
+/// Whether `config` asks for automatic rollback without naming an event that
+/// would trigger one, which is one of the cases
+/// `InvalidAutoRollbackConfigException` describes ("automatic rollback is
+/// enabled, but an invalid triggering event type or no event types were
+/// listed").
+pub fn auto_rollback_is_enabled_without_events(config: &AutoRollbackConfiguration) -> bool {
+    config.enabled && config.events.as_ref().is_none_or(Vec::is_empty)
+}
+
+/// `config` as it is STORED: `None` when it carries no information.
+///
+/// A disabled automatic rollback listing no events says nothing a caller did not
+/// already get by omitting the member, so it is normalised away at the store
+/// rather than kept and echoed — a round-tripped deployment-group or deployment
+/// document then holds exactly the members that carry information, and absent
+/// and information-free requests read back the same. A configuration that lists
+/// events is kept whether or not it is enabled: the events are information.
+pub fn normalized_auto_rollback_configuration(
+    config: Option<AutoRollbackConfiguration>,
+) -> Option<AutoRollbackConfiguration> {
+    config.filter(|config| config.enabled || config.events.as_ref().is_some_and(|e| !e.is_empty()))
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -1171,7 +1402,7 @@ pub fn deployment_info(deployment: &Deployment) -> crate::ops::types::Deployment
         previous_revision: deployment.previous_revision.clone(),
         revision: deployment.revision.clone(),
         status: Some(deployment.status.clone()),
-        error_information: None,
+        error_information: deployment_error_information(deployment),
         create_time: Some(timestamp(deployment.create_time_ms)),
         start_time: deployment.start_time_ms.map(timestamp),
         complete_time: deployment.complete_time_ms.map(timestamp),
@@ -1198,6 +1429,24 @@ pub fn deployment_info(deployment: &Deployment) -> crate::ops::types::Deployment
         override_alarm_configuration: deployment.override_alarm_configuration.clone(),
         ec2_deployment_options: deployment.ec2_deployment_options.clone(),
     }
+}
+
+/// Why a failed deployment failed, as the modelled `ErrorInformation`.
+///
+/// DERIVED from the deployment's own record — the terminal status the clock gave
+/// it and the targets its group resolved — rather than stored a second time
+/// where it could disagree with the status beside it.
+fn deployment_error_information(
+    deployment: &Deployment,
+) -> Option<crate::ops::types::ErrorInformation> {
+    (deployment.status == DEPLOYMENT_STATUS_FAILED && deployment.target_count == 0).then(|| {
+        crate::ops::types::ErrorInformation {
+            code: Some(ERROR_CODE_NO_INSTANCES.to_string()),
+            message: Some(
+                "No instances found for the deployment group of this deployment".to_string(),
+            ),
+        }
+    })
 }
 
 /// A stored deployment group as the modelled `DeploymentGroupInfo`.
@@ -1239,23 +1488,28 @@ pub fn deployment_group_info(
         deployment_group_id: Some(group.deployment_group_id.clone()),
         deployment_group_name: Some(group.deployment_group_name.clone()),
         deployment_config_name: Some(group.deployment_config_name.clone()),
-        ec2_tag_filters: non_empty(&group.ec2_tag_filters),
-        on_premises_instance_tag_filters: non_empty(&group.on_premises_instance_tag_filters),
-        auto_scaling_groups: non_empty(
-            &group
+        // The group's instance-selection and trigger lists are reported as the
+        // lists the group HOLDS, empty included: a request that sent one empty
+        // and a request that omitted it gave the group the same thing, so they
+        // read back the same way and a client can index the member instead of
+        // handling absent and empty separately.
+        ec2_tag_filters: Some(group.ec2_tag_filters.clone()),
+        on_premises_instance_tag_filters: Some(group.on_premises_instance_tag_filters.clone()),
+        auto_scaling_groups: Some(
+            group
                 .auto_scaling_groups
                 .iter()
                 .map(|name| crate::ops::types::AutoScalingGroup {
                     name: Some(name.clone()),
                     ..Default::default()
                 })
-                .collect::<Vec<_>>(),
+                .collect(),
         ),
         service_role_arn: Some(group.service_role_arn.clone()),
         target_revision: last_attempted
             .as_ref()
             .and_then(|deployment| deployment.revision.clone()),
-        trigger_configurations: non_empty(&group.trigger_configurations),
+        trigger_configurations: Some(group.trigger_configurations.clone()),
         alarm_configuration: group.alarm_configuration.clone(),
         auto_rollback_configuration: group.auto_rollback_configuration.clone(),
         deployment_style: group.deployment_style.clone(),
@@ -1267,6 +1521,10 @@ pub fn deployment_group_info(
         ec2_tag_set: group.ec2_tag_set.clone(),
         on_premises_tag_set: group.on_premises_tag_set.clone(),
         compute_platform: Some(group.compute_platform.clone()),
+        // `ecsServices` is reported only when the group has any: the model scopes
+        // the member to one compute platform ("This applies only to deployment
+        // groups that use the Amazon ECS compute platform"), so an empty list is
+        // not something every group holds.
         ecs_services: non_empty(&group.ecs_services),
         ec2_deployment_options: group.ec2_deployment_options.clone(),
         termination_hook_enabled: group.termination_hook_enabled,
@@ -1274,7 +1532,7 @@ pub fn deployment_group_info(
 }
 
 /// A stored list as an optional modelled list: absent when nothing was stored,
-/// so a group created without one does not report an empty list for it.
+/// for a member a resource does not always carry.
 fn non_empty<T: Clone>(items: &[T]) -> Option<Vec<T>> {
     (!items.is_empty()).then(|| items.to_vec())
 }
@@ -1430,4 +1688,284 @@ pub fn with_state<Eng: Send + Sync + 'static, R>(
     guard.ensure_seeded(now);
     guard.advance_clock(now);
     Some(body(&mut guard))
+}
+
+#[cfg(test)]
+mod tests {
+    //! What [`deployment_target_count`] resolves, over a store built in place.
+    //!
+    //! These tables span the selector forms exhaustively and cheaply — every
+    //! `TagFilterType`, a filter naming only one member, an empty tag set, a
+    //! deregistered instance — where building the same row over the wire costs a
+    //! registration, a tagging call and a deployment each. The rule they pin is
+    //! also asserted end-to-end, through the operations a client calls, in
+    //! `tests/all/codedeploy_deployment_outcome.rs`.
+
+    use super::*;
+
+    /// A deployment group of `platform` carrying no selector at all; each case
+    /// below sets the one member it is about.
+    fn group(platform: &str) -> DeploymentGroup {
+        DeploymentGroup {
+            deployment_group_id: "dgid".to_string(),
+            deployment_group_name: "dg".to_string(),
+            application_name: "app".to_string(),
+            service_role_arn: "arn:aws:iam::123456789012:role/CodeDeployRole".to_string(),
+            deployment_config_name: "CodeDeployDefault.OneAtATime".to_string(),
+            compute_platform: platform.to_string(),
+            ec2_tag_filters: Vec::new(),
+            on_premises_instance_tag_filters: Vec::new(),
+            auto_scaling_groups: Vec::new(),
+            trigger_configurations: Vec::new(),
+            alarm_configuration: None,
+            auto_rollback_configuration: None,
+            outdated_instances_strategy: None,
+            deployment_style: None,
+            blue_green_deployment_configuration: None,
+            load_balancer_info: None,
+            ec2_tag_set: None,
+            on_premises_tag_set: None,
+            ecs_services: Vec::new(),
+            ec2_deployment_options: None,
+            termination_hook_enabled: false,
+            tags: Vec::new(),
+            create_time_ms: 0,
+        }
+    }
+
+    fn tag(key: &str, value: &str) -> Tag {
+        Tag {
+            key: Some(key.to_string()),
+            value: Some(value.to_string()),
+        }
+    }
+
+    /// One on-premises tag filter: `kind` is a `TagFilterType` value, or `None`
+    /// for a filter that states no type.
+    fn filter(key: Option<&str>, value: Option<&str>, kind: Option<&str>) -> TagFilter {
+        TagFilter {
+            key: key.map(str::to_string),
+            value: value.map(str::to_string),
+            r#type: kind.map(str::to_string),
+        }
+    }
+
+    /// Put one on-premises instance in the registry.
+    fn register(
+        state: &mut ComAmazonawsCodedeployCodedeploy20141006State,
+        name: &str,
+        tags: Vec<Tag>,
+        deregistered: bool,
+    ) {
+        state.register_on_premises_instance(OnPremisesInstance {
+            instance_name: name.to_string(),
+            instance_arn: instance_arn("us-east-1", name),
+            iam_user_arn: Some(format!("arn:aws:iam::123456789012:user/{name}")),
+            iam_session_arn: None,
+            register_time_ms: 1,
+            deregister_time_ms: deregistered.then_some(2),
+            tags,
+        });
+    }
+
+    /// RULE: an EC2/on-premises deployment group targets the REGISTERED
+    /// on-premises instances its `onPremisesInstanceTagFilters` (any filter) or
+    /// its `onPremisesTagSet` (one filter from every group) select.
+    #[test]
+    fn a_server_group_targets_the_on_premises_instances_it_selects() {
+        // Rows differ along the selector the group carries, the `TagFilterType`
+        // it uses, and whether the instance's tags satisfy it.
+        struct Case {
+            case: &'static str,
+            filters: Vec<TagFilter>,
+            tag_set: Option<Vec<Vec<TagFilter>>>,
+            expected: usize,
+        }
+        let cases = vec![
+            Case {
+                case: "no selector at all",
+                filters: Vec::new(),
+                tag_set: None,
+                expected: 0,
+            },
+            Case {
+                case: "KEY_AND_VALUE matching both instances",
+                filters: vec![filter(Some("Env"), Some("prod"), Some("KEY_AND_VALUE"))],
+                tag_set: None,
+                expected: 2,
+            },
+            Case {
+                case: "KEY_AND_VALUE matching neither",
+                filters: vec![filter(Some("Env"), Some("staging"), Some("KEY_AND_VALUE"))],
+                tag_set: None,
+                expected: 0,
+            },
+            Case {
+                case: "KEY_AND_VALUE naming only the key",
+                filters: vec![filter(Some("Env"), None, Some("KEY_AND_VALUE"))],
+                tag_set: None,
+                expected: 0,
+            },
+            Case {
+                case: "KEY_AND_VALUE naming only the value",
+                filters: vec![filter(None, Some("prod"), Some("KEY_AND_VALUE"))],
+                tag_set: None,
+                expected: 0,
+            },
+            Case {
+                case: "KEY_ONLY, which ignores the value",
+                filters: vec![filter(Some("Rack"), Some("ignored"), Some("KEY_ONLY"))],
+                tag_set: None,
+                expected: 1,
+            },
+            Case {
+                case: "VALUE_ONLY, which ignores the key",
+                filters: vec![filter(Some("ignored"), Some("seven"), Some("VALUE_ONLY"))],
+                tag_set: None,
+                expected: 1,
+            },
+            Case {
+                case: "no type, so the members the filter names",
+                filters: vec![filter(Some("Env"), Some("prod"), None)],
+                tag_set: None,
+                expected: 2,
+            },
+            Case {
+                case: "a filter naming nothing",
+                filters: vec![filter(None, None, None)],
+                tag_set: None,
+                expected: 0,
+            },
+            Case {
+                case: "two filters, either of which includes an instance",
+                filters: vec![
+                    filter(Some("Rack"), Some("seven"), Some("KEY_AND_VALUE")),
+                    filter(Some("Env"), Some("prod"), Some("KEY_AND_VALUE")),
+                ],
+                tag_set: None,
+                expected: 2,
+            },
+            Case {
+                case: "a tag set whose every group matches one instance",
+                filters: Vec::new(),
+                tag_set: Some(vec![
+                    vec![filter(Some("Env"), Some("prod"), Some("KEY_AND_VALUE"))],
+                    vec![filter(Some("Rack"), Some("seven"), Some("KEY_AND_VALUE"))],
+                ]),
+                expected: 1,
+            },
+            Case {
+                case: "a tag set with a group nothing matches",
+                filters: Vec::new(),
+                tag_set: Some(vec![
+                    vec![filter(Some("Env"), Some("prod"), Some("KEY_AND_VALUE"))],
+                    vec![filter(Some("Rack"), Some("nine"), Some("KEY_AND_VALUE"))],
+                ]),
+                expected: 0,
+            },
+            Case {
+                case: "an empty tag set",
+                filters: Vec::new(),
+                tag_set: Some(Vec::new()),
+                expected: 0,
+            },
+        ];
+
+        for case in cases {
+            let mut state = ComAmazonawsCodedeployCodedeploy20141006State::default();
+            register(
+                &mut state,
+                "rack-seven",
+                vec![tag("Env", "prod"), tag("Rack", "seven")],
+                false,
+            );
+            register(&mut state, "plain", vec![tag("Env", "prod")], false);
+            // Deregistered, and tagged exactly like the first: it is a record,
+            // not a target.
+            register(
+                &mut state,
+                "retired",
+                vec![tag("Env", "prod"), tag("Rack", "seven")],
+                true,
+            );
+
+            let mut group = group("Server");
+            group.on_premises_instance_tag_filters = case.filters;
+            group.on_premises_tag_set = case.tag_set.map(|list| OnPremisesTagSet {
+                on_premises_tag_set_list: Some(list),
+            });
+            let got = deployment_target_count(&state, &group);
+            assert_eq!(
+                got, case.expected,
+                "case {:?}: expected {} target(s), got {got}",
+                case.case, case.expected
+            );
+        }
+    }
+
+    /// RULE: an EC2 selector resolves nothing here — CodeDeploy's state keeps no
+    /// EC2 inventory — while an ECS group's targets are its `ecsServices` and a
+    /// Lambda group has exactly one target.
+    #[test]
+    fn the_other_selectors_and_platforms_resolve_their_own_targets() {
+        let mut state = ComAmazonawsCodedeployCodedeploy20141006State::default();
+        register(&mut state, "rack-seven", vec![tag("Env", "prod")], false);
+
+        let ec2_filter = EC2TagFilter {
+            key: Some("Env".to_string()),
+            value: Some("prod".to_string()),
+            r#type: Some("KEY_AND_VALUE".to_string()),
+        };
+        let mut by_ec2_filter = group("Server");
+        by_ec2_filter.ec2_tag_filters = vec![ec2_filter.clone()];
+        let mut by_ec2_tag_set = group("Server");
+        by_ec2_tag_set.ec2_tag_set = Some(EC2TagSet {
+            ec2_tag_set_list: Some(vec![vec![ec2_filter]]),
+        });
+        let mut by_auto_scaling = group("Server");
+        by_auto_scaling.auto_scaling_groups = vec!["asg-web".to_string()];
+        let mut one_service = group("ECS");
+        one_service.ecs_services = vec![ECSService {
+            cluster_name: Some("cluster".to_string()),
+            service_name: Some("web".to_string()),
+        }];
+        let mut two_services = group("ECS");
+        two_services.ecs_services = vec![
+            ECSService {
+                cluster_name: Some("cluster".to_string()),
+                service_name: Some("web".to_string()),
+            },
+            ECSService {
+                cluster_name: Some("cluster".to_string()),
+                service_name: Some("api".to_string()),
+            },
+        ];
+
+        let cases: &[(&str, DeploymentGroup, usize)] = &[
+            ("an ec2 tag filter", by_ec2_filter, 0),
+            ("an ec2 tag set", by_ec2_tag_set, 0),
+            ("an auto scaling group", by_auto_scaling, 0),
+            ("an ecs group with no service", group("ECS"), 0),
+            ("an ecs group with one service", one_service, 1),
+            ("an ecs group with two services", two_services, 2),
+            ("a lambda group", group("Lambda"), 1),
+        ];
+
+        for (case, group, expected) in cases {
+            let got = deployment_target_count(&state, group);
+            assert_eq!(
+                got, *expected,
+                "case {case:?}: expected {expected} target(s), got {got}"
+            );
+            assert_eq!(
+                terminal_status(got),
+                if *expected == 0 {
+                    DEPLOYMENT_STATUS_FAILED
+                } else {
+                    DEPLOYMENT_STATUS_SUCCEEDED
+                },
+                "case {case:?}: expected the terminal status its targets imply, got {got} target(s)"
+            );
+        }
+    }
 }

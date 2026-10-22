@@ -352,6 +352,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     recording_mode,
                     recording_scope,
                     service_principal: None,
+                    // A provider names the third-party cloud this recorder records
+                    // from, which only a third-party service-linked recorder has.
+                    provider: None,
                     tags: input.tags.clone().unwrap_or_default(),
                 },
             );

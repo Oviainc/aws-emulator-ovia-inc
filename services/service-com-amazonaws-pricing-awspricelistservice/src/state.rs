@@ -41,6 +41,22 @@ pub const DEFAULT_FORMAT_VERSION: &str = "aws_v1";
 /// in CNY. The set is the API's, so it does not move when the catalog is reseeded.
 pub const SUPPORTED_CURRENCY_CODES: &[&str] = &["CNY", "USD"];
 
+/// The message every paginated Price List operation refuses an unusable
+/// `NextToken` with.
+///
+/// The sentence carries no request data and does not vary with the token, so it is
+/// an API constant for this condition rather than a per-request message — trailing
+/// space included, as the service sends it.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "NextToken is invalid. ";
+
+/// The message `ListPriceLists` refuses a pattern-valid currency the API publishes
+/// no price lists in with.
+///
+/// AWS answers that condition as an authorization outcome rather than a bad
+/// parameter, with a fixed sentence carrying no request data.
+pub const CURRENCY_NOT_AUTHORIZED_MESSAGE: &str =
+    "Caller is not authorized to access requested price lists";
+
 /// Page size used when a request names no `MaxResults`.
 ///
 /// The model declares the member nullable with no server-side default, and the API
@@ -59,8 +75,10 @@ const FILE_DISCLAIMER: &str = "This price-list file is rendered by the AWS emula
 /// The on-demand offer-term code AWS uses in every `aws_v1` offer document.
 const ON_DEMAND_TERM_CODE: &str = "JRTCKXETXF";
 
-/// The on-demand rate code suffix AWS uses in every `aws_v1` offer document.
-const ON_DEMAND_RATE_CODE: &str = "6YS6EN2CT7";
+/// The rate-code suffix AWS uses for a term's per-unit price dimension in every
+/// `aws_v1` offer document. A term is identified by its offer term code, so the
+/// on-demand and the reserved dimensions share this suffix.
+const PRICE_DIMENSION_RATE_CODE: &str = "6YS6EN2CT7";
 
 /// The file formats each seeded price list is published in.
 const SEEDED_FILE_FORMATS: &[&str] = &["json"];
@@ -418,9 +436,17 @@ fn covers(record: &PriceListRecord, product: &Product) -> bool {
 
 /// The `v1.0` price-list file: the file header, every product it covers, and the terms
 /// that price them, taken from the products' own offer documents.
+///
+/// EVERY term type a covered product's offer document carries is copied, keyed by
+/// term type and then by SKU the way the offer file nests them — so a product priced
+/// both on demand and under a reservation is priced both ways in the file too, and a
+/// term type added to the catalog needs no change here. Each term is re-denominated
+/// in the record's own currency, so a file never prices in a currency other than the
+/// one its `currencyCode` names.
 fn price_list_file_json(record: &PriceListRecord, products: &[&Product]) -> String {
     let mut product_blocks = serde_json::Map::new();
-    let mut on_demand = serde_json::Map::new();
+    let mut terms: BTreeMap<String, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
+    let percent = currency_percent(&record.currency_code);
     for product in products {
         let Ok(offer) = serde_json::from_str::<serde_json::Value>(&product.offer_json) else {
             continue;
@@ -428,8 +454,13 @@ fn price_list_file_json(record: &PriceListRecord, products: &[&Product]) -> Stri
         if let Some(block) = offer.get("product") {
             product_blocks.insert(product.sku.clone(), block.clone());
         }
-        if let Some(terms) = offer.pointer("/terms/OnDemand") {
-            on_demand.insert(product.sku.clone(), terms.clone());
+        if let Some(offer_terms) = offer.get("terms").and_then(serde_json::Value::as_object) {
+            for (term_type, by_sku) in offer_terms {
+                terms.entry(term_type.clone()).or_default().insert(
+                    product.sku.clone(),
+                    term_in_currency(by_sku, &record.currency_code, percent),
+                );
+            }
         }
     }
     serde_json::json!({
@@ -441,9 +472,70 @@ fn price_list_file_json(record: &PriceListRecord, products: &[&Product]) -> Stri
         "currencyCode": record.currency_code,
         "regionCode": record.region_code,
         "products": product_blocks,
-        "terms": { "OnDemand": on_demand },
+        "terms": terms,
     })
     .to_string()
+}
+
+/// One SKU's terms of a single term type, re-denominated in `currency_code`.
+///
+/// The value is the offer document's own `terms.<type>` block: a map of offer term
+/// code to term, each term holding its price dimensions.
+///
+/// `GetProducts` returns USD-priced offer documents — that is the denomination the
+/// Price List Query API answers in — while a price-list FILE is denominated in the one
+/// currency its record names. So every price dimension's `pricePerUnit` is re-keyed to
+/// that currency and scaled to it, and the rate stated in the dimension's description
+/// follows. Everything else is carried through unchanged, including a reserved term's
+/// `termAttributes`.
+fn term_in_currency(
+    by_term_code: &serde_json::Value,
+    currency_code: &str,
+    percent: u64,
+) -> serde_json::Value {
+    let mut by_term_code = by_term_code.clone();
+    let Some(terms) = by_term_code.as_object_mut() else {
+        return by_term_code;
+    };
+    for term in terms.values_mut() {
+        let Some(dimensions) = term
+            .pointer_mut("/priceDimensions")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        for dimension in dimensions.values_mut() {
+            let in_usd = dimension
+                .pointer("/pricePerUnit/USD")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let Some(in_usd) = in_usd else { continue };
+            let Some(converted) = rate_e10_of(&in_usd).map(|usd| rate_text(scale(usd, percent)))
+            else {
+                continue;
+            };
+            // The description states the same rate, so it is restated rather than left
+            // claiming the USD figure. It carries the rate exactly once.
+            let description = dimension
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| text.replace(&in_usd, &converted));
+            let Some(object) = dimension.as_object_mut() else {
+                continue;
+            };
+            object.insert(
+                "pricePerUnit".to_string(),
+                serde_json::json!({ currency_code: converted }),
+            );
+            if let Some(description) = description {
+                object.insert(
+                    "description".to_string(),
+                    serde_json::Value::String(description),
+                );
+            }
+        }
+    }
+    by_term_code
 }
 
 // ---------------------------------------------------------------------------
@@ -520,47 +612,146 @@ pub fn paginate<'a, T>(
 // Seeding
 // ---------------------------------------------------------------------------
 
-/// One seeded product, before its offer document is built.
-struct ProductSeed {
-    sku: &'static str,
+/// One product to add to the catalog, before its offer document is rendered.
+struct ProductDraft {
+    /// The product's SKU, unique within its service.
+    sku: String,
+    /// The `productFamily` the offer document reports.
     product_family: &'static str,
+    /// The unit the rate is per (`Hrs`, `GB-Mo`, `Requests`).
     unit: &'static str,
-    price_usd: &'static str,
-    attributes: &'static [(&'static str, &'static str)],
+    /// The on-demand rate per `unit`, in 1e-10 USD.
+    rate_e10: u64,
+    /// Whether this product is also offered under a reservation, which is what gives
+    /// its offer document a `terms.Reserved` block beside `terms.OnDemand`.
+    reserved: bool,
+    /// The product metadata, keyed by attribute name.
+    attributes: BTreeMap<String, String>,
 }
 
-/// One seeded price list, before its ARN and file paths are built.
-struct PriceListSeed {
-    service_code: &'static str,
-    region_code: &'static str,
-    currency_code: &'static str,
-    /// The instant the price list takes effect, as an RFC 3339 timestamp. The
-    /// price-list file `version` stamp is derived from it, so the two agree.
-    effective_date: &'static str,
+/// One reserved offer term a reservable product is priced by.
+///
+/// AWS publishes reserved pricing per lease length, offering class and purchase
+/// option, keyed in `terms.Reserved` by the term's own offer term code; the lease
+/// lengths the Price List API publishes are `1yr` and `3yr`. `rate_percent` is this
+/// emulator's own discount off the on-demand rate — the real discount is per SKU and
+/// is not published as a rule, so it is named here rather than implied.
+struct ReservedTermSeed {
+    offer_term_code: &'static str,
+    lease_contract_length: &'static str,
+    offering_class: &'static str,
+    purchase_option: &'static str,
+    rate_percent: u64,
 }
 
-/// The catalog every emulator starts with.
+/// The reserved terms every reservable product in this catalog is offered under.
+const RESERVED_TERMS: &[ReservedTermSeed] = &[
+    ReservedTermSeed {
+        offer_term_code: "4NA7Y494T4",
+        lease_contract_length: "1yr",
+        offering_class: "standard",
+        purchase_option: "No Upfront",
+        rate_percent: 62,
+    },
+    ReservedTermSeed {
+        offer_term_code: "BPH4J8HBKS",
+        lease_contract_length: "3yr",
+        offering_class: "standard",
+        purchase_option: "No Upfront",
+        rate_percent: 40,
+    },
+];
+
+/// The scale AWS publishes a price-list rate at: ten decimal places
+/// (`"0.0104000000"`). Every seeded rate is held as an integer count of 1e-10 USD
+/// and rendered at exactly that scale, so no rate in this catalog is the result of
+/// floating-point arithmetic.
+const RATE_SCALE: u64 = 10_000_000_000;
+
+/// A rate held in 1e-10 USD, as an offer document writes it.
+fn rate_text(rate_e10: u64) -> String {
+    format!("{}.{:010}", rate_e10 / RATE_SCALE, rate_e10 % RATE_SCALE)
+}
+
+/// The integer count of 1e-10 units a rate's text stands for: the inverse of
+/// [`rate_text`], for re-denominating a rate already written into a document.
+fn rate_e10_of(text: &str) -> Option<u64> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let whole: u64 = whole.parse().ok()?;
+    // The scale is fixed at ten places, so a shorter or a longer fraction still reads
+    // as the same magnitude.
+    let mut digits: String = fraction.chars().take(10).collect();
+    while digits.len() < 10 {
+        digits.push('0');
+    }
+    let fraction: u64 = digits.parse().ok()?;
+    whole.checked_mul(RATE_SCALE)?.checked_add(fraction)
+}
+
+/// How many hundredths of a unit of a currency one USD buys in this catalog.
+///
+/// USD is 1:1 by definition; the CNY figure is this emulator's own constant — its
+/// files say so ([`FILE_DISCLAIMER`]) — not a live exchange rate. A currency with no
+/// figure here is carried at parity rather than silently dropped.
+const CURRENCY_PER_USD_PERCENT: &[(&str, u64)] = &[("CNY", 720), ("USD", 100)];
+
+/// The percentage of a USD rate a `currency_code` rate is.
+fn currency_percent(currency_code: &str) -> u64 {
+    CURRENCY_PER_USD_PERCENT
+        .iter()
+        .find(|(code, _)| *code == currency_code)
+        .map_or(100, |(_, percent)| *percent)
+}
+
+/// `percent` of `rate_e10`, for a Region, an operating system or a reservation
+/// priced as a proportion of a base rate.
+fn scale(rate_e10: u64, percent: u64) -> u64 {
+    rate_e10.saturating_mul(percent) / 100
+}
+
+/// A deterministic, catalog-unique SKU built from the parts that identify a product.
+///
+/// A Price List SKU is opaque, so what matters is that it is STABLE across reads and
+/// names exactly one product.
+fn sku(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .flat_map(|part| part.chars())
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_uppercase())
+        .collect()
+}
+
+/// Collect a product's `(attribute name, value)` pairs into its attribute map.
+fn attributes(pairs: Vec<(&str, String)>) -> BTreeMap<String, String> {
+    pairs
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
+}
+
+/// The catalog every emulator starts with: every service code the Price List API
+/// publishes here with the products that price it, plus one price-list file set per
+/// service, Region and published version.
 fn seeded_catalog() -> ComAmazonawsPricingAwspricelistserviceState {
-    let mut services = BTreeMap::new();
-    for (service_code, seeds) in [
-        ("AmazonEC2", EC2_PRODUCTS),
-        ("AmazonS3", S3_PRODUCTS),
+    let mut services: BTreeMap<String, ServiceCatalog> = BTreeMap::new();
+    for (service_code, products) in [
+        (EC2_SERVICE_CODE, ec2_products()),
+        (S3_SERVICE_CODE, s3_products()),
     ] {
-        let products = seeds
-            .iter()
-            .map(|seed| product_from_seed(service_code, seed))
-            .collect();
         services.insert(
             service_code.to_string(),
             ServiceCatalog::new(service_code, products),
         );
     }
-
-    let mut price_lists = BTreeMap::new();
-    for seed in SEEDED_PRICE_LISTS {
-        let record = price_list_from_seed(seed);
-        price_lists.insert(record.arn.clone(), record);
+    for seed in GENERIC_SERVICES {
+        services.insert(
+            seed.service_code.to_string(),
+            ServiceCatalog::new(seed.service_code, generic_products(seed)),
+        );
     }
+
+    let price_lists = seeded_price_lists(&services);
 
     ComAmazonawsPricingAwspricelistserviceState {
         format_version: DEFAULT_FORMAT_VERSION.to_string(),
@@ -572,47 +763,61 @@ fn seeded_catalog() -> ComAmazonawsPricingAwspricelistserviceState {
     }
 }
 
-/// Build a catalog product, including the offer document returned for it.
-fn product_from_seed(service_code: &str, seed: &ProductSeed) -> Product {
-    let attributes: BTreeMap<String, String> = seed
-        .attributes
-        .iter()
-        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
-        .collect();
-    let offer_json = offer_document(service_code, seed, &attributes);
+/// Build a catalog product from a draft, including the offer document returned for
+/// it, so the document can never disagree with the attributes the filters read.
+fn product_from_draft(service_code: &str, draft: ProductDraft) -> Product {
+    let offer_json = offer_document(service_code, &draft);
     Product {
-        sku: seed.sku.to_string(),
-        attributes,
+        sku: draft.sku,
+        attributes: draft.attributes,
         offer_json,
     }
 }
 
 /// The `aws_v1` product-offer document for one product: the `product` block with its
-/// attributes, and the on-demand term that prices it.
-fn offer_document(
-    service_code: &str,
-    seed: &ProductSeed,
-    attributes: &BTreeMap<String, String>,
-) -> String {
-    let sku = seed.sku;
-    let term_key = format!("{sku}.{ON_DEMAND_TERM_CODE}");
-    let rate_code = format!("{term_key}.{ON_DEMAND_RATE_CODE}");
+/// attributes, and every term type that prices it.
+fn offer_document(service_code: &str, draft: &ProductDraft) -> String {
     let effective = CATALOG_PUBLICATION_DATE;
+    let mut terms = serde_json::Map::new();
+    terms.insert(
+        "OnDemand".to_string(),
+        serde_json::Value::Object(on_demand_term(draft)),
+    );
+    // Only a product AWS also offers under a reservation carries a Reserved term; one
+    // priced on demand only carries none, so the block is absent rather than empty.
+    if draft.reserved {
+        terms.insert(
+            "Reserved".to_string(),
+            serde_json::Value::Object(reserved_terms(draft)),
+        );
+    }
 
-    // The term and rate keys are the SKU-derived codes AWS keys these maps by, so
-    // they are inserted rather than written as literals.
-    let mut price_dimensions = serde_json::Map::new();
-    price_dimensions.insert(
-        rate_code.clone(),
-        serde_json::json!({
-            "rateCode": rate_code,
-            "unit": seed.unit,
-            "beginRange": "0",
-            "endRange": "Inf",
-            "appliesTo": [],
-            "description": format!("${} per {} of {sku}", seed.price_usd, seed.unit),
-            "pricePerUnit": { "USD": seed.price_usd },
-        }),
+    serde_json::json!({
+        "product": {
+            "productFamily": draft.product_family,
+            "attributes": draft.attributes,
+            "sku": draft.sku,
+        },
+        "serviceCode": service_code,
+        "terms": terms,
+        "version": version_stamp(effective),
+        "publicationDate": effective,
+    })
+    .to_string()
+}
+
+/// The `terms.OnDemand` block for one product: the single on-demand term, keyed by
+/// the SKU-derived term code AWS keys it by.
+fn on_demand_term(draft: &ProductDraft) -> serde_json::Map<String, serde_json::Value> {
+    let sku = draft.sku.as_str();
+    let unit = draft.unit;
+    let term_key = format!("{sku}.{ON_DEMAND_TERM_CODE}");
+    let rate = rate_text(draft.rate_e10);
+    let dimensions = price_dimensions(
+        &term_key,
+        unit,
+        &rate,
+        &format!("{rate} per {unit} of {sku}"),
     );
     let mut on_demand = serde_json::Map::new();
     on_demand.insert(
@@ -620,39 +825,123 @@ fn offer_document(
         serde_json::json!({
             "sku": sku,
             "offerTermCode": ON_DEMAND_TERM_CODE,
-            "effectiveDate": effective,
+            "effectiveDate": CATALOG_PUBLICATION_DATE,
             "termAttributes": {},
-            "priceDimensions": price_dimensions,
+            "priceDimensions": dimensions,
         }),
     );
-
-    serde_json::json!({
-        "product": {
-            "productFamily": seed.product_family,
-            "attributes": attributes,
-            "sku": sku,
-        },
-        "serviceCode": service_code,
-        "terms": { "OnDemand": on_demand },
-        "version": version_stamp(effective),
-        "publicationDate": effective,
-    })
-    .to_string()
+    on_demand
 }
 
-/// Build a price-list record: its ARN, the formats it is published in, and the URL
-/// for each of those formats. Every one is derived from the seed, so the ARN
-/// `ListPriceLists` reports resolves in `GetPriceListFileUrl` and the URL is the same
-/// on every call.
-fn price_list_from_seed(seed: &PriceListSeed) -> PriceListRecord {
-    let partition = partition_for(seed.currency_code);
-    let version = version_stamp(seed.effective_date);
+/// The `terms.Reserved` block for one product: one term per lease length, offering
+/// class and purchase option the catalog publishes, each keyed by its own offer term
+/// code and stating that lease's `LeaseContractLength` in `termAttributes`.
+fn reserved_terms(draft: &ProductDraft) -> serde_json::Map<String, serde_json::Value> {
+    let sku = draft.sku.as_str();
+    let unit = draft.unit;
+    let mut reserved = serde_json::Map::new();
+    for term in RESERVED_TERMS {
+        let term_key = format!("{sku}.{}", term.offer_term_code);
+        let rate = rate_text(scale(draft.rate_e10, term.rate_percent));
+        let lease = term.lease_contract_length;
+        let dimensions = price_dimensions(
+            &term_key,
+            unit,
+            &rate,
+            &format!("{rate} per {unit} of {sku} on a {lease} reservation"),
+        );
+        reserved.insert(
+            term_key,
+            serde_json::json!({
+                "sku": sku,
+                "offerTermCode": term.offer_term_code,
+                "effectiveDate": CATALOG_PUBLICATION_DATE,
+                "termAttributes": {
+                    "LeaseContractLength": lease,
+                    "OfferingClass": term.offering_class,
+                    "PurchaseOption": term.purchase_option,
+                },
+                "priceDimensions": dimensions,
+            }),
+        );
+    }
+    reserved
+}
+
+/// The per-unit price dimension of one term, keyed by the rate code AWS derives from
+/// the term's key.
+fn price_dimensions(
+    term_key: &str,
+    unit: &str,
+    rate: &str,
+    description: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let rate_code = format!("{term_key}.{PRICE_DIMENSION_RATE_CODE}");
+    let mut dimensions = serde_json::Map::new();
+    dimensions.insert(
+        rate_code.clone(),
+        serde_json::json!({
+            "rateCode": rate_code,
+            "unit": unit,
+            "beginRange": "0",
+            "endRange": "Inf",
+            "appliesTo": [],
+            "description": description,
+            "pricePerUnit": { "USD": rate },
+        }),
+    );
+    dimensions
+}
+
+/// The price-list file sets the catalog publishes: for every service, one per Region
+/// it has products in and per published version.
+///
+/// DERIVED from the products rather than listed separately, so every price list
+/// `ListPriceLists` reports has a file `GetPriceListFileUrl` can resolve and
+/// [`render_price_list_file`] can render from this same catalog.
+fn seeded_price_lists(
+    services: &BTreeMap<String, ServiceCatalog>,
+) -> BTreeMap<String, PriceListRecord> {
+    let mut price_lists = BTreeMap::new();
+    for catalog in services.values() {
+        let regions: BTreeSet<&str> = catalog
+            .products
+            .iter()
+            .filter_map(|product| product.attributes.get("regionCode"))
+            .map(String::as_str)
+            .collect();
+        for region_code in regions {
+            for effective_date in PRICE_LIST_EFFECTIVE_DATES.iter().copied() {
+                let record = price_list_record(
+                    &catalog.service_code,
+                    region_code,
+                    currency_for(region_code),
+                    effective_date,
+                );
+                price_lists.insert(record.arn.clone(), record);
+            }
+        }
+    }
+    price_lists
+}
+
+/// Build a price-list record: its ARN, the formats it is published in, and the path
+/// each of those formats is served at. Every one is derived from the service, Region,
+/// currency and effective date, so the ARN `ListPriceLists` reports resolves in
+/// `GetPriceListFileUrl` and the URL is the same on every call.
+fn price_list_record(
+    service_code: &str,
+    region_code: &str,
+    currency_code: &str,
+    effective_date: &str,
+) -> PriceListRecord {
+    let partition = partition_for(currency_code);
+    let version = version_stamp(effective_date);
     let arn = format!(
         // Not `engine::emulator_arn`: a Price List ARN carries neither a Region nor an
         // account id (the modelled pattern is `^arn:…:pricing:::price-list/…$`), which
         // that helper always writes.
-        "arn:aws:pricing:::price-list/{partition}/{}/{}/{version}/{}",
-        seed.service_code, seed.currency_code, seed.region_code
+        "arn:aws:pricing:::price-list/{partition}/{service_code}/{currency_code}/{version}/{region_code}"
     );
     let file_formats: Vec<String> = SEEDED_FILE_FORMATS
         .iter()
@@ -664,20 +953,30 @@ fn price_list_from_seed(seed: &PriceListSeed) -> PriceListRecord {
         .iter()
         .map(|format| {
             let path = format!(
-                "/offers/v1.0/{partition}/{}/{version}/{}/index.{format}",
-                seed.service_code, seed.region_code
+                "/offers/v1.0/{partition}/{service_code}/{version}/{region_code}/index.{format}"
             );
             (format.clone(), path)
         })
         .collect();
     PriceListRecord {
         arn,
-        service_code: seed.service_code.to_string(),
-        region_code: Some(seed.region_code.to_string()),
-        currency_code: seed.currency_code.to_string(),
-        effective_date: instant_of(seed.effective_date),
+        service_code: service_code.to_string(),
+        region_code: Some(region_code.to_string()),
+        currency_code: currency_code.to_string(),
+        effective_date: instant_of(effective_date),
         file_formats,
         file_paths,
+    }
+}
+
+/// The currency the Price List API denominates a Region's files in: `CNY` for the
+/// China partition's Regions and `USD` for every other one, which together are
+/// exactly [`SUPPORTED_CURRENCY_CODES`].
+fn currency_for(region_code: &str) -> &'static str {
+    if region_code.starts_with("cn-") {
+        "CNY"
+    } else {
+        "USD"
     }
 }
 
@@ -720,229 +1019,605 @@ fn epoch_secs(instant: SystemTime) -> i64 {
 /// The publication date of the seeded catalog's offer documents.
 const CATALOG_PUBLICATION_DATE: &str = "2024-01-01T00:00:00Z";
 
-/// The seeded `AmazonEC2` products. Attribute names and values are the ones the
-/// real EC2 offer file carries for an on-demand compute instance.
-const EC2_PRODUCTS: &[ProductSeed] = &[
-    ProductSeed {
-        sku: "T3MICROUSE1LINUX",
-        product_family: "Compute Instance",
-        unit: "Hrs",
-        price_usd: "0.0104000000",
-        attributes: &[
-            ("capacitystatus", "Used"),
-            ("instanceFamily", "General purpose"),
-            ("instanceType", "t3.micro"),
-            ("location", "US East (N. Virginia)"),
-            ("locationType", "AWS Region"),
-            ("memory", "1 GiB"),
-            ("operatingSystem", "Linux"),
-            ("operation", "RunInstances"),
-            ("preInstalledSw", "NA"),
-            ("regionCode", "us-east-1"),
-            ("servicecode", "AmazonEC2"),
-            ("tenancy", "Shared"),
-            ("termType", "OnDemand"),
-            ("usagetype", "BoxUsage:t3.micro"),
-            ("vcpu", "2"),
-        ],
-    },
-    ProductSeed {
-        sku: "T3SMALLUSE1LINUX",
-        product_family: "Compute Instance",
-        unit: "Hrs",
-        price_usd: "0.0208000000",
-        attributes: &[
-            ("capacitystatus", "Used"),
-            ("instanceFamily", "General purpose"),
-            ("instanceType", "t3.small"),
-            ("location", "US East (N. Virginia)"),
-            ("locationType", "AWS Region"),
-            ("memory", "2 GiB"),
-            ("operatingSystem", "Linux"),
-            ("operation", "RunInstances"),
-            ("preInstalledSw", "NA"),
-            ("regionCode", "us-east-1"),
-            ("servicecode", "AmazonEC2"),
-            ("tenancy", "Shared"),
-            ("termType", "OnDemand"),
-            ("usagetype", "BoxUsage:t3.small"),
-            ("vcpu", "2"),
-        ],
-    },
-    ProductSeed {
-        sku: "M5LARGEUSE1LINUX",
-        product_family: "Compute Instance",
-        unit: "Hrs",
-        price_usd: "0.0960000000",
-        attributes: &[
-            ("capacitystatus", "Used"),
-            ("instanceFamily", "General purpose"),
-            ("instanceType", "m5.large"),
-            ("location", "US East (N. Virginia)"),
-            ("locationType", "AWS Region"),
-            ("memory", "8 GiB"),
-            ("operatingSystem", "Linux"),
-            ("operation", "RunInstances"),
-            ("preInstalledSw", "NA"),
-            ("regionCode", "us-east-1"),
-            ("servicecode", "AmazonEC2"),
-            ("tenancy", "Shared"),
-            ("termType", "OnDemand"),
-            ("usagetype", "BoxUsage:m5.large"),
-            ("vcpu", "2"),
-        ],
-    },
-    ProductSeed {
-        sku: "T3MICROEUW1LINUX",
-        product_family: "Compute Instance",
-        unit: "Hrs",
-        price_usd: "0.0114000000",
-        attributes: &[
-            ("capacitystatus", "Used"),
-            ("instanceFamily", "General purpose"),
-            ("instanceType", "t3.micro"),
-            ("location", "EU (Ireland)"),
-            ("locationType", "AWS Region"),
-            ("memory", "1 GiB"),
-            ("operatingSystem", "Linux"),
-            ("operation", "RunInstances"),
-            ("preInstalledSw", "NA"),
-            ("regionCode", "eu-west-1"),
-            ("servicecode", "AmazonEC2"),
-            ("tenancy", "Shared"),
-            ("termType", "OnDemand"),
-            ("usagetype", "EU-BoxUsage:t3.micro"),
-            ("vcpu", "2"),
-        ],
-    },
-    ProductSeed {
-        sku: "M5LARGEUSW2WINDOWS",
-        product_family: "Compute Instance",
-        unit: "Hrs",
-        price_usd: "0.1920000000",
-        attributes: &[
-            ("capacitystatus", "Used"),
-            ("instanceFamily", "General purpose"),
-            ("instanceType", "m5.large"),
-            ("location", "US West (Oregon)"),
-            ("locationType", "AWS Region"),
-            ("memory", "8 GiB"),
-            ("operatingSystem", "Windows"),
-            ("operation", "RunInstances:0002"),
-            ("preInstalledSw", "NA"),
-            ("regionCode", "us-west-2"),
-            ("servicecode", "AmazonEC2"),
-            ("tenancy", "Shared"),
-            ("termType", "OnDemand"),
-            ("usagetype", "USW2-BoxUsage:m5.large"),
-            ("vcpu", "2"),
-        ],
-    },
+/// The effective dates the catalog publishes a price-list file set for.
+///
+/// AWS keeps every published version of a price list addressable, so a Region's
+/// price list exists in more than one version and `ListPriceLists(EffectiveDate=…)`
+/// selects the versions in effect at that instant.
+const PRICE_LIST_EFFECTIVE_DATES: &[&str] = &["2023-01-01T00:00:00Z", "2024-06-01T00:00:00Z"];
+
+/// The `locationType` every Region-scoped product in this catalog carries.
+const AWS_REGION_LOCATION_TYPE: &str = "AWS Region";
+
+/// The service code of the compute service, whose products are seeded per instance
+/// type, Region and operating system.
+const EC2_SERVICE_CODE: &str = "AmazonEC2";
+
+/// The `servicename` the compute service's products carry.
+const EC2_SERVICE_NAME: &str = "Amazon Elastic Compute Cloud";
+
+/// The service code of the object-storage service, whose products are seeded per
+/// storage class and Region.
+const S3_SERVICE_CODE: &str = "AmazonS3";
+
+/// The `servicename` the object-storage service's products carry.
+const S3_SERVICE_NAME: &str = "Amazon Simple Storage Service";
+
+/// The `licenseModel` of an operating system that needs no license — the value the
+/// documented EC2 on-demand filter set keys on for Linux.
+const NO_LICENSE_REQUIRED: &str = "No License required";
+
+/// The `licenseModel` of an operating system whose license is in the instance rate.
+const LICENSE_INCLUDED: &str = "License included";
+
+// --- Regions ---------------------------------------------------------------
+
+/// One Region the catalog publishes prices for.
+struct RegionSeed {
+    /// The `regionCode` attribute, and the Region a price list covers.
+    code: &'static str,
+    /// The `location` attribute: the Region display name the Price List API reports,
+    /// which is what `GetAttributeValues(<service>, location)` enumerates.
+    location: &'static str,
+    /// The prefix AWS puts on a `usagetype` outside us-east-1 (`EU-BoxUsage:…`).
+    usage_prefix: &'static str,
+    /// This Region's rate as a percentage of the us-east-1 rate, so a Region is
+    /// priced differently from the next one.
+    rate_percent: u64,
+}
+
+impl RegionSeed {
+    const fn new(
+        code: &'static str,
+        location: &'static str,
+        usage_prefix: &'static str,
+        rate_percent: u64,
+    ) -> Self {
+        Self {
+            code,
+            location,
+            usage_prefix,
+            rate_percent,
+        }
+    }
+}
+
+/// The Regions the catalog publishes prices for, with the display name the Price
+/// List API reports for each.
+const REGIONS: &[RegionSeed] = &[
+    RegionSeed::new("us-east-1", "US East (N. Virginia)", "", 100),
+    RegionSeed::new("us-east-2", "US East (Ohio)", "USE2-", 100),
+    RegionSeed::new("us-west-1", "US West (N. California)", "USW1-", 118),
+    RegionSeed::new("us-west-2", "US West (Oregon)", "USW2-", 100),
+    RegionSeed::new("ca-central-1", "Canada (Central)", "CAN1-", 105),
+    RegionSeed::new("eu-west-1", "EU (Ireland)", "EU-", 110),
+    RegionSeed::new("eu-west-2", "EU (London)", "EUW2-", 112),
+    RegionSeed::new("eu-west-3", "EU (Paris)", "EUW3-", 112),
+    RegionSeed::new("eu-central-1", "EU (Frankfurt)", "EUC1-", 115),
+    RegionSeed::new("eu-north-1", "EU (Stockholm)", "EUN1-", 104),
+    RegionSeed::new("ap-northeast-1", "Asia Pacific (Tokyo)", "APN1-", 125),
+    RegionSeed::new("ap-northeast-2", "Asia Pacific (Seoul)", "APN2-", 115),
+    RegionSeed::new("ap-southeast-1", "Asia Pacific (Singapore)", "APS1-", 120),
+    RegionSeed::new("ap-southeast-2", "Asia Pacific (Sydney)", "APS2-", 122),
+    RegionSeed::new("ap-south-1", "Asia Pacific (Mumbai)", "APS3-", 102),
+    RegionSeed::new("sa-east-1", "South America (Sao Paulo)", "SAE1-", 155),
+    RegionSeed::new("cn-north-1", "China (Beijing)", "CNN1-", 108),
 ];
 
-/// The seeded `AmazonS3` products, with the attribute names the real S3 offer file
-/// carries for storage.
-const S3_PRODUCTS: &[ProductSeed] = &[
-    ProductSeed {
-        sku: "S3STDUSE1BYTEHRS",
-        product_family: "Storage",
-        unit: "GB-Mo",
-        price_usd: "0.0230000000",
-        attributes: &[
-            ("availability", "99.99%"),
-            ("durability", "99.999999999%"),
-            ("location", "US East (N. Virginia)"),
-            ("locationType", "AWS Region"),
-            ("regionCode", "us-east-1"),
-            ("servicecode", "AmazonS3"),
-            ("storageClass", "General Purpose"),
-            ("termType", "OnDemand"),
-            ("usagetype", "TimedStorage-ByteHrs"),
-            ("volumeType", "Standard"),
-        ],
-    },
-    ProductSeed {
-        sku: "S3IAUSE1BYTEHRS",
-        product_family: "Storage",
-        unit: "GB-Mo",
-        price_usd: "0.0125000000",
-        attributes: &[
-            ("availability", "99.9%"),
-            ("durability", "99.999999999%"),
-            ("location", "US East (N. Virginia)"),
-            ("locationType", "AWS Region"),
-            ("regionCode", "us-east-1"),
-            ("servicecode", "AmazonS3"),
-            ("storageClass", "Infrequent Access"),
-            ("termType", "OnDemand"),
-            ("usagetype", "TimedStorage-SIA-ByteHrs"),
-            ("volumeType", "Standard - Infrequent Access"),
-        ],
-    },
-    ProductSeed {
-        sku: "S3STDEUW1BYTEHRS",
-        product_family: "Storage",
-        unit: "GB-Mo",
-        price_usd: "0.0245000000",
-        attributes: &[
-            ("availability", "99.99%"),
-            ("durability", "99.999999999%"),
-            ("location", "EU (Ireland)"),
-            ("locationType", "AWS Region"),
-            ("regionCode", "eu-west-1"),
-            ("servicecode", "AmazonS3"),
-            ("storageClass", "General Purpose"),
-            ("termType", "OnDemand"),
-            ("usagetype", "EU-TimedStorage-ByteHrs"),
-            ("volumeType", "Standard"),
-        ],
-    },
+/// The Regions a service with one usage type per Region is priced in.
+const CORE_REGIONS: &[&str] = &["us-east-1", "us-west-2", "eu-west-1", "ap-northeast-1"];
+
+/// The Region `code` names, or `None` when the catalog publishes no prices there.
+fn region(code: &str) -> Option<&'static RegionSeed> {
+    REGIONS.iter().find(|region| region.code == code)
+}
+
+// --- AmazonEC2: compute instances ------------------------------------------
+
+/// One EC2 instance type the catalog prices.
+struct InstanceTypeSeed {
+    instance_type: &'static str,
+    instance_family: &'static str,
+    vcpu: &'static str,
+    memory: &'static str,
+    physical_processor: &'static str,
+    current_generation: &'static str,
+    /// The us-east-1 Linux on-demand rate per hour, in 1e-10 USD.
+    rate_e10: u64,
+}
+
+impl InstanceTypeSeed {
+    const fn new(
+        instance_type: &'static str,
+        instance_family: &'static str,
+        vcpu: &'static str,
+        memory: &'static str,
+        physical_processor: &'static str,
+        current_generation: &'static str,
+        rate_e10: u64,
+    ) -> Self {
+        Self {
+            instance_type,
+            instance_family,
+            vcpu,
+            memory,
+            physical_processor,
+            current_generation,
+            rate_e10,
+        }
+    }
+}
+
+/// The instance types the catalog prices, across every instance family the Price
+/// List API publishes a `instanceFamily` value for here.
+const EC2_INSTANCE_TYPES: &[InstanceTypeSeed] = &[
+    InstanceTypeSeed::new("t2.micro", "General purpose", "1", "1 GiB", "Intel Xeon Family", "No", 116_000_000),
+    InstanceTypeSeed::new("t2.small", "General purpose", "1", "2 GiB", "Intel Xeon Family", "No", 230_000_000),
+    InstanceTypeSeed::new("t2.medium", "General purpose", "2", "4 GiB", "Intel Xeon Family", "No", 464_000_000),
+    InstanceTypeSeed::new("t3.micro", "General purpose", "2", "1 GiB", "Intel Skylake E5 2686 v5", "Yes", 104_000_000),
+    InstanceTypeSeed::new("t3.small", "General purpose", "2", "2 GiB", "Intel Skylake E5 2686 v5", "Yes", 208_000_000),
+    InstanceTypeSeed::new("t3.medium", "General purpose", "2", "4 GiB", "Intel Skylake E5 2686 v5", "Yes", 416_000_000),
+    InstanceTypeSeed::new("t3.large", "General purpose", "2", "8 GiB", "Intel Skylake E5 2686 v5", "Yes", 832_000_000),
+    InstanceTypeSeed::new("m5.large", "General purpose", "2", "8 GiB", "Intel Xeon Platinum 8175", "Yes", 960_000_000),
+    InstanceTypeSeed::new("m5.xlarge", "General purpose", "4", "16 GiB", "Intel Xeon Platinum 8175", "Yes", 1_920_000_000),
+    InstanceTypeSeed::new("m5.2xlarge", "General purpose", "8", "32 GiB", "Intel Xeon Platinum 8175", "Yes", 3_840_000_000),
+    InstanceTypeSeed::new("c5.large", "Compute optimized", "2", "4 GiB", "Intel Xeon Platinum 8124M", "Yes", 850_000_000),
+    InstanceTypeSeed::new("c5.xlarge", "Compute optimized", "4", "8 GiB", "Intel Xeon Platinum 8124M", "Yes", 1_700_000_000),
+    InstanceTypeSeed::new("r5.large", "Memory optimized", "2", "16 GiB", "Intel Xeon Platinum 8175", "Yes", 1_260_000_000),
+    InstanceTypeSeed::new("r5.xlarge", "Memory optimized", "4", "32 GiB", "Intel Xeon Platinum 8175", "Yes", 2_520_000_000),
+    InstanceTypeSeed::new("m6g.large", "General purpose", "2", "8 GiB", "AWS Graviton2 Processor", "Yes", 770_000_000),
 ];
 
-/// The seeded price-list file sets. `USD` price lists cover the commercial
-/// partition's Regions and `CNY` ones the China partition's, as the Price List API
-/// publishes them.
-const SEEDED_PRICE_LISTS: &[PriceListSeed] = &[
-    PriceListSeed {
-        service_code: "AmazonEC2",
-        region_code: "us-east-1",
-        currency_code: "USD",
-        effective_date: "2023-01-01T00:00:00Z",
-    },
-    PriceListSeed {
-        service_code: "AmazonEC2",
-        region_code: "eu-west-1",
-        currency_code: "USD",
-        effective_date: "2023-01-01T00:00:00Z",
-    },
-    PriceListSeed {
-        service_code: "AmazonEC2",
-        region_code: "us-west-2",
-        currency_code: "USD",
-        effective_date: "2023-01-01T00:00:00Z",
-    },
-    PriceListSeed {
-        service_code: "AmazonEC2",
-        region_code: "us-east-1",
-        currency_code: "USD",
-        effective_date: "2024-06-01T00:00:00Z",
-    },
-    PriceListSeed {
-        service_code: "AmazonEC2",
-        region_code: "cn-north-1",
-        currency_code: "CNY",
-        effective_date: "2023-01-01T00:00:00Z",
-    },
-    PriceListSeed {
-        service_code: "AmazonS3",
-        region_code: "us-east-1",
-        currency_code: "USD",
-        effective_date: "2023-01-01T00:00:00Z",
-    },
-    PriceListSeed {
-        service_code: "AmazonS3",
-        region_code: "eu-west-1",
-        currency_code: "USD",
-        effective_date: "2023-01-01T00:00:00Z",
-    },
+/// The instance type `name` names, or `None` when the catalog prices no such type.
+fn instance_type_seed(name: &str) -> Option<&'static InstanceTypeSeed> {
+    EC2_INSTANCE_TYPES
+        .iter()
+        .find(|seed| seed.instance_type == name)
+}
+
+/// Which instance types the catalog prices in one Region under one operating system.
+struct ComputePlan {
+    region_code: &'static str,
+    operating_system: &'static str,
+    /// The `licenseModel` the Price List API reports for this operating system.
+    license_model: &'static str,
+    /// The `operation` code the usage is billed under.
+    operation: &'static str,
+    /// This operating system's rate as a percentage of the Linux rate.
+    rate_percent: u64,
+    instance_types: &'static [&'static str],
+}
+
+impl ComputePlan {
+    const fn new(
+        region_code: &'static str,
+        operating_system: &'static str,
+        license_model: &'static str,
+        operation: &'static str,
+        rate_percent: u64,
+        instance_types: &'static [&'static str],
+    ) -> Self {
+        Self {
+            region_code,
+            operating_system,
+            license_model,
+            operation,
+            rate_percent,
+            instance_types,
+        }
+    }
+}
+
+/// The compute instances the catalog prices. Every Region carries the entry-level
+/// burstable type, so `location` enumerates every Region the catalog publishes; the
+/// larger Regions carry more of the type list, and `us-east-1` carries all of it.
+const EC2_COMPUTE_PLAN: &[ComputePlan] = &[
+    ComputePlan::new(
+        "us-east-1",
+        "Linux",
+        NO_LICENSE_REQUIRED,
+        "RunInstances",
+        100,
+        &[
+            "t2.micro",
+            "t2.small",
+            "t2.medium",
+            "t3.micro",
+            "t3.small",
+            "t3.medium",
+            "t3.large",
+            "m5.large",
+            "m5.xlarge",
+            "m5.2xlarge",
+            "c5.large",
+            "c5.xlarge",
+            "r5.large",
+            "r5.xlarge",
+            "m6g.large",
+        ],
+    ),
+    ComputePlan::new("us-east-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large"]),
+    ComputePlan::new("us-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large"]),
+    ComputePlan::new("us-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large", "c5.large"]),
+    ComputePlan::new("us-west-2", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, &["m5.large"]),
+    ComputePlan::new("ca-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
+    ComputePlan::new("eu-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "t3.small", "m5.large"]),
+    ComputePlan::new("eu-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
+    ComputePlan::new("eu-west-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
+    ComputePlan::new("eu-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large"]),
+    ComputePlan::new("eu-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
+    ComputePlan::new("ap-northeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large"]),
+    ComputePlan::new("ap-northeast-1", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, &["m5.large"]),
+    ComputePlan::new("ap-northeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
+    ComputePlan::new("ap-southeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro", "m5.large"]),
+    ComputePlan::new("ap-southeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
+    ComputePlan::new("ap-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
+    ComputePlan::new("sa-east-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
+    ComputePlan::new("cn-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.micro"]),
 ];
+
+// --- AmazonEC2: EBS volumes ------------------------------------------------
+
+/// One EBS volume type the catalog prices.
+///
+/// `volume_type` is the label the Price List API publishes as the `volumeType`
+/// attribute — the attribute the model's own `Filter` example names for EC2 volumes.
+struct VolumeSeed {
+    volume_type: &'static str,
+    volume_api_name: &'static str,
+    storage_media: &'static str,
+    max_iops: &'static str,
+    max_throughput: &'static str,
+    usagetype: &'static str,
+    /// The us-east-1 rate per GB-month, in 1e-10 USD.
+    rate_e10: u64,
+}
+
+impl VolumeSeed {
+    const fn new(
+        volume_type: &'static str,
+        volume_api_name: &'static str,
+        storage_media: &'static str,
+        max_iops: &'static str,
+        max_throughput: &'static str,
+        usagetype: &'static str,
+        rate_e10: u64,
+    ) -> Self {
+        Self {
+            volume_type,
+            volume_api_name,
+            storage_media,
+            max_iops,
+            max_throughput,
+            usagetype,
+            rate_e10,
+        }
+    }
+}
+
+/// The EBS volume types the catalog prices, one per volume API name AWS publishes.
+const EBS_VOLUMES: &[VolumeSeed] = &[
+    VolumeSeed::new("General Purpose", "gp3", "SSD-backed", "16000", "1000 MiB/s", "EBS:VolumeUsage.gp3", 800_000_000),
+    VolumeSeed::new("Provisioned IOPS", "io2", "SSD-backed", "64000", "1000 MiB/s", "EBS:VolumeUsage.io2", 1_250_000_000),
+    VolumeSeed::new("Magnetic", "standard", "HDD-backed", "40 - 200", "40 - 90 MB/sec", "EBS:VolumeUsage", 500_000_000),
+    VolumeSeed::new("Cold HDD", "sc1", "HDD-backed", "250", "250 MiB/s", "EBS:VolumeUsage.sc1", 150_000_000),
+    VolumeSeed::new("Throughput Optimized HDD", "st1", "HDD-backed", "500", "500 MiB/s", "EBS:VolumeUsage.st1", 450_000_000),
+];
+
+/// The volume type `api_name` names, or `None` when the catalog prices no such
+/// volume.
+fn volume_seed(api_name: &str) -> Option<&'static VolumeSeed> {
+    EBS_VOLUMES
+        .iter()
+        .find(|seed| seed.volume_api_name == api_name)
+}
+
+/// Which volume types the catalog prices in which Region, by volume API name.
+const EBS_VOLUME_PLAN: &[(&str, &[&str])] = &[
+    ("us-east-1", &["gp3", "io2", "standard", "sc1", "st1"]),
+    ("eu-west-1", &["gp3", "io2"]),
+    ("ap-northeast-1", &["gp3"]),
+];
+
+// --- AmazonS3 ---------------------------------------------------------------
+
+/// One S3 storage class the catalog prices.
+struct StorageClassSeed {
+    storage_class: &'static str,
+    volume_type: &'static str,
+    availability: &'static str,
+    durability: &'static str,
+    usagetype: &'static str,
+    /// The us-east-1 rate per GB-month, in 1e-10 USD.
+    rate_e10: u64,
+}
+
+impl StorageClassSeed {
+    const fn new(
+        storage_class: &'static str,
+        volume_type: &'static str,
+        availability: &'static str,
+        durability: &'static str,
+        usagetype: &'static str,
+        rate_e10: u64,
+    ) -> Self {
+        Self {
+            storage_class,
+            volume_type,
+            availability,
+            durability,
+            usagetype,
+            rate_e10,
+        }
+    }
+}
+
+/// The S3 storage classes the catalog prices.
+const S3_STORAGE_CLASSES: &[StorageClassSeed] = &[
+    StorageClassSeed::new("General Purpose", "Standard", "99.99%", "99.999999999%", "TimedStorage-ByteHrs", 230_000_000),
+    StorageClassSeed::new("Infrequent Access", "Standard - Infrequent Access", "99.9%", "99.999999999%", "TimedStorage-SIA-ByteHrs", 125_000_000),
+    StorageClassSeed::new("Archive", "Glacier Flexible Retrieval", "99.99%", "99.999999999%", "TimedStorage-GlacierByteHrs", 36_000_000),
+];
+
+// --- Every other service code ----------------------------------------------
+
+/// One service the catalog prices with a single usage type per Region.
+///
+/// The Price List API publishes a service code for essentially every AWS service, so
+/// the catalog has to carry far more than the handful it prices in depth: a client
+/// that enumerates service codes, or pages `DescribeServices`, sees the breadth.
+struct GenericServiceSeed {
+    service_code: &'static str,
+    service_name: &'static str,
+    product_family: &'static str,
+    usagetype: &'static str,
+    unit: &'static str,
+    /// The us-east-1 rate per `unit`, in 1e-10 USD.
+    rate_e10: u64,
+}
+
+impl GenericServiceSeed {
+    const fn new(
+        service_code: &'static str,
+        service_name: &'static str,
+        product_family: &'static str,
+        usagetype: &'static str,
+        unit: &'static str,
+        rate_e10: u64,
+    ) -> Self {
+        Self {
+            service_code,
+            service_name,
+            product_family,
+            usagetype,
+            unit,
+            rate_e10,
+        }
+    }
+}
+
+/// The service codes the catalog publishes beyond the two it prices in depth.
+const GENERIC_SERVICES: &[GenericServiceSeed] = &[
+    GenericServiceSeed::new("AWSAmplify", "AWS Amplify", "Build Minutes", "BuildDuration", "minutes", 100_000_000),
+    GenericServiceSeed::new("AWSAppSync", "AWS AppSync", "API Request", "Request", "Requests", 40_000),
+    GenericServiceSeed::new("AWSBackup", "AWS Backup", "Storage Snapshot", "Warm-Storage-ByteHrs", "GB-Mo", 500_000_000),
+    GenericServiceSeed::new("AWSBudgets", "AWS Budgets", "Budget", "Budget-Day", "Days", 20_000_000),
+    GenericServiceSeed::new("AWSCloudFormation", "AWS CloudFormation", "Handler Operation", "HandlerOperation", "Operations", 90_000),
+    GenericServiceSeed::new("AWSCloudTrail", "AWS CloudTrail", "Paid Events Recorded", "PaidEventsRecorded", "Events", 20_000),
+    GenericServiceSeed::new("AWSCodeArtifact", "AWS CodeArtifact", "Storage", "Storage-ByteHrs", "GB-Mo", 500_000_000),
+    GenericServiceSeed::new("AWSCodeCommit", "AWS CodeCommit", "Active User", "ActiveUsers", "Users", 10_000_000_000),
+    GenericServiceSeed::new("AWSCodePipeline", "AWS CodePipeline", "Pipeline", "ActivePipeline", "Pipelines", 10_000_000_000),
+    GenericServiceSeed::new("AWSConfig", "AWS Config", "Configuration Item Recorded", "ConfigurationItemRecorded", "Items", 30_000_000),
+    GenericServiceSeed::new("AWSDataTransfer", "AWS Data Transfer", "Data Transfer", "DataTransfer-Out-Bytes", "GB", 900_000_000),
+    GenericServiceSeed::new("AWSDatabaseMigrationSvc", "AWS Database Migration Service", "Database Migration", "dms:t3.medium", "Hrs", 360_000_000),
+    GenericServiceSeed::new("AWSDirectConnect", "AWS Direct Connect", "Dedicated Connection", "PortUsage:1G", "Hrs", 3_000_000_000),
+    GenericServiceSeed::new("AWSDirectoryService", "AWS Directory Service", "Directory", "DirectoryUsage:Standard", "Hrs", 500_000_000),
+    GenericServiceSeed::new("AWSELB", "Elastic Load Balancing", "Load Balancer-Application", "LoadBalancerUsage", "Hrs", 225_000_000),
+    GenericServiceSeed::new("AWSEvents", "Amazon EventBridge", "Event", "Event-64K-Chunks", "Events", 100_000),
+    GenericServiceSeed::new("AWSGlue", "AWS Glue", "Data Processing Unit", "ETL-DPU-Hour", "DPU-Hour", 4_400_000_000),
+    GenericServiceSeed::new("AWSIoT", "AWS IoT", "IoT Message", "Messaging-Messages", "Messages", 10_000),
+    GenericServiceSeed::new("AWSKeyManagementService", "AWS Key Management Service", "Key Management", "KMS-Keys", "Keys", 10_000_000_000),
+    GenericServiceSeed::new("AWSLambda", "AWS Lambda", "Serverless", "Request", "Requests", 2_000),
+    GenericServiceSeed::new("AWSQueueService", "Amazon Simple Queue Service", "API Request", "Requests-Tier1", "Requests", 4_000),
+    GenericServiceSeed::new("AWSSecretsManager", "AWS Secrets Manager", "Secret", "Secrets", "Secrets", 4_000_000_000),
+    GenericServiceSeed::new("AWSSecurityHub", "AWS Security Hub", "Security Check", "SecurityChecks", "Checks", 100_000),
+    GenericServiceSeed::new("AWSShield", "AWS Shield", "DDoS Protection", "ShieldAdvanced", "Months", 30_000_000_000_000),
+    GenericServiceSeed::new("AWSStorageGateway", "AWS Storage Gateway", "Storage Gateway", "StorageGateway-ByteHrs", "GB-Mo", 100_000_000),
+    GenericServiceSeed::new("AWSSystemsManager", "AWS Systems Manager", "Managed Instance", "AdvancedInstances", "Hrs", 29_580_000),
+    GenericServiceSeed::new("AWSTransfer", "AWS Transfer Family", "Transfer Endpoint", "SFTP:Protocol", "Hrs", 3_000_000_000),
+    GenericServiceSeed::new("AWSWAF", "AWS WAF", "Web ACL", "WebACLV2", "Months", 50_000_000_000),
+    GenericServiceSeed::new("AWSXRay", "AWS X-Ray", "Trace", "XRay-TracesRecorded", "Traces", 50_000),
+    GenericServiceSeed::new("AmazonApiGateway", "Amazon API Gateway", "API Calls", "ApiGatewayRequest", "Requests", 35_000),
+    GenericServiceSeed::new("AmazonAthena", "Amazon Athena", "Queries", "Athena-DataScannedInTB", "TB", 50_000_000_000),
+    GenericServiceSeed::new("AmazonCloudFront", "Amazon CloudFront", "Data Transfer", "DataTransfer-Out-Bytes", "GB", 850_000_000),
+    GenericServiceSeed::new("AmazonCloudWatch", "AmazonCloudWatch", "Metric", "CW:MetricMonitorUsage", "Metrics", 3_000_000_000),
+    GenericServiceSeed::new("AmazonCognito", "Amazon Cognito", "Monthly Active User", "CognitoMAU", "Users", 55_000_000),
+    GenericServiceSeed::new("AmazonConnect", "Amazon Connect", "Agent Minutes", "ConnectAgentMinutes", "Minutes", 180_000_000),
+    GenericServiceSeed::new("AmazonDocDB", "Amazon DocumentDB", "Database Instance", "InstanceUsage:db.r5.large", "Hrs", 2_770_000_000),
+    GenericServiceSeed::new("AmazonDynamoDB", "Amazon DynamoDB", "Provisioned IOPS", "WriteCapacityUnit-Hrs", "WCU-Hrs", 650_000),
+    GenericServiceSeed::new("AmazonECR", "Amazon EC2 Container Registry (ECR)", "Storage", "TimedStorage-ByteHrs", "GB-Mo", 1_000_000_000),
+    GenericServiceSeed::new("AmazonECS", "Amazon EC2 Container Service", "Compute", "Fargate-vCPU-Hours:perCPU", "Hrs", 404_800_000),
+    GenericServiceSeed::new("AmazonEFS", "Amazon EFS", "Storage", "TimedStorage-ByteHrs", "GB-Mo", 3_000_000_000),
+    GenericServiceSeed::new("AmazonEKS", "Amazon Elastic Kubernetes Service", "Compute", "AmazonEKS-Hours:perCluster", "Hrs", 1_000_000_000),
+    GenericServiceSeed::new("AmazonES", "Amazon OpenSearch Service", "Elastic Search Instance", "ESInstance:m5.large.search", "Hrs", 1_610_000_000),
+    GenericServiceSeed::new("AmazonElastiCache", "Amazon ElastiCache", "Cache Instance", "NodeUsage:cache.t3.micro", "Hrs", 170_000_000),
+    GenericServiceSeed::new("AmazonFSx", "Amazon FSx", "Storage", "FSx-SSD-Storage", "GB-Mo", 1_300_000_000),
+    GenericServiceSeed::new("AmazonGuardDuty", "Amazon GuardDuty", "Analyzed Event", "PaidEventsAnalyzed", "Events", 100_000),
+    GenericServiceSeed::new("AmazonInspector", "Amazon Inspector", "Assessment", "InstanceAssessment", "Assessments", 15_000_000_000),
+    GenericServiceSeed::new("AmazonKinesis", "Amazon Kinesis", "Kinesis Streams", "Shard-Hour", "Hrs", 150_000_000),
+    GenericServiceSeed::new("AmazonKinesisFirehose", "Amazon Kinesis Firehose", "Kinesis Firehose", "Firehose-DataIngestion", "GB", 290_000_000),
+    GenericServiceSeed::new("AmazonMQ", "Amazon MQ", "Broker Instances", "BrokerUsage:mq.t3.micro", "Hrs", 360_000_000),
+    GenericServiceSeed::new("AmazonMSK", "Amazon Managed Streaming for Apache Kafka", "Broker Instances", "Kafka.m5.large", "Hrs", 2_100_000_000),
+    GenericServiceSeed::new("AmazonNeptune", "Amazon Neptune", "Database Instance", "InstanceUsage:db.r5.large", "Hrs", 3_480_000_000),
+    GenericServiceSeed::new("AmazonRDS", "Amazon Relational Database Service", "Database Instance", "InstanceUsage:db.t3.micro", "Hrs", 170_000_000),
+    GenericServiceSeed::new("AmazonRedshift", "Amazon Redshift", "Compute Instance", "Node:dc2.large", "Hrs", 2_500_000_000),
+    GenericServiceSeed::new("AmazonRoute53", "Amazon Route 53", "DNS Zone", "HostedZone", "HostedZones", 5_000_000_000),
+    GenericServiceSeed::new("AmazonSES", "Amazon Simple Email Service", "Sending Email", "Message", "Messages", 1_000),
+    GenericServiceSeed::new("AmazonSNS", "Amazon Simple Notification Service", "API Request", "Requests-Tier1", "Requests", 5_000),
+    GenericServiceSeed::new("AmazonSageMaker", "Amazon SageMaker", "ML Instance", "ml.m5.large-Hosting", "Hrs", 1_340_000_000),
+    GenericServiceSeed::new("AmazonStates", "AWS Step Functions", "State Transition", "StateTransition", "Transitions", 250_000),
+    GenericServiceSeed::new("AmazonTimestream", "Amazon Timestream", "Write Requests", "Timestream-WriteBytes", "Writes", 500_000),
+    GenericServiceSeed::new("AmazonVPC", "Amazon Virtual Private Cloud", "NAT Gateway", "NatGateway-Hours", "Hrs", 450_000_000),
+    GenericServiceSeed::new("AmazonWorkSpaces", "Amazon WorkSpaces", "WorkSpace", "WorkSpace:Standard", "Months", 350_000_000_000),
+    GenericServiceSeed::new("ElasticMapReduce", "Amazon Elastic MapReduce", "Elastic Map Reduce Instance", "EMR:m5.xlarge", "Hrs", 480_000_000),
+];
+
+// --- Building the products --------------------------------------------------
+
+/// The seeded `AmazonEC2` products: the on-demand compute instances the Price List
+/// API prices per instance type, Region and operating system, and the EBS volume
+/// products that carry the `volumeType` attribute the model's `Filter` example names.
+fn ec2_products() -> Vec<Product> {
+    let mut products = Vec::new();
+    for plan in EC2_COMPUTE_PLAN {
+        let Some(region) = region(plan.region_code) else {
+            continue;
+        };
+        for instance_type in plan.instance_types.iter().copied() {
+            let Some(instance) = instance_type_seed(instance_type) else {
+                continue;
+            };
+            let draft = ProductDraft {
+                sku: sku(&[instance.instance_type, region.code, plan.operating_system]),
+                product_family: "Compute Instance",
+                unit: "Hrs",
+                rate_e10: scale(
+                    scale(instance.rate_e10, region.rate_percent),
+                    plan.rate_percent,
+                ),
+                // AWS prices a compute instance both on demand and under a
+                // reservation, so its offer document carries both term types.
+                reserved: true,
+                attributes: attributes(vec![
+                    ("capacitystatus", "Used".to_string()),
+                    ("currentGeneration", instance.current_generation.to_string()),
+                    ("instanceFamily", instance.instance_family.to_string()),
+                    ("instanceType", instance.instance_type.to_string()),
+                    ("licenseModel", plan.license_model.to_string()),
+                    ("location", region.location.to_string()),
+                    ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
+                    ("memory", instance.memory.to_string()),
+                    ("operatingSystem", plan.operating_system.to_string()),
+                    ("operation", plan.operation.to_string()),
+                    ("physicalProcessor", instance.physical_processor.to_string()),
+                    ("preInstalledSw", "NA".to_string()),
+                    ("regionCode", region.code.to_string()),
+                    ("servicecode", EC2_SERVICE_CODE.to_string()),
+                    ("servicename", EC2_SERVICE_NAME.to_string()),
+                    ("tenancy", "Shared".to_string()),
+                    (
+                        "usagetype",
+                        format!(
+                            "{}BoxUsage:{}",
+                            region.usage_prefix, instance.instance_type
+                        ),
+                    ),
+                    ("vcpu", instance.vcpu.to_string()),
+                ]),
+            };
+            products.push(product_from_draft(EC2_SERVICE_CODE, draft));
+        }
+    }
+    for (region_code, volume_names) in EBS_VOLUME_PLAN.iter().copied() {
+        let Some(region) = region(region_code) else {
+            continue;
+        };
+        for volume_name in volume_names.iter().copied() {
+            let Some(volume) = volume_seed(volume_name) else {
+                continue;
+            };
+            let draft = ProductDraft {
+                sku: sku(&["EBS", volume.volume_api_name, region.code]),
+                product_family: "Storage",
+                unit: "GB-Mo",
+                rate_e10: scale(volume.rate_e10, region.rate_percent),
+                // A volume is priced on demand only.
+                reserved: false,
+                attributes: attributes(vec![
+                    ("location", region.location.to_string()),
+                    ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
+                    ("maxIopsvolume", volume.max_iops.to_string()),
+                    ("maxThroughputvolume", volume.max_throughput.to_string()),
+                    ("regionCode", region.code.to_string()),
+                    ("servicecode", EC2_SERVICE_CODE.to_string()),
+                    ("servicename", EC2_SERVICE_NAME.to_string()),
+                    ("storageMedia", volume.storage_media.to_string()),
+                    (
+                        "usagetype",
+                        format!("{}{}", region.usage_prefix, volume.usagetype),
+                    ),
+                    ("volumeApiName", volume.volume_api_name.to_string()),
+                    ("volumeType", volume.volume_type.to_string()),
+                ]),
+            };
+            products.push(product_from_draft(EC2_SERVICE_CODE, draft));
+        }
+    }
+    products
+}
+
+/// The seeded `AmazonS3` products: one per storage class and Region.
+fn s3_products() -> Vec<Product> {
+    let mut products = Vec::new();
+    for region_code in CORE_REGIONS.iter().copied() {
+        let Some(region) = region(region_code) else {
+            continue;
+        };
+        for class in S3_STORAGE_CLASSES {
+            let draft = ProductDraft {
+                sku: sku(&["S3", class.usagetype, region.code]),
+                product_family: "Storage",
+                unit: "GB-Mo",
+                rate_e10: scale(class.rate_e10, region.rate_percent),
+                reserved: false,
+                attributes: attributes(vec![
+                    ("availability", class.availability.to_string()),
+                    ("durability", class.durability.to_string()),
+                    ("location", region.location.to_string()),
+                    ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
+                    ("regionCode", region.code.to_string()),
+                    ("servicecode", S3_SERVICE_CODE.to_string()),
+                    ("servicename", S3_SERVICE_NAME.to_string()),
+                    ("storageClass", class.storage_class.to_string()),
+                    (
+                        "usagetype",
+                        format!("{}{}", region.usage_prefix, class.usagetype),
+                    ),
+                    ("volumeType", class.volume_type.to_string()),
+                ]),
+            };
+            products.push(product_from_draft(S3_SERVICE_CODE, draft));
+        }
+    }
+    products
+}
+
+/// The products of a service the catalog prices with one usage type per Region.
+fn generic_products(seed: &GenericServiceSeed) -> Vec<Product> {
+    let mut products = Vec::new();
+    for region_code in CORE_REGIONS.iter().copied() {
+        let Some(region) = region(region_code) else {
+            continue;
+        };
+        let draft = ProductDraft {
+            sku: sku(&[seed.service_code, region.code]),
+            product_family: seed.product_family,
+            unit: seed.unit,
+            rate_e10: scale(seed.rate_e10, region.rate_percent),
+            reserved: false,
+            attributes: attributes(vec![
+                ("location", region.location.to_string()),
+                ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
+                ("regionCode", region.code.to_string()),
+                ("servicecode", seed.service_code.to_string()),
+                ("servicename", seed.service_name.to_string()),
+                (
+                    "usagetype",
+                    format!("{}{}", region.usage_prefix, seed.usagetype),
+                ),
+            ]),
+        };
+        products.push(product_from_draft(seed.service_code, draft));
+    }
+    products
+}

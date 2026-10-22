@@ -21,10 +21,11 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     Application, BlockPublicAccessConfiguration, BlockPublicAccessConfigurationMetadata,
     BootstrapActionConfig, Cluster, ClusterStateChangeReason, ClusterStatus, ClusterSummary,
-    ClusterTimeline, Configuration, Ec2InstanceAttributes, HadoopStepConfig,
+    ClusterTimeline, Configuration, Ec2InstanceAttributes, HadoopStepConfig, InstanceFleetConfig,
     JobFlowInstancesConfig, KerberosAttributes, ManagedScalingPolicy, MonitoringConfiguration,
-    OSRelease, PlacementGroupConfig, PortRange, SimplifiedApplication, Step, StepConfig,
-    StepStatus, StepSummary, StepTimeline, SupportedInstanceType, Tag,
+    NotebookExecution, OSRelease, PlacementGroupConfig, PortRange, Session, SessionMappingDetail,
+    SimplifiedApplication, Step, StepConfig, StepStatus, StepSummary, StepTimeline, Studio,
+    SupportedInstanceType, Tag,
 };
 
 /// `com.amazonaws.emr#ClusterState`, as the wire carries it.
@@ -58,6 +59,43 @@ pub mod step_state {
 pub mod instance_collection_type {
     pub const INSTANCE_FLEET: &str = "INSTANCE_FLEET";
     pub const INSTANCE_GROUP: &str = "INSTANCE_GROUP";
+}
+
+/// `com.amazonaws.emr#InstanceFleetState`, as the wire carries it.
+pub mod instance_fleet_state {
+    pub const PROVISIONING: &str = "PROVISIONING";
+    pub const RUNNING: &str = "RUNNING";
+}
+
+/// `com.amazonaws.emr#CancelStepsRequestStatus`: "The value may be SUBMITTED or
+/// FAILED." (`CancelStepsInfo$Status` doc.)
+pub mod cancel_steps_request_status {
+    pub const SUBMITTED: &str = "SUBMITTED";
+    pub const FAILED: &str = "FAILED";
+}
+
+/// `com.amazonaws.emr#NotebookExecutionStatus`, for the statuses this emulator sets.
+pub mod notebook_execution_status {
+    /// "`STOP_PENDING` indicates that the cluster has received a
+    /// `StopNotebookExecution` request and the stop is pending."
+    pub const STOP_PENDING: &str = "STOP_PENDING";
+    /// "`STOPPED` indicates that the execution stopped because of a
+    /// `StopNotebookExecution` request."
+    pub const STOPPED: &str = "STOPPED";
+    /// "`FINISHED` indicates that the execution has completed without error."
+    pub const FINISHED: &str = "FINISHED";
+    /// "`FAILED` indicates that the execution failed."
+    pub const FAILED: &str = "FAILED";
+
+    /// The statuses a notebook execution never leaves, so a stop has nothing left to
+    /// do (`NotebookExecutionStatus` doc).
+    pub const TERMINAL: &[&str] = &[FINISHED, FAILED, STOPPED];
+}
+
+/// `com.amazonaws.emr#AuthMode`
+/// (`smithy_query(query="shape", shape="AuthMode")`: SSO, IAM).
+pub mod auth_mode {
+    pub const IAM: &str = "IAM";
 }
 
 /// `com.amazonaws.emr#ClusterStateChangeReasonCode`, for the codes this emulator sets.
@@ -134,6 +172,41 @@ pub const DEFAULT_STEP_CONCURRENCY_LEVEL: i32 = 1;
 /// See [`DEFAULT_STEP_CONCURRENCY_LEVEL`].
 pub const MAX_STEP_CONCURRENCY_LEVEL: i32 = 256;
 
+/// "A maximum of 256 steps are allowed in each CancelSteps request." (`CancelSteps`
+/// doc, Smithy model.)
+pub const MAX_CANCEL_STEP_IDS: usize = 256;
+
+/// The step states a cancel can still act on: "When you use Amazon EMR releases 5.28.0
+/// and later, you can cancel steps that are in a `PENDING` or `RUNNING` state."
+/// (`CancelSteps` doc, Smithy model.)
+pub const CANCELLABLE_STEP_STATES: &[&str] = &[step_state::PENDING, step_state::RUNNING];
+
+/// "A Studio can have a maximum of 5 subnets." (`CreateStudio$SubnetIds` doc, Smithy
+/// model.)
+pub const MAX_STUDIO_SUBNETS: usize = 5;
+
+/// How many EMR Studios this emulator holds at once.
+///
+/// CHOSEN, not documented: AWS bounds Studios per account, and this number is what
+/// stops the studio map growing without end — a create past it is refused with the
+/// modelled `InvalidRequestException` rather than accepted.
+pub const MAX_STUDIOS: usize = 100;
+
+/// How many session mappings one Studio holds at once.
+///
+/// CHOSEN, not documented, for the same reason [`MAX_STUDIOS`] is: the identity a
+/// mapping is keyed by comes from the request, so without a bound one studio could
+/// accumulate mappings without end.
+pub const MAX_SESSION_MAPPINGS_PER_STUDIO: usize = 500;
+
+/// How many instance fleets one cluster holds at once.
+///
+/// CHOSEN, not documented here, and shaped after EMR's instance-group limit (a cluster
+/// carries one master and one core group plus up to 48 task groups): it is what stops
+/// one cluster's fleet list growing without end, the same way
+/// [`MAX_STEPS_PER_JOB_FLOW`] bounds its step list.
+pub const MAX_INSTANCE_FLEETS_PER_CLUSTER: usize = 50;
+
 /// The account-wide default for `BlockPublicSecurityGroupRules`: "By default, the value
 /// is `false` for accounts that have created Amazon EMR clusters before July 2019. For
 /// accounts created after this, the default is `true`."
@@ -204,6 +277,27 @@ pub struct ComAmazonawsEmrElasticmapreduceState {
     /// One counter for every step of every cluster, so a step id is unique
     /// service-wide rather than only within its own cluster.
     pub next_step_seq: u64,
+    /// One counter for every instance fleet of every cluster, for the same reason.
+    pub next_instance_fleet_seq: u64,
+    /// The persisted EMR Studios, keyed by studio id. `CreateStudio` inserts the
+    /// `Studio` the request describes plus the id, ARN, URL and creation instant it
+    /// mints, and every studio operation resolves that record: the shape is complete
+    /// and nothing is derived from it, so it is held as the wire shape rather than
+    /// projected (unlike [`ClusterRecord`], whose wire shapes ARE projections).
+    /// Bounded by [`MAX_STUDIOS`].
+    pub studios: BTreeMap<String, Studio>,
+    pub next_studio_seq: u64,
+    /// The persisted studio session mappings, keyed by
+    /// [`session_mapping_key`] — one mapping per (studio, identity type, identity),
+    /// which is the identity `GetStudioSessionMapping` addresses one by. Bounded per
+    /// studio by [`MAX_SESSION_MAPPINGS_PER_STUDIO`].
+    pub studio_session_mappings: BTreeMap<String, SessionMappingDetail>,
+    /// The persisted notebook executions, keyed by execution id.
+    ///
+    /// `StartNotebookExecution` is what inserts one; it is still a scaffold stub (its
+    /// own issue), so until it lands this map is what tells `DescribeNotebookExecution`
+    /// and `StopNotebookExecution` that an execution id names nothing.
+    pub notebook_executions: BTreeMap<String, NotebookExecution>,
     /// The ONE block public access configuration of this account and Region, which
     /// always exists: `PutBlockPublicAccessConfiguration` REPLACES it and
     /// `GetBlockPublicAccessConfiguration` reports it.
@@ -227,6 +321,11 @@ impl Default for ComAmazonawsEmrElasticmapreduceState {
             clusters: BTreeMap::new(),
             next_cluster_seq: 0,
             next_step_seq: 0,
+            next_instance_fleet_seq: 0,
+            studios: BTreeMap::new(),
+            next_studio_seq: 0,
+            studio_session_mappings: BTreeMap::new(),
+            notebook_executions: BTreeMap::new(),
             block_public_access: BlockPublicAccessRecord::account_default(SystemTime::now()),
             security_configurations: BTreeMap::new(),
         }
@@ -244,6 +343,28 @@ impl ComAmazonawsEmrElasticmapreduceState {
     pub fn mint_step_id(&mut self) -> String {
         self.next_step_seq += 1;
         format!("s-{}", base36_id(self.next_step_seq))
+    }
+
+    /// A fresh instance fleet id: `if-` followed by uppercase alphanumerics.
+    pub fn mint_instance_fleet_id(&mut self) -> String {
+        self.next_instance_fleet_seq += 1;
+        format!("if-{}", base36_id(self.next_instance_fleet_seq))
+    }
+
+    /// A fresh studio id: `es-` followed by uppercase alphanumerics.
+    pub fn mint_studio_id(&mut self) -> String {
+        self.next_studio_seq += 1;
+        format!("es-{}", base36_id(self.next_studio_seq))
+    }
+
+    /// How many session mappings the studio `studio_id` holds — the count
+    /// [`MAX_SESSION_MAPPINGS_PER_STUDIO`] is taken against.
+    pub fn session_mappings_of(&self, studio_id: &str) -> usize {
+        let prefix = session_mapping_key_prefix(studio_id);
+        self.studio_session_mappings
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .count()
     }
 
     /// The cluster `id`, with every transition the clock already made due applied.
@@ -285,6 +406,58 @@ pub fn cluster_arn(region: &str, cluster_id: &str) -> String {
         region,
         &format!("cluster/{cluster_id}"),
     )
+}
+
+/// The ARN of a studio: `arn:aws:elasticmapreduce:<region>:<account>:studio/<id>`.
+pub fn studio_arn(region: &str, studio_id: &str) -> String {
+    ::engine::emulator_arn("elasticmapreduce", region, &format!("studio/{studio_id}"))
+}
+
+/// "The unique access URL of the Amazon EMR Studio" (`Studio$Url` doc): the studio's
+/// own id under the regional EMR Studio domain, so the URL is derived from the studio
+/// rather than invented per read.
+pub fn studio_url(region: &str, studio_id: &str) -> String {
+    format!("https://{studio_id}.emrstudio-prod.{region}.amazonaws.com")
+}
+
+/// The key one studio session mapping is held under: its studio, its identity type and
+/// the identity itself.
+///
+/// `GetStudioSessionMapping` addresses a mapping by `StudioId` + `IdentityType` +
+/// either `IdentityId` or `IdentityName` ("Specify `IdentityId` or `IdentityName`"),
+/// so those three are its identity. The identity is case-folded because an IAM
+/// Identity Center user or group name is not distinguished by case.
+pub fn session_mapping_key(studio_id: &str, identity_type: &str, identity: &str) -> String {
+    format!(
+        "{}{identity_type}\u{1f}{}",
+        session_mapping_key_prefix(studio_id),
+        identity.to_lowercase()
+    )
+}
+
+/// The identity a studio session mapping names, and which member named it.
+///
+/// "Either `IdentityName` or `IdentityId` must be specified, but not both."
+/// (`CreateStudioSessionMapping$IdentityId` doc.) `None` means the request named
+/// neither or both, which every mapping operation refuses.
+pub fn session_mapping_identity(
+    identity_id: Option<&String>,
+    identity_name: Option<&String>,
+) -> Option<(Option<String>, Option<String>, String)> {
+    let identity_id = identity_id.filter(|value| !value.trim().is_empty());
+    let identity_name = identity_name.filter(|value| !value.trim().is_empty());
+    match (identity_id, identity_name) {
+        (Some(id), None) => Some((Some(id.clone()), None, id.clone())),
+        (None, Some(name)) => Some((None, Some(name.clone()), name.clone())),
+        _ => None,
+    }
+}
+
+/// The prefix every session-mapping key of `studio_id` begins with, so the mappings
+/// that belong to one studio can be found (and dropped with it) without a second map
+/// keyed by studio.
+pub fn session_mapping_key_prefix(studio_id: &str) -> String {
+    format!("{studio_id}\u{1f}")
 }
 
 /// The region this request is addressed to: the region of its SigV4 credential scope,
@@ -920,6 +1093,16 @@ pub struct ClusterRecord {
     pub status: ClusterStatusRecord,
     /// Steps in submission order. `ListSteps` reverses this.
     pub steps: Vec<StepRecord>,
+    /// The instance fleets this cluster carries, in the order they were added: the
+    /// ones `RunJobFlow` was given, then every `AddInstanceFleet`.
+    pub fleets: Vec<InstanceFleetRecord>,
+    /// The Spark Connect sessions this cluster carries.
+    ///
+    /// `StartSession` is what appends one; it is still a scaffold stub (its own
+    /// issue), so until it lands this is what tells `GetSession` that a session id
+    /// names nothing on this cluster. Held as the wire shape for the same reason the
+    /// studios are.
+    pub sessions: Vec<Session>,
 }
 
 impl ClusterRecord {
@@ -930,6 +1113,12 @@ impl ClusterRecord {
     /// `WAITING` (it is to stay up after its steps) or `RUNNING`, and one the caller
     /// terminated reaches `TERMINATED`.
     pub fn advance_to(&mut self, now: SystemTime) {
+        for fleet in &mut self.fleets {
+            fleet.advance_to(now);
+        }
+        for step in &mut self.steps {
+            step.advance_to(now);
+        }
         if self.status.state == cluster_state::TERMINATING {
             if let Some(due) = self.status.terminated_due_at {
                 if now >= due {
@@ -988,6 +1177,18 @@ impl ClusterRecord {
     /// The step `step_id` of this cluster, if it has one.
     pub fn step(&self, step_id: &str) -> Option<&StepRecord> {
         self.steps.iter().find(|step| step.id == step_id)
+    }
+
+    /// The step `step_id` of this cluster, for an operation that changes it.
+    pub fn step_mut(&mut self, step_id: &str) -> Option<&mut StepRecord> {
+        self.steps.iter_mut().find(|step| step.id == step_id)
+    }
+
+    /// The session `session_id` of this cluster, if it has one.
+    pub fn session(&self, session_id: &str) -> Option<&Session> {
+        self.sessions
+            .iter()
+            .find(|session| session.id == session_id)
     }
 
     /// The wire `ClusterStatus` for this record.
@@ -1106,6 +1307,53 @@ impl ClusterRecord {
     }
 }
 
+/// One persisted instance fleet, built from a submitted `InstanceFleetConfig`.
+///
+/// `ListInstanceFleets` — still a scaffold stub, its own issue — is what projects this
+/// to the modelled `InstanceFleet` shape; what is held here is the submitted
+/// configuration plus the id EMR minted for it and the state the clock moves.
+#[derive(Debug, Clone)]
+pub struct InstanceFleetRecord {
+    pub id: String,
+    pub config: InstanceFleetConfig,
+    pub state: String,
+    pub creation_date_time: SystemTime,
+    /// When the `PROVISIONING` -> `RUNNING` transition the clock owes comes due.
+    pub ready_due_at: Option<SystemTime>,
+}
+
+impl InstanceFleetRecord {
+    /// Persist a submitted `InstanceFleetConfig` under `id`.
+    ///
+    /// A fleet EMR has just accepted is `PROVISIONING` — "the instance fleet is
+    /// provisioning Amazon EC2 resources and is not yet ready to run jobs"
+    /// (`InstanceFleetState`) — and the clock owes it the move to `RUNNING`.
+    pub fn from_config(id: String, config: InstanceFleetConfig, now: SystemTime) -> Self {
+        Self {
+            id,
+            config,
+            state: instance_fleet_state::PROVISIONING.to_string(),
+            creation_date_time: now,
+            ready_due_at: Some(now + TRANSITION_SPAN),
+        }
+    }
+
+    /// Materialise the transition the clock already made due, and nothing else: a
+    /// fleet that was `PROVISIONING` is `RUNNING` once its span has passed, which was
+    /// owed at that instant whether or not anybody looked.
+    pub fn advance_to(&mut self, now: SystemTime) {
+        if self.state != instance_fleet_state::PROVISIONING {
+            return;
+        }
+        if let Some(due) = self.ready_due_at {
+            if now >= due {
+                self.state = instance_fleet_state::RUNNING.to_string();
+                self.ready_due_at = None;
+            }
+        }
+    }
+}
+
 /// One persisted security configuration, named by a `CreateSecurityConfiguration`
 /// request.
 ///
@@ -1137,6 +1385,8 @@ pub struct StepRecord {
     pub creation_date_time: SystemTime,
     pub start_date_time: Option<SystemTime>,
     pub end_date_time: Option<SystemTime>,
+    /// When the `CANCEL_PENDING` -> `CANCELLED` transition the clock owes comes due.
+    pub cancelled_due_at: Option<SystemTime>,
 }
 
 impl StepRecord {
@@ -1175,6 +1425,47 @@ impl StepRecord {
             creation_date_time: now,
             start_date_time: None,
             end_date_time: None,
+            cancelled_due_at: None,
+        }
+    }
+
+    /// Begin cancelling this step on the caller's request.
+    ///
+    /// Answers `false` without touching the step when it is past cancelling: "you can
+    /// cancel steps that are in a `PENDING` or `RUNNING` state" (`CancelSteps` doc),
+    /// so a step that has already finished, failed or been cancelled is refused in the
+    /// request's own `CancelStepsInfo` rather than silently reported as submitted.
+    ///
+    /// "CancelSteps is idempotent but asynchronous" (`CancelSteps` doc): the step goes
+    /// `CANCEL_PENDING` now and the clock owes it the move to `CANCELLED`, so a second
+    /// cancel of the same step reports the same submission and changes nothing.
+    pub fn begin_cancellation(&mut self, now: SystemTime) -> bool {
+        // "CancelSteps is idempotent but asynchronous" (`CancelSteps` doc): a step
+        // whose cancel is already pending was accepted once, so repeating the request
+        // reports the same submission and does not push its due instant out.
+        if self.state == step_state::CANCEL_PENDING {
+            return true;
+        }
+        if !CANCELLABLE_STEP_STATES.contains(&self.state.as_str()) {
+            return false;
+        }
+        self.state = step_state::CANCEL_PENDING.to_string();
+        self.cancelled_due_at = Some(now + TRANSITION_SPAN);
+        true
+    }
+
+    /// Materialise the transition the clock already made due, and nothing else: a step
+    /// the caller cancelled reaches `CANCELLED` once its span has passed.
+    pub fn advance_to(&mut self, now: SystemTime) {
+        if self.state != step_state::CANCEL_PENDING {
+            return;
+        }
+        if let Some(due) = self.cancelled_due_at {
+            if now >= due {
+                self.state = step_state::CANCELLED.to_string();
+                self.end_date_time = Some(due);
+                self.cancelled_due_at = None;
+            }
         }
     }
 
@@ -1197,8 +1488,8 @@ impl StepRecord {
     fn to_status(&self) -> StepStatus {
         StepStatus {
             state: Some(self.state.clone()),
-            // Nothing moved this step out of PENDING, so there is no reason to give
-            // and no failure to detail.
+            // Nothing moved this step out of PENDING other than a cancel the caller
+            // asked for, so there is no reason to give and no failure to detail.
             state_change_reason: None,
             failure_details: None,
             timeline: Some(StepTimeline {
@@ -1343,6 +1634,36 @@ pub fn decode_release_label_token(
 /// A stored instant as the wire timestamp the model declares.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
+}
+
+/// Whether `id` can name an Amazon EC2 resource of the kind `prefix` names
+/// (`vpc`, `subnet`, `sg`).
+///
+/// An EC2 resource id is its type's prefix, a hyphen, and then the id itself in
+/// lowercase hex — 8 characters in the short form and 17 in the long one ("Resource
+/// IDs", Amazon EC2 User Guide). A value outside that form cannot be the id of any EC2
+/// resource, so an operation given one is naming a resource that does not exist rather
+/// than one it could look up.
+pub fn is_ec2_resource_id(prefix: &str, id: &str) -> bool {
+    let Some(body) = id
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    matches!(body.len(), 8 | 17)
+        && body
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Whether `location` is an Amazon S3 URI naming at least a bucket (`s3://bucket`,
+/// optionally with a key), which is the form every EMR member documented as "the
+/// Amazon S3 location …" carries.
+pub fn is_s3_location(location: &str) -> bool {
+    location
+        .strip_prefix("s3://")
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
 }
 
 /// A list member is absent on the wire when the cluster has none, rather than present

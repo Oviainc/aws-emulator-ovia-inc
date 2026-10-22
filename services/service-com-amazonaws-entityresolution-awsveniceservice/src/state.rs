@@ -887,6 +887,14 @@ pub mod messages {
     /// [`GET_MATCHING_WORKFLOW_NOT_FOUND`] form rather than the templated delete one.
     pub const UPDATE_MATCHING_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
 
+    /// `UpdateIdMappingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404) when
+    /// no ID mapping workflow carries the `workflowName` @httpLabel. Not itself
+    /// recorded; it is this operation's own constant. `UpdateIdMappingWorkflow`
+    /// addresses the SAME resource by the SAME key as `GetIdMappingWorkflow` ("the
+    /// IdMappingWorkflow must already exist for the method to succeed"), so it follows
+    /// the same constant, no-name form as [`GET_ID_MAPPING_WORKFLOW_NOT_FOUND`].
+    pub const UPDATE_ID_MAPPING_WORKFLOW_NOT_FOUND: &str = "IdMappingWorkflow Not Found";
+
     /// `ListTagsForResource`'s `ResourceNotFoundException$message` (HTTP 404) when the
     /// `resourceArn` names no resource this service holds.
     ///

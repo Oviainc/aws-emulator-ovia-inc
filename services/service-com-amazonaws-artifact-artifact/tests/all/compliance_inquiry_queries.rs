@@ -15,7 +15,8 @@
 //!   reports the terminal pair, and every later listing reports that same record — so a
 //!   read never changes what a later caller sees;
 //! * the page is bounded by `maxResults` (`@range(min: 1, max: 300)`) and resumed by a
-//!   `nextToken` this service issued for THIS inquiry; a token it did not issue is refused
+//!   `nextToken` this service issued for THIS inquiry — an OPAQUE cursor, not the
+//!   `<inquiryId>:<identifier>` pair it resumes at; a token it did not issue is refused
 //!   with the service's one fixed invalid-token `ValidationException`;
 //! * an inquiry id this account holds no inquiry for is refused by the gateway in front of
 //!   this service (HTTP 401 `UnauthorizedException`), which does not confirm the
@@ -32,6 +33,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
+use service_com_amazonaws_artifact_artifact::state::inquiry_queries_token;
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -496,9 +498,11 @@ async fn a_page_is_bounded_by_max_results_and_resumed_by_a_token_this_service_is
     }
 
     // A token this service issued for THIS inquiry is a resume point: one naming the
-    // first identifier serves the query again, and one naming an identifier past the last
-    // serves an empty page rather than failing.
-    let resumed = list_queries(&router, &id, &format!("&nextToken={id}:1")).await;
+    // first position serves the query again, and one naming a position past the last
+    // serves an empty page rather than failing. The token is the OPAQUE cursor this
+    // operation cuts, so it is built through the same codec the handler issues it from.
+    let first_cursor = inquiry_queries_token(&id, 0);
+    let resumed = list_queries(&router, &id, &format!("&nextToken={first_cursor}")).await;
     assert_eq!(
         resumed.queries().len(),
         1,
@@ -512,7 +516,8 @@ async fn a_page_is_bounded_by_max_results_and_resumed_by_a_token_this_service_is
         "case \"a token resuming at the first query\": expected {query:?}, got {:?}",
         resumed.body
     );
-    let exhausted = list_queries(&router, &id, &format!("&nextToken={id}:2")).await;
+    let past_cursor = inquiry_queries_token(&id, 1);
+    let exhausted = list_queries(&router, &id, &format!("&nextToken={past_cursor}")).await;
     assert_eq!(
         exhausted.status, 200,
         "case \"a token past the last query\": expected HTTP 200, got {} with {:?}",
@@ -539,13 +544,19 @@ async fn a_token_this_operation_never_issued_is_refused_with_the_fixed_text() {
 
     // Every row satisfies `NextTokenAttribute`'s modelled length, so each one reaches the
     // handler and is refused for what it IS rather than for how it is spelled. The rows
-    // differ along the token's shape: a word, a bare number, a token cut for ANOTHER
-    // inquiry, an inquiry id with no resume point, and resume points outside the
-    // identifier sequence.
+    // differ along the token's shape: a word, a bare number, a cursor cut for ANOTHER
+    // inquiry, an inquiry id with no resume point, resume points outside the identifier
+    // sequence, and the unencoded `<inquiryId>:<identifier>` spelling of a resume point,
+    // which is a resource identifier rather than a cursor this operation issued.
     let rows = [
         ("a word", "nota".to_string()),
         ("a bare number", "1".to_string()),
-        ("a token cut for another inquiry", format!("{other}:1")),
+        (
+            "a cursor cut for another inquiry",
+            inquiry_queries_token(&other, 1),
+        ),
+        ("an unencoded resume point", format!("{mine}:1")),
+        ("another inquiry's unencoded resume point", format!("{other}:1")),
         ("an inquiry id with no resume point", mine.clone()),
         ("a resume point below the sequence", format!("{mine}:0")),
         ("a negative resume point", format!("{mine}:-1")),

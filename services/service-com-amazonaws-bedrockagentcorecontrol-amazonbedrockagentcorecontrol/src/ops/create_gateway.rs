@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a gateway and PERSISTS it in [`crate::state`]: the configuration the caller
+//! supplied, its endpoint URL, and the `CREATING` -> `READY` transition the clock owes
+//! it. Every later read of the gateway, and every target created on it, comes from that
+//! record.
 //!
 //! ## Shape of an operation
 //!
@@ -162,6 +158,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// `protocolType`'s modelled default: `GatewayProtocolType` has the single value `MCP`
+/// and the member carries `default: "MCP"` (`smithy_query operation=CreateGateway`).
+const DEFAULT_PROTOCOL_TYPE: &str = "MCP";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -235,18 +235,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGateway"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateGatewayErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the gateway store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // gateway that token first produced, rather than minting a second one.
+        if let Some((gateway_id, _)) =
+            store.replayed_gateway_result(Self::NAME, input.client_token.as_deref())
+        {
+            if let Some(record) = store.gateways.get(&gateway_id) {
+                return Ok(record.create_output(now));
+            }
+        }
+
+        // The model states this rule in prose, so the framework's constraint walk
+        // cannot refuse it: "If you specify CUSTOM_JWT as the authorizerType, you
+        // must provide an authorizerConfiguration." The other authorizer types
+        // carry no configuration of their own and the model states nothing about
+        // supplying one with them, so a configuration sent alongside one is
+        // stored and reported rather than refused.
+        if input.authorizer_type == crate::state::AUTHORIZER_TYPE_CUSTOM_JWT
+            && input.authorizer_configuration.is_none()
+        {
+            return Err(CreateGatewayErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "authorizerConfiguration",
+                    &format!(
+                        "is required when authorizerType is {}",
+                        crate::state::AUTHORIZER_TYPE_CUSTOM_JWT
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // "The name must be unique within your account", so a repeated name is a
+        // conflict, not a second gateway that later reads cannot tell apart.
+        if let Some(existing) = store.gateway_names.get(&input.name) {
+            return Err(CreateGatewayErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a gateway named {} already exists (gatewayId {existing})",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if store.gateways.len() >= crate::state::MAX_GATEWAYS {
+            return Err(CreateGatewayErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} gateways",
+                        crate::state::MAX_GATEWAYS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let gateway_id = store.mint_gateway_id(&input.name, now);
+        let record = crate::state::GatewayRecord {
+            gateway_arn: crate::state::gateway_arn(&region, &gateway_id),
+            gateway_url: crate::state::gateway_url(&region, &gateway_id),
+            name: input.name,
+            created_at: now,
+            updated_at: now,
+            // A new gateway is created, not ready: the transition to READY is owed
+            // by the clock, not by this call.
+            transient_status: crate::state::STATUS_CREATING.to_string(),
+            settled_status: crate::state::STATUS_READY.to_string(),
+            settles_at: now + crate::state::GATEWAY_SETTLE_DELAY,
+            description: input.description,
+            role_arn: input.role_arn,
+            // `protocolType` carries the model's `MCP` default, so a gateway created
+            // without one still reports the protocol it speaks.
+            protocol_type: Some(
+                input
+                    .protocol_type
+                    .unwrap_or_else(|| DEFAULT_PROTOCOL_TYPE.to_string()),
+            ),
+            protocol_configuration: input.protocol_configuration,
+            authorizer_type: input.authorizer_type,
+            authorizer_configuration: input.authorizer_configuration,
+            kms_key_arn: input.kms_key_arn,
+            interceptor_configurations: input.interceptor_configurations,
+            policy_engine_configuration: input.policy_engine_configuration,
+            exception_level: input.exception_level,
+            tags: crate::state::sorted_map(input.tags),
+            workload_identity_details: Some(WorkloadIdentityDetails {
+                workload_identity_arn: crate::state::workload_identity_arn(&region, &gateway_id),
+            }),
+            targets: ::std::collections::BTreeMap::new(),
+            gateway_id: gateway_id.clone(),
+        };
+        let output = record.create_output(now);
+
+        store
+            .gateway_names
+            .insert(record.name.clone(), gateway_id.clone());
+        store.remember_gateway_client_token(Self::NAME, input.client_token, &gateway_id, None);
+        store.gateways.insert(gateway_id, record);
+
+        Ok(output)
     }
 }

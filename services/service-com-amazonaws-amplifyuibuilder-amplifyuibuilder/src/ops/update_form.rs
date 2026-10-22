@@ -4,7 +4,10 @@
 //! Merges a patch into one stored form: every `UpdateFormData` member the request
 //! carries replaces what [`crate::state::StoredForm`] held, every member it leaves out
 //! keeps its stored value, and the returned `Form` is computed from that one record —
-//! so a later `GetForm` reports exactly what this call left behind.
+//! so a later `GetForm` reports exactly what this call left behind. An id that names no
+//! form anywhere is refused with the modelled `ResourceNotFoundException` (404) and an
+//! id a DIFFERENT app environment owns with the modelled `InvalidParameterException`
+//! (400).
 //!
 //! ## Shape of an operation
 //!
@@ -160,16 +163,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let patch = input.updated_form;
         let mut store = state.lock();
 
-        // The target is resolved before anything is merged: a form is addressed by
-        // (appId, environmentName, id), so an id that names no form in the app
-        // environment the request addressed is absent
-        // (`ResourceNotFoundException`, 404 — widened in above, and the same
-        // refusal `GetForm` answers for that id). Nothing is created: an update is
-        // not an upsert.
+        // The target is resolved before anything is merged, and the two ways it
+        // can fail to resolve are the two `GetForm` and `DeleteForm` tell apart
+        // (and `GetComponent`/`DeleteComponent` before them): an id a DIFFERENT
+        // app environment owns is a wrong-scope request (the modelled
+        // `InvalidParameterException`, 400) and an id that names no form anywhere
+        // is absent (`ResourceNotFoundException`, 404 — widened in above, and the
+        // same refusal `GetForm` answers for that id). Nothing is created either
+        // way: an update is not an upsert.
         //
         // `clientToken` is an `@idempotencyToken`, but a merge of the same patch
         // into the same form leaves the same form behind however often it is
         // applied, so no token bookkeeping is needed to make a retry idempotent.
+        let addressed = store
+            .form(&input.app_id, &input.environment_name, &input.id)
+            .is_some();
+        if !addressed && store.form_in_other_scope(&input.app_id, &input.environment_name, &input.id)
+        {
+            return Err(UpdateFormErrorModeled::InvalidParameterException(
+                crate::state::item_wrong_scope(),
+            )
+            .into());
+        }
+
         let Some(form) = store.form_mut(&input.app_id, &input.environment_name, &input.id) else {
             return Err(UpdateFormErrorModeled::ResourceNotFoundException(
                 crate::state::item_not_found(),

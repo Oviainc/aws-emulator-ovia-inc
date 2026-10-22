@@ -85,3 +85,6 @@ Smithy (services/service-com-amazonaws-codedeploy-codedeploy-20141006/smithy-mod
 5. GetDeployment(deploymentId="not-a-deployment-id") -> expect 400 InvalidDeploymentIdException; GetDeployment(deploymentId="d-ABCDEFGHI") -> expect 400 DeploymentDoesNotExistException.
 6. CreateDeployment(applicationName="never-created-app", deploymentGroupName="whatever") -> expect 400 ApplicationDoesNotExistException.
 7. ListOnPremisesInstances(registrationStatus="NotAnEnumValue") on a client with parameter_validation disabled -> expect 400 InvalidRegistrationStatusException.
+
+## Resolution note
+Cause 3 was fixed as a rule over the deployment group's list members that the model does not scope to one compute platform: `ec2TagFilters`, `onPremisesInstanceTagFilters`, `autoScalingGroups` and `triggerConfigurations` now all report the list the group holds, the empty list included, so an omitted member and an explicitly empty one round-trip identically. Only `onPremisesInstanceTagFilters` carries a recording here; the other three are the same class and follow by the rule, with `triggerConfigurations` the least evidenced of them — a later recording of GetDeploymentGroup can confirm it or narrow the rule to the tag-filter and Auto Scaling members. `ecsServices` is deliberately left absent when empty, because the model scopes it to the ECS compute platform.

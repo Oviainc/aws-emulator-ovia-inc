@@ -594,7 +594,6 @@ impl ProcessingJob {
     }
 }
 
-
 /// A pipeline created by `CreatePipeline`, as `DescribePipeline` replays it and
 /// `DeletePipeline` retires it.
 ///
@@ -1157,6 +1156,13 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub trial_components: BTreeMap<String, TrialComponent>,
     /// Keyed by `ProcessingJobName`.
     pub processing_jobs: BTreeMap<String, ProcessingJob>,
+    /// Keyed by `ImageName`. See [`Image`], at the end of this module with the rest of
+    /// the custom-image slice.
+    pub images: BTreeMap<String, Image>,
+    /// Every stored image VERSION, keyed by `(ImageName, Version)` so the versions of
+    /// one image sit together in ascending version order and the latest one is the last
+    /// of that range. See [`ImageVersion`].
+    pub image_versions: BTreeMap<(String, i32), ImageVersion>,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -2274,4 +2280,181 @@ pub fn entity_name_from_name_or_arn<'v>(
     }
     let name = resource.strip_prefix(kind)?.strip_prefix('/')?;
     (!name.is_empty() && !name.contains('/')).then_some(name)
+}
+
+// ---------------------------------------------------------------------------
+// The custom-image slice: `CreateImage` / `CreateImageVersion` and the two
+// `Describe*` readers. Kept together at the end of this module, the way the
+// lineage-action, model-card and notebook-instance slices are, so one slice's
+// records, constants and helpers read as one unit.
+// ---------------------------------------------------------------------------
+
+/// How long after `CreateImage` / `CreateImageVersion` the clock owes the
+/// `CREATING` -> `CREATED` transition.
+///
+/// SageMaker AI returns a freshly created image and image version in `CREATING` and
+/// moves it to `CREATED` once the registry path is resolved, so a caller that describes
+/// straight after creating still observes `CREATING` and one that waits observes
+/// `CREATED`. Real SageMaker takes seconds; the span is compressed, never zero.
+pub const IMAGE_CREATED_AFTER: Duration = Duration::from_millis(300);
+
+/// See [`MODEL_QUOTA`].
+pub const IMAGE_QUOTA: usize = 1_000;
+
+/// See [`MODEL_QUOTA`]: the bound is per image, since versions are numbered within one
+/// image and `CreateImageVersion` is the only call that adds one.
+pub const IMAGE_VERSION_QUOTA: usize = 1_000;
+
+/// The most aliases one image version carries, after which `CreateImageVersion` is
+/// refused with the modelled `ResourceLimitExceeded`.
+///
+/// `SageMakerImageVersionAliases` is modelled with no length, so nothing at the request
+/// boundary bounds the list: without this the request would choose both how much is
+/// stored per version and how much work the alias-collision check does. It is the
+/// emulator's OWN bound rather than a claim about any account's limit, far above any
+/// workflow an emulator serves (a version is normally tagged with a handful of aliases).
+pub const MAX_ALIASES_PER_IMAGE_VERSION: usize = 50;
+
+/// The `ImageStatus` / `ImageVersionStatus` members this emulator moves an image and an
+/// image version through. Both modelled enums spell the creating and created states the
+/// same way (`CREATING`, `CREATED`) and also carry the failure, update and delete states,
+/// which this slice does not reach. Named once here so no handler compares a bare string
+/// literal.
+pub const IMAGE_STATUS_CREATING: &str = "CREATING";
+/// See [`IMAGE_STATUS_CREATING`].
+pub const IMAGE_STATUS_CREATED: &str = "CREATED";
+
+/// `VendorGuidance`'s member for a version whose maintainer named no stability, which
+/// the model documents as "The maintainers did not provide a status for image version
+/// stability" — so it is what a version created without `VendorGuidance` reports.
+pub const VENDOR_GUIDANCE_NOT_PROVIDED: &str = "NOT_PROVIDED";
+
+/// A custom SageMaker AI image created by `CreateImage`, as `DescribeImage` replays it
+/// and `CreateImageVersion` reads it.
+///
+/// `created_at` is the instant the clock owes the `CREATING` -> `CREATED` transition;
+/// it is stored, never slept on, and materialised by whichever reporting call first
+/// runs at or after it. `next_version` is the number the NEXT version of this image
+/// takes: it only ever increases, so a version number — which an image version's ARN
+/// carries — is never handed to two different container images.
+#[derive(Debug, Clone)]
+pub struct Image {
+    pub name: String,
+    pub arn: String,
+    pub description: Option<String>,
+    pub display_name: Option<String>,
+    pub role_arn: String,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub created_at: SystemTime,
+    pub next_version: i32,
+}
+
+/// A version of an image created by `CreateImageVersion`, as `DescribeImageVersion`
+/// replays it.
+///
+/// `created_at` carries the same owed transition as [`Image::created_at`].
+/// `client_token` is the request's `@idempotencyToken`, kept so a retried create
+/// answers with the version the first call minted instead of minting a second one.
+#[derive(Debug, Clone)]
+pub struct ImageVersion {
+    pub image_name: String,
+    pub image_arn: String,
+    pub version: i32,
+    pub arn: String,
+    pub base_image: String,
+    pub client_token: String,
+    pub aliases: Vec<String>,
+    pub vendor_guidance: String,
+    pub job_type: Option<String>,
+    pub ml_framework: Option<String>,
+    pub programming_lang: Option<String>,
+    pub processor: Option<String>,
+    pub horovod: Option<bool>,
+    pub release_notes: Option<String>,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub created_at: SystemTime,
+}
+
+/// Materialise the `CREATING` -> `CREATED` transition the clock already owes to the
+/// record whose `status` is `*status` and whose transition was due at `created_at`.
+///
+/// This is the one write a reporting operation may make: the transition was due
+/// whether or not anybody described the resource, so the observer makes no difference
+/// to the result. `LastModifiedTime` moves to the instant the transition was due, not
+/// to "now", so the value is stable across later reads.
+///
+/// Answers whether the transition happened on this call, so the caller can record it.
+fn settle_created(
+    status: &mut String,
+    last_modified_time: &mut SystemTime,
+    created_at: SystemTime,
+    now: SystemTime,
+) -> bool {
+    if status == IMAGE_STATUS_CREATING && now >= created_at {
+        *status = IMAGE_STATUS_CREATED.to_string();
+        *last_modified_time = created_at;
+        return true;
+    }
+    false
+}
+
+impl Image {
+    /// See [`settle_created`].
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        settle_created(
+            &mut self.status,
+            &mut self.last_modified_time,
+            self.created_at,
+            now,
+        )
+    }
+}
+
+impl ImageVersion {
+    /// See [`settle_created`].
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        settle_created(
+            &mut self.status,
+            &mut self.last_modified_time,
+            self.created_at,
+            now,
+        )
+    }
+}
+
+impl ComAmazonawsSagemakerSagemakerState {
+    /// Whether another image fits, i.e. the store is below [`IMAGE_QUOTA`].
+    pub fn images_below_quota(&self) -> bool {
+        self.images.len() < IMAGE_QUOTA
+    }
+
+    /// Every stored version of `image_name`, in ascending version order.
+    pub fn versions_of<'store>(
+        &'store self,
+        image_name: &str,
+    ) -> impl DoubleEndedIterator<Item = &'store ImageVersion> + 'store {
+        self.image_versions
+            .range((image_name.to_string(), i32::MIN)..=(image_name.to_string(), i32::MAX))
+            .map(|(_, version)| version)
+    }
+
+    /// Whether another version of `image_name` fits, i.e. the image holds fewer than
+    /// [`IMAGE_VERSION_QUOTA`] of them.
+    pub fn image_versions_below_quota(&self, image_name: &str) -> bool {
+        self.versions_of(image_name).count() < IMAGE_VERSION_QUOTA
+    }
+
+    /// The highest-numbered stored version of `image_name` — what
+    /// `DescribeImageVersion` describes when the request names neither a version nor an
+    /// alias.
+    pub fn latest_version_of(&self, image_name: &str) -> Option<&ImageVersion> {
+        self.versions_of(image_name).next_back()
+    }
 }

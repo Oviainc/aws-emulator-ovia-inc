@@ -144,9 +144,38 @@ const REFUSAL_CODES: &[(&str, Option<&str>, Option<&str>)] = &[
         None,
         Some("InvalidDeploymentStatusException"),
     ),
+    (
+        "registrationStatus",
+        None,
+        Some("InvalidRegistrationStatusException"),
+    ),
+    ("tagFilters", None, Some("InvalidTagFilterException")),
+    (
+        "deploymentWaitType",
+        None,
+        Some("InvalidDeploymentWaitTypeException"),
+    ),
+    (
+        "status",
+        None,
+        Some("InvalidLifecycleEventHookExecutionStatusException"),
+    ),
     ("sortBy", None, Some("InvalidSortByException")),
     ("sortOrder", None, Some("InvalidSortOrderException")),
     ("deployed", None, Some("InvalidDeployedStateFilterException")),
+    (
+        "instanceStatusFilter",
+        None,
+        Some("InvalidInstanceStatusException"),
+    ),
+    (
+        "instanceTypeFilter",
+        None,
+        Some("InvalidInstanceTypeException"),
+    ),
+    // `targetFilters` is a map whose KEY is the enumerated filter name, and the
+    // framework captures no key constraints, so such a value is not refused at the
+    // boundary at all and there is nothing here to word.
 ];
 
 /// The code [`EmulatedService::override_refusal`] answers for `member` failing

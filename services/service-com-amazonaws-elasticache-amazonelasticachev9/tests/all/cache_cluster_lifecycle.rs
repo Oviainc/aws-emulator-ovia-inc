@@ -13,6 +13,10 @@
 //! test generalises over (engine, node count, port, region, page size, subnet
 //! count, apply-immediately), and the `demo-cluster` case from the bootstrap
 //! issue is only one row.
+//!
+//! The wire harness below ([`Emulator`], [`Reply`], [`params`]) is
+//! `pub(crate)`, so the other suites of this test target drive the same router
+//! through the same helpers instead of carrying a second copy of them.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,7 +37,7 @@ const API_VERSION: &str = "2015-02-02";
 
 /// Long enough past [`state::CLUSTER_TRANSITION`] that the clock owes a cluster
 /// its next status; the handlers never sleep, so only the test waits.
-const PAST_TRANSITION: Duration = Duration::from_millis(750);
+pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(750);
 
 /// One wire answer, reduced to what a client branches on: the status, and every
 /// text node in the XML body keyed by its element path.
@@ -217,7 +221,7 @@ impl Emulator {
 
 /// One refusal row: the case name, the form pairs that make the request, and
 /// the HTTP status plus `awsQuery` error code it must be answered with.
-type RefusalCase = (
+pub(crate) type RefusalCase = (
     &'static str,
     &'static [(&'static str, &'static str)],
     u16,
@@ -243,14 +247,14 @@ pub(crate) fn params(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 /// Create one cluster with `CacheClusterId` and whatever else `extra` names.
-async fn create_cluster(emulator: &Emulator, id: &str, extra: &[(&str, &str)]) -> Reply {
+pub(crate) async fn create_cluster(emulator: &Emulator, id: &str, extra: &[(&str, &str)]) -> Reply {
     let mut pairs = params(&[("CacheClusterId", id)]);
     pairs.extend(params(extra));
     emulator.call("CreateCacheCluster", &pairs).await
 }
 
 /// Describe one cluster by id, with its node list.
-async fn describe_cluster(emulator: &Emulator, id: &str) -> Reply {
+pub(crate) async fn describe_cluster(emulator: &Emulator, id: &str) -> Reply {
     emulator
         .call(
             "DescribeCacheClusters",
@@ -261,7 +265,7 @@ async fn describe_cluster(emulator: &Emulator, id: &str) -> Reply {
 
 /// Create a cluster and wait out the span after which the clock owes it
 /// `available`, so a test about modify / delete starts from a settled cluster.
-async fn create_available_cluster(emulator: &Emulator, id: &str, extra: &[(&str, &str)]) {
+pub(crate) async fn create_available_cluster(emulator: &Emulator, id: &str, extra: &[(&str, &str)]) {
     let created = create_cluster(emulator, id, extra).await;
     assert_eq!(
         created.status, 200,

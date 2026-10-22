@@ -13,34 +13,36 @@
 //! read ONE copy of each agent space.
 //!
 //! The security requirement packs live here for the same reason:
-//! `CreateSecurityRequirementPack` and `GetSecurityRequirementPack` — and every pack
-//! operation implemented after them — read and write ONE copy of each pack record.
+//! `CreateSecurityRequirementPack`, `GetSecurityRequirementPack`,
+//! `ListSecurityRequirementPacks` — and every pack operation implemented after them —
+//! read and write ONE copy of each pack record.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
     AWSResources, AgentSpace, ApplicationSummary, CodeReviewSettings, IdCConfiguration,
+    SecurityRequirementPackSummary,
 };
 
 /// The region every value this service derives from the request's region carries when
 /// the request arrived without a SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// How many `ApplicationSummary` entries one `ListApplications` page holds when the
-/// caller asks for no page size.
+/// How many summary entries one `ListApplications` or `ListSecurityRequirementPacks`
+/// page holds when the caller asks for no page size.
 ///
 /// CHOSEN, not cited: `MaxResults` carries neither `@default` nor `@range` in the
 /// model, so nothing pins this value. It only bounds the size of one response.
 pub const DEFAULT_MAX_RESULTS: i32 = 100;
 
-/// The most `ApplicationSummary` entries one `ListApplications` page can hold,
-/// whatever the caller asks for.
+/// The most summary entries one `ListApplications` or `ListSecurityRequirementPacks`
+/// page can hold, whatever the caller asks for.
 ///
 /// CHOSEN, not cited, for the same reason as [`DEFAULT_MAX_RESULTS`]: `MaxResults`
 /// carries no `@range`, so nothing is refused at the boundary and a caller could
 /// otherwise ask for the whole store in one response. A larger request is clamped to
-/// this ceiling and the page simply carries a `nextToken`, so no application becomes
+/// this ceiling and the page simply carries a `nextToken`, so no record becomes
 /// unreachable — only the work and the response size one call can demand are bounded.
 pub const MAX_PAGE_SIZE: i32 = 100;
 
@@ -96,6 +98,11 @@ pub const PACK_STATUS_VALUES: [&str; 2] = [PACK_STATUS_ENABLED, PACK_STATUS_DISA
 /// The prefix every `ListApplications` pagination cursor carries, so a token this
 /// service did not mint is refused instead of being read as a resume point.
 const PAGE_TOKEN_PREFIX: &str = "app-v1:";
+
+/// The prefix every `ListSecurityRequirementPacks` pagination cursor carries. Distinct
+/// from [`PAGE_TOKEN_PREFIX`], so a cursor one list minted is not read as a resume
+/// point by the other.
+const PACK_PAGE_TOKEN_PREFIX: &str = "pack-v1:";
 
 /// The IAM Identity Center instance id an `idcInstanceArn` that names none falls back
 /// to, so the minted `idcApplicationArn` is always well formed.
@@ -230,6 +237,24 @@ pub struct SecurityRequirementPack {
     pub updated_at: SystemTime,
 }
 
+impl SecurityRequirementPack {
+    /// This pack projected onto the `SecurityRequirementPackSummary` shape
+    /// `ListSecurityRequirementPacks` returns: the stored record's own fields, never
+    /// request input.
+    pub fn summary(&self) -> SecurityRequirementPackSummary {
+        SecurityRequirementPackSummary {
+            pack_id: self.pack_id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            vendor_name: self.vendor_name.clone(),
+            management_type: self.management_type.clone(),
+            status: self.status.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+        }
+    }
+}
+
 /// The identity minted for a new application: the three values that are the service's
 /// to choose rather than the caller's to supply.
 #[derive(Debug, Clone)]
@@ -344,22 +369,46 @@ pub fn idc_application_arn(idc_instance_arn: &str, sequence: u64) -> String {
     )
 }
 
-/// Encode the `applicationId` a `ListApplications` page resumes at as an opaque
-/// `nextToken`.
+/// Encode the record id a page resumes at as an opaque `nextToken` under `prefix`.
 ///
 /// The cursor names the record to resume AT, not an offset, so deleting a record
-/// between two pages cannot make the next page skip or repeat an application.
+/// between two pages cannot make the next page skip or repeat one.
+fn encode_cursor(prefix: &str, record_id: &str) -> String {
+    format!("{prefix}{}", hex::encode(record_id))
+}
+
+/// The record id a `nextToken` minted under `prefix` resumes at, or `None` when the
+/// token is not one this service minted for that list.
+fn decode_cursor(prefix: &str, token: &str) -> Option<String> {
+    let body = token.strip_prefix(prefix)?;
+    let bytes = hex::decode(body).ok()?;
+    let record_id = String::from_utf8(bytes).ok()?;
+    (!record_id.is_empty()).then_some(record_id)
+}
+
+/// Encode the `applicationId` a `ListApplications` page resumes at as an opaque
+/// `nextToken`.
 pub fn encode_page_token(application_id: &str) -> String {
-    format!("{PAGE_TOKEN_PREFIX}{}", hex::encode(application_id))
+    encode_cursor(PAGE_TOKEN_PREFIX, application_id)
 }
 
 /// The `applicationId` a `nextToken` resumes at, or `None` when the token is not one
 /// this service minted (the caller answers that with a `ValidationException`).
 pub fn decode_page_token(token: &str) -> Option<String> {
-    let body = token.strip_prefix(PAGE_TOKEN_PREFIX)?;
-    let bytes = hex::decode(body).ok()?;
-    let application_id = String::from_utf8(bytes).ok()?;
-    (!application_id.is_empty()).then_some(application_id)
+    decode_cursor(PAGE_TOKEN_PREFIX, token)
+}
+
+/// Encode the `packId` a `ListSecurityRequirementPacks` page resumes at as an opaque
+/// `nextToken`.
+pub fn encode_pack_page_token(pack_id: &str) -> String {
+    encode_cursor(PACK_PAGE_TOKEN_PREFIX, pack_id)
+}
+
+/// The `packId` a `ListSecurityRequirementPacks` `nextToken` resumes at, or `None`
+/// when the token is not one this service minted for that list (the caller answers
+/// that with a `ValidationException`).
+pub fn decode_pack_page_token(token: &str) -> Option<String> {
+    decode_cursor(PACK_PAGE_TOKEN_PREFIX, token)
 }
 
 /// The region this request was signed for, from its SigV4 credential scope;

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopTrainingDocumentClassifier
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopTrainingDocumentClassifier`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopTrainingDocumentClassifier::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Records the stop on the classifier
+//! ([`crate::state::DocumentClassifier::request_stop`]) and answers an empty 200,
+//! which is what the operation documents; an ARN no classifier was created under is
+//! answered with the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +70,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -146,18 +144,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopTrainingDocumentClassifier` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopTrainingDocumentClassifierErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopTrainingDocumentClassifier"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopTrainingDocumentClassifierErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The service store is unavailable. Retry your request.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle_document_classifiers(now);
+
+        let classifier = store
+            .document_classifiers
+            .get_mut(&input.document_classifier_arn)
+            .ok_or_else(|| {
+                StopTrainingDocumentClassifierErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "RESOURCE_NOT_FOUND: Could not find the document classifier {}.",
+                            input.document_classifier_arn
+                        )),
+                    },
+                )
+            })?;
+        // "If the training job completes before it can be stopped, it is put into the
+        // TRAINED" — a training that already ended keeps the status it reached, and the
+        // operation still answers 200 with an empty body. `request_stop` applies that
+        // rule for every status.
+        classifier.request_stop(now);
+
+        Ok(StopTrainingDocumentClassifierOutput {})
     }
 }

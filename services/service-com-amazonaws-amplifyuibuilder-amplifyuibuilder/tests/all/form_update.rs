@@ -31,6 +31,11 @@ const SIGNED_FOR_AMPLIFYUIBUILDER: &str = "AWS4-HMAC-SHA256 \
 const APP_ID: &str = "d1234abcd";
 const ENVIRONMENT: &str = "staging";
 
+/// The fixed phrase the wrong-scope refusal's message carries — recorded behaviour, and
+/// what `crate::state::WRONG_SCOPE_MESSAGE` holds. Only the phrase is pinned: it names no
+/// ids.
+const WRONG_SCOPE_PHRASE: &str = "does not belong to that app or environment";
+
 /// The longest `FormName` the model admits (`@length(min: 1, max: 255)` on
 /// `UpdateFormData$name`, from `smithy_query(query="shape", shape="UpdateFormData")`).
 const NAME_MAX_LENGTH: usize = 255;
@@ -535,9 +540,12 @@ async fn repeating_an_update_is_idempotent_and_touches_only_the_form_addressed()
     }
 }
 
-/// An update is not an upsert: an id that names no form in the app environment the request
-/// addressed is refused with HTTP 404 and nothing is stored, including the id of a form
-/// another app environment owns.
+/// An update is not an upsert: an id that names no form is refused with HTTP 404 and
+/// nothing is stored, and an id a DIFFERENT app environment owns is refused as the
+/// wrong-scope class the service answers for every (appId, environmentName, id)-addressed
+/// operation — HTTP 400 carrying the fixed phrase (see the module doc of
+/// `resource_error_messages.rs`: the refusal classes are per CLASS, not per resource kind,
+/// and the component path has answered this one since it was recorded).
 #[tokio::test]
 async fn update_form_refuses_an_id_that_names_no_form_in_the_scope_addressed() {
     let router = emulator();
@@ -567,9 +575,10 @@ async fn update_form_refuses_an_id_that_names_no_form_in_the_scope_addressed() {
         );
     }
 
-    // A form is addressed by (appId, environmentName, id): the same id in another scope
-    // names no form there, and the form it does name elsewhere is left alone. Rows differ
-    // in which half of the key changes.
+    // A form is addressed by (appId, environmentName, id): the same id in another scope is
+    // addressed in the wrong scope — the wrong-scope refusal (400), not the absent one —
+    // and the form it does name elsewhere is left alone. Rows differ in which half of the
+    // key changes.
     let created = create(&router, baseline()).await;
     let id = created.id();
     for (case, app_id, environment) in [
@@ -579,10 +588,18 @@ async fn update_form_refuses_an_id_that_names_no_form_in_the_scope_addressed() {
     ] {
         let answer = update_in(&router, app_id, environment, &id, json!({"name": "Crossed"})).await;
         assert_eq!(
-            answer.status, 404,
+            answer.status, 400,
             "case {case:?}: UpdateForm must refuse an id outside the app environment that \
-             holds the form, got {} with {:?}",
+             holds the form as a wrong-scope request, got {} with {:?}",
             answer.status, answer.body
+        );
+        assert!(
+            answer.body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(WRONG_SCOPE_PHRASE),
+            "case {case:?}: the refusal must carry {WRONG_SCOPE_PHRASE:?}, got {:?}",
+            answer.body
         );
         let read = get(&router, &id).await;
         assert_eq!(

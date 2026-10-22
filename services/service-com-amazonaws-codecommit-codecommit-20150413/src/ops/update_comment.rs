@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateComment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateComment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateComment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: replaces the content of a comment the caller posted in
+//! `crate::state`, stamps its `lastModifiedDate` and answers with the stored
+//! comment.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateComment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCommentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateComment"))
+        // "Only comment authors can modify or delete their comments", so who is
+        // asking decides whether this edit is allowed.
+        let caller_arn = crate::state::caller_identity_arn(ctx.parts());
+
+        let comment_id = match crate::state::normalize_comment_id(&input.comment_id) {
+            Ok(comment_id) => comment_id.to_string(),
+            Err(crate::state::CommentIdProblem::Missing) => {
+                return Err(UpdateCommentErrorModeled::CommentIdRequiredException(
+                    CommentIdRequiredException {
+                        message: Some(
+                            "The comment ID is missing or null. A comment ID is required."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::CommentIdProblem::Invalid) => {
+                return Err(UpdateCommentErrorModeled::InvalidCommentIdException(
+                    InvalidCommentIdException {
+                        message: Some(format!(
+                            "the comment ID {} is not in a valid format",
+                            input.comment_id
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // The same two content rules the post path applies: a comment carries some
+        // content, and at most the documented 10,240 characters of it.
+        if input.content.trim().is_empty() {
+            return Err(UpdateCommentErrorModeled::CommentContentRequiredException(
+                CommentContentRequiredException {
+                    message: Some(
+                        "The comment is empty. You must provide some content for a comment."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        let characters = input.content.chars().count();
+        if characters > crate::state::MAX_COMMENT_CHARACTERS {
+            return Err(
+                UpdateCommentErrorModeled::CommentContentSizeLimitExceededException(
+                    CommentContentSizeLimitExceededException {
+                        message: Some(format!(
+                            "the comment is {characters} characters, and comments are limited to {} characters",
+                            crate::state::MAX_COMMENT_CHARACTERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let comment = store.comment_mut(&comment_id).ok_or_else(|| {
+            UpdateCommentErrorModeled::CommentDoesNotExistException(CommentDoesNotExistException {
+                message: Some(format!("no comment exists with the ID {comment_id}")),
+            })
+        })?;
+        // "This comment has already been deleted. You cannot edit or delete a
+        // deleted comment."
+        if comment.deleted {
+            return Err(UpdateCommentErrorModeled::CommentDeletedException(
+                CommentDeletedException {
+                    message: Some(format!(
+                        "the comment {comment_id} has already been deleted"
+                    )),
+                },
+            )
+            .into());
+        }
+        // "You cannot modify or delete this comment. Only comment authors can
+        // modify or delete their comments."
+        if comment.author_arn != caller_arn {
+            return Err(
+                UpdateCommentErrorModeled::CommentNotCreatedByCallerException(
+                    CommentNotCreatedByCallerException {
+                        message: Some(format!(
+                            "the comment {comment_id} was posted by {} and only its author can modify it",
+                            comment.author_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        comment.content = input.content.clone();
+        comment.last_modified_date = std::time::SystemTime::now();
+
+        Ok(UpdateCommentOutput {
+            comment: Some(comment.comment_as(&caller_arn)),
+        })
     }
 }

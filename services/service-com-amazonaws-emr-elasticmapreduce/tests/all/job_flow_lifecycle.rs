@@ -123,7 +123,7 @@ impl Emr {
     }
 
     /// `RunJobFlow`, answering the minted cluster id.
-    async fn run_job_flow(&self, request: Value) -> String {
+    pub(crate) async fn run_job_flow(&self, request: Value) -> String {
         let out = self.ok("RunJobFlow", request).await;
         out["JobFlowId"]
             .as_str()
@@ -131,13 +131,13 @@ impl Emr {
             .to_string()
     }
 
-    async fn describe_cluster(&self, cluster_id: &str) -> Value {
+    pub(crate) async fn describe_cluster(&self, cluster_id: &str) -> Value {
         self.ok("DescribeCluster", json!({ "ClusterId": cluster_id }))
             .await["Cluster"]
             .clone()
     }
 
-    async fn list_steps(&self, request: Value) -> Value {
+    pub(crate) async fn list_steps(&self, request: Value) -> Value {
         self.ok("ListSteps", request).await
     }
 }
@@ -170,7 +170,7 @@ pub(crate) fn assert_refused(case: &str, status: u16, payload: &Value, expected_
 }
 
 /// An EMR-minted id: the documented prefix plus uppercase alphanumerics.
-fn assert_minted_id(case: &str, prefix: &str, id: &str) {
+pub(crate) fn assert_minted_id(case: &str, prefix: &str, id: &str) {
     let body = id
         .strip_prefix(prefix)
         .unwrap_or_else(|| panic!("case {case:?}: id {id:?} must start with {prefix:?}"));
@@ -180,7 +180,7 @@ fn assert_minted_id(case: &str, prefix: &str, id: &str) {
     );
 }
 
-fn step_config(name: &str, jar: &str, args: Value, extra: Value) -> Value {
+pub(crate) fn step_config(name: &str, jar: &str, args: Value, extra: Value) -> Value {
     let mut hadoop = json!({ "Jar": jar });
     if !args.is_null() {
         hadoop["Args"] = args;
@@ -202,7 +202,7 @@ pub(crate) fn minimal_request(name: &str) -> Value {
 }
 
 /// A cluster that stays up when it has no steps to run.
-fn kept_alive_request(name: &str) -> Value {
+pub(crate) fn kept_alive_request(name: &str) -> Value {
     json!({
         "Name": name,
         "Instances": {

@@ -23,8 +23,9 @@
 //!
 //! It also holds the EKS Pod Identity association slice:
 //! `CreatePodIdentityAssociation` writes a [`PodIdentityAssociationRecord`] here
-//! and `DescribePodIdentityAssociation`, `UpdatePodIdentityAssociation` and
-//! `DeletePodIdentityAssociation` read, mutate and remove exactly that record.
+//! and `DescribePodIdentityAssociation`, `UpdatePodIdentityAssociation`,
+//! `DeletePodIdentityAssociation` and `ListPodIdentityAssociations` read, mutate
+//! and remove exactly that record.
 //!
 //! It also holds the Kubernetes version calendar `DescribeClusterVersions`
 //! reports ([`ClusterVersionRecord`]), which is seeded once because it is what
@@ -56,8 +57,9 @@ use crate::ops::types::{
     ControlPlaneScalingConfig, EncryptionConfig, Identity, KubeApiServerConfigResponse,
     KubeControllerManagerConfigResponse, KubeSchedulerConfigResponse,
     KubernetesNetworkConfigResponse, Logging, OidcIdentityProviderConfig, OutpostConfigResponse,
-    PodIdentityAssociation, RemoteNetworkConfigResponse, StorageConfigResponse, Update,
-    UpdateParam, UpgradePolicyResponse, VpcConfigResponse, ZonalShiftConfigResponse,
+    PodIdentityAssociation, PodIdentityAssociationSummary, RemoteNetworkConfigResponse,
+    StorageConfigResponse, Update, UpdateParam, UpgradePolicyResponse, VpcConfigResponse,
+    ZonalShiftConfigResponse,
 };
 
 /// The `ClusterStatus` members this slice uses. The model's enum
@@ -1149,13 +1151,33 @@ impl PodIdentityAssociationRecord {
             ),
             created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
             modified_at: Some(::aws_smithy_types::DateTime::from(self.modified_at)),
+            // "If defined, the EKS Pod Identity association is owned by an Amazon
+            // EKS add-on" — an association created through this API is owned by
+            // the caller, so it reports no owner.
+            owner_arn: None,
             disable_session_tags: self.disable_session_tags,
             target_role_arn: self.target_role_arn.clone(),
             external_id: self.external_id.clone(),
             policy: self.policy.clone(),
-            // "If defined, the EKS Pod Identity association is owned by an Amazon
-            // EKS add-on" — an association created through this API is owned by
-            // the caller, so it reports no owner.
+        }
+    }
+
+    /// This record as the modelled `PodIdentityAssociationSummary` shape, which
+    /// is what `ListPodIdentityAssociations` reports.
+    ///
+    /// The summary is the association "simplified by removing these fields
+    /// compared to the full `PodIdentityAssociation`: the IAM role `roleArn`,
+    /// `createdAt`, `modifiedAt` and `tags`" (`PodIdentityAssociationSummary`) —
+    /// so this projects exactly the six members that shape declares and drops
+    /// the rest.
+    pub fn to_summary(&self) -> PodIdentityAssociationSummary {
+        PodIdentityAssociationSummary {
+            cluster_name: Some(self.cluster_name.clone()),
+            namespace: Some(self.namespace.clone()),
+            service_account: Some(self.service_account.clone()),
+            association_arn: Some(self.association_arn.clone()),
+            association_id: Some(self.association_id.clone()),
+            // As on the full association: only an Amazon EKS add-on owns one.
             owner_arn: None,
         }
     }
@@ -1556,7 +1578,8 @@ impl ComAmazonawsEksAwswesleyfrontendState {
     /// Every EKS Pod Identity association of one cluster, in association-id order.
     ///
     /// The map is keyed `(region, clusterName, associationId)`, so one cluster's
-    /// associations are a contiguous range of it.
+    /// associations are a contiguous range of it — which is also the ascending
+    /// id order a page token resumes after.
     pub fn pod_identity_associations_in<'a>(
         &'a self,
         region: &'a str,
@@ -1848,6 +1871,9 @@ pub const PAGE_TOKEN_TAG_LEN: usize = 4;
 pub const CLUSTERS_LISTING: &str = "";
 /// The scope `ListAccessPolicies`'s tokens carry. See [`CLUSTERS_LISTING`].
 pub const ACCESS_POLICIES_LISTING: &str = "access-policies";
+/// The scope `ListPodIdentityAssociations`'s tokens carry, whose key is an
+/// association id. See [`CLUSTERS_LISTING`].
+pub const POD_IDENTITY_ASSOCIATIONS_LISTING: &str = "pod-identity-associations";
 /// The scope `DescribeClusterVersions`'s tokens carry, over the calendar rows'
 /// [`ClusterVersionRecord::page_key`]s. See [`CLUSTERS_LISTING`].
 pub const CLUSTER_VERSIONS_LISTING: &str = "cluster-versions";

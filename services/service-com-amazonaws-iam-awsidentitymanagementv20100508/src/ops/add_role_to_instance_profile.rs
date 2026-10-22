@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddRoleToInstanceProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddRoleToInstanceProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddRoleToInstanceProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts the named role on the named instance profile in the shared IAM store, so a
+//! later `GetInstanceProfile` reports it. "An instance profile can contain only one
+//! role, and this quota cannot be increased", and neither the profile nor the role may
+//! be one the account does not hold.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +183,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddRoleToInstanceProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddRoleToInstanceProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddRoleToInstanceProfile"))
+        // `ctx` carries request metadata only; nothing here depends on it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AddRoleToInstanceProfileErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // Both entities are resolved out of the one store that records what the
+        // account holds, under the case-folded key every IAM name is keyed by.
+        let profile_key = crate::state::name_key(&input.instance_profile_name);
+        if !store.instance_profiles.contains_key(&profile_key) {
+            return Err(AddRoleToInstanceProfileErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Instance Profile {} cannot be found.",
+                        input.instance_profile_name
+                    )),
+                },
+            )
+            .into());
+        }
+        let role_key = crate::state::name_key(&input.role_name);
+        let Some(role) = store.roles.get(&role_key).cloned() else {
+            return Err(AddRoleToInstanceProfileErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!("Role {} cannot be found.", input.role_name)),
+                },
+            )
+            .into());
+        };
+
+        // "Service-linked roles are protected Amazon Web Services resources. Only the
+        // service that depends on the service-linked role can modify or delete the
+        // role on your behalf." (`UnmodifiableEntityException` doc.) Putting one in an
+        // instance profile is such a modification.
+        if let Some(principal) = crate::state::service_linked_role_principal(&role.path) {
+            return Err(
+                AddRoleToInstanceProfileErrorModeled::UnmodifiableEntityException(
+                    UnmodifiableEntityException {
+                        message: Some(format!(
+                            "Service role {} is protected and can only be modified by \
+                             {principal}. You must request the change through that service.",
+                            input.role_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let profile = store
+            .instance_profiles
+            .get_mut(&profile_key)
+            .expect("the profile was just resolved under this key");
+
+        // A repeated add of the role the profile already carries attempted "to create
+        // a resource that already exists" (`EntityAlreadyExistsException` doc) rather
+        // than a second association.
+        if profile
+            .roles
+            .iter()
+            .any(|held| crate::state::name_key(&held.role_name) == role_key)
+        {
+            return Err(
+                AddRoleToInstanceProfileErrorModeled::EntityAlreadyExistsException(
+                    EntityAlreadyExistsException {
+                        message: Some(format!(
+                            "Role {} is already associated with Instance Profile {}.",
+                            input.role_name, input.instance_profile_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "An instance profile can contain only one role, and this quota cannot be
+        // increased. You can remove the existing role and then add a different role to
+        // an instance profile." (`AddRoleToInstanceProfile` doc.)
+        if profile.roles.len() >= crate::state::MAX_ROLES_PER_INSTANCE_PROFILE {
+            return Err(AddRoleToInstanceProfileErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for RolesPerInstanceProfile: {}",
+                        crate::state::MAX_ROLES_PER_INSTANCE_PROFILE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The role is stored on the profile record itself, so the single store is
+        // still the one place the association lives.
+        profile.roles.push(role);
+        Ok(AddRoleToInstanceProfileOutput)
     }
 }

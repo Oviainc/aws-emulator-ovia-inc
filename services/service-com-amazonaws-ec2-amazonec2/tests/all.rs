@@ -40,6 +40,8 @@ mod security_group_filter_limits;
 mod security_groups;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/volume_lifecycle.rs"]
+mod volume_lifecycle;
 #[path = "all/vpc_lifecycle.rs"]
 mod vpc_lifecycle;
 // Reading one VPC back out of an ec2Query response, on top of `ec2_query`'s plumbing.

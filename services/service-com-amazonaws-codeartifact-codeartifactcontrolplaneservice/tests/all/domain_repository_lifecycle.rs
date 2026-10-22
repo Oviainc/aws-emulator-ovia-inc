@@ -71,6 +71,13 @@ impl Answer {
 /// The emulator under test: the production router with this one service mounted on a
 /// single shared engine, exactly as `core/router` assembles it.
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// [`emulator`], handing back the shared engine as well — for a suite that reads the
+/// stored record directly, to catch a call that mutated state its answer looked right
+/// about.
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Deterministic regardless of the ambient `--auth` setting: these requests carry an
@@ -79,10 +86,10 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     router.set_request_authentication(false);
     router.register_service(
         service_com_amazonaws_codeartifact_codeartifactcontrolplaneservice::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ),
     );
-    router
+    (router, engine)
 }
 
 /// Send one request signed for [`REGION`] and reduce the response to an [`Answer`].

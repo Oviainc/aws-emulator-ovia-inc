@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomainPermissionsPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomainPermissionsPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the resource policy attached to a domain and answers with the policy as it
+//! was, immediately before removal, so the caller keeps what it deleted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomainPermissionsPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `policyRevision` is optimistic locking: when the caller supplies one it must be the
+//! revision currently attached, otherwise the delete is refused with `ConflictException`
+//! (409) and the policy stays attached. A domain that holds no policy has nothing to
+//! delete, which is `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +82,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::DOMAIN_RESOURCE_TYPE;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,20 +155,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomainPermissionsPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainPermissionsPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomainPermissionsPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteDomainPermissionsPolicyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // `domainOwner` pins the account the domain must belong to; `store.domain_mut` is
+        // the single place that rule lives, so a domain held by another account is not
+        // found here exactly as it is not found on every other domain-scoped operation.
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(
+                DeleteDomainPermissionsPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Domain {} not found.", input.domain),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some(DOMAIN_RESOURCE_TYPE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Nothing attached means there is no policy resource to delete: reported the same
+        // way `GetDomainPermissionsPolicy` reports an unset policy, so a caller sees one
+        // answer for "this domain has no policy" whichever way it asks. Decided BEFORE the
+        // lock below, so a domain that never had a policy answers the same way whether or
+        // not the caller named a revision.
+        if domain.policy.is_none() {
+            return Err(
+                DeleteDomainPermissionsPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::no_policy_message(
+                            DOMAIN_RESOURCE_TYPE,
+                            &input.domain,
+                        ),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some(DOMAIN_RESOURCE_TYPE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The optimistic lock, exactly as the put applies it: a caller that named a
+        // revision is deleting the policy it read, so a stale revision is refused and the
+        // policy stays attached.
+        if !crate::state::policy_revision_matches(
+            domain.policy.as_ref(),
+            input.policy_revision.as_deref(),
+        ) {
+            return Err(DeleteDomainPermissionsPolicyErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::policy_revision_conflict_message(
+                        DOMAIN_RESOURCE_TYPE,
+                        &input.domain,
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some(DOMAIN_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Removed, and answered with the record as it was immediately before removal, so
+        // the very next read of this domain reports no policy.
+        let policy = domain.policy.take();
+
+        Ok(DeleteDomainPermissionsPolicyOutput { policy })
     }
 }

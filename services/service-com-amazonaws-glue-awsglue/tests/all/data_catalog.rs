@@ -25,7 +25,8 @@ use service_com_amazonaws_glue_awsglue::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    assert_echoed, call, emulator, emulator_on, error_code, ok, ACCOUNT_ID, CALLER_PRINCIPAL,
+    assert_echoed, call, emulator, emulator_on, error_code, ok, table_names, ACCOUNT_ID,
+    CALLER_PRINCIPAL,
 };
 
 /// A `CreateDatabase` body for `name`, with no optional members beyond the name.
@@ -46,21 +47,6 @@ async fn create_table(router: &MultiServiceRouter, database: &str, table: &str) 
         &json!({ "DatabaseName": database, "TableInput": { "Name": table } }),
     )
     .await;
-}
-
-/// The names in a `GetTables` `TableList`, in the order the service returned them.
-fn table_names(page: &Value) -> Vec<String> {
-    page["TableList"]
-        .as_array()
-        .expect("TableList is a list")
-        .iter()
-        .map(|table| {
-            table["Name"]
-                .as_str()
-                .expect("Table.Name is a string")
-                .to_string()
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------

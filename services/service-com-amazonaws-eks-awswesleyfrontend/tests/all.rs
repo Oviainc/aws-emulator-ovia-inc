@@ -31,6 +31,8 @@ mod identity_provider_config;
 mod identity_provider_config_not_found;
 #[path = "all/identity_provider_configs.rs"]
 mod identity_provider_configs;
+#[path = "all/list_pod_identity_associations.rs"]
+mod list_pod_identity_associations;
 #[path = "all/pod_identity_associations.rs"]
 mod pod_identity_associations;
 #[path = "all/state_roundtrip.rs"]

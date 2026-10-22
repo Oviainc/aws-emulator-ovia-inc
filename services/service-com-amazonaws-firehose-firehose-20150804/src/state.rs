@@ -26,7 +26,7 @@ use crate::ops::types::{
     AmazonopensearchserviceDestinationConfiguration, DeliveryStreamEncryptionConfiguration,
     DeliveryStreamEncryptionConfigurationInput, ElasticsearchDestinationConfiguration,
     ExtendedS3DestinationConfiguration, HttpEndpointDestinationConfiguration,
-    IcebergDestinationConfiguration, RedshiftDestinationConfiguration,
+    IcebergDestinationConfiguration, ProcessingConfiguration, RedshiftDestinationConfiguration,
     S3DestinationConfiguration, SnowflakeDestinationConfiguration, SourceDescription,
     SplunkDestinationConfiguration, KEY_TYPE_VALUES,
 };
@@ -100,6 +100,17 @@ pub const DEFAULT_KEY_TYPE: &str = "AWS_OWNED_CMK";
 /// enable SSE for a Firehose stream only if it's a Firehose stream that uses DirectPut as
 /// its source" (`StartDeliveryStreamEncryption`).
 pub const DIRECT_PUT_STREAM_TYPE: &str = "DirectPut";
+
+/// The modelled `ProcessorType` values that make up Firehose's CloudWatch Logs
+/// decompression pipeline: `Decompression`, which inflates the gzip payload CloudWatch
+/// Logs delivers, and `CloudWatchLogProcessing`, which extracts the log events out of
+/// that payload's `DataMessage` envelope. Both are values of `ProcessorType`
+/// (`crate::ops::types::PROCESSOR_TYPE_VALUES`) and neither can process anything a
+/// CloudWatch Logs producer did not send, which is why a stream whose data processing is
+/// enabled with one of them takes data from CloudWatch Logs ONLY: "Only requests from
+/// CloudWatch Logs are supported when CloudWatch Logs decompression is enabled"
+/// (`InvalidSourceException`).
+pub const CLOUDWATCH_LOGS_PROCESSOR_TYPES: &[&str] = &["CloudWatchLogProcessing", "Decompression"];
 
 /// The `DeliveryStreamEncryptionStatus` a started enable is in while it is in flight:
 /// "Firehose first sets the encryption status of the stream to ENABLING".
@@ -183,6 +194,40 @@ pub enum DestinationConfigKind {
     Iceberg(Box<IcebergDestinationConfiguration>),
 }
 
+impl DestinationConfigKind {
+    /// The data-processing configuration this destination carries, whatever variant it is.
+    ///
+    /// `S3DestinationConfiguration` is the one destination the model gives no
+    /// `ProcessingConfiguration` member, so a plain Amazon S3 destination has none.
+    pub fn processing_configuration(&self) -> Option<&ProcessingConfiguration> {
+        match self {
+            Self::S3(_) => None,
+            Self::ExtendedS3(config) => config.processing_configuration.as_ref(),
+            Self::Redshift(config) => config.processing_configuration.as_ref(),
+            Self::Elasticsearch(config) => config.processing_configuration.as_ref(),
+            Self::AmazonOpenSearchService(config) => config.processing_configuration.as_ref(),
+            Self::Splunk(config) => config.processing_configuration.as_ref(),
+            Self::HttpEndpoint(config) => config.processing_configuration.as_ref(),
+            Self::Snowflake(config) => config.processing_configuration.as_ref(),
+            Self::AmazonOpenSearchServerless(config) => config.processing_configuration.as_ref(),
+            Self::Iceberg(config) => config.processing_configuration.as_ref(),
+        }
+    }
+}
+
+/// Whether `processing` turns on a processor that only a CloudWatch Logs producer can
+/// feed ([`CLOUDWATCH_LOGS_PROCESSOR_TYPES`]).
+///
+/// A configuration whose `Enabled` is not `true` processes nothing — "Enables or disables
+/// data processing" (`ProcessingConfiguration$Enabled`) — so the processors it lists are
+/// not in force and gate nothing.
+fn enables_cloudwatch_logs_processing(processing: &ProcessingConfiguration) -> bool {
+    processing.enabled == Some(true)
+        && processing.processors.iter().flatten().any(|processor| {
+            CLOUDWATCH_LOGS_PROCESSOR_TYPES.contains(&processor.r#type.as_str())
+        })
+}
+
 /// One destination of a stream: the id Firehose assigned it and the configuration it was
 /// created with.
 #[derive(Debug, Clone)]
@@ -257,6 +302,22 @@ impl DeliveryStream {
         self.encryption
             .as_ref()
             .is_some_and(|encryption| encryption.status.as_deref() == Some(ENCRYPTION_ENABLED))
+    }
+
+    /// Whether this stream takes data from CloudWatch Logs only, because one of its
+    /// destinations has data processing enabled with a processor of the CloudWatch Logs
+    /// decompression pipeline ([`CLOUDWATCH_LOGS_PROCESSOR_TYPES`]).
+    ///
+    /// A property of the stream's configuration, not of any one payload: every direct
+    /// `PutRecord` / `PutRecordBatch` to such a stream is refused with the modelled
+    /// `InvalidSourceException`, whatever it carries.
+    pub fn takes_cloudwatch_logs_only(&self) -> bool {
+        self.destinations.iter().any(|destination| {
+            destination
+                .config
+                .processing_configuration()
+                .is_some_and(enables_cloudwatch_logs_processing)
+        })
     }
 
     /// The `DeliveryStreamEncryptionStatus` this stream's SSE is in, if SSE was ever
@@ -455,6 +516,11 @@ impl ComAmazonawsFirehoseFirehose20150804State {
         if stream.status != StreamStatus::Active {
             return Err(StreamRefusal::NotActive(stream.status.as_wire()));
         }
+        // A stream configured for the CloudWatch Logs decompression pipeline takes data
+        // from CloudWatch Logs only; an API put is by definition not that producer.
+        if stream.takes_cloudwatch_logs_only() {
+            return Err(StreamRefusal::SourceNotCloudWatchLogs);
+        }
         Ok((stream, counter, buffered_bytes))
     }
 }
@@ -472,6 +538,10 @@ pub enum StreamRefusal {
     NoSuchStream,
     /// The stream exists but is not `ACTIVE`; carries the status it is in.
     NotActive(&'static str),
+    /// The stream only takes data from CloudWatch Logs
+    /// ([`DeliveryStream::takes_cloudwatch_logs_only`]), and an API put is not that
+    /// producer: the modelled `InvalidSourceException`.
+    SourceNotCloudWatchLogs,
 }
 
 /// Buffer `data` under a freshly minted `RecordId` and answer that id, or `None` when the

@@ -242,6 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             volume_kms_key_id: input.volume_kms_key_id.as_deref(),
             vpc_config: input.vpc_config.as_ref(),
             tags: &tags,
+            // The key-phrases family's input models neither a mode nor a redaction
+            // configuration.
+            mode: None,
+            redaction_config: None,
         }
         .digest();
         let mut store = state.lock();
@@ -306,6 +310,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_config: input.vpc_config,
             tags,
             client_request_token: input.client_request_token,
+            // The key-phrases family's input models neither a mode nor a redaction
+            // configuration, so this record carries neither.
+            mode: None,
+            redaction_config: None,
             request_digest,
         };
         let job_status = job.job_status.clone();

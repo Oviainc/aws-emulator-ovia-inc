@@ -5,7 +5,8 @@
 //! Creates a customer managed security requirement pack: mints the pack's `packId`,
 //! stores a record carrying every supplied input plus the status the service resolved,
 //! and answers with that identity. The stored record is what
-//! `GetSecurityRequirementPack` reads back.
+//! `GetSecurityRequirementPack` reads back and what
+//! `ListSecurityRequirementPacks` reports.
 //!
 //! ## Shape of an operation
 //!

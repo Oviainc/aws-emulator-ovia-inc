@@ -229,6 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             s3_bucket_arn: crate::state::asset_bucket_arn(&region, &input.domain),
             tags: input.tags.clone().unwrap_or_default(),
             policy: None,
+            // No policy has ever been attached to a domain that was just created.
+            policy_attachments: 0,
             repositories: ::std::collections::BTreeMap::new(),
             // A domain is created WITH its root package group `/*`: it is the ancestor
             // every later package group inherits its origin restrictions from, so a

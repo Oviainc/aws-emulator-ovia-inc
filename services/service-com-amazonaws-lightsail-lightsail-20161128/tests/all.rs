@@ -29,6 +29,8 @@ mod container_service_lifecycle;
 mod container_service_public_endpoint;
 #[path = "all/disk_block_storage.rs"]
 mod disk_block_storage;
+#[path = "all/disk_restore_from_snapshot.rs"]
+mod disk_restore_from_snapshot;
 #[path = "all/disk_snapshot.rs"]
 mod disk_snapshot;
 #[path = "all/domain_entry_recordset.rs"]

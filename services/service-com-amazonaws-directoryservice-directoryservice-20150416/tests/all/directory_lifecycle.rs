@@ -29,28 +29,29 @@ const TARGET_PREFIX: &str = "DirectoryService_20150416";
 /// A password satisfying the modelled `Password` pattern: 8–64 characters with digits,
 /// upper case, lower case and a special character. It is never asserted on — no
 /// operation reports it back — and exists only so the create requests are well formed.
-const PASSWORD: &str = "Passw0rd!2345";
+pub(crate) const PASSWORD: &str = "Passw0rd!2345";
 
 /// The stage a directory is in between the create and the transition that create owes:
 /// the first value of the modelled `DirectoryStage` enum.
-const STAGE_REQUESTED: &str = "Requested";
+pub(crate) const STAGE_REQUESTED: &str = "Requested";
 
 /// The stage a created directory reaches once that transition falls due.
-const STAGE_ACTIVE: &str = "Active";
+pub(crate) const STAGE_ACTIVE: &str = "Active";
 
 /// The network types `CreateDirectoryRequest$NetworkType`'s documentation says a Simple
 /// AD directory admits: "Simple AD supports IPv4 and Dual-stack only."
 const SIMPLE_AD_NETWORK_TYPES: [&str; 2] = ["IPv4", "Dual-stack"];
 
-/// Directory Service's default quota "Simple AD directories: 10" per account per Region.
-const DIRECTORY_QUOTA: usize = 10;
+/// Directory Service's default quota of 10 directories per account per Region, which
+/// every create counts against.
+pub(crate) const DIRECTORY_QUOTA: usize = 10;
 
 /// AWS's tagging limit of 50 tags per resource.
-const TAG_QUOTA: usize = 50;
+pub(crate) const TAG_QUOTA: usize = 50;
 
 /// Comfortably longer than one clock-owed transition span, with margin for a loaded
 /// test machine.
-const PAST_ONE_SPAN: Duration = Duration::from_millis(900);
+pub(crate) const PAST_ONE_SPAN: Duration = Duration::from_millis(900);
 
 /// The Region the calls below are signed for, and the one a minted ARN therefore
 /// carries. `tests/all/event_topics.rs` reuses the harness below with another Region,
@@ -58,6 +59,9 @@ const PAST_ONE_SPAN: Duration = Duration::from_millis(900);
 pub(crate) const REGION: &str = "us-east-1";
 
 /// A router with just this service mounted on a fresh engine.
+///
+/// This suite's harness is shared with the sibling suites in `tests/all/`, which reach
+/// it as `crate::directory_lifecycle::<item>` rather than standing up a second copy.
 pub(crate) fn service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -156,7 +160,7 @@ pub(crate) fn string(body: &Value, member: &str, case: &str) -> String {
 }
 
 /// The modelled `DirectoryId` pattern, `^d-[0-9a-f]{10}$`, as an assertion.
-fn assert_directory_id(id: &str, case: &str) {
+pub(crate) fn assert_directory_id(id: &str, case: &str) {
     let suffix = id.strip_prefix("d-").unwrap_or_default();
     assert!(
         suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
@@ -182,7 +186,7 @@ pub(crate) fn minimal_create(name: &str) -> Value {
 }
 
 /// The `DirectoryDescriptions` of a `DescribeDirectories` answer.
-fn descriptions(body: &Value, case: &str) -> Vec<Value> {
+pub(crate) fn descriptions(body: &Value, case: &str) -> Vec<Value> {
     body["DirectoryDescriptions"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected DirectoryDescriptions, got {body}"))
@@ -196,7 +200,11 @@ async fn describe_all(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
 }
 
 /// The one description `DescribeDirectories` reports for `directory_id`.
-async fn describe_one(router: &MultiServiceRouter, directory_id: &str, case: &str) -> Value {
+pub(crate) async fn describe_one(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) -> Value {
     let answer = ok(
         router,
         "DescribeDirectories",
@@ -214,7 +222,7 @@ async fn describe_one(router: &MultiServiceRouter, directory_id: &str, case: &st
 }
 
 /// The `Tags` of a `ListTagsForResource` answer, as a key -> value map.
-fn tag_map(body: &Value, case: &str) -> BTreeMap<String, String> {
+pub(crate) fn tag_map(body: &Value, case: &str) -> BTreeMap<String, String> {
     body["Tags"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected Tags, got {body}"))

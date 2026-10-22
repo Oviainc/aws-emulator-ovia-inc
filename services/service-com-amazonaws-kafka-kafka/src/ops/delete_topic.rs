@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTopic
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTopic`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Accepts the deletion of one topic of a stored cluster.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTopic::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation checks what the REQUEST alone decides first, then resolves the
+//! CLUSTER, then the TOPIC — the order every topic operation of this service
+//! follows:
+//!
+//! * a `ClusterArn` that is not shaped like an MSK cluster ARN is a
+//!   `BadRequestException`;
+//! * a `TopicName` Apache Kafka itself would refuse (see
+//!   [`crate::state::topic_name_error`]) is a `BadRequestException`: no cluster
+//!   can hold a topic of that name, so it is refused before any lookup;
+//! * a well-formed `ClusterArn` this endpoint's region holds no cluster for
+//!   (absent, or belonging to another region) is a `NotFoundException`;
+//! * a legal name the cluster holds no topic for is an
+//!   `UnknownTopicOrPartitionException`, the modelled 404 for the topic rather
+//!   than for the cluster.
+//!
+//! Deleting a topic the cluster does hold moves it to `DELETING` and records the
+//! instant the clock owes its removal ([`crate::state::TOPIC_DELETION_DELAY`]),
+//! so the non-terminal `DELETING` status this call reports is one a later reader
+//! actually observes rather than a label on an already-vanished record. Once that
+//! instant passes the topic is gone from every reader. Repeating the call reports
+//! the same pending deletion without postponing it.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +175,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTopic` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTopicErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTopic"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteTopicErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                DeleteTopicErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+        if let Some(reason) = crate::state::topic_name_error(&input.topic_name) {
+            return Err(
+                DeleteTopicErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("TopicName".to_string()),
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
+        let mut state = state.lock();
+
+        // The cluster is resolved FIRST: a topic is addressed through the cluster
+        // whose brokers hold it, so a cluster this endpoint does not hold is the
+        // resource that is missing, not the topic.
+        if state.cluster_in(&region, &input.cluster_arn).is_none() {
+            return Err(
+                DeleteTopicErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        let Some(topic) = state.begin_topic_deletion(
+            &input.cluster_arn,
+            &input.topic_name,
+            std::time::SystemTime::now(),
+        ) else {
+            return Err(DeleteTopicErrorModeled::UnknownTopicOrPartitionException(
+                UnknownTopicOrPartitionException {
+                    invalid_parameter: Some("TopicName".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        Ok(DeleteTopicOutput {
+            topic_arn: Some(topic.arn.clone()),
+            topic_name: Some(topic.name.clone()),
+            status: Some(topic.state.clone()),
+        })
     }
 }

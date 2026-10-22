@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeWebAppCustomization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeWebAppCustomization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeWebAppCustomization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the customization `UpdateWebAppCustomization` assigned to the web app, out
+//! of this service's engine store. A REPORTING operation (`@readonly`): it writes
+//! NOTHING, so two reads of an unchanged web app answer the same thing.
+//!
+//! `Arn` is documented as "the ARN for the web app", so the customization is reported
+//! under the web app's own ARN — a customization has no identifier of its own and is
+//! addressed only by `WebAppId`. A web app no update has customized yet reports that
+//! ARN and id with none of `Title`, `LogoFile` or `FaviconFile`, since nothing has
+//! assigned them; a `WebAppId` the store does not hold is answered with the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +150,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeWebAppCustomization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeWebAppCustomizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeWebAppCustomization"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DescribeWebAppCustomizationErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        // A read: nothing below mutates the store, so what a later caller sees is
+        // exactly what it would have seen without this call.
+        let guard = state.lock();
+        let Some(stored) = guard.web_apps.get(&input.web_app_id) else {
+            return Err(st::not_found(
+                DescribeWebAppCustomizationErrorModeled::ResourceNotFoundException(
+                    st::unknown_web_app(&input.web_app_id),
+                ),
+            ));
+        };
+
+        let web_app_customization = DescribedWebAppCustomization {
+            // The web app's own ARN: `Arn` is documented as "the ARN for the web app".
+            arn: stored.arn.clone(),
+            web_app_id: stored.web_app_id.clone(),
+            // Each member is reported only when an update assigned it; an unassigned
+            // one is absent rather than defaulted, because the model documents no
+            // default title, logo or icon.
+            title: stored.customization.title.clone(),
+            logo_file: stored.customization.logo_file.clone(),
+            favicon_file: stored.customization.favicon_file.clone(),
+        };
+
+        Ok(DescribeWebAppCustomizationOutput {
+            web_app_customization,
+        })
     }
 }

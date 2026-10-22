@@ -67,6 +67,11 @@ pub const MAX_ROLE_NAME_CHARACTERS: usize = 64;
 /// the limit exceeded". It is also what stops the role map growing without end.
 pub const MAX_ROLES_PER_ACCOUNT: usize = 1_000;
 
+/// How many roles one instance profile may hold. `AddRoleToInstanceProfile`'s
+/// documentation: "An instance profile can contain only one role, and this quota
+/// cannot be increased."
+pub const MAX_ROLES_PER_INSTANCE_PROFILE: usize = 1;
+
 /// The maximum session duration, in seconds, a role created without one carries.
 /// `CreateRole$MaxSessionDuration`'s documentation states "if you do not specify a
 /// value for this setting, the default value of one hour is applied", and
@@ -512,6 +517,16 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         unique_id(ROLE_ID_PREFIX, self.role_id_seq)
     }
 
+    /// Mint the next instance profile's `InstanceProfileId`.
+    ///
+    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id)
+    /// is: the counter is bijectively mixed into the suffix, and the id is minted
+    /// once and then stored with the instance profile.
+    pub fn next_instance_profile_id(&mut self) -> String {
+        self.instance_profile_id_seq += 1;
+        unique_id(INSTANCE_PROFILE_ID_PREFIX, self.instance_profile_id_seq)
+    }
+
     /// How many access keys the user keyed by `user_key` holds.
     ///
     /// This is the measure IAM's access-keys-per-user quota
@@ -569,16 +584,6 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn next_policy_id(&mut self) -> String {
         self.policy_id_seq += 1;
         unique_id(POLICY_ID_PREFIX, self.policy_id_seq)
-    }
-
-    /// Mint the next instance profile's `InstanceProfileId`.
-    ///
-    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id) is: the
-    /// counter is bijectively mixed into the suffix, and the id is minted once and then
-    /// stored with the profile.
-    pub fn next_instance_profile_id(&mut self) -> String {
-        self.instance_profile_id_seq += 1;
-        unique_id(INSTANCE_PROFILE_ID_PREFIX, self.instance_profile_id_seq)
     }
 
     /// The managed policy `arn` names, if the account holds it.
