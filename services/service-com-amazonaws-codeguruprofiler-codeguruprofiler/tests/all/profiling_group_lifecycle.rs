@@ -65,7 +65,10 @@ impl Answer {
 /// state itself, which is the only way to observe a retention bound.
 pub(crate) struct Harness {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    /// `pub(crate)` for the same reason as the harness itself: a sibling suite that
+    /// has to place a stored record at a chosen instant reaches the one shared engine
+    /// through it instead of standing up a second emulator.
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Harness {
@@ -182,7 +185,7 @@ impl Harness {
         .await
     }
 
-    async fn post_agent_profile(
+    pub(crate) async fn post_agent_profile(
         &self,
         name: &str,
         content_type: &str,
@@ -199,7 +202,7 @@ impl Harness {
         .await
     }
 
-    async fn get_profile(&self, name: &str, query: &str) -> Answer {
+    pub(crate) async fn get_profile(&self, name: &str, query: &str) -> Answer {
         self.get_profile_accepting(name, query, None).await
     }
 
