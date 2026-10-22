@@ -474,11 +474,18 @@ async fn every_ivs_signed_request_is_dispatched_instead_of_refused_as_ambiguous(
     //
     // Each row names the answer of the ONE service that owns it, which is what excludes
     // both routing failures: `AmbiguousService` (500, two claimants) and `UnknownService`
-    // (404, none). The low-latency endpoint's implemented operations answer their own
-    // modelled success or error; its — and every RealTime — operation that is still
-    // scaffolded answers the scaffold's `501 NotImplemented`, which is also an answer
-    // from the service that owns the path.
-    let rows: [(&str, &str, &str, Value, u16, &str); 9] = [
+    // (404, none). Each endpoint's implemented operations answer their own modelled
+    // success or error; an operation that is still scaffolded answers the scaffold's
+    // `501 NotImplemented`, which is also an answer from the service that owns the path.
+    //
+    // The RealTime endpoint's own answers (its implemented stage operations, and the 501
+    // of the ones still scaffolded) are asserted end-to-end against the same router in
+    // that service's own suite,
+    // `services/service-com-amazonaws-ivsrealtime-amazoninteractivevideoservicerealtime/tests/all/stages.rs`;
+    // which of the two services CLAIMS each `ivs`-signed path, including every RealTime
+    // one, is the table in `exactly_one_service_sharing_the_ivs_signing_name_claims_each_request`
+    // above.
+    let rows: [(&str, &str, &str, Value, u16, &str); 7] = [
         (
             "ivs CreateChannel",
             "POST",
@@ -543,22 +550,6 @@ async fn every_ivs_signed_request_is_dispatched_instead_of_refused_as_ambiguous(
             json!({"publicKeyMaterial": "-----BEGIN PUBLIC KEY-----\n-----END PUBLIC KEY-----"}),
             400,
             "ValidationException",
-        ),
-        (
-            "realtime CreateStage, still scaffolded",
-            "POST",
-            "/CreateStage",
-            json!({"name": "stage-1"}),
-            501,
-            "NotImplemented",
-        ),
-        (
-            "realtime GetStage, still scaffolded",
-            "POST",
-            "/GetStage",
-            json!({"arn": "arn:aws:ivs:us-east-1:000000000000:stage/stage-1"}),
-            501,
-            "NotImplemented",
         ),
     ];
 

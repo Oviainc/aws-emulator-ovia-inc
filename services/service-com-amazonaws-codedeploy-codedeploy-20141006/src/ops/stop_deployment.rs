@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stops a deployment that is still in flight: the stored deployment moves to the
+//! terminal `Stopped` status, and a caller that asked for a rollback gets one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +73,20 @@
 //!   specified in an invalid format.
 //! * `UnsupportedActionForDeploymentTypeException` (HTTP 400) — A call was submitted that is
 //!   not supported for the specified deployment type.
+//!
+//! ## The modelled errors this handler cannot reach
+//!
+//! * `InvalidDeploymentIdException` — the model puts no length or pattern on
+//!   `DeploymentId`, and this crate's deployment readers (`GetDeployment`,
+//!   `ListDeployments`) treat an id of any form as one the account does not hold, so an
+//!   id this service never minted is answered as unknown here too rather than as
+//!   malformed by one operation and unknown by the next. A modelled constraint failure
+//!   on the member is refused before this handler runs, with this code
+//!   (`crate::service::REFUSAL_CODES`).
+//! * `DeploymentGroupDoesNotExistException` and
+//!   `UnsupportedActionForDeploymentTypeException` — a stored deployment always names
+//!   the group it was created on, and every compute platform this emulator deploys to
+//!   supports being stopped, so neither refusal has a condition to fire on.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -155,18 +164,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopDeployment"))
+        let _ = ctx;
+        // `deploymentId` is @required but carries no modelled length, so an empty one
+        // reaches the handler and is what `DeploymentIdRequiredException` is for — the
+        // same reading `GetDeployment` uses, so the two agree about one id. The model
+        // states no FORMAT for a deployment id either, so an id of any other shape is
+        // simply one this account does not have.
+        let deployment_id = input.deployment_id;
+        if deployment_id.trim().is_empty() {
+            return Err(StopDeploymentErrorModeled::DeploymentIdRequiredException(
+                DeploymentIdRequiredException {
+                    message: Some("The deployment ID was not specified".to_string()),
+                },
+            )
+            .into());
+        }
+        // Whether the caller asked for the updated instances to go back to the
+        // revision deployed before this deployment. Absent is no rollback.
+        let auto_rollback_enabled = input.auto_rollback_enabled.unwrap_or(false);
+
+        let outcome = crate::state::with_state(&*self.engine, |state| {
+            let Some(deployment) = state.deployments.get(&deployment_id) else {
+                return Err(StopDeploymentErrorModeled::DeploymentDoesNotExistException(
+                    DeploymentDoesNotExistException {
+                        message: Some(format!("No deployment found for ID {deployment_id}")),
+                    },
+                ));
+            };
+            // A deployment that already reached an outcome has nothing left to
+            // stop. `with_state` has brought the record up to the instants the
+            // clock owed it first, so this reads the status a reader would see at
+            // this same instant.
+            if crate::state::deployment_is_terminal(&deployment.status) {
+                return Err(
+                    StopDeploymentErrorModeled::DeploymentAlreadyCompletedException(
+                        DeploymentAlreadyCompletedException {
+                            message: Some(format!(
+                                "The deployment {deployment_id} is already complete: its status \
+                                 is {status}",
+                                status = deployment.status
+                            )),
+                        },
+                    ),
+                );
+            }
+
+            // What a rollback of this deployment would redeploy, and what the
+            // rollback deployment inherits from it: a rollback goes to the same
+            // deployment group with the same configuration, so those come from the
+            // stored record rather than from the request.
+            let rollback_revision = deployment.previous_revision.clone();
+            let stopped_revision = deployment.revision.clone();
+            let application_name = deployment.application_name.clone();
+            let deployment_group_name = deployment.deployment_group_name.clone();
+            let deployment_config_name = deployment.deployment_config_name.clone();
+            let compute_platform = deployment.compute_platform.clone();
+            let deployment_style = deployment.deployment_style.clone();
+            let auto_rollback_configuration = deployment.auto_rollback_configuration.clone();
+
+            // The id of the rollback deployment, minted only when the caller asked
+            // for a rollback AND this deployment group has a revision to go back
+            // to. A group whose first deployment is being stopped has none, which
+            // is what the rollback message then reports.
+            let rollback_deployment_id = (auto_rollback_enabled && rollback_revision.is_some())
+                .then(|| state.mint_deployment_id());
+            let rollback_info = match (auto_rollback_enabled, &rollback_deployment_id) {
+                (false, _) => None,
+                (true, Some(rollback_id)) => Some(RollbackInfo {
+                    rollback_deployment_id: Some(rollback_id.clone()),
+                    rollback_triggering_deployment_id: Some(deployment_id.clone()),
+                    rollback_message: Some(format!(
+                        "Deployment {rollback_id} was created to roll deployment \
+                         {deployment_id} back to the previously deployed revision"
+                    )),
+                }),
+                (true, None) => Some(RollbackInfo {
+                    rollback_deployment_id: None,
+                    rollback_triggering_deployment_id: Some(deployment_id.clone()),
+                    rollback_message: Some(format!(
+                        "Deployment {deployment_id} cannot be rolled back: no revision was \
+                         deployed to this deployment group before it"
+                    )),
+                }),
+            };
+
+            let stopped_at_ms = crate::state::now_ms();
+            if let Some(deployment) = state.deployments.get_mut(&deployment_id) {
+                // The stop takes effect at this instant, so the deployment is
+                // terminal from here on and the clock owes it nothing further.
+                deployment.status = crate::state::DEPLOYMENT_STATUS_STOPPED.to_string();
+                deployment.complete_time_ms = Some(stopped_at_ms);
+                deployment.rollback_info = rollback_info.clone();
+            }
+
+            // The rollback is a DEPLOYMENT of its own, created by the service
+            // rather than by a client, which the clock then runs like any other.
+            if let (Some(rollback_id), Some(revision)) =
+                (rollback_deployment_id.clone(), rollback_revision)
+            {
+                state.record_deployment(crate::state::Deployment {
+                    deployment_id: rollback_id,
+                    application_name,
+                    deployment_group_name,
+                    deployment_config_name,
+                    revision: Some(revision),
+                    // The revision this group was on when the rollback started:
+                    // the one the stopped deployment was deploying.
+                    previous_revision: stopped_revision,
+                    status: crate::state::DEPLOYMENT_STATUS_CREATED.to_string(),
+                    creator: crate::state::DEPLOYMENT_CREATOR_ROLLBACK.to_string(),
+                    description: None,
+                    ignore_application_stop_failures: false,
+                    update_outdated_instances_only: false,
+                    file_exists_behavior: None,
+                    deployment_mode: None,
+                    auto_rollback_configuration,
+                    // Nothing a client sent to the stopped deployment carries over:
+                    // a rollback targets the group's own instances with the group's
+                    // own settings.
+                    target_instances: None,
+                    override_alarm_configuration: None,
+                    ec2_deployment_options: None,
+                    deployment_style,
+                    compute_platform,
+                    external_id: None,
+                    rollback_info: rollback_info.clone(),
+                    create_time_ms: stopped_at_ms,
+                    start_time_ms: None,
+                    complete_time_ms: None,
+                    starts_at_ms: crate::state::deployment_start_due(stopped_at_ms),
+                    completes_at_ms: crate::state::deployment_completion_due(stopped_at_ms),
+                });
+            }
+
+            Ok(rollback_info)
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+        let rollback_info = outcome?;
+
+        // `StopStatus` is Pending | Succeeded
+        // (`smithy_query(query="shape",shape="StopStatus")`), where Pending means
+        // the stop operation has not taken effect yet. Nothing here is still
+        // winding instances down — the deployment is already terminal by the time
+        // this answers — so reporting Pending would claim work no part of the
+        // emulator is doing.
+        let status_message = match &rollback_info {
+            Some(info) => info.rollback_message.clone(),
+            None => Some(format!("Deployment {deployment_id} was stopped")),
+        };
+        Ok(StopDeploymentOutput {
+            status: Some(STOP_STATUS_SUCCEEDED.to_string()),
+            status_message,
+        })
     }
 }
+
+/// The `StopStatus` value for a stop that has already taken effect
+/// (`smithy_query(query="shape",shape="StopStatus")`: Pending | Succeeded).
+const STOP_STATUS_SUCCEEDED: &str = "Succeeded";

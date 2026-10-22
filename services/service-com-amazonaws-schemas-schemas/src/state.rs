@@ -758,67 +758,123 @@ pub fn local_registry_count(state: &ComAmazonawsSchemasSchemasState) -> usize {
 /// naming two different drafts.
 pub const JSON_SCHEMA_DRAFT4_URI: &str = "http://json-schema.org/draft-04/schema#";
 
-/// The `Code` member of this service's error shapes is documented as "the error
-/// code", and the code a restJson1 client matches on is the error's shape name, so
-/// every error this emulator raises carries its own shape name there.
+// ---------------------------------------------------------------------------
+// Error codes
+//
+// Every error shape this service models carries two REQUIRED members, `Code`
+// ("The error code.") and `Message`, and the two say different things. The
+// exception SHAPE name is what the protocol already carries, in the
+// `x-amzn-errortype` header (`OperationError::shape_name`, see
+// `crate::scaffolded`); `Code` carries the service's own code for the CONDITION
+// that was raised, which is what a client branching on the SDK's error-code
+// accessor reads. So the two are never the same string: a condition-level code
+// goes in `Code` and the shape name is left to the header.
+//
+// The codes below are the ones this service answers with; each is named once
+// here so no handler can spell one differently.
+// ---------------------------------------------------------------------------
+
+/// `Code` for a resource the store does not hold — a registry, a schema, a schema
+/// version, a code binding or a resource-based policy. One code for every
+/// not-found condition: what is missing is said in the `Message`, not the code.
+pub const CODE_RESOURCE_NOT_FOUND: &str = "ResourceNotFound";
+
+/// `Code` for a create whose resource already exists, the conflict an idempotent
+/// create-or-reuse caller keys on.
+pub const CODE_RESOURCE_ALREADY_EXIST: &str = "ResourceAlreadyExist";
+
+/// `Code` for a request the service will not act on as sent: a member outside the
+/// constraint the service enforces, or content that is not the document it must be.
+pub const CODE_MALFORMED_REQUEST: &str = "MalformedRequest";
+
+/// `Code` for a request that conflicts with the state of the resource it names —
+/// both the 409 conflicts that are not "already exists" and the 412 a stale
+/// `RevisionId` precondition fails with, which an optimistic-concurrency retry loop
+/// keys on.
+pub const CODE_CONFLICT: &str = "Conflict";
+
+/// `Code` for a caller that may not perform the action on this resource.
+pub const CODE_FORBIDDEN: &str = "Forbidden";
+
+/// `Code` for a fault on the service's side rather than in the request.
+pub const CODE_INTERNAL_SERVER_ERROR: &str = "InternalServerError";
+
+/// A `NotFoundException` for a resource this store does not hold.
+///
+/// `Code` is [`CODE_RESOURCE_NOT_FOUND`], never the shape name: see the note above.
 pub fn not_found(message: impl Into<String>) -> NotFoundException {
     NotFoundException {
-        code: "NotFoundException".to_string(),
+        code: CODE_RESOURCE_NOT_FOUND.to_string(),
         message: message.into(),
     }
 }
 
-/// See [`not_found`] for the `Code` member.
+/// A `ConflictException` for a create whose resource already exists.
+/// `Code` is [`CODE_RESOURCE_ALREADY_EXIST`].
+pub fn already_exists(message: impl Into<String>) -> ConflictException {
+    ConflictException {
+        code: CODE_RESOURCE_ALREADY_EXIST.to_string(),
+        message: message.into(),
+    }
+}
+
+/// A `ConflictException` for a request that conflicts with the state of the
+/// resource it names, other than a resource that already exists.
+/// `Code` is [`CODE_CONFLICT`].
 pub fn conflict(message: impl Into<String>) -> ConflictException {
     ConflictException {
-        code: "ConflictException".to_string(),
+        code: CODE_CONFLICT.to_string(),
         message: message.into(),
     }
 }
 
-/// See [`not_found`] for the `Code` member.
+/// A `BadRequestException`. `Code` is [`CODE_MALFORMED_REQUEST`].
 pub fn bad_request(message: impl Into<String>) -> BadRequestException {
     BadRequestException {
-        code: "BadRequestException".to_string(),
+        code: CODE_MALFORMED_REQUEST.to_string(),
         message: message.into(),
     }
 }
 
-/// See [`not_found`] for the `Code` member.
+/// A `ForbiddenException`. `Code` is [`CODE_FORBIDDEN`].
 pub fn forbidden(message: impl Into<String>) -> ForbiddenException {
     ForbiddenException {
-        code: "ForbiddenException".to_string(),
+        code: CODE_FORBIDDEN.to_string(),
         message: message.into(),
     }
 }
 
-/// See [`not_found`] for the `Code` member.
+/// A `PreconditionFailedException`: the request's precondition is not the state the
+/// resource is in. `Code` is [`CODE_CONFLICT`] — the condition is a conflict with
+/// the stored resource, and the 412 is what says the request stated a precondition.
 pub fn precondition_failed(message: impl Into<String>) -> PreconditionFailedException {
     PreconditionFailedException {
-        code: "PreconditionFailedException".to_string(),
+        code: CODE_CONFLICT.to_string(),
         message: message.into(),
     }
 }
 
-/// See [`not_found`] for the `Code` member.
+/// An `InternalServerErrorException`. `Code` is [`CODE_INTERNAL_SERVER_ERROR`].
 ///
 /// Raised only where a handler cannot reach its own store, which is a server fault.
 pub fn internal_error() -> InternalServerErrorException {
     InternalServerErrorException {
-        code: "InternalServerErrorException".to_string(),
+        code: CODE_INTERNAL_SERVER_ERROR.to_string(),
         message: "The schemas emulator could not reach its own state store.".to_string(),
     }
 }
 
-/// Message for a registry no caller has created.
+/// Message for a registry no caller has created. The template is AWS's own, built
+/// from the request's `RegistryName`.
 pub fn registry_not_found(registry: &str) -> NotFoundException {
-    not_found(format!("Registry {registry} does not exist."))
+    not_found(format!("Registry with name {registry} does not exist."))
 }
 
-/// Message for a registry that holds no resource-based policy.
+/// Message for a registry that holds no resource-based policy. The template is
+/// AWS's own, built from the request's `RegistryName`.
 pub fn policy_not_found(registry: &str) -> NotFoundException {
     not_found(format!(
-        "Registry {registry} does not have a resource-based policy."
+        "Policy for registry with name '{registry}' does not exist."
     ))
 }
 
@@ -864,23 +920,26 @@ pub fn policy_not_json(detail: &str) -> BadRequestException {
 }
 
 /// Message for a schema the named registry does not hold.
-pub fn schema_not_found(registry: &str, schema: &str) -> NotFoundException {
-    not_found(format!(
-        "Schema {schema} does not exist in registry {registry}."
-    ))
+///
+/// The sentence is the service's own template for a missing resource — "«Resource»
+/// with name «name» does not exist.", as [`registry_not_found`] carries it — built
+/// from the request's `SchemaName` and from that member ALONE, the way
+/// [`schema_already_exists`] keeps the registry out of its sentence.
+pub fn schema_not_found(schema: &str) -> NotFoundException {
+    not_found(format!("Schema with name {schema} does not exist."))
 }
 
 /// Refuse a `CreateRegistry` for a name the store already holds. The template is
 /// AWS's own, built from the request's `RegistryName`.
 pub fn registry_already_exists(registry: &str) -> ConflictException {
-    conflict(format!("Registry with name {registry} already exists."))
+    already_exists(format!("Registry with name {registry} already exists."))
 }
 
 /// Refuse a `CreateSchema` for a name its registry already holds. The template is
 /// AWS's own, built from the request's `SchemaName` — and from that member ALONE:
 /// AWS keeps the registry out of this sentence.
 pub fn schema_already_exists(schema: &str) -> ConflictException {
-    conflict(format!("Schema with name {schema} already exists."))
+    already_exists(format!("Schema with name {schema} already exists."))
 }
 
 /// Refuse a `DeleteRegistry` that would take a registry's schemas with it. Names no
@@ -913,15 +972,14 @@ pub fn schema_version_not_found(registry: &str, schema: &str, requested: Option<
 
 /// Message for a code binding nobody has started for this schema version and
 /// language.
-pub fn code_binding_not_found(
-    registry: &str,
-    schema: &str,
-    version: u64,
-    language: &str,
-) -> NotFoundException {
+///
+/// The template is AWS's own, built from the request's `SchemaName`, the resolved
+/// version and the request's `Language`. It names no registry — AWS's sentence for
+/// this refusal names none — so this helper takes none.
+pub fn code_binding_not_found(schema: &str, version: u64, language: &str) -> NotFoundException {
     not_found(format!(
-        "No code binding exists for language {language} of version {version} of schema \
-         {schema} in registry {registry}."
+        "Code bindings for schema with name {schema} and version {version} language \
+         {language} not found."
     ))
 }
 
@@ -1009,6 +1067,18 @@ pub fn validate_content(content: &str, schema_type: &str) -> Result<(), BadReque
         "Content is not a valid {schema_type} document: a schema document is a JSON object, \
          but this Content is {kind}."
     )))
+}
+
+/// Refuse one of `GetDiscoveredSchema`'s `Events` that discovery cannot read.
+///
+/// The message is built from the request: it names the INDEX of the event at
+/// fault — `Events` is a list, so the index is what tells a caller sending a batch
+/// WHICH event to fix — and then the reason that event could not be read. The
+/// event itself is never echoed back: it is the caller's data.
+pub fn event_not_parsable(index: usize, reason: impl std::fmt::Display) -> BadRequestException {
+    bad_request(format!(
+        "Fail to parse event index: [{index}]. Reason: {reason}"
+    ))
 }
 
 /// Refuse a search that names more keywords than one request may carry. Names the
@@ -1312,8 +1382,9 @@ mod tests {
             );
             if let Err(refusal) = outcome {
                 assert_eq!(
-                    refusal.code, "BadRequestException",
-                    "case {case:?}: a refusal carries its own code, got {:?}",
+                    refusal.code, CODE_MALFORMED_REQUEST,
+                    "case {case:?}: a refusal carries the service's error code for the \
+                     condition, got {:?}",
                     refusal.code
                 );
                 assert!(

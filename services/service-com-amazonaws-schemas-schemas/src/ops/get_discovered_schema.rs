@@ -538,12 +538,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (index, event) in input.events.iter().enumerate() {
             // `serde_json` refuses an event that is not JSON — including one nested
             // deeper than its own limit — so nothing unbounded reaches the walk.
-            let event: Value = serde_json::from_str(event).map_err(|error| {
+            // The refusal's message is built from the request: it names the INDEX of
+            // the event that could not be parsed, which is what tells a caller
+            // sending a batch which of its events to fix, and then the reason.
+            let event: Value = serde_json::from_str(event).map_err(|_| {
                 GetDiscoveredSchemaError::from(
                     GetDiscoveredSchemaErrorModeled::BadRequestException(
-                        crate::state::bad_request(format!(
-                            "Events[{index}] is not a JSON event: {error}."
-                        )),
+                        crate::state::event_not_parsable(
+                            index,
+                            "Failed to parse JSON content",
+                        ),
                     ),
                 )
             })?;
@@ -551,10 +555,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // schema describes, and a bare scalar or array has none.
             if !event.is_object() {
                 return Err(GetDiscoveredSchemaErrorModeled::BadRequestException(
-                    crate::state::bad_request(format!(
-                        "Events[{index}] must be a JSON object, but is {}.",
-                        json_type_name(&event)
-                    )),
+                    crate::state::event_not_parsable(
+                        index,
+                        format!(
+                            "An event is a JSON object, but this event is {}",
+                            json_type_name(&event)
+                        ),
+                    ),
                 )
                 .into());
             }

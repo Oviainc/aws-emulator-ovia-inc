@@ -210,6 +210,16 @@ pub const MAX_CLUSTERS: usize = 100;
 /// live cluster.
 pub const MAX_RETIRED_CLUSTERS: usize = MAX_CLUSTERS;
 
+/// The most tags one resource holds.
+///
+/// Not a guess: `TagMap` is modelled `@length(min: 0, max: 200)`
+/// (`smithy_query(query="shape", shape="TagMap")`), and every reader of a
+/// resource's tags reports them through that shape, so a resource holding more
+/// tags than the map admits could not be reported at all. A write that would
+/// leave a resource past this ceiling is refused with the tagging operation's
+/// own `ServiceQuotaExceededException`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// The most `clientToken` entries one ledger keeps.
 ///
 /// At most one token is recorded per call that carried one, and a token is

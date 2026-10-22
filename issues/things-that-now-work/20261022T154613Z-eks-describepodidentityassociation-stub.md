@@ -33,3 +33,24 @@ AssertionError: describe malformed -> NotImplemented: operation DescribePodIdent
 Boot the eks emulator
 Call DescribePodIdentityAssociation and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+
+`DescribePodIdentityAssociation` is implemented and computes its whole response from
+the stored `PodIdentityAssociationRecord`; the SCAFFOLDED marker is gone. Because a
+describe can only answer from state somebody wrote, the write side of the same
+resource landed with it: `CreatePodIdentityAssociation` (which mints the id, ARN and
+external id, and is the round-trip's writer), `UpdatePodIdentityAssociation` and
+`DeletePodIdentityAssociation`. `src/state.rs` carries
+`pod_identity_associations` keyed `(region, clusterName, associationId)`, and
+`DeleteCluster` now takes its cluster's associations with it.
+
+Every operation that takes an `associationId` or a `clusterName` checks the
+identifier's documented FORM before resolving anything, so a value that can name no
+resource is `InvalidParameterException` (400) and a well-formed one that names
+nothing is `ResourceNotFoundException` (404). Covered by the suites in
+`services/service-com-amazonaws-eks-awswesleyfrontend/tests/all/pod_identity_associations.rs`.
+
+REMAINING, TRACKED ELSEWHERE: `ListPodIdentityAssociations` is still a 501 with its
+own issue (`20261022T154613Z-eks-listpodidentityassociations-stub.md`); it reads the
+same map this change added.

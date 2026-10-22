@@ -15,12 +15,15 @@ use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
 /// One emulator with one CodeDeploy service mounted on one shared engine.
-struct Emulator {
+///
+/// `pub(crate)` because the other suites in this test target drive the service
+/// through the same front door; there is one harness, not one per suite.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing; routing is by `X-Amz-Target`.
@@ -32,7 +35,7 @@ impl Emulator {
     }
 
     /// Call `operation` with `body`, answering its HTTP status and parsed body.
-    async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
         let request = ::http::Request::builder()
             .method("POST")
             .uri("/")
@@ -51,7 +54,7 @@ impl Emulator {
     }
 
     /// Call `operation` and require success, answering the response body.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(status, 200, "{operation} must succeed, got {parsed:?}");
         parsed
@@ -60,7 +63,7 @@ impl Emulator {
 
 /// The wire error code of a failure body: awsJson carries it in `__type`, either
 /// bare or namespaced.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or("<no __type>")
@@ -71,12 +74,16 @@ fn error_code(body: &Value) -> String {
 }
 
 /// An `s3Location` revision, the form the AWS CLI's `--s3-location` sends.
-fn s3_revision(bucket: &str, key: &str) -> Value {
+pub(crate) fn s3_revision(bucket: &str, key: &str) -> Value {
     json!({"revisionType": "S3", "s3Location": {"bucket": bucket, "key": key, "bundleType": "zip"}})
 }
 
 /// Create an application and a deployment group on it, answering the group name.
-async fn seeded_group(emulator: &Emulator, application: &str, platform: &str) -> String {
+pub(crate) async fn seeded_group(
+    emulator: &Emulator,
+    application: &str,
+    platform: &str,
+) -> String {
     emulator
         .ok(
             "CreateApplication",

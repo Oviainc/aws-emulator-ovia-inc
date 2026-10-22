@@ -305,14 +305,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if let Some(existing) = store.config_rules.get_mut(name) {
-            // An update keeps the id, ARN and creation time the rule was created with.
+            // An update keeps the id, ARN and creation time the rule was created with,
+            // and the evaluation results already recorded against it.
             existing.description = requested.description.clone();
             existing.scope = requested.scope.clone();
             existing.source = requested.source.clone();
             existing.input_parameters = requested.input_parameters.clone();
             existing.maximum_execution_frequency = requested.maximum_execution_frequency.clone();
             existing.evaluation_modes = evaluation_modes;
-            existing.rule_evaluation_visibility = requested.rule_evaluation_visibility.clone();
         } else {
             let sequence = store.next_rule_seq;
             // A u64 counter cannot be exhausted by API calls, so it never reissues an
@@ -333,9 +333,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     maximum_execution_frequency: requested.maximum_execution_frequency.clone(),
                     state: crate::state::CONFIG_RULE_STATE_ACTIVE.to_string(),
                     evaluation_modes,
-                    rule_evaluation_visibility: requested.rule_evaluation_visibility.clone(),
+                    // Config decides a rule's evaluation visibility; it is not the
+                    // caller's to set. A rule created here belongs to this account,
+                    // so its `Evaluation`s are retrievable through the Evaluations
+                    // read path, which is what EXTERNAL means.
+                    rule_evaluation_visibility: Some(
+                        crate::state::RULE_EVALUATION_VISIBILITY_EXTERNAL.to_string(),
+                    ),
                     created_at: ::std::time::SystemTime::now(),
                     tags: input.tags.clone().unwrap_or_default(),
+                    resource_compliance: ::std::collections::BTreeMap::new(),
                 },
             );
         }

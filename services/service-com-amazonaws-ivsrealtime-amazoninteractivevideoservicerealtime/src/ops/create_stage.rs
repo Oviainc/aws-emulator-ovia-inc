@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -95,10 +86,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `CreateStageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#CreateStage")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#CreateStage",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateStageErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `CreateStage` does not list it, and it is the only honest
+    // answer if the shared engine cannot hand back this service's store.
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
@@ -155,18 +153,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStage"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateStageErrorModeled::InternalServerException(crate::state::state_unavailable())
+        })?;
+
+        let configurations = input.participant_token_configurations.unwrap_or_default();
+        // The 1 KB `attributes` limit is documented, not modeled, so it is refused
+        // here — before anything is persisted, so a refused request leaves no stage.
+        for (index, configuration) in configurations.iter().enumerate() {
+            let size = configuration
+                .attributes
+                .as_ref()
+                .map_or(0, crate::state::attributes_size);
+            if size > crate::state::MAX_TOKEN_ATTRIBUTES_BYTES {
+                return Err(CreateStageErrorModeled::ValidationException(
+                    ValidationException {
+                        exception_message: Some(format!(
+                            "participantTokenConfigurations[{index}].attributes must be at most \
+                             {} bytes in total, but is {size}",
+                            crate::state::MAX_TOKEN_ATTRIBUTES_BYTES,
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The store grows only here and in `CreateParticipantToken`, so the bound is
+        // checked before anything is minted or persisted. A stage created here holds
+        // at most the 12 token records the model allows in one request, which is far
+        // under `MAX_PARTICIPANT_TOKENS_PER_STAGE`, so only the stage count needs it.
+        if store.stages.len() >= crate::state::MAX_STAGES {
+            return Err(CreateStageErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    exception_message: Some(format!(
+                        "this emulator holds the maximum of {} stages; delete one before \
+                         creating another",
+                        crate::state::MAX_STAGES,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // A fresh id per creation, re-minted on the (vanishingly unlikely) chance the
+        // digest already names a live stage, so one ARN never denotes two stages.
+        let sequence = store.next_sequence();
+        let mut arn = crate::state::stage_arn(
+            &region,
+            &crate::state::mint_id(sequence, crate::state::STAGE_ID_LEN),
+        );
+        while store.stages.contains_key(&arn) {
+            let retry = store.next_sequence();
+            arn = crate::state::stage_arn(
+                &region,
+                &crate::state::mint_id(retry, crate::state::STAGE_ID_LEN),
+            );
+        }
+
+        let mut records = Vec::with_capacity(configurations.len());
+        for configuration in configurations {
+            // Each configuration in the request becomes one participant token, minted
+            // the single way `crate::state` mints them, so the documented defaults this
+            // operation applies are the ones `CreateParticipantToken` applies too.
+            let record = crate::state::issue_token_record(
+                &mut store,
+                ctx.credential_store(),
+                &arn,
+                &records,
+                crate::state::RequestedToken {
+                    user_id: configuration.user_id,
+                    attributes: configuration.attributes,
+                    duration: configuration.duration,
+                    capabilities: configuration.capabilities,
+                },
+            )
+            .ok_or_else(|| {
+                CreateStageErrorModeled::InternalServerException(
+                    crate::state::token_minting_failed(),
+                )
+            })?;
+            records.push(record);
+        }
+
+        let record = crate::state::StageRecord {
+            arn: arn.clone(),
+            name: input.name,
+            // A stage AWS has just created holds no session yet.
+            active_session_id: None,
+            tags: input.tags.unwrap_or_default(),
+            auto_participant_recording_configuration: input
+                .auto_participant_recording_configuration,
+            endpoints: None,
+            created_at: ::std::time::SystemTime::now(),
+            sequence,
+        };
+
+        let stage = record.to_stage();
+        // Reported only when the request asked for tokens: the model's doc for
+        // `participantTokens` is "Participant tokens attached to the stage. These
+        // correspond to the participants in the request", so a request that named no
+        // participant has no list to report and the member is left out — the same shape
+        // the token store keeps below.
+        let participant_tokens: Option<Vec<ParticipantToken>> = (!records.is_empty()).then(|| {
+            records
+                .iter()
+                .map(crate::state::ParticipantTokenRecord::to_participant_token)
+                .collect()
+        });
+        store.stages.insert(arn.clone(), record);
+        // Only when the request asked for tokens: a stage created without any leaves
+        // no empty entry behind, so the token map holds exactly the stages that have
+        // tokens (the same shape `CreateParticipantToken` maintains).
+        if !records.is_empty() {
+            store.participant_tokens.insert(arn, records);
+        }
+
+        Ok(CreateStageOutput {
+            stage: Some(stage),
+            participant_tokens,
+        })
     }
 }
+

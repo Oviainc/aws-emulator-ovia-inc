@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-mq-mq.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.mq#CreateConfigurationRequest")]
+// Both enum-typed members of this request are refused by the HANDLER
+// (`ops::create_configuration`), not by the framework's boundary validator, so
+// the refusal is Amazon MQ's own `BadRequestException` with `errorAttribute`
+// naming the member at fault. See `ops::types::create_broker_types` for the
+// full reasoning.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.mq#CreateConfigurationRequest",
+    skip_validation = ["AuthenticationStrategy", "EngineType"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateConfigurationInput {
     pub authentication_strategy: Option<String>,

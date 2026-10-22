@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateParticipantToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateParticipantToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateParticipantToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -102,10 +93,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `CreateParticipantTokenError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#CreateParticipantToken")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#CreateParticipantToken",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateParticipantTokenErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `CreateParticipantToken` does not list it, and it is the only
+    // honest answer if the shared engine cannot hand back this service's store.
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
@@ -163,18 +161,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateParticipantToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateParticipantTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateParticipantTokenErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+
+        let attributes = input.attributes.unwrap_or_default();
+        // The 1 KB `attributes` limit is documented, not modeled, so it is refused
+        // here rather than persisted.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateParticipantToken"))
+        // It is checked BEFORE the stage lookup, so a request that is both oversized and
+        // names no stage answers `ValidationException` (400): the limit is a property of
+        // the request alone, and the modelled constraints the framework checks ahead of
+        // this handler are refused the same way, so a malformed request is answered as
+        // malformed whether or not its target exists.
+        let size = crate::state::attributes_size(&attributes);
+        if size > crate::state::MAX_TOKEN_ATTRIBUTES_BYTES {
+            return Err(CreateParticipantTokenErrorModeled::ValidationException(
+                ValidationException {
+                    exception_message: Some(format!(
+                        "attributes must be at most {} bytes in total, but is {size}",
+                        crate::state::MAX_TOKEN_ATTRIBUTES_BYTES,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        if !store.stages.contains_key(&input.stage_arn) {
+            return Err(CreateParticipantTokenErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    exception_message: Some(format!(
+                        "stage {} does not exist",
+                        input.stage_arn
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // Bound the one store this operation grows, before anything is minted: the
+        // records are reclaimed only by `DeleteStage`, so without this a caller could
+        // append to a single stage without limit.
+        let issued = store
+            .participant_tokens
+            .get(&input.stage_arn)
+            .map_or(0, Vec::len);
+        if issued >= crate::state::MAX_PARTICIPANT_TOKENS_PER_STAGE {
+            return Err(
+                CreateParticipantTokenErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        exception_message: Some(format!(
+                            "stage {} already holds the maximum of {} participant tokens \
+                             this emulator keeps for one stage",
+                            input.stage_arn,
+                            crate::state::MAX_PARTICIPANT_TOKENS_PER_STAGE,
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Minted the single way `crate::state` mints a token record, so this operation
+        // and `CreateStage` apply the same documented defaults (including the 720-minute
+        // duration for a request that does not size its token) and mint the token secret
+        // the same way.
+        let record = crate::state::issue_token_record(
+            &mut store,
+            ctx.credential_store(),
+            &input.stage_arn,
+            // Nothing in flight: this operation issues exactly one token per request.
+            &[],
+            crate::state::RequestedToken {
+                user_id: input.user_id,
+                attributes: Some(attributes),
+                duration: input.duration,
+                capabilities: input.capabilities,
+            },
+        )
+        .ok_or_else(|| {
+            CreateParticipantTokenErrorModeled::InternalServerException(
+                crate::state::token_minting_failed(),
+            )
+        })?;
+
+        let participant_token = record.to_participant_token();
+        store
+            .participant_tokens
+            .entry(input.stage_arn)
+            .or_default()
+            .push(record);
+
+        Ok(CreateParticipantTokenOutput {
+            participant_token: Some(participant_token),
+        })
     }
 }

@@ -406,6 +406,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 deployment_style: group_style,
                 compute_platform,
                 external_id: None,
+                // Nothing has rolled this deployment back; `StopDeployment` is
+                // what fills this in.
+                rollback_info: None,
                 create_time_ms,
                 start_time_ms: None,
                 complete_time_ms: None,

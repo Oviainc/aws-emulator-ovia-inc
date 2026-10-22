@@ -4,7 +4,8 @@
 //! IMPLEMENTED. Removes the cluster — and its ARN index entry — from the store and
 //! answers with the record it removed, reporting `DELETING`. A second `DeleteCluster`,
 //! or any later `DescribeCluster`, for that name is then a `ResourceNotFoundException`,
-//! and `ListClusters` no longer lists it.
+//! and `ListClusters` no longer lists it. Its EKS Pod Identity associations, which
+//! are children of the cluster, are removed with it.
 //!
 //! A cluster created with `deletionProtection` is refused with
 //! `InvalidRequestException` and left in the store: "the cluster cannot be deleted
@@ -183,6 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found());
         };
         guard.arn_index.remove(&record.arn);
+        // An EKS Pod Identity association is a child of its cluster, so the
+        // cluster's associations go with it: a cluster later created with the same
+        // name in the same Region must not inherit the deleted cluster's
+        // associations.
+        guard.remove_pod_identity_associations_for_cluster(&key.0, &key.1);
         record.status = STATUS_DELETING.to_string();
         // The cluster is gone, so the `CREATING` -> `ACTIVE` move the clock owed it is
         // no longer owed to anybody.

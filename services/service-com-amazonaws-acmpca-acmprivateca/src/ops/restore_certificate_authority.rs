@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreCertificateAuthority
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreCertificateAuthority`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreCertificateAuthority::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +70,25 @@
 //!   action to occur.
 //! * `ResourceNotFoundException` (HTTP 400) — A resource such as a private CA, S3 bucket,
 //!   certificate, audit report, or policy cannot be found.
+//!
+//! ## What this handler does
+//!
+//! A restore UNDOES A PENDING DELETION, which is the whole of its state rule:
+//!
+//! * a CA that is `DELETED` and still inside the restoration period
+//!   `DeleteCertificateAuthority` assigned it goes back to the status it held before that
+//!   delete ("The status of a restored CA is set to its pre-deletion status when the
+//!   RestoreCertificateAuthority action returns") and stops carrying a restoration window;
+//! * a CA with no pending deletion has nothing to undo, so the call changes NOTHING and
+//!   still answers this operation's empty success — the restore is idempotent. That is
+//!   what the recorded behaviour of a restore against a live CA shows, and it is why this
+//!   handler does not refuse a CA merely for holding another status;
+//! * a CA deleted with no assigned restoration period ("A private CA deleted in the
+//!   CREATING or FAILED state has no assigned restoration period and cannot be restored")
+//!   is refused with the modelled `InvalidStateException`;
+//! * a CA whose restoration period has run out is permanently deleted ("You cannot restore
+//!   a CA after the restoration period has ended"), so it answers
+//!   `ResourceNotFoundException` like any ARN that names no CA.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -113,12 +123,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for RestoreCertificateAuthor
 // here — hence the `RestoreCertificateAuthorityError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.acmpca#RestoreCertificateAuthority")]
+// `RequestFailedException` is widened in: the service models it, this operation does
+// not list it, and it is the only modelled answer for "this emulator could not reach
+// its own state store".
+#[smithy_macros::operation_error(
+    "com.amazonaws.acmpca#RestoreCertificateAuthority",
+    extra_errors = ["RequestFailedException"]
+)]
 #[derive(Debug)]
 pub enum RestoreCertificateAuthorityErrorModeled {
     InvalidArnException(InvalidArnException),
     InvalidStateException(InvalidStateException),
     ResourceNotFoundException(ResourceNotFoundException),
+    RequestFailedException(RequestFailedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -172,18 +189,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreCertificateAuthority` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreCertificateAuthorityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreCertificateAuthority"))
+        let _ = ctx;
+        let arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(RestoreCertificateAuthorityErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RestoreCertificateAuthorityErrorModeled::RequestFailedException(
+                    RequestFailedException {
+                        message: Some("the private CA store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // A CA whose restoration period has already run out is permanently deleted —
+        // that deletion came due on the clock, so `certificate_authority_mut` drops the
+        // record and the CA names no resource at all.
+        let Some(record) = state.certificate_authority_mut(&arn, now) else {
+            return Err(
+                RestoreCertificateAuthorityErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("the certificate authority {arn} was not found")),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // What a restore undoes is a pending deletion, so a CA that is not deleted has
+        // nothing to undo and the call changes nothing: the restore is IDEMPOTENT, which
+        // is what the recorded behaviour of a restore against a live CA shows (the
+        // recorded unit of this issue restores a CA that was never deleted and is
+        // answered with this operation's empty success). The CA's status, its restoration
+        // window and the instant it last changed status are all left exactly as they
+        // were, so a later reader cannot tell this call happened.
+        if record.status != crate::state::STATUS_DELETED {
+            return Ok(RestoreCertificateAuthorityOutput);
+        }
+
+        // "A private CA deleted in the CREATING or FAILED state has no assigned
+        // restoration period and cannot be restored." (`DeleteCertificateAuthority`
+        // docs) — recorded as a DELETED CA with neither a restoration window nor a
+        // status to go back to.
+        if record.restorable_until.is_none() {
+            return Err(
+                RestoreCertificateAuthorityErrorModeled::InvalidStateException(
+                    InvalidStateException {
+                        message: Some(
+                            crate::state::RESTORE_WITHOUT_RESTORATION_PERIOD_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        let Some(status_before_deletion) = record.status_before_deletion.take() else {
+            return Err(
+                RestoreCertificateAuthorityErrorModeled::InvalidStateException(
+                    InvalidStateException {
+                        message: Some(
+                            crate::state::RESTORE_WITHOUT_RESTORATION_PERIOD_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "The status of a restored CA is set to its pre-deletion status when the
+        // RestoreCertificateAuthority action returns": the status is put back as it was,
+        // NOT driven through a transient state, and the CA stops carrying a restoration
+        // window because it is no longer deleted.
+        record.status = status_before_deletion;
+        record.restorable_until = None;
+        record.last_state_change_at = now;
+
+        Ok(RestoreCertificateAuthorityOutput)
     }
 }
