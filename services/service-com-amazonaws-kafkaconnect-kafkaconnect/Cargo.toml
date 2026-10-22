@@ -21,13 +21,24 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mints the UUID every ARN this service assigns carries, by hashing the store's
+# own mint counter. Hashed with `sha2` rather than drawn from `uuid`'s v4
+# generator so the suffix is DETERMINISTIC for a given sequence of calls (a test
+# or a replay sees the same ARNs twice) while still being unique per resource.
+sha2 = { workspace = true }
+# Encodes the opaque `nextToken` both list operations page with.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
+# Percent-encodes an `@httpLabel` ARN into one URI path segment in the tests,
+# with the same encoder the server side uses.
+percent-encoding = "2"
+# The tests wait out the clock-owed transitions, so they need tokio's timer on
+# top of the workspace's macros/runtime features.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored connector the ARN names, from state — never from the request. An ARN
+//! no stored connector carries is a `NotFoundException`. Reporting only: the one write it
+//! makes is materialising the state change the clock already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +179,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConnector"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeConnectorErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the kafkaconnect store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+        let mut state = store.lock();
+        state.settle_due();
+
+        let Some(connector) = state.connectors.get(&input.connector_arn) else {
+            return Err(DescribeConnectorErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "No connector exists with the ARN {}.",
+                    input.connector_arn
+                )),
+            })
+            .into());
+        };
+
+        Ok(DescribeConnectorOutput {
+            capacity: Some(connector.capacity_description()),
+            connector_arn: Some(connector.arn.clone()),
+            connector_configuration: Some(connector.configuration.clone()),
+            connector_description: connector.description.clone(),
+            connector_name: Some(connector.name.clone()),
+            connector_state: Some(connector.state.clone()),
+            creation_time: Some(crate::state::date_time(connector.creation_time)),
+            current_version: Some(connector.current_version.clone()),
+            kafka_cluster: Some(connector.kafka_cluster_description()),
+            kafka_cluster_client_authentication: Some(
+                connector.client_authentication_description(),
+            ),
+            kafka_cluster_encryption_in_transit: Some(
+                connector.encryption_in_transit_description(),
+            ),
+            kafka_connect_version: Some(connector.kafka_connect_version.clone()),
+            log_delivery: connector.log_delivery_description(),
+            network_type: Some(connector.network_type.clone()),
+            plugins: Some(connector.plugin_descriptions()),
+            service_execution_role_arn: Some(connector.service_execution_role_arn.clone()),
+            worker_configuration: connector.worker_configuration_description(),
+            state_description: None,
+        })
     }
 }
