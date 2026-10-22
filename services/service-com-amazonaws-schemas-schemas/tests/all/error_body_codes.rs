@@ -16,8 +16,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::state::{
-    AWS_MANAGED_CATALOG, CODE_CONFLICT, CODE_FORBIDDEN, CODE_MALFORMED_REQUEST,
-    CODE_RESOURCE_ALREADY_EXIST, CODE_RESOURCE_NOT_FOUND,
+    aws_managed_schemas, AWS_MANAGED_REGISTRY, CODE_CONFLICT, CODE_FORBIDDEN,
+    CODE_MALFORMED_REQUEST, CODE_RESOURCE_ALREADY_EXIST, CODE_RESOURCE_NOT_FOUND,
 };
 
 use crate::registry_schema_lifecycle::{create_registry, registry_uri, schema_uri, Answer, Emulator};
@@ -91,8 +91,12 @@ async fn seed(emulator: &Emulator) -> String {
 fn cases(stale_revision: &str, current_revision: &str) -> Vec<Case> {
     // The service-owned registry and one of its schemas, read from the catalogue the
     // store seeds rather than written out here.
-    let (managed_registry, managed_schemas) = AWS_MANAGED_CATALOG[0];
-    let managed_schema = managed_schemas[0].0;
+    let managed_registry = AWS_MANAGED_REGISTRY;
+    let managed_schema = aws_managed_schemas()
+        .first()
+        .expect("the catalogue holds schemas")
+        .name
+        .as_str();
     let absent = "no-such-registry";
     let absent_schema = "no-such-schema";
 
