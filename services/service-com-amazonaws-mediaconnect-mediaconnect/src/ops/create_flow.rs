@@ -405,6 +405,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `FlowTags` writes the same tag map TagResource writes, so a pair it carries is
+        // bounded by the same rule, named once in `crate::state`.
+        for (key, value) in input.flow_tags.iter().flatten() {
+            if let Some(reason) = crate::state::tag_pair_rejection(key, value) {
+                return Err(bad_request(reason));
+            }
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
