@@ -233,6 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             configuration: input.configuration,
             archive_rules,
             archive_rule_tokens: crate::state::ClientTokens::default(),
+            // A fresh analyzer previews nothing yet; `CreateAccessPreview` fills these.
+            access_previews: ::std::collections::BTreeMap::new(),
+            access_preview_tokens: crate::state::ClientTokens::default(),
         };
         state
             .analyzers

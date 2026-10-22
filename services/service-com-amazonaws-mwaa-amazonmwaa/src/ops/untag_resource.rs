@@ -149,13 +149,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         let resource_arn = input.resource_arn.clone();
-        let stored = store
-            .environment_by_arn_mut(&resource_arn)
-            .ok_or_else(|| {
-                UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: Some(format!("Environment {resource_arn} could not be found")),
-                })
-            })?;
+        // The same refusal `TagResource` answers, for the same lookup: HTTP 404 with the
+        // wire error code the tagging operations publish, `NotFoundException`.
+        let stored = store.environment_by_arn_mut(&resource_arn).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
+        })?;
 
         // `@idempotent`: a key the environment does not carry is simply not there to
         // remove, which is the state the caller asked for.

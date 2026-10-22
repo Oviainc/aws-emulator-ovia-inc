@@ -475,6 +475,30 @@ impl ComAmazonawsMwaaAmazonmwaaState {
     }
 }
 
+/// The message an environment-not-found refusal carries: the sentence names the
+/// environment the REQUEST asked for.
+///
+/// Request-derived, so the form is the rule and the name is whatever the request carried.
+/// Every operation addressed by `Name` — `GetEnvironment`, `UpdateEnvironment`,
+/// `DeleteEnvironment`, `CreateCliToken`, `CreateWebLoginToken`, `InvokeRestApi` — words
+/// the same condition through this one builder, so none of them can drift from the rest.
+pub fn environment_not_found_message(name: &str) -> String {
+    format!("Environment {name} not found.")
+}
+
+/// The message the `/tags/{ResourceArn}` operations' not-found refusal carries.
+///
+/// A tagging request names its resource by an ARN the caller already holds, so there is
+/// nothing in it to build a sentence from that would tell the caller anything new: the
+/// refusal states the condition and nothing else. What a client branches on is the 404
+/// and the `NotFoundException` wire code these operations answer with (see
+/// [`crate::scaffolded::Scaffolded::not_found`]), not this prose.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// `AirflowIdentity`'s own `@length(1, 64)` maximum, which
+/// [`airflow_identity`] keeps the reported identity inside.
+const AIRFLOW_IDENTITY_MAX_LENGTH: usize = 64;
+
 /// The region this request was signed for, read from its SigV4 credential scope.
 pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
     ::emulator_server::sigv4_credential_scope(&ctx.parts().headers)
@@ -529,6 +553,67 @@ pub fn celery_executor_queue(region: &str, name: &str) -> String {
 pub fn webserver_url(region: &str, arn: &str) -> String {
     let id = uuid_shaped_id(&format!("webserver/{arn}"));
     format!("https://{id}.c2.{region}.airflow.amazonaws.com")
+}
+
+/// The `Hostname` of an environment's Apache Airflow web server: the host of the
+/// environment's STORED [`webserver_url`], with the scheme and any path removed —
+/// `Hostname`'s own pattern
+/// (`^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|…)$`) carries a
+/// host and nothing else. Reading it off the stored URL is what keeps the host
+/// `CreateCliToken` and `CreateWebLoginToken` report equal to the one `GetEnvironment`
+/// reports for the same environment.
+pub fn webserver_hostname(webserver_url: &str) -> &str {
+    let without_scheme = webserver_url
+        .split_once("://")
+        .map_or(webserver_url, |(_scheme, rest)| rest);
+    match without_scheme.split_once('/') {
+        Some((host, _path)) => host,
+        None => without_scheme,
+    }
+}
+
+/// The IAM identity a request was signed by, as this emulator knows it.
+///
+/// MWAA reports the identity that asked for a token (`IamIdentity`: "This might be an IAM
+/// user, or an assumed or federated identity"). The only identity fact this emulator
+/// holds about a request is the access-key id its SigV4 credential presented, so that is
+/// what is reported: no user, role or session is invented around it.
+pub fn caller_iam_identity(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::engine::extract_akid(&ctx.parts().headers)
+}
+
+/// The Apache Airflow user name the calling IAM identity maps to.
+///
+/// MWAA maps the IAM identity to an Apache Airflow user (`AirflowIdentity`: "The user name
+/// of the Apache Airflow identity creating the web login token"); the mapping here is the
+/// identity itself, truncated to [`AIRFLOW_IDENTITY_MAX_LENGTH`] so the reported value
+/// stays inside the modelled bound.
+pub fn airflow_identity(iam_identity: &str) -> String {
+    iam_identity
+        .chars()
+        .take(AIRFLOW_IDENTITY_MAX_LENGTH)
+        .collect()
+}
+
+/// A fresh Apache Airflow token, for `CreateCliToken` and `CreateWebLoginToken`.
+///
+/// The token authenticates to the environment's Apache Airflow web server, NOT to this
+/// emulator, so it must never be accepted as a SigV4 credential — but it is still a
+/// secret handed to a caller, and nothing in a service may construct a secret itself. It
+/// is therefore minted by the one component that generates secrets, the emulator's
+/// credential store, and then removed from that store again: the caller gets the secret,
+/// the emulator keeps no credential it would accept, and nothing accumulates per call.
+///
+/// `None` when the store minted no session-token secret, which leaves the operation to
+/// refuse rather than report a token it made up.
+pub fn mint_airflow_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .map(str::to_string);
+    // The token is not a credential of this emulator; see above.
+    let _ = store.delete(&minted.id);
+    token
 }
 
 /// The VPC endpoint service name of the environment's web server, matching

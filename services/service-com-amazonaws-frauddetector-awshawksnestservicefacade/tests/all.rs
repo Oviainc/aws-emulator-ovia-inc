@@ -15,3 +15,5 @@
 mod detector_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/timestamp_rendering.rs"]
+mod timestamp_rendering;

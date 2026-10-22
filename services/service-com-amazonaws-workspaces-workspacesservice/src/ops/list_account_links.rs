@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccountLinks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccountLinks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccountLinks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the account links this service persisted, filtered by the statuses the
+//! request names and paginated over a stable creation order. The records live in
+//! [`crate::state`], which the other five account-link operations read and write
+//! too.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +107,15 @@ impl From<ListAccountLinksErrorModeled> for ListAccountLinksError {
     }
 }
 
+/// Refuse the request as invalid, with this operation's own modelled
+/// `ValidationException`.
+fn invalid(message: String) -> ListAccountLinksError {
+    ListAccountLinksErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `ListAccountLinks` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -145,18 +152,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccountLinks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountLinksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccountLinks"))
+        let _ = ctx;
+
+        // `LinkStatusFilter` "filters the account based on their link status":
+        // a link is reported when its status is one the request names. Every
+        // value of the model's status enum decodes, so only a value the model
+        // does not declare is refused here.
+        let wanted: Option<Vec<crate::state::AccountLinkStatus>> =
+            match input.link_status_filter.as_deref() {
+                Some(values) => {
+                    let mut wanted = Vec::with_capacity(values.len());
+                    for value in values {
+                        wanted.push(
+                            crate::state::AccountLinkStatus::from_wire(value).ok_or_else(|| {
+                                invalid(format!(
+                                    "The LinkStatusFilter value {value} is not a valid account link status."
+                                ))
+                            })?,
+                        );
+                    }
+                    Some(wanted)
+                }
+                None => None,
+            };
+
+        // The token names the last link the previous page reported, by its
+        // creation sequence; this page resumes strictly after it.
+        let after_seq = match input.next_token.as_deref() {
+            Some(token) => crate::state::decode_page_token(token)
+                .ok_or_else(|| invalid("The NextToken value is not valid.".to_string()))?,
+            None => 0,
+        };
+        // `MaxResults` is `range 1..25`, so request validation refuses anything
+        // outside that; a value that still does not convert is refused here
+        // rather than silently answered with a default-sized page.
+        let max_results = match input.max_results {
+            Some(max_results) => usize::try_from(max_results).map_err(|_| {
+                invalid(format!(
+                    "The MaxResults value {max_results} is not valid; MaxResults must be between 1 and 25."
+                ))
+            })?,
+            None => crate::state::DEFAULT_ACCOUNT_LINK_PAGE_SIZE,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAccountLinksErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        // Reporting only: an account link moves when a caller accepts, rejects
+        // or deletes it, so there is nothing the clock owes this store.
+        let state = state.lock();
+
+        let mut remaining = state
+            .ordered_account_links()
+            .into_iter()
+            .filter(|record| {
+                wanted
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.contains(&record.status))
+            })
+            .filter(|record| record.seq > after_seq);
+        let page_records: Vec<&crate::state::AccountLinkRecord> =
+            remaining.by_ref().take(max_results).collect();
+        // A token only when a matching link is left beyond this page: "This
+        // value is null when there are no more results to return."
+        let more_to_come = remaining.next().is_some();
+        let next_token = page_records
+            .last()
+            .filter(|_| more_to_come)
+            .map(|record| crate::state::encode_page_token(record.seq));
+
+        Ok(ListAccountLinksOutput {
+            account_links: Some(
+                page_records
+                    .iter()
+                    .map(|record| record.to_account_link())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccountLinkInvitation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccountLinkInvitation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccountLinkInvitation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an account-link invitation: the link is persisted awaiting the target
+//! account's own `AcceptAccountLinkInvitation` or `RejectAccountLinkInvitation`
+//! call. The records live in [`crate::state`], which the other five
+//! account-link operations read and write too.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -108,6 +106,36 @@ impl From<CreateAccountLinkInvitationErrorModeled> for CreateAccountLinkInvitati
     }
 }
 
+/// Lift a store refusal into this operation's modelled errors.
+///
+/// Each kind maps to the shape the model declares for it: an invalid request to
+/// `ValidationException` ("You either haven't provided a `TargetAccountId` or are
+/// using the same value for `TargetAccountId` and `SourceAccountId`"), and a
+/// target account that is already linked or invited to `ConflictException`
+/// ("The `TargetAccountId` is already linked or invited").
+fn account_link_error(
+    failure: crate::state::AccountLinkFailure,
+) -> CreateAccountLinkInvitationError {
+    use crate::state::AccountLinkFailure;
+    match failure {
+        AccountLinkFailure::Conflict(message) => {
+            CreateAccountLinkInvitationErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+        // Creating names no existing link, so the store's not-found refusal
+        // cannot arise here; it is still mapped to the request-level error this
+        // operation models rather than dropped.
+        AccountLinkFailure::Validation(message)
+        | AccountLinkFailure::NotFound { message, .. } => {
+            CreateAccountLinkInvitationErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
+}
+
 /// The `CreateAccountLinkInvitation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -144,18 +172,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccountLinkInvitation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccountLinkInvitationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccountLinkInvitation"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAccountLinkInvitationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the WorkSpaces state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The inviting account is this emulator's own account: every request is
+        // signed for it, so it is the `SourceAccountId` of the link it creates.
+        let source_account_id = ::engine::emulator_account_id();
+        let record = state
+            .lock()
+            .create_account_link_invitation(
+                source_account_id,
+                &input.target_account_id,
+                input.client_token.as_deref(),
+            )
+            .map_err(account_link_error)?;
+
+        Ok(CreateAccountLinkInvitationOutput {
+            account_link: Some(record.to_account_link()),
+        })
     }
 }

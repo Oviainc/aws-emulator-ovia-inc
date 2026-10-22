@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWebLoginToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWebLoginToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWebLoginToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an Apache Airflow web login token for the STORED environment the request names,
+//! and reports it with the web-server host that environment's record carries. A name that
+//! resolves to no stored environment is refused with the operation's modeled 404.
+//!
+//! The token is minted by the emulator's credential store and removed from it again (see
+//! [`crate::state::mint_airflow_token`]): it is a secret for the environment's Apache
+//! Airflow web server, not a credential of this emulator, so nothing here constructs it
+//! and nothing here would accept it.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +154,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWebLoginToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWebLoginTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWebLoginToken"))
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWebLoginTokenErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Amazon MWAA environment store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+        // The transition the clock already owes, materialised before anything is read —
+        // the same first step every handler of this service takes.
+        store.settle(now);
+
+        // The web server a token is minted for is the one the STORED record names, so a
+        // name matching no environment has nothing to mint a token against: that is the
+        // modeled `ResourceNotFoundException` (HTTP 404), never a 501.
+        let stored = store.environments.get(&input.name).ok_or_else(|| {
+            CreateWebLoginTokenErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::environment_not_found_message(&input.name)),
+            })
+        })?;
+        let web_server_hostname = crate::state::webserver_hostname(&stored.webserver_url).to_string();
+        // Nothing below reads or writes the store; holding its lock across the mint would
+        // only widen the critical section.
+        drop(store);
+
+        let web_token = crate::state::mint_airflow_token(ctx.credential_store()).ok_or_else(|| {
+            CreateWebLoginTokenErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the emulator minted no Apache Airflow web login token for this request"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let iam_identity = crate::state::caller_iam_identity(ctx);
+        Ok(CreateWebLoginTokenOutput {
+            airflow_identity: Some(crate::state::airflow_identity(&iam_identity)),
+            iam_identity: Some(iam_identity),
+            web_server_hostname: Some(web_server_hostname),
+            web_token: Some(web_token),
+        })
     }
 }

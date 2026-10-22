@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccessPreview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccessPreview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccessPreview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates an access preview of the proposed resource configuration against the
+//! analyzer the request names, and STORES it on that analyzer's record, so the
+//! `accessPreviewId` this operation returns is the one `GetAccessPreview` resolves and
+//! no preview outlives the analyzer it was created for.
+//!
+//! The analysis of a proposed configuration is not instantaneous: the preview is
+//! created `CREATING` and the clock owes it its terminal status
+//! ([`crate::state::ACCESS_PREVIEW_ANALYSIS_SPAN`] later) — `COMPLETED` for a
+//! configuration that can be analyzed, `FAILED` with `INVALID_CONFIGURATION` for one
+//! that cannot. The due instant is stored; nothing sleeps for it.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +159,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccessPreview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccessPreviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccessPreview"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAccessPreviewErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        // `configurations` is documented as "The configuration must contain exactly one
+        // element", and the model puts no size bound on the map, so the refusal is this
+        // operation's own `ValidationException`.
+        if input.configurations.len() != 1 {
+            let message = format!(
+                "configurations must contain exactly one element, but contained {}",
+                input.configurations.len()
+            );
+            return Err(CreateAccessPreviewErrorModeled::ValidationException(
+                ValidationException {
+                    message: message.clone(),
+                    reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "configurations".to_string(),
+                        message,
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let analyzer = state
+            .analyzer_by_arn_mut(&input.analyzer_arn)
+            .ok_or_else(|| {
+                // Fixed text, the ARN the caller named in the modelled `resourceId`:
+                // every resource-scoped refusal in this service goes through
+                // `crate::state`'s constructors.
+                CreateAccessPreviewErrorModeled::ResourceNotFoundException(
+                    crate::state::analyzer_not_found(&input.analyzer_arn),
+                )
+            })?;
+
+        // `analyzerArn` is documented as the ARN of an account analyzer: "You can only
+        // create an access preview for analyzers with an Account type and Active
+        // status", so any other analyzer this account holds is refused rather than
+        // previewed against.
+        if analyzer.r#type != crate::state::ACCESS_PREVIEW_ANALYZER_TYPE
+            || analyzer.status != crate::state::ANALYZER_STATUS_ACTIVE
+        {
+            let message = format!(
+                "Access previews require an analyzer of type {} with status {}, but {} is of type {} with status {}",
+                crate::state::ACCESS_PREVIEW_ANALYZER_TYPE,
+                crate::state::ANALYZER_STATUS_ACTIVE,
+                analyzer.arn,
+                analyzer.r#type,
+                analyzer.status
+            );
+            return Err(CreateAccessPreviewErrorModeled::ValidationException(
+                ValidationException {
+                    message: message.clone(),
+                    reason: crate::state::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "analyzerArn".to_string(),
+                        message,
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // A repeated `clientToken` is the SAME create retried, not a second preview: it
+        // answers with the id the first call returned, as long as that preview is still
+        // held.
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| analyzer.access_preview_tokens.get(token))
+            .filter(|id| analyzer.access_previews.contains_key(id.as_str()))
+        {
+            return Ok(CreateAccessPreviewOutput {
+                id: recorded.clone(),
+            });
+        }
+
+        if analyzer.access_previews.len() >= crate::state::MAX_ACCESS_PREVIEWS_PER_ANALYZER {
+            // The emulator's own per-analyzer ceiling, expressed with the quota error
+            // this operation models (HTTP 402) rather than by growing the store.
+            return Err(
+                CreateAccessPreviewErrorModeled::ServiceQuotaExceededException(
+                    crate::state::access_preview_quota_exceeded(&analyzer.arn),
+                )
+                .into(),
+            );
+        }
+
+        // The terminal status is decided from the configuration the request proposes: one
+        // that cannot be analyzed is the "invalid proposed resource configuration" the
+        // model's `AccessPreviewStatusReason` documents, which the preview reports as
+        // `FAILED`/`INVALID_CONFIGURATION` once the analysis is due — the create itself
+        // still succeeds, the way it does for a configuration that analyzes.
+        let defect = input
+            .configurations
+            .iter()
+            .find_map(|(resource, configuration)| {
+                crate::state::configuration_defect(resource, configuration)
+            });
+        let (terminal_status, terminal_status_reason) = match &defect {
+            None => (crate::state::ACCESS_PREVIEW_STATUS_COMPLETED, None),
+            Some(defect) => {
+                ::tracing::debug!(
+                    analyzer_arn = %input.analyzer_arn,
+                    defect = %defect,
+                    "the proposed access-preview configuration cannot be analyzed"
+                );
+                (
+                    crate::state::ACCESS_PREVIEW_STATUS_FAILED,
+                    Some(AccessPreviewStatusReason {
+                        code: crate::state::ACCESS_PREVIEW_REASON_INVALID_CONFIGURATION
+                            .to_string(),
+                    }),
+                )
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // An id already held would overwrite that preview, so mint until one is free.
+        let id = ::std::iter::repeat_with(crate::state::new_access_preview_id)
+            .find(|candidate| !analyzer.access_previews.contains_key(candidate))
+            .expect("repeat_with yields candidate ids until an unused one is found");
+
+        analyzer.access_previews.insert(
+            id.clone(),
+            crate::state::AccessPreviewRecord {
+                id: id.clone(),
+                analyzer_arn: analyzer.arn.clone(),
+                configurations: input.configurations,
+                created_at: now,
+                completes_at: now + crate::state::ACCESS_PREVIEW_ANALYSIS_SPAN,
+                terminal_status: terminal_status.to_string(),
+                terminal_status_reason,
+            },
+        );
+        if let Some(token) = input.client_token {
+            // First result wins, and the store is bounded (oldest record evicted
+            // first), so a token already recorded keeps the preview it recorded.
+            analyzer.access_preview_tokens.remember(token, id.clone());
+        }
+
+        Ok(CreateAccessPreviewOutput { id })
     }
 }

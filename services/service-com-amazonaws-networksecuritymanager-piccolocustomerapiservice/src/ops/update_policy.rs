@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members a request provides to the policy persisted in [`crate::state`],
+//! under optimistic concurrency control: the caller's `updateToken` must be the stored
+//! one, and a successful update bumps the version and rotates the token.
 //!
 //! ## Shape of an operation
 //!
@@ -208,20 +202,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdatePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the policy store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, token));
+
+        let mut store = state.lock();
+
+        let Some(policy_id) = store.resolve_policy_id(&input.policy_identifier) else {
+            return Err(UpdatePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no policy answers to the identifier {:?}",
+                        input.policy_identifier
+                    ),
+                    resource_id: Some(input.policy_identifier.clone()),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_POLICY.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `clientToken` is `@idempotencyToken`: a retry of an update that already landed
+        // answers with that update's result instead of applying it (and bumping the
+        // version) a second time. Checked BEFORE the token comparison, because the first
+        // attempt rotated the `updateToken` the retry still carries — and only while the
+        // stored record IS still what that call left behind, so an intervening update is
+        // never reported as this call's result (the retry then carries a stale
+        // `updateToken` and is refused below).
+        if let Some(applied) = idempotency_key
+            .as_deref()
+            .and_then(|key| store.idempotent_call(key))
+            .filter(|call| call.policy_id == policy_id)
+            .and_then(|call| {
+                store
+                    .policies
+                    .get(&call.policy_id)
+                    .filter(|policy| policy.version == call.version)
+            })
+        {
+            return Ok(output_of(applied));
+        }
+
+        // Documented prose rules the constraint traits cannot express. The firewall type
+        // comes from the stored record: no modelled operation changes it.
+        let stored_firewall_type = store
+            .policies
+            .get(&policy_id)
+            .map(|policy| policy.firewall_type.clone())
+            .unwrap_or_default();
+        if let Some(references) = input.associated_template_and_rule_list.as_deref() {
+            if let Some(message) =
+                crate::state::association_list_violation(&stored_firewall_type, references)
+            {
+                return Err(
+                    UpdatePolicyErrorModeled::ValidationException(ValidationException {
+                        reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "associatedTemplateAndRuleList".to_string(),
+                            message: message.clone(),
+                        }]),
+                        message,
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        let Some(policy) = store.policies.get_mut(&policy_id) else {
+            return Err(UpdatePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the policy resolved from the identifier is no longer stored"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Optimistic concurrency control: "Provide the most recent value on your next
+        // update to detect and prevent conflicting concurrent modifications." Anything
+        // else is a stale view of the resource.
+        if input.update_token != policy.update_token {
+            return Err(UpdatePolicyErrorModeled::ConflictException(ConflictException {
+                message: "updateToken does not match the policy's current token; read the \
+                          policy again and retry with the token it returns"
+                    .to_string(),
+                resource_id: Some(policy.policy_id.clone()),
+                resource_type: Some(crate::state::RESOURCE_TYPE_POLICY.to_string()),
+            })
+            .into());
+        }
+
+        // Only the members the request provided change; every absent optional member
+        // keeps its stored value.
+        if let Some(description) = input.policy_description {
+            policy.policy_description = Some(description);
+        }
+        if let Some(priority) = input.priority {
+            policy.priority = priority;
+        }
+        if let Some(configuration) = input.policy_configuration {
+            policy.policy_configuration = Some(configuration);
+        }
+        if let Some(references) = input.associated_template_and_rule_list.as_deref() {
+            policy.associated_template_and_rule_list = references
+                .iter()
+                .map(crate::state::association_of)
+                .collect();
+        }
+        policy.status = crate::state::status_for(input.is_published).to_string();
+        // Once a version has been published the resource HAS a published version, whether
+        // or not this update publishes one.
+        policy.has_published_version = policy.has_published_version || input.is_published;
+        policy.version = policy.version.saturating_add(1);
+        policy.update_token = crate::state::mint_update_token();
+        policy.updated_at = now;
+
+        let output = output_of(policy);
+        let applied_version = policy.version;
+        if let Some(key) = idempotency_key {
+            store.remember_idempotent_call(key, policy_id, applied_version);
+        }
+        Ok(output)
+    }
+}
+
+/// The `UpdatePolicyOutput` view of a persisted policy.
+fn output_of(policy: &crate::state::Policy) -> UpdatePolicyOutput {
+    UpdatePolicyOutput {
+        policy_id: policy.policy_id.clone(),
+        policy_arn: policy.policy_arn.clone(),
+        policy_name: policy.policy_name.clone(),
+        policy_description: policy.policy_description.clone(),
+        status: policy.status.clone(),
+        priority: policy.priority,
+        associated_template_and_rule_list: policy.associated_template_and_rule_list.clone(),
+        version: policy.version_string(),
+        update_token: Some(policy.update_token.clone()),
+        is_snapshot: Some(policy.is_snapshot),
+        has_published_version: Some(policy.has_published_version),
+        firewall_type: policy.firewall_type.clone(),
+        policy_configuration: policy.policy_configuration.clone(),
+        updated_at: Some(policy.updated_at_timestamp()),
     }
 }

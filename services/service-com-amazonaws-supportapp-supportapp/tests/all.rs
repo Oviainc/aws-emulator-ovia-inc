@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/error_message_templates.rs"]
 mod error_message_templates;
+#[path = "all/resource_preconditions.rs"]
+mod resource_preconditions;
 #[path = "all/slack_channel_configurations.rs"]
 mod slack_channel_configurations;
 #[path = "all/state_roundtrip.rs"]

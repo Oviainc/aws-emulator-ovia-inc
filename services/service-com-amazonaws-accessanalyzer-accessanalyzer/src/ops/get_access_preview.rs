@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccessPreview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccessPreview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccessPreview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the access preview `accessPreviewId` names under the analyzer
+//! `analyzerArn` names, rebuilt from the record `CreateAccessPreview` stored — so an
+//! id this analyzer never minted, or one minted under a different analyzer, is a 404
+//! rather than someone else's preview.
+//!
+//! Reporting only: the preview's `status` is computed from the clock against the
+//! instant its analysis is due, so a read never changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +147,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccessPreview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccessPreviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccessPreview"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAccessPreviewErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let state = state.lock();
+
+        let analyzer = state.analyzer_by_arn(&input.analyzer_arn).ok_or_else(|| {
+            // Fixed text, the ARN the caller named in the modelled `resourceId`: every
+            // resource-scoped refusal in this service goes through `crate::state`'s
+            // constructors.
+            GetAccessPreviewErrorModeled::ResourceNotFoundException(
+                crate::state::analyzer_not_found(&input.analyzer_arn),
+            )
+        })?;
+
+        // Previews are stored ON the analyzer record, so an id created against a
+        // DIFFERENT analyzer is not found here — which is what the request being scoped
+        // by `analyzerArn` means.
+        let preview = analyzer
+            .access_previews
+            .get(&input.access_preview_id)
+            .ok_or_else(|| {
+                GetAccessPreviewErrorModeled::ResourceNotFoundException(
+                    crate::state::access_preview_not_found(&input.access_preview_id),
+                )
+            })?;
+
+        Ok(GetAccessPreviewOutput {
+            access_preview: preview.preview_at(::std::time::SystemTime::now()),
+        })
     }
 }

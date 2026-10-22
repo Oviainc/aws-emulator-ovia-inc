@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRepositoryCreationTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRepositoryCreationTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRepositoryCreationTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +121,16 @@ impl From<DescribeRepositoryCreationTemplatesErrorModeled> for DescribeRepositor
     }
 }
 
+/// Map a shared-state failure (a malformed `nextToken`, a `maxResults` the pagination
+/// helper refuses) onto this operation's own modelled error.
+fn fault_error(fault: crate::state::Fault) -> DescribeRepositoryCreationTemplatesErrorModeled {
+    DescribeRepositoryCreationTemplatesErrorModeled::InvalidParameterException(
+        InvalidParameterException {
+            message: Some(fault.message().to_string()),
+        },
+    )
+}
+
 /// The `DescribeRepositoryCreationTemplates` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,18 +167,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRepositoryCreationTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRepositoryCreationTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRepositoryCreationTemplates"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeRepositoryCreationTemplatesErrorModeled::ServerException(
+                    ServerException {
+                        message: Some("the ecr repository store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // This operation names no registry: it reports the templates of the registry the
+        // request is served by, which is this emulator's own.
+        let _ = ctx;
+
+        let store = state.lock();
+
+        // "The repository namespace prefixes associated with the repository creation
+        // templates to describe. If this value is not specified, all repository creation
+        // templates are returned." A prefix naming no template is simply not reported:
+        // this operation models no not-found error.
+        let wanted: ::std::collections::BTreeSet<String> = input
+            .prefixes
+            .unwrap_or_default()
+            .iter()
+            .map(|prefix| crate::state::normalize_prefix(prefix))
+            .collect();
+
+        // Keyed by prefix, which is the order the store holds them in, so a page
+        // boundary means the same thing on the next call.
+        let candidates: Vec<(String, RepositoryCreationTemplate)> = store
+            .creation_templates
+            .iter()
+            .filter(|(prefix, _)| wanted.is_empty() || wanted.contains(prefix.as_str()))
+            .map(|(prefix, template)| (prefix.clone(), template.to_template()))
+            .collect();
+
+        let (templates, next_token) =
+            crate::state::paginate(candidates, input.next_token.as_ref(), input.max_results)
+                .map_err(fault_error)?;
+
+        Ok(DescribeRepositoryCreationTemplatesOutput {
+            registry_id: Some(crate::state::registry_id().to_string()),
+            repository_creation_templates: Some(templates),
+            next_token,
+        })
     }
 }
