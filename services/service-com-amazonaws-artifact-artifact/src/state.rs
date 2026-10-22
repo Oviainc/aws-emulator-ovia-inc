@@ -158,8 +158,12 @@ pub const INQUIRY_STATUS_FAILED: &str = "FAILED";
 /// `InquiryStatusMessage`'s value for an inquiry that is still being processed.
 pub const INQUIRY_MESSAGE_IN_PROGRESS: &str = "Compliance inquiry processing is in-progress.";
 
+/// `InquiryStatusMessage`'s value for an inquiry that is over and every query of which
+/// reached its terminal state without erroring.
+pub const INQUIRY_MESSAGE_COMPLETE: &str = "Compliance inquiry processing is complete.";
+
 /// `InquiryStatusMessage`'s value for an inquiry that is over with at least one query
-/// that did not yield a response.
+/// that failed.
 pub const INQUIRY_MESSAGE_COMPLETE_WITH_QUERY_ERRORS: &str =
     "Compliance inquiry processing is complete. One or more queries encountered errors \
      during processing.";
@@ -171,13 +175,19 @@ pub const INQUIRY_MESSAGE_INTERNAL_ERROR: &str =
 /// `QueryStatus`'s non-terminal value.
 pub const QUERY_STATUS_PROCESSING: &str = "PROCESSING";
 
-/// `QueryStatus`'s value for a query that did not yield a response.
+/// `QueryStatus`'s value for a query whose processing is over.
+pub const QUERY_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `QueryStatus`'s value for a query whose processing could not be performed.
 pub const QUERY_STATUS_FAILED: &str = "FAILED";
 
 /// `QueryStatusMessage`'s value for a query that is still being processed.
 pub const QUERY_MESSAGE_IN_PROGRESS: &str = "Query processing is in-progress.";
 
-/// `QueryStatusMessage`'s value for a query that did not yield a response.
+/// `QueryStatusMessage`'s value for a query whose processing is over.
+pub const QUERY_MESSAGE_COMPLETE: &str = "Query processing is complete.";
+
+/// `QueryStatusMessage`'s value for a query whose processing could not be performed.
 pub const QUERY_MESSAGE_INTERNAL_ERROR: &str =
     "An internal error occurred while processing the query. Try again at a later time.";
 
@@ -436,10 +446,11 @@ pub struct InquiryQuery {
     pub query: String,
     /// "Generated response to the query."
     ///
-    /// `None` until something generates one. NOTHING in this emulator does: a compliance
-    /// answer is model-generated text, and no such engine runs in-process, so a query
-    /// ends in its modelled failure status instead of carrying a response nothing
-    /// produced.
+    /// `None` until something generates one, and NOTHING in this emulator does: a
+    /// compliance answer is model-generated text and no such engine runs in-process, so
+    /// this member stays absent rather than carrying prose nothing produced. Its absence
+    /// is the honest signal; the query's own status still reports that its processing is
+    /// over, because the query itself was received and recorded.
     pub response: Option<String>,
     /// One of `ReviewType`'s values — the review the inquiry was submitted for.
     pub review_type: Option<String>,
@@ -506,16 +517,23 @@ impl ComplianceInquiry {
     /// instant. A no-op otherwise, and a no-op for an inquiry already terminal, so
     /// calling it on every read is idempotent.
     ///
-    /// The terminal status is the one the emulator can honestly report. No
-    /// response-generating engine runs in-process, so:
+    /// The terminal status is DERIVED from the queries': an inquiry is over when its
+    /// queries are, and the inquiry-level message says whether any of them errored.
     ///
-    /// * a TEXT inquiry's one query is enumerated (its text IS the submitted query) and
-    ///   then fails for want of a response, which is exactly the inquiry-level
-    ///   "processing is complete. One or more queries encountered errors" state the
-    ///   `InquiryStatusMessage` enum models;
+    /// * a TEXT inquiry's one query is enumerated — its text IS the submitted query, so
+    ///   nothing had to be read or generated to know it — and its processing is over at
+    ///   the due instant, so it reaches `COMPLETED` and the inquiry reaches the modelled
+    ///   clean-completion message. NO RESPONSE is reported for it: a compliance answer is
+    ///   model-generated text and no such engine runs in-process, so the `response` member
+    ///   stays absent (see [`InquiryQuery::response`]) rather than carrying prose nothing
+    ///   produced. The absent member is the honest signal, not a query-level error that
+    ///   never happened;
     /// * a FILE inquiry's queries would have to be read out of the uploaded document,
     ///   which this emulator does not parse, so its processing never got as far as a
-    ///   query and the inquiry ends in the modelled FAILED state instead.
+    ///   query and the inquiry ends in the modelled FAILED state instead;
+    /// * a query that did reach `FAILED` is what selects the inquiry-level
+    ///   "One or more queries encountered errors" message, so the two enum values are
+    ///   told apart by the queries rather than one of them being unreachable.
     pub fn materialise(&mut self, now: SystemTime) {
         let Some(due) = self.processing_due_at else {
             return;
@@ -528,15 +546,24 @@ impl ComplianceInquiry {
         // not the instant some caller happened to look.
         self.updated_at = due;
         for query in &mut self.queries {
-            query.status = QUERY_STATUS_FAILED.to_string();
-            query.status_message = QUERY_MESSAGE_INTERNAL_ERROR.to_string();
+            if query.status == QUERY_STATUS_PROCESSING {
+                query.status = QUERY_STATUS_COMPLETED.to_string();
+                query.status_message = QUERY_MESSAGE_COMPLETE.to_string();
+            }
         }
+        let any_query_failed = self
+            .queries
+            .iter()
+            .any(|query| query.status == QUERY_STATUS_FAILED);
         if self.queries.is_empty() {
             self.status = INQUIRY_STATUS_FAILED.to_string();
             self.status_message = INQUIRY_MESSAGE_INTERNAL_ERROR.to_string();
-        } else {
+        } else if any_query_failed {
             self.status = INQUIRY_STATUS_COMPLETED.to_string();
             self.status_message = INQUIRY_MESSAGE_COMPLETE_WITH_QUERY_ERRORS.to_string();
+        } else {
+            self.status = INQUIRY_STATUS_COMPLETED.to_string();
+            self.status_message = INQUIRY_MESSAGE_COMPLETE.to_string();
         }
     }
 

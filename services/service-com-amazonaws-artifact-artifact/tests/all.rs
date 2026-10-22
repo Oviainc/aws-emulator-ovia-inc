@@ -29,5 +29,7 @@ mod report_workflow;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/timestamp_wire_form.rs"]
+mod timestamp_wire_form;
 #[path = "all/validation_message_rendering.rs"]
 mod validation_message_rendering;
