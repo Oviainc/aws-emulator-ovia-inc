@@ -22,9 +22,24 @@ pub const PROVIDER_STATUS_ACTIVE: &str = "ACTIVE";
 /// `UpdateServiceSettings` reports (`LinuxSubscriptionsDiscovery`: Disabled | Enabled).
 pub const DISCOVERY_DISABLED: &str = "Disabled";
 
-/// The `Status` of service settings that are applied (`Status`: Completed | Failed |
-/// InProgress | Successful).
-pub const SETTINGS_STATUS_SUCCESSFUL: &str = "Successful";
+/// The `Status` a settled change to the Linux subscriptions service settings reports
+/// (`Status`: Completed | Failed | InProgress | Successful — `smithy_query(query="shape",
+/// shape="Status")`).
+///
+/// `Completed` is the value the recorded service reports once an enable or a disable of
+/// `LinuxSubscriptionsDiscovery` has been applied, and it is the value every client's
+/// onboarding poll waits for. The settings singleton is written before the call that
+/// changed it returns, so the change is already applied — the status is terminal on the
+/// first read and no later transition is owed on it.
+pub const SETTINGS_STATUS_COMPLETED: &str = "Completed";
+
+/// The fixed text a refusal naming no registered subscription provider carries.
+///
+/// The recorded service states this refusal as a CONSTANT that names the resource type
+/// and nothing from the request: the ARN the caller sent is not interpolated back into
+/// it. The TAG APIs have their own taxonomy for the same condition — a different code
+/// and a different constant, `crate::scaffolded::NOT_FOUND_MESSAGE`.
+pub const PROVIDER_NOT_FOUND_MESSAGE: &str = "Registered Subscription Provider not found";
 
 /// Why an operation could not be served from state.
 ///
@@ -151,9 +166,6 @@ pub struct ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscr
     pub providers: HashMap<String, SubscriptionProviderRecord>,
     /// Provider ARNs in registration order, so a list is stable and pageable.
     pub provider_order: Vec<String>,
-    /// `(source, secret ARN) -> SubscriptionProviderArn`, so re-registering the same
-    /// provider resolves the record already in state instead of adding a second one.
-    pub provider_index: HashMap<(String, String), String>,
     /// The per-account settings singleton, once an update persisted one.
     pub service_settings: Option<ServiceSettingsRecord>,
     /// The instances Linux subscription discovery has found, by `Instance$InstanceID`.
@@ -164,25 +176,9 @@ pub struct ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscr
     /// until one has run, the account has discovered nothing and both lists are empty,
     /// which is exactly what an account with no instances reports.
     pub discovered_instances: BTreeMap<String, DiscoveredInstanceRecord>,
-    /// Source of the resource ids this service mints.
-    pub next_id: u64,
 }
 
 impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState {
-    /// Mint the resource-id portion of a `SubscriptionProviderArn`.
-    ///
-    /// AWS puts a UUID there, so the id keeps that lowercase-hex 8-4-4-4-12 shape, which
-    /// also satisfies the modelled `SubscriptionProviderArn` pattern's
-    /// `[a-z0-9-\.]{1,510}` resource segment. The value is the monotonic registration
-    /// counter rendered into that shape: unique within a run and never derived from the
-    /// request.
-    pub fn mint_provider_id(&mut self) -> String {
-        self.next_id += 1;
-        let counter = self.next_id;
-        let high = (counter >> 32) as u32;
-        format!("{high:08x}-0000-4000-8000-{counter:012x}")
-    }
-
     /// The registered providers in registration order.
     pub fn providers_in_order(&self) -> Vec<SubscriptionProviderRecord> {
         self.provider_order
@@ -195,9 +191,9 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
     ///
     /// `ResourceNotFoundException` when no provider with that ARN is registered.
     pub fn resolve_provider(&self, arn: &str) -> Result<&SubscriptionProviderRecord, StateError> {
-        self.providers.get(arn).ok_or_else(|| {
-            StateError::NotFound(format!("subscription provider {arn} is not registered"))
-        })
+        self.providers
+            .get(arn)
+            .ok_or_else(|| StateError::NotFound(PROVIDER_NOT_FOUND_MESSAGE.to_string()))
     }
 
     /// The discovered instances in instance-id order.
@@ -252,11 +248,10 @@ impl ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscription
         self.providers.get_mut(arn).map(|record| &mut record.tags)
     }
 
-    /// Remove a registration from the store and from every index that reaches it.
+    /// Remove a registration from the store and from the order that reaches it.
     pub fn remove_provider(&mut self, arn: &str) -> Option<SubscriptionProviderRecord> {
         let record = self.providers.remove(arn)?;
         self.provider_order.retain(|stored| stored != arn);
-        self.provider_index.retain(|_, indexed| indexed != arn);
         Some(record)
     }
 }
@@ -275,19 +270,6 @@ pub fn registered_subscription_provider(
         last_successful_data_retrieval_time: record.last_successful_data_retrieval_time.clone(),
     }
 }
-
-/// The ceiling on how many subscription providers this store holds: the cap that bounds
-/// caller-driven growth of the provider store.
-///
-/// A generated emulator keeps its resources in memory for the life of the process and a
-/// registration is the only thing that adds one, so the store needs a maximum entry count
-/// — neither a TTL nor an eviction policy is available to it, because
-/// `GetRegisteredSubscriptionProvider` must still answer what `RegisterSubscriptionProvider`
-/// registered. `RegisterSubscriptionProvider` refuses past this cap with its own modelled
-/// `ValidationException` (HTTP 400), the only client error that operation declares for a
-/// request it cannot accept. The number is the emulator's own bound, not a published AWS
-/// default, and is set high enough that no ordinary workflow meets it.
-pub const MAX_PROVIDERS: usize = 5_000;
 
 /// The largest number of home Regions the settings may aggregate data in: the modelled
 /// `HomeRegions` list is `len 1..100`, so a 101st home Region could not be reported.
@@ -330,7 +312,7 @@ pub fn reported_service_settings(
         return ReportedServiceSettings {
             linux_subscriptions_discovery: Some(DISCOVERY_DISABLED.to_string()),
             discovery_settings: None,
-            status: Some(SETTINGS_STATUS_SUCCESSFUL.to_string()),
+            status: Some(SETTINGS_STATUS_COMPLETED.to_string()),
             status_message: None,
             home_regions: None,
         };
@@ -363,10 +345,18 @@ pub fn request_region(headers: &::http::HeaderMap) -> String {
         .unwrap_or_else(|| "us-east-1".to_string())
 }
 
-/// An ARN for one of this service's resources:
-/// `arn:aws:<signing name>:<region>:<account>:<kind>/<id>`.
-pub fn resource_arn(signing_name: &str, region: &str, kind: &str, id: &str) -> String {
-    ::engine::emulator_arn(signing_name, region, &format!("{kind}/{id}"))
+/// Whether `region` names an AWS Region.
+///
+/// The catalog is `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the
+/// wire may carry, sorted for binary search", maintained with the backend contract and
+/// already a dependency of this crate) rather than a list copied into this service: this
+/// service models no Region enum — `SourceRegions` is a plain `StringList` — so the set
+/// a value may name is exactly that shared catalog, and it must not drift from it. The
+/// lookup is the binary search the catalog's ordering is maintained for.
+pub fn is_known_region(region: &str) -> bool {
+    ::emulator_telemetry::policy::KNOWN_REGIONS
+        .binary_search(&region)
+        .is_ok()
 }
 
 /// One page of `items`, plus the token that reaches the next one.

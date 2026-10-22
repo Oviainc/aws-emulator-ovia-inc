@@ -152,9 +152,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.accelerators.get(&input.accelerator_arn) else {
             return Err(DescribeAcceleratorErrorModeled::AcceleratorNotFoundException(
                 AcceleratorNotFoundException {
-                    message: Some(format!(
-                        "accelerator {} not found",
-                        input.accelerator_arn
+                    message: Some(crate::state::accelerator_not_found_message(
+                        &input.accelerator_arn,
                     )),
                 },
             )

@@ -121,3 +121,62 @@ Cause 5: lls.list_registered_subscription_providers(SubscriptionProviderSources=
 Cause 6: lls.untag_resource(resourceArn='not-an-arn-at-all', tagKeys=['a','b']) — expect BadRequestException, observe ValidationException. Then lls.untag_resource(resourceArn=f'arn:aws:license-manager-linux-subscriptions:{region}:{account}:subscription-provider/55555555-5555-5555-5555-555555555555', tagKeys=['a','b']) — expect NotFoundException 'Resource was not found'.
 
 Cause 7: lls.deregister_subscription_provider(SubscriptionProviderArn=f'arn:aws:license-manager-linux-subscriptions:{region}:{account}:subscription-provider/22222222-2222-2222-2222-222222222222') twice — both must be the identical fixed-text ResourceNotFoundException; observe the request-echoing message.
+
+## Resolution
+
+All seven causes are fixed; the fix is in
+`services/service-com-amazonaws-licensemanagerlinuxsubscriptions-licensemanagerlinuxsubscriptions/`
+and is covered by `tests/all/error_taxonomy.rs` (one test per cause, each over a table of
+inputs spanning the class) plus the reworked `tests/all/subscription_providers.rs`.
+
+### RegisterSubscriptionProvider is DECLINED as unsupported — what clients should expect
+
+Cause 3's fix is a refusal, and it applies to EVERY registration, not only to the
+recorded fake-token one. Stated plainly so no client is surprised:
+
+* `RegisterSubscriptionProvider` answers **HTTP 400 `ValidationException`** for every
+  request, and writes nothing to state. The CODE is the recorded one; the MESSAGE states
+  what is unsupported ("The subscription provider token cannot be validated: this
+  emulator holds no subscription-provider trust material and makes no call to the
+  provider, so no registration is accepted") rather than the recorded verdict on one
+  token, because this emulator inspects no token and reaches no verdict.
+* WHY: registering a BYOL subscription provider means having License Manager validate the
+  Red Hat offline token held in the referenced Secrets Manager secret against Red Hat SSO
+  before the resource exists. This emulator holds no Red Hat SSO trust material and makes
+  no outbound call, so it cannot establish ANY token as genuine — and a token that cannot
+  be established as genuine is exactly what the recorded service refuses. Answering 200
+  with a minted `SubscriptionProviderArn` and `SubscriptionProviderStatus: ACTIVE` (what
+  the emulator did before) reports a BYOL registration that cannot exist and a validation
+  nothing performed; storing it in `PENDING` instead would still report a registration
+  nothing validated, and would make the recorded check that expects zero successful
+  registrations fail.
+* CONSEQUENCE for clients: the subscription-provider resource has no create path over the
+  wire. `GetRegisteredSubscriptionProvider`, `ListRegisteredSubscriptionProviders`,
+  `DeregisterSubscriptionProvider`, `TagResource`, `UntagResource` and
+  `ListTagsForResource` are fully implemented and answer from the single shared store, so
+  they report an empty account (empty list, `ResourceNotFoundException` /
+  `NotFoundException` for a named ARN) unless a record is placed in the store
+  in-process — which is how this crate's test suites exercise the lifecycle
+  (`tests/all/harness.rs::seed_provider`, `tests/all/resource_tags.rs::register`, both
+  through the same `engine.state::<…>()` seam the handlers use).
+* WHAT WOULD CHANGE IT: a Red Hat token validator the emulator can run in-process, or a
+  recorded AWS response showing a registration this emulator could faithfully accept.
+  Until then the refusal is the honest answer, and it is the recorded one.
+
+### KNOWN GAP — a partially-invalid collection quotes only the failing elements
+
+Cause 5's rule is implemented in `src/service/validation.rs`, and one part of it cannot
+be met from inside a service crate:
+
+* AWS quotes the WHOLE collection the caller sent (`Value '[RedHat, SUSE]'`). The
+  structured refusal the framework hands a service
+  (`smithy_server_runtime::Refusal::Invalid`) carries one `Violation` per OFFENDING
+  element — the elements that passed are not in it — so the renderer can only quote the
+  collection formed from the ones that failed (`Value '[SUSE]'`).
+* The recorded case, and every case where no element passes, is byte-identical to AWS;
+  the difference appears only when a collection mixes valid and invalid elements. The
+  test pins the emulator's actual rendering for that case so the gap is visible rather
+  than silent.
+* CLOSING IT needs `Violation` (in `vendor/smithy-schema-server/src/constraints.rs`) to
+  carry the collection value it was built from, which is outside the paths a service fix
+  may change.

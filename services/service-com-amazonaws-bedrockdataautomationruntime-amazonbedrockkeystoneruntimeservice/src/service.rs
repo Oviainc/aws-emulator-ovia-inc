@@ -45,17 +45,6 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// This service's own Smithy shape id, whose LOCAL name
-/// (`AmazonBedrockKeystoneRuntimeService`) is what an `awsJson1_1` request names its
-/// target service by (`X-Amz-Target: AmazonBedrockKeystoneRuntimeService.<Operation>`).
-///
-/// The SigV4 signing name cannot tell this service from its Bedrock-family peers — they
-/// all sign as `bedrock` — and path segments cannot either, because every `awsJson1_1`
-/// operation posts to the ROOT path. So the shape id is what
-/// `service_common::claims_request` keys this service's RPC traffic on.
-const RPC_SERVICE_SHAPE_ID: &str =
-    "com.amazonaws.bedrockdataautomationruntime#AmazonBedrockKeystoneRuntimeService";
-
 /// The `com-amazonaws-bedrockdataautomationruntime-amazonbedrockkeystoneruntimeservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -85,27 +74,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // This service signs as `bedrock` — a signing name it SHARES with every other
-        // emulated Bedrock-family service (the Bedrock control plane, Bedrock Runtime,
-        // Bedrock Agent, Bedrock Agent Runtime and Bedrock Data Automation), while its
-        // own endpoint is `bedrock-data-automation-runtime`. The router resolves the
-        // routing key from the SigV4 credential scope first, so all six see the key
-        // `bedrock`: claiming on the signing name ALONE makes each of them claim every
-        // sibling's traffic, and the router — which refuses rather than guesses —
-        // answers `500 AmbiguousService` for ALL of it.
+        // This service signs as `bedrock`, the signing name every Bedrock-family service
+        // shares while serving its own endpoint (`bedrock-data-automation-runtime` here).
+        // Claiming on that name alone makes all six claimants for every Bedrock request,
+        // which the router answers `500 AmbiguousService` — a code no AWS model carries —
+        // rather than serving one of them.
         //
-        // So the claim is narrowed to this service's own modelled wire surface, by the
-        // one rule `service-common` states for every service under a shared signing
-        // name. This model is `awsJson1_1` and carries no `smithy.api#http` binding, so
-        // its surface is the RPC form: the request must NAME this service in
-        // `X-Amz-Target: AmazonBedrockKeystoneRuntimeService.<Operation>` and arrive on
-        // the path that protocol posts to (the root). Each REST sibling's own URI path
-        // space is then claimed by it alone.
-        service_common::claims_request(
+        // This is the one `awsJson1_1` model of the six and it publishes no
+        // `smithy.api#http` bindings, so its generated `ROUTE_PATH_SEGMENTS` is EMPTY —
+        // which on its own claims every path and swallows all five REST peers. An
+        // `awsJson` request names its service out of band instead, by the LOCAL name of
+        // the service shape (`X-Amz-Target: AmazonBedrockKeystoneRuntimeService.<Op>`),
+        // so this service's own shape id — read off its model-derived identity, never
+        // written out here — is passed as the RPC argument of the one rule
+        // `service_common::bedrock` states for the family: it claims a root `POST` whose
+        // target names IT, and nothing else, leaving each REST sibling's URI path space
+        // to that sibling alone.
+        service_common::bedrock::claims_request(
             parts,
-            self.entry.identity().signing_name(),
+            self.definition(),
             crate::ROUTE_PATH_SEGMENTS,
-            Some(RPC_SERVICE_SHAPE_ID),
+            Some(self.entry.identity().shape_id()),
         )
     }
 

@@ -7,7 +7,10 @@
 //! every config member of the response is read back out of the stored record, so
 //! `GetMatchingWorkflow` cannot disagree with it. "The workflow name must be unique",
 //! so re-creating an existing `workflowName` is refused with the modelled
-//! `ConflictException` (HTTP 400).
+//! `ConflictException` (HTTP 400). A request pairing an `incrementalRunConfig` with
+//! the `PROVIDER` `resolutionType` is refused with the modelled `ValidationException`
+//! (HTTP 400) — the rule [`crate::state::incremental_run_conflict`] states, which
+//! `UpdateMatchingWorkflow` applies identically.
 //!
 //! ## Shape of an operation
 //!
@@ -200,6 +203,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One instant for both stamps: a workflow that has only just been created has
         // not been updated since, so `createdAt` and `updatedAt` are equal.
         let created = crate::state::now();
+
+        // The documented cross-member refusal is decided BEFORE anything is minted or
+        // stored — the same rule `UpdateMatchingWorkflow` applies, since both carry the
+        // same two members and the same doc sentence.
+        if let Some(message) = crate::state::incremental_run_conflict(
+            &input.resolution_techniques.resolution_type,
+            input.incremental_run_config.as_ref(),
+        ) {
+            return Err(CreateMatchingWorkflowErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         let mut store = state.lock();
 

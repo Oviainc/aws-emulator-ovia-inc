@@ -12,7 +12,8 @@
 //! No test lives here and no request is built here: the dispatch, the signing
 //! and the error-code reading all stay in `wire`, so this module cannot drift
 //! from how every other suite reaches the emulator. What it adds is the group
-//! collection's URI, its two implemented operations as one call each, and the
+//! collection's URI, its two implemented operations as one call each, the
+//! label encoder every `@httpLabel` suite shares ([`percent_encoded`]) and the
 //! readers the group assertions need.
 
 use serde_json::Value;
@@ -54,11 +55,14 @@ pub async fn get_in(
     .await
 }
 
-/// `Identifier` is an `@httpLabel`, so an identifier that is not made of
-/// URI-unreserved characters travels percent-encoded. Encoding every
-/// non-alphanumeric byte is a superset of what the label needs, and the
-/// `percent-encoding` crate owns the encoding itself.
-fn percent_encoded(label: &str) -> String {
+/// Percent-encode one URI path segment.
+///
+/// `Identifier` and `ResourceArn` are `@httpLabel`s, so a label that is not made
+/// of URI-unreserved characters travels percent-encoded. Encoding every
+/// non-alphanumeric byte is a superset of what a label needs (it also covers the
+/// `:` and `/` of an ARN), and the `percent-encoding` crate owns the encoding
+/// itself.
+pub fn percent_encoded(label: &str) -> String {
     percent_encoding::utf8_percent_encode(label, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 

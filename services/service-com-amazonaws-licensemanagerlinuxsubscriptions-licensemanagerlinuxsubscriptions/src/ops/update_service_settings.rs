@@ -170,6 +170,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(&ctx.parts().headers);
         let mut state = state.lock();
 
+        // Input validation first, so a refused request leaves the account's settings
+        // exactly as they were. `SourceRegions` is a plain `StringList` in the model, so
+        // nothing in the request walk checks that its entries name Regions; this
+        // operation does, against the published Region codes
+        // (`crate::state::is_known_region`).
+        if let Some(unknown) = input
+            .linux_subscriptions_discovery_settings
+            .source_regions
+            .iter()
+            .find(|source| !crate::state::is_known_region(source))
+        {
+            return Err(validation(format!("Invalid region name/format : {unknown}")));
+        }
+
         let mut home_regions = state
             .service_settings
             .as_ref()
@@ -197,8 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.service_settings = Some(crate::state::ServiceSettingsRecord {
             linux_subscriptions_discovery: input.linux_subscriptions_discovery.clone(),
             discovery_settings: input.linux_subscriptions_discovery_settings.clone(),
-            // The settings are stored by the time this call returns, so they are applied.
-            status: crate::state::SETTINGS_STATUS_SUCCESSFUL.to_string(),
+            // The settings are stored by the time this call returns, so the change has
+            // been applied: `Completed` is the settled status, which is what a client's
+            // onboarding poll waits for.
+            status: crate::state::SETTINGS_STATUS_COMPLETED.to_string(),
             // Nothing to detail about that status: a message is not invented for it.
             status_message: std::collections::HashMap::new(),
             home_regions,
