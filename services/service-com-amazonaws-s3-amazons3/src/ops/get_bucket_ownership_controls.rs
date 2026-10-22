@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketOwnershipControls
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketOwnershipControls`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketOwnershipControls::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ownership controls `PutBucketOwnershipControls` associated with the named
+//! bucket, and answers the documented `OwnershipControlsNotFoundError` (HTTP 404) when the
+//! bucket has none. Read-only: nothing here writes to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -86,14 +81,22 @@ use super::types::*;
 // `GetBucketOwnershipControlsError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GetBucketOwnershipControlsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#GetBucketOwnershipControls")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="GetBucketOwnershipControls")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#GetBucketOwnershipControls",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum GetBucketOwnershipControlsErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,18 +150,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketOwnershipControls` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketOwnershipControlsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketOwnershipControls"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Nothing can be reported about a bucket the emulator cannot look up, and
+            // neither widened-in error would be a true statement about it. The scaffold's
+            // 501 says what is true: this emulator cannot serve the request.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetBucketOwnershipControls",
+            ));
+        };
+
+        // Read-only: the guard is taken, the rules are copied out, and nothing is written
+        // — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(
+                GetBucketOwnershipControlsErrorModeled::NoSuchBucket(NoSuchBucket {}).into(),
+            );
+        };
+        let Some(rules) = bucket.ownership_controls() else {
+            // "A bucket doesn't have OwnershipControls settings in the following cases:
+            // The bucket was created before the BucketOwnerEnforced ownership setting was
+            // introduced and you've never explicitly applied this value[;] You've manually
+            // deleted the bucket ownership control value" (this operation's own
+            // documentation). `OwnershipControls` is the whole @httpPayload, so a 200 with
+            // an empty body would report ownership controls that do not exist; AWS answers
+            // that case with the code below and HTTP 404, which the model declares no shape
+            // for, so it goes out through the unmodelled channel.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::OWNERSHIP_CONTROLS_NOT_FOUND_CODE,
+                OWNERSHIP_CONTROLS_NOT_FOUND_STATUS,
+                crate::state::OWNERSHIP_CONTROLS_NOT_FOUND_MESSAGE,
+            ));
+        };
+
+        Ok(GetBucketOwnershipControlsOutput {
+            ownership_controls: Some(OwnershipControls {
+                rules: rules
+                    .iter()
+                    .map(|object_ownership| OwnershipControlsRule {
+                        object_ownership: object_ownership.clone(),
+                    })
+                    .collect(),
+            }),
+        })
     }
 }
+
+/// The HTTP status AWS answers `OwnershipControlsNotFoundError` with: 404, the status S3's
+/// error-responses list carries for a subresource that is not there.
+const OWNERSHIP_CONTROLS_NOT_FOUND_STATUS: u16 = 404;
