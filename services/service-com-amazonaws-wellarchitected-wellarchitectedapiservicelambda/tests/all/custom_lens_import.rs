@@ -24,6 +24,11 @@
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do
 //! in production. The HTTP client is the shared `super::workload_harness`.
+//!
+//! The wire helpers here (`lens_document`, `import`, `export`, `imported_arn`,
+//! `wait_for_the_import_to_land`) are `pub(crate)` because the version suite,
+//! `super::custom_lens_versions`, publishes versions of the lenses THIS suite's import
+//! helper records — one spelling of each lens request for both.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -35,7 +40,7 @@ use super::workload_harness::{encode_path_segment, Answer, Client};
 use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
 
 /// A custom lens ARN that is well-formed but names no imported lens.
-const ABSENT_LENS_ARN: &str =
+pub(crate) const ABSENT_LENS_ARN: &str =
     "arn:aws:wellarchitected:us-west-2:000000000000:lens/0123456789abcdef0123456789abcdef";
 
 /// A lens document, as the lens JSON format specification the `ImportLens` doc points at
@@ -45,7 +50,11 @@ const ABSENT_LENS_ARN: &str =
 ///
 /// `pillars` is `(pillar id, questions, choices per question)`, so a row can vary the
 /// document's shape without spelling the whole document out.
-fn lens_document(name: &str, description: Option<&str>, pillars: &[(&str, usize, usize)]) -> Value {
+pub(crate) fn lens_document(
+    name: &str,
+    description: Option<&str>,
+    pillars: &[(&str, usize, usize)],
+) -> Value {
     let pillars_json: Vec<Value> = pillars
         .iter()
         .enumerate()
@@ -94,7 +103,7 @@ fn lens_document(name: &str, description: Option<&str>, pillars: &[(&str, usize,
 }
 
 /// `PUT /importLens`, the wire form of `ImportLens`.
-async fn import(
+pub(crate) async fn import(
     client: &Client,
     document: &str,
     alias: Option<&str>,
@@ -113,7 +122,7 @@ async fn import(
 
 /// `GET /lenses/{LensAlias}/export`. The alias is percent-encoded because a custom lens
 /// is named by its ARN, which carries `:` and `/` inside ONE path segment.
-async fn export(client: &Client, alias: &str, version: Option<&str>) -> Answer {
+pub(crate) async fn export(client: &Client, alias: &str, version: Option<&str>) -> Answer {
     let path = format!("/lenses/{}/export", encode_path_segment(alias));
     let uri = match version {
         Some(version) => format!("{path}?LensVersion={version}"),
@@ -122,14 +131,14 @@ async fn export(client: &Client, alias: &str, version: Option<&str>) -> Answer {
     client.send("GET", &uri, None).await
 }
 
-fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
+pub(crate) fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
     answer.body.get(name).and_then(Value::as_str).unwrap_or("")
 }
 
 /// The `LensArn` a successful import answered with, checked against the form the
 /// `LensAlias` doc gives for a custom lens: `…:lens/<32 hex>` under this emulator's
 /// account and the request's Region.
-fn imported_arn(answer: &Answer, case: &str) -> String {
+pub(crate) fn imported_arn(answer: &Answer, case: &str) -> String {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected ImportLens 200, got {answer:?}"
@@ -150,7 +159,7 @@ fn imported_arn(answer: &Answer, case: &str) -> String {
 /// Wait for an accepted import to land. The span is the service's own
 /// ([`state::LENS_IMPORT_DURATION`]) plus a margin, and it is non-zero on purpose: that
 /// is what makes the `IN_PROGRESS` status observable to a caller.
-fn wait_for_the_import_to_land() {
+pub(crate) fn wait_for_the_import_to_land() {
     assert!(
         !state::LENS_IMPORT_DURATION.is_zero(),
         "an import that lands instantly would never report IN_PROGRESS, got {:?}",
@@ -272,7 +281,7 @@ async fn an_imported_lens_document_is_recorded_and_exported_back_verbatim() {
         );
 
         // A version of the lens exists only once one is published from the draft, which
-        // nothing in this emulator does yet.
+        // no request here did — `super::custom_lens_versions` covers the publish.
         let versioned = export(&client, arn, Some("2024-01-01")).await;
         assert_eq!(
             versioned.status, 404,

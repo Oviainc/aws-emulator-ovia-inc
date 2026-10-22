@@ -14,6 +14,9 @@
 #[path = "all/custom_lens_import.rs"]
 mod custom_lens_import;
 
+#[path = "all/custom_lens_versions.rs"]
+mod custom_lens_versions;
+
 #[path = "all/lens_review_answers.rs"]
 mod lens_review_answers;
 

@@ -8,7 +8,8 @@
 //! (`CreateReviewTemplate`, `GetReviewTemplate`), the answers of a workload's lens
 //! reviews (`ListAnswers`) and the answers of a review template's lens reviews
 //! (`ListReviewTemplateAnswers`) are backed entirely by the maps below, so a create is
-//! visible to the next request on the same engine. The custom lenses `ImportLens` imports and
+//! visible to the next request on the same engine. The custom lenses `ImportLens`
+//! imports, the versions `CreateLensVersion` publishes from them and the content
 //! `ExportLens` reads back are backed the same way. The record types and their
 //! projections live here rather than in a handler because several operations reach them.
 //!
@@ -372,8 +373,10 @@ pub const MAX_LENSES_PER_REVIEW_TEMPLATE: usize = 10;
 /// applied to it is at its current version. The enum publishes exactly `CURRENT` and
 /// `LENS_NOT_CURRENT` (`smithy_query(query="shape",
 /// shape="ReviewTemplateUpdateStatus")`), and a template whose lenses have not been
-/// superseded is current. No operation in this emulator publishes a new lens version
-/// (`CreateLensVersion` and `ImportLens` are stubs), so a stored template stays current.
+/// superseded is current. A stored template records the lens aliases applied to it and
+/// no lens VERSION ([`ReviewTemplateRecord::lenses`]), so there is no pinned version for
+/// a later `CreateLensVersion` to supersede: pinning one is `UpdateReviewTemplate` /
+/// `UpgradeReviewTemplateLensReview`'s work, each a stub with its own issue.
 pub const REVIEW_TEMPLATE_UPDATE_STATUS_CURRENT: &str = "CURRENT";
 
 /// The `Question` bucket a question with no answer counts under —
@@ -527,6 +530,12 @@ pub const LENS_JSON_MEMBER: &str = "JSONString";
 /// count, and this ceiling is what bounds the lens map's growth. It sits far above any
 /// realistic client workflow.
 pub const MAX_CUSTOM_LENSES_PER_ACCOUNT_REGION: usize = 1_000;
+
+/// The most versions one custom lens carries: "A lens can have up to 100 versions" (the
+/// `CreateLensVersion` doc). `CreateLensVersion` models `ServiceQuotaExceededException`
+/// (HTTP 402, "The user has reached their resource quota"), which is what a publish past
+/// this ceiling answers, so this is what bounds a lens record's version map.
+pub const MAX_LENS_VERSIONS_PER_LENS: usize = 100;
 
 /// The most `ImportLens` idempotency tokens the store remembers.
 ///
@@ -996,13 +1005,30 @@ pub struct PendingLensImport {
     pub completes_at: SystemTime,
 }
 
+/// One PUBLISHED version of a custom lens: the lens's content as it stood when
+/// `CreateLensVersion` published that version, plus what the publishing request said
+/// about it.
+///
+/// A version is immutable — "Create a new lens version… after you have imported a lens"
+/// (`CreateLensVersion` doc) — so the content is held BY VALUE here: a later import that
+/// changes the lens's draft must not change what a published version carries.
+#[derive(Debug, Clone)]
+pub struct PublishedLensVersion {
+    /// The content published under this version.
+    pub content: LensContent,
+    /// `CreateLensVersionInput$IsMajorVersion` — "Set to true if this new major lens
+    /// version". A request that omits the member is not publishing a major version.
+    pub is_major_version: bool,
+    pub published_at: SystemTime,
+}
+
 /// One stored custom lens.
 ///
 /// A lens imported by `ImportLens` "will have a status of DRAFT. The lens cannot be
 /// applied to workloads or shared with other Amazon Web Services accounts until it's
 /// published with CreateLensVersion" (`ImportLens` doc) — so a record carries its draft
-/// content plus the versions that have been published from it, and the latter stays
-/// empty until `CreateLensVersion` (its own stub, its own issue) publishes one.
+/// content plus the versions `CreateLensVersion` has published from it, and the latter
+/// stays empty until it publishes one.
 #[derive(Debug, Clone)]
 pub struct LensRecord {
     /// The 32-lowercase-hex resource id the lens ARN ends in.
@@ -1017,7 +1043,7 @@ pub struct LensRecord {
     /// The import still in flight, if one is.
     pub pending: Option<PendingLensImport>,
     /// The published versions of this lens, by `LensVersion`.
-    pub versions: BTreeMap<String, LensContent>,
+    pub versions: BTreeMap<String, PublishedLensVersion>,
 }
 
 impl LensRecord {
@@ -1058,6 +1084,16 @@ impl LensRecord {
 #[derive(Debug, Clone)]
 pub struct ImportLensToken {
     pub lens_id: String,
+    pub fingerprint: String,
+}
+
+/// What a `CreateLensVersion` idempotency token resolves to: the lens and the version
+/// the original request published, plus that request's parameter fingerprint so a reuse
+/// of the token with DIFFERENT parameters can be told from a genuine replay.
+#[derive(Debug, Clone)]
+pub struct CreateLensVersionToken {
+    pub lens_id: String,
+    pub lens_version: String,
     pub fingerprint: String,
 }
 
@@ -1340,12 +1376,14 @@ pub fn lens_alias(lens: &str) -> &str {
 ///
 /// Only the AWS-official Well-Architected Framework lens has a definition here
 /// ([`FRAMEWORK_LENS_QUESTIONS`]); another lens — an AWS-published specialised lens, or
-/// a custom one — carries no question set in this emulator yet, so it asks nothing. An
-/// imported custom lens is not a counter-example: `ImportLens` leaves it in DRAFT, and
-/// "the lens cannot be applied to workloads or shared with other Amazon Web Services
-/// accounts until it's published with CreateLensVersion" (`ImportLens` doc), which is
-/// still a stub with its own issue — so no custom lens in this emulator can be attached
-/// to a workload for its questions to be reported or counted.
+/// a custom one — carries no question set in this emulator yet, so it asks nothing. A
+/// custom lens is not a counter-example even once `CreateLensVersion` has published a
+/// version of it: its question set is lens CONTENT, held on its own
+/// [`LensRecord`] in the store rather than in this static catalog, and
+/// "the lens cannot be applied to workloads … until it's published with
+/// CreateLensVersion" (`ImportLens` doc) is enforced by `AssociateLenses`, still a stub
+/// with its own issue — so no custom lens in this emulator is attached to a workload for
+/// its questions to be reported or counted.
 pub fn lens_questions(lens: &str) -> &'static [FrameworkQuestion] {
     if lens_alias(lens) == FRAMEWORK_LENS_ALIAS {
         FRAMEWORK_LENS_QUESTIONS
@@ -1616,6 +1654,13 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// The remembered import tokens in insertion order, so the ledger above evicts the
     /// one remembered longest ago first. A `HashMap` alone cannot say which that is.
     import_lens_token_order: VecDeque<String>,
+    /// `CreateLensVersion`'s `ClientRequestToken` -> the version the original request
+    /// published. Caller input keys this map, but only a request that PUBLISHED a
+    /// version records one, so it is bounded by the lens and version quotas
+    /// ([`MAX_CUSTOM_LENSES_PER_ACCOUNT_REGION`] times
+    /// [`MAX_LENS_VERSIONS_PER_LENS`]) rather than by the stream of tokens — the same
+    /// reasoning as the create-token ledgers of the workload operations above.
+    pub create_lens_version_tokens: HashMap<String, CreateLensVersionToken>,
     /// Monotonic input to [`Self::next_hex_id`]; never returned to a caller.
     id_counter: u64,
 }
@@ -2304,6 +2349,19 @@ pub fn lens_version_not_found(alias: &str, version: &str) -> ResourceNotFoundExc
         LENS_RESOURCE_TYPE,
         alias.to_string(),
         &format!("version {version} of the custom lens with alias {alias}"),
+    )
+}
+
+/// [`conflict`] for a `LensVersion` the lens has already published: a published version
+/// is immutable, so a second publish under the same name collides with it rather than
+/// replacing it — the modelled `ConflictException`'s own "The resource has already been
+/// processed" case. The `ResourceId` is the alias AS SENT, as the lookup failures above
+/// report it.
+pub fn lens_version_conflict(alias: &str, version: &str) -> ConflictException {
+    conflict(
+        LENS_RESOURCE_TYPE,
+        alias.to_string(),
+        &format!("Version {version} of the lens with alias {alias} has already been published."),
     )
 }
 

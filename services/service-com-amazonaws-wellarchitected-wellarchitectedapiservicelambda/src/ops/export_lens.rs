@@ -186,13 +186,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The lens version to be exported": a version exists only once
         // `CreateLensVersion` has published it from the draft, so a request naming one
-        // resolves against the published versions and nothing else.
+        // resolves against the published versions and nothing else — and against the
+        // content as it stood when that version was published, which a later import of
+        // the lens does not change.
         let content = match input.lens_version.as_deref() {
-            Some(version) => record.versions.get(version).ok_or_else(|| {
-                ExportLensErrorModeled::ResourceNotFoundException(
-                    crate::state::lens_version_not_found(&input.lens_alias, version),
-                )
-            })?,
+            Some(version) => record
+                .versions
+                .get(version)
+                .map(|published| &published.content)
+                .ok_or_else(|| {
+                    ExportLensErrorModeled::ResourceNotFoundException(
+                        crate::state::lens_version_not_found(&input.lens_alias, version),
+                    )
+                })?,
             // Without a version, the lens's current content: the latest import that has
             // landed. While the first import of a lens is still in flight there is no
             // lens content to export yet.
