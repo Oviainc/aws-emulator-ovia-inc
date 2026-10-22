@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketEncryption
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketEncryption`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketEncryption::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates the request's `ServerSideEncryptionConfiguration` with the named bucket as
+//! its whole default encryption configuration, replacing whatever the bucket held, and
+//! answers the modelled 200 with an empty body. `GetBucketEncryption` reads the same
+//! state back, and reports the SSE-S3 default for a bucket this operation never
+//! configured.
 //!
 //! ## Shape of an operation
 //!
@@ -157,9 +154,20 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketEncryptionOutpu
 // here — hence the `PutBucketEncryptionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketEncryption")]
+// Widened by `NoSuchBucket`: the model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketEncryption")` reports
+// `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
+// not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
+// not exist", `httpError 404`). `extra_errors` widens the set with that shape, which the
+// SERVICE models, so this handler answers the same 404 every other bucket-scoped
+// operation does rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketEncryption",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketEncryptionErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -213,18 +221,193 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketEncryption` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketEncryptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Everything this write needs is in its deserialized input: the expected owner and
+        // the configuration travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`PutBucketEncryptionRequest$ExpectedBucketOwner`), judged the way
+        // `PutBucketVersioning` judges it: this emulator serves one account, so that
+        // account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine
+            // that is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // this operation models no server-fault error to say so, so the scaffold's
+            // 501 carries "this emulator cannot serve it" rather than a false success.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "PutBucketEncryption",
+            ));
+        };
+
+        // The rules the request carried, in document order.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketEncryption"))
+        // `ServerSideEncryptionConfiguration` is the @httpPayload and both it and
+        // `ServerSideEncryptionConfiguration$Rules` are required, so reaching here means
+        // the boundary parsed the container; each rule's members are optional except
+        // `SSEAlgorithm` inside `ApplyServerSideEncryptionByDefault`, which is why the
+        // stored rule carries an algorithm exactly when that container is present.
+        let rules: Vec<crate::state::BucketEncryptionRule> = input
+            .server_side_encryption_configuration
+            .rules
+            .iter()
+            .map(|rule| crate::state::BucketEncryptionRule {
+                sse_algorithm: rule
+                    .apply_server_side_encryption_by_default
+                    .as_ref()
+                    .map(|by_default| by_default.sse_algorithm.clone()),
+                kms_master_key_id: rule
+                    .apply_server_side_encryption_by_default
+                    .as_ref()
+                    .and_then(|by_default| by_default.kms_master_key_id.clone()),
+                bucket_key_enabled: rule.bucket_key_enabled,
+                blocked_encryption_types: rule
+                    .blocked_encryption_types
+                    .as_ref()
+                    .and_then(|blocked| blocked.encryption_type.clone()),
+            })
+            .collect();
+
+        // Every refusal below is decided BEFORE anything is written, so a refused put
+        // leaves the bucket's current configuration exactly as it was; and the bucket is
+        // looked up FIRST, so a request naming a bucket this emulator does not hold
+        // answers that rather than reporting whatever is wrong with a configuration the
+        // bucket could never have carried (the order `PutBucketOwnershipControls` keeps).
+        let mut store = state.lock();
+        if store.bucket(&input.bucket).is_none() {
+            return Err(PutBucketEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        }
+
+        if rules.is_empty() {
+            // The invariant this store keeps: a configuration associated with a bucket
+            // names at least one rule, because `ServerSideEncryptionConfiguration$Rules`
+            // is a REQUIRED member and `GetBucketEncryption` reports the container as its
+            // whole payload. AWS refuses a payload that does not validate against the
+            // schema it publishes with `MalformedXML` (HTTP 400), a code this service's
+            // model declares no shape for, so it goes out through the unmodelled channel.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                MALFORMED_XML_STATUS,
+                "ServerSideEncryptionConfiguration names no Rule; a default encryption \
+                 configuration carries at least one rule",
+            ));
+        }
+        if rules.len() > crate::state::MAX_SERVER_SIDE_ENCRYPTION_RULES {
+            // The emulator's own ceiling on what one bucket's record may hold (the model
+            // bounds the list at neither end), so it is a refusal rather than a modelled
+            // failure: 400 `ValidationException`, the channel `CreateBucket` answers its
+            // unmodelled bucket-quota refusal through.
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "ServerSideEncryptionConfiguration carries {} rules, more than the {} this \
+                 emulator records for one bucket",
+                rules.len(),
+                crate::state::MAX_SERVER_SIDE_ENCRYPTION_RULES
+            )));
+        }
+
+        for rule in &rules {
+            // `SSEAlgorithm` is a `ServerSideEncryption` enum member, so the boundary
+            // refuses a value outside the published set before this handler runs; this
+            // guard is what keeps a stored algorithm inside that set if a payload ever
+            // parses to something else, and it is the same schema refusal.
+            if let Some(algorithm) = rule.sse_algorithm.as_deref() {
+                if !SERVER_SIDE_ENCRYPTION_VALUES.contains(&algorithm) {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::MALFORMED_XML_CODE,
+                        MALFORMED_XML_STATUS,
+                        format!(
+                            "ApplyServerSideEncryptionByDefault.SSEAlgorithm must be one of \
+                             {SERVER_SIDE_ENCRYPTION_VALUES:?}, got {algorithm:?}"
+                        ),
+                    ));
+                }
+            }
+
+            // "This parameter is allowed if and only if SSEAlgorithm is set to aws:kms or
+            // aws:kms:dsse" (`ApplyServerSideEncryptionByDefault$KMSMasterKeyID`): a key
+            // named beside any other algorithm, or beside no algorithm at all, is a value
+            // that is not valid for the parameter carrying it, which is what
+            // `InvalidArgument` (HTTP 400) reports. The model declares no shape for that
+            // code either, so it goes out through the unmodelled channel.
+            if rule.kms_master_key_id.is_some()
+                && !rule.sse_algorithm.as_deref().is_some_and(|algorithm| {
+                    crate::state::KMS_SSE_ALGORITHMS.contains(&algorithm)
+                })
+            {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::INVALID_ARGUMENT_CODE,
+                    INVALID_ARGUMENT_STATUS,
+                    format!(
+                        "ApplyServerSideEncryptionByDefault.KMSMasterKeyID is allowed if and \
+                         only if SSEAlgorithm is one of {:?}, got {:?}",
+                        crate::state::KMS_SSE_ALGORITHMS,
+                        rule.sse_algorithm
+                    ),
+                ));
+            }
+
+            // A rule has to configure SOMETHING: the three members a
+            // `ServerSideEncryptionRule` carries are each optional on their own, so a rule
+            // naming none of them is a container the published schema gives no meaning to,
+            // and recording it would make `GetBucketEncryption` report a rule that says
+            // nothing. Refused the same way as the schema refusals above.
+            if rule.sse_algorithm.is_none()
+                && rule.bucket_key_enabled.is_none()
+                && rule.blocked_encryption_types.is_none()
+            {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::MALFORMED_XML_CODE,
+                    MALFORMED_XML_STATUS,
+                    "a ServerSideEncryptionConfiguration Rule names neither \
+                     ApplyServerSideEncryptionByDefault nor BucketKeyEnabled nor \
+                     BlockedEncryptionTypes",
+                ));
+            }
+        }
+
+        // "This operation configures default encryption and Amazon S3 Bucket Keys for an
+        // existing bucket" (this operation's own documentation): the payload is the
+        // complete container, so what it names becomes the bucket's default encryption
+        // configuration in full, whether the bucket had one of its own already or carried
+        // only the SSE-S3 default.
+        //
+        // `ContentMD5` is NOT verified here: it is "the Base64 encoded 128-bit MD5 digest
+        // of the server-side encryption configuration", and by the time this handler runs
+        // the payload is the deserialized container rather than the bytes it was computed
+        // over, so nothing this handler holds can confirm or deny the digest. That is the
+        // same place every other bucket-subresource put in this crate leaves it.
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            // Unreachable: the lookup above ran under this same guard.
+            return Err(PutBucketEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        bucket.set_encryption(rules);
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(PutBucketEncryptionOutput)
     }
 }
+
+/// The HTTP status AWS answers `MalformedXML` with: 400, the status S3's error-responses
+/// list carries for it.
+const MALFORMED_XML_STATUS: u16 = 400;
+
+/// The HTTP status AWS answers `InvalidArgument` with: 400, the status S3's
+/// error-responses list carries for it.
+const INVALID_ARGUMENT_STATUS: u16 = 400;
+
+/// The status `ExpectedBucketOwner` names for a mismatch: "the request fails with the HTTP
+/// status code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;

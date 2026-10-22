@@ -355,6 +355,59 @@ pub struct BucketVersioning {
     pub mfa_delete: Option<String>,
 }
 
+/// One rule of a bucket's default server-side-encryption configuration: one
+/// `ServerSideEncryptionRule` of the `ServerSideEncryptionConfiguration` a
+/// `PutBucketEncryption` carried.
+///
+/// Every member is optional exactly where the model makes it so
+/// (`smithy_query(query="shape",shape="ServerSideEncryptionRule")`): a rule may name a
+/// default algorithm, a Bucket Key setting, a set of blocked encryption types, or any
+/// combination of them. `sse_algorithm` and `kms_master_key_id` are the two members of
+/// the rule's `ApplyServerSideEncryptionByDefault` container, flattened here because
+/// `SSEAlgorithm` is REQUIRED inside it — so the container is present in the stored rule
+/// exactly when the algorithm is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketEncryptionRule {
+    /// `ApplyServerSideEncryptionByDefault$SSEAlgorithm`: a `ServerSideEncryption` value
+    /// (`SERVER_SIDE_ENCRYPTION_VALUES`), or `None` when the rule names no default
+    /// encryption at all.
+    pub sse_algorithm: Option<String>,
+    /// `ApplyServerSideEncryptionByDefault$KMSMasterKeyID`, verbatim as the request
+    /// carried it — "You can specify the key ID, key alias, or the Amazon Resource Name
+    /// (ARN) of the KMS key" (that member's own documentation), and S3 "doesn't validate
+    /// the KMS key ID provided in PutBucketEncryption requests" (`PutBucketEncryption`'s
+    /// documentation), so whichever form arrives is what comes back.
+    pub kms_master_key_id: Option<String>,
+    /// `ServerSideEncryptionRule$BucketKeyEnabled`, or `None` when the rule names no
+    /// Bucket Key setting.
+    pub bucket_key_enabled: Option<bool>,
+    /// `BlockedEncryptionTypes$EncryptionType`: the `EncryptionType` values the rule
+    /// blocks, in the order the request carried them, or `None` when the rule carries no
+    /// `BlockedEncryptionTypes` container.
+    pub blocked_encryption_types: Option<Vec<String>>,
+}
+
+/// The default encryption rule a general purpose bucket carries while no
+/// `PutBucketEncryption` has configured one.
+///
+/// "By default, all buckets have a default encryption configuration that uses server-side
+/// encryption with Amazon S3 managed keys (SSE-S3)" (`GetBucketEncryption`'s own
+/// documentation), and "General purpose buckets - By default, S3 Bucket Key is not
+/// enabled" (`ServerSideEncryptionRule$BucketKeyEnabled`) — so the rule a never-configured
+/// bucket reports is [`DEFAULT_SSE_ALGORITHM`] with the Bucket Key off and nothing blocked.
+///
+/// COMPUTED rather than stored, so a read of a bucket that was never configured reports
+/// this without writing anything: [`Bucket::encryption`] stays `None` and a later reader
+/// sees exactly what this one saw.
+pub fn default_encryption_rule() -> BucketEncryptionRule {
+    BucketEncryptionRule {
+        sse_algorithm: Some(DEFAULT_SSE_ALGORITHM.to_string()),
+        kms_master_key_id: None,
+        bucket_key_enabled: Some(DEFAULT_BUCKET_KEY_ENABLED),
+        blocked_encryption_types: None,
+    }
+}
+
 /// One general purpose bucket this emulator holds.
 #[derive(Debug, Clone, Default)]
 pub struct Bucket {
@@ -399,6 +452,18 @@ pub struct Bucket {
     ///
     /// Private, like `tags`, so the pair of accessors below is the only way in or out.
     ownership_controls: Option<Vec<String>>,
+    /// The bucket's own default server-side-encryption configuration: one entry per
+    /// `ServerSideEncryptionRule` the last `PutBucketEncryption` carried, in that order,
+    /// or `None` while no configuration of the bucket's own is associated with it.
+    ///
+    /// `None` is NOT "no encryption": a bucket without a configuration of its own is
+    /// encrypted with SSE-S3 by default (see [`default_encryption_rule`]), which is what a
+    /// read of a never-configured bucket reports. Keeping that case as `None` rather than
+    /// as a stored copy of the default is what lets a reader report it without writing.
+    ///
+    /// Private, like `tags` and `ownership_controls`, so the accessor pair below is the
+    /// only way in or out.
+    encryption: Option<Vec<BucketEncryptionRule>>,
     /// The objects the bucket holds, by key, as `PutObject` last recorded each.
     ///
     /// Private for the same reason as `tags`, and sorted by key because that is the order
@@ -465,6 +530,23 @@ impl Bucket {
     /// request names becomes the bucket's controls in full.
     pub fn set_ownership_controls(&mut self, rules: Vec<String>) {
         self.ownership_controls = Some(rules);
+    }
+
+    /// The bucket's own default server-side-encryption rules, in the order they were
+    /// applied, or `None` when no configuration of the bucket's own is associated with it
+    /// — in which case [`default_encryption_rule`] is what applies to the bucket.
+    pub fn encryption(&self) -> Option<&[BucketEncryptionRule]> {
+        self.encryption.as_deref()
+    }
+
+    /// Associate `rules` with the bucket as its whole default encryption configuration.
+    ///
+    /// A replacement, not a merge: `PutBucketEncryption` "configures default encryption
+    /// and Amazon S3 Bucket Keys for an existing bucket" from the complete
+    /// `ServerSideEncryptionConfiguration` it carries as its payload, so what the request
+    /// names becomes the bucket's configuration in full.
+    pub fn set_encryption(&mut self, rules: Vec<BucketEncryptionRule>) {
+        self.encryption = Some(rules);
     }
 
     /// The object stored at `key`, or `None` when the bucket holds no such key.
@@ -910,6 +992,43 @@ pub const MALFORMED_XML_CODE: &str = "MalformedXML";
 /// the three-value `ObjectOwnership` enum, so this ceiling is far above any list that says
 /// something new; a put past it is refused rather than recorded.
 pub const MAX_OWNERSHIP_CONTROLS_RULES: usize = 10;
+
+/// The `SSEAlgorithm` a general purpose bucket's default encryption uses until a
+/// `PutBucketEncryption` names another one.
+///
+/// "By default, all buckets have a default encryption configuration that uses server-side
+/// encryption with Amazon S3 managed keys (SSE-S3)" (`GetBucketEncryption`'s own
+/// documentation); SSE-S3 is the `ServerSideEncryption` value `AES256`
+/// (`smithy_query(query="shape",shape="ServerSideEncryption")`).
+pub const DEFAULT_SSE_ALGORITHM: &str = "AES256";
+
+/// Whether a bucket's default encryption uses an S3 Bucket Key until a configuration
+/// enables one: "General purpose buckets - By default, S3 Bucket Key is not enabled"
+/// (`ServerSideEncryptionRule$BucketKeyEnabled`).
+pub const DEFAULT_BUCKET_KEY_ENABLED: bool = false;
+
+/// The `ServerSideEncryption` values a `KMSMasterKeyID` may accompany in a default
+/// encryption rule.
+///
+/// `ApplyServerSideEncryptionByDefault$KMSMasterKeyID`'s own documentation: "General
+/// purpose buckets - This parameter is allowed if and only if `SSEAlgorithm` is set to
+/// `aws:kms` or `aws:kms:dsse`." Both are values of the `ServerSideEncryption` enum, so a
+/// rule naming a key beside any other algorithm is one S3 refuses rather than records.
+pub const KMS_SSE_ALGORITHMS: [&str; 2] = ["aws:kms", "aws:kms:dsse"];
+
+/// The code S3 answers a request whose value is not valid for the parameter carrying it:
+/// "InvalidArgument - Invalid Argument", HTTP 400 (Amazon S3 "Error responses", list of
+/// error codes).
+pub const INVALID_ARGUMENT_CODE: &str = "InvalidArgument";
+
+/// How many default-encryption rules this emulator records for one bucket.
+///
+/// NOT a fidelity claim, for the same reason as [`MAX_OWNERSHIP_CONTROLS_RULES`]:
+/// `ServerSideEncryptionRules` carries no `@length` in the model
+/// (`smithy_query(query="shape",shape="ServerSideEncryptionRules")`), so nothing bounds
+/// the list a request may send, and a bucket's rules live in this process's memory. A put
+/// past this ceiling is refused rather than recorded.
+pub const MAX_SERVER_SIDE_ENCRYPTION_RULES: usize = 10;
 
 /// "The bucket policy does not exist."
 pub const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";

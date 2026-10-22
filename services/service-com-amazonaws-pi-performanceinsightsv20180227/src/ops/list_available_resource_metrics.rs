@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAvailableResourceMetrics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAvailableResourceMetrics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers the CATALOG of metrics of the requested types that a data
+//! source of the requested service can be queried for. Availability is a published
+//! property of the service and the engine family, not a measurement, so this read
+//! computes its answer from that catalog plus the request's own members and
+//! persists nothing — repeating it answers identically.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAvailableResourceMetrics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What it does NOT do is invent telemetry or a catalog it cannot know. The
+//! per-SQL metric types (`db.sql.stats`, `db.sql_tokenized.stats`) name counters
+//! whose set differs per DB engine, and this emulator monitors no running engine,
+//! so it cannot know which engine's per-SQL catalog a data source would publish:
+//! those types are answered with the scaffold's 501 rather than with another
+//! engine's names. A metric type the service does not publish at all, and one the
+//! requested `ServiceType` does not publish, are refused with the modelled
+//! `InvalidArgumentException`.
+//!
+//! A request that addresses no data source this account may see is refused with
+//! the modelled `NotAuthorizedException`, the uniform answer the real service
+//! gives for an absent, another account's or a wrong-`ServiceType` data source
+//! (see [`crate::state::is_data_source_identifier`]).
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +172,429 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAvailableResourceMetrics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAvailableResourceMetricsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAvailableResourceMetrics"))
+        let _ = (ctx, &self.engine);
+
+        // `MetricTypes` is a list of `SanitizedString`, so the model cannot hold a
+        // caller to the four types its own documentation publishes ("os", "db",
+        // "db.sql.stats", "db.sql_tokenized.stats", each scoped to the engines
+        // that publish it). This loop is what does: a type the service publishes
+        // for no engine, and one the requested `ServiceType` does not publish, are
+        // both argument errors, answered BEFORE the authorization gate so a
+        // request whose own members do not hold together is still answered as the
+        // argument error it is.
+        let mut requested: Vec<&MetricTypeCatalog> = Vec::new();
+        for name in &input.metric_types {
+            let Some(catalog) = PUBLISHED_METRIC_TYPES
+                .iter()
+                .find(|candidate| candidate.name == name)
+            else {
+                return Err(invalid_argument(format!(
+                    "MetricTypes must name only metric types Performance Insights \
+                     publishes ({}); got {name:?}.",
+                    published_type_names()
+                )));
+            };
+            if !catalog.published_for(&input.service_type) {
+                return Err(invalid_argument(format!(
+                    "The metric type {:?} is not published for a {} data source; the \
+                     metric types published for it are {}.",
+                    catalog.name,
+                    input.service_type,
+                    published_type_names_for(&input.service_type)
+                )));
+            }
+            // One entry per type however often the caller named it: a metric is
+            // listed once, so a repeated type cannot duplicate its catalog.
+            if !requested
+                .iter()
+                .any(|already| already.name == catalog.name)
+            {
+                requested.push(catalog);
+            }
+        }
+
+        // Nothing about the data source is answered until the request is
+        // authorized for it: a caller listing the metrics of a data source this
+        // account does not monitor gets the modelled refusal, not an
+        // authoritative-looking catalog.
+        if !crate::state::is_data_source_identifier(&input.identifier) {
+            return Err(not_authorized());
+        }
+
+        // The metrics of the requested types, in the order the caller named the
+        // types and in catalog order within each one.
+        let mut available: Vec<&CatalogMetric> = Vec::new();
+        for catalog in &requested {
+            match catalog.metrics {
+                Some(metrics) => available.extend(metrics),
+                // A per-SQL catalog is the engine's, and this emulator monitors
+                // none. Answer that honestly rather than publishing one engine's
+                // per-SQL counter names for every data source.
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                        "ListAvailableResourceMetrics for the metric type {}",
+                        catalog.name
+                    )))
+                }
+            }
+        }
+
+        // `MaxResults` pages the catalog. A page size of zero could never advance
+        // a cursor, so 0 — which the modelled `range` 0..25 admits — reads as "no
+        // caller-imposed page size".
+        let page_size = match input.max_results {
+            Some(max) if max > 0 => max as usize,
+            _ => available.len(),
+        };
+        let scope = page_scope(&input.service_type, &input.identifier, &requested);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(token, &scope) {
+                Some(offset) => offset,
+                None => {
+                    return Err(invalid_argument(
+                        "The NextToken was not issued for this request's service type, \
+                         resource and metric types.",
+                    ))
+                }
+            },
+        };
+
+        let metrics: Vec<ResponseResourceMetric> = available
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|metric| ResponseResourceMetric {
+                metric: Some(metric.metric.to_string()),
+                description: Some(metric.description.to_string()),
+                unit: Some(metric.unit.to_string()),
+            })
+            .collect();
+
+        let resumed_at = offset.saturating_add(metrics.len());
+        let next_token = (resumed_at < available.len())
+            .then(|| crate::state::encode_page_token(&scope, resumed_at));
+
+        Ok(ListAvailableResourceMetricsOutput {
+            metrics: Some(metrics),
+            next_token,
+        })
     }
+}
+
+/// One entry of the published catalog: a metric that can be queried for a data
+/// source, with the description and unit `ResponseResourceMetric` reports.
+struct CatalogMetric {
+    /// The metric's full name, WITHOUT an aggregate function: `GetResourceMetrics`
+    /// documents that the caller appends one ("to find the average for the metric
+    /// db.load you must use db.load.avg"), and
+    /// `ListAvailableResourceDimensions`'s `Metrics` member names the metric
+    /// itself ("Valid values include db.load").
+    metric: &'static str,
+    /// What the metric measures.
+    description: &'static str,
+    /// The unit the metric is reported in.
+    unit: &'static str,
+}
+
+/// One metric type `MetricTypes` publishes, with the engines it is published for
+/// and the catalog it covers.
+struct MetricTypeCatalog {
+    /// The value a caller names in `MetricTypes`.
+    name: &'static str,
+    /// Whether an Amazon DocumentDB data source publishes this type. The
+    /// `MetricTypes` documentation scopes each type: "os (OS counter metrics) -
+    /// All engines", and the three `db` types "All engines except for Amazon
+    /// DocumentDB".
+    docdb: bool,
+    /// The metrics of this type, or `None` when their set is the DB engine's own
+    /// and this emulator — which monitors no running engine — cannot know which
+    /// engine's applies.
+    metrics: Option<&'static [CatalogMetric]>,
+}
+
+impl MetricTypeCatalog {
+    /// Whether this type is published for `service_type`, a value of the modelled
+    /// `ServiceType` enum (`RDS` | `DOCDB`).
+    fn published_for(&self, service_type: &str) -> bool {
+        self.docdb || service_type != DOCDB_SERVICE_TYPE
+    }
+}
+
+/// The `ServiceType` enum value naming an Amazon DocumentDB data source — the
+/// one the `db` metric types are documented NOT to be published for.
+const DOCDB_SERVICE_TYPE: &str = "DOCDB";
+
+/// The DB load metrics, the catalog of the `db` ("DB load metrics") type.
+///
+/// SOURCE: this model's own documentation of a Performance Insights metric, on
+/// `MetricQuery$Metric` and `DescribeDimensionKeysRequest$Metric` — "db.load.avg
+/// - A scaled representation of the number of active sessions for the database
+/// engine" and "db.sampledload.avg - The raw number of active sessions for the
+/// database engine" — with the aggregate function the caller appends dropped from
+/// the name, exactly as `ListAvailableResourceDimensions`' `Metrics` member names
+/// the same metric `db.load`.
+const DB_LOAD_METRICS: &[CatalogMetric] = &[
+    CatalogMetric {
+        metric: "db.load",
+        description: "A scaled representation of the number of active sessions for the \
+                      database engine.",
+        unit: "Active sessions",
+    },
+    CatalogMetric {
+        metric: "db.sampledload",
+        description: "The raw number of active sessions for the database engine.",
+        unit: "Active sessions",
+    },
+];
+
+/// The OS counter metrics, the catalog of the `os` ("OS counter metrics") type,
+/// published for all engines.
+///
+/// SOURCE: the "Performance Insights operating system counters" catalog this
+/// model's `MetricQuery$Metric` documentation links to in the Amazon RDS and
+/// Amazon Aurora user guides, which is what makes these names queryable for any
+/// engine. The families below are the host-level ones that catalog lists for
+/// every engine (CPU utilization, load average, memory, swap, network, tasks and
+/// the vCPU count); the device- and filesystem-scoped families it lists per
+/// instance class and storage layout (`os.diskIO.*`, `os.fileSys.*`) are left out
+/// because their entries name a device this emulator does not have.
+const OS_COUNTER_METRICS: &[CatalogMetric] = &[
+    CatalogMetric {
+        metric: "os.cpuUtilization.guest",
+        description: "The percentage of CPU in use by guest programs.",
+        unit: "Percent",
+    },
+    CatalogMetric {
+        metric: "os.cpuUtilization.idle",
+        description: "The percentage of CPU that is idle.",
+        unit: "Percent",
+    },
+    CatalogMetric {
+        metric: "os.cpuUtilization.irq",
+        description: "The percentage of CPU in use by software interrupts.",
+        unit: "Percent",
+    },
+    CatalogMetric {
+        metric: "os.cpuUtilization.nice",
+        description: "The percentage of CPU in use by programs running at the lowest priority.",
+        unit: "Percent",
+    },
+    CatalogMetric {
+        metric: "os.cpuUtilization.steal",
+        description: "The percentage of CPU in use by other virtual machines.",
+        unit: "Percent",
+    },
+    CatalogMetric {
+        metric: "os.cpuUtilization.system",
+        description: "The percentage of CPU in use by the kernel.",
+        unit: "Percent",
+    },
+    CatalogMetric {
+        metric: "os.cpuUtilization.total",
+        description: "The total percentage of the CPU in use.",
+        unit: "Percent",
+    },
+    CatalogMetric {
+        metric: "os.cpuUtilization.user",
+        description: "The percentage of CPU in use by user programs.",
+        unit: "Percent",
+    },
+    CatalogMetric {
+        metric: "os.cpuUtilization.wait",
+        description: "The percentage of CPU unused while waiting for I/O access.",
+        unit: "Percent",
+    },
+    CatalogMetric {
+        metric: "os.general.numVCPUs",
+        description: "The number of virtual CPUs the data source is provisioned with.",
+        unit: "Count",
+    },
+    CatalogMetric {
+        metric: "os.loadAverageMinute.one",
+        description: "The number of processes requesting CPU time over the last minute.",
+        unit: "Count",
+    },
+    CatalogMetric {
+        metric: "os.loadAverageMinute.five",
+        description: "The number of processes requesting CPU time over the last five minutes.",
+        unit: "Count",
+    },
+    CatalogMetric {
+        metric: "os.loadAverageMinute.fifteen",
+        description: "The number of processes requesting CPU time over the last fifteen minutes.",
+        unit: "Count",
+    },
+    CatalogMetric {
+        metric: "os.memory.active",
+        description: "The amount of assigned memory.",
+        unit: "Kilobytes",
+    },
+    CatalogMetric {
+        metric: "os.memory.buffers",
+        description: "The amount of memory used for buffering I/O requests before writing to \
+                      the storage device.",
+        unit: "Kilobytes",
+    },
+    CatalogMetric {
+        metric: "os.memory.cached",
+        description: "The amount of memory used for caching file system based I/O.",
+        unit: "Kilobytes",
+    },
+    CatalogMetric {
+        metric: "os.memory.free",
+        description: "The amount of unassigned memory.",
+        unit: "Kilobytes",
+    },
+    CatalogMetric {
+        metric: "os.memory.inactive",
+        description: "The amount of least-frequently used memory pages.",
+        unit: "Kilobytes",
+    },
+    CatalogMetric {
+        metric: "os.memory.total",
+        description: "The total amount of memory.",
+        unit: "Kilobytes",
+    },
+    CatalogMetric {
+        metric: "os.network.rx",
+        description: "The number of bytes received per second.",
+        unit: "Bytes/Second",
+    },
+    CatalogMetric {
+        metric: "os.network.tx",
+        description: "The number of bytes uploaded per second.",
+        unit: "Bytes/Second",
+    },
+    CatalogMetric {
+        metric: "os.swap.cached",
+        description: "The amount of swap memory used as cache memory.",
+        unit: "Kilobytes",
+    },
+    CatalogMetric {
+        metric: "os.swap.free",
+        description: "The amount of swap memory free.",
+        unit: "Kilobytes",
+    },
+    CatalogMetric {
+        metric: "os.swap.total",
+        description: "The total amount of swap memory available.",
+        unit: "Kilobytes",
+    },
+    CatalogMetric {
+        metric: "os.tasks.blocked",
+        description: "The number of tasks that are blocked.",
+        unit: "Count",
+    },
+    CatalogMetric {
+        metric: "os.tasks.running",
+        description: "The number of tasks that are running.",
+        unit: "Count",
+    },
+    CatalogMetric {
+        metric: "os.tasks.sleeping",
+        description: "The number of tasks that are sleeping.",
+        unit: "Count",
+    },
+    CatalogMetric {
+        metric: "os.tasks.stopped",
+        description: "The number of tasks that are stopped.",
+        unit: "Count",
+    },
+    CatalogMetric {
+        metric: "os.tasks.total",
+        description: "The total number of tasks.",
+        unit: "Count",
+    },
+    CatalogMetric {
+        metric: "os.tasks.zombie",
+        description: "The number of child tasks that are inactive with an active parent task.",
+        unit: "Count",
+    },
+];
+
+/// Every metric type `MetricTypes` publishes, in the order that member's own
+/// documentation lists them: "os (OS counter metrics) - All engines", "db (DB load
+/// metrics) - All engines except for Amazon DocumentDB", "db.sql.stats (per-SQL
+/// metrics) - All engines except for Amazon DocumentDB", "db.sql_tokenized.stats
+/// (per-SQL digest metrics) - All engines except for Amazon DocumentDB".
+const PUBLISHED_METRIC_TYPES: &[MetricTypeCatalog] = &[
+    MetricTypeCatalog {
+        name: "os",
+        docdb: true,
+        metrics: Some(OS_COUNTER_METRICS),
+    },
+    MetricTypeCatalog {
+        name: "db",
+        docdb: false,
+        metrics: Some(DB_LOAD_METRICS),
+    },
+    MetricTypeCatalog {
+        name: "db.sql.stats",
+        docdb: false,
+        metrics: None,
+    },
+    MetricTypeCatalog {
+        name: "db.sql_tokenized.stats",
+        docdb: false,
+        metrics: None,
+    },
+];
+
+/// The published metric types, for the refusal that names them.
+fn published_type_names() -> String {
+    PUBLISHED_METRIC_TYPES
+        .iter()
+        .map(|catalog| catalog.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The metric types published for one `ServiceType`, for the refusal that names
+/// them.
+fn published_type_names_for(service_type: &str) -> String {
+    PUBLISHED_METRIC_TYPES
+        .iter()
+        .filter(|catalog| catalog.published_for(service_type))
+        .map(|catalog| catalog.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `InvalidArgumentException` (HTTP 400), this operation's modelled refusal for a
+/// request whose values do not hold together.
+fn invalid_argument(message: impl Into<String>) -> ListAvailableResourceMetricsError {
+    ListAvailableResourceMetricsErrorModeled::InvalidArgumentException(InvalidArgumentException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal for a request that
+/// addresses a data source this account may not read.
+fn not_authorized() -> ListAvailableResourceMetricsError {
+    ListAvailableResourceMetricsErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The result set a `NextToken` was handed out for, as a digest: the service
+/// type, the data source and the requested metric types — the members that fix
+/// which metrics are listed and in which order. Hashed so the token stays far
+/// inside the modelled `NextToken` length bound however many types were asked
+/// for.
+fn page_scope(service_type: &str, identifier: &str, requested: &[&MetricTypeCatalog]) -> String {
+    use sha2::Digest as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(service_type.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(identifier.as_bytes());
+    hasher.update([0u8]);
+    for catalog in requested {
+        hasher.update(catalog.name.as_bytes());
+        hasher.update([0u8]);
+    }
+    hex::encode(hasher.finalize())
 }
