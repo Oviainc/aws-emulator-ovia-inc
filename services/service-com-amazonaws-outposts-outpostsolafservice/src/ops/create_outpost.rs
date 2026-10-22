@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOutpost
-//! IMPLEMENTED: resolves the `SiteId` the caller named against this service's store,
+//! IMPLEMENTED: validates the Availability Zone the caller named against the region
+//! the request is addressed to, resolves the `SiteId` against this service's store,
 //! mints an `OutpostId` / `OutpostArn`, persists the Outpost against that site and
 //! answers the stored record. `GetOutpost`, `ListOutposts` and `DeleteOutpost` read
 //! that same store, and `DeleteSite` refuses a site this still references.
@@ -160,6 +161,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let region = crate::state::request_region(ctx.parts());
+
+        // An Availability Zone belongs to exactly one region, so a request
+        // addressed to this region cannot place an Outpost in another region's
+        // zone. Checked BEFORE anything the request references is looked up:
+        // resolving the site first would answer a cross-region zone with the
+        // site's own error and hide the zone entirely. The region is the one the
+        // request's SigV4 credential scope names — `request_region` falls back to
+        // `DEFAULT_REGION` for an unsigned call, exactly as the ARNs this handler
+        // mints do, so an unsigned request is judged against that region.
+        if let Some(message) = crate::state::availability_zone_region_refusal(
+            &region,
+            input.availability_zone.as_deref(),
+            input.availability_zone_id.as_deref(),
+        ) {
+            return Err(CreateOutpostErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
 
         // `SiteId` accepts the bare id or the full site ARN; both name the same
         // stored site.

@@ -211,6 +211,121 @@ pub fn resolve_outpost_id(identifier: &str) -> Option<String> {
     resolve_id(identifier, "op")
 }
 
+/// The `(resource type, resource id)` an Outposts resource ARN names, e.g.
+/// `("site", "os-…")` for `arn:aws:outposts:<region>:<account>:site/os-…`.
+///
+/// Every `Arn` member in this API is modelled
+/// `^(arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:([a-z\d-]+)/)[a-z]{2,8}-[a-f0-9]{17}$`,
+/// so the resource field is always `<type>/<id>` and the service field is always
+/// this service's own ARN namespace. `None` means the value is not an ARN of this
+/// service at all.
+pub fn resource_arn_parts(arn: &str) -> Option<(String, String)> {
+    let mut fields = arn.strip_prefix("arn:")?.splitn(5, ':');
+    let _partition = fields.next()?;
+    let service = fields.next()?;
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let (resource_type, resource_id) = fields.next()?.split_once('/')?;
+    (service == ARN_NAMESPACE).then(|| (resource_type.to_string(), resource_id.to_string()))
+}
+
+/// Which Availability Zone identifiers a request addressed to a region may name.
+///
+/// AWS names an Availability Zone in two ways, and both pin it to ONE region: the
+/// zone NAME is the region code plus a zone suffix (`us-east-1a`), while the zone
+/// ID is the region's abbreviation plus `-az<n>` (`us-east-1` -> `use1-az1`), which
+/// [`region_abbreviation`] derives from the region code itself. So a request
+/// addressed to one region cannot name a zone of another.
+///
+/// Whether `zone` is an Availability Zone NAME of `region`: the region code plus a
+/// suffix that is not itself more digits of a longer region code (so `us-east-1`
+/// does not claim `us-east-12a`).
+pub fn zone_name_in_region(zone: &str, region: &str) -> bool {
+    zone.to_ascii_lowercase()
+        .strip_prefix(region)
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && !suffix.starts_with(|character: char| character.is_ascii_digit())
+        })
+}
+
+/// Whether `zone_id` is an Availability Zone ID of `region`: the region's
+/// abbreviation followed by the zone's own part. A region
+/// [`region_abbreviation`] cannot abbreviate is a region no zone id can be judged
+/// against, so every id passes rather than being refused on a guess.
+pub fn zone_id_in_region(zone_id: &str, region: &str) -> bool {
+    match region_abbreviation(region) {
+        Some(abbreviation) => zone_id
+            .to_ascii_lowercase()
+            .strip_prefix(&abbreviation)
+            .is_some_and(|rest| rest.starts_with('-')),
+        None => true,
+    }
+}
+
+/// Why the Availability Zone identifiers a request named are not usable in
+/// `region`, or `None` when every one of them belongs to it.
+///
+/// An Availability Zone belongs to exactly one region (see
+/// [`zone_name_in_region`]), so a request addressed to one region naming another
+/// region's zone describes a resource that cannot exist — a bad parameter, which
+/// this API answers as its `ValidationException` (400). AWS states that as
+/// `<the value as supplied> does not match your region.`
+///
+/// A value that names THIS region and no zone within it is refused too, but it is
+/// not a cross-region mismatch, so it is not worded as one.
+///
+/// The zone ID is reported first: it is the region-stable identifier of a zone (a
+/// zone NAME is per-account), so when a request names both and neither belongs to
+/// the region, the ID is the identifier the refusal names.
+pub fn availability_zone_region_refusal(
+    region: &str,
+    zone: Option<&str>,
+    zone_id: Option<&str>,
+) -> Option<String> {
+    zone_id
+        .and_then(|zone_id| zone_id_refusal(zone_id, region))
+        .or_else(|| zone.and_then(|zone| zone_name_refusal(zone, region)))
+}
+
+/// Why `zone` is not an Availability Zone name `region` can place a resource in,
+/// or `None` when it is one of its zones.
+fn zone_name_refusal(zone: &str, region: &str) -> Option<String> {
+    if zone_name_in_region(zone, region) {
+        return None;
+    }
+    Some(match zone.eq_ignore_ascii_case(region) {
+        true => names_no_zone(zone, region),
+        false => wrong_region(zone),
+    })
+}
+
+/// Why `zone_id` is not an Availability Zone ID `region` can place a resource in,
+/// or `None` when it is one of its zones.
+fn zone_id_refusal(zone_id: &str, region: &str) -> Option<String> {
+    if zone_id_in_region(zone_id, region) {
+        return None;
+    }
+    let names_region = region_abbreviation(region)
+        .is_some_and(|abbreviation| zone_id.eq_ignore_ascii_case(&abbreviation));
+    Some(match names_region {
+        true => names_no_zone(zone_id, region),
+        false => wrong_region(zone_id),
+    })
+}
+
+/// How this API words a zone of another region, as the recorded response does:
+/// the value exactly as the request supplied it, and no more.
+fn wrong_region(value: &str) -> String {
+    format!("{value} does not match your region.")
+}
+
+/// How this service words a value that names the request's own region but no zone
+/// within it — refused for the same reason (it is no zone of this region) but
+/// stated separately, because calling it a region mismatch would be wrong.
+fn names_no_zone(value: &str, region: &str) -> String {
+    format!("{value} is not an Availability Zone of {region}.")
+}
+
 /// The `Site` projection of an operating address: the three members `Site`
 /// declares for it, each read off the address the caller supplied.
 pub fn operating_address_projection(

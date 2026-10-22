@@ -260,7 +260,8 @@ async fn an_empty_tag_map_in_a_request_is_refused() {
 /// Rule B, exhaustively over the whole domain the rule has: every region in
 /// [`REGIONS`] crossed with every zone index the modelled one-digit
 /// `AvailabilityZoneId` can name, named BOTH ways round — so no generator is needed
-/// to cover it.
+/// to cover it. Each create is ADDRESSED to the region whose zone it names, because a
+/// zone is only usable in its own region.
 #[tokio::test]
 async fn an_outpost_reports_both_availability_zone_identities() {
     let outposts = Outposts::new();
@@ -286,7 +287,7 @@ async fn an_outpost_reports_both_availability_zone_identities() {
                 ),
             ];
             for (case, request) in named_by {
-                let outpost = outposts.create_outpost(&request).await;
+                let outpost = outposts.create_outpost_in(region, &request).await;
                 let outpost_id = text(&outpost, "OutpostId");
                 assert!(
                     is_zone_id(&text(&outpost, "AvailabilityZoneId")),
@@ -328,9 +329,13 @@ async fn an_outpost_reports_both_availability_zone_identities() {
 }
 
 /// Rule B's other side: a zone value no second identity can be resolved from leaves
-/// the other member ABSENT rather than carrying an invented value — a region code
-/// with no zone letter, a letter past the highest index the modelled id can name,
-/// and an id whose abbreviation names no region.
+/// the other member ABSENT rather than carrying an invented value — a zone letter past
+/// the highest index the modelled id can name, and a zone index no letter names.
+///
+/// Both rows name a zone of the region the request is addressed to: a zone of ANOTHER
+/// region is refused outright (`CreateOutpost`'s region check, covered in
+/// [`crate::error_classification`]), so it never reaches the resolution this rule is
+/// about.
 #[tokio::test]
 async fn an_unresolvable_zone_leaves_the_other_identity_absent() {
     let outposts = Outposts::new();
@@ -338,22 +343,19 @@ async fn an_unresolvable_zone_leaves_the_other_identity_absent() {
         .create_site(&json!({ "Name": "unresolvable zone site" }))
         .await;
     let site_id = text(&site, "SiteId");
+    // The region every row below is addressed to, and whose zones they name.
+    let region = "us-west-2";
 
     let cases: Vec<(&str, &str, &str)> = vec![
-        (
-            "a region code with no zone letter",
-            "AvailabilityZone",
-            "us-west-2",
-        ),
         (
             "a zone letter one past the highest index the id can name",
             "AvailabilityZone",
             "us-west-2j",
         ),
         (
-            "a zone id whose abbreviation names no region",
+            "a zone index below the first letter the name can carry",
             "AvailabilityZoneId",
-            "zzz9-az1",
+            "usw2-az0",
         ),
     ];
     for (case, member, value) in &cases {
@@ -363,7 +365,7 @@ async fn an_unresolvable_zone_leaves_the_other_identity_absent() {
         };
         let mut request = json!({ "Name": format!("outpost {case}"), "SiteId": site_id });
         request[*member] = json!(value);
-        let outpost = outposts.create_outpost(&request).await;
+        let outpost = outposts.create_outpost_in(region, &request).await;
         assert_eq!(
             outpost.get(*member).and_then(Value::as_str),
             Some(*value),
@@ -409,7 +411,7 @@ async fn a_created_outpost_provisions_then_settles_on_the_clock() {
                 "Name": "tagged",
                 "SiteId": site_id,
                 "Tags": { "Env": "dev" },
-                "AvailabilityZone": "eu-west-1b",
+                "AvailabilityZone": "us-east-1b",
             }),
         ),
         (
@@ -417,7 +419,7 @@ async fn a_created_outpost_provisions_then_settles_on_the_clock() {
             json!({
                 "Name": "server form factor",
                 "SiteId": site_id,
-                "AvailabilityZoneId": "apse2-az3",
+                "AvailabilityZoneId": "use1-az3",
                 "SupportedHardwareType": "SERVER",
             }),
         ),

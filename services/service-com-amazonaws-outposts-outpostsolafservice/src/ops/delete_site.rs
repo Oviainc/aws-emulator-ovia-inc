@@ -2,7 +2,8 @@
 
 //! @op DeleteSite
 //! IMPLEMENTED: removes the stored site the `SiteId` names, so every later call observes
-//! it gone. A site an Outpost still references is refused with `ConflictException` (409);
+//! it gone. A site an Outpost still references is refused with `ValidationException`
+//! (400) — the dependents make the request itself wrong, not the site's state;
 //! an absent id is `NotFoundException` (404).
 //!
 //! ## Shape of an operation
@@ -163,21 +164,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // An Outpost names the site it lives at, so removing a site that still has
-        // one would leave that Outpost pointing at nothing: the service refuses with
-        // the conflict error it models, naming the Outpost that causes it.
-        if let Some(blocking) = store
+        // one would leave that Outpost pointing at nothing: the service refuses the
+        // request. The refusal is about what the request asked for, not about the
+        // site being in some transient state, so it is the modelled
+        // `ValidationException` (400) — `ConflictException` (409) would tell an SDK
+        // retry policy and a client's conflict branch that waiting might help.
+        if store
             .outposts
             .values()
-            .find(|record| record.outpost.site_id.as_deref() == Some(site_id.as_str()))
+            .any(|record| record.outpost.site_id.as_deref() == Some(site_id.as_str()))
         {
-            let outpost_id = blocking.outpost.outpost_id.clone().unwrap_or_default();
-            return Err(DeleteSiteErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "the site {site_id} cannot be deleted while Outpost {outpost_id} is at it"
-                )),
-                resource_id: Some(outpost_id),
-                resource_type: Some("OUTPOST".to_string()),
-            })
+            return Err(DeleteSiteErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Site {site_id} cannot be deleted because it has one or more outposts."
+                    )),
+                },
+            )
             .into());
         }
         store.sites.remove(&site_id);

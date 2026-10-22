@@ -18,7 +18,8 @@
 //!    stable order, cut into pages of at most `MaxResults` with a `NextToken` that
 //!    resumes exactly where the previous page stopped — for any page size.
 //! 4. A delete makes the resource observably gone to every later call, and is
-//!    refused while another resource still references it.
+//!    refused as a bad request (400 `ValidationException`) while another resource
+//!    still references it.
 //! 5. An identifier that names nothing is 404 `NotFoundException`; one that is not an
 //!    identifier at all is 400 `ValidationException`.
 //!
@@ -34,12 +35,22 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_outposts_outpostsolafservice::EmulatedService;
 
-/// A SigV4 `Authorization` header is how a request names the service and the region
-/// it is addressed to, so every call carries one. The signature itself is never
-/// checked here: request authentication is off unless a router turns it on.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDTESTOUTPOSTS/20260101/us-east-1/outposts/aws4_request, \
-     SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000";
+/// The region every call that does not name its own is addressed to, and the region
+/// the ARN prefixes below are written in.
+pub(crate) const HOME_REGION: &str = "us-east-1";
+
+/// A SigV4 `Authorization` header addressed to `region`: how a request names the
+/// service and the region it is for. The signature itself is never checked here —
+/// request authentication is off unless a router turns it on — but the credential
+/// scope's region is what the service reads, and an Availability Zone is only usable
+/// in its own region, so a case that names a zone has to name its region too.
+pub(crate) fn authorization(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDTESTOUTPOSTS/20260101/{region}/outposts/aws4_request, \
+         SignedHeaders=host;x-amz-date, \
+         Signature=0000000000000000000000000000000000000000000000000000000000000000"
+    )
+}
 
 /// The ARN prefix every site this emulator mints must carry, from the modelled
 /// `SiteArn` pattern `^arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:site/(os-[a-f0-9]{17})$`
@@ -62,11 +73,13 @@ pub(crate) struct Outposts {
     router: MultiServiceRouter,
 }
 
-/// One answer from the emulator: the status, the wire error code (the restJson1
-/// `__type` discriminator) and the parsed body.
+/// One answer from the emulator: the status, the wire error code as BOTH restJson1
+/// carries it (the body's `__type` discriminator and the `x-amzn-errortype` header,
+/// which is how restJson1 resolves an error shape), and the parsed body.
 pub(crate) struct Reply {
     pub(crate) status: u16,
     pub(crate) error_code: String,
+    pub(crate) errortype_header: String,
     pub(crate) body: Value,
 }
 
@@ -93,20 +106,32 @@ impl Outposts {
         Self { router }
     }
 
-    /// Dispatch one restJson1 request at `method path`, with `body` as the JSON
-    /// payload (absent for the GET and DELETE routes, which bind every member to
-    /// the URI).
-    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+    /// Dispatch one restJson1 request at `method path`, addressed to `region`, with
+    /// `body` as the JSON payload (absent for the GET and DELETE routes, which bind
+    /// every member to the URI).
+    pub(crate) async fn call_in(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Reply {
         let payload = body.map(Value::to_string).unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
-            .uri(format!("https://outposts.us-east-1.amazonaws.com{path}"))
+            .uri(format!("https://outposts.{region}.amazonaws.com{path}"))
             .header("content-type", "application/json")
-            .header("authorization", AUTHORIZATION)
+            .header("authorization", authorization(region))
             .body(bytes::Bytes::from(payload))
             .expect("the test request is well formed");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let errortype_header = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let parsed: Value = if response.body().is_empty() {
             Value::Null
         } else {
@@ -120,19 +145,37 @@ impl Outposts {
         Reply {
             status,
             error_code,
+            errortype_header,
             body: parsed,
         }
     }
 
-    /// Dispatch `method path` and require HTTP 200, returning the body.
-    pub(crate) async fn ok(&self, method: &str, path: &str, body: Option<&Value>) -> Value {
-        let reply = self.call(method, path, body).await;
+    /// Dispatch in [`HOME_REGION`], which every resource a case does not place
+    /// itself is created in.
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+        self.call_in(HOME_REGION, method, path, body).await
+    }
+
+    /// Dispatch `method path` in `region` and require HTTP 200, returning the body.
+    pub(crate) async fn ok_in(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Value {
+        let reply = self.call_in(region, method, path, body).await;
         assert_eq!(
             reply.status, 200,
-            "case {method} {path}: expected HTTP 200, got {} {}",
+            "case {method} {path} in {region}: expected HTTP 200, got {} {}",
             reply.status, reply.body
         );
         reply.body
+    }
+
+    /// Dispatch `method path` and require HTTP 200, returning the body.
+    pub(crate) async fn ok(&self, method: &str, path: &str, body: Option<&Value>) -> Value {
+        self.ok_in(HOME_REGION, method, path, body).await
     }
 
     /// `CreateSite`, returning the `Site` it answered with.
@@ -142,7 +185,14 @@ impl Outposts {
 
     /// `CreateOutpost`, returning the `Outpost` it answered with.
     pub(crate) async fn create_outpost(&self, request: &Value) -> Value {
-        self.ok("POST", "/outposts", Some(request)).await["Outpost"].clone()
+        self.create_outpost_in(HOME_REGION, request).await
+    }
+
+    /// `CreateOutpost` addressed to `region`, returning the `Outpost` it answered
+    /// with. An Outpost's Availability Zone has to be one of its own region's, so a
+    /// case naming a zone names the region that zone is in.
+    pub(crate) async fn create_outpost_in(&self, region: &str, request: &Value) -> Value {
+        self.ok_in(region, "POST", "/outposts", Some(request)).await["Outpost"].clone()
     }
 
     /// `GetSite`, returning the `Site` it answered with.
@@ -432,13 +482,13 @@ async fn create_outpost_persists_against_its_site_and_reads_back() {
         }),
     ));
     cases.push((
-        "empty description, zone in another region".to_string(),
+        "empty description, another zone of the request's region".to_string(),
         json!({
-            "Name": "eu outpost",
+            "Name": "second zone outpost",
             "SiteId": site_id,
             "Description": "",
-            "AvailabilityZone": "eu-west-1b",
-            "AvailabilityZoneId": "euw1-az2",
+            "AvailabilityZone": "us-east-1b",
+            "AvailabilityZoneId": "use1-az2",
         }),
     ));
 
@@ -638,10 +688,12 @@ async fn listing_filters_select_only_matching_stored_records() {
         }))
         .await;
 
+    // Three zones of the region these requests are addressed to (us-east-1), since
+    // an Outpost can only be placed in a zone of its own region.
     let zones = [
         ("us-east-1a", "use1-az1"),
         ("us-east-1b", "use1-az2"),
-        ("eu-west-1a", "euw1-az1"),
+        ("us-east-1c", "use1-az3"),
     ];
     let mut by_zone: Vec<(String, String, String)> = Vec::new();
     for (zone, zone_id) in zones {
@@ -679,8 +731,8 @@ async fn listing_filters_select_only_matching_stored_records() {
         ),
         (
             "two availability zones",
-            "?AvailabilityZoneFilter=us-east-1a&AvailabilityZoneFilter=eu-west-1a".to_string(),
-            expect(&["us-east-1a", "eu-west-1a"]),
+            "?AvailabilityZoneFilter=us-east-1a&AvailabilityZoneFilter=us-east-1c".to_string(),
+            expect(&["us-east-1a", "us-east-1c"]),
         ),
         (
             "a zone nothing is in",
@@ -695,7 +747,7 @@ async fn listing_filters_select_only_matching_stored_records() {
         (
             "the status every Outpost carries once it has settled",
             "?LifeCycleStatusFilter=ACTIVE".to_string(),
-            expect(&["us-east-1a", "us-east-1b", "eu-west-1a"]),
+            expect(&["us-east-1a", "us-east-1b", "us-east-1c"]),
         ),
         (
             "a status no settled Outpost carries",
@@ -782,20 +834,14 @@ async fn delete_removes_the_record_and_is_refused_while_referenced() {
             .await;
         assert_eq!(
             (refused.status, refused.error_code.as_str()),
-            (409, "ConflictException"),
-            "case {identifier:?}: deleting a referenced site conflicts, got {:?}",
+            (400, "ValidationException"),
+            "case {identifier:?}: deleting a referenced site is refused as a bad \
+             request, got {:?}",
             refused.body
         );
-        assert_eq!(
-            refused.body.get("ResourceId").and_then(Value::as_str),
-            Some(outpost_id.as_str()),
-            "case {identifier:?}: the conflict must name the Outpost causing it, got {:?}",
-            refused.body
-        );
-        assert_eq!(
-            refused.body.get("ResourceType").and_then(Value::as_str),
-            Some("OUTPOST"),
-            "case {identifier:?}: the conflict's ResourceType must be OUTPOST, got {:?}",
+        assert!(
+            text(&refused.body, "Message").contains(&site_id),
+            "case {identifier:?}: the refusal must name the site it refused, got {:?}",
             refused.body
         );
     }

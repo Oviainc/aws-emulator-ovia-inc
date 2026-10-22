@@ -41,9 +41,44 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The dotted member path every tagging operation's resource ARN is refused
+/// under: `ListTagsForResource`, `TagResource` and `UntagResource` all bind the
+/// modelled `Arn` member `ResourceArn`, and a refusal names it in lowerCamel.
+const RESOURCE_ARN_PATH: &str = "resourceArn";
+
+/// The error code this service names an ARN-syntax refusal with.
+///
+/// A resource ARN that is not an Outposts resource ARN is refused by the tagging
+/// API itself rather than by the generic parameter validator, so it carries this
+/// code and not `ValidationException` — which is what a client branches on.
+const RESOURCE_ARN_SYNTAX_CODE: &str = "BadRequestException";
+
+/// How this service words that refusal: the ARN could not be read, with no echo
+/// of what was sent.
+const RESOURCE_ARN_SYNTAX_MESSAGE: &str = "Invalid input resource arn: bad syntax";
+
+/// Whether `violations` include the tagging API's resource ARN failing to be an
+/// Outposts resource ARN — its modelled `@pattern`, or its modelled maximum length,
+/// which an ARN too long to be one exceeds.
+///
+/// ANY such violation is enough: the tagging operations read that ARN before they
+/// report parameter validation, so an unreadable ARN is what the caller is told
+/// about even when something else in the request is also wrong. Every refusal that
+/// does NOT involve the ARN's syntax (a missing member, a bad tag map, a bound on
+/// another member) keeps the framework's generic wording.
+fn is_resource_arn_syntax(violations: &[Violation]) -> bool {
+    violations.iter().any(|violation| {
+        violation.path == RESOURCE_ARN_PATH
+            && matches!(
+                violation.kind,
+                ViolationKind::Pattern(_) | ViolationKind::MaxLength(_)
+            )
+    })
+}
 
 /// The `com-amazonaws-outposts-outpostsolafservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -100,19 +135,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this
         // service reword it.
         //
-        // This service's rule: a `ValidationException` body is the standard AWS
-        // validation report — the violation count, then one `Value at '<member>'
-        // failed to satisfy constraint: <requirement>` clause per violated
-        // constraint — and it NEVER renders the offending value. The framework's
-        // default interpolates that value, which this API's own recordings
-        // contradict, and which would echo back a member the model marks
-        // `@sensitive` (`CreateQuote$Description`, say).
+        // TWO classes are reworded, the more specific one first, and each replaces
+        // BOTH the code and the message:
         //
-        // The code is replaced alongside the message, with the one the modelled
-        // `ValidationException` (HTTP 400) already carries, so a client's branch
-        // on the code is unaffected. Authentication refusals keep the
-        // framework's wording: they are not a validation report.
+        // 1. A resource ARN that is not an Outposts resource ARN. The tagging
+        //    operations parse that ARN themselves before any parameter validation
+        //    is reported, so they answer an ARN-syntax error rather than a
+        //    validation report — and a client branching on the error code has to
+        //    see the code the service names.
+        // 2. Everything else the boundary validator found: a `ValidationException`
+        //    body is the standard AWS validation report — the violation count,
+        //    then one `Value at '<member>' failed to satisfy constraint:
+        //    <requirement>` clause per violated constraint — and it NEVER renders
+        //    the offending value. The framework's default interpolates that value,
+        //    which this API's own recordings contradict, and which would echo back
+        //    a member the model marks `@sensitive` (`CreateQuote$Description`,
+        //    say). Its code is the one the modelled `ValidationException` (HTTP
+        //    400) already carries, so that rewording never moves a client off the
+        //    code it branches on.
+        //
+        // Authentication refusals keep the framework's wording: they are neither.
         match refusal {
+            Refusal::Invalid(violations) if is_resource_arn_syntax(violations) => Some(Refused {
+                code: RESOURCE_ARN_SYNTAX_CODE.to_string(),
+                message: RESOURCE_ARN_SYNTAX_MESSAGE.to_string(),
+            }),
             Refusal::Invalid(violations) if !violations.is_empty() => Some(Refused {
                 code: crate::state::VALIDATION_EXCEPTION.to_string(),
                 message: crate::state::refusal_report(violations),
