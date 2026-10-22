@@ -17,6 +17,10 @@
 //! Classic ByteMatchSet records", so this one store carries them beside every other
 //! resource kind.
 
+//! `GeoMatchSet` records live in the same store, under [`GeoMatchSetEntry`] at the end
+//! of this file: `CreateGeoMatchSet` stores one and `GetGeoMatchSet` projects it,
+//! through that same id minting and change-token protocol.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -24,13 +28,16 @@ use std::time::{Duration, Instant};
 use crate::ops::types::{
     ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, RateBasedRule, Rule, RuleGroup,
     RuleSummary, SizeConstraint, SizeConstraintSet, SqlInjectionMatchSet, SqlInjectionMatchTuple,
-    WafAction, WebACL, XssMatchSet,
-    XssMatchSetSummary, XssMatchTuple,
+    WafAction, WebACL, XssMatchSet, XssMatchSetSummary, XssMatchTuple,
 };
 
 // The shapes the ByteMatchSet records at the end of this file project onto. A `use` of
 // their own, so the shared list above stays exactly as the other resource kinds leave it.
 use crate::ops::types::{ByteMatchSet, ByteMatchTuple, FieldToMatch};
+
+// The GeoMatchSet shapes, kept in their own `use` for the same reason: this list stays
+// beside the record that projects them.
+use crate::ops::types::{GeoMatchConstraint, GeoMatchSet};
 
 /// `ChangeTokenStatus` wire values, from the model's `CHANGE_TOKEN_STATUS_VALUES`
 /// (`INSYNC`, `PENDING`, `PROVISIONED`).
@@ -935,6 +942,10 @@ pub struct ComAmazonawsWafregionalAwswafRegional20161128State {
     /// same reason as `ip_sets`: one stable order for `ListByteMatchSets` to walk. The
     /// records themselves are at the end of this file.
     pub byte_match_sets: BTreeMap<String, ByteMatchSetEntry>,
+    /// Every stored `GeoMatchSet`, keyed by its `GeoMatchSetId`. A `BTreeMap` for the
+    /// same reason as [`Self::ip_sets`]: one stable order for `ListGeoMatchSets` to page
+    /// over. The records themselves are at the end of this file.
+    pub geo_match_sets: BTreeMap<String, GeoMatchSetEntry>,
     /// Monotonic counter behind every minted id and change token.
     next_seq: u64,
 }
@@ -1050,6 +1061,73 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsWafregionalAwswafRegional20161128State>)
+}
+
+// ---------------------------------------------------------------------------
+// AWS WAF Classic GeoMatchSet records
+//
+// `CreateGeoMatchSet` and `GetGeoMatchSet` read and write the `geo_match_sets` map of
+// the one state struct above through the record and bound below.
+// ---------------------------------------------------------------------------
+
+/// The most `GeoMatchSet`s this emulator stores for the account before
+/// `CreateGeoMatchSet` answers its modelled `WAFLimitsExceededException`.
+///
+/// The model states no quota, so this bound is the one AWS WAF Classic publishes for
+/// an account (50 GeoMatchSets), the same shape of bound as [`MAX_IP_SETS`].
+pub const MAX_GEO_MATCH_SETS: usize = 50;
+
+/// One stored `GeoMatchConstraint`.
+///
+/// A `GeoMatchSet` created by `CreateGeoMatchSet` holds none of these — countries
+/// arrive through `UpdateGeoMatchSet` — but the record carries the member so every
+/// reader projects the same shape.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GeoMatchConstraintEntry {
+    /// `GeoMatchConstraintType` as it goes on the wire; the model's
+    /// `GEO_MATCH_CONSTRAINT_TYPE_VALUES` declares only `Country`.
+    pub kind: String,
+    /// A `GeoMatchConstraintValue`: the two-letter country code.
+    pub value: String,
+}
+
+/// One stored `GeoMatchSet`.
+#[derive(Debug, Clone)]
+pub struct GeoMatchSetEntry {
+    pub geo_match_set_id: String,
+    pub name: String,
+    /// The constraints in insertion order; a `GeoMatchSet` is a SET of countries, so
+    /// one country appears at most once.
+    pub constraints: Vec<GeoMatchConstraintEntry>,
+}
+
+impl GeoMatchSetEntry {
+    /// A new, empty GeoMatchSet record. `CreateGeoMatchSet` documents the emptiness:
+    /// "The GeoMatchSet contains no GeoMatchConstraints."
+    pub fn new(geo_match_set_id: String, name: String) -> Self {
+        Self {
+            geo_match_set_id,
+            name,
+            constraints: Vec::new(),
+        }
+    }
+
+    /// This record projected onto the modelled `GeoMatchSet` shape the Get and Create
+    /// responses carry: the stored record's own fields, never request input.
+    pub fn to_modelled(&self) -> GeoMatchSet {
+        GeoMatchSet {
+            geo_match_set_id: self.geo_match_set_id.clone(),
+            name: Some(self.name.clone()),
+            geo_match_constraints: self
+                .constraints
+                .iter()
+                .map(|constraint| GeoMatchConstraint {
+                    r#type: constraint.kind.clone(),
+                    value: constraint.value.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

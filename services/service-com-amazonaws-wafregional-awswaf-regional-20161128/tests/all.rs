@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/byte_match_set_lifecycle.rs"]
 mod byte_match_set_lifecycle;
+#[path = "all/geo_match_set_lifecycle.rs"]
+mod geo_match_set_lifecycle;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
 #[path = "all/rate_based_rule_lifecycle.rs"]
