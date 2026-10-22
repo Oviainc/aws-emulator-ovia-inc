@@ -49,3 +49,10 @@ mod update_channel;
 mod update_origin_endpoint;
 #[path = "all/update_roundtrip.rs"]
 mod update_roundtrip;
+
+// Declared last, out of the sorted order above, on purpose: every new suite adds a line
+// to this file, and a line inserted in the middle of the list conflicts with every other
+// suite landing in the same window. Appending keeps this change out of that contended
+// region. The suite itself is an ordinary `tests/all/<name>.rs` file.
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
