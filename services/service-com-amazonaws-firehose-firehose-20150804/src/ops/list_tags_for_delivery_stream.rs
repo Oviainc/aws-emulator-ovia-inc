@@ -169,10 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ListTagsForDeliveryStreamErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Firehose stream {} not found",
-                            input.delivery_stream_name
-                        )),
+                        // Scoped to the account, and NOT to the name that was probed —
+                        // see `crate::service::not_found_message`.
+                        message: Some(crate::service::not_found_message()),
                     },
                 )
                 .into(),

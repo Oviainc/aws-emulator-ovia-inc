@@ -284,9 +284,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.streams.contains_key(&input.delivery_stream_name) {
             return Err(CreateDeliveryStreamErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "Firehose stream {} already exists",
-                        input.delivery_stream_name
+                    // The namespace a name collides in is the ACCOUNT's, so the refusal
+                    // states both; the wording rule lives in `crate::service`.
+                    message: Some(crate::service::already_exists_message(
+                        &input.delivery_stream_name,
                     )),
                 },
             )
@@ -417,14 +418,9 @@ fn sole_destination(
             Kind::HttpEndpoint(Box::new(config)),
         ));
     }
-    if let Some(mut config) = input.snowflake_destination_configuration.clone() {
-        config.private_key = None;
-        config.key_passphrase = None;
-        supplied.push((
-            "SnowflakeDestinationConfiguration",
-            Kind::Snowflake(Box::new(config)),
-        ));
-    }
+    // Declared after `HttpEndpointDestinationConfiguration` in the model, and collected
+    // in that order: the mutual-exclusion refusal names the members it saw in the
+    // model's declaration order.
     if let Some(config) = input
         .amazon_open_search_serverless_destination_configuration
         .clone()
@@ -432,6 +428,14 @@ fn sole_destination(
         supplied.push((
             "AmazonOpenSearchServerlessDestinationConfiguration",
             Kind::AmazonOpenSearchServerless(Box::new(config)),
+        ));
+    }
+    if let Some(mut config) = input.snowflake_destination_configuration.clone() {
+        config.private_key = None;
+        config.key_passphrase = None;
+        supplied.push((
+            "SnowflakeDestinationConfiguration",
+            Kind::Snowflake(Box::new(config)),
         ));
     }
     if let Some(config) = input.iceberg_destination_configuration.clone() {
@@ -442,11 +446,12 @@ fn sole_destination(
     }
 
     if supplied.len() > 1 {
+        // The model declares these as separate optional members with no union over
+        // them, so the exclusion is this service's rule and it is stated as one sentence
+        // over the alternatives that were supplied.
         let names: Vec<&str> = supplied.iter().map(|(name, _)| *name).collect();
-        return Err(invalid_argument(format!(
-            "only one destination configuration may be specified, but {} were: {}",
-            names.len(),
-            names.join(", ")
+        return Err(invalid_argument(crate::service::exactly_one_of_message(
+            &names,
         )));
     }
     supplied
