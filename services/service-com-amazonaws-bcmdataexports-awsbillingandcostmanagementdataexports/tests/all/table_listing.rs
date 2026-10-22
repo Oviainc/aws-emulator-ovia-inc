@@ -41,6 +41,18 @@ const KNOWN_TABLE: &str = "COST_AND_USAGE_REPORT";
 /// token without making progress fails the test instead of looping forever.
 const MAX_PAGES: usize = 64;
 
+/// A reported table property's `DefaultValue`, which every property carries.
+fn default_value_of(property: &Value) -> Option<&str> {
+    property.get("DefaultValue").and_then(Value::as_str)
+}
+
+/// The only table properties whose value the caller WRITES rather than picks from a
+/// published list — a billing view ARN and a filter expression (AWS Data Exports table
+/// dictionary) — so they are the only ones that may report an empty `ValidValues`. Every
+/// other property publishes the values it accepts, and `catalog_dictionary.rs` pins each
+/// of those lists.
+const FREE_FORM_PROPERTIES: &[&str] = &["BILLING_VIEW_ARN", "FILTER"];
+
 /// Call `ListTables` with the paging members a case sets, requiring HTTP 200.
 async fn list_tables(client: &Client, max_results: Option<i64>, token: Option<&str>) -> Value {
     let mut request = Map::new();
@@ -198,7 +210,9 @@ async fn every_listed_table_satisfies_the_modelled_table_contract() {
         // description that IS reported names a property, the values it accepts, and a
         // default among them ("Each table property has a default value that it assumes if
         // not specified" — smithy_query shape `GetTableRequest`, member
-        // `TableProperties`).
+        // `TableProperties`). A FREE-FORM property — one whose value the caller writes
+        // rather than picks, such as a billing view ARN — publishes no valid values, so
+        // only its default is constrained.
         let properties = table
             .get("TableProperties")
             .and_then(Value::as_array)
@@ -222,15 +236,13 @@ async fn every_listed_table_satisfies_the_modelled_table_contract() {
                 })
                 .collect();
             assert!(
-                !valid_values.is_empty(),
-                "case {name:?}/{property_name}: a reported property must accept at least one value"
+                !valid_values.is_empty() || FREE_FORM_PROPERTIES.contains(&property_name),
+                "case {name:?}/{property_name}: only a free-form property {FREE_FORM_PROPERTIES:?} may report an empty ValidValues, got {property}"
             );
-            let default_value = property
-                .get("DefaultValue")
-                .and_then(Value::as_str)
+            let default_value = default_value_of(property)
                 .unwrap_or_else(|| panic!("case {name:?}/{property_name}: DefaultValue is absent from {property}"));
             assert!(
-                valid_values.contains(&default_value),
+                valid_values.is_empty() || valid_values.contains(&default_value),
                 "case {name:?}/{property_name}: DefaultValue {default_value:?} must be one of {valid_values:?}"
             );
             let property_description = property
