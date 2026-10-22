@@ -32,6 +32,9 @@ const ARN_NAMESPACE: &str = "health-agent";
 /// AWS documents no duration for this, so the span is CHOSEN, and chosen inside the
 /// emulator's transient window (250-750 ms): a caller that reads straight after
 /// `DeleteDomain` still observes the `DELETING` state rather than an instant purge.
+///
+/// Only a domain whose deletion CANNOT finish inside the call waits this span — see
+/// [`Domain::deletion_completes_in_call`].
 pub const DOMAIN_DELETION_SPAN: Duration = Duration::from_millis(500);
 
 /// The most `Domain` records this store holds. Every growth site is capped so a caller
@@ -56,9 +59,10 @@ pub const MAX_TAG_VALUE_LEN: usize = 256;
 pub enum DomainStatus {
     Active,
     Deleting,
-    /// Accepted as a `ListDomains` filter value because the model declares it, but
-    /// never stored: a domain goes ACTIVE -> DELETING -> purged, so a deleted domain is
-    /// gone rather than sitting in DELETED.
+    /// The TERMINAL state: the deletion has been applied. A domain reaches it only as
+    /// the record is purged — either within the deleting call (when nothing outside
+    /// this service had to be torn down) or when the `DELETING` span falls due — so a
+    /// `DELETED` domain is gone rather than sitting in the store.
     Deleted,
 }
 
@@ -102,6 +106,34 @@ impl SubscriptionStatus {
     }
 }
 
+/// Which provisioning generation a `Domain` was onboarded through.
+///
+/// RECORDED behaviour, not modelled: no shape in this model declares an
+/// `onboardingGeneration` member (`smithy_query(query="shape",
+/// shape="CreateDomainOutput,GetDomainOutput")` lists neither), while every recorded
+/// domain response carries the discriminator a client branches on to decide which
+/// provisioning path a domain uses. It is a property of the domain, fixed when the
+/// domain is created and stored on the record, never recomputed per read.
+///
+/// This emulator provisions a domain through exactly one path — the legacy web-app /
+/// Identity Center onboarding every `CreateDomain` input in this model describes
+/// (`webAppSetupConfiguration` naming an Identity Center instance) — so `LEGACY` is
+/// the generation it records. The enum, rather than a bare string, is what keeps the
+/// value a closed discriminator with room for a later generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingGeneration {
+    Legacy,
+}
+
+impl OnboardingGeneration {
+    /// The wire value.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Legacy => "LEGACY",
+        }
+    }
+}
+
 /// How a `Domain`'s data is encrypted, as the model's `EncryptionType` enum declares it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncryptionType {
@@ -135,6 +167,12 @@ pub struct WebAppConfigurationRecord {
 pub struct Domain {
     pub domain_id: String,
     pub arn: String,
+    /// The account that OWNS this domain — the account the create was signed for.
+    /// Stored on the record, so every response projects the domain's own account
+    /// rather than recomputing one per read.
+    pub account_id: String,
+    /// The provisioning generation this domain was onboarded through.
+    pub onboarding_generation: OnboardingGeneration,
     pub name: String,
     pub kms_key_arn: Option<String>,
     pub encryption_type: EncryptionType,
@@ -142,10 +180,30 @@ pub struct Domain {
     /// When the owed `DELETING` -> purged transition becomes due; `None` unless the
     /// domain is being deleted.
     pub purge_due_at: Option<SystemTime>,
+    /// When this domain's deletion was RECORDED — the instant the call that deleted it
+    /// was served; `None` while the domain is live. Written once, so a repeated delete
+    /// reports the instant the first one recorded.
+    pub deleted_at: Option<SystemTime>,
     pub web_app_url: Option<String>,
     pub web_app_configuration: Option<WebAppConfigurationRecord>,
     pub created_at: SystemTime,
     pub subscriptions: BTreeMap<String, Subscription>,
+}
+
+impl Domain {
+    /// Whether deleting this domain finishes inside the deleting call.
+    ///
+    /// Deleting a domain tears down everything the service provisioned for it. What it
+    /// has to wait for is the resource provisioned OUTSIDE this service: a domain with
+    /// a web application owns an Identity Center application in another service, whose
+    /// teardown outlives the call, so such a domain is reported in the non-terminal
+    /// `DELETING` and the purge the clock owes applies the deletion afterwards. A domain
+    /// with nothing provisioned outside this service holds only records of this store
+    /// (its subscriptions and tags), which this call removes itself, so its deletion
+    /// completes within the call and is reported in the terminal `DELETED`.
+    pub fn deletion_completes_in_call(&self) -> bool {
+        self.web_app_configuration.is_none()
+    }
 }
 
 /// A persisted `Subscription`, stored under its own `Domain`.
@@ -277,6 +335,17 @@ impl ComAmazonawsConnecthealthConnecthealthState {
         self.tags_by_arn.get(arn).cloned().unwrap_or_default()
     }
 
+    /// The tags a RESPONSE reports for `arn`: always a map, EMPTY when the resource
+    /// carries none.
+    ///
+    /// A modelled tag map is a map of the resource's tags, and a resource with no tags
+    /// has an empty one — an absent member says "unknown" instead, so a client
+    /// iterating the member would have to tell the two apart. Every response that
+    /// reports a resource's tags projects them through here.
+    pub fn reported_tags(&self, arn: &str) -> std::collections::HashMap<String, String> {
+        self.tags_for(arn).into_iter().collect()
+    }
+
     /// The live domain `domain_id` names, for reading.
     ///
     /// `None` when it is absent or no longer `ACTIVE` — the cases every operation on a
@@ -349,6 +418,64 @@ fn mint_id(prefix: &str, body_len: usize, seq: u64) -> String {
 /// `arn:aws:health-agent:<region>:<account>:domain/<domainId>`.
 pub fn domain_arn(region: &str, domain_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("domain/{domain_id}"))
+}
+
+/// The account every resource of this emulator belongs to: the canonical emulator
+/// account the vendored runtime owns, which is also the account segment of every ARN
+/// [`domain_arn`] builds. A domain's owning account is stored on its record at creation
+/// (`Domain::account_id`), so the responses project the domain's own account.
+pub fn owning_account_id() -> String {
+    ::engine::emulator_account_id().to_string()
+}
+
+/// One member the RECORDED service carries beside a modelled response, with the member
+/// schema it is written under.
+///
+/// None of these members is in the model (`smithy_query(query="shape",
+/// shape="CreateDomainOutput,GetDomainOutput,DeleteDomainOutput")` lists neither
+/// `accountId`, `onboardingGeneration` nor `deletedAt`), so no generated field exists
+/// to fill: [`RecordedMembers`] writes them after the modelled payload's own members,
+/// each under a member schema the answering operation declares. The modelled shapes and
+/// the model file stay exactly as shipped, and a client that knows only the modelled
+/// shape ignores the extra keys.
+#[derive(Debug)]
+pub enum RecordedMember {
+    /// A string-valued member.
+    Text(&'static ::aws_smithy_schema::Schema, String),
+    /// A timestamp-valued member, serialized in the protocol's timestamp format.
+    Instant(
+        &'static ::aws_smithy_schema::Schema,
+        ::aws_smithy_types::DateTime,
+    ),
+}
+
+/// A modelled response plus the members the recorded service carries beside it.
+#[derive(Debug)]
+pub struct RecordedMembers<T> {
+    /// The modelled response — the only part an SDK-generated client reads.
+    pub payload: T,
+    /// The recorded-only members, written in order after the modelled ones.
+    pub members: Vec<RecordedMember>,
+}
+
+impl<T: ::aws_smithy_schema::serde::SerializableStruct>
+    ::aws_smithy_schema::serde::SerializableStruct for RecordedMembers<T>
+{
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        self.payload.serialize_members(serializer)?;
+        for member in &self.members {
+            match member {
+                RecordedMember::Text(schema, value) => serializer.write_string(schema, value)?,
+                RecordedMember::Instant(schema, value) => {
+                    serializer.write_timestamp(schema, value)?
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The ARN of a `Subscription`: its domain's ARN plus `/subscription/<subscriptionId>`.
