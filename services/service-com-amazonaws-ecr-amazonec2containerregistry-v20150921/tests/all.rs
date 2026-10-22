@@ -17,6 +17,8 @@ mod account_settings;
 mod image_tag_mutability;
 #[path = "all/layer_availability.rs"]
 mod layer_availability;
+#[path = "all/lifecycle_policy_preview.rs"]
+mod lifecycle_policy_preview;
 #[path = "all/pull_time_update_exclusion_removal.rs"]
 mod pull_time_update_exclusion_removal;
 #[path = "all/pull_time_update_exclusions.rs"]

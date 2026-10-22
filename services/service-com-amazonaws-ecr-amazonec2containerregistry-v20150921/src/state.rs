@@ -9,13 +9,15 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     EncryptionConfiguration, EncryptionConfigurationForRepositoryCreationTemplate, ImageDetail,
     ImageIdentifier, ImageScanningConfiguration, ImageTagMutabilityExclusionFilter,
+    LifecyclePolicyPreviewResult, LifecyclePolicyPreviewSummary, LifecyclePolicyRuleAction,
     ReplicationConfiguration, ReplicationRule, Repository, RepositoryCreationTemplate,
-    RepositoryScanningConfiguration, SigningConfiguration, Tag,
+    RepositoryScanningConfiguration, SigningConfiguration, Tag, TransitioningImageTotalCount,
+    IMAGE_ACTION_TYPE_VALUES, LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES, TAG_STATUS_VALUES,
 };
 
 /// `CreateRepository`'s documented default: "If this parameter is omitted, the default
@@ -108,6 +110,51 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// The region an unsigned request is served in: a request that carries no SigV4
 /// credential scope names no region, and ECR's ARNs and repository URIs are regional.
 pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// How long after the `StartLifecyclePolicyPreview` call that starts it the clock owes a
+/// lifecycle policy preview its `IN_PROGRESS` -> `COMPLETE` transition.
+///
+/// AWS publishes no duration for a preview run, so this is a CHOSEN value inside the
+/// 250–750 ms band this project fixes for a clock-owed transition. It is never zero, so a
+/// caller that starts a second preview straight after the first still meets the
+/// `IN_PROGRESS` state and the `LifecyclePolicyPreviewInProgressException` it answers
+/// with. It is stored as a due instant and never slept for: the completion is owed
+/// whether or not anybody calls again.
+pub const LIFECYCLE_PREVIEW_DELAY: Duration = Duration::from_millis(400);
+
+/// The `LifecyclePolicyPreviewStatus` a preview carries while it is still running.
+///
+/// The other two values the enum carries are not reachable here: a policy document that
+/// does not parse is refused at the start call rather than stored as a `FAILED` preview,
+/// and no published lifetime after which a stored preview goes `EXPIRED` exists to drive
+/// that one.
+pub const PREVIEW_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The `LifecyclePolicyPreviewStatus` a preview carries once the clock has made its
+/// completion due. See [`PREVIEW_STATUS_IN_PROGRESS`].
+pub const PREVIEW_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// The `LifecyclePolicyStorageClass` every image this emulator stores is in: moving one
+/// to archive is `UpdateImageStorageClass`, still a 501 stub, so every previewed image
+/// reports standard storage.
+pub const STANDARD_STORAGE_CLASS: &str = "STANDARD";
+
+/// The `ImageActionType` an `expire` rule applies — the modelled spelling (from
+/// `IMAGE_ACTION_TYPE_VALUES`) of what a policy document writes in lower case.
+pub const EXPIRE_ACTION_TYPE: &str = "EXPIRE";
+
+/// The `ImageActionType` a `transition` rule applies. See [`EXPIRE_ACTION_TYPE`].
+pub const TRANSITION_ACTION_TYPE: &str = "TRANSITION";
+
+/// The `TagStatus` a selection with no tag list asks for.
+pub const ANY_TAG_STATUS: &str = "ANY";
+
+/// The only `selection.countUnit` a lifecycle policy rule carries: a `sinceImagePushed`
+/// count is a number of days.
+pub const COUNT_UNIT_DAYS: &str = "days";
+
+/// The unit a `sinceImagePushed` rule counts in, in seconds.
+const SECONDS_PER_DAY: u64 = 86_400;
 
 /// One account setting of this registry: the setting's name, the values
 /// `PutAccountSetting` accepts for it, and the value the registry reports for it before
@@ -289,6 +336,451 @@ impl ImageRecord {
     }
 }
 
+/// One parsed `rules` entry of a lifecycle policy document.
+///
+/// ECR's lifecycle policy document is the service's own format, so it is read here
+/// rather than with a crates.io parser: the JSON itself comes from `serde_json`, and
+/// what this adds is the meaning of `selection` and `action`. Every modelled value it
+/// checks against comes from the model's own enums (`TAG_STATUS_VALUES`,
+/// `IMAGE_ACTION_TYPE_VALUES`, `LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES`).
+#[derive(Debug, Clone)]
+pub struct LifecycleRule {
+    /// `rulePriority`: unique within a policy, and the order rules are applied in.
+    pub priority: i32,
+    /// `selection.tagStatus`, as the modelled `TagStatus` spells it.
+    pub tag_status: String,
+    /// `selection.tagPrefixList`: a tag the rule selects begins with one of these.
+    pub tag_prefixes: Vec<String>,
+    /// `selection.tagPatternList`: a tag the rule selects matches one of these, where
+    /// `*` stands for any run of characters.
+    pub tag_patterns: Vec<String>,
+    /// `selection.countType` and the numbers that go with it.
+    pub count: LifecycleCount,
+    /// `action.type`, as the modelled `ImageActionType` spells it.
+    pub action_type: String,
+    /// `action.targetStorageClass`, present only on a `TRANSITION` action.
+    pub target_storage_class: Option<String>,
+}
+
+/// What a rule's `selection.countType` counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleCount {
+    /// `imageCountMoreThan`: the rule acts on every image its selection matches beyond
+    /// the newest `keep` of them.
+    ImageCountMoreThan { keep: usize },
+    /// `sinceImagePushed`: the rule acts on every image its selection matches that was
+    /// pushed more than `days` days ago.
+    SinceImagePushed { days: u64 },
+}
+
+impl LifecycleRule {
+    /// Whether this rule's `selection` admits `image`, before its count is applied.
+    fn selects(&self, image: &ImageRecord) -> bool {
+        match self.tag_status.as_str() {
+            "UNTAGGED" => image.tags.is_empty(),
+            "TAGGED" => image.tags.iter().any(|tag| self.tag_matches(tag)),
+            // ANY, and anything the model widens `TagStatus` with later.
+            _ => true,
+        }
+    }
+
+    /// Whether `tag` begins with one of the rule's `tagPrefixList` entries or matches one
+    /// of its `tagPatternList` wildcards.
+    fn tag_matches(&self, tag: &str) -> bool {
+        self.tag_prefixes
+            .iter()
+            .any(|prefix| tag.starts_with(prefix))
+            || self
+                .tag_patterns
+                .iter()
+                .any(|pattern| wildcard_matches(pattern, tag))
+    }
+}
+
+/// One image a preview acts on: the image as it stood when the preview was started, and
+/// the rule that claimed it.
+#[derive(Debug, Clone)]
+pub struct PreviewedImage {
+    pub digest: String,
+    pub tags: BTreeSet<String>,
+    pub pushed_at: SystemTime,
+    pub applied_rule_priority: i32,
+    pub action_type: String,
+    pub target_storage_class: Option<String>,
+}
+
+impl PreviewedImage {
+    /// The `LifecyclePolicyPreviewResult` a preview read reports for this image.
+    pub fn to_result(&self) -> LifecyclePolicyPreviewResult {
+        LifecyclePolicyPreviewResult {
+            // As everywhere else in this service, an untagged image omits `imageTags`
+            // rather than reporting [].
+            image_tags: if self.tags.is_empty() {
+                None
+            } else {
+                Some(self.tags.iter().cloned().collect())
+            },
+            image_digest: Some(self.digest.clone()),
+            image_pushed_at: Some(::aws_smithy_types::DateTime::from(self.pushed_at)),
+            action: Some(LifecyclePolicyRuleAction {
+                r#type: Some(self.action_type.clone()),
+                target_storage_class: self.target_storage_class.clone(),
+            }),
+            applied_rule_priority: Some(self.applied_rule_priority),
+            storage_class: Some(STANDARD_STORAGE_CLASS.to_string()),
+        }
+    }
+}
+
+/// The lifecycle policy preview one `StartLifecyclePolicyPreview` call started.
+///
+/// The evaluation is computed once, when the preview is started, from the images the
+/// repository held at that instant: a preview is a snapshot, so an image pushed after it
+/// started does not appear in it, and reading the preview back computes nothing new.
+#[derive(Debug, Clone)]
+pub struct LifecyclePreview {
+    /// The policy the preview was started with — the text the start call named, or the
+    /// repository's own policy when it named none.
+    pub policy_text: String,
+    /// A [`PREVIEW_STATUS_IN_PROGRESS`] / [`PREVIEW_STATUS_COMPLETE`] value.
+    pub status: String,
+    /// When the `IN_PROGRESS` -> `COMPLETE` transition the clock owes falls due; `None`
+    /// once it has been materialised.
+    pub complete_due_at: Option<SystemTime>,
+    /// The images the policy acts on, keyed by digest so every page — and therefore
+    /// every pagination token — has one deterministic order.
+    pub results: BTreeMap<String, PreviewedImage>,
+}
+
+impl LifecyclePreview {
+    /// The `summary` a preview read reports: how many images the preview expires, and how
+    /// many it transitions to each storage class.
+    ///
+    /// It summarises the whole preview rather than one page of it, so it does not change
+    /// as a caller pages through the results.
+    pub fn summary(&self) -> LifecyclePolicyPreviewSummary {
+        let expiring = self
+            .results
+            .values()
+            .filter(|result| result.action_type == EXPIRE_ACTION_TYPE)
+            .count();
+        let mut transitioning: BTreeMap<String, i32> = BTreeMap::new();
+        for result in self
+            .results
+            .values()
+            .filter(|result| result.action_type == TRANSITION_ACTION_TYPE)
+        {
+            let class = result.target_storage_class.clone().unwrap_or_default();
+            *transitioning.entry(class).or_default() += 1;
+        }
+        LifecyclePolicyPreviewSummary {
+            expiring_image_total_count: Some(i32::try_from(expiring).unwrap_or(i32::MAX)),
+            // "This field is only present if at least one image will be transitioned in
+            // the summary."
+            transitioning_image_total_counts: if transitioning.is_empty() {
+                None
+            } else {
+                Some(
+                    transitioning
+                        .into_iter()
+                        .map(
+                            |(target_storage_class, image_total_count)| {
+                                TransitioningImageTotalCount {
+                                    target_storage_class: Some(target_storage_class),
+                                    image_total_count: Some(image_total_count),
+                                }
+                            },
+                        )
+                        .collect(),
+                )
+            },
+        }
+    }
+}
+
+/// The rules a lifecycle policy document declares, in the order they are applied, or
+/// [`Fault::InvalidParameter`] naming what the document got wrong.
+///
+/// Every check below is a documented requirement of the policy format: a `rules` array;
+/// a unique `rulePriority` of 1 or more per rule; a `selection` naming a `TagStatus`, a
+/// count type and a `countNumber` of 1 or more (the format's own minimum — an
+/// `imageCountMoreThan` keeps at least one image, and a `sinceImagePushed` counts at
+/// least one day); exactly one of the two tag lists on a rule selecting tagged images,
+/// and neither anywhere else; `countUnit` on `sinceImagePushed` and only there; and an
+/// `action` naming an `ImageActionType`, with a target storage class on a transition and
+/// only there.
+pub fn parse_lifecycle_policy(text: &str) -> Result<Vec<LifecycleRule>, Fault> {
+    fn bad(detail: impl ::std::fmt::Display) -> Fault {
+        Fault::InvalidParameter(format!(
+            "lifecyclePolicyText is not a valid lifecycle policy: {detail}"
+        ))
+    }
+
+    let document: serde_json::Value = serde_json::from_str(text).map_err(bad)?;
+    let rules = document
+        .get("rules")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| bad("it carries no 'rules' array"))?;
+    if rules.is_empty() {
+        return Err(bad("'rules' carries no rule"));
+    }
+
+    let mut parsed: Vec<LifecycleRule> = Vec::new();
+    // A rule priority is unique within a policy, so each one is recorded as it is read.
+    let mut seen_priorities: BTreeSet<i32> = BTreeSet::new();
+    for rule in rules {
+        let priority = rule
+            .get("rulePriority")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|priority| i32::try_from(priority).ok())
+            .filter(|priority| *priority >= 1)
+            .ok_or_else(|| bad("every rule needs a 'rulePriority' integer of 1 or more"))?;
+        if !seen_priorities.insert(priority) {
+            return Err(bad(format!(
+                "two rules carry rulePriority {priority}; a rule priority is unique \
+                 within a policy"
+            )));
+        }
+
+        let selection = rule
+            .get("selection")
+            .ok_or_else(|| bad(format!("rule {priority} carries no 'selection'")))?;
+        let tag_status_text = selection
+            .get("tagStatus")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| bad(format!("rule {priority} carries no 'selection.tagStatus'")))?;
+        // A policy document writes `tagStatus`, `countType` and `action.type` in lower
+        // camel case; the modelled enums are what they mean, so they are matched against
+        // those case-insensitively and stored in the modelled spelling.
+        let tag_status = TAG_STATUS_VALUES
+            .iter()
+            .find(|value| value.eq_ignore_ascii_case(tag_status_text))
+            .ok_or_else(|| {
+                bad(format!(
+                    "rule {priority} carries 'selection.tagStatus' {tag_status_text:?}, \
+                     which is not one of {TAG_STATUS_VALUES:?}"
+                ))
+            })?;
+
+        let string_list = |member: &str| -> Result<Vec<String>, Fault> {
+            match selection.get(member) {
+                None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+                Some(value) => value
+                    .as_array()
+                    .ok_or_else(|| {
+                        bad(format!(
+                            "rule {priority} carries a 'selection.{member}' that is not \
+                             an array"
+                        ))
+                    })?
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .as_str()
+                            .map(ToString::to_string)
+                            .ok_or_else(|| {
+                                bad(format!(
+                                    "rule {priority} carries a non-string entry in \
+                                     'selection.{member}'"
+                                ))
+                            })
+                    })
+                    .collect(),
+            }
+        };
+        let tag_prefixes = string_list("tagPrefixList")?;
+        let tag_patterns = string_list("tagPatternList")?;
+        let tagged = *tag_status == "TAGGED";
+        let names_tags = !tag_prefixes.is_empty() || !tag_patterns.is_empty();
+        if tagged && !names_tags {
+            return Err(bad(format!(
+                "rule {priority} selects tagged images but carries neither \
+                 'selection.tagPrefixList' nor 'selection.tagPatternList'"
+            )));
+        }
+        if !tag_prefixes.is_empty() && !tag_patterns.is_empty() {
+            return Err(bad(format!(
+                "rule {priority} carries both 'selection.tagPrefixList' and \
+                 'selection.tagPatternList'; a rule selects tagged images by one of the \
+                 two"
+            )));
+        }
+        if !tagged && names_tags {
+            return Err(bad(format!(
+                "rule {priority} carries a tag list with 'selection.tagStatus' \
+                 {tag_status_text:?}; a tag list belongs to a rule selecting tagged images"
+            )));
+        }
+
+        let count_type = selection
+            .get("countType")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| bad(format!("rule {priority} carries no 'selection.countType'")))?;
+        let count_number = selection
+            .get("countNumber")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|number| *number >= 1)
+            .ok_or_else(|| {
+                bad(format!(
+                    "rule {priority} carries no 'selection.countNumber' integer of 1 or \
+                     more"
+                ))
+            })?;
+        let count_unit = selection
+            .get("countUnit")
+            .and_then(serde_json::Value::as_str);
+        let count = if count_type.eq_ignore_ascii_case("imageCountMoreThan") {
+            if count_unit.is_some() {
+                return Err(bad(format!(
+                    "rule {priority} carries a 'selection.countUnit' with the \
+                     {count_type:?} count type, which counts images rather than time"
+                )));
+            }
+            LifecycleCount::ImageCountMoreThan {
+                keep: usize::try_from(count_number).unwrap_or(usize::MAX),
+            }
+        } else if count_type.eq_ignore_ascii_case("sinceImagePushed") {
+            if !count_unit.is_some_and(|unit| unit.eq_ignore_ascii_case(COUNT_UNIT_DAYS)) {
+                return Err(bad(format!(
+                    "rule {priority} carries the {count_type:?} count type, which needs \
+                     'selection.countUnit' {COUNT_UNIT_DAYS:?}, and carries \
+                     {count_unit:?}"
+                )));
+            }
+            LifecycleCount::SinceImagePushed {
+                days: u64::try_from(count_number).unwrap_or(u64::MAX),
+            }
+        } else {
+            return Err(bad(format!(
+                "rule {priority} carries 'selection.countType' {count_type:?}, which is \
+                 neither \"imageCountMoreThan\" nor \"sinceImagePushed\""
+            )));
+        };
+
+        let action = rule
+            .get("action")
+            .ok_or_else(|| bad(format!("rule {priority} carries no 'action'")))?;
+        let action_text = action
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| bad(format!("rule {priority} carries no 'action.type'")))?;
+        let action_type: &str = IMAGE_ACTION_TYPE_VALUES
+            .iter()
+            .find(|value| value.eq_ignore_ascii_case(action_text))
+            .ok_or_else(|| {
+                bad(format!(
+                    "rule {priority} carries 'action.type' {action_text:?}, which is not \
+                     one of {IMAGE_ACTION_TYPE_VALUES:?}"
+                ))
+            })?;
+        let target_text = action
+            .get("targetStorageClass")
+            .and_then(serde_json::Value::as_str);
+        let target_storage_class = match (action_type, target_text) {
+            (TRANSITION_ACTION_TYPE, Some(target)) => Some(
+                LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES
+                    .iter()
+                    .find(|value| value.eq_ignore_ascii_case(target))
+                    .ok_or_else(|| {
+                        bad(format!(
+                            "rule {priority} carries 'action.targetStorageClass' \
+                             {target:?}, which is not one of \
+                             {LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES:?}"
+                        ))
+                    })?
+                    .to_string(),
+            ),
+            (TRANSITION_ACTION_TYPE, None) => {
+                return Err(bad(format!(
+                    "rule {priority} transitions images but carries no \
+                     'action.targetStorageClass'"
+                )))
+            }
+            (_, Some(target)) => {
+                return Err(bad(format!(
+                    "rule {priority} carries 'action.targetStorageClass' {target:?} with \
+                     the {action_text:?} action, which moves no image between storage \
+                     classes"
+                )))
+            }
+            (_, None) => None,
+        };
+
+        parsed.push(LifecycleRule {
+            priority,
+            tag_status: (*tag_status).to_string(),
+            tag_prefixes,
+            tag_patterns,
+            count,
+            action_type: action_type.to_string(),
+            target_storage_class,
+        });
+    }
+
+    // Rules are applied in ascending rule priority, whatever order the document lists
+    // them in.
+    parsed.sort_by_key(|rule| rule.priority);
+    Ok(parsed)
+}
+
+/// The images `rules` acts on, evaluated against `images` as they stand at `now` and
+/// keyed by digest.
+///
+/// Rules are applied in ascending `rulePriority`, and an image the first matching rule
+/// claims is not offered to a later one — so every previewed image carries exactly one
+/// `appliedRulePriority`.
+pub fn evaluate_lifecycle_policy(
+    rules: &[LifecycleRule],
+    images: &BTreeMap<String, ImageRecord>,
+    now: SystemTime,
+) -> BTreeMap<String, PreviewedImage> {
+    let mut acted: BTreeMap<String, PreviewedImage> = BTreeMap::new();
+    for rule in rules {
+        let mut candidates: Vec<&ImageRecord> = images
+            .values()
+            .filter(|image| !acted.contains_key(&image.digest))
+            .filter(|image| rule.selects(image))
+            .collect();
+        let claimed: Vec<&ImageRecord> = match rule.count {
+            LifecycleCount::SinceImagePushed { days } => {
+                let age = Duration::from_secs(days.saturating_mul(SECONDS_PER_DAY));
+                candidates
+                    .into_iter()
+                    .filter(|image| {
+                        now.duration_since(image.pushed_at).unwrap_or_default() > age
+                    })
+                    .collect()
+            }
+            LifecycleCount::ImageCountMoreThan { keep } => {
+                // The newest `keep` images the selection matched stay; everything older
+                // is what the rule acts on. The digest breaks a tie between two images
+                // pushed at the same instant, so the choice is deterministic.
+                candidates.sort_by(|left, right| {
+                    right
+                        .pushed_at
+                        .cmp(&left.pushed_at)
+                        .then_with(|| left.digest.cmp(&right.digest))
+                });
+                candidates.into_iter().skip(keep).collect()
+            }
+        };
+        for image in claimed {
+            acted.insert(
+                image.digest.clone(),
+                PreviewedImage {
+                    digest: image.digest.clone(),
+                    tags: image.tags.clone(),
+                    pushed_at: image.pushed_at,
+                    applied_rule_priority: rule.priority,
+                    action_type: rule.action_type.clone(),
+                    target_storage_class: rule.target_storage_class.clone(),
+                },
+            );
+        }
+    }
+    acted
+}
+
 /// One stored repository, with the identity fields computed once at creation so every
 /// later read reports exactly what the create returned.
 #[derive(Debug, Clone)]
@@ -311,6 +803,12 @@ pub struct Repo {
     pub policy_text: Option<String>,
     pub images: BTreeMap<String, ImageRecord>,
     pub tag_index: BTreeMap<String, String>,
+    /// The repository's lifecycle policy, which `PutLifecyclePolicy` sets: the policy
+    /// `StartLifecyclePolicyPreview` evaluates when the start call names none.
+    pub lifecycle_policy: Option<String>,
+    /// The one lifecycle policy preview this repository carries; a later start replaces
+    /// it.
+    pub lifecycle_preview: Option<LifecyclePreview>,
 }
 
 impl Repo {
@@ -460,6 +958,33 @@ impl Repo {
         if let Some(image) = self.images.get_mut(digest) {
             image.tags.insert(tag.to_string());
         }
+    }
+
+    /// Materialise the lifecycle policy preview completion the clock has already made
+    /// due at `now`.
+    ///
+    /// The transition is owed by the clock, not by a call: it falls due
+    /// [`LIFECYCLE_PREVIEW_DELAY`] after the start whether or not anybody asks, so every
+    /// operation that looks at the preview writes down what was already due before
+    /// reading it.
+    pub fn settle_lifecycle_preview(&mut self, now: SystemTime) {
+        let Some(preview) = self.lifecycle_preview.as_mut() else {
+            return;
+        };
+        let Some(due) = preview.complete_due_at else {
+            return;
+        };
+        if due <= now {
+            preview.status = PREVIEW_STATUS_COMPLETE.to_string();
+            preview.complete_due_at = None;
+        }
+    }
+
+    /// Whether a preview started on this repository is still running.
+    pub fn lifecycle_preview_in_progress(&self) -> bool {
+        self.lifecycle_preview
+            .as_ref()
+            .is_some_and(|preview| preview.status == PREVIEW_STATUS_IN_PROGRESS)
     }
 }
 

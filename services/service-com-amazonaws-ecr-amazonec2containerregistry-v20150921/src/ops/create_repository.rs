@@ -307,6 +307,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             policy_text: None,
             images: ::std::collections::BTreeMap::new(),
             tag_index: ::std::collections::BTreeMap::new(),
+            // A new repository carries no lifecycle policy, and no preview of one.
+            lifecycle_policy: None,
+            lifecycle_preview: None,
         };
 
         // The create's tags go in through the same merge `TagResource` uses, so one key

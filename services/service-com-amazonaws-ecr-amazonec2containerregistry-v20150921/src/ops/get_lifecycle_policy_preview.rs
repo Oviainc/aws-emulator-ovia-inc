@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLifecyclePolicyPreview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLifecyclePolicyPreview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLifecyclePolicyPreview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the preview `StartLifecyclePolicyPreview` stored for a repository: its policy
+//! text, its status, and — once the clock has completed it — the images it acts on, one
+//! page at a time. The only thing this operation writes is the `IN_PROGRESS` ->
+//! `COMPLETE` transition the clock had already made due, which was owed at the same
+//! instant whether or not anybody read the preview.
 //!
 //! ## Shape of an operation
 //!
@@ -149,6 +146,32 @@ impl From<GetLifecyclePolicyPreviewErrorModeled> for GetLifecyclePolicyPreviewEr
     }
 }
 
+/// The shared state helpers report their failures as [`crate::state::Fault`]; this maps
+/// each onto the modelled error this operation declares for it.
+fn fault_error(fault: crate::state::Fault) -> GetLifecyclePolicyPreviewErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            GetLifecyclePolicyPreviewErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException { message },
+            )
+        }
+        // A pagination token that was not issued here, and a registry that is not this
+        // one, are each a parameter this operation cannot honour. The remaining kinds are
+        // unreachable: this operation models no image-not-found failure, so an identifier
+        // naming no stored image selects nothing instead (see `handle`), and it carries
+        // no tags.
+        crate::state::Fault::InvalidParameter(_)
+        | crate::state::Fault::ImageNotFound(_)
+        | crate::state::Fault::InvalidTagParameter(_)
+        | crate::state::Fault::TooManyTags(_) => {
+            GetLifecyclePolicyPreviewErrorModeled::InvalidParameterException(
+                InvalidParameterException { message },
+            )
+        }
+    }
+}
+
 /// The `GetLifecyclePolicyPreview` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -183,20 +206,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLifecyclePolicyPreview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLifecyclePolicyPreviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLifecyclePolicyPreview"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetLifecyclePolicyPreviewErrorModeled::ServerException(
+                ServerException {
+                    message: Some("the ecr repository store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        // Of `maxResults` and `nextToken`: "This option cannot be used when you specify
+        // images with imageIds."
+        let requested = input.image_ids.unwrap_or_default();
+        let restrict = !requested.is_empty();
+        if restrict && (input.max_results.is_some() || input.next_token.is_some()) {
+            return Err(fault_error(crate::state::Fault::InvalidParameter(
+                "maxResults and nextToken cannot be used when imageIds names the images \
+                 to include"
+                    .to_string(),
+            ))
+            .into());
+        }
+        // An identifier naming nothing names no image, so the request is refused rather
+        // than read as "every image".
+        if requested
+            .iter()
+            .any(|id| id.image_digest.is_none() && id.image_tag.is_none())
+        {
+            return Err(fault_error(crate::state::Fault::InvalidParameter(
+                "an imageIds entry must carry an imageDigest, an imageTag, or both"
+                    .to_string(),
+            ))
+            .into());
+        }
+
+        // A value outside `TagStatus` was already refused at the boundary, and a request
+        // naming no filter asks for every previewed image.
+        let tag_status = input
+            .filter
+            .unwrap_or_default()
+            .tag_status
+            .unwrap_or_else(|| crate::state::ANY_TAG_STATUS.to_string());
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The guard is mutable only so the clock-owed IN_PROGRESS -> COMPLETE transition
+        // can be written down; nothing else about the preview changes on a read.
+        let repo = store
+            .repository_mut(&input.repository_name)
+            .map_err(fault_error)?;
+        repo.settle_lifecycle_preview(now);
+
+        let Some(preview) = repo.lifecycle_preview.as_ref() else {
+            return Err(
+                GetLifecyclePolicyPreviewErrorModeled::LifecyclePolicyPreviewNotFoundException(
+                    LifecyclePolicyPreviewNotFoundException {
+                        message: Some(format!(
+                            "There is no dry run for the repository with name '{}' in \
+                             the registry with id '{}'",
+                            repo.name,
+                            crate::state::registry_id()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A preview that is still running has no results to report yet; its status is
+        // what the caller polls for.
+        if preview.status != crate::state::PREVIEW_STATUS_COMPLETE {
+            return Ok(GetLifecyclePolicyPreviewOutput {
+                registry_id: Some(repo.registry_id.clone()),
+                repository_name: Some(repo.name.clone()),
+                lifecycle_policy_text: Some(preview.policy_text.clone()),
+                status: Some(preview.status.clone()),
+                next_token: None,
+                preview_results: None,
+                summary: None,
+            });
+        }
+
+        // `imageIds` names the images to include. The identifiers are resolved against
+        // the preview's own snapshot — the tags each image carried when the preview was
+        // started — so the selection and the results it reports come from one record. An
+        // identifier that names nothing in the preview selects nothing: this operation
+        // models no image-not-found failure.
+        let mut wanted = ::std::collections::BTreeSet::new();
+        for id in &requested {
+            match (id.image_digest.as_deref(), id.image_tag.as_deref()) {
+                (Some(digest), Some(tag)) => {
+                    if preview
+                        .results
+                        .get(digest)
+                        .is_some_and(|result| result.tags.contains(tag))
+                    {
+                        wanted.insert(digest.to_string());
+                    }
+                }
+                (Some(digest), None) => {
+                    if preview.results.contains_key(digest) {
+                        wanted.insert(digest.to_string());
+                    }
+                }
+                (None, Some(tag)) => {
+                    wanted.extend(
+                        preview
+                            .results
+                            .values()
+                            .filter(|result| result.tags.contains(tag))
+                            .map(|result| result.digest.clone()),
+                    );
+                }
+                // Refused above, before this operation looked at any state.
+                (None, None) => {}
+            }
+        }
+
+        let candidates: Vec<(String, LifecyclePolicyPreviewResult)> = preview
+            .results
+            .values()
+            .filter(|result| !restrict || wanted.contains(&result.digest))
+            .filter(|result| match tag_status.as_str() {
+                "TAGGED" => !result.tags.is_empty(),
+                "UNTAGGED" => result.tags.is_empty(),
+                _ => true,
+            })
+            .map(|result| (result.digest.clone(), result.to_result()))
+            .collect();
+
+        let (preview_results, next_token) =
+            crate::state::paginate(candidates, input.next_token.as_ref(), input.max_results)
+                .map_err(fault_error)?;
+
+        Ok(GetLifecyclePolicyPreviewOutput {
+            registry_id: Some(repo.registry_id.clone()),
+            repository_name: Some(repo.name.clone()),
+            lifecycle_policy_text: Some(preview.policy_text.clone()),
+            status: Some(preview.status.clone()),
+            next_token,
+            preview_results: Some(preview_results),
+            summary: Some(preview.summary()),
+        })
     }
 }
