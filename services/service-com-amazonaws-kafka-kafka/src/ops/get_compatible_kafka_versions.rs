@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCompatibleKafkaVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCompatibleKafkaVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the Apache Kafka versions a cluster can be upgraded to, derived from
+//! this service's version catalog ([`crate::state::KAFKA_VERSION_CATALOG`]) and,
+//! when the caller names a cluster, from that cluster's stored Kafka version.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCompatibleKafkaVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! * With `ClusterArn`: ONE `CompatibleKafkaVersion`, whose `SourceVersion` is the
+//!   version the stored cluster runs and whose `TargetVersions` are the catalogued
+//!   versions still offered and strictly newer than it (MSK upgrades in place and
+//!   does not downgrade, and a deprecated version is not an upgrade target).
+//! * Without `ClusterArn` (the member is optional in the model): the whole matrix,
+//!   one entry per catalogued source version.
+//!
+//! A `ClusterArn` that is not shaped like an MSK cluster ARN is a
+//! `BadRequestException`; a well-formed one this endpoint's region holds no cluster
+//! for is a `NotFoundException`. This operation only REPORTS: it writes nothing.
+//!
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +157,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCompatibleKafkaVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCompatibleKafkaVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCompatibleKafkaVersions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetCompatibleKafkaVersionsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The source versions this answer covers: the one version the named
+        // cluster runs, or every catalogued version when the caller names none —
+        // `ClusterArn` is optional in the model.
+        let source_versions: Vec<String> = match input.cluster_arn.as_deref() {
+            Some(cluster_arn) => {
+                if !crate::state::is_cluster_arn(cluster_arn) {
+                    return Err(GetCompatibleKafkaVersionsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("ClusterArn".to_string()),
+                            message: Some(format!(
+                                "{cluster_arn} is not a valid Amazon MSK cluster ARN."
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                let region = crate::state::request_region(ctx.parts());
+                // Reporting only, so the registry is read and never written: which
+                // versions a cluster can move to does not depend on its status, so
+                // this handler has no clock-owed transition to materialise.
+                let store = state.lock();
+                let Some(cluster) = store.cluster_in(&region, cluster_arn) else {
+                    return Err(GetCompatibleKafkaVersionsErrorModeled::NotFoundException(
+                        NotFoundException {
+                            invalid_parameter: Some("ClusterArn".to_string()),
+                            // The service's one wording for a resource it does not
+                            // hold; the member at fault is named above.
+                            message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                };
+                vec![cluster.kafka_version.clone()]
+            }
+            None => crate::state::KAFKA_VERSION_CATALOG
+                .iter()
+                .map(|entry| entry.version.to_string())
+                .collect(),
+        };
+
+        Ok(GetCompatibleKafkaVersionsOutput {
+            compatible_kafka_versions: Some(
+                source_versions
+                    .into_iter()
+                    .map(|source_version| CompatibleKafkaVersion {
+                        target_versions: Some(crate::state::compatible_target_versions(
+                            &source_version,
+                        )),
+                        source_version: Some(source_version),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }
