@@ -18,6 +18,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// ACTIVE."; `ACTIVE` — "Workspace has been created and is usable."; `DELETING` —
 /// "Workspace is being deleted. Deletions are allowed only when status is ACTIVE."
 /// (`crate::ops::types::WORKSPACE_STATUS_CODE_VALUES` carries the full list.)
+///
+/// The same three literals are entries of `com.amazonaws.amp#AnomalyDetectorStatusCode`
+/// too (`crate::ops::types::ANOMALY_DETECTOR_STATUS_CODE_VALUES`), so an anomaly
+/// detector's lifecycle reports them from these same constants rather than from a
+/// second copy of the strings.
 pub const STATUS_CREATING: &str = "CREATING";
 /// See [`STATUS_CREATING`].
 pub const STATUS_ACTIVE: &str = "ACTIVE";
@@ -214,6 +219,40 @@ pub const WORKSPACE_PAGE_LIMIT: i32 = 1_000;
 /// See [`WORKSPACE_PAGE_LIMIT`].
 pub const WORKSPACE_PAGE_DEFAULT: i32 = 100;
 
+/// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException` /
+/// `ServiceQuotaExceededException` report for an anomaly detector — the resource's AWS
+/// type name, as [`WORKSPACE_RESOURCE_TYPE`] is for a workspace.
+pub const ANOMALY_DETECTOR_RESOURCE_TYPE: &str = "AWS::APS::AnomalyDetector";
+
+/// The `message` the modelled `ResourceNotFoundException` carries for an anomaly
+/// detector that does not resolve.
+///
+/// The id itself goes in that exception's `resourceId` member — which is what the
+/// member is for — so the message is the fixed sentence the service answers with,
+/// rather than a second copy of the id.
+pub const ANOMALY_DETECTOR_NOT_FOUND_MESSAGE: &str = "Anomaly detector not found.";
+
+/// How many anomaly detectors one workspace holds before `CreateAnomalyDetector`
+/// refuses with the modelled `ServiceQuotaExceededException`.
+///
+/// Amazon Managed Service for Prometheus publishes no fixed number here, and this
+/// emulator models neither Service Quotas nor an account's adjustments, so this is the
+/// emulator's OWN bound on the store — the role [`WORKSPACE_QUOTA`] plays for
+/// workspaces. It is what stops a workspace's detector map (and the client-token map
+/// the same deletion releases) growing without end.
+pub const ANOMALY_DETECTORS_PER_WORKSPACE_QUOTA: usize = 1_000;
+
+/// The PromQL aggregation operators a Random Cut Forest query may be wrapped by.
+///
+/// Source: `RandomCutForestConfiguration$query`, which states "Random Cut Forest
+/// queries must be wrapped by a supported PromQL aggregation operator" and then lists
+/// them — "Supported PromQL aggregation operators: `avg`, `count`, `group`, `max`,
+/// `min`, `quantile`, `stddev`, `stdvar`, and `sum`". Sorted, so a refusal names them
+/// in one stable order.
+pub const RANDOM_CUT_FOREST_AGGREGATION_OPERATORS: &[&str] = &[
+    "avg", "count", "group", "max", "min", "quantile", "stddev", "stdvar", "sum",
+];
+
 /// This service's ARN namespace (`OPERATIONS.md`: "ARN namespace: `aps`").
 const ARN_SERVICE: &str = "aps";
 
@@ -237,6 +276,15 @@ pub struct Workspace {
     /// Sorted so a listing and a describe report the tags in one stable order.
     pub tags: BTreeMap<String, String>,
     pub kms_key_arn: Option<String>,
+    /// The anomaly detectors this workspace holds, keyed by `anomalyDetectorId`. A
+    /// detector is a CHILD of its workspace
+    /// (`/workspaces/{workspaceId}/anomalydetectors`), so it lives in the workspace's
+    /// own record: removing the workspace removes its detectors with it, and no second
+    /// map can disagree about which workspace a detector belongs to.
+    pub anomaly_detectors: HashMap<String, AnomalyDetector>,
+    /// `clientToken -> anomalyDetectorId`, which is what makes `CreateAnomalyDetector`
+    /// idempotent per its `@idempotencyToken`.
+    pub anomaly_detector_tokens: HashMap<String, String>,
     /// When the clock owes this workspace's next lifecycle transition, if one is
     /// pending: `CREATING` becomes `ACTIVE`, `DELETING` is removed.
     pub transition_due: Option<SystemTime>,
@@ -435,6 +483,32 @@ pub struct QueryLoggingConfiguration {
     pub client_token: Option<String>,
 }
 
+/// One stored anomaly detector: every member `AnomalyDetectorDescription` /
+/// `AnomalyDetectorSummary` report, plus the bookkeeping its lifecycle needs.
+#[derive(Debug, Clone)]
+pub struct AnomalyDetector {
+    pub anomaly_detector_id: String,
+    /// The workspace this detector belongs to — the `ws-` segment of its ARN.
+    pub workspace_id: String,
+    pub arn: String,
+    /// `AnomalyDetectorDescription$alias` is **required**, so a detector always has one.
+    pub alias: String,
+    pub evaluation_interval_in_seconds: i32,
+    pub missing_data_action: Option<crate::ops::types::AnomalyDetectorMissingDataAction>,
+    pub configuration: crate::ops::types::AnomalyDetectorConfiguration,
+    /// Sorted, so a describe reports the labels in one stable order.
+    pub labels: BTreeMap<String, String>,
+    /// One of [`STATUS_CREATING`], [`STATUS_ACTIVE`], [`STATUS_DELETING`].
+    pub status_code: String,
+    pub created_at: SystemTime,
+    pub modified_at: SystemTime,
+    /// Sorted so a describe reports the tags in one stable order.
+    pub tags: BTreeMap<String, String>,
+    /// When the clock owes this detector's next lifecycle transition, if one is
+    /// pending: `CREATING` becomes `ACTIVE`, `DELETING` is removed.
+    pub transition_due: Option<SystemTime>,
+}
+
 /// Per-service state for com-amazonaws-amp-amazonprometheusservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAmpAmazonprometheusserviceState {
@@ -464,6 +538,33 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
     pub fn materialize_due(&mut self, now: SystemTime) {
         let mut deleted: Vec<String> = Vec::new();
         for workspace in self.workspaces.values_mut() {
+            // A detector's own pending transitions, owed on the same terms. A workspace
+            // removed below takes its detectors with it, so this only has to settle the
+            // detectors of a workspace that stays.
+            let mut deleted_detectors: Vec<String> = Vec::new();
+            for detector in workspace.anomaly_detectors.values_mut() {
+                let Some(detector_due) = detector.transition_due else {
+                    continue;
+                };
+                if now < detector_due {
+                    continue;
+                }
+                detector.transition_due = None;
+                if detector.status_code == STATUS_DELETING {
+                    deleted_detectors.push(detector.anomaly_detector_id.clone());
+                } else {
+                    // Only the lifecycle status moves here — which `status` reports —
+                    // so `modifiedAt` keeps the instant the record itself last changed.
+                    detector.status_code = STATUS_ACTIVE.to_string();
+                }
+            }
+            for detector_id in deleted_detectors {
+                workspace.anomaly_detectors.remove(&detector_id);
+                workspace
+                    .anomaly_detector_tokens
+                    .retain(|_, id| id != &detector_id);
+            }
+
             if workspace.configuration.status_due.is_some_and(|due| now >= due) {
                 workspace.configuration.status_due = None;
                 workspace.configuration.status_code = CONFIG_STATUS_ACTIVE.to_string();
@@ -575,6 +676,19 @@ pub fn workspace_arn(region: &str, workspace_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("workspace/{workspace_id}"))
 }
 
+/// An anomaly detector ARN:
+/// `arn:aws:aps:<region>:<account>:anomalydetector/<workspaceId>/<anomalyDetectorId>`,
+/// as `AnomalyDetectorArn`'s pattern
+/// `^arn:aws[-a-z]*:aps:[-a-z0-9]+:[0-9]{12}:anomalydetector/ws-.+/ad-.+$` requires.
+/// The account segment comes from the engine, never from a literal.
+pub fn anomaly_detector_arn(region: &str, workspace_id: &str, anomaly_detector_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("anomalydetector/{workspace_id}/{anomaly_detector_id}"),
+    )
+}
+
 /// A rule groups namespace ARN, in the form
 /// `RuleGroupsNamespaceDescription$arn` documents: "For example,
 /// `arn:aws:aps:<region>:123456789012:rulegroupsnamespace/ws-example1-1234-abcd-5678-ef90abcd1234/rulesfile1`".
@@ -605,15 +719,30 @@ pub fn prometheus_endpoint(region: &str, workspace_id: &str) -> String {
 /// handler holding a stored record borrowed can still mint — which is what lets it mint
 /// only AFTER every refusal has been answered.
 pub fn mint_workspace_id(counter: &mut u64) -> String {
+    mint_id(b"workspace", "ws", counter)
+}
+
+/// A fresh anomaly detector id of the shape the service mints: `ad-` followed by a
+/// UUID, which `AnomalyDetectorId`'s pattern (`^ad-[0-9A-Za-z][-.0-9A-Z_a-z]*$`,
+/// length 1..64) requires. Minted exactly as [`mint_workspace_id`] is, off the same
+/// store counter, so two resources never share an id's input.
+pub fn mint_anomaly_detector_id(counter: &mut u64) -> String {
+    mint_id(b"anomalydetector", "ad", counter)
+}
+
+/// `<prefix>-<uuid>` for one resource `domain`: the shared body of
+/// [`mint_workspace_id`] and [`mint_anomaly_detector_id`], so both kinds of id are
+/// minted by ONE rule.
+fn mint_id(domain: &[u8], prefix: &str, counter: &mut u64) -> String {
     *counter += 1;
     let mut hasher = Sha256::new();
-    hasher.update(b"workspace");
+    hasher.update(domain);
     hasher.update(counter.to_be_bytes());
     hasher.update(process_seed().to_be_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     let hex = hex::encode(digest);
     format!(
-        "ws-{}-{}-{}-{}-{}",
+        "{prefix}-{}-{}-{}-{}-{}",
         &hex[0..8],
         &hex[8..12],
         &hex[12..16],
@@ -721,11 +850,61 @@ pub fn logging_configuration_status(
 /// The stored tags as the `TagMap` the wire shapes carry. Always a map, empty when
 /// the resource has no tags, so a reader sees `{}` rather than an absent member.
 pub fn tag_map(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
+    string_map(tags, false)
+}
+
+/// The stored metric labels as the `PrometheusMetricLabelMap` the wire shapes carry.
+/// ABSENT when the resource carries no labels — the member is optional and a detector
+/// created without labels has none, so there is nothing to report.
+pub fn label_map(labels: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
+    string_map(labels, true)
+}
+
+/// One stored string map as the wire map shape, so [`tag_map`] and [`label_map`] share
+/// ONE projection and differ only in `empty_is_absent`: whether an empty map is
+/// reported as `{}` or left out of the response altogether.
+fn string_map(
+    map: &BTreeMap<String, String>,
+    empty_is_absent: bool,
+) -> Option<HashMap<String, String>> {
+    if empty_is_absent && map.is_empty() {
+        return None;
+    }
     Some(
-        tags.iter()
+        map.iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
     )
+}
+
+/// The operator an expression APPLIES outermost, when it leads with one: the identifier
+/// the expression STARTS with, immediately followed by its argument list (`sum(x)`) or by
+/// an aggregation modifier (`sum by (job) (x)`, `sum without (job) (x)`) — the form
+/// PromQL's aggregation syntax takes, `<aggr-op> [by|without (<labels>)] (<expression>)`.
+///
+/// This is how [`RANDOM_CUT_FOREST_AGGREGATION_OPERATORS`] is checked: a Random Cut
+/// Forest query must be WRAPPED by one of those aggregation operators, so the whole
+/// expression has to BE a call to one. `None` when the expression does not lead with a
+/// call at all (a bare selector, a parenthesised or arithmetic expression), which is
+/// exactly the shape that is not wrapped.
+pub fn leading_call_operator(expression: &str) -> Option<&str> {
+    let trimmed = expression.trim_start();
+    let end = trimmed
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(trimmed.len());
+    let (identifier, rest) = trimmed.split_at(end);
+    // An identifier starts with a letter or `_`, so a leading digit is a number and not
+    // a call at all.
+    if identifier.is_empty() || identifier.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let applies = rest.starts_with('(')
+        || ["by", "without"].iter().any(|modifier| {
+            rest.strip_prefix(modifier)
+                .is_some_and(|tail| tail.starts_with('(') || tail.starts_with(char::is_whitespace))
+        });
+    applies.then_some(identifier)
 }
 
 /// The query logging destinations to STORE for a request's `destinations` member: the

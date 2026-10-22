@@ -255,6 +255,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             kms_key_arn: input.kms_key_arn,
+            // A fresh workspace holds no child resources yet; `CreateAnomalyDetector`
+            // fills these in.
+            anomaly_detectors: ::std::collections::HashMap::new(),
+            anomaly_detector_tokens: ::std::collections::HashMap::new(),
             transition_due: Some(now + crate::state::TRANSITION_DELAY),
             delete_token: None,
             // A workspace is created with the service's default configuration, which
