@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBackendJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBackendJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBackendJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the job records this app has accumulated for one backend environment.
+//!
+//! Every mutating AmplifyBackend operation records a job against the app (see
+//! [`crate::state::BackendApp::record_job`]), and this operation is the enumeration of
+//! that same map: the records it reports are exactly the ones `GetBackendJob` reads one
+//! at a time, narrowed by the request's `JobId` / `Operation` / `Status` filters, ordered
+//! newest first, and cut into pages of at most `MaxResults` records with an opaque
+//! `NextToken` that resumes immediately after the record the previous page ended on.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +154,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBackendJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBackendJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBackendJobs"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBackendJobsError::from(ListBackendJobsErrorModeled::GatewayTimeoutException(
+                crate::state::store_unavailable(),
+            ))
+        })?;
+
+        // `MaxResults` is modelled `@range{min:1,max:25}`, so the runtime has already
+        // refused anything outside that span: reaching here, the value is a usable page
+        // size. A request that names none is served at the modelled maximum.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+        let app = store.app_mut(&input.app_id).ok_or_else(|| {
+            ListBackendJobsError::from(ListBackendJobsErrorModeled::NotFoundException(
+                crate::state::not_found(
+                    crate::state::RESOURCE_TYPE_BACKEND,
+                    format!("no backend exists for app {}", input.app_id),
+                ),
+            ))
+        })?;
+
+        // Materialise the completions the clock has ALREADY made due, before the records
+        // are read or filtered on `Status`: the transition was owed at each job's
+        // `completes_at` whether or not anybody listed, so this call reports the same
+        // status a `GetBackendJob` of the same job would report at the same instant.
+        for job in app.jobs.values_mut() {
+            job.settle(now);
+        }
+
+        // A job is addressed by (app, environment, job id), so the environment label
+        // selects the records; the optional members narrow them further. The environment
+        // itself need not still exist — a job record OUTLIVES it (see
+        // `BackendApp::jobs`), so the jobs of a deleted environment are still listed.
+        let mut matching: Vec<&crate::state::BackendJob> = app
+            .jobs
+            .values()
+            .filter(|job| job.backend_environment_name == input.backend_environment_name)
+            .filter(|job| {
+                input
+                    .job_id
+                    .as_deref()
+                    .is_none_or(|job_id| job.job_id == job_id)
+            })
+            .filter(|job| {
+                input
+                    .operation
+                    .as_deref()
+                    .is_none_or(|operation| job.operation == operation)
+            })
+            .filter(|job| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| job.status == status)
+            })
+            .collect();
+        // Newest first, which is the order a caller polling its own jobs wants, and a
+        // TOTAL order (the id breaks a tie between two jobs minted in the same
+        // millisecond) so paging over it neither repeats nor skips a record.
+        matching.sort_by(|left, right| order_key(right).cmp(&order_key(left)));
+
+        // Resume immediately after the record the previous page ended on. A token this
+        // operation did not mint for this (app, environment), or one naming a record
+        // that no longer matches, is REFUSED rather than silently restarting the walk:
+        // a page that quietly began again would report the same job twice.
+        let start = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => {
+                let resume_after = decode_next_token(
+                    token,
+                    &input.app_id,
+                    &input.backend_environment_name,
+                )
+                .ok_or_else(|| unresolvable_next_token(&input.backend_environment_name))?;
+                matching
+                    .iter()
+                    .position(|job| job.job_id == resume_after)
+                    .ok_or_else(|| unresolvable_next_token(&input.backend_environment_name))?
+                    .saturating_add(1)
+            }
+            None => 0,
+        };
+
+        let jobs: Vec<BackendJobRespObj> = matching
+            .get(start..)
+            .unwrap_or_default()
+            .iter()
+            .take(page_size)
+            .map(|job| BackendJobRespObj {
+                app_id: job.app_id.clone(),
+                backend_environment_name: job.backend_environment_name.clone(),
+                create_time: Some(crate::state::format_time(job.create_time)),
+                error: job.error.clone(),
+                job_id: Some(job.job_id.clone()),
+                operation: Some(job.operation.clone()),
+                status: Some(job.status.clone()),
+                update_time: Some(crate::state::format_time(job.update_time)),
+            })
+            .collect();
+
+        // A token is minted only when a record this page did not reach still matches, so
+        // a caller that paged to the end is told so by its absence.
+        let next_token = if start.saturating_add(jobs.len()) < matching.len() {
+            jobs.last()
+                .and_then(|job| job.job_id.as_deref())
+                .map(|last| {
+                    encode_next_token(&input.app_id, &input.backend_environment_name, last)
+                })
+        } else {
+            None
+        };
+
+        Ok(ListBackendJobsOutput {
+            jobs: Some(jobs),
+            next_token,
+        })
     }
+}
+
+/// The page size used when a request names no `MaxResults`.
+///
+/// `ListBackendJobsRequest$MaxResults` is modelled `@range{min:1,max:25}` and AWS
+/// documents no default, so an unbounded request is served at that modelled maximum —
+/// which is also what bounds one response.
+const DEFAULT_MAX_RESULTS: usize = 25;
+
+/// Version tag inside the opaque `NextToken`, so a token in any other shape is refused
+/// rather than misread as a job id.
+const TOKEN_PREFIX: &str = "v1:";
+
+/// The total order job records are reported in, newest first once reversed.
+///
+/// `create_time` orders the records; the job id breaks a tie between two jobs minted in
+/// the same millisecond. The id is compared by LENGTH first because it is a decimal
+/// value (see `BackendApp::mint_job_id`), for which a plain string compare would order
+/// `"9"` after `"10"`.
+fn order_key(job: &crate::state::BackendJob) -> (std::time::SystemTime, usize, &str) {
+    (job.create_time, job.job_id.len(), job.job_id.as_str())
+}
+
+/// Mint the opaque `NextToken` that resumes after `last_job_id` within one
+/// (app, backend environment).
+///
+/// The token encodes a POSITION in this operation's own order plus the scope it was
+/// issued for, so it cannot be replayed against another app or environment, and it is
+/// never an echo of anything the caller sent. The job id comes first: it is a decimal
+/// value, so the first `:` always ends it however the caller's identifiers are spelled.
+fn encode_next_token(app_id: &str, environment_name: &str, last_job_id: &str) -> String {
+    hex::encode(format!(
+        "{TOKEN_PREFIX}{last_job_id}:{app_id}:{environment_name}"
+    ))
+}
+
+/// The job id a `NextToken` resumes after, or `None` when the token was not minted by
+/// [`encode_next_token`] for this (app, backend environment).
+fn decode_next_token(token: &str, app_id: &str, environment_name: &str) -> Option<String> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let (last_job_id, scope) = decoded.strip_prefix(TOKEN_PREFIX)?.split_once(':')?;
+    (scope == format!("{app_id}:{environment_name}")).then(|| last_job_id.to_string())
+}
+
+/// The refusal for a `NextToken` this operation cannot resolve to a position in the
+/// requested environment's job list.
+///
+/// `BadRequestException` ("An error returned if a request is not formed properly") is
+/// this operation's modelled client-input error; the message is built from the request so
+/// the caller can see what it addressed.
+fn unresolvable_next_token(environment_name: &str) -> ListBackendJobsError {
+    ListBackendJobsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(format!(
+            "NextToken is not a pagination token this service issued for backend environment {environment_name}"
+        )),
+    })
+    .into()
 }
