@@ -48,7 +48,7 @@ const ABSENT_ACTION_ID: &str = "gateaction000001";
 /// operation's own outcome, which the gate is what stands in front of.
 ///
 /// This is every implemented operation of the service except
-/// `GetEnrollmentConfiguration` and `UpdateEnrollmentConfiguration`; the ten
+/// `GetEnrollmentConfiguration` and `UpdateEnrollmentConfiguration`; the
 /// still-scaffolded ones answer 501 whether or not the account is enrolled, so
 /// they are not listed (see the `SCAFFOLDED, NOT IMPLEMENTED` headers in
 /// `src/ops/`).
@@ -64,6 +64,11 @@ fn gated_calls() -> Vec<(&'static str, Value, u16)> {
         ("ListAutomationEvents", json!({}), 200),
         ("ListAutomationRules", json!({}), 200),
         ("ListRecommendedActions", json!({}), 200),
+        (
+            "ListAutomationRulePreview",
+            json!({"ruleType": "AccountRule", "recommendedActionTypes": ["UpgradeEbsVolumeType"]}),
+            200,
+        ),
         ("ListTagsForResource", json!({"resourceArn": arn}), 404),
         ("CreateAutomationRule", minimal_rule("gate-rule"), 200),
         (

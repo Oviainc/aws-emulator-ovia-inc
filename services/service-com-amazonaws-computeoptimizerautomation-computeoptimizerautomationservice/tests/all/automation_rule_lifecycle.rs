@@ -71,6 +71,9 @@ pub(crate) fn enroll_caller(engine: &Arc<engine::InMemoryEngine>) {
 }
 
 /// Call one operation and return `(http status, parsed body)`.
+///
+/// `pub(crate)` because the other suites in this crate drive the service the same
+/// way: one awsJson1_0 harness for all of them, not one each.
 pub(crate) async fn call(
     router: &MultiServiceRouter,
     operation: &str,

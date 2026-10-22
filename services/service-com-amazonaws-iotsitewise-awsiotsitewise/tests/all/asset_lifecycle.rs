@@ -92,7 +92,7 @@ pub(crate) fn error_code(body: &Value) -> &str {
 /// Hand-rolled on purpose, as an INDEPENDENT oracle: the handler encodes its token
 /// with the `hex` crate, so re-using that crate here would let one encoding bug
 /// agree with itself and pass.
-fn hex_token(asset_id: &str) -> String {
+pub(crate) fn hex_token(asset_id: &str) -> String {
     asset_id
         .as_bytes()
         .iter()

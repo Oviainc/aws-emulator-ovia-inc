@@ -151,11 +151,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(DeleteGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // Removing the record removes the API keys held under it with it, so a later
         // `ListApiKeys` on the same id answers `NotFoundException` too.
         if state.lock().graphql_apis.remove(&input.api_id).is_none() {
             return Err(DeleteGraphqlApiErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("No GraphQL API found with ID {}", input.api_id)),
+                message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         }
