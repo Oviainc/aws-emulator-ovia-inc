@@ -548,6 +548,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         }),
                 }
             }),
+            // A brand new cluster has run no asynchronous update yet; the
+            // operations that start one (`AssociateEncryptionConfig` and friends)
+            // write into this map.
+            updates: ::std::collections::BTreeMap::new(),
         };
 
         let cluster = record.to_cluster();

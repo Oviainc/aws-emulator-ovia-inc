@@ -9,6 +9,10 @@
 //! reads and writes, plus the two projections the model asks for (`Component`
 //! and `ComponentSummary`).
 //!
+//! Beside the components, the store holds one app environment's UI-builder
+//! metadata: the feature flags `PutMetadataFlag` writes and `GetMetadata`
+//! reports.
+//!
 //! ## The codegen job, and the clock that moves its status
 //!
 //! `StartCodegenJob` mints the service's other resource, the CODEGEN JOB, and
@@ -34,8 +38,8 @@ use crate::ops::types::{
     CodegenFeatureFlags, CodegenJob, CodegenJobGenericDataSchema, CodegenJobRenderConfig,
     Component, ComponentBindingPropertiesValue, ComponentChild, ComponentDataConfiguration,
     ComponentEvent, ComponentProperty, ComponentSummary, ComponentVariant, FieldConfig, Form,
-    FormCTA, FormDataTypeConfig, FormStyle, ResourceNotFoundException, SectionalElement, Theme,
-    ThemeValues,
+    FormCTA, FormDataTypeConfig, FormStyle, InvalidParameterException, ResourceConflictException,
+    ResourceNotFoundException, SectionalElement, Theme, ThemeValues,
 };
 
 /// The largest page `ListComponents` serves, and the page size it uses when the
@@ -62,6 +66,48 @@ pub const EXPORT_PAGE_LIMIT: usize = COMPONENT_PAGE_LIMIT as usize;
 /// released by `DeleteComponent`, which also forgets that component's client
 /// tokens, so the token map can never outgrow this bound either.
 pub const COMPONENT_QUOTA: usize = 1_000;
+
+/// The feature names this service's metadata holds — the catalogue
+/// `PutMetadataFlag` accepts and `GetMetadata` reports.
+///
+/// `FeaturesMap` is modelled as an open `String -> String` map and names no
+/// feature (`smithy_query(query="shape",shape="FeaturesMap")`), so the catalogue
+/// cannot be read off the model: it is the fixed set of UI-builder feature flags
+/// `GetMetadata` reports for an app environment, which is what `PutMetadataFlag`
+/// validates `featureName` against — any other name is refused rather than
+/// stored.
+pub const METADATA_FEATURES: [&str; 5] = [
+    "autoGenerateForms",
+    "autoGenerateViews",
+    "isRelationshipSupported",
+    "isNonModelSupported",
+    "isGraphQLEnabled",
+];
+
+/// What `GetMetadata` reports for a feature no `PutMetadataFlag` has set.
+///
+/// Every feature in [`METADATA_FEATURES`] is a flag, and `PutMetadataFlagBody$newValue`
+/// is the free-form string a caller sets it to, so an app environment nothing has
+/// written reports every one of them off. This is the emulator's OWN starting
+/// value — AWS publishes no default for these flags — and it moves only when a
+/// `PutMetadataFlag` writes one.
+pub const METADATA_FEATURE_DEFAULT: &str = "false";
+
+/// How many app environments the metadata store holds flags for before
+/// `PutMetadataFlag` refuses to start another one.
+///
+/// Amplify UI Builder publishes no quota on app environments this emulator can
+/// quote, so — exactly like [`COMPONENT_QUOTA`] — this is the emulator's OWN
+/// bound on the store rather than a claim about any account's limit, and it is
+/// what stops the state growing without end: `appId` and `environmentName` are
+/// request-supplied `@httpLabel` values, so without a bound every request naming
+/// a fresh pair would add an entry nothing ever releases (the service models no
+/// delete-metadata operation). It is set far above any workflow an emulator
+/// serves. Each entry holds at most [`METADATA_FEATURES`]`.len()` values —
+/// `PutMetadataFlag` refuses every other feature name — so the whole store is
+/// bounded by this many entries times that many values, each value no longer
+/// than the request that wrote it.
+pub const METADATA_ENVIRONMENT_QUOTA: usize = 1_000;
 
 /// How many forms the store holds before `CreateForm` refuses with the modelled
 /// `ServiceQuotaExceededException`.
@@ -418,6 +464,13 @@ pub struct ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// own component rather than reporting a component the request does not
     /// address.
     pub component_tokens: HashMap<(EnvironmentKey, String), String>,
+    /// The UI-builder metadata flags written for one app environment, keyed by
+    /// the (appId, environmentName) the `PutMetadataFlag` addressed: the feature
+    /// name to the value it was last set to. A feature nothing has written is
+    /// absent here and reported as [`METADATA_FEATURE_DEFAULT`], so the map holds
+    /// only what a caller actually stored, and how many app environments it holds
+    /// at all is bounded by [`METADATA_ENVIRONMENT_QUOTA`].
+    pub metadata_flags: HashMap<EnvironmentKey, HashMap<String, String>>,
     /// Every codegen job, keyed by the (appId, environmentName) it belongs to and
     /// held in start order within that environment.
     pub codegen_jobs: HashMap<EnvironmentKey, Vec<StoredCodegenJob>>,
@@ -469,6 +522,39 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
         self.components_in(app_id, environment_name)
             .iter()
             .find(|component| component.id == id)
+    }
+
+    /// Whether `id` names a component some OTHER app environment owns.
+    ///
+    /// A component is addressed by (appId, environmentName, id), so an id that
+    /// resolves outside the app environment the request named is a request made
+    /// in the wrong scope — told apart here from an id that names no component at
+    /// all, which is simply absent.
+    pub fn component_in_other_scope(
+        &self,
+        app_id: &str,
+        environment_name: &str,
+        id: &str,
+    ) -> bool {
+        self.components
+            .iter()
+            .filter(|((app, environment), _)| app != app_id || environment != environment_name)
+            .any(|(_, components)| components.iter().any(|component| component.id == id))
+    }
+
+    /// The live component called `name` in one app environment, if there is one.
+    ///
+    /// A component name identifies a component within its app environment, so
+    /// this is what a create (or a rename) consults before taking a name.
+    pub fn component_named(
+        &self,
+        app_id: &str,
+        environment_name: &str,
+        name: &str,
+    ) -> Option<&StoredComponent> {
+        self.components_in(app_id, environment_name)
+            .iter()
+            .find(|component| component.name == name)
     }
 
     /// The component `id` names in one app environment, for a caller that
@@ -530,6 +616,57 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// Remember that `token` created the component `id` in that app environment.
     pub fn remember_token(&mut self, key: EnvironmentKey, token: String, id: String) {
         self.component_tokens.insert((key, token), id);
+    }
+
+    /// The metadata features of one app environment: every feature in
+    /// [`METADATA_FEATURES`] with the value a `PutMetadataFlag` last wrote for it,
+    /// or [`METADATA_FEATURE_DEFAULT`] for one nothing has written.
+    pub fn metadata_features(
+        &self,
+        app_id: &str,
+        environment_name: &str,
+    ) -> HashMap<String, String> {
+        let written = self
+            .metadata_flags
+            .get(&(app_id.to_string(), environment_name.to_string()));
+        METADATA_FEATURES
+            .iter()
+            .map(|feature| {
+                let value = written
+                    .and_then(|flags| flags.get(*feature))
+                    .cloned()
+                    .unwrap_or_else(|| METADATA_FEATURE_DEFAULT.to_string());
+                ((*feature).to_string(), value)
+            })
+            .collect()
+    }
+
+    /// Store the value of one metadata feature of an app environment.
+    ///
+    /// Writing a feature of an app environment the store does not hold yet starts
+    /// an entry, which is what [`METADATA_ENVIRONMENT_QUOTA`] bounds: a caller
+    /// checks [`Self::can_hold_metadata_for`] first and refuses past the bound
+    /// rather than growing the store without end.
+    pub fn set_metadata_flag(&mut self, key: EnvironmentKey, feature: String, value: String) {
+        self.metadata_flags
+            .entry(key)
+            .or_default()
+            .insert(feature, value);
+    }
+
+    /// How many app environments the metadata store holds flags for — what
+    /// [`METADATA_ENVIRONMENT_QUOTA`] bounds.
+    pub fn metadata_environments(&self) -> usize {
+        self.metadata_flags.len()
+    }
+
+    /// Whether a metadata write to `key` is within the store's bound: an app
+    /// environment the store already holds always is (the write replaces a value
+    /// in an existing entry, and an entry holds at most the catalogue), and a new
+    /// one only while the store is below [`METADATA_ENVIRONMENT_QUOTA`].
+    pub fn can_hold_metadata_for(&self, key: &EnvironmentKey) -> bool {
+        self.metadata_flags.contains_key(key)
+            || self.metadata_environments() < METADATA_ENVIRONMENT_QUOTA
     }
 
     /// How many components the whole store holds — what [`COMPONENT_QUOTA`]
@@ -876,12 +1013,47 @@ fn token_scope(key: &EnvironmentKey) -> u32 {
     (hasher.finish() >> 32) as u32
 }
 
+/// True when `name` is a feature this service's metadata holds.
+pub fn is_known_metadata_feature(name: &str) -> bool {
+    METADATA_FEATURES.contains(&name)
+}
+
 /// The `ResourceNotFoundException` payload for an id that names no component in
 /// the app environment the request addressed.
 pub fn component_not_found(app_id: &str, environment_name: &str, id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!(
             "no component {id} in app {app_id} environment {environment_name}"
+        )),
+    }
+}
+
+/// The `InvalidParameterException` payload for an id that names a component
+/// another app environment owns: the request is addressed to the wrong scope,
+/// which is a different failure from an id that names nothing.
+pub fn component_wrong_scope(
+    app_id: &str,
+    environment_name: &str,
+    id: &str,
+) -> InvalidParameterException {
+    InvalidParameterException {
+        message: Some(format!(
+            "component {id} does not belong to app {app_id} environment {environment_name}"
+        )),
+    }
+}
+
+/// The `ResourceConflictException` payload for a component name another live
+/// component of the same app environment already holds.
+pub fn duplicate_component_name(
+    app_id: &str,
+    environment_name: &str,
+    name: &str,
+) -> ResourceConflictException {
+    ResourceConflictException {
+        message: Some(format!(
+            "a component named {name} already exists in app {app_id} environment \
+             {environment_name}"
         )),
     }
 }
