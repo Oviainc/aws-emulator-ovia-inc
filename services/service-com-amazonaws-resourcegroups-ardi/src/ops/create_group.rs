@@ -301,6 +301,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group_configuration: None,
         };
         store.groups.insert(record.name.clone(), record);
+        // Everything below is owned, so the store lock is released before the record
+        // is formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, where, what, and
+        // the outcome. Metadata only — no tag values, no query body — and
+        // request-derived values are `Debug`-escaped so none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?region,
+            group = ?input.name,
+            outcome = "created",
+            "resource group created",
+        );
         Ok(output)
     }
 }

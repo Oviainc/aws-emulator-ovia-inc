@@ -230,6 +230,33 @@ pub fn request_region(parts: &http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
+/// The `target` every audit record this service emits carries, so a consumer can
+/// select the access trail without reading the rest of the emulator's traces.
+///
+/// A state-changing operation emits ONE record, at `INFO`, naming the operation,
+/// the caller's presented access key id, the region the request resolved to, the
+/// resource it changed and the outcome. Metadata only — never a request body, a
+/// tag value or a credential secret.
+pub const AUDIT_TARGET: &str = "emulator::audit";
+
+/// The identity a request presents, for an audit record: the access key id in its
+/// SigV4 credential scope. `emulator_server::extract_akid` answers `"default"`
+/// when the request carries no scope. An access key id NAMES a caller and is not
+/// a secret — the signature and the secret key are never read here.
+pub fn request_caller(parts: &http::request::Parts) -> String {
+    emulator_server::extract_akid(&parts.headers)
+}
+
+/// Whether `partition` matches the partition production the modelled ARN patterns
+/// use: `aws(-[a-z]+)*`.
+fn is_arn_partition(partition: &str) -> bool {
+    let mut segments = partition.split('-');
+    segments.next() == Some("aws")
+        && segments.all(|segment| {
+            !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_lowercase())
+        })
+}
+
 /// Whether `region` matches the region production the modelled ARN patterns use:
 /// `[a-z]{2}(-[a-z]+)+-\d{1}`.
 fn is_arn_region(region: &str) -> bool {
@@ -354,10 +381,10 @@ pub fn is_resource_arn(arn: &str) -> bool {
 ///
 /// The shape is the modelled `ResourceArn`'s own:
 /// `^arn:aws(-[a-z]+)*:[a-z0-9\-]*:([a-z]{2}(-[a-z]+)+-\d{1})?:([0-9]{12})?:.+$`
-/// — six fields; a partition starting `aws`; a lowercase service; a region that
-/// is either empty (a global service, as in `arn:aws:s3:::bucket`) or shaped like
-/// an AWS region; an account that is either empty or twelve digits; and a
-/// non-empty resource.
+/// — six fields; a partition matching `aws(-[a-z]+)*`; a lowercase service; a
+/// region that is either empty (a global service, as in `arn:aws:s3:::bucket`) or
+/// shaped like an AWS region; an account that is either empty or twelve digits;
+/// and a non-empty resource.
 fn parse_arn(arn: &str) -> Option<(&str, &str)> {
     let mut fields = arn.splitn(6, ':');
     if fields.next()? != "arn" {
@@ -368,7 +395,7 @@ fn parse_arn(arn: &str) -> Option<(&str, &str)> {
     let region = fields.next()?;
     let account = fields.next()?;
     let resource = fields.next()?;
-    if !partition.starts_with("aws") {
+    if !is_arn_partition(partition) {
         return None;
     }
     if service.is_empty()
