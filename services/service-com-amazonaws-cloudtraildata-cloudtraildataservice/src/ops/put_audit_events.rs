@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAuditEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAuditEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAuditEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Ingests a batch of audit events into a CloudTrail Lake channel held in this
+//! service's engine state (see [`crate::state`]): the channel is resolved from
+//! `channelArn` (full ARN or ARN suffix), the caller's account and the channel's
+//! external-id requirement are checked, the batch is rejected as a whole when it
+//! repeats an event id, and every event that passes per-event validation is APPENDED to
+//! the channel's ingest log under a freshly minted `eventID` which is then echoed in
+//! `successful`. Events that fail validation are reported per event in `failed`, which
+//! is a partial failure, not an operation error.
+//!
+//! The channel's ingest log is the emulator's own record of what it accepted, bounded by
+//! the retention limits in [`crate::state`] (oldest evicted first) so repeated calls
+//! cannot grow the store without limit, and every request — ingested or refused — emits
+//! one structured access record (see `record_access`).
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +129,94 @@ impl From<PutAuditEventsErrorModeled> for PutAuditEventsError {
     }
 }
 
+/// The largest `eventData` payload a single event may carry, as
+/// [`crate::state::MAX_EVENT_DATA_BYTES`] — exported there so this handler and the
+/// crate's tests cannot disagree about where the bound sits.
+use crate::state::MAX_EVENT_DATA_BYTES;
+
+/// The base64-SHA256 checksum of `event_data`, which is what
+/// `AuditEvent$eventDataChecksum` carries: the model documents it as the output of
+/// `printf %s $eventdata | openssl dgst -binary -sha256 | base64` — the raw 32-byte
+/// digest, standard base64 with padding.
+///
+/// The codec is `aws_smithy_types::base64`, the standard-alphabet encoder the wire
+/// serializer already uses for every Smithy blob, so this crate needs no second base64
+/// implementation.
+fn event_data_checksum(event_data: &str) -> String {
+    use sha2::Digest as _;
+    ::aws_smithy_types::base64::encode(sha2::Sha256::digest(event_data.as_bytes()))
+}
+
+/// Why this event cannot be ingested, as a `ResultErrorEntry$errorCode` from the
+/// catalog the model documents, plus the message explaining it — or `None` when the
+/// event is acceptable.
+///
+/// Size is clamped FIRST, so neither the O(n) digest below nor the JSON parse ever runs
+/// over a caller-sized payload this function is about to reject anyway; then integrity
+/// (was the payload received intact?), then content. An event that breaks several is
+/// reported under the earliest.
+///
+/// DEFERRED, and so deliberately not decided here: whether the JSON object carries the
+/// members of CloudTrail's open audit event schema (and therefore `FieldNotFound` for a
+/// missing one, or the operation's `ChannelUnsupportedSchema` for a schema version this
+/// channel does not take). The bootstrap issue puts `ChannelUnsupportedSchema` schema
+/// validation out of this slice, and its own happy path ingests a two-member payload, so
+/// this slice validates `eventData` only as far as it can without inventing a schema —
+/// the schema check is its own gap issue. Nothing is fabricated in the meantime: an
+/// event that parses is reported as ingested only because it really was stored.
+fn rejection(event: &AuditEvent) -> Option<(&'static str, String)> {
+    if event.event_data.len() > MAX_EVENT_DATA_BYTES {
+        return Some((
+            "FieldTooLong",
+            format!(
+                "eventData is {} bytes, which exceeds the {MAX_EVENT_DATA_BYTES} byte limit.",
+                event.event_data.len()
+            ),
+        ));
+    }
+    if let Some(supplied) = event.event_data_checksum.as_deref() {
+        if supplied != event_data_checksum(&event.event_data) {
+            return Some((
+                "InvalidChecksum",
+                "eventDataChecksum does not match the base64-SHA256 checksum of eventData."
+                    .to_string(),
+            ));
+        }
+    }
+    if !matches!(
+        serde_json::from_str::<serde_json::Value>(&event.event_data),
+        Ok(serde_json::Value::Object(_))
+    ) {
+        return Some((
+            "InvalidData",
+            "eventData is not a JSON object carrying the content of an audit event."
+                .to_string(),
+        ));
+    }
+    None
+}
+
+/// Emit this request's access record: when it happened (the subscriber's timestamp),
+/// which operation, the presented access key id, the caller account, the channel the
+/// caller named, and how the request ended. Carries NO event payload and no secret —
+/// an access key id is an identifier, not a credential.
+fn record_access(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    channel_arn: &str,
+    outcome: &str,
+    detail: &str,
+) {
+    tracing::info!(
+        operation = "PutAuditEvents",
+        akid = %::engine::extract_akid(&ctx.parts().headers),
+        account_id = %::engine::emulator_account_id(),
+        channel = ?channel_arn,
+        outcome = outcome,
+        detail = detail,
+        "PutAuditEvents access record"
+    );
+}
+
 /// The `PutAuditEvents` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +253,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAuditEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAuditEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAuditEvents"))
+        // The engine is reachable from `&self` (constructor-injected); never build one
+        // here, or the ingest log this request appends to is dropped on return.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            record_access(
+                ctx,
+                &input.channel_arn,
+                "UnsupportedOperationException",
+                "no state store for this service",
+            );
+            return Err(PutAuditEventsErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "PutAuditEvents is not supported here: this emulator engine holds no \
+                         CloudTrail Data state."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `channelArn` is "The ARN or ID (the ARN suffix) of a channel"; a value that
+        // names neither is not a channel ARN. (A value that does not even start with
+        // `arn:` is refused before this handler by the member's modelled `@pattern`.)
+        let Some(channel_ref) = crate::state::parse_channel_ref(&input.channel_arn) else {
+            record_access(
+                ctx,
+                &input.channel_arn,
+                "InvalidChannelARN",
+                "channelArn names no channel",
+            );
+            return Err(PutAuditEventsErrorModeled::InvalidChannelARN(InvalidChannelARN {
+                message: Some(format!(
+                    "The specified channel ARN is not a valid channel ARN: {}",
+                    input.channel_arn
+                )),
+            })
+            .into());
+        };
+
+        // Per-event validation is PURE (it reads only the request), so it runs before
+        // the state lock is taken: the digest and the JSON parse of a caller-sized
+        // payload never hold the lock against every other request to this service.
+        let rejections: Vec<Option<(&'static str, String)>> =
+            input.audit_events.iter().map(rejection).collect();
+
+        let mut guard = state.lock();
+        let Some(channel) = guard.channel_mut(&channel_ref) else {
+            record_access(
+                ctx,
+                &input.channel_arn,
+                "ChannelNotFound",
+                "no channel is registered under this reference",
+            );
+            return Err(PutAuditEventsErrorModeled::ChannelNotFound(ChannelNotFound {
+                message: Some(format!(
+                    "The channel could not be found: {}",
+                    input.channel_arn
+                )),
+            })
+            .into());
+        };
+
+        // Ownership: the emulator's caller is its own canonical account, so a channel
+        // owned by any other account is not the caller's to ingest into.
+        if channel.owner_account_id != ::engine::emulator_account_id() {
+            record_access(
+                ctx,
+                &input.channel_arn,
+                "ChannelInsufficientPermission",
+                "the channel is owned by another account",
+            );
+            return Err(
+                PutAuditEventsErrorModeled::ChannelInsufficientPermission(
+                    ChannelInsufficientPermission {
+                        message: Some(
+                            "The caller's account ID must be the same as the channel owner's \
+                             account ID."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `externalId` is "conditionally required when the channel's resource policy
+        // includes an external ID": absent or different is insufficient permission. A
+        // channel whose policy includes none ignores whatever the request supplies.
+        if let Some(required) = channel.required_external_id.as_deref() {
+            if input.external_id.as_deref() != Some(required) {
+                record_access(
+                    ctx,
+                    &input.channel_arn,
+                    "ChannelInsufficientPermission",
+                    "externalId is absent or does not match the channel's resource policy",
+                );
+                return Err(
+                    PutAuditEventsErrorModeled::ChannelInsufficientPermission(
+                        ChannelInsufficientPermission {
+                            message: Some(
+                                "The externalId does not match the external ID in the channel's \
+                                 resource policy."
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A repeated event id fails the WHOLE request — checked before anything is
+        // written, so such a request persists nothing.
+        let mut seen: ::std::collections::HashSet<&str> =
+            ::std::collections::HashSet::with_capacity(input.audit_events.len());
+        for event in &input.audit_events {
+            if !seen.insert(event.id.as_str()) {
+                record_access(
+                    ctx,
+                    &input.channel_arn,
+                    "DuplicatedAuditEventId",
+                    "the request repeats an event id; nothing was persisted",
+                );
+                return Err(PutAuditEventsErrorModeled::DuplicatedAuditEventId(
+                    DuplicatedAuditEventId {
+                        message: Some(format!(
+                            "Two or more entries in the request have the same event ID: {}",
+                            event.id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Per-event outcome: an accepted event is appended to the channel's ingest log
+        // under a freshly minted `eventID`; a rejected one is reported in `failed` and
+        // is NOT stored. Both lists are always present, empty when that bucket is.
+        let mut successful: Vec<AuditEventResultEntry> =
+            Vec::with_capacity(input.audit_events.len());
+        let mut failed: Vec<ResultErrorEntry> = Vec::new();
+        for (event, rejected) in input.audit_events.iter().zip(rejections) {
+            match rejected {
+                Some((error_code, error_message)) => failed.push(ResultErrorEntry {
+                    id: event.id.clone(),
+                    error_code: error_code.to_string(),
+                    error_message,
+                }),
+                None => {
+                    let event_id = crate::state::new_event_id();
+                    // Appends under the channel's retention bounds, so repeated calls
+                    // cannot grow this store without limit.
+                    channel.record_ingest(crate::state::IngestedEvent {
+                        source_id: event.id.clone(),
+                        event_id: event_id.clone(),
+                        event_data: event.event_data.clone(),
+                        event_data_checksum: event.event_data_checksum.clone(),
+                        ingested_at: ::std::time::SystemTime::now(),
+                    });
+                    successful.push(AuditEventResultEntry {
+                        id: event.id.clone(),
+                        event_id,
+                    });
+                }
+            }
+        }
+        drop(guard);
+
+        record_access(
+            ctx,
+            &input.channel_arn,
+            "Ingested",
+            &format!(
+                "accepted={} rejected={}",
+                successful.len(),
+                failed.len()
+            ),
+        );
+        Ok(PutAuditEventsOutput { successful, failed })
     }
 }

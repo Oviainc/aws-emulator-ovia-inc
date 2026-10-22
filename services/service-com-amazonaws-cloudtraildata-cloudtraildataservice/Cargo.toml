@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Verifies AuditEvent.eventDataChecksum (base64 of the SHA-256 of eventData) and
+# supplies the random bytes of the eventID this service mints.
+sha2 = { workspace = true }
+# Hex-codes those bytes into the eventID's UUID form.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
