@@ -22,6 +22,12 @@
 //!   operation names its resource by, so one quota has exactly one tag set however
 //!   it is reached.
 //!
+//! Beside them it owns the account's **Automatic Management configuration**
+//! (`StartAutoManagement` / `UpdateAutoManagement` / `StopAutoManagement` write it,
+//! `GetAutoManagementConfiguration` reports it). That one is ACCOUNT scoped — its
+//! only `OptInLevel` is `ACCOUNT` — so it is stored once for the account and reads
+//! the same at every regional endpoint.
+//!
 //! The overlay and the requests are per region (Service Quotas is a regional service:
 //! an increase applied in one region does not change another's value), while the
 //! catalog and the defaults are the same everywhere. The account is the emulator's
@@ -35,13 +41,14 @@
 //! model allows (`MaxResults` 1..100) they genuinely run to many
 //! `NextToken`-chained pages.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 
 use crate::ops::types::{
-    MetricInfo, QuotaPeriod, RequestedServiceQuotaChange, ServiceInfo, ServiceQuota, Tag,
+    MetricInfo, QuotaInfo, QuotaPeriod, RequestedServiceQuotaChange, ServiceInfo, ServiceQuota,
+    Tag,
 };
 
 /// The region a request carries no SigV4 credential scope to name, and the one a
@@ -105,6 +112,12 @@ pub const ARN_NAMESPACE: &str = "servicequotas";
 pub const LEVEL_ACCOUNT: &str = "ACCOUNT";
 /// `AppliedLevelEnum` / `AdjustableAtLevelEnum` member `ALL`.
 pub const LEVEL_ALL: &str = "ALL";
+
+/// `OptInStatus` member `ENABLED`: Automatic Management is started.
+pub const OPT_IN_STATUS_ENABLED: &str = "ENABLED";
+/// `OptInStatus` member `DISABLED`: Automatic Management is stopped — and what an
+/// account that has never started it reports.
+pub const OPT_IN_STATUS_DISABLED: &str = "DISABLED";
 
 /// `RequestStatus` member `PENDING`: the status a newly minted request carries.
 pub const STATUS_PENDING: &str = "PENDING";
@@ -218,6 +231,29 @@ pub struct AppliedQuota {
     pub quota_applied_at_level: String,
 }
 
+/// The account's Service Quotas Automatic Management configuration.
+///
+/// One record per account, not per region: the only `OptInLevel` the model declares
+/// is `ACCOUNT`.
+#[derive(Debug, Clone)]
+pub struct AutoManagementConfig {
+    /// `OptInLevel` — an `OptInLevel` member, as the opt-in named it.
+    pub opt_in_level: String,
+    /// `OptInType` — an `OptInType` member, as the opt-in named it.
+    pub opt_in_type: String,
+    /// `OptInStatus` — [`OPT_IN_STATUS_ENABLED`] while Automatic Management is
+    /// started, [`OPT_IN_STATUS_DISABLED`] once it is stopped. Stopping keeps the
+    /// record, so the preferences a later start would otherwise have to be given
+    /// again are still reported.
+    pub opt_in_status: String,
+    /// `NotificationArn` — the User Notifications ARN, when one was given.
+    pub notification_arn: Option<String>,
+    /// `ExclusionList`: `ExcludedService` -> the excluded `QuotaCode`s. Stored as the
+    /// codes the caller named; `GetAutoManagementConfiguration` reports them as
+    /// `QuotaInfo` entries, pairing each code with the catalog's `QuotaName`.
+    pub exclusion_list: BTreeMap<String, Vec<String>>,
+}
+
 /// One stored quota increase request.
 #[derive(Debug, Clone)]
 pub struct QuotaRequest {
@@ -302,6 +338,9 @@ pub struct ComAmazonawsServicequotasServicequotasv20190624State {
     global_applied_quotas: BTreeMap<(String, String), AppliedQuota>,
     /// The mutable state, per region.
     regions: BTreeMap<String, RegionState>,
+    /// The account's Automatic Management configuration: `None` until the account
+    /// opts in for the first time.
+    auto_management: Option<AutoManagementConfig>,
     /// The tags on an applied quota: the quota's CANONICAL ARN (what
     /// [`quota_arn`] builds, so a global quota's regionless one) -> `TagKey` ->
     /// `TagValue`, in tag-key order.
@@ -321,6 +360,7 @@ impl Default for ComAmazonawsServicequotasServicequotasv20190624State {
             default_quotas: seed_default_quotas(),
             global_applied_quotas: BTreeMap::new(),
             regions: BTreeMap::new(),
+            auto_management: None,
             quota_tags: BTreeMap::new(),
         }
     }
@@ -334,6 +374,49 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             .map(|(code, name)| ServiceInfo {
                 service_code: Some(code.clone()),
                 service_name: Some(name.clone()),
+            })
+            .collect()
+    }
+
+    /// The account's Automatic Management configuration as stored, or `None` while
+    /// the account has never opted in.
+    pub fn auto_management(&self) -> Option<&AutoManagementConfig> {
+        self.auto_management.as_ref()
+    }
+
+    /// Record the account's Automatic Management configuration: what an opt-in
+    /// (`StartAutoManagement`), a change to it (`UpdateAutoManagement`) and an opt-out
+    /// (`StopAutoManagement`, which only moves `OptInStatus` to
+    /// [`OPT_IN_STATUS_DISABLED`]) write.
+    pub fn set_auto_management(&mut self, config: AutoManagementConfig) {
+        self.auto_management = Some(config);
+    }
+
+    /// The stored exclusion list as `GetAutoManagementConfiguration` reports it:
+    /// every excluded `QuotaCode`, in stored order, paired with the `QuotaName` the
+    /// quota catalog holds for it.
+    ///
+    /// A code the catalog does not know is still reported, with no `QuotaName`: the
+    /// exclusion is the caller's own, so dropping it would under-report the
+    /// configuration. Empty when the account has no configuration stored.
+    pub fn auto_management_exclusion_view(&self) -> HashMap<String, Vec<QuotaInfo>> {
+        let Some(config) = self.auto_management.as_ref() else {
+            return HashMap::new();
+        };
+        config
+            .exclusion_list
+            .iter()
+            .map(|(service_code, quota_codes)| {
+                let quotas = quota_codes
+                    .iter()
+                    .map(|quota_code| QuotaInfo {
+                        quota_code: Some(quota_code.clone()),
+                        quota_name: self
+                            .default_quota(service_code, quota_code)
+                            .map(|quota| quota.quota_name.clone()),
+                    })
+                    .collect();
+                (service_code.clone(), quotas)
             })
             .collect()
     }

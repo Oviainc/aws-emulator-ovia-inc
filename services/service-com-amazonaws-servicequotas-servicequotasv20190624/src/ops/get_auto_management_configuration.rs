@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAutoManagementConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAutoManagementConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAutoManagementConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's Service Quotas Automatic Management configuration from state:
+//! the opt-in level, type and status, the notification ARN and the exclusion list the
+//! opt-in stored, with each excluded `QuotaCode` paired with the `QuotaName` the quota
+//! catalog holds for it.
+//!
+//! This is a REPORTING operation: it writes nothing, so two reads with no intervening
+//! Start/Update/Stop answer identically. An account that has never opted in has no
+//! configuration record, and is reported as `OptInStatus: DISABLED` with no
+//! preferences — the status enum's own "stopped" member, rather than an error, because
+//! Automatic Management is an account-level setting that is simply off until it is
+//! started.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +157,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAutoManagementConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAutoManagementConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAutoManagementConfiguration"))
+        // The request carries no members, and the configuration is ACCOUNT scoped, so
+        // neither the input nor the endpoint's region narrows what is reported.
+        let _ = (&input, ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAutoManagementConfigurationErrorModeled::ServiceException(ServiceException {
+                message: Some("the Service Quotas state store is unavailable".to_string()),
+            })
+        })?;
+
+        let quotas_state = state.lock();
+        let Some(config) = quotas_state.auto_management() else {
+            // Never opted in: nothing is monitored and no preference was ever given,
+            // so the only thing to report is that Automatic Management is not running.
+            return Ok(GetAutoManagementConfigurationOutput {
+                opt_in_status: Some(crate::state::OPT_IN_STATUS_DISABLED.to_string()),
+                ..GetAutoManagementConfigurationOutput::default()
+            });
+        };
+
+        // An absent `ExclusionList` and an empty one say the same thing — nothing is
+        // excluded — so the empty map is left off the wire rather than serialized.
+        let exclusion_list = quotas_state.auto_management_exclusion_view();
+        Ok(GetAutoManagementConfigurationOutput {
+            opt_in_level: Some(config.opt_in_level.clone()),
+            opt_in_type: Some(config.opt_in_type.clone()),
+            opt_in_status: Some(config.opt_in_status.clone()),
+            notification_arn: config.notification_arn.clone(),
+            exclusion_list: (!exclusion_list.is_empty()).then_some(exclusion_list),
+        })
     }
 }
