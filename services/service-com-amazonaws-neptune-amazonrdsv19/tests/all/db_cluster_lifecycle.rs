@@ -235,6 +235,10 @@ impl Neptune {
             .method("POST")
             .uri("/")
             .header("content-type", "application/x-www-form-urlencoded")
+            // This model's sigv4 name is `rds`, which it SHARES with the Amazon RDS and
+            // Amazon DocumentDB views of the same Query front door; the shared `rds` key
+            // resolves to the Amazon RDS crate and this service answers under its own
+            // service prefix, so the scope names that key here. See `src/service.rs`.
             .header(
                 // The routing key every front door reads: the SigV4 credential scope.
                 // Neptune SHARES the `rds` signing name with Amazon RDS and Amazon

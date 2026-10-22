@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the tag keys named from the tag set stored on the DynamoDB resource its
+//! `ResourceArn` names, leaving every other key alone, and answers an empty body.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The mirror of `tag_resource`: both resolve the ARN through
+//! [`crate::state::resolve_resource_arn`] and edit the one tag set the table holds,
+//! which `list_tags_of_resource` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +181,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        // The ARN is this operation's whole selector, and it names the region the
+        // table lives in as well as the table.
+        let resource = crate::state::resolve_resource_arn(&input.resource_arn).map_err(lift)?;
+
+        // The key list is caller-sized, so it is bounded BEFORE anything walks it: a
+        // table carries at most `MAX_TAGS_PER_TABLE` tags, so a request naming more
+        // keys than that names keys no resource can hold.
+        if input.tag_keys.len() > crate::state::MAX_TAGS_PER_TABLE {
+            return Err(too_many_keys(input.tag_keys.len()));
+        }
+
+        let mut store = state.lock();
+        // Finish the transition the clock already made due, so a table whose
+        // DeleteTable span has elapsed is not edited after it is gone.
+        store.apply_due_transitions(now);
+        let table = store
+            .table_mut(&resource.region, &resource.table)
+            .map_err(lift)?;
+        // "The operation conflicts with the resource's availability" — a table being
+        // deleted cannot take a configuration change.
+        if table.status(now) == crate::state::TableStatus::Deleting {
+            return Err(UntagResourceErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "Table {} is being deleted and cannot be untagged",
+                        resource.table
+                    )),
+                },
+            )
+            .into());
+        }
+        // Exactly the keys named go, and a key the table does not carry is nothing to
+        // remove — so repeating the call changes nothing further.
+        table.remove_tags(input.tag_keys.iter().map(String::as_str));
+
+        Ok(UntagResourceOutput)
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> UntagResourceError {
+    UntagResourceErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// Lift a store refusal into this operation's error channel.
+fn lift(error: crate::state::RequestError) -> UntagResourceError {
+    match error {
+        crate::state::RequestError::NotFound(message) => {
+            UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(message),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
+    }
+}
+
+/// The modelled limit error for a key list longer than any resource's tag set: "You
+/// can add up to 50 tags to a single DynamoDB table" (the `Tag` doc).
+fn too_many_keys(requested: usize) -> UntagResourceError {
+    UntagResourceErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(format!(
+            "Subscriber limit exceeded: a resource carries at most {} tags, so TagKeys may \
+             name at most that many keys, got {requested}",
+            crate::state::MAX_TAGS_PER_TABLE
+        )),
+    })
+    .into()
 }

@@ -357,6 +357,20 @@ pub struct Keyspace {
     pub tables: BTreeMap<String, Table>,
 }
 
+impl Keyspace {
+    /// The `replicationRegions` a report of this keyspace carries: the stored region
+    /// list for a `MULTI_REGION` keyspace, and nothing for any other strategy.
+    ///
+    /// "If the `replicationStrategy` of the keyspace is `MULTI_REGION`, a list of
+    /// replication Regions is returned" (`KeyspaceSummary$replicationRegions`), and the
+    /// member's modelled minimum length is 2 — which a single-Region keyspace's own
+    /// region, on its own, could never satisfy.
+    pub fn reported_replication_regions(&self) -> Option<Vec<String>> {
+        (self.replication_strategy == MULTI_REGION_STRATEGY)
+            .then(|| self.replication_regions.clone())
+    }
+}
+
 /// One table: everything `CreateTable` was given, plus what the service derives.
 #[derive(Debug, Clone)]
 pub struct Table {

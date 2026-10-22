@@ -36,6 +36,8 @@ mod rule_predicates;
 mod size_constraint_set;
 #[path = "all/sql_injection_match_set.rs"]
 mod sql_injection_match_set;
+#[path = "all/sql_injection_match_set_updates.rs"]
+mod sql_injection_match_set_updates;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/web_acl_default_action.rs"]

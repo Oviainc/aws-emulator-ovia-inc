@@ -15,6 +15,11 @@
 //! `PubliclyAccessible` default, each published bound of `Port`,
 //! `BackupRetentionPeriod` and `MaxRecords` plus one value past it, and the identifier
 //! shapes the `DBInstanceIdentifier` constraints admit and refuse.
+//!
+//! The wire harness here — the router, the `awsQuery` call, the status/`<Code>`
+//! assertions and the XML element readers — is `pub(crate)`, so the crate's other
+//! suites drive this service over the wire the same way rather than growing a second
+//! copy of it.
 
 use std::sync::Arc;
 use std::thread::sleep;

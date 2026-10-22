@@ -154,13 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(record) = store.resolver_endpoints.get(&input.resolver_endpoint_id) else {
             return Err(GetResolverEndpointErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resolver endpoint with ID '{}' does not exist",
-                        input.resolver_endpoint_id
-                    )),
-                    resource_type: Some("ResolverEndpoint".to_string()),
-                },
+                crate::state::resolver_endpoint_not_found(&input.resolver_endpoint_id),
             )
             .into());
         };

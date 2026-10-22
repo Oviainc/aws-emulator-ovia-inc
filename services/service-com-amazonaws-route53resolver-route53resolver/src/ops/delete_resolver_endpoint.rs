@@ -158,13 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Nothing is stored under that id — including a second delete of the
             // same endpoint, which the first one already removed.
             return Err(DeleteResolverEndpointErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Resolver endpoint with ID '{}' does not exist",
-                        input.resolver_endpoint_id
-                    )),
-                    resource_type: Some("ResolverEndpoint".to_string()),
-                },
+                crate::state::resolver_endpoint_not_found(&input.resolver_endpoint_id),
             )
             .into());
         };
