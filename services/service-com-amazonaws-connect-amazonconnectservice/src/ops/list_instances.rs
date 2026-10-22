@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects every stored instance onto an `InstanceSummary`, in instance-id order, one
+//! `MaxResults`-sized page at a time. The `NextToken` it returns carries the last id on
+//! the page, so the next call resumes immediately after it; the last page carries none.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +140,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInstances"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListInstancesErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Amazon Connect store is unavailable".to_string()),
+            })
+        })?;
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListInstancesErrorModeled::InvalidRequestException(InvalidRequestException {
+                    message: Some("NextToken is not a token this service issued".to_string()),
+                    reason: None,
+                })
+            })?),
+            None => None,
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let entries: Vec<(String, InstanceSummary)> = store
+            .instances
+            .iter()
+            .map(|(id, instance)| (id.clone(), instance.to_summary(now)))
+            .collect();
+        drop(store);
+
+        let (summaries, next_token) = crate::state::paginate(
+            entries,
+            cursor.as_deref(),
+            input.max_results,
+            crate::state::LIST_INSTANCES_DEFAULT_PAGE_SIZE,
+        );
+
+        Ok(ListInstancesOutput {
+            instance_summary_list: Some(summaries),
+            next_token,
+        })
     }
 }
