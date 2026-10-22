@@ -252,6 +252,10 @@ pub const TAGS_PER_RESOURCE_LIMIT: usize = 50;
 /// path rather than from the request.
 const DOCUMENT_HOST: &str = "artifact-documents";
 
+/// The visibility of a report AWS publishes in the Artifact catalog: it is visible to
+/// every account, as opposed to a report scoped to one customer.
+pub const VISIBILITY_PUBLIC: &str = "PUBLIC";
+
 /// One version of one AWS Artifact report, as this emulator persists it.
 ///
 /// Every member of `ReportSummary` and `ReportDetail` that can differ between two
@@ -292,6 +296,9 @@ pub struct Report {
     /// One of `AcceptanceType`'s values: `EXPLICIT` requires click-through acceptance
     /// of the report's term, `PASSTHROUGH` does not.
     pub acceptance_type: String,
+    /// Who can see this report — [`VISIBILITY_PUBLIC`] for everything AWS publishes in
+    /// the catalog. Stored rather than assumed, so the projections report the record.
+    pub visibility: String,
     /// The file name of the report document, used to build its URL.
     pub document_object: String,
     /// The file name of the term document, used to build its URL.
@@ -319,14 +326,21 @@ impl Report {
 
     /// The `ReportSummary` projection `ListReports` and `ListReportVersions` return for
     /// one version of this report.
+    ///
+    /// A catalog listing projects the PUBLISHED report: who published it, what period it
+    /// covers, which version this entry is and who may see it. The document-upload
+    /// progress members (`uploadState`, `statusMessage`) are not part of that projection —
+    /// the recorded AWS response for a published, PUBLIC catalog entry carries neither,
+    /// while the single-report metadata read ([`Report::to_detail`]) carries both — so
+    /// they are left unset here and reported there, from the one stored record.
     pub fn to_summary(&self, version: &ReportVersion, region: &str) -> ReportSummary {
         ReportSummary {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
             state: Some(version.state.clone()),
-            arn: Some(report_arn(region, &self.id)),
+            arn: Some(report_arn(region, &self.id, version.version)),
             version: Some(version.version),
-            upload_state: Some(version.upload_state.clone()),
+            upload_state: None,
             description: Some(version.description.clone()),
             period_start: Some(::aws_smithy_types::DateTime::from(version.period_start)),
             period_end: Some(::aws_smithy_types::DateTime::from(version.period_end)),
@@ -334,8 +348,9 @@ impl Report {
             category: Some(self.category.clone()),
             company_name: Some(self.company_name.clone()),
             product_name: Some(self.product_name.clone()),
-            status_message: version.status_message.clone(),
+            status_message: None,
             acceptance_type: Some(self.acceptance_type.clone()),
+            visibility: Some(self.visibility.clone()),
         }
     }
 
@@ -357,7 +372,7 @@ impl Report {
             // deleted report carries one, and the catalog holds none.
             deleted_at: None,
             state: Some(version.state.clone()),
-            arn: Some(report_arn(region, &self.id)),
+            arn: Some(report_arn(region, &self.id, version.version)),
             series: Some(self.series.clone()),
             category: Some(self.category.clone()),
             company_name: Some(self.company_name.clone()),
@@ -368,6 +383,7 @@ impl Report {
             sequence_number: Some(version.sequence_number),
             upload_state: Some(version.upload_state.clone()),
             status_message: version.status_message.clone(),
+            visibility: Some(self.visibility.clone()),
         }
     }
 }
@@ -1220,13 +1236,22 @@ fn remember_token<R>(
     }
 }
 
-/// The ARN of a report resource.
+/// The ARN of one VERSION of a report resource.
 ///
 /// AWS Artifact reports are service-owned, so the ARN carries the region the request was
-/// signed for and an EMPTY account id — the form the model's own `ListReports` example
-/// shows (`arn:aws:artifact:<region>::report/<reportId>`).
-pub fn report_arn(region: &str, report_id: &str) -> String {
-    format!("arn:aws:artifact:{region}::report/{report_id}")
+/// signed for and an EMPTY account id. The version is part of the ARN
+/// (`arn:aws:artifact:<region>::report/<reportId>:<version>`), because the resource an
+/// Artifact report ARN names is one published version of a report: `ListReportVersions`
+/// reports one entry per version, and two of them must not name the same resource.
+///
+/// The version-bearing form is what the recorded `ListReports` and `ListReportVersions`
+/// bodies quoted in
+/// `issues/things-that-now-work/20261022T003730Z-artifact-report-catalog-and-report-record-projection-diverge.md`
+/// show (`arn:aws:artifact:us-east-1::report/report-7g5j2DTVeNXWx7St:1`). It supersedes
+/// the version-less form the model's `ListReports` example sketches, which cannot name
+/// one version of a report at all.
+pub fn report_arn(region: &str, report_id: &str, version: i64) -> String {
+    format!("arn:aws:artifact:{region}::report/{report_id}:{version}")
 }
 
 /// The ARN of the term resource attached to one version of a report, in the same
@@ -1354,8 +1379,8 @@ fn is_region_shaped(value: &str) -> bool {
 
 /// True when `value` satisfies `ReportId`'s `^report-[a-zA-Z0-9]{16}$`.
 ///
-/// Two callers need it where the boundary validator cannot be the judge: a `nextToken`,
-/// which `ListReports` carries a report id in and the model does not constrain, and the
+/// Two callers need it where the boundary validator cannot be the judge: a pagination
+/// cursor, which carries a report id and which the model does not constrain, and the
 /// front door in [`crate::service`], which decides whether a request names a resource
 /// at all BEFORE that validator runs.
 pub fn is_report_id(value: &str) -> bool {
@@ -1365,8 +1390,8 @@ pub fn is_report_id(value: &str) -> bool {
 /// True when `value` satisfies `CustomerAgreementIdAttribute`'s
 /// `^customer-agreement-[a-zA-Z0-9]{16}$`.
 ///
-/// As with [`is_report_id`], this is for a value the model does not constrain: the
-/// `nextToken` `ListCustomerAgreements` carries a customer-agreement id in.
+/// As with [`is_report_id`], this is for a value the model does not constrain: the id a
+/// decoded `ListCustomerAgreements` pagination cursor resumes at.
 pub fn is_customer_agreement_id(value: &str) -> bool {
     is_id_shaped(value, "customer-agreement-")
 }
@@ -1392,68 +1417,197 @@ pub fn is_inquiry_id(value: &str) -> bool {
     suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-/// The separator a SCOPED pagination token — one cut for the sub-collection of ONE
-/// resource, as `ListReportVersions` and `ListComplianceInquiryQueries` both serve —
-/// joins the owning resource's id and the resume point with. `:` is a query-safe
-/// sub-delimiter, and it cannot appear in a `ReportId` or an `InquiryId`, so the split is
-/// unambiguous.
-const SCOPED_TOKEN_SEPARATOR: char = ':';
+// ---------------------------------------------------------------------------
+// Pagination tokens.
+//
+// A `nextToken` is an OPAQUE continuation value: the only thing a client may do with one
+// is hand it back. So a token this service mints carries NOTHING a caller could read a
+// record out of — not the id of the record the next page resumes at, and not the id of the
+// resource whose sub-collection was paged:
+//
+//   * WHERE the page resumes is carried as the POSITION in the operation's own reported
+//     order (an index), never as the key of a record the same response published;
+//   * WHICH resource a scoped page belongs to is carried as the DIGEST of that resource's
+//     id, so the cursor still binds to exactly one resource — a token cut for one report
+//     is refused on another — without putting the id on the wire;
+//   * the whole payload is SEALED with a digest over it, so a value a client assembled
+//     decodes to no cursor at all and is refused with the modelled `ValidationException`,
+//     rather than being honoured as a resume point this service never cut.
+//
+// This holds for EVERY paginated operation of the service, not only the report listings:
+// `ListReports`, `ListReportVersions`, `ListCustomerAgreements`, `ListComplianceInquiries`
+// and `ListComplianceInquiryQueries` all cut their page with a cursor from this codec, so
+// none of them can publish — or hand back a token anyone can decode into — one of its own
+// records' ids.
+//
+// The encoding is lowercase HEX: every character it emits is unreserved in a URI, so the
+// token survives `@httpQuery` round-tripping unescaped, it carries no punctuation a client
+// could mangle, and its output stays far inside `NextTokenAttribute`'s `@length(1..2048)`.
+// ---------------------------------------------------------------------------
 
-/// The scoped pagination token that resumes the sub-collection of `scope` at `resume_at`.
-///
-/// ONE spelling for every scoped token this service issues, so the two paginated
-/// sub-collections cannot drift apart: the token carries the resource it was cut for, not
-/// just an offset, which is what stops a token issued for one resource being spent as a
-/// resume point on another and a number a client made up being mistaken for a token the
-/// service issued.
-fn scoped_token<T: ::std::fmt::Display>(scope: &str, resume_at: T) -> String {
-    format!("{scope}{SCOPED_TOKEN_SEPARATOR}{resume_at}")
+/// The service every cursor this codec mints belongs to. Part of the encoded payload, so
+/// a value that is not a full cursor of THIS service never decodes to one.
+const CURSOR_SERVICE: &str = "artifact";
+
+/// The cursor kind a `ListReports` token carries.
+const REPORTS_CURSOR: &str = "reports";
+
+/// The cursor kind a `ListReportVersions` token carries.
+const REPORT_VERSIONS_CURSOR: &str = "reportVersions";
+
+/// The cursor kind a `ListCustomerAgreements` token carries.
+const CUSTOMER_AGREEMENTS_CURSOR: &str = "customerAgreements";
+
+/// The cursor kind a `ListComplianceInquiries` token carries.
+const INQUIRIES_CURSOR: &str = "complianceInquiries";
+
+/// The cursor kind a `ListComplianceInquiryQueries` token carries.
+const INQUIRY_QUERIES_CURSOR: &str = "inquiryQueries";
+
+/// The separator between a cursor's fields. Any byte works — the payload is encoded, so
+/// the separator never reaches the wire — and `|` appears in no cursor field: not in a
+/// kind, not in a hex digest and not in a decimal position.
+const CURSOR_SEPARATOR: char = '|';
+
+/// The scope field of a cursor cut for a WHOLE collection rather than for the
+/// sub-collection of one resource. Not a digest, so it can never be mistaken for one.
+const CURSOR_UNSCOPED: &str = "-";
+
+/// Encode a cursor: the service and operation that cut the page, the resource the page was
+/// cut for (as a digest, or [`CURSOR_UNSCOPED`]) and the position it resumes at, sealed
+/// with the digest that lets [`decode_cursor`] tell a cursor this service minted from a
+/// value a client assembled.
+fn encode_cursor(kind: &str, scope: Option<&str>, resume_at: &str) -> String {
+    let scope = scope.map_or_else(|| CURSOR_UNSCOPED.to_string(), cursor_digest);
+    let payload = format!(
+        "{CURSOR_SERVICE}{CURSOR_SEPARATOR}{kind}{CURSOR_SEPARATOR}{scope}\
+         {CURSOR_SEPARATOR}{resume_at}"
+    );
+    let digest = cursor_digest(&payload);
+    ::hex::encode(format!("{payload}{CURSOR_SEPARATOR}{digest}"))
 }
 
-/// The resume point a scoped token names, when it is a token THIS service issued for
-/// `scope`. `None` for anything else — a token cut for another resource, a value that is
-/// not a resume point at all, or one below the first position the sub-collection numbers
-/// from (every sequence this service pages is 1-based).
-fn parse_scoped_token<T>(token: &str, scope: &str) -> Option<T>
-where
-    T: ::std::str::FromStr + PartialOrd + From<u8>,
-{
-    let (id, resume_at) = token.split_once(SCOPED_TOKEN_SEPARATOR)?;
-    if id != scope {
+/// The digest a cursor's payload is sealed with.
+fn cursor_digest(payload: &str) -> String {
+    use ::sha2::Digest;
+    let mut hasher = ::sha2::Sha256::new();
+    hasher.update(CURSOR_DIGEST_DOMAIN.as_bytes());
+    hasher.update(payload.as_bytes());
+    ::hex::encode(hasher.finalize())
+}
+
+/// The domain string every cursor digest is taken over, so a digest from this codec can
+/// never collide with one this service computes for anything else.
+const CURSOR_DIGEST_DOMAIN: &str = "com.amazonaws.artifact#pagination-cursor\n";
+
+/// The position a token resumes at, when it decodes to a cursor of `kind` cut for `scope`.
+/// `None` for anything else — a value this service never minted, a cursor another of its
+/// paginated operations cut, or one cut for another resource.
+fn decode_cursor(kind: &str, scope: Option<&str>, token: &str) -> Option<String> {
+    let decoded = ::hex::decode(token).ok()?;
+    let cursor = String::from_utf8(decoded).ok()?;
+    let (payload, digest) = cursor.rsplit_once(CURSOR_SEPARATOR)?;
+    if digest != cursor_digest(payload) {
         return None;
     }
-    resume_at
-        .parse::<T>()
-        .ok()
-        .filter(|resume_at| *resume_at >= T::from(1u8))
+    let mut fields = payload.split(CURSOR_SEPARATOR);
+    let service = fields.next()?;
+    let found_kind = fields.next()?;
+    let found_scope = fields.next()?;
+    let resume_at = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let expected_scope = scope.map_or_else(|| CURSOR_UNSCOPED.to_string(), cursor_digest);
+    (service == CURSOR_SERVICE && found_kind == kind && found_scope == expected_scope)
+        .then(|| resume_at.to_string())
 }
 
-/// The `ListReportVersions` pagination token that resumes `report_id` at `version`.
-pub fn report_versions_token(report_id: &str, version: i64) -> String {
-    scoped_token(report_id, version)
+/// The position a cursor of `kind` cut for `scope` resumes its collection at, when
+/// `token` is one this service minted for it.
+fn decode_position(kind: &str, scope: Option<&str>, token: &str) -> Option<usize> {
+    decode_cursor(kind, scope, token)?.parse().ok()
 }
 
-/// The version a `ListReportVersions` token resumes at, when it is a token THIS service
-/// issued for `report_id`. `None` for anything else.
-pub fn parse_report_versions_token(token: &str, report_id: &str) -> Option<i64> {
-    parse_scoped_token(token, report_id)
+/// The `ListReports` pagination token that resumes the catalog at `position` — the number
+/// of catalog entries this operation has already reported.
+pub fn reports_page_token(position: usize) -> String {
+    encode_cursor(REPORTS_CURSOR, None, &position.to_string())
 }
 
-/// The `ListComplianceInquiryQueries` pagination token that resumes `inquiry_id` at
-/// `identifier`.
+/// The catalog position a `ListReports` token resumes at, when it is a token THIS operation
+/// issued. `None` for anything else.
+pub fn parse_reports_page_token(token: &str) -> Option<usize> {
+    decode_position(REPORTS_CURSOR, None, token)
+}
+
+/// The `ListReportVersions` pagination token that resumes `report_id`'s versions at
+/// `position` — the number of that report's versions this operation has already reported.
+///
+/// SCOPED to the report it was cut for: the payload carries the digest of the report id, so
+/// a token cut for one report is refused on another, while the id itself never reaches the
+/// wire.
+pub fn report_versions_token(report_id: &str, position: usize) -> String {
+    encode_cursor(
+        REPORT_VERSIONS_CURSOR,
+        Some(report_id),
+        &position.to_string(),
+    )
+}
+
+/// The position in `report_id`'s versions a `ListReportVersions` token resumes at, when it
+/// is a token THIS operation issued for that report. `None` for anything else.
+pub fn parse_report_versions_token(token: &str, report_id: &str) -> Option<usize> {
+    decode_position(REPORT_VERSIONS_CURSOR, Some(report_id), token)
+}
+
+/// The `ListComplianceInquiryQueries` pagination token that resumes `inquiry_id`'s queries
+/// at `position`.
 ///
 /// Scoped to the inquiry it was cut for, for the same reason as
-/// [`report_versions_token`]: a query identifier is a small sequential number, so an
-/// unscoped token would be indistinguishable from one a client made up, and a token issued
-/// for one inquiry would be spendable as a resume point on another.
-pub fn inquiry_queries_token(inquiry_id: &str, identifier: i32) -> String {
-    scoped_token(inquiry_id, identifier)
+/// [`report_versions_token`]: a token issued for one inquiry must not be spendable as a
+/// resume point on another.
+pub fn inquiry_queries_token(inquiry_id: &str, position: usize) -> String {
+    encode_cursor(
+        INQUIRY_QUERIES_CURSOR,
+        Some(inquiry_id),
+        &position.to_string(),
+    )
 }
 
-/// The `queryIdentifier` a `ListComplianceInquiryQueries` token resumes at, when it is a
-/// token THIS service issued for `inquiry_id`. `None` for anything else.
-pub fn parse_inquiry_queries_token(token: &str, inquiry_id: &str) -> Option<i32> {
-    parse_scoped_token(token, inquiry_id)
+/// The position in `inquiry_id`'s queries a `ListComplianceInquiryQueries` token resumes
+/// at, when it is a token THIS operation issued for that inquiry. `None` for anything else.
+pub fn parse_inquiry_queries_token(token: &str, inquiry_id: &str) -> Option<usize> {
+    decode_position(INQUIRY_QUERIES_CURSOR, Some(inquiry_id), token)
+}
+
+/// The `ListCustomerAgreements` pagination token that resumes the account's agreements at
+/// `position` — the number of agreements this operation has already reported.
+///
+/// A position rather than an agreement id, for the same reason as [`reports_page_token`]:
+/// a `nextToken` is a continuation value, not a resource identifier, so no id this
+/// operation reports reaches the wire inside its token.
+pub fn customer_agreements_page_token(position: usize) -> String {
+    encode_cursor(CUSTOMER_AGREEMENTS_CURSOR, None, &position.to_string())
+}
+
+/// The position a `ListCustomerAgreements` token resumes at, when it is a token THIS
+/// operation issued. `None` for anything else.
+pub fn parse_customer_agreements_page_token(token: &str) -> Option<usize> {
+    decode_position(CUSTOMER_AGREEMENTS_CURSOR, None, token)
+}
+
+/// The `ListComplianceInquiries` pagination token that resumes the account's inquiries at
+/// `position`. A position rather than an inquiry id, for the same reason as
+/// [`reports_page_token`].
+pub fn inquiries_page_token(position: usize) -> String {
+    encode_cursor(INQUIRIES_CURSOR, None, &position.to_string())
+}
+
+/// The position a `ListComplianceInquiries` token resumes at, when it is a token THIS
+/// operation issued. `None` for anything else.
+pub fn parse_inquiries_page_token(token: &str) -> Option<usize> {
+    decode_position(INQUIRIES_CURSOR, None, token)
 }
 
 /// The `ResourceNotFoundException` payload for a report id the catalog does not hold.
@@ -1761,20 +1915,51 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 // The seeded, service-owned catalog.
 // ---------------------------------------------------------------------------
 
+/// Seconds since the Unix epoch at 2022-01-01T00:00:00Z.
+const T2022JAN: u64 = 1_640_995_200;
+/// Seconds since the Unix epoch at 2022-07-01T00:00:00Z.
+const T2022JUL: u64 = 1_656_633_600;
 /// Seconds since the Unix epoch at 2023-01-01T00:00:00Z.
-const T2023H1: u64 = 1_672_531_200;
+const T2023JAN: u64 = 1_672_531_200;
+/// Seconds since the Unix epoch at 2023-04-01T00:00:00Z.
+const T2023APR: u64 = 1_680_307_200;
 /// Seconds since the Unix epoch at 2023-07-01T00:00:00Z.
-const T2023H2: u64 = 1_688_169_600;
+const T2023JUL: u64 = 1_688_169_600;
 /// Seconds since the Unix epoch at 2024-01-01T00:00:00Z.
-const T2024H1: u64 = 1_704_067_200;
+const T2024JAN: u64 = 1_704_067_200;
+/// Seconds since the Unix epoch at 2024-04-01T00:00:00Z.
+const T2024APR: u64 = 1_711_929_600;
 /// Seconds since the Unix epoch at 2024-07-01T00:00:00Z.
-const T2024H2: u64 = 1_719_792_000;
+const T2024JUL: u64 = 1_719_792_000;
 /// Seconds since the Unix epoch at 2025-01-01T00:00:00Z.
-const T2025H1: u64 = 1_735_689_600;
+const T2025JAN: u64 = 1_735_689_600;
+/// Seconds since the Unix epoch at 2025-04-01T00:00:00Z.
+const T2025APR: u64 = 1_743_465_600;
 /// Seconds since the Unix epoch at 2025-07-01T00:00:00Z.
-const T2025H2: u64 = 1_751_328_000;
+const T2025JUL: u64 = 1_751_328_000;
 /// Seconds since the Unix epoch at 2026-01-01T00:00:00Z.
-const T2026H1: u64 = 1_767_225_600;
+const T2026JAN: u64 = 1_767_225_600;
+
+// The ANNUAL AWS reporting cycle a published report's period runs on: 1 November to 31
+// October of the following year. The corpus's recorded Artifact catalog bodies carry
+// exactly such a window on a report entry (`periodStart` 2024-11-01, `periodEnd`
+// 2025-10-31, quoted in
+// `issues/things-that-do-not-work/20261022T085754Z-artifact-compliance-inquiry-projection-returns-epoch-timestamps-and.md`),
+// so the report the recording names at three published versions carries that window and
+// its earlier versions the preceding years' windows.
+
+/// Seconds since the Unix epoch at 2022-11-01T00:00:00Z.
+const T2022NOV: u64 = 1_667_260_800;
+/// Seconds since the Unix epoch at 2023-10-31T00:00:00Z.
+const T2023OCT31: u64 = 1_698_710_400;
+/// Seconds since the Unix epoch at 2023-11-01T00:00:00Z.
+const T2023NOV: u64 = 1_698_796_800;
+/// Seconds since the Unix epoch at 2024-10-31T00:00:00Z.
+const T2024OCT31: u64 = 1_730_332_800;
+/// Seconds since the Unix epoch at 2024-11-01T00:00:00Z.
+const T2024NOV: u64 = 1_730_419_200;
+/// Seconds since the Unix epoch at 2025-10-31T00:00:00Z.
+const T2025OCT31: u64 = 1_761_868_800;
 
 /// The message `UploadState` `COMPLETE` carries — one of `StatusMessage`'s documented
 /// upload messages.
@@ -1802,117 +1987,199 @@ struct SeedReport {
     versions: &'static [SeedVersion],
 }
 
-/// Every report in the catalog publishes under one company and one product.
-const COMPANY_NAME: &str = "Amazon Web Services";
+/// Every report in the catalog is published by AWS, under the AWS product.
+const COMPANY_NAME: &str = "AWS";
 /// See [`COMPANY_NAME`].
 const PRODUCT_NAME: &str = "AWS";
 
-/// The catalog this emulator serves: five reports of three series, with one, two and
-/// three published versions, under both `AcceptanceType` values.
+/// The catalog this emulator serves: AWS Artifact's published reports.
+///
+/// AWS Artifact has no `CreateReport`, so this set is not something a caller can bring
+/// into being — it is the published catalog itself, the same for every account, keyed by
+/// the `ReportId` AWS assigned each report. A client's whole report flow starts by
+/// listing it and then naming one of these ids (or one of these series) to
+/// `GetReportMetadata`, `GetTermForReport` and `GetReport`, which is why the first four
+/// rows carry the ids and names AWS publishes for them, as the issue's recording of a
+/// live `ListReports` shows them: `report-073F0fUCdVVNKJrF`, `report-0c1IXmudeXuTlHJJ`,
+/// `report-5eevElBv6MyRmQsD` and `report-7g5j2DTVeNXWx7St`.
+///
+/// Every row after those four carries a report AWS really publishes in Artifact (the SOC
+/// reports, the ISO certificates, the PCI DSS attestation, the FedRAMP, IRAP and C5
+/// packages and the CSA questionnaire) under an id this catalog assigns, because the
+/// recording names an id only for the four above: those ids satisfy `ReportId`'s pattern
+/// and are this emulator's, not a claim that AWS issued them. They are here so the
+/// catalog is the published SET a client browses and PAGES — a set of a handful of rows
+/// is one no realistic page bound ever cuts — not to reach AWS's full catalog size, which
+/// no recording in this corpus discloses. Every version's `description` is likewise the
+/// emulator's own prose: the recording withholds its descriptions, and no rule derives
+/// one.
+///
+/// The rows span what the report surface generalises over: ten series, two categories,
+/// both `AcceptanceType` values, one, two, three and seven published versions, and
+/// reporting periods on the calendar-annual, the November-annual and the semiannual
+/// windows AWS publishes on.
 ///
 /// Every value satisfies the member's modelled constraints — `id` matches `ReportId`'s
 /// `^report-[a-zA-Z0-9]{16}$`, and `name`, `series` and `category` match
 /// `ShortStringAttribute`'s `^[a-zA-Z0-9_\-\s]*$`.
 const SEED: &[SeedReport] = &[
     SeedReport {
-        id: "report-cloudsecalliance",
-        name: "Cloud Security Alliance CAIQ",
-        series: "CSA",
-        category: "Certifications and Attestations",
+        id: "report-073F0fUCdVVNKJrF",
+        name: "AWS Outposts Rack Information Security FAQ",
+        series: "AWS Services",
+        category: "Alignment Documents",
         acceptance_type: "PASSTHROUGH",
-        document_object: "CSA-CAIQ.pdf",
-        term_object: "CSA-CAIQ-Term.txt",
-        versions: &[SeedVersion {
-            version: 1,
-            description: "Cloud Security Alliance Consensus Assessments Initiative Questionnaire",
-            period_start: T2024H1,
-            period_end: T2025H1,
-            published_at: T2025H1,
-            sequence_number: 1,
-        }],
+        document_object: "AWS-Outposts-Rack-Information-Security-FAQ.pdf",
+        term_object: "AWS-Outposts-Rack-Information-Security-FAQ-Term.txt",
+        versions: &[
+            SeedVersion {
+                version: 1,
+                description: "Information security FAQ for AWS Outposts rack",
+                period_start: T2022NOV,
+                period_end: T2023OCT31,
+                published_at: T2022NOV,
+                sequence_number: 1,
+            },
+            SeedVersion {
+                version: 2,
+                description: "Information security FAQ for AWS Outposts rack",
+                period_start: T2023NOV,
+                period_end: T2024OCT31,
+                published_at: T2023NOV,
+                sequence_number: 2,
+            },
+            SeedVersion {
+                version: 3,
+                description: "Information security FAQ for AWS Outposts rack",
+                period_start: T2024NOV,
+                period_end: T2025OCT31,
+                published_at: T2024NOV,
+                sequence_number: 3,
+            },
+        ],
     },
     SeedReport {
-        id: "report-iso270012022cert",
+        id: "report-0c1IXmudeXuTlHJJ",
         name: "ISO 27001 2022 Certification",
         series: "ISO",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
         document_object: "ISO-27001-2022.pdf",
         term_object: "ISO-27001-2022-Term.txt",
-        versions: &[SeedVersion {
-            version: 1,
-            description: "ISO/IEC 27001:2022 certificate covering AWS infrastructure services",
-            period_start: T2024H1,
-            period_end: T2026H1,
-            published_at: T2024H1,
-            sequence_number: 1,
-        }],
-    },
-    SeedReport {
-        id: "report-pcidss4aoc000001",
-        name: "PCI DSS v4 AOC",
-        series: "PCI",
-        category: "Certifications and Attestations",
-        acceptance_type: "EXPLICIT",
-        document_object: "PCI-DSS-v4-AOC.pdf",
-        term_object: "PCI-DSS-v4-AOC-Term.txt",
         versions: &[
             SeedVersion {
                 version: 1,
-                description: "PCI DSS v4 Attestation of Compliance for calendar year 2023",
-                period_start: T2023H1,
-                period_end: T2024H1,
-                published_at: T2024H1,
+                description: "ISO 27001 2022 certificate covering AWS infrastructure services",
+                period_start: T2023JAN,
+                period_end: T2024JAN,
+                published_at: T2023JAN,
                 sequence_number: 1,
             },
             SeedVersion {
                 version: 2,
-                description: "PCI DSS v4 Attestation of Compliance for calendar year 2024",
-                period_start: T2024H1,
-                period_end: T2025H1,
-                published_at: T2025H1,
-                sequence_number: 4,
+                description: "ISO 27001 2022 certificate covering AWS infrastructure services",
+                period_start: T2024JAN,
+                period_end: T2025JAN,
+                published_at: T2024JAN,
+                sequence_number: 2,
+            },
+            SeedVersion {
+                version: 3,
+                description: "ISO 27001 2022 certificate covering AWS infrastructure services",
+                period_start: T2025JAN,
+                period_end: T2026JAN,
+                published_at: T2025JAN,
+                sequence_number: 3,
             },
         ],
     },
     SeedReport {
-        id: "report-soc1type2report1",
-        name: "SOC 1 Type 2",
-        series: "SOC",
+        id: "report-5eevElBv6MyRmQsD",
+        name: "UAE IAR Compliance Report",
+        series: "UAE TDRA IAR",
         category: "Certifications and Attestations",
         acceptance_type: "EXPLICIT",
-        document_object: "SOC1-Type2.pdf",
-        term_object: "SOC1-Type2-Term.txt",
+        document_object: "UAE-TDRA-IAR.pdf",
+        term_object: "UAE-TDRA-IAR-Term.txt",
         versions: &[
             SeedVersion {
                 version: 1,
-                description: "SOC 1 Type 2 report for the first half of 2023",
-                period_start: T2023H1,
-                period_end: T2023H2,
-                published_at: T2023H2,
+                description: "UAE TDRA Information Assurance Regulation compliance report",
+                period_start: T2022JAN,
+                period_end: T2022JUL,
+                published_at: T2022JUL,
                 sequence_number: 1,
             },
             SeedVersion {
                 version: 2,
-                description: "SOC 1 Type 2 report for the second half of 2023",
-                period_start: T2023H2,
-                period_end: T2024H1,
-                published_at: T2024H1,
-                sequence_number: 3,
+                description: "UAE TDRA Information Assurance Regulation compliance report",
+                period_start: T2022JUL,
+                period_end: T2023JAN,
+                published_at: T2023JAN,
+                sequence_number: 2,
             },
             SeedVersion {
                 version: 3,
-                description: "SOC 1 Type 2 report for the first half of 2024",
-                period_start: T2024H1,
-                period_end: T2024H2,
-                published_at: T2024H2,
+                description: "UAE TDRA Information Assurance Regulation compliance report",
+                period_start: T2023JAN,
+                period_end: T2023JUL,
+                published_at: T2023JUL,
+                sequence_number: 3,
+            },
+            SeedVersion {
+                version: 4,
+                description: "UAE TDRA Information Assurance Regulation compliance report",
+                period_start: T2023JUL,
+                period_end: T2024JAN,
+                published_at: T2024JAN,
+                sequence_number: 4,
+            },
+            SeedVersion {
+                version: 5,
+                description: "UAE TDRA Information Assurance Regulation compliance report",
+                period_start: T2024JAN,
+                period_end: T2024JUL,
+                published_at: T2024JUL,
+                sequence_number: 5,
+            },
+            SeedVersion {
+                version: 6,
+                description: "UAE TDRA Information Assurance Regulation compliance report",
+                period_start: T2024JUL,
+                period_end: T2025JAN,
+                published_at: T2025JAN,
+                sequence_number: 6,
+            },
+            SeedVersion {
+                version: 7,
+                description: "UAE TDRA Information Assurance Regulation compliance report",
+                period_start: T2025JAN,
+                period_end: T2025JUL,
+                published_at: T2025JUL,
                 sequence_number: 7,
             },
         ],
     },
     SeedReport {
-        id: "report-soc2type2report1",
-        name: "SOC 2 Type 2",
+        id: "report-7g5j2DTVeNXWx7St",
+        name: "Annual Compliance Report",
+        series: "ACR",
+        category: "Certifications and Attestations",
+        acceptance_type: "EXPLICIT",
+        document_object: "AWS-Annual-Compliance-Report.pdf",
+        term_object: "AWS-Annual-Compliance-Report-Term.txt",
+        versions: &[SeedVersion {
+            version: 1,
+            description: "AWS annual compliance report",
+            period_start: T2024JAN,
+            period_end: T2025JAN,
+            published_at: T2025JAN,
+            sequence_number: 1,
+        }],
+    },
+    SeedReport {
+        id: "report-9pQ2mT8xLbV4sZ1c",
+        name: "SOC 2 Type 2 Report",
         series: "SOC",
         category: "Certifications and Attestations",
         acceptance_type: "EXPLICIT",
@@ -1922,20 +2189,250 @@ const SEED: &[SeedReport] = &[
             SeedVersion {
                 version: 1,
                 description: "SOC 2 Type 2 report for the first half of 2024",
-                period_start: T2024H1,
-                period_end: T2024H2,
-                published_at: T2024H2,
-                sequence_number: 2,
+                period_start: T2024JAN,
+                period_end: T2024JUL,
+                published_at: T2024JUL,
+                sequence_number: 1,
             },
             SeedVersion {
                 version: 2,
                 description: "SOC 2 Type 2 report for the second half of 2024",
-                period_start: T2024H2,
-                period_end: T2025H1,
-                published_at: T2025H2,
-                sequence_number: 5,
+                period_start: T2024JUL,
+                period_end: T2025JAN,
+                published_at: T2025JAN,
+                sequence_number: 2,
             },
         ],
+    },
+    SeedReport {
+        id: "report-Af3KdN7yRw2HqS5e",
+        name: "PCI DSS Attestation of Compliance",
+        series: "PCI",
+        category: "Certifications and Attestations",
+        acceptance_type: "EXPLICIT",
+        document_object: "PCI-DSS-AOC.pdf",
+        term_object: "PCI-DSS-AOC-Term.txt",
+        versions: &[
+            SeedVersion {
+                version: 1,
+                description: "PCI DSS Attestation of Compliance for calendar year 2023",
+                period_start: T2023JAN,
+                period_end: T2024JAN,
+                published_at: T2024JAN,
+                sequence_number: 1,
+            },
+            SeedVersion {
+                version: 2,
+                description: "PCI DSS Attestation of Compliance for calendar year 2024",
+                period_start: T2024JAN,
+                period_end: T2025JAN,
+                published_at: T2025JAN,
+                sequence_number: 2,
+            },
+        ],
+    },
+    SeedReport {
+        id: "report-Bq7WmF3xTk9ZpL2a",
+        name: "SOC 1 Report",
+        series: "SOC",
+        category: "Certifications and Attestations",
+        acceptance_type: "EXPLICIT",
+        document_object: "AWS-SOC-1.pdf",
+        term_object: "AWS-SOC-1-Term.txt",
+        versions: &[
+            SeedVersion {
+                version: 1,
+                description: "SOC 1 report on the controls of the AWS infrastructure services",
+                period_start: T2024JAN,
+                period_end: T2024JUL,
+                published_at: T2024JUL,
+                sequence_number: 1,
+            },
+            SeedVersion {
+                version: 2,
+                description: "SOC 1 report on the controls of the AWS infrastructure services",
+                period_start: T2024JUL,
+                period_end: T2025JAN,
+                published_at: T2025JAN,
+                sequence_number: 2,
+            },
+        ],
+    },
+    SeedReport {
+        id: "report-C4tYhR8nJd6VxQ3b",
+        name: "SOC 3 Report",
+        series: "SOC",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        document_object: "AWS-SOC-3.pdf",
+        term_object: "AWS-SOC-3-Term.txt",
+        versions: &[SeedVersion {
+            version: 1,
+            description: "SOC 3 general-use report on the AWS system and controls",
+            period_start: T2024JUL,
+            period_end: T2025JAN,
+            published_at: T2025JAN,
+            sequence_number: 1,
+        }],
+    },
+    SeedReport {
+        id: "report-D9kPzX2mLb7TnR4c",
+        name: "ISO 27017 Certification",
+        series: "ISO",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        document_object: "ISO-27017.pdf",
+        term_object: "ISO-27017-Term.txt",
+        versions: &[
+            SeedVersion {
+                version: 1,
+                description: "ISO 27017 cloud services information security certificate",
+                period_start: T2023JAN,
+                period_end: T2024JAN,
+                published_at: T2023JAN,
+                sequence_number: 1,
+            },
+            SeedVersion {
+                version: 2,
+                description: "ISO 27017 cloud services information security certificate",
+                period_start: T2024JAN,
+                period_end: T2025JAN,
+                published_at: T2024JAN,
+                sequence_number: 2,
+            },
+        ],
+    },
+    SeedReport {
+        id: "report-E2nVbK6yQw8MsZ5d",
+        name: "ISO 27018 Certification",
+        series: "ISO",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        document_object: "ISO-27018.pdf",
+        term_object: "ISO-27018-Term.txt",
+        versions: &[SeedVersion {
+            version: 1,
+            description: "ISO 27018 certificate for the protection of personal data in the cloud",
+            period_start: T2024JAN,
+            period_end: T2025JAN,
+            published_at: T2024JAN,
+            sequence_number: 1,
+        }],
+    },
+    SeedReport {
+        id: "report-F6sJdL9xRt3WqN7e",
+        name: "ISO 27701 Certification",
+        series: "ISO",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        document_object: "ISO-27701.pdf",
+        term_object: "ISO-27701-Term.txt",
+        versions: &[SeedVersion {
+            version: 1,
+            description: "ISO 27701 privacy information management certificate",
+            period_start: T2024JUL,
+            period_end: T2025JUL,
+            published_at: T2024JUL,
+            sequence_number: 1,
+        }],
+    },
+    SeedReport {
+        id: "report-G3mQfT7bXz5KpV8h",
+        name: "ISO 9001 Certification",
+        series: "ISO",
+        category: "Certifications and Attestations",
+        acceptance_type: "PASSTHROUGH",
+        document_object: "ISO-9001.pdf",
+        term_object: "ISO-9001-Term.txt",
+        versions: &[SeedVersion {
+            version: 1,
+            description: "ISO 9001 quality management certificate covering AWS services",
+            period_start: T2023JUL,
+            period_end: T2024JUL,
+            published_at: T2023JUL,
+            sequence_number: 1,
+        }],
+    },
+    SeedReport {
+        id: "report-H8wRnP4cYk2JsL6m",
+        name: "FedRAMP Moderate Customer Package",
+        series: "FedRAMP",
+        category: "Certifications and Attestations",
+        acceptance_type: "EXPLICIT",
+        document_object: "FedRAMP-Moderate-Customer-Package.pdf",
+        term_object: "FedRAMP-Moderate-Customer-Package-Term.txt",
+        versions: &[SeedVersion {
+            version: 1,
+            description: "FedRAMP Moderate customer package for the AWS US East and US West \
+                          Regions",
+            period_start: T2024JAN,
+            period_end: T2025JAN,
+            published_at: T2024APR,
+            sequence_number: 1,
+        }],
+    },
+    SeedReport {
+        id: "report-J5zXkM9dVb3QtR7n",
+        name: "IRAP Assessment Report",
+        series: "IRAP",
+        category: "Certifications and Attestations",
+        acceptance_type: "EXPLICIT",
+        document_object: "IRAP-Assessment.pdf",
+        term_object: "IRAP-Assessment-Term.txt",
+        versions: &[SeedVersion {
+            version: 1,
+            description: "IRAP assessment of the AWS Asia Pacific Sydney Region",
+            period_start: T2024APR,
+            period_end: T2025APR,
+            published_at: T2024APR,
+            sequence_number: 1,
+        }],
+    },
+    SeedReport {
+        id: "report-K7bNqS2fWx8LmT4p",
+        name: "C5 Attestation Report",
+        series: "C5",
+        category: "Certifications and Attestations",
+        acceptance_type: "EXPLICIT",
+        document_object: "C5-Attestation.pdf",
+        term_object: "C5-Attestation-Term.txt",
+        versions: &[
+            SeedVersion {
+                version: 1,
+                description: "C5 attestation report on the AWS cloud computing compliance \
+                              controls catalogue",
+                period_start: T2023APR,
+                period_end: T2024APR,
+                published_at: T2023APR,
+                sequence_number: 1,
+            },
+            SeedVersion {
+                version: 2,
+                description: "C5 attestation report on the AWS cloud computing compliance \
+                              controls catalogue",
+                period_start: T2024APR,
+                period_end: T2025APR,
+                published_at: T2024APR,
+                sequence_number: 2,
+            },
+        ],
+    },
+    SeedReport {
+        id: "report-L4dTvJ8hZn6RkQ9s",
+        name: "Cloud Security Alliance CAIQ",
+        series: "CSA",
+        category: "Alignment Documents",
+        acceptance_type: "PASSTHROUGH",
+        document_object: "CSA-CAIQ.pdf",
+        term_object: "CSA-CAIQ-Term.txt",
+        versions: &[SeedVersion {
+            version: 1,
+            description: "Consensus Assessments Initiative Questionnaire answered for AWS",
+            period_start: T2024JAN,
+            period_end: T2025JAN,
+            published_at: T2024JAN,
+            sequence_number: 1,
+        }],
     },
 ];
 
@@ -1957,6 +2454,9 @@ fn seed_catalog() -> BTreeMap<String, Report> {
                 company_name: COMPANY_NAME.to_string(),
                 product_name: PRODUCT_NAME.to_string(),
                 acceptance_type: seed.acceptance_type.to_string(),
+                // Every report AWS publishes in the Artifact catalog is visible to every
+                // account; a report scoped to one customer is not part of this catalog.
+                visibility: VISIBILITY_PUBLIC.to_string(),
                 document_object: seed.document_object.to_string(),
                 term_object: seed.term_object.to_string(),
                 versions: seed
@@ -2020,7 +2520,7 @@ const AGREEMENT_SEED: &[SeedAgreement] = &[
         description: "HIPAA Business Associate Addendum to the AWS Customer Agreement",
         agreement_type: AGREEMENT_TYPE_DEFAULT,
         state: AGREEMENT_STATE_ACTIVE,
-        effective_start: T2024H1,
+        effective_start: T2024JAN,
         effective_end: None,
         acceptance_terms: &[
             "Acceptance by an authorized representative of the account",
@@ -2035,8 +2535,8 @@ const AGREEMENT_SEED: &[SeedAgreement] = &[
         description: "Criminal Justice Information Services Security Addendum",
         agreement_type: AGREEMENT_TYPE_DEFAULT,
         state: AGREEMENT_STATE_CUSTOMER_TERMINATED,
-        effective_start: T2023H1,
-        effective_end: Some(T2024H2),
+        effective_start: T2023JAN,
+        effective_end: Some(T2024JUL),
         acceptance_terms: &["Acceptance by an authorized representative of the account"],
         terminate_terms: &["Written notice of termination by an authorized representative"],
     },
@@ -2047,7 +2547,7 @@ const AGREEMENT_SEED: &[SeedAgreement] = &[
         description: "Data Processing Addendum with the EU standard contractual clauses",
         agreement_type: AGREEMENT_TYPE_MODIFIED,
         state: AGREEMENT_STATE_ACTIVE,
-        effective_start: T2024H2,
+        effective_start: T2024JUL,
         effective_end: None,
         acceptance_terms: &[
             "Acceptance by an authorized representative of the account",
@@ -2066,7 +2566,7 @@ const AGREEMENT_SEED: &[SeedAgreement] = &[
         description: "Mutual nondisclosure agreement negotiated for this customer",
         agreement_type: AGREEMENT_TYPE_CUSTOM,
         state: AGREEMENT_STATE_ACTIVE,
-        effective_start: T2025H1,
+        effective_start: T2025JAN,
         effective_end: None,
         acceptance_terms: &["Signature by an authorized representative of the account"],
         terminate_terms: &["Expiry of the confidentiality period"],
@@ -2078,8 +2578,8 @@ const AGREEMENT_SEED: &[SeedAgreement] = &[
         description: "Payment Card Industry Data Security Standard merchant addendum",
         agreement_type: AGREEMENT_TYPE_MODIFIED,
         state: AGREEMENT_STATE_AWS_TERMINATED,
-        effective_start: T2023H2,
-        effective_end: Some(T2025H1),
+        effective_start: T2023JUL,
+        effective_end: Some(T2025JAN),
         acceptance_terms: &["Acceptance by an authorized representative of the account"],
         terminate_terms: &["Written notice of termination by AWS"],
     },

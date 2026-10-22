@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use super::repository_lifecycle::{base64, call, emulator_with_engine, is_uuid, ok, string_at};
+use crate::repository_lifecycle::{base64, call, emulator_with_engine, is_uuid, ok, string_at};
 
 /// The file every comparison in this suite is built around.
 const FILE_PATH: &str = "docs/notes.md";

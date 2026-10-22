@@ -190,13 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the store lookup, as `ListReportVersions` judges its own: a malformed request
         // parameter is refused whatever the state holds.
         let resume_at = match input.next_token.as_deref() {
-            None => None,
+            None => 0usize,
             Some(token) => {
                 match crate::state::parse_inquiry_queries_token(
                     token,
                     &input.compliance_inquiry_id,
                 ) {
-                    Some(identifier) => Some(identifier),
+                    Some(position) => position,
                     None => {
                         return Err(
                             ListComplianceInquiryQueriesErrorModeled::ValidationException(
@@ -230,20 +230,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut queries = Vec::with_capacity(page_size.min(inquiry.queries.len()));
         let mut next_token = None;
+        let mut position = 0usize;
         for query in &inquiry.queries {
-            // Resume at the first identifier at or after the token, so a page is still
-            // served when the query the token named is no longer the next one.
-            if resume_at.is_some_and(|resume| query.identifier < resume) {
+            // Resume at the cursor's position in this operation's own order, so a page is
+            // still served when the query it was cut after is no longer the next one.
+            if position < resume_at {
+                position += 1;
                 continue;
             }
             if queries.len() >= page_size {
                 next_token = Some(crate::state::inquiry_queries_token(
                     &input.compliance_inquiry_id,
-                    query.identifier,
+                    position,
                 ));
                 break;
             }
             queries.push(query.to_summary());
+            position += 1;
         }
 
         Ok(ListComplianceInquiryQueriesOutput {

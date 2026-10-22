@@ -270,7 +270,8 @@ impl ::aws_smithy_schema_server::DeserializableStruct for InquirySummary {
 
 /// `ReportSummary`, with its schema written out instead of derived: `periodStart` and
 /// `periodEnd` target `TimestampAttribute`, so they are date-time strings on the wire (see
-/// the note above). Member set, order and nullability from
+/// the note above). It also carries `visibility`, which AWS reports on every catalog entry
+/// and the on-disk model snapshot does not declare. Member set, order and nullability from
 /// `smithy_query(query="shape",shape="ReportSummary")`.
 #[derive(Debug, Clone, Default)]
 pub struct ReportSummary {
@@ -289,6 +290,13 @@ pub struct ReportSummary {
     pub product_name: Option<String>,
     pub status_message: Option<String>,
     pub acceptance_type: Option<String>,
+    /// Not in the on-disk model snapshot. Its value comes from the stored record
+    /// ([`crate::state::Report::visibility`], seeded `PUBLIC`); the evidence that AWS
+    /// reports it on every catalog entry is the recorded `ListReports` body quoted in
+    /// `issues/things-that-now-work/20261022T003730Z-artifact-report-catalog-and-report-record-projection-diverge.md`
+    /// (causes 4 and 5, member `visibility` = `PUBLIC`). Drop this member if a refreshed
+    /// model snapshot still omits it AND a new recording shows AWS does not send it.
+    pub visibility: Option<String>,
 }
 
 #[allow(non_upper_case_globals)]
@@ -325,6 +333,10 @@ impl ReportSummary {
         artifact_member_schema!("ReportSummary", "statusMessage", String, 13);
     pub const M_ACCEPTANCE_TYPE: ::aws_smithy_schema::Schema =
         artifact_member_schema!("ReportSummary", "acceptanceType", String, 14);
+    /// Reported by AWS on every catalog entry and absent from the on-disk model snapshot
+    /// — see the member's own doc on [`ReportSummary::visibility`].
+    pub const M_VISIBILITY: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportSummary", "visibility", String, 15);
 
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static(
@@ -349,6 +361,7 @@ impl ReportSummary {
             &Self::M_PRODUCT_NAME,
             &Self::M_STATUS_MESSAGE,
             &Self::M_ACCEPTANCE_TYPE,
+            &Self::M_VISIBILITY,
         ],
     );
 }
@@ -405,6 +418,9 @@ impl ::aws_smithy_schema::serde::SerializableStruct for ReportSummary {
         if let Some(v) = self.acceptance_type.as_ref() {
             s.write_string(&Self::M_ACCEPTANCE_TYPE, v.as_str())?;
         }
+        if let Some(v) = self.visibility.as_ref() {
+            s.write_string(&Self::M_VISIBILITY, v.as_str())?;
+        }
         Ok(())
     }
 }
@@ -431,6 +447,7 @@ impl ::aws_smithy_schema_server::DeserializableStruct for ReportSummary {
                 Some(12) => out.product_name = Some(d.read_string(&Self::M_PRODUCT_NAME)?),
                 Some(13) => out.status_message = Some(d.read_string(&Self::M_STATUS_MESSAGE)?),
                 Some(14) => out.acceptance_type = Some(d.read_string(&Self::M_ACCEPTANCE_TYPE)?),
+                Some(15) => out.visibility = Some(d.read_string(&Self::M_VISIBILITY)?),
                 _ => {}
             }
             Ok(())

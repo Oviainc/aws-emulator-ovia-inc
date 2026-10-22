@@ -47,7 +47,11 @@ use super::object_storage::delete_object;
 const NOT_THE_OWNER: &str = "123456789012";
 
 /// `PUT /<bucket>/<key>?tagging` — `PutObjectTagging`.
-async fn put_object_tagging(
+///
+/// `pub(crate)` for the same reason as the reader below it: the suite for a tag set
+/// delivered on the WRITE ([`super::object_write_tagging_header`]) compares the two paths
+/// against each other rather than reimplementing this one.
+pub(crate) async fn put_object_tagging(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -65,7 +69,11 @@ async fn put_object_tagging(
 
 /// `GET /<bucket>/<key>?tagging` — `GetObjectTagging`, with whatever extra query
 /// parameters the case under test carries.
-async fn get_object_tagging(
+///
+/// `pub(crate)`, so the suite for a tag set delivered on the WRITE
+/// ([`super::object_write_tagging_header`]) reads it back through this one reader rather
+/// than standing up a second one.
+pub(crate) async fn get_object_tagging(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,

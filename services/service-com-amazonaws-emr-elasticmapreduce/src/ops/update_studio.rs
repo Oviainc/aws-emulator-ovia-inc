@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStudio
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStudio`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStudio::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the name, description, subnets, backup location and encryption key of the
+//! studio the shared engine holds, so a later `DescribeStudio` reports the new values.
+//! A member the request omits is not a change. An id no studio carries, and a subnet
+//! list that no longer covers what the Studio may have, are refused with
+//! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +169,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStudio` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStudioErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStudio"))
+        use crate::state::{is_ec2_resource_id, is_s3_location, MAX_STUDIO_SUBNETS};
+
+        let _ = ctx;
+        let refuse = |message: String| -> Self::Error {
+            UpdateStudioErrorModeled::InvalidRequestException(InvalidRequestException {
+                error_code: None,
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // The same network and storage rules `CreateStudio` applies, on the members
+        // this operation may change. "A Studio can have a maximum of 5 subnets."
+        // (`UpdateStudio$SubnetIds` doc.)
+        if let Some(subnet_ids) = input.subnet_ids.as_ref() {
+            if subnet_ids.is_empty() || subnet_ids.len() > MAX_STUDIO_SUBNETS {
+                return Err(refuse(format!(
+                    "SubnetIds carries {} subnets; a Studio has 1 to {MAX_STUDIO_SUBNETS} \
+                     subnets",
+                    subnet_ids.len()
+                )));
+            }
+            for subnet_id in subnet_ids {
+                if !is_ec2_resource_id("subnet", subnet_id) {
+                    return Err(refuse(format!(
+                        "SubnetIds entry '{subnet_id}' does not name a subnet in this account"
+                    )));
+                }
+            }
+        }
+        if let Some(location) = input.default_s3_location.as_ref() {
+            if !is_s3_location(location) {
+                return Err(refuse(format!(
+                    "DefaultS3Location '{location}' is not an Amazon S3 location"
+                )));
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateStudioErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR studio store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        let Some(studio) = store.studios.get_mut(&input.studio_id) else {
+            return Err(refuse(format!(
+                "Studio id '{}' is not valid or does not exist.",
+                input.studio_id
+            )));
+        };
+
+        // Only what the request carried changes; everything else keeps the value the
+        // studio already holds.
+        if input.name.is_some() {
+            studio.name = input.name;
+        }
+        if input.description.is_some() {
+            studio.description = input.description;
+        }
+        if input.subnet_ids.is_some() {
+            studio.subnet_ids = input.subnet_ids;
+        }
+        if input.default_s3_location.is_some() {
+            studio.default_s3_location = input.default_s3_location;
+        }
+        if input.encryption_key_arn.is_some() {
+            studio.encryption_key_arn = input.encryption_key_arn;
+        }
+
+        Ok(UpdateStudioOutput)
     }
 }

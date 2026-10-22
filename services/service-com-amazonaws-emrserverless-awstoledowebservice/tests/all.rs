@@ -23,6 +23,8 @@ mod refusal_wording;
 mod resource_tagging;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/session_endpoint.rs"]
+mod session_endpoint;
 #[path = "all/session_lifecycle.rs"]
 mod session_lifecycle;
 #[path = "all/state_roundtrip.rs"]

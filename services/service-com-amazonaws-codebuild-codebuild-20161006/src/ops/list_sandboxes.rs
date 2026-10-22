@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSandboxes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSandboxes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the ids of the sandboxes this account has started: this is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSandboxes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read of the account's sandbox ids in request order
+//! ([`crate::state::ComAmazonawsCodebuildCodebuild20161006State::sandbox_order`]). The
+//! answer carries only ids, so nothing here depends on a sandbox's status and this
+//! operation materialises no transition — a caller reads the records themselves through
+//! `BatchGetSandboxes`, which does.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +139,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSandboxes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSandboxesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSandboxes"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListSandboxes (this engine carries no CodeBuild state)",
+            ));
+        };
+        let _ = ctx;
+
+        // Held in request order, oldest first, by `insert_sandbox`.
+        let mut ids = state.lock().sandbox_order.clone();
+        if input.sort_order.as_deref() != Some(ASCENDING_SORT_ORDER) {
+            ids.reverse();
+        }
+
+        let Some((page, next_token)) =
+            crate::state::page_limited(&ids, input.next_token.as_deref(), input.max_results)
+        else {
+            return Err(ListSandboxesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("Invalid nextToken".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListSandboxesOutput {
+            // `SandboxIds` carries no `@length`, so an empty page is representable and
+            // is serialized as `[]` — the same answer `BatchGetSandboxes` gives for a
+            // list of its own that came out empty.
+            ids: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The one `SortOrderType` value that asks for the oldest sandbox first.
+///
+/// `ListSandboxesInput$sortOrder` documents no default ("The order in which sandbox
+/// records should be retrieved."), so the default here is the one CodeBuild documents
+/// for the sibling member it does describe, `ListBuildsForProjectInput$sortOrder`: "If
+/// this is not specified, the results are sorted in descending order." Anything that is
+/// not `ASCENDING` therefore reports the most recently requested sandbox first.
+const ASCENDING_SORT_ORDER: &str = "ASCENDING";

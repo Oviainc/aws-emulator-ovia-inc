@@ -53,6 +53,9 @@ pub struct ReportDetail {
     pub sequence_number: Option<i64>,
     pub upload_state: Option<String>,
     pub status_message: Option<String>,
+    /// Not in the on-disk model snapshot; see [`ReportSummary::visibility`] in
+    /// `shared_types` for the recorded evidence and the condition for dropping it.
+    pub visibility: Option<String>,
 }
 
 #[allow(non_upper_case_globals)]
@@ -102,6 +105,10 @@ impl ReportDetail {
         artifact_member_schema!("ReportDetail", "uploadState", String, 18);
     pub const M_STATUS_MESSAGE: ::aws_smithy_schema::Schema =
         artifact_member_schema!("ReportDetail", "statusMessage", String, 19);
+    /// Reported by AWS on `reportDetails` and absent from the on-disk model snapshot —
+    /// see the member's own doc on [`ReportDetail::visibility`].
+    pub const M_VISIBILITY: ::aws_smithy_schema::Schema =
+        artifact_member_schema!("ReportDetail", "visibility", String, 20);
 
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static(
@@ -131,6 +138,7 @@ impl ReportDetail {
             &Self::M_SEQUENCE_NUMBER,
             &Self::M_UPLOAD_STATE,
             &Self::M_STATUS_MESSAGE,
+            &Self::M_VISIBILITY,
         ],
     );
 }
@@ -202,6 +210,9 @@ impl ::aws_smithy_schema::serde::SerializableStruct for ReportDetail {
         if let Some(v) = self.status_message.as_ref() {
             s.write_string(&Self::M_STATUS_MESSAGE, v.as_str())?;
         }
+        if let Some(v) = self.visibility.as_ref() {
+            s.write_string(&Self::M_VISIBILITY, v.as_str())?;
+        }
         Ok(())
     }
 }
@@ -237,6 +248,7 @@ impl ::aws_smithy_schema_server::DeserializableStruct for ReportDetail {
                 Some(17) => out.sequence_number = Some(d.read_long(&Self::M_SEQUENCE_NUMBER)?),
                 Some(18) => out.upload_state = Some(d.read_string(&Self::M_UPLOAD_STATE)?),
                 Some(19) => out.status_message = Some(d.read_string(&Self::M_STATUS_MESSAGE)?),
+                Some(20) => out.visibility = Some(d.read_string(&Self::M_VISIBILITY)?),
                 _ => {}
             }
             Ok(())

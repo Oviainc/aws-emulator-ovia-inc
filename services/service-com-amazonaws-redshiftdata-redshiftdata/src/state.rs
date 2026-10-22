@@ -1286,8 +1286,13 @@ fn execute_once(
         let mut record = Vec::with_capacity(columns.len());
         for (index, declared_type) in declared.iter().enumerate() {
             let value = row.get_ref(index)?;
-            if observed[index].is_none() {
-                observed[index] = ColumnType::from_value(value);
+            // A column the engine declares a type for reports THAT type; one
+            // without is inferred from the values it produces, and the inferred
+            // type has to hold every one of them (see
+            // [`ColumnType::widened_with`]), so every row is looked at rather
+            // than only the first non-NULL one.
+            if declared_type.is_none() {
+                observed[index] = ColumnType::widened_with(observed[index].take(), value);
             }
             record.push(field_from(value, declared_type.as_ref()));
         }
@@ -1473,12 +1478,25 @@ impl ColumnType {
 
     /// Resolve a column with no declared type — an expression such as
     /// `SELECT 1` — from the value the engine produced for it.
+    ///
+    /// An INTEGER value takes the NARROWEST Redshift integer type whose range
+    /// holds it, which is how a Redshift (PostgreSQL-derived) integer constant is
+    /// typed: `int4` while the value fits the 4-byte `INTEGER` range
+    /// (-2147483648 to +2147483647) and `int8` for anything past it, the ranges
+    /// the Amazon Redshift *Data types* documentation publishes for `INTEGER` and
+    /// `BIGINT`.
     fn from_value(value: rusqlite::types::ValueRef<'_>) -> Option<Self> {
         use rusqlite::types::ValueRef;
         let name = match value {
             // NULL says nothing about the column's type.
             ValueRef::Null => return None,
-            ValueRef::Integer(_) => "int8",
+            ValueRef::Integer(integer) => {
+                if i32::try_from(integer).is_ok() {
+                    "int4"
+                } else {
+                    "int8"
+                }
+            }
             ValueRef::Real(_) => "float8",
             ValueRef::Text(_) => "varchar",
             ValueRef::Blob(_) => "varbyte",
@@ -1489,6 +1507,45 @@ impl ColumnType {
             scale: 0,
         })
     }
+
+    /// The type an expression column must report once it has produced one more
+    /// `value`: the type that holds EVERY value the column carried.
+    ///
+    /// Only widening happens, and only within the integer types, because that is
+    /// the only family [`Self::from_value`] can infer differently for two values
+    /// of one column: a column whose values all fit `INTEGER` is `int4`, and one
+    /// value past that range makes the whole column `int8`, whichever row it
+    /// arrives in. The first non-NULL value decides anything else, and a NULL
+    /// says nothing.
+    fn widened_with(current: Option<Self>, value: rusqlite::types::ValueRef<'_>) -> Option<Self> {
+        let observed = Self::from_value(value);
+        match (current, observed) {
+            (None, observed) => observed,
+            (Some(current), None) => Some(current),
+            (Some(current), Some(observed)) => {
+                match (integer_width(&current.name), integer_width(&observed.name)) {
+                    (Some(held), Some(seen)) if seen > held => Some(observed),
+                    _ => Some(current),
+                }
+            }
+        }
+    }
+}
+
+/// The integer type names [`ColumnType::from_value`] infers, NARROWEST FIRST — the
+/// order of the ranges the Amazon Redshift *Data types* documentation publishes
+/// for `INTEGER` (`int4`, 4 bytes) and `BIGINT` (`int8`, 8 bytes).
+///
+/// The ordering lives HERE rather than in a pairwise name comparison, so widening
+/// an inferred column keeps working when another inferred width joins the list.
+const INFERRED_INTEGER_WIDTHS: &[&str] = &["int4", "int8"];
+
+/// How wide an inferred integer type is, as its position in
+/// [`INFERRED_INTEGER_WIDTHS`]; `None` for a type that is not one of them.
+fn integer_width(name: &str) -> Option<usize> {
+    INFERRED_INTEGER_WIDTHS
+        .iter()
+        .position(|candidate| *candidate == name)
 }
 
 /// Build the modelled `ColumnMetadata` for one result column.

@@ -193,17 +193,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A job template is resolved, never assumed: this service stores no templates
-        // yet (`CreateJobTemplate` is still a stub), so a `jobTemplateId` names a
-        // template that does not exist and the modelled not-found is the honest answer.
-        // Resolved BEFORE the idempotency replay, so which requests this operation
-        // refuses does not depend on whether one of them was retried.
+        // A job template is resolved out of state, never assumed. Resolved BEFORE the
+        // idempotency replay, so which requests this operation refuses does not depend
+        // on whether one of them was retried.
         if let Some(template_id) = input.job_template_id.as_deref() {
-            return Err(StartJobRunErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Job template {template_id} was not found")),
-                },
-            )
+            if !state.job_templates.contains_key(template_id) {
+                return Err(StartJobRunErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("Job template {template_id} was not found")),
+                    },
+                )
+                .into());
+            }
+            // The template exists, but APPLYING it — building the run from the template's
+            // `jobTemplateData`, substituting the `parameterConfiguration` placeholders
+            // it declares and enforcing the values it fixes — is not implemented in this
+            // slice. A run built from the request alone would silently ignore the values
+            // the template exists to enforce, so the submission is refused with the
+            // modelled error rather than answered with a run the template did not shape.
+            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "job template {template_id} cannot be applied to a job run by this emulator yet"
+                )),
+            })
             .into());
         }
         // `jobTemplateParameters` only has meaning as the parameters OF a job template,

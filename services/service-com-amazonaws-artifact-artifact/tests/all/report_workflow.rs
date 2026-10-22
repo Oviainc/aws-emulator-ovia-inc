@@ -18,102 +18,22 @@
 //!   version, yields a modelled failure rather than a URL.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::Value;
 use service_com_amazonaws_artifact_artifact::state::TERM_GRANT_CAPACITY;
-use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::{
+    emulator, get_report, get_report_metadata, get_signed, get_term_for_report,
+    list_report_versions, list_reports, signed_for, CATALOG, FALLBACK_REGION, REGION,
+    SIGNED_FOR_A_MALFORMED_REGION,
+};
+
 /// The bounds `MaxResultsAttribute` declares (`@range(min: 1, max: 300)`), spelled out
 /// here rather than imported from the crate so a wrong bound in `src/state.rs` fails.
 const MAX_RESULTS_FLOOR: i32 = 1;
 /// See [`MAX_RESULTS_FLOOR`].
 const MAX_RESULTS_CEILING: i32 = 300;
-
-/// A SigV4 credential scope naming this service. It is what routes a request to the
-/// artifact service, and its region is what a report ARN is built for.
-const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/eu-west-1/artifact/aws4_request, \
-     SignedHeaders=host, Signature=abc";
-
-/// The region [`SIGNED_FOR_EU_WEST_1`] signs for.
-const REGION: &str = "eu-west-1";
-
-/// A credential scope whose region field does not have an AWS region's shape. It still
-/// names the `artifact` signing name, so the request routes and the handler runs — and
-/// has to choose the region a report ARN names without letting a header shape it.
-const SIGNED_FOR_A_MALFORMED_REGION: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/not_a_region/artifact/aws4_request, \
-     SignedHeaders=host, Signature=abc";
-
-/// The region a report ARN names when the request's scope offers none usable.
-const FALLBACK_REGION: &str = "us-east-1";
-
-/// A credential scope for `region`, in the shape SigV4 declares.
-fn signed_for(region: &str) -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/artifact/aws4_request, \
-         SignedHeaders=host, Signature=abc"
-    )
-}
-
-/// One row of the service-owned catalog this emulator publishes.
-struct Expected {
-    id: &'static str,
-    name: &'static str,
-    series: &'static str,
-    /// One of `AcceptanceType`'s values (`EXPLICIT` | `PASSTHROUGH`).
-    acceptance_type: &'static str,
-    /// Every published version of this report, ascending.
-    versions: &'static [i64],
-}
-
-/// The catalog the emulator serves, in the ascending report-id order `ListReports` uses.
-///
-/// AWS Artifact has no `CreateReport`: the catalog is service-owned, so these rows are
-/// the emulator's published set. They are spelled out here, independently of the seed in
-/// `src/state.rs`, so a changed or fabricated catalog fails this suite rather than
-/// quietly redefining what it asserts. The rows differ along everything the rules below
-/// generalise over: report series, `AcceptanceType`, and how many versions a report has
-/// (one, two and three).
-const CATALOG: &[Expected] = &[
-    Expected {
-        id: "report-cloudsecalliance",
-        name: "Cloud Security Alliance CAIQ",
-        series: "CSA",
-        acceptance_type: "PASSTHROUGH",
-        versions: &[1],
-    },
-    Expected {
-        id: "report-iso270012022cert",
-        name: "ISO 27001 2022 Certification",
-        series: "ISO",
-        acceptance_type: "PASSTHROUGH",
-        versions: &[1],
-    },
-    Expected {
-        id: "report-pcidss4aoc000001",
-        name: "PCI DSS v4 AOC",
-        series: "PCI",
-        acceptance_type: "EXPLICIT",
-        versions: &[1, 2],
-    },
-    Expected {
-        id: "report-soc1type2report1",
-        name: "SOC 1 Type 2",
-        series: "SOC",
-        acceptance_type: "EXPLICIT",
-        versions: &[1, 2, 3],
-    },
-    Expected {
-        id: "report-soc2type2report1",
-        name: "SOC 2 Type 2",
-        series: "SOC",
-        acceptance_type: "EXPLICIT",
-        versions: &[1, 2],
-    },
-];
 
 /// `ReportId`'s `^report-[a-zA-Z0-9]{16}$`, checked here rather than through the crate's
 /// own predicate so a wrong predicate cannot make this test pass.
@@ -132,87 +52,6 @@ fn matches_term_token_pattern(value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c.is_whitespace())
-}
-
-/// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// What the emulator answered: the HTTP status and the JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
-}
-
-impl Answer {
-    /// The wire error code (`__type`), or the empty string on a success.
-    fn error_code(&self) -> &str {
-        self.body["__type"].as_str().unwrap_or_default()
-    }
-
-    /// The `reports` list a paginated report operation returns.
-    fn reports(&self) -> &[Value] {
-        self.body["reports"].as_array().map_or(&[], |items| items)
-    }
-
-    /// The `nextToken` the answer carries, if any.
-    fn next_token(&self) -> Option<String> {
-        self.body["nextToken"].as_str().map(str::to_string)
-    }
-}
-
-async fn get(router: &MultiServiceRouter, uri: &str) -> Answer {
-    get_signed(router, uri, SIGNED_FOR_EU_WEST_1).await
-}
-
-async fn get_signed(router: &MultiServiceRouter, uri: &str, authorization: &str) -> Answer {
-    let request = ::http::Request::builder()
-        .method("GET")
-        .uri(uri)
-        .header("host", "artifact.eu-west-1.amazonaws.com")
-        .header("authorization", authorization)
-        .body(Bytes::new())
-        .expect("the test request is well formed");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-            panic!(
-                "GET {uri} answered a body that is not JSON ({error}): {:?}",
-                String::from_utf8_lossy(&bytes)
-            )
-        })
-    };
-    Answer { status, body }
-}
-
-async fn list_reports(router: &MultiServiceRouter, query: &str) -> Answer {
-    get(router, &format!("/v1/report/list{query}")).await
-}
-
-async fn list_report_versions(router: &MultiServiceRouter, query: &str) -> Answer {
-    get(router, &format!("/v1/report/listVersions{query}")).await
-}
-
-async fn get_report_metadata(router: &MultiServiceRouter, query: &str) -> Answer {
-    get(router, &format!("/v1/report/getMetadata{query}")).await
-}
-
-async fn get_term_for_report(router: &MultiServiceRouter, query: &str) -> Answer {
-    get(router, &format!("/v1/report/getTermForReport{query}")).await
-}
-
-async fn get_report(router: &MultiServiceRouter, query: &str) -> Answer {
-    get(router, &format!("/v1/report/get{query}")).await
 }
 
 /// Walk every page of `ListReports` at `page_size`, returning the concatenated summaries.
@@ -342,21 +181,27 @@ async fn list_reports_serves_the_persisted_catalog_identically_on_every_call() {
             expected.acceptance_type,
             actual
         );
-        // A report ARN is service-owned: the region the request was signed for, and an
-        // empty account id.
-        assert_eq!(
-            actual["arn"].as_str(),
-            Some(format!("arn:aws:artifact:{REGION}::report/{}", expected.id).as_str()),
-            "case {case:?}: expected a service-owned ARN for region {REGION}, got {:?}",
-            actual
-        );
-        // ListReports reports one entry per report, at its LATEST published version.
+        // A report ARN is service-owned: the region the request was signed for, an empty
+        // account id, and the VERSION this entry projects.
         let latest = expected
             .versions
             .iter()
             .copied()
             .next_back()
             .expect("every catalog row publishes a version");
+        assert_eq!(
+            actual["arn"].as_str(),
+            Some(
+                format!(
+                    "arn:aws:artifact:{REGION}::report/{}:{latest}",
+                    expected.id
+                )
+                .as_str()
+            ),
+            "case {case:?}: expected a service-owned ARN for region {REGION}, got {:?}",
+            actual
+        );
+        // ListReports reports one entry per report, at its LATEST published version.
         assert_eq!(
             actual["version"].as_i64(),
             Some(latest),
@@ -370,11 +215,19 @@ async fn list_reports_serves_the_persisted_catalog_identically_on_every_call() {
             actual
         );
         assert_eq!(
-            actual["uploadState"].as_str(),
-            Some("COMPLETE"),
-            "case {case:?}: a catalog entry's document upload must be COMPLETE, got {:?}",
+            actual["visibility"].as_str(),
+            Some("PUBLIC"),
+            "case {case:?}: a report AWS publishes in the catalog is PUBLIC, got {:?}",
             actual
         );
+        // The document-upload progress members are not part of the catalog projection.
+        for member in ["uploadState", "statusMessage"] {
+            assert!(
+                actual[member].is_null(),
+                "case {case:?}: ListReports must not project {member}, got {:?}",
+                actual
+            );
+        }
         for member in ["description", "category", "companyName", "productName"] {
             assert!(
                 actual[member].is_string(),
@@ -383,16 +236,18 @@ async fn list_reports_serves_the_persisted_catalog_identically_on_every_call() {
             );
         }
         // The reporting period is the stored window, and it is a window: start strictly
-        // before end. Both members target `TimestampAttribute`
-        // (`@timestampFormat("date-time")`), so they arrive as RFC 3339 STRINGS and are
-        // compared as the instants they name.
+        // before end, and after the epoch — a 1970-era instant is what an epoch-seconds
+        // number read as a date-time renders as, which is the defect this suite pins.
+        // Both members target `TimestampAttribute` (`@timestampFormat("date-time")`), so
+        // they arrive as RFC 3339 STRINGS and are compared as the instants they name.
         let (start, end) = (
             instant(case, "periodStart", &actual["periodStart"]),
             instant(case, "periodEnd", &actual["periodEnd"]),
         );
         assert!(
             start > 0 && start < end,
-            "case {case:?}: expected a reporting period with start before end, got {:?}",
+            "case {case:?}: expected a reporting period after the epoch with start before \
+             end, got {:?}",
             actual
         );
     }
@@ -496,7 +351,6 @@ async fn every_listed_report_is_fetchable_by_id_and_by_version() {
             "arn",
             "version",
             "state",
-            "uploadState",
             "description",
             "series",
             "category",
@@ -505,6 +359,7 @@ async fn every_listed_report_is_fetchable_by_id_and_by_version() {
             "periodStart",
             "periodEnd",
             "acceptanceType",
+            "visibility",
         ] {
             assert_eq!(
                 detail[member], summary[member],
@@ -515,6 +370,17 @@ async fn every_listed_report_is_fetchable_by_id_and_by_version() {
         }
         // `ReportDetail` adds members the summary has no room for; they come from the
         // same stored version.
+        assert_eq!(
+            detail["uploadState"].as_str(),
+            Some("COMPLETE"),
+            "case {case:?}: a published version's document upload is COMPLETE, got {:?}",
+            detail
+        );
+        assert!(
+            detail["statusMessage"].is_string(),
+            "case {case:?}: the metadata read reports the upload's status message, got {:?}",
+            detail
+        );
         assert_eq!(
             detail["termArn"].as_str(),
             Some(
@@ -618,6 +484,21 @@ async fn list_report_versions_returns_every_stored_version_of_one_report() {
                 report["id"].as_str(),
                 Some(expected.id),
                 "case {case:?}: every version belongs to the requested report, got {:?}",
+                report
+            );
+            // Each entry's ARN names the VERSION it projects, so no two of them name the
+            // same resource.
+            assert_eq!(
+                report["arn"].as_str(),
+                Some(
+                    format!(
+                        "arn:aws:artifact:{REGION}::report/{}:{}",
+                        expected.id,
+                        report["version"].as_i64().unwrap_or_default()
+                    )
+                    .as_str()
+                ),
+                "case {case:?}: a version's ARN must name that version, got {:?}",
                 report
             );
         }
@@ -930,9 +811,18 @@ async fn a_malformed_report_id_or_version_is_refused_before_the_catalog_is_consu
 #[tokio::test]
 async fn a_next_token_this_service_never_issued_is_refused() {
     let router = emulator();
-    // A pagination token is opaque, but it is still one of THIS operation's tokens: a
-    // ListReports token is a report id, a ListReportVersions token is a version number.
-    for token in ["not-a-token", "report-short", "0", "-3", ""] {
+    // A pagination token is OPAQUE: the only admissible value is one this operation
+    // itself cut. The rows span what a client might otherwise hand back — a made-up
+    // string, a resource identifier (which is what a leaky implementation publishes as
+    // its token), a bare offset, and the empty string.
+    for token in [
+        "not-a-token",
+        "report-short",
+        "report-073F0fUCdVVNKJrF",
+        "0",
+        "-3",
+        "",
+    ] {
         let reports = list_reports(&router, &format!("?nextToken={token}")).await;
         assert_eq!(
             reports.status, 400,
@@ -946,7 +836,14 @@ async fn a_next_token_this_service_never_issued_is_refused() {
             reports.body
         );
     }
-    for token in ["not-a-number", "0", "-3", "1.5", "", "report-cloudsecalliance:x"] {
+    for token in [
+        "not-a-number",
+        "0",
+        "-3",
+        "1.5",
+        "",
+        "report-073F0fUCdVVNKJrF:2",
+    ] {
         let versions = list_report_versions(
             &router,
             &format!("?reportId={}&nextToken={token}", CATALOG[0].id),
@@ -959,6 +856,23 @@ async fn a_next_token_this_service_never_issued_is_refused() {
             versions.status, versions.body
         );
     }
+
+    // A token one paginated operation issued is not a token of the other: each cursor
+    // names the operation that cut it.
+    let reports_page = list_reports(&router, "?maxResults=1").await;
+    let reports_token = reports_page
+        .next_token()
+        .expect("a catalog of several reports must page");
+    let crossed = list_report_versions(
+        &router,
+        &format!("?reportId={}&nextToken={reports_token}", CATALOG[0].id),
+    )
+    .await;
+    assert_eq!(
+        crossed.status, 400,
+        "a ListReports token must not resume ListReportVersions, got {} with {:?}",
+        crossed.status, crossed.body
+    );
 
     // A ListReportVersions token is bound to the report it was cut for: spending it on
     // another report is not a resume offset, it is a token that was never issued there.
@@ -1029,8 +943,14 @@ async fn a_report_arn_names_the_region_the_request_was_signed_for() {
             answer.body["reportDetails"]["arn"].as_str(),
             Some(
                 format!(
-                    "arn:aws:artifact:{expected_region}::report/{}",
-                    CATALOG[0].id
+                    "arn:aws:artifact:{expected_region}::report/{}:{}",
+                    CATALOG[0].id,
+                    CATALOG[0]
+                        .versions
+                        .iter()
+                        .copied()
+                        .next_back()
+                        .unwrap_or(1)
                 )
                 .as_str()
             ),

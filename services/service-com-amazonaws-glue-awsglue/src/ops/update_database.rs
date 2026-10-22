@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +148,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDatabase"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateDatabaseErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        // `Name` addresses the database to update; `DatabaseInput$Name` is the name the
+        // updated definition carries. Both are folded, as the model documents for each
+        // ("For Hive compatibility, this is folded to lowercase").
+        let addressed = crate::state::fold_name(&input.name);
+        let submitted = crate::state::fold_name(&input.database_input.name);
+        let renaming = submitted != addressed;
+
+        let mut store = state.lock();
+        let Some(catalog) = store.catalogs.get_mut(&catalog_id) else {
+            return Err(UpdateDatabaseErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Database {addressed} not found in catalog {catalog_id}"
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // The submitted definition carries the database's own name, so an update that
+        // submits a different one moves the database to that name — and the destination
+        // may be taken, which is the `AlreadyExistsException` this operation models. A
+        // taken destination is only a conflict when the addressed database exists at
+        // all; otherwise the request is a miss, reported as such below.
+        if renaming
+            && catalog.databases.contains_key(&addressed)
+            && catalog.databases.contains_key(&submitted)
+        {
+            return Err(UpdateDatabaseErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("Database already exists: {submitted}")),
+                },
+            )
+            .into());
+        }
+        // Taking the entry out and putting it back under the submitted name is what
+        // makes a rename reachable by the new name and unreachable by the old one; for
+        // an update that keeps the name, the key does not change.
+        let Some(mut entry) = catalog.databases.remove(&addressed) else {
+            return Err(UpdateDatabaseErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!(
+                        "Database {addressed} not found in catalog {catalog_id}"
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+        // Write the submitted definition into the stored record `GetDatabase` and
+        // `GetDatabases` read, so the next read reports what this request sent.
+        entry.apply_input(&input.database_input);
+        catalog.databases.insert(submitted.clone(), entry);
+        ::tracing::info!(
+            operation = "UpdateDatabase",
+            catalog_id = %catalog_id,
+            database = %submitted,
+            previous_name = %addressed,
+            renamed = renaming,
+            "updated a Data Catalog database"
+        );
+
+        Ok(UpdateDatabaseOutput {})
     }
 }

@@ -446,6 +446,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Indicates that a range of bytes was specified" — S3 reports that an
             // object read supports range requests whether or not one was made.
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            // "The number of tags, if any, on the object" (`HeadObjectOutput$TagCount`) —
+            // the count of the tag set the object holds, whether the write that stored it
+            // carried the set in `x-amz-tagging` or a later `PutObjectTagging` associated
+            // one with it. "If any": an object with no tags reports no count at all
+            // rather than a zero.
+            tag_count: object.tag_count(),
             // "Version ID of the object" (`HeadObjectOutput$VersionId`), reported for a
             // version the store minted an id for — a write into a bucket whose versioning
             // status is `Enabled`. A `null` version carries no id of its own, so none is
@@ -458,9 +464,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // checksum was uploaded with it (`Checksum*`, `ChecksumType`), metadata could
             // not be decoded (`MissingMeta`), the read was partial (`ContentRange`,
             // `PartsCount`), something encrypted it (`ServerSideEncryption`, `SSE*`,
-            // `BucketKeyEnabled`), it carries object tags (`TagCount`), it is replicated
-            // (`ReplicationStatus`), it is locked (`ObjectLock*`) or the bucket is
-            // Requester Pays (`RequestCharged`).
+            // `BucketKeyEnabled`), it is replicated (`ReplicationStatus`), it is locked
+            // (`ObjectLock*`) or the bucket is Requester Pays (`RequestCharged`).
             ..HeadObjectOutput::default()
         })
     }

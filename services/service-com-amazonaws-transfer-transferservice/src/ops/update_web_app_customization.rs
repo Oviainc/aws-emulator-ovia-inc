@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWebAppCustomization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWebAppCustomization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWebAppCustomization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns the branding a web app is served with — its page title, logo file and icon
+//! file — into the web app `CreateWebApp` persisted in this service's engine store, and
+//! answers the `WebAppId` it updated.
+//!
+//! A MUTATION, and a PARTIAL one: the operation is documented as "assigns new
+//! customization properties to a web app. You can modify the icon file, logo file, and
+//! title", and models all three of those members optional beside the `@required`
+//! `WebAppId` — so a request assigns the members it carries and leaves the ones it omits
+//! exactly as they stand ([`crate::state::WebAppCustomization::assign`]). Clearing a web
+//! app's customization is what `DeleteWebAppCustomization` is for; an omitted member is
+//! "not modified", never "removed".
+//!
+//! A `WebAppId` the store does not hold is answered with the modelled
+//! `ResourceNotFoundException`. The model carries no version, ETag or client token for
+//! this operation, so there is no documented condition under which it conflicts: two
+//! updates of one web app both apply, in the order the store serialises them.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +166,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWebAppCustomization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWebAppCustomizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWebAppCustomization"))
+        use crate::state as st;
+
+        // This operation reads no request metadata: it addresses a stored web app by id
+        // and answers that same id, so nothing here is derived from the Region.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            UpdateWebAppCustomizationErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+        let Some(stored) = guard.web_apps.get_mut(&input.web_app_id) else {
+            return Err(st::not_found(
+                UpdateWebAppCustomizationErrorModeled::ResourceNotFoundException(
+                    st::unknown_web_app(&input.web_app_id),
+                ),
+            ));
+        };
+
+        // The partial-update rule, applied through the one function that holds it:
+        // every member the request carries is assigned, every member it omits is left
+        // as it stands.
+        stored
+            .customization
+            .assign(input.title, input.logo_file, input.favicon_file);
+        let web_app_id = stored.web_app_id.clone();
+        drop(guard);
+
+        Ok(UpdateWebAppCustomizationOutput { web_app_id })
     }
 }

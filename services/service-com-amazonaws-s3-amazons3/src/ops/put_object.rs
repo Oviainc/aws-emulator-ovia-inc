@@ -362,11 +362,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //   unretrievable without the key it is not storing).
         // * the Object Lock members decide whether a later delete is allowed; no
         //   retention or hold is emulated.
-        // * `x-amz-tagging` sets the object's tag set in the same request as the write,
-        //   as a URL-encoded query string this handler does not parse; the implemented
-        //   path for an object's tags is `PutObjectTagging`, which carries the modelled
-        //   `Tagging` container, so a write carrying the header is refused rather than
-        //   stored with the tag set silently dropped.
+        //
+        // `x-amz-tagging` is NOT in this list: it carries a tag set this emulator stores
+        // on the object it writes (see below), exactly as `PutObjectTagging` would.
         //
         // The checksum members are NOT in this list: a checksum this handler neither
         // computes nor verifies is simply not reported back, so nothing is claimed about
@@ -411,7 +409,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "x-amz-object-lock-event-hold",
                 input.object_lock_event_hold.is_some(),
             ),
-            ("x-amz-tagging", input.tagging.is_some()),
         ] {
             if present {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
@@ -444,6 +441,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The tag-set for the object. The tag-set must be encoded as URL Query
+        // parameters. (For example, "Key1=Value1")" (`PutObjectRequest$Tagging`) — so the
+        // header is read as the URL-encoded query string it is declared to be, and the
+        // object is stored WITH that tag set: a write that carries its tags is the normal
+        // way to stage a tagged object, and `GetObjectTagging` reports the same set a
+        // `PutObjectTagging` of it would have stored.
+        //
+        // Judged against the OBJECT's published tag-set limits, the same ones
+        // `PutObjectTagging` judges its container against — "Amazon S3 limits the maximum
+        // number of tags to 10 tags per object", with the shared key and value character
+        // bounds and the key-uniqueness a tag set has. AWS refuses these with
+        // `InvalidTag`, a code this service's model does not declare as a shape and so
+        // cannot render, so the refusal goes out through the framework's 400
+        // `ValidationException` channel — and BEFORE anything is written, so a refused
+        // write leaves whatever was at the key exactly as it was. The parse and that
+        // judgement are one seam, so a header naming more pairs than an object may hold is
+        // refused without this process holding a tag set it would never store.
+        let tags = match input.tagging.as_deref() {
+            Some(header) => {
+                match crate::state::tag_set_from_header(
+                    header,
+                    crate::state::OBJECT_TAG_SET_LIMITS,
+                ) {
+                    Ok(tags) => tags,
+                    Err(rejection) => {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            rejection.to_string(),
+                        ))
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+
         let etag = crate::state::object_etag(&input.body);
         let object = crate::state::Object {
             etag: etag.clone(),
@@ -466,10 +497,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .collect(),
             // A write REPLACES the whole object, so the object it replaces takes its tag
-            // set with it: a `PutObject` that carries no tag set leaves none associated
-            // with the key (`x-amz-tagging` is refused above). `PutObjectTagging` is what
-            // associates one afterwards.
-            tags: Vec::new(),
+            // set with it: what the key carries afterwards is the tag set THIS request's
+            // `x-amz-tagging` header named, and nothing of the one before it — a write
+            // carrying no header leaves the key with no tags at all, which is what
+            // `PutObjectTagging` then associates one with.
+            tags,
             // Minted by the store, which is the only place that sees the bucket's
             // versioning state: this write carries no id of its own.
             version_id: None,
