@@ -3,17 +3,19 @@
 //! Engine state for the com-amazonaws-redshift-redshiftserviceversion20121201 service.
 //!
 //! One store per emulator, holding the provisioned-cluster control plane: the
-//! clusters and the snapshots taken of them. Both collections keep INSERTION
-//! ORDER, so the `Marker` cursor the paginated `Describe*` operations hand out is
-//! a stable, resumable offset into the same sequence a later page walks.
+//! clusters, the snapshots taken of them, and the cluster parameter groups they
+//! are configured from. Every collection keeps INSERTION ORDER, so the `Marker`
+//! cursor the paginated `Describe*` operations hand out is a stable, resumable
+//! offset into the same sequence a later page walks.
 //!
 //! Besides the store this module owns the small rules every cluster operation
-//! shares: the published engine-version catalog, the documented identifier
+//! shares: the published engine-version catalog and the default parameter group
+//! of each of its families, the documented identifier
 //! syntax, the documented `MaxRecords` window,
 //! the derived endpoint address / namespace ARN, and the clock-owed
 //! `creating` -> `available` transitions (see [`PROVISIONING_SPAN`]).
 
-use crate::ops::types::{Cluster, ClusterVersion, Snapshot};
+use crate::ops::types::{Cluster, ClusterParameterGroup, ClusterVersion, Snapshot};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
@@ -85,6 +87,58 @@ pub fn published_cluster_versions() -> Vec<ClusterVersion> {
         })
         .collect()
 }
+
+/// The DEFAULT cluster parameter group of every published engine version: the
+/// groups a fresh account already has, before it creates one of its own.
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterParameterGroupMessage",
+/// member="ParameterGroupFamily")` — "For example, a valid family name is
+/// \"redshift-1.0\"" and "The parameter group family names associated with the
+/// default parameter groups provide you the valid values": the families these
+/// groups carry ARE the catalogue a `CreateClusterParameterGroup` request is
+/// checked against (see
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::parameter_group_families`]).
+/// Derived from [`published_cluster_versions`], so the engine-version catalog
+/// `DescribeClusterVersions` reports and the parameter-group families
+/// `CreateClusterParameterGroup` accepts cannot disagree.
+pub fn default_parameter_groups() -> Vec<StoredParameterGroup> {
+    published_cluster_versions()
+        .into_iter()
+        .filter_map(|version| {
+            let engine_version = version.cluster_version?;
+            let family = version
+                .cluster_parameter_group_family
+                .unwrap_or_else(|| parameter_group_family(&engine_version));
+            Some(StoredParameterGroup {
+                group: ClusterParameterGroup {
+                    parameter_group_name: Some(default_parameter_group(&engine_version)),
+                    parameter_group_family: Some(family.clone()),
+                    description: Some(default_parameter_group_description(&family)),
+                    tags: Some(Vec::new()),
+                },
+                default_group: true,
+            })
+        })
+        .collect()
+}
+
+/// The description Redshift gives a default cluster parameter group.
+pub fn default_parameter_group_description(family: &str) -> String {
+    format!("Default parameter group for {family}")
+}
+
+/// How many parameter groups the ACCOUNT's own groups may number before
+/// `CreateClusterParameterGroup` refuses with the modelled
+/// `ClusterParameterGroupQuotaExceededFault`.
+///
+/// The same reasoning as [`CLUSTER_QUOTA`]: Amazon Redshift publishes an
+/// adjustable quota on parameter groups per account per Region, and this
+/// emulator models neither Service Quotas nor an account's adjustments, so this
+/// is the emulator's OWN bound on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::parameter_groups`]
+/// rather than a claim about any account's limit. The default parameter groups
+/// Redshift owns are outside it — the quota bounds what a caller can add.
+pub const PARAMETER_GROUP_QUOTA: usize = 1_000;
 
 /// The maintenance track a cluster joins when the request names none.
 ///
@@ -202,6 +256,19 @@ pub struct StoredCluster {
     pub available_at: Instant,
 }
 
+/// A cluster parameter group as this service stores it.
+#[derive(Debug, Clone)]
+pub struct StoredParameterGroup {
+    /// Exactly what `DescribeClusterParameterGroups` reports, so a read never
+    /// recomputes it.
+    pub group: ClusterParameterGroup,
+    /// Whether Redshift itself owns the group (a DEFAULT parameter group, which
+    /// every account has for each engine version) rather than the account having
+    /// created it. A default group is outside [`PARAMETER_GROUP_QUOTA`] and its
+    /// family is one of the valid `ParameterGroupFamily` values.
+    pub default_group: bool,
+}
+
 /// A snapshot as this service stores it.
 #[derive(Debug, Clone)]
 pub struct StoredSnapshot {
@@ -218,6 +285,10 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     pub clusters: Vec<StoredCluster>,
     /// Every snapshot, keyed by `SnapshotIdentifier`, in creation order.
     pub snapshots: Vec<StoredSnapshot>,
+    /// Every cluster parameter group, keyed by `ParameterGroupName`, in creation
+    /// order — the default parameter groups first, then the ones the account
+    /// created.
+    pub parameter_groups: Vec<StoredParameterGroup>,
     /// The engine versions this service offers, in catalog order. Unlike the
     /// collections above this one is SEEDED when the store is created — the
     /// versions exist before any cluster does, which is why
@@ -226,11 +297,21 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     pub cluster_versions: Vec<ClusterVersion>,
 }
 
+/// A fresh store already holds what exists before any caller writes anything:
+/// the published engine-version catalog and, for each of its versions, the
+/// DEFAULT parameter group of that version's family.
+///
+/// Source: `smithy_query(query="doc", operation="DescribeClusterParameterGroups")`
+/// — "Returns a list of Amazon Redshift parameter groups, including parameter
+/// groups you created and the default parameter group": the default group exists
+/// without anybody creating it, so it is part of an empty store rather than
+/// something a read mints.
 impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     fn default() -> Self {
         Self {
             clusters: Vec::new(),
             snapshots: Vec::new(),
+            parameter_groups: default_parameter_groups(),
             cluster_versions: published_cluster_versions(),
         }
     }
@@ -282,6 +363,48 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             .iter()
             .find(|s| s.snapshot.snapshot_identifier.as_deref() == Some(identifier))
     }
+
+    /// The stored cluster parameter group with this name, if any.
+    ///
+    /// The name is compared as stored: a group's name is held in the documented
+    /// lower-case form (see [`normalized_parameter_group_name`]), so a caller
+    /// naming it in any other case names no group.
+    pub fn parameter_group(&self, name: &str) -> Option<&StoredParameterGroup> {
+        self.parameter_groups
+            .iter()
+            .find(|g| g.group.parameter_group_name.as_deref() == Some(name))
+    }
+
+    /// The `ParameterGroupFamily` values a request may name.
+    ///
+    /// Source: `smithy_query(query="doc", shape="CreateClusterParameterGroupMessage",
+    /// member="ParameterGroupFamily")` — "The parameter group family names
+    /// associated with the default parameter groups provide you the valid
+    /// values." So the catalogue is read off the DEFAULT groups the store holds,
+    /// never hard-coded at the call site.
+    pub fn parameter_group_families(&self) -> Vec<&str> {
+        let mut families: Vec<&str> = Vec::new();
+        for family in self
+            .parameter_groups
+            .iter()
+            .filter(|g| g.default_group)
+            .filter_map(|g| g.group.parameter_group_family.as_deref())
+        {
+            if !families.contains(&family) {
+                families.push(family);
+            }
+        }
+        families
+    }
+
+    /// How many cluster parameter groups the ACCOUNT created, which is what
+    /// [`PARAMETER_GROUP_QUOTA`] bounds.
+    pub fn owned_parameter_group_count(&self) -> usize {
+        self.parameter_groups
+            .iter()
+            .filter(|g| !g.default_group)
+            .count()
+    }
 }
 
 /// `ClusterAvailabilityStatus` for a `ClusterStatus`.
@@ -323,6 +446,29 @@ pub const CLUSTER_IDENTIFIER_RULE: IdentifierRule = IdentifierRule {
     max_len: 63,
     lowercase_only: true,
 };
+
+/// The rule for a cluster parameter group name (`ParameterGroupName`).
+///
+/// Source: `smithy_query(query="doc", shape="CreateClusterParameterGroupMessage",
+/// member="ParameterGroupName")` — "Must be 1 to 255 alphanumeric characters or
+/// hyphens First character must be a letter. Cannot end with a hyphen or contain
+/// two consecutive hyphens." Mixed case is ACCEPTED and folded by
+/// [`normalized_parameter_group_name`] rather than refused, because the same doc
+/// says the value "is stored as a lower-case string".
+pub const PARAMETER_GROUP_NAME_RULE: IdentifierRule = IdentifierRule {
+    member: "ParameterGroupName",
+    max_len: 255,
+    lowercase_only: false,
+};
+
+/// The form a cluster parameter group name is STORED and reported in.
+///
+/// Source: the same doc sentence as [`PARAMETER_GROUP_NAME_RULE`] — "This value
+/// is stored as a lower-case string." The rule admits only ASCII alphanumerics
+/// and hyphens, so ASCII folding is the whole of it.
+pub fn normalized_parameter_group_name(requested: &str) -> String {
+    requested.to_ascii_lowercase()
+}
 
 /// The rule for a snapshot identifier (`SnapshotIdentifier`,
 /// `FinalClusterSnapshotIdentifier`).
