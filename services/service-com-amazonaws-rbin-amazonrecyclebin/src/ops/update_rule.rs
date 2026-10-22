@@ -207,13 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(rule) = store.rules.get_mut(&input.identifier) else {
             return Err(UpdateRuleErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Retention rule with ID {} not found",
-                        input.identifier
-                    )),
-                    reason: Some("RULE_NOT_FOUND".to_string()),
-                },
+                crate::state::rule_not_found(&input.identifier),
             )
             .into());
         };
@@ -223,16 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         rule.settle(now);
         // A locked rule "can't be modified or deleted", and an unlocked one still
         // inside its unlock delay can be modified "only after the unlock delay period
-        // has expired".
+        // has expired" — to the caller, both are a rule that is locked.
         if rule.is_lock_protected(now) {
-            return Err(UpdateRuleErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Retention rule with ID {} can't be modified while its lock state is {}",
-                    rule.identifier,
-                    rule.lock_state.as_deref().unwrap_or("locked")
-                )),
-                reason: Some("INVALID_RULE_STATE".to_string()),
-            })
+            return Err(UpdateRuleErrorModeled::ConflictException(
+                crate::state::rule_state_conflict(
+                    crate::state::BlockedAction::Modify,
+                    &rule.identifier,
+                    crate::state::BlockingCondition::Locked,
+                ),
+            )
             .into());
         }
 
@@ -247,14 +240,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .exclude_resource_tags
             .unwrap_or_else(|| rule.exclude_resource_tags.clone());
         if !merged_resource_tags.is_empty() && !merged_exclude_resource_tags.is_empty() {
-            return Err(UpdateRuleErrorModeled::ValidationException(ValidationException {
-                message: Some(
-                    "ExcludeResourceTags can't be specified together with ResourceTags: \
-                     exclusion tags apply to Region-level retention rules only"
-                        .to_string(),
+            // A rule the MODEL cannot express, stated in the same envelope a modelled
+            // constraint takes: the member that cannot hold, and what it must satisfy.
+            return Err(UpdateRuleErrorModeled::ValidationException(
+                crate::state::member_validation_failed(
+                    "excludeResourceTags",
+                    "Member must not be specified for a tag-level retention rule",
                 ),
-                reason: Some("INVALID_PARAMETER_VALUE".to_string()),
-            })
+            )
             .into());
         }
         if let Some(retention_period) = input.retention_period {

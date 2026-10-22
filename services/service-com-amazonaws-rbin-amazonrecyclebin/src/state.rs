@@ -12,7 +12,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{LockConfiguration, ResourceTag, RetentionPeriod, RuleSummary, Tag};
+use aws_smithy_schema_server::constraints::Violation;
+
+use crate::ops::types::{
+    ConflictException, LockConfiguration, ResourceNotFoundException, ResourceTag, RetentionPeriod,
+    RuleSummary, Tag, ValidationException,
+};
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. Every emulator defaults to `us-east-1`.
@@ -283,6 +288,222 @@ fn contains_resource_tag(tags: &[ResourceTag], wanted: &ResourceTag) -> bool {
                 .as_ref()
                 .is_none_or(|value| tag.resource_tag_value.as_ref() == Some(value))
     })
+}
+
+// ---------------------------------------------------------------------------
+// The modelled error BODIES this service answers with.
+//
+// Every one of them is composed here, from the request and from the rule's own state,
+// so one refusal class cannot be worded two ways by two handlers — and so the gate in
+// `crate::service`, which answers a constraint refusal before any handler runs, states
+// it exactly as a handler-raised refusal of the same class does.
+// ---------------------------------------------------------------------------
+
+/// `ValidationExceptionReason` for a parameter value the service refuses: a value
+/// outside a constraint the model declares, or a combination of members that cannot
+/// hold together.
+///
+/// Source: smithy_query(query="shape", shape="ValidationExceptionReason") — values
+/// `[INVALID_PAGE_TOKEN, INVALID_PARAMETER_VALUE]`.
+pub const VALIDATION_REASON_INVALID_PARAMETER_VALUE: &str = "INVALID_PARAMETER_VALUE";
+
+/// `ValidationExceptionReason` for a `NextToken` whose SYNTAX is fine but which this
+/// service never issued — the other fault class that enum names. A token that fails
+/// `NextToken`'s own `@pattern` is a parameter value fault, not this one.
+pub const VALIDATION_REASON_INVALID_PAGE_TOKEN: &str = "INVALID_PAGE_TOKEN";
+
+/// `ConflictExceptionReason`'s sole value.
+/// Source: smithy_query(query="shape", shape="ConflictExceptionReason").
+pub const CONFLICT_REASON_INVALID_RULE_STATE: &str = "INVALID_RULE_STATE";
+
+/// The modelled 404 for a retention rule the request addressed and this Region does
+/// not hold — one that was never created, or one already deleted.
+///
+/// `addressed` is the value the REQUEST named the rule by: the `Identifier` an
+/// identifier-addressed operation binds, or the `ResourceArn` a tag operation binds.
+/// The message is composed from it, so a rule that does not exist reads the same way
+/// whichever operation reports it.
+///
+/// `Reason` is deliberately left UNSET: Recycle Bin does not populate the modelled
+/// `ResourceNotFoundExceptionReason` on this path, and sending it would have a client
+/// branch on a field the real service never gives it.
+pub fn rule_not_found(addressed: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Recycle Bin Rule '{addressed}' does not exist.")),
+        reason: None,
+    }
+}
+
+/// What a refused request asked to do to the rule, as the conflict message names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedAction {
+    /// `LockRule`.
+    Lock,
+    /// `UnlockRule`.
+    Unlock,
+    /// `UpdateRule`: every change to a rule is "modify" in the lock documentation
+    /// ("The retention rule is locked and can't be modified or deleted").
+    Modify,
+    /// `DeleteRule`.
+    Delete,
+}
+
+impl BlockedAction {
+    /// The verb the message states this action with.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Lock => "lock",
+            Self::Unlock => "unlock",
+            Self::Modify => "modify",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// The rule's own condition that blocks the request — the second half of a conflict
+/// message, and the only thing a caller can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockingCondition {
+    /// The rule's lock still forbids modifying or deleting it.
+    ///
+    /// Reported for `locked` AND for `pending_unlock` while the unlock delay is still
+    /// running — the model says such a rule "can be modified or deleted only after the
+    /// unlock delay period has expired", so to the caller it is still locked.
+    /// `pending_unlock` is an internal step of releasing that lock, not a different
+    /// answer to "why was this refused", so the stored lock-state token stays out of the
+    /// message.
+    Locked,
+    /// The rule is already `locked`, so locking it again would modify it.
+    AlreadyLocked,
+    /// The rule has no lock to release: it has never been locked, is `unlocked`, or is
+    /// already serving its unlock delay.
+    NotLocked,
+    /// A tag-level rule (one carrying resource tags): "You can't lock tag-level
+    /// retention rules".
+    TagLevelRule,
+    /// A Region-level rule carrying exclusion tags, which cannot be locked either:
+    /// "or Region-level retention rules that have exclusion tags".
+    RuleWithExclusionTags,
+}
+
+impl BlockingCondition {
+    /// How the message describes the condition, after "because it is".
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::AlreadyLocked => "already locked",
+            Self::NotLocked => "not locked",
+            Self::TagLevelRule => "a tag-level rule",
+            Self::RuleWithExclusionTags => "a Region-level rule with exclusion tags",
+        }
+    }
+}
+
+/// The modelled 409 for a lock, modify or delete the rule's own state forbids.
+///
+/// Composed from the identifier the request addressed and the condition that blocks it,
+/// which is the form Recycle Bin states a refused lock/modify/delete with. The rule's
+/// stored lock-state token is never interpolated: it is an internal spelling, and a
+/// caller is told the condition instead.
+pub fn rule_state_conflict(
+    action: BlockedAction,
+    identifier: &str,
+    condition: BlockingCondition,
+) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Cannot {} Recycle Bin rule {identifier} because it is {}.",
+            action.verb(),
+            condition.describe()
+        )),
+        reason: Some(CONFLICT_REASON_INVALID_RULE_STATE.to_string()),
+    }
+}
+
+/// The modelled 400 for the constraints a request violated, as the framework's own
+/// constraint walk reports them. `None` when nothing was violated.
+///
+/// `Reason` is the fault class, not the member: every value that fails a bound the
+/// model declares is an `INVALID_PARAMETER_VALUE`, including a `NextToken` that fails
+/// its `@pattern` (an unusable page token whose syntax is fine is the service's own
+/// [`VALIDATION_REASON_INVALID_PAGE_TOKEN`] fault, raised by the handler that decodes
+/// it).
+pub fn constraint_violations(violations: &[Violation]) -> Option<ValidationException> {
+    Some(ValidationException {
+        message: Some(validation_envelope(violations)?),
+        reason: Some(VALIDATION_REASON_INVALID_PARAMETER_VALUE.to_string()),
+    })
+}
+
+/// The modelled 400 for a rule the MODEL cannot express — a combination of members that
+/// cannot hold together — stated in the same envelope a modelled constraint takes, so a
+/// caller reads one form for both.
+pub fn member_validation_failed(member_path: &str, requirement: &str) -> ValidationException {
+    ValidationException {
+        message: Some(envelope_of(&[clause(member_path, requirement)])),
+        reason: Some(VALIDATION_REASON_INVALID_PARAMETER_VALUE.to_string()),
+    }
+}
+
+/// Every violated constraint as one `ValidationException` message. `None` when
+/// `violations` is empty, so a caller cannot render "0 validation errors detected".
+pub fn validation_envelope(violations: &[Violation]) -> Option<String> {
+    if violations.is_empty() {
+        return None;
+    }
+    let clauses: Vec<String> = violations.iter().map(constraint_clause).collect();
+    Some(envelope_of(&clauses))
+}
+
+/// `1 validation error detected: <clause>` / `N validation errors detected: <clause>;
+/// <clause>` — the envelope AWS counts and joins its validation clauses in.
+fn envelope_of(clauses: &[String]) -> String {
+    match clauses.len() {
+        1 => format!("1 validation error detected: {}", clauses[0]),
+        n => format!("{n} validation errors detected: {}", clauses.join("; ")),
+    }
+}
+
+/// One clause: the member path the request named, then the requirement it failed.
+fn clause(member_path: &str, requirement: &str) -> String {
+    format!("Value at '{member_path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The marker a clause splits at: what precedes it names the member, what follows states
+/// the requirement.
+const CONSTRAINT_MARKER: &str = " failed to satisfy constraint: ";
+
+/// One violated constraint as a clause.
+///
+/// The REQUIREMENT half is the framework's own wording for that constraint class
+/// ([`Violation::message`]), which is where the model's declared bound — a range
+/// endpoint, a `@pattern`, an enum's value set — is rendered, so no bound text is
+/// restated here. Only the SUBJECT changes: Recycle Bin names the member that failed
+/// without quoting the submitted value back.
+///
+/// The requirement is read off the wording for the SAME violation with no value
+/// attached, so the submitted value is nowhere in the text this splits and cannot leak
+/// into the clause whatever it holds; the split takes the LAST marker, so neither a
+/// value nor a caller-chosen map key inside the member path can move it.
+///
+/// An absent required member states no value either — the framework's
+/// `Value null at '<path>' …` quotes nothing of the request — so that sentence stands.
+fn constraint_clause(violation: &Violation) -> String {
+    let unechoed = Violation {
+        path: violation.path.clone(),
+        kind: violation.kind.clone(),
+        value: None,
+    };
+    let stated = unechoed.message();
+    if violation.value.is_none() {
+        return stated;
+    }
+    match stated.rsplit_once(CONSTRAINT_MARKER) {
+        Some((_subject, requirement)) => clause(&violation.path, requirement),
+        // The framework no longer words a clause with that marker: keep its sentence,
+        // which (built with no value attached) still echoes nothing of the request.
+        None => stated,
+    }
 }
 
 /// Per-service state for com-amazonaws-rbin-amazonrecyclebin. A handler reaches it through [`service_state`].
