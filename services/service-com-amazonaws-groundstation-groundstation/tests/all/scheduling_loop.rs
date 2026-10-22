@@ -62,7 +62,21 @@ pub(crate) const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
 /// waiting, and this workspace's `tokio` carries no `time` feature.
 const AFTER_SETTLE: Duration = Duration::from_millis(600);
 
+/// The uplink band this suite grants the account before creating an antenna-uplink
+/// config: a sub-band of the 2025–2120 MHz the service operates
+/// (`smithy_query(query="doc", shape="UplinkSpectrumConfig", member="centerFrequency")`)
+/// that contains [`antenna_uplink_config_data`]'s center frequency.
+const UPLINK_APPROVAL_MHZ: (f64, f64) = (2025.0, 2120.0);
+
+/// The bucket the table's `s3RecordingConfig` records to, made locatable in the store
+/// before that row runs: Ground Station reads a recording bucket's location before it
+/// will create the config.
+const RECORDING_BUCKET: &str = "ground-station-downlink";
+
 /// One HTTP answer, reduced to what these tests assert on.
+///
+/// `pub(crate)` here and below: the sibling suites in this target reach the same front
+/// door, so the plumbing is written once and shared rather than copied per file.
 pub(crate) struct Reply {
     pub(crate) status: u16,
     /// The `x-amzn-errortype` header, present only on an error answer.
@@ -100,6 +114,9 @@ impl Reply {
 /// `core/router/src/lib.rs` builds, minus every other service. The engine comes back
 /// too, so a test can read the store directly where that is the only way to observe a
 /// state transition without racing the clock.
+///
+/// The account is as a fresh one is: no uplink approval, and no bucket to record to.
+/// Call [`provision_uplink_and_recording`] for a suite that needs either.
 pub(crate) fn harness_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -108,9 +125,30 @@ pub(crate) fn harness_with_engine() -> (MultiServiceRouter, Arc<engine::InMemory
     (router, engine)
 }
 
-/// A router holding only this service, over one shared engine.
+/// Grant the account the uplink band [`UPLINK_APPROVAL_MHZ`] and make
+/// [`RECORDING_BUCKET`] a bucket this service can read the location of — the two things
+/// that happen OUTSIDE this API before Ground Station will create an antenna-uplink
+/// config or an s3-recording config (`state::approved_uplink_bands_mhz` and
+/// `state::readable_recording_buckets`, which an operator sets through the environment
+/// variables the crate README documents).
+///
+/// The suites here assert what a provisioned account can do; what an unprovisioned one
+/// is answered instead is `tests/all/request_validation.rs`'s subject.
+pub(crate) fn provision_uplink_and_recording(engine: &engine::InMemoryEngine) {
+    let state = service_state(engine).expect("this service's state store");
+    let mut guard = state.lock();
+    guard.approved_uplink_bands_mhz.push(UPLINK_APPROVAL_MHZ);
+    guard
+        .readable_recording_buckets
+        .push(RECORDING_BUCKET.to_string());
+}
+
+/// A router holding only this service, over one shared engine, on an account provisioned
+/// by [`provision_uplink_and_recording`].
 pub(crate) fn harness() -> MultiServiceRouter {
-    harness_with_engine().0
+    let (router, engine) = harness_with_engine();
+    provision_uplink_and_recording(&engine);
+    router
 }
 
 pub(crate) async fn send(
@@ -165,6 +203,8 @@ pub(crate) fn spectrum_config(center_mhz: f64, bandwidth_mhz: f64) -> Value {
 }
 
 /// An `antennaUplinkConfig` body — also the config an `uplinkEchoConfig` must point at.
+/// Its center frequency sits inside [`UPLINK_APPROVAL_MHZ`], the band this suite grants
+/// the account.
 pub(crate) fn antenna_uplink_config_data() -> Value {
     json!({
         "transmitDisabled": false,

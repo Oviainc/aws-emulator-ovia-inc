@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBucketAccessKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBucketAccessKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints one access key for a stored bucket and appends it to that bucket's
+//! record, answering the key — with the secret access key, which only this
+//! response ever carries — together with the operation-log entry the create
+//! wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBucketAccessKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +163,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBucketAccessKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBucketAccessKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBucketAccessKey"))
+        use ::emulator_server::aws_credentials::{AWS_ACCESS_KEY, SECRET_ACCESS_KEY};
+
+        // A bucket is a REGIONAL resource — `GetBuckets` reports "all of your
+        // buckets in the Amazon Web Services Region where the request is made" —
+        // so the region the request is signed for selects which bucket record
+        // this key is minted for, exactly as `CreateBucket` and `GetBuckets`
+        // resolve it.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
+
+        // The key material comes from the emulator's credential store, the only
+        // thing that creates credential material: the id and the secret are
+        // values a later signed request verifies against, never values this
+        // handler made up. It is minted BEFORE the bucket store is locked, so no
+        // other component's lock is taken while that guard is held; a request
+        // that is then refused withdraws the credential again below, so a
+        // refusal leaves nothing signable behind.
+        let credentials = ctx.credential_store();
+        let minted = credentials.create(&AWS_ACCESS_KEY);
+        let secret_access_key = minted.secret(SECRET_ACCESS_KEY).map(str::to_string);
+
+        let withdraw = |why: &'static str| {
+            // A key no bucket kept is a credential nothing can be attributed to,
+            // so it is forgotten again rather than left signable. A failed
+            // withdrawal would leave an orphaned credential record, so say so
+            // rather than dropping the result silently.
+            if let Err(error) = credentials.delete(&minted.id) {
+                ::tracing::warn!(
+                    operation = "CreateBucketAccessKey",
+                    reason = ?error,
+                    why,
+                    "an unattributed bucket access key could not be withdrawn from the \
+                     credential store"
+                );
+            }
+        };
+
+        // A credential without its secret cannot be signed with, and the secret
+        // "is returned only in response to the CreateBucketAccessKey action" — so
+        // no later call could supply it, and the key is withdrawn instead of
+        // being stored unusable.
+        let Some(secret_access_key) = secret_access_key else {
+            withdraw("minted without a secret access key");
+            return Err(CreateBucketAccessKeyErrorModeled::ServiceException(
+                ServiceException {
+                    message: Some(
+                        "the bucket access key was minted without a secret access key".to_string(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        // `bucketName` is a modelled `@required` member carrying the modelled
+        // length and pattern, so the centralized walk refused anything outside
+        // them before this body ran. What is left is what the model cannot
+        // express: the bucket has to exist in this region, and it may hold only
+        // so many keys. Each is checked BEFORE the key is attributed to it, so a
+        // refused request stores nothing.
+        let created = crate::state::with_state(&*self.engine, |store| {
+            let bucket = store
+                .bucket_mut(&region, &input.bucket_name)
+                .ok_or_else(|| {
+                    not_found(format!(
+                        "bucketName '{}' does not name a bucket of this account in {region}",
+                        input.bucket_name
+                    ))
+                })?;
+            if bucket.access_keys.len() >= crate::state::MAX_BUCKET_ACCESS_KEYS {
+                return Err(invalid(format!(
+                    "bucket '{}' already holds {} access keys, the maximum a bucket may have; \
+                     delete one with DeleteBucketAccessKey before creating another",
+                    input.bucket_name,
+                    crate::state::MAX_BUCKET_ACCESS_KEYS
+                )));
+            }
+
+            let key = crate::state::StoredBucketAccessKey {
+                access_key_id: minted.id.clone(),
+                // A new key is valid at once: the modelled `AccessKey$status`
+                // documents `Active` as "the key is valid", which is the only
+                // thing a key its caller was just handed the secret of can be.
+                status: crate::state::ACCESS_KEY_STATUS_ACTIVE.to_string(),
+                created_at_ms: now,
+            };
+            // The secret lives in this response and nowhere else — the store
+            // keeps only the id, as AWS keeps no retrievable copy either.
+            let view = key.created_view(secret_access_key);
+            bucket.access_keys.push(key);
+            let location = bucket.location.clone();
+
+            // The key exists as this call returns, which is why the operation it
+            // logs is answered terminal. The resource that entry names is the
+            // BUCKET: `Operation$resourceType` targets the modelled
+            // `ResourceType` enum, which has a `Bucket` member and none for an
+            // access key.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_BUCKET_ACCESS_KEY,
+                crate::state::RESOURCE_TYPE_BUCKET,
+                &input.bucket_name,
+                &location,
+                None,
+            );
+            Ok(CreateBucketAccessKeyOutput {
+                access_key: Some(view),
+                operations: Some(vec![operation.view()]),
+            })
+        });
+
+        match created {
+            Some(Ok(output)) => {
+                // Audit record for a credential-minting call: the bucket the key
+                // belongs to and the server-minted id — NEVER the secret access
+                // key, which no log may carry.
+                ::tracing::info!(
+                    audit = true,
+                    operation = "CreateBucketAccessKey",
+                    outcome = "created",
+                    bucket_name = %input.bucket_name,
+                    access_key_id = %minted.id,
+                    "bucket access key created"
+                );
+                Ok(output)
+            }
+            Some(Err(refusal)) => {
+                withdraw("the request was refused");
+                Err(refusal)
+            }
+            None => {
+                withdraw("the bucket store is unavailable");
+                Err(unavailable())
+            }
+        }
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateBucketAccessKeyError {
+    CreateBucketAccessKeyErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// This operation's 404 for a bucket name this account holds no bucket under: the
+/// modelled `NotFoundException`, which the model documents as what "Lightsail
+/// throws when it cannot find a resource".
+fn not_found(message: String) -> CreateBucketAccessKeyError {
+    CreateBucketAccessKeyErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateBucketAccessKeyError {
+    CreateBucketAccessKeyErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail bucket store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

@@ -7,6 +7,7 @@
 //! modules, and `types/mod.rs` re-exports them all.
 #![allow(unused_imports)]
 
+use super::shared_types::schemas_member;
 use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-schemas-schemas.json");
@@ -22,7 +23,11 @@ pub struct UpdateSchemaInput {
     pub r#type: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.schemas#UpdateSchemaResponse")]
+/// `UpdateSchemaResponse`, written out by hand rather than produced by
+/// `#[smithy_macros::smithy(shape = ...)]` because `LastModified` and
+/// `VersionCreatedDate` target `__timestampIso8601` and so carry
+/// `@timestampFormat("date-time")` — see the block over `schemas_member!` in
+/// `shared_types`.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateSchemaOutput {
     pub description: Option<String>,
@@ -35,3 +40,119 @@ pub struct UpdateSchemaOutput {
     pub version_created_date: Option<::aws_smithy_types::DateTime>,
 }
 
+#[allow(non_upper_case_globals)]
+impl UpdateSchemaOutput {
+    pub const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+        schemas_member!("UpdateSchemaResponse", "Description", String, 0);
+    /// `@timestampFormat("date-time")` from `__timestampIso8601`.
+    pub const M_LAST_MODIFIED: ::aws_smithy_schema::Schema =
+        schemas_member!(iso8601 "UpdateSchemaResponse", "LastModified", 1);
+    pub const M_SCHEMA_ARN: ::aws_smithy_schema::Schema =
+        schemas_member!("UpdateSchemaResponse", "SchemaArn", String, 2);
+    pub const M_SCHEMA_NAME: ::aws_smithy_schema::Schema =
+        schemas_member!("UpdateSchemaResponse", "SchemaName", String, 3);
+    pub const M_SCHEMA_VERSION: ::aws_smithy_schema::Schema =
+        schemas_member!("UpdateSchemaResponse", "SchemaVersion", String, 4);
+    pub const M_TAGS: ::aws_smithy_schema::Schema =
+        schemas_member!(tags "UpdateSchemaResponse", "Tags", 5);
+    pub const M_TYPE: ::aws_smithy_schema::Schema =
+        schemas_member!("UpdateSchemaResponse", "Type", String, 6);
+    /// `@timestampFormat("date-time")`, as for `LastModified`.
+    pub const M_VERSION_CREATED_DATE: ::aws_smithy_schema::Schema =
+        schemas_member!(iso8601 "UpdateSchemaResponse", "VersionCreatedDate", 7);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.schemas#UpdateSchemaResponse",
+            "com.amazonaws.schemas",
+            "UpdateSchemaResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_DESCRIPTION,
+            &Self::M_LAST_MODIFIED,
+            &Self::M_SCHEMA_ARN,
+            &Self::M_SCHEMA_NAME,
+            &Self::M_SCHEMA_VERSION,
+            &Self::M_TAGS,
+            &Self::M_TYPE,
+            &Self::M_VERSION_CREATED_DATE,
+        ],
+    );
+}
+
+pub static UPDATE_SCHEMA_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &UpdateSchemaOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for UpdateSchemaOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.description.as_ref() {
+            s.write_string(&Self::M_DESCRIPTION, v.as_str())?;
+        }
+        if let Some(v) = self.last_modified.as_ref() {
+            s.write_timestamp(&Self::M_LAST_MODIFIED, v)?;
+        }
+        if let Some(v) = self.schema_arn.as_ref() {
+            s.write_string(&Self::M_SCHEMA_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.schema_name.as_ref() {
+            s.write_string(&Self::M_SCHEMA_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.schema_version.as_ref() {
+            s.write_string(&Self::M_SCHEMA_VERSION, v.as_str())?;
+        }
+        if let Some(v) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|sm| {
+                for (key, value) in v.iter() {
+                    sm.write_string(&Self::M_TAGS, key.as_str())?;
+                    sm.write_string(&Self::M_TAGS, value.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.r#type.as_ref() {
+            s.write_string(&Self::M_TYPE, v.as_str())?;
+        }
+        if let Some(v) = self.version_created_date.as_ref() {
+            s.write_timestamp(&Self::M_VERSION_CREATED_DATE, v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for UpdateSchemaOutput {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.description = Some(d.read_string(&Self::M_DESCRIPTION)?),
+                Some(1) => out.last_modified = Some(d.read_timestamp(&Self::M_LAST_MODIFIED)?),
+                Some(2) => out.schema_arn = Some(d.read_string(&Self::M_SCHEMA_ARN)?),
+                Some(3) => out.schema_name = Some(d.read_string(&Self::M_SCHEMA_NAME)?),
+                Some(4) => out.schema_version = Some(d.read_string(&Self::M_SCHEMA_VERSION)?),
+                Some(5) => {
+                    let mut entries: std::collections::HashMap<String, String> =
+                        ::std::default::Default::default();
+                    d.read_map(&Self::M_TAGS, &mut |key, dm| {
+                        let value = dm.read_string(&Self::M_TAGS)?;
+                        entries.insert(key, value);
+                        Ok(())
+                    })?;
+                    out.tags = Some(entries);
+                }
+                Some(6) => out.r#type = Some(d.read_string(&Self::M_TYPE)?),
+                Some(7) => {
+                    out.version_created_date =
+                        Some(d.read_timestamp(&Self::M_VERSION_CREATED_DATE)?)
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}

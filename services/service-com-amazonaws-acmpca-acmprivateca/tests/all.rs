@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/certificate_authority_listing.rs"]
 mod certificate_authority_listing;
+#[path = "all/certificate_authority_tags.rs"]
+mod certificate_authority_tags;
 #[path = "all/delete_certificate_authority.rs"]
 mod delete_certificate_authority;
 #[path = "all/permissions.rs"]
@@ -21,6 +23,8 @@ mod permissions;
 mod private_ca_lifecycle;
 #[path = "all/resource_policy_read.rs"]
 mod resource_policy_read;
+#[path = "all/restore_certificate_authority.rs"]
+mod restore_certificate_authority;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_listing.rs"]

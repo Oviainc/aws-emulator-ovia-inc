@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation sets or removes the account's root CA override for the
+//! region the request is signed for — the certificate new DB instances are created with.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The override lives in [`crate::state`] (`certificate_overrides`), which is what
+//! `DescribeCertificates` reports as `CustomerOverride` /
+//! `DefaultCertificateForNewLaunches` and what `CreateDBInstance` reads for an instance
+//! created without a `CACertificateIdentifier`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +157,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCertificates"))
+        let region =
+            crate::state::request_region(ctx).map_err(ModifyCertificatesError::validation)?;
+
+        // The two members are the two things this operation can do — "Override the
+        // system-default … certificate for Amazon RDS for new DB instances, or remove the
+        // override" — so exactly one of them has to be asked for. Naming both, or
+        // neither, names no change this operation can make, which is the combination
+        // refusal rather than a silent no-op.
+        let remove = input.remove_customer_override == Some(true);
+        match (&input.certificate_identifier, remove) {
+            (Some(identifier), true) => {
+                return Err(ModifyCertificatesError::invalid_parameter_combination(format!(
+                    "CertificateIdentifier ({identifier}) and RemoveCustomerOverride cannot \
+                     be specified together: specify the certificate to override the default \
+                     with, or RemoveCustomerOverride to go back to the system default"
+                )));
+            }
+            (None, false) => {
+                return Err(ModifyCertificatesError::invalid_parameter_combination(
+                    "Specify either CertificateIdentifier, to override the default \
+                     certificate for new DB instances, or RemoveCustomerOverride, to remove \
+                     an override that is set",
+                ));
+            }
+            _ => {}
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so
+        // the override has nowhere to live and no later read could agree with a success
+        // reported here.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+
+        let certificate = match &input.certificate_identifier {
+            // "The new default certificate identifier to override the current one with.
+            // To determine the valid values, use … the DescribeCertificates API
+            // operation" — so the identifier must name a certificate THIS service
+            // publishes, and one it does not is the modelled not-found rather than an
+            // override onto a certificate no instance could be launched with.
+            Some(requested) => {
+                let entry = crate::state::ca_certificate(requested).ok_or_else(|| {
+                    ModifyCertificatesErrorModeled::CertificateNotFoundFault(
+                        CertificateNotFoundFault {
+                            message: Some(format!("Certificate {requested} not found")),
+                        },
+                    )
+                })?;
+                // An override is a record stored under the region the request is signed
+                // for, and the region comes from the caller's own credential scope — so
+                // this insert opens a region bucket and gates on the same store-wide
+                // region capacity every other record-creating operation gates on
+                // (`has_room_for_region`), rather than growing the store once per
+                // distinct region-shaped string a caller cares to sign for. A region
+                // that already holds records (or already has an override) is always
+                // admitted, so this refuses nothing a bounded caller does.
+                if !store.has_room_for_region(&region) {
+                    return Err(ModifyCertificatesError::validation(format!(
+                        "the request would exceed the allowed number of regions holding \
+                         records ({})",
+                        crate::state::MAX_REGIONS
+                    )));
+                }
+                // The override is stored under the certificate's own identifier, not the
+                // spelling the request used: the identifier is not case-sensitive, and
+                // every later read reports the published one.
+                store
+                    .certificate_overrides
+                    .insert(region.clone(), entry.identifier.to_string());
+                entry
+            }
+            // "Specifies whether to remove the override for the default certificate. If
+            // the override is removed, the default certificate is the system default."
+            // Removing an override that is not set leaves the system default in place,
+            // which is already what this region reports — the same end state, so it is
+            // not an error.
+            None => {
+                store.certificate_overrides.remove(&region);
+                crate::state::ca_certificate(crate::state::DEFAULT_CA_CERTIFICATE_IDENTIFIER)
+                    .ok_or_else(|| {
+                        ModifyCertificatesErrorModeled::CertificateNotFoundFault(
+                            CertificateNotFoundFault {
+                                message: Some(format!(
+                                    "Certificate {} not found",
+                                    crate::state::DEFAULT_CA_CERTIFICATE_IDENTIFIER
+                                )),
+                            },
+                        )
+                    })?
+            }
+        };
+
+        // `ModifyCertificatesResult$Certificate` is reported from the state this call has
+        // just written, through the same projection `DescribeCertificates` uses, so the
+        // answer here and the next read of that certificate cannot disagree about the
+        // override.
+        let pinned = store.certificate_override(&region).map(str::to_string);
+        Ok(ModifyCertificatesOutput {
+            certificate: Some(certificate.to_wire(&region, pinned.as_deref())),
+        })
     }
 }

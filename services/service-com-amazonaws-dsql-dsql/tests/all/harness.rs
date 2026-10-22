@@ -59,9 +59,18 @@ impl Dsql {
         // The one shared engine the router builds in production, handed to the
         // service through its constructor.
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        Self::sharing(&engine, region)
+    }
+
+    /// Another view of an EXISTING store, signed for `region`: the service is built
+    /// from the same engine `Arc`, which is exactly what the production router does —
+    /// so two views signed for different regions read one set of clusters.
+    pub fn sharing(engine: &Arc<engine::InMemoryEngine>, region: &str) -> Self {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(service_com_amazonaws_dsql_dsql::EmulatedService::new(engine));
+        router.register_service(service_com_amazonaws_dsql_dsql::EmulatedService::new(
+            Arc::clone(engine),
+        ));
         Self {
             router,
             region: region.to_string(),
@@ -197,6 +206,16 @@ impl Dsql {
         .await
     }
 
+    /// `GET /tags/{resourceArn}`: the tags persisted on an ARN-addressed resource.
+    pub async fn list_tags_for_resource(&self, resource_arn: &str) -> Answer {
+        self.call(
+            "GET",
+            &format!("/tags/{}", percent_encode_label(resource_arn)),
+            None,
+        )
+        .await
+    }
+
     /// Create a cluster that accepts a mutation straight away: deletion protection
     /// off, and the clock's `CREATING -> ACTIVE` transition already settled.
     pub async fn create_settled(&self) -> String {
@@ -249,3 +268,14 @@ pub fn expected_arn(region: &str, identifier: &str) -> String {
 pub fn absent_identifier() -> String {
     "zzzzzzzzzzzzzzzzzzzzzzzzzz".to_string()
 }
+
+/// The published bounds of this service's tag shapes, shared by every suite that
+/// asserts on tags. Source: `smithy_query(query="shape",
+/// shape="TagKey,TagValue,TagMap")` — key `@length(1..128)`, value
+/// `@length(0..256)`, both `@pattern("^[a-zA-Z0-9_.:/=+\\-@ ]*$")`, and the map
+/// itself `@length(0..200)`.
+pub const TAG_KEY_MAX: usize = 128;
+/// See [`TAG_KEY_MAX`].
+pub const TAG_VALUE_MAX: usize = 256;
+/// See [`TAG_KEY_MAX`]: the most tags one resource holds.
+pub const TAG_MAP_MAX: usize = 200;

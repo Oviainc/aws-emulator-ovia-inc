@@ -28,7 +28,7 @@ const TARGET_PREFIX: &str = "SpencerFrontendService";
 pub(crate) const REGISTRY_ID: &str = "000000000000";
 
 /// The ARN prefix of every repository in this partition-wide (region-less) registry.
-const ARN_PREFIX: &str = "arn:aws:ecr-public::000000000000:repository/";
+pub(crate) const ARN_PREFIX: &str = "arn:aws:ecr-public::000000000000:repository/";
 
 /// The universal gallery prefix plus this registry's alias: the leading segments of
 /// every `repositoryUri`.
@@ -118,7 +118,7 @@ pub(crate) async fn refused(
 }
 
 /// A required string member of a (possibly nested) response object.
-fn text(body: &Value, path: &[&str], case: &str) -> String {
+pub(crate) fn text(body: &Value, path: &[&str], case: &str) -> String {
     let mut cursor = body;
     for step in path {
         cursor = &cursor[*step];
@@ -1450,7 +1450,6 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
     // `NotImplemented`, never an empty 200 that a client cannot tell from a real answer.
     for (operation, body) in [
         ("GetAuthorizationToken", json!({})),
-        ("DescribeRegistries", json!({})),
         (
             "GetRepositoryCatalogData",
             json!({"repositoryName": "team/app"}),
@@ -1458,10 +1457,6 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
         (
             "DescribeImageTags",
             json!({"repositoryName": "team/app"}),
-        ),
-        (
-            "ListTagsForResource",
-            json!({"resourceArn": format!("{ARN_PREFIX}team/app")}),
         ),
     ] {
         let (status, parsed) = call(&router, operation, body).await;

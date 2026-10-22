@@ -227,6 +227,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+        // A rule holds at most one tag per key, so the request's tags are assigned the
+        // same way `TagResource` assigns them — and the rule a create leaves behind is
+        // held to the same published tags-per-resource quota.
+        let mut tags = Vec::new();
+        crate::state::upsert_tags(&mut tags, input.tags.unwrap_or_default());
+        if tags.len() > crate::state::MAX_TAGS_PER_RULE {
+            return Err(CreateRuleErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "The request would create a retention rule with {} tags, \
+                         exceeding the quota of {} tags per resource",
+                        tags.len(),
+                        crate::state::MAX_TAGS_PER_RULE
+                    )),
+                    reason: Some("SERVICE_QUOTA_EXCEEDED".to_string()),
+                },
+            )
+            .into());
+        }
         let mut store = state.lock();
         // Bound the store before it grows: a Region holds at most
         // `crate::state::MAX_RULES` retention rules, which is the service's own
@@ -261,7 +280,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             retention_period: input.retention_period,
             resource_tags,
             exclude_resource_tags,
-            tags: input.tags.unwrap_or_default(),
+            tags,
             // Recycle Bin hands back a rule that already retains resources, so there is
             // no `pending` interval here for the clock to work off.
             status: "available".to_string(),

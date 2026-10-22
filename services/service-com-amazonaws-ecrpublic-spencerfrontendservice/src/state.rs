@@ -48,6 +48,15 @@ pub const GALLERY_HOST: &str = "public.ecr.aws";
 /// a `repositoryUri` be compared across calls.
 pub const DEFAULT_REGISTRY_ALIAS: &str = "emulator";
 
+/// The status every alias of this registry carries.
+///
+/// `RegistryAliasStatus` is modelled as an enum of `ACTIVE` / `PENDING` / `REJECTED`
+/// (`REGISTRY_ALIAS_STATUS_VALUES` in `ops/types/shared_types.rs`), and `PENDING` /
+/// `REJECTED` describe a *requested* custom alias: this service exposes no operation that
+/// requests one, so the alias the registry was assigned is the only one it has and it is
+/// usable — `ACTIVE`.
+pub const REGISTRY_ALIAS_STATUS_ACTIVE: &str = "ACTIVE";
+
 /// The largest page either `Describe*` operation will serve, and the page size a request
 /// that named none resolves to: `MaxResults` is modelled `range 1..1000`, so 1000 is the
 /// most a caller can ask for.
@@ -215,6 +224,20 @@ impl StoredRepository {
         }
     }
 
+    /// This repository's resource tags as the modelled `TagList`.
+    ///
+    /// The stored map is keyed by tag key, so the list comes out in key order: a stable
+    /// sequence, which is what lets two reads of one repository be compared.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        self.tags
+            .iter()
+            .map(|(key, value)| Tag {
+                key: Some(key.clone()),
+                value: Some(value.clone()),
+            })
+            .collect()
+    }
+
     /// This repository as the modelled `Repository` shape.
     pub fn as_repository(&self) -> Repository {
         Repository {
@@ -331,10 +354,27 @@ impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
         )
     }
 
+    /// The ARN of the registry itself.
+    ///
+    /// `Registry$registryArn` is "the Amazon Resource Name (ARN) of the public registry",
+    /// and ECR Public is a partition-wide service, so — exactly as for a repository ARN —
+    /// the region segment is empty and the account segment is the registry id, which is
+    /// also the registry resource's own name.
+    pub fn registry_arn(&self) -> String {
+        ::engine::emulator_arn(ARN_NAMESPACE, "", &format!("registry/{}", self.registry_id))
+    }
+
+    /// The URI of the registry: `Registry$registryUri` documents it as "a universal
+    /// prefix and the registry alias", which is the `repositoryUri` form without the
+    /// trailing repository segment.
+    pub fn registry_uri(&self) -> String {
+        format!("{GALLERY_HOST}/{}", self.registry_alias)
+    }
+
     /// The `docker pull`-able URI of a repository: the universal gallery prefix, the
     /// registry alias, then the repository name.
     pub fn repository_uri(&self, repository_name: &str) -> String {
-        format!("{GALLERY_HOST}/{}/{repository_name}", self.registry_alias)
+        format!("{}/{repository_name}", self.registry_uri())
     }
 
     /// This registry's catalog metadata as the modelled `RegistryCatalogData` shape: what
@@ -349,9 +389,118 @@ impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
 
     /// Whether `registry_id` — a request's `registryId`, which the model lets be either
     /// an account id or a registry alias — names this registry.
+    ///
+    /// This leniency belongs to the `registryId` REQUEST MEMBER only: an ARN's account
+    /// segment is an account id, so [`Self::repository_by_arn`] compares that segment
+    /// against this registry's id and not against its alias.
     pub fn is_this_registry(&self, registry_id: &str) -> bool {
         registry_id == self.registry_id || registry_id == self.registry_alias
     }
+
+    /// The repository a `resourceArn` names, or why nothing stored answers to it.
+    ///
+    /// The ARN is parsed by [`parse_repository_arn`] and then resolved against this
+    /// registry: it must agree with the ARN this registry mints for that repository
+    /// ([`Self::repository_arn`]) on partition, account and name, so an ARN naming
+    /// another partition or another registry names no repository here — the same
+    /// not-found answer as a name this registry never held ("ensure that you're
+    /// performing operations on the correct registry",
+    /// `RepositoryNotFoundException$message`). The region segment is not compared:
+    /// ECR Public is partition-wide, so the ARNs it mints carry none and a caller that
+    /// supplies one still names the same resource.
+    pub fn repository_by_arn(
+        &self,
+        resource_arn: &str,
+    ) -> Result<&StoredRepository, ResourceArnProblem> {
+        let arn = parse_repository_arn(resource_arn)?;
+        let not_found = || {
+            ResourceArnProblem::RepositoryNotFound(format!(
+                "The repository with name '{}' does not exist in the registry with id '{}'",
+                arn.name, arn.registry_id
+            ))
+        };
+        // The ARN this registry mints for the same name, so neither the partition nor
+        // the account id is written out here: both come from `engine::emulator_arn`.
+        let minted = parse_repository_arn(&self.repository_arn(&arn.name))
+            .map_err(|_| not_found())?;
+        if arn.partition != minted.partition || arn.registry_id != minted.registry_id {
+            return Err(not_found());
+        }
+        self.repositories.get(&arn.name).ok_or_else(not_found)
+    }
+}
+
+/// Why a `resourceArn` names no repository of this registry.
+///
+/// The two variants are the two modelled refusals every tagging operation declares:
+/// a string that is not a well-formed ECR Public repository ARN is an
+/// `InvalidParameterException`, while a well-formed one naming a repository (or a
+/// registry) this emulator does not hold is a `RepositoryNotFoundException`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceArnProblem {
+    /// Not a well-formed ECR Public repository ARN; carries the message that names
+    /// the offending member and the constraint it failed.
+    Malformed(String),
+    /// Well-formed, but nothing stored answers to it.
+    RepositoryNotFound(String),
+}
+
+/// The registry and repository a well-formed ECR Public repository ARN names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryArn {
+    /// The ARN's partition segment (`aws` and its siblings).
+    pub partition: String,
+    /// The ARN's account segment, which for this service is the registry id.
+    pub registry_id: String,
+    /// The repository name, which may itself carry `/` separators (a namespaced
+    /// repository such as `team/app`), as `RepositoryName`'s modelled pattern
+    /// `^(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*$` admits.
+    pub name: String,
+}
+
+/// What the service tells a caller whose `resourceArn` is not a well-formed ECR Public
+/// repository ARN: the parameter-constraint form the real service answers with, naming
+/// the member and the constraint it failed (`InvalidParameterException`: "the specified
+/// parameter is invalid; review the available parameters for the API request").
+pub const INVALID_ARN_MESSAGE: &str =
+    "Invalid parameter at 'resourceArn' failed to satisfy constraint: 'Invalid ARN'";
+
+/// Parse `resource_arn` as the ARN of an ECR Public repository.
+///
+/// `ListTagsForResource$resourceArn` documents that "currently, the supported resource
+/// is an Amazon ECR Public repository", so the only string this accepts is the six-field
+/// ARN form `arn:<partition>:ecr-public:<region>:<account>:repository/<name>` — the
+/// general ARN syntax with this service's namespace and the `repository` resource type.
+/// Every other string fails the one `resourceArn` constraint, so they all share
+/// [`INVALID_ARN_MESSAGE`].
+///
+/// The region segment is left free: ECR Public is partition-wide, so the ARNs it mints
+/// carry none, but a caller that supplies one still names the same resource.
+pub fn parse_repository_arn(resource_arn: &str) -> Result<RepositoryArn, ResourceArnProblem> {
+    // The resource segment may itself contain `:`, so only the first five fields are
+    // split off; everything after the fifth colon is the resource.
+    let fields: Vec<&str> = resource_arn.splitn(6, ':').collect();
+    let malformed = || {
+        Err(ResourceArnProblem::Malformed(
+            INVALID_ARN_MESSAGE.to_string(),
+        ))
+    };
+    let [arn, partition, service, _region, account, resource] = fields[..] else {
+        return malformed();
+    };
+    if arn != "arn" || partition.is_empty() || service != ARN_NAMESPACE || account.is_empty() {
+        return malformed();
+    }
+    // A repository name may itself carry `/` separators (`team/app`), so everything
+    // after the resource type is the name.
+    let Some(name) = resource.strip_prefix("repository/").filter(|n| !n.is_empty()) else {
+        return malformed();
+    };
+    Ok(RepositoryArn {
+        partition: partition.to_string(),
+        registry_id: account.to_string(),
+        name: name.to_string(),
+    })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -497,7 +646,7 @@ pub fn decode_page_token(token: Option<&str>) -> Result<Option<String>, String> 
 }
 
 /// What to tell a caller that presented a token this service did not mint.
-fn invalid_token_message() -> String {
+pub fn invalid_token_message() -> String {
     "Invalid parameter at 'nextToken' failed to satisfy constraint: 'Member must be a \
      token returned by a previous call'"
         .to_string()

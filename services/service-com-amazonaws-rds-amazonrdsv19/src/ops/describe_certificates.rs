@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCertificates
-//! IMPLEMENTED: this operation reports the CA certificates this front door publishes.
+//! IMPLEMENTED: this operation reports the CA certificates this front door publishes,
+//! and the account's root CA override as it stands in the signed region.
 //! This is the ONLY file to touch for it.
 //!
 //! The catalog it reports, and the projection onto the modelled `Certificate` shape,
-//! live in [`crate::state`] beside the other published catalogs.
+//! live in [`crate::state`] beside the other published catalogs; the override the
+//! `CustomerOverride`, `CustomerOverrideValidTill` and `DefaultCertificateForNewLaunches`
+//! members answer from is the one `ModifyCertificates` stores.
 //!
 //! ## Shape of an operation
 //!
@@ -153,10 +156,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A published catalog read touches no store, so the engine on `self` is unused
-        // here: what this operation reports is the same for every caller, and lives in
-        // `crate::state`'s catalog rather than in the engine.
-        let _ = &self.engine;
         let region =
             crate::state::request_region(ctx).map_err(DescribeCertificatesError::validation)?;
         let page_size = crate::state::check_max_records(input.max_records)
@@ -174,29 +173,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // WHICH certificates are published is the same for every caller and lives in
+        // `crate::state`'s catalog; what an ACCOUNT did with them — the root CA override
+        // `ModifyCertificates` sets — is state, and it is what `CustomerOverride`,
+        // `CustomerOverrideValidTill` and `DefaultCertificateForNewLaunches` report. No
+        // store means this service was mounted on an engine it has no state in, so it
+        // cannot answer those members at all; 501 is the honest answer.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let store = state.lock();
+        let override_identifier = store.certificate_override(&region).map(str::to_string);
+        // "This is either the root CA override set on your Amazon Web Services account or
+        // the system default CA for the Region if no override exists."
+        let default_for_new_launches = store.default_ca_certificate(&region).to_string();
+        drop(store);
+        let pinned = override_identifier.as_deref();
+
         // "If this parameter is specified, information for only the specified
         // certificate is returned. This parameter is not case sensitive."
         let matching: Vec<(String, Certificate)> = match &input.certificate_identifier {
             Some(requested) => {
-                let entry = crate::state::CA_CERTIFICATES
-                    .iter()
-                    .find(|certificate| certificate.identifier.eq_ignore_ascii_case(requested))
-                    .ok_or_else(|| {
-                        DescribeCertificatesError::from(
-                            DescribeCertificatesErrorModeled::CertificateNotFoundFault(
-                                CertificateNotFoundFault {
-                                    message: Some(format!(
-                                        "Certificate {requested} not found"
-                                    )),
-                                },
-                            ),
-                        )
-                    })?;
-                vec![(entry.identifier.to_string(), entry.to_wire(&region))]
+                let entry = crate::state::ca_certificate(requested).ok_or_else(|| {
+                    DescribeCertificatesError::from(
+                        DescribeCertificatesErrorModeled::CertificateNotFoundFault(
+                            CertificateNotFoundFault {
+                                message: Some(format!("Certificate {requested} not found")),
+                            },
+                        ),
+                    )
+                })?;
+                vec![(entry.identifier.to_string(), entry.to_wire(&region, pinned))]
             }
             None => crate::state::CA_CERTIFICATES
                 .iter()
-                .map(|entry| (entry.identifier.to_string(), entry.to_wire(&region)))
+                .map(|entry| (entry.identifier.to_string(), entry.to_wire(&region, pinned)))
                 .collect(),
         };
 
@@ -205,9 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
             .map_err(DescribeCertificatesError::invalid_parameter_value)?;
         Ok(DescribeCertificatesOutput {
-            default_certificate_for_new_launches: Some(
-                crate::state::DEFAULT_CA_CERTIFICATE_FOR_NEW_LAUNCHES.to_string(),
-            ),
+            default_certificate_for_new_launches: Some(default_for_new_launches),
             certificates: Some(page.items),
             marker: page.next_marker,
         })

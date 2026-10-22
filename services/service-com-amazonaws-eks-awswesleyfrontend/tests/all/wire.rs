@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The wire harness every suite in this crate drives the emulator through: one
+//! shared engine behind the same `MultiServiceRouter` the production binary
+//! mounts, plus the request/response plumbing an AWS SDK would do.
+//!
+//! It lives here rather than in each suite so there is ONE copy of it: a second
+//! copy is a second place where "what a client sees" can drift.
+
+use std::sync::Arc;
+
+use service_com_amazonaws_eks_awswesleyfrontend::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// One answer from the emulator, reduced to what a client branches on.
+#[derive(Debug)]
+pub struct Answer {
+    pub status: u16,
+    /// The restJson1 error envelope's `__type`, absent on success.
+    pub error_type: Option<String>,
+    pub body: serde_json::Value,
+}
+
+impl Answer {
+    pub fn cluster(&self) -> &serde_json::Value {
+        &self.body["cluster"]
+    }
+
+    pub fn association(&self) -> &serde_json::Value {
+        &self.body["association"]
+    }
+}
+
+/// The emulator under test: one shared engine, one service, authentication off so a
+/// test signs nothing (the credential scope below is still parsed for its region).
+pub fn emulator() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(engine));
+    router
+}
+
+/// Percent-encode a value that travels in ONE path segment, the way an AWS SDK
+/// encodes an `@httpLabel`: `/` must not look like a segment separator.
+///
+/// Written out rather than pulled from `percent-encoding`, because a new
+/// dependency means a new `Cargo.lock` entry and these tests deliberately leave
+/// that file — the one every concurrent fix also edits — untouched. The rule is
+/// the one an SDK applies to a non-greedy label: keep the unreserved set
+/// (`A-Za-z0-9`, which is a subset of RFC 3986's, so this is a superset of what
+/// must be escaped) and percent-encode every other byte; the server
+/// percent-decodes the segment either way.
+pub fn encode_label(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
+pub async fn call(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> Answer {
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/eks/aws4_request, \
+                 SignedHeaders=host, Signature=deadbeef"
+            ),
+        )
+        .body(bytes::Bytes::from(body.to_owned()))
+        .expect("a well-formed test request");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let bytes = response.body();
+    let body = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(bytes).unwrap_or(serde_json::Value::Null)
+    };
+    let error_type = error_type.or_else(|| {
+        body.get("__type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
+    Answer {
+        status,
+        error_type,
+        body,
+    }
+}

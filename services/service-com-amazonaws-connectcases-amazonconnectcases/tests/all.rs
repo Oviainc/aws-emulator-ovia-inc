@@ -25,3 +25,5 @@ mod layout_lifecycle;
 mod state_roundtrip;
 #[path = "all/template_listing.rs"]
 mod template_listing;
+#[path = "all/template_update.rs"]
+mod template_update;

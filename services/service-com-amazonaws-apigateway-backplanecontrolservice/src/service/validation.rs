@@ -1,0 +1,387 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! How this service STATES a request that breaks a modelled constraint.
+//!
+//! The framework finds the violations (the protocol's deserializer for an absent
+//! required member, `constraints::validate` for a value outside a declared bound) and
+//! words them in its own conventional envelope. API Gateway words the same facts
+//! differently in three ways, all of them properties of the service or of the shape
+//! that was violated rather than of one request:
+//!
+//! 1. **The member path is rooted at the operation's input shape.** AWS's own model
+//!    names an operation's input `<Operation>Input`, and the clause names the member by
+//!    its path from that root in lowerCamel — `updateDocumentationVersionInput.
+//!    patchOperations.1.member.op`, `putGatewayResponseInput.statusCode` — so a client
+//!    can map the clause back to the operation AND the field. The framework's path
+//!    starts at the first input member, which names no operation. [`input_root`] is
+//!    that root; it is derived per operation, which the recordings prove by showing a
+//!    DIFFERENT root for the same member path on `UpdateRestApi`, `UpdateApiKey` and
+//!    `UpdateDocumentationVersion`.
+//! 2. **A `@pattern` is emitted without the whole-value anchors.** The public Smithy
+//!    model writes AWS's implicit whole-value match as an explicit `^…$` pair
+//!    (`smithy_query(query="shape", shape="com.amazonaws.apigateway#StatusCode")` gives
+//!    `^[1-5]\d\d$`); the service emits the expression itself, `[1-5]\d\d`. The pair is
+//!    dropped from the RENDERING only — the check still runs the model's own pattern.
+//! 3. **An enum value set is listed in the order the service declares the enum in**,
+//!    which is not always the order the public model lists (see [`OP_VALUE_SET`]).
+//!
+//! Status (400) and error code ([`VALIDATION_EXCEPTION`]) are the framework's own
+//! choice for a constraint failure and are left alone; only the constructed sentence
+//! changes.
+
+use aws_smithy_schema_server::constraints::{path, ViolationKind};
+use smithy_server_runtime::{Refused, Violation};
+
+/// The error code a constraint failure is named by, unchanged from the one the
+/// framework's refusal channel picks for this `restJson1` service: a chosen [`Refused`]
+/// replaces the code and the message TOGETHER, so the code is restated here rather than
+/// left to a default that a reworded message would otherwise silently drop.
+pub(super) const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The one enum of this service whose value set the recordings show in an order the
+/// public Smithy model does not list it in.
+///
+/// `PatchOperation$op` targets `com.amazonaws.apigateway#Op`, which
+/// `smithy_query(query="shape", shape="com.amazonaws.apigateway#Op")` declares as
+/// `[add, remove, replace, move, copy, test]`. Every recorded refusal of an invalid
+/// `op` — on `UpdateDocumentationVersion`, on `UpdateRestApi` and on `UpdateApiKey`,
+/// three different operations — lists the set as below instead. The order is therefore
+/// a property of the ENUM SHAPE (the order the service's own model declares its
+/// values in), not of any one request, and is recorded as such: a value set is rendered
+/// in the service's declared order, which for every other enum of this service is the
+/// order the public model preserves.
+const OP_VALUE_SET: [&str; 6] = ["add", "remove", "move", "test", "replace", "copy"];
+
+/// This service's wording for the violations the framework found on `operation`'s
+/// request, or `None` when there are none to word.
+pub(super) fn refusal(operation: &str, violations: &[Violation]) -> Option<Refused> {
+    let root = input_root(operation);
+    let stated: Vec<Violation> = violations
+        .iter()
+        .map(|violation| as_stated(&root, violation))
+        .collect();
+    // The envelope — `1 validation error detected: <clause>` / `N validation errors
+    // detected: <clause>; <clause>` — and each clause's own frame are the framework's,
+    // reached through the same `Violation` the walk produced, so a new constraint class
+    // cannot arrive here with wording of its own.
+    let message = aws_smithy_schema_server::envelope(&stated)?;
+    Some(Refused {
+        code: VALIDATION_EXCEPTION.to_string(),
+        message,
+    })
+}
+
+/// The root segment of every validation path of `operation`: its input shape, named as
+/// AWS's own model names it (`<Operation>Input`) and cased as a path segment is.
+///
+/// The casing comes from [`path::member`], the framework's own spelling of a path
+/// segment — the same function the walk applies to every segment BELOW this root — so
+/// the root cannot be cased differently from the path it heads.
+fn input_root(operation: &str) -> String {
+    format!("{}Input", path::member(operation))
+}
+
+/// One violation as this service states it: the path rooted at the input shape, the
+/// constraint rendered the way the service renders it, the value as the framework
+/// echoed it (already elided to the framework's cap).
+fn as_stated(root: &str, violation: &Violation) -> Violation {
+    Violation {
+        path: format!("{root}.{}", violation.path),
+        kind: as_rendered(&violation.kind),
+        value: violation.value.clone(),
+    }
+}
+
+/// A violated constraint as this service renders it: a pattern without its whole-value
+/// anchors, an enum value set in the service's declared order, and every other class
+/// exactly as the framework renders it.
+fn as_rendered(kind: &ViolationKind) -> ViolationKind {
+    match kind {
+        ViolationKind::Pattern(regex) => ViolationKind::Pattern(unanchored(regex)),
+        ViolationKind::EnumValue(values) => ViolationKind::EnumValue(declared_order(values)),
+        other => other.clone(),
+    }
+}
+
+/// `regex` without the whole-value anchors the public model adds to express the match
+/// AWS's own pattern makes implicitly.
+///
+/// MIGRATION NOTE, as `services/common/src/validation.rs` asks of anything that inlines
+/// this rule again: that module's docs ("Still to migrate here") name the unanchored
+/// `@pattern` rendering as one of three parts of a validation message that are the same
+/// for every service and belong there, carried inlined in ~24 service crates today
+/// (`grep -rln 'fn unanchored' services/*/src`). This is a 25th copy, pinned by this
+/// service's own recordings, and is to be DELETED by the change that owns that
+/// migration rather than copied again. Which values a value set lists, and in which
+/// order, stays here: that is this service's dialect.
+///
+/// The pair is dropped only when BOTH ends carry it AND the pair WRAPS the whole
+/// expression: a `^` alone, or a `$` alone, is an expression anchored at one end — a
+/// different expression, not an anchored spelling of this one — and in an alternation
+/// (`^a$|^b$`, `^a|b$`) the outer `^` and `$` govern only their own branch, so dropping
+/// them would state an expression the service never evaluated. Both are emitted
+/// verbatim. A `$` that is ESCAPED is a literal dollar, not an anchor, so it stays.
+fn unanchored(regex: &str) -> String {
+    let Some(body) = regex.strip_prefix('^') else {
+        return regex.to_string();
+    };
+    match body.strip_suffix('$') {
+        Some(inner) if !ends_with_escape(inner) && wraps_whole_expression(inner) => {
+            inner.to_string()
+        }
+        _ => regex.to_string(),
+    }
+}
+
+/// Whether a `^`/`$` pair around `text` anchors the WHOLE expression, which is what a
+/// whole-value pattern's pair does.
+///
+/// It does not when `text` carries an anchor of its own (so the outer pair belongs to
+/// the branches of an alternation, `^a$|^b$`), nor when `text` alternates at the top
+/// level (`^a|b$`, where the `^` governs only the first branch and the `$` only the
+/// last). A `^`, `$` or `|` inside a character class is a literal or a negation marker
+/// rather than an anchor or an alternation, and one inside a group alternates only
+/// within that group (`^(a|b)$` IS wrapped), so the scan tracks class and group
+/// context. Escapes are honoured throughout.
+fn wraps_whole_expression(text: &str) -> bool {
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut depth = 0_usize;
+    for character in text.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            _ if in_class => {}
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '^' | '$' => return false,
+            '|' if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Whether `text` ends in an escape — an odd number of trailing backslashes, so the
+/// character that followed them was escaped.
+fn ends_with_escape(text: &str) -> bool {
+    text.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
+}
+
+/// `values` in the order the service declares the enum they came from.
+///
+/// A value set is identified by the values it holds (a runtime `Violation` carries the
+/// set, not the shape it came from), so the one enum this service declares in an order
+/// the public model does not list is recognised by its own value set. Every other value
+/// set is already in its declared order and is passed through.
+fn declared_order(values: &[String]) -> Vec<String> {
+    if is_set_of(values, &OP_VALUE_SET) {
+        return OP_VALUE_SET.iter().map(|value| (*value).to_string()).collect();
+    }
+    values.to_vec()
+}
+
+/// Whether `values` holds exactly the values `expected` does, in any order.
+fn is_set_of(values: &[String], expected: &[&str]) -> bool {
+    values.len() == expected.len()
+        && expected
+            .iter()
+            .all(|wanted| values.iter().any(|value| value == wanted))
+}
+
+#[cfg(test)]
+mod tests {
+    //! The three renderings this module owns, each over a set of inputs rather than the
+    //! one recorded case. The end-to-end wording is pinned on the wire in
+    //! `tests/all/validation_message_rules.rs`.
+
+    use super::*;
+
+    /// A path is rooted at the operation's own input shape, for every operation name
+    /// shape this service's model holds.
+    #[test]
+    fn a_validation_path_is_rooted_at_the_operations_input_shape() {
+        // (operation, expected root) — three the recordings cover plus operations whose
+        // names differ in shape (one word, an acronym, a trailing plural).
+        let rows: [(&str, &str); 6] = [
+            ("UpdateDocumentationVersion", "updateDocumentationVersionInput"),
+            ("UpdateRestApi", "updateRestApiInput"),
+            ("UpdateApiKey", "updateApiKeyInput"),
+            ("PutGatewayResponse", "putGatewayResponseInput"),
+            ("GetSdkTypes", "getSdkTypesInput"),
+            ("TestInvokeAuthorizer", "testInvokeAuthorizerInput"),
+        ];
+
+        for (operation, expected) in rows {
+            let actual = input_root(operation);
+            assert_eq!(
+                actual, expected,
+                "case {operation:?}: expected the root {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A pattern loses the whole-value anchor PAIR and nothing else.
+    #[test]
+    fn a_pattern_is_rendered_without_its_whole_value_anchors() {
+        // (case, modelled pattern, rendered pattern)
+        let rows: [(&str, &str, &str); 12] = [
+            // Source: `smithy_query(query="shape",
+            // shape="com.amazonaws.apigateway#StatusCode")`.
+            ("the modelled status code", r"^[1-5]\d\d$", r"[1-5]\d\d"),
+            ("an anchored character class", "^[a-z]+$", "[a-z]+"),
+            ("anchored at the start only", "^arn:aws:", "^arn:aws:"),
+            ("anchored at the end only", "[0-9]+$", "[0-9]+$"),
+            ("no anchor at all", r"\d{3}", r"\d{3}"),
+            ("an escaped trailing dollar", r"^[a-z]+\$$", r"[a-z]+\$"),
+            ("a fully anchored alternation", "^a$|^b$", "^a$|^b$"),
+            ("a half-anchored alternation", "^a|b$", "^a|b$"),
+            ("an alternation inside a group", "^(a|b)$", "(a|b)"),
+            (
+                "a class holding a literal caret",
+                r"^[\^a-z]+$",
+                r"[\^a-z]+",
+            ),
+            ("a negated character class", r"^[^/]+$", r"[^/]+"),
+            ("a class holding a literal dollar", "^[a-z$]+$", "[a-z$]+"),
+        ];
+
+        for (case, modelled, expected) in rows {
+            let actual = unanchored(modelled);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} ({modelled}): expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A value set is listed in the service's declared order: the recorded order for
+    /// `Op`, the model's own order for every other enum.
+    #[test]
+    fn an_enum_value_set_is_listed_in_the_services_declared_order() {
+        // (case, the set as the model declares it, the set as the service lists it)
+        let rows: [(&str, &[&str], &[&str]); 4] = [
+            (
+                "Op, in the model's declaration order",
+                &["add", "remove", "replace", "move", "copy", "test"],
+                &OP_VALUE_SET,
+            ),
+            (
+                "Op, already in the service's order",
+                &OP_VALUE_SET,
+                &OP_VALUE_SET,
+            ),
+            // Source: `smithy_query(query="shape",
+            // shape="com.amazonaws.apigateway#ApiKeySourceType")`.
+            (
+                "ApiKeySourceType",
+                &["HEADER", "AUTHORIZER"],
+                &["HEADER", "AUTHORIZER"],
+            ),
+            // A set that merely overlaps `Op` keeps its own order and its own members.
+            (
+                "a value set holding some of Op's values",
+                &["add", "remove"],
+                &["add", "remove"],
+            ),
+        ];
+
+        for (case, declared, expected) in rows {
+            let given: Vec<String> = declared.iter().map(|v| (*v).to_string()).collect();
+            let actual = declared_order(&given);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// Every constraint class the framework can report is stated with the rooted path,
+    /// and only the two renderings above are changed.
+    #[test]
+    fn every_constraint_class_is_stated_with_the_rooted_path() {
+        // (case, the violation the framework found, the clause this service states)
+        let rows: [(&str, Violation, &str); 4] = [
+            (
+                "an enum value set",
+                Violation {
+                    path: "patchOperations.1.member.op".to_string(),
+                    kind: ViolationKind::EnumValue(
+                        ["add", "remove", "replace", "move", "copy", "test"]
+                            .iter()
+                            .map(|v| (*v).to_string())
+                            .collect(),
+                    ),
+                    value: Some("invalid_op".to_string()),
+                },
+                "1 validation error detected: Value 'invalid_op' at \
+                 'updateRestApiInput.patchOperations.1.member.op' failed to satisfy \
+                 constraint: Member must satisfy enum value set: \
+                 [add, remove, move, test, replace, copy]",
+            ),
+            (
+                "a pattern",
+                Violation {
+                    path: "statusCode".to_string(),
+                    kind: ViolationKind::Pattern(r"^[1-5]\d\d$".to_string()),
+                    value: Some("999".to_string()),
+                },
+                "1 validation error detected: Value '999' at \
+                 'updateRestApiInput.statusCode' failed to satisfy constraint: Member \
+                 must satisfy regular expression pattern: [1-5]\\d\\d",
+            ),
+            (
+                "an absent required member",
+                Violation {
+                    path: "name".to_string(),
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                },
+                "1 validation error detected: Value null at 'updateRestApiInput.name' \
+                 failed to satisfy constraint: Member must not be null",
+            ),
+            (
+                "a length bound",
+                Violation {
+                    path: "tags.someKey.member".to_string(),
+                    kind: ViolationKind::MaxLength(128),
+                    value: Some("x".to_string()),
+                },
+                "1 validation error detected: Value 'x' at \
+                 'updateRestApiInput.tags.someKey.member' failed to satisfy constraint: \
+                 Member must have length less than or equal to 128",
+            ),
+        ];
+
+        for (case, found, expected) in rows {
+            let stated = refusal("UpdateRestApi", std::slice::from_ref(&found))
+                .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
+            assert_eq!(
+                stated.code, VALIDATION_EXCEPTION,
+                "case {case:?}: expected the code {VALIDATION_EXCEPTION}, got {:?}",
+                stated.code
+            );
+            assert_eq!(
+                stated.message, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                stated.message
+            );
+        }
+    }
+
+    /// Nothing to word is no refusal: a request that breaks no constraint is not
+    /// answered here.
+    #[test]
+    fn no_violations_is_no_refusal() {
+        let stated = refusal("GetRestApi", &[]);
+        assert!(
+            stated.is_none(),
+            "case no violations: expected None, got {stated:?}"
+        );
+    }
+}

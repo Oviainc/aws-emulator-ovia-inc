@@ -2823,3 +2823,59 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsTransferTransferserviceState>)
 }
+
+// ---------------------------------------------------------------------------
+// What writing an access grant adds to the resource
+// ---------------------------------------------------------------------------
+//
+// The access grant itself — [`Access`], the `accesses` map, `RESOURCE_TYPE_ACCESS`,
+// `NOT_FOUND_ACCESS`/[`unknown_access`] and the directory-provider rule
+// [`accesses_require_directory_provider`] every access operation refuses a
+// non-directory server with — is declared above, beside the resources it sits with.
+// `CreateAccess` is the first operation that WRITES a grant, so what a write needs and
+// a delete did not is added here: the store bound, the already-exists payload for a
+// grant the server already has, and the two lookups over one server's run of the map.
+
+/// How many access grants ONE server holds before `CreateAccess` refuses with the
+/// modelled `ServiceUnavailableException` instead of growing.
+///
+/// Chosen on the same basis as [`MAX_USERS_PER_SERVER`] — the emulator's own bound on
+/// the store, not an account's quota. `DeleteAccess` releases one grant and
+/// `DeleteServer` all of a server's.
+pub const MAX_ACCESSES_PER_SERVER: usize = 1_000;
+
+/// The fixed `Message` for a `CreateAccess` whose `ExternalId` the server already has
+/// a grant for.
+pub const ACCESS_ALREADY_EXISTS: &str = "Access already exists";
+
+/// The already-exists payload for an `ExternalId` the named server already has a grant
+/// for. Same construction as [`user_already_exists`]: the service's fixed text for the
+/// condition, with the colliding identifier in `Resource` alone.
+pub fn access_already_exists(external_id: &str) -> ResourceExistsException {
+    ResourceExistsException {
+        message: ACCESS_ALREADY_EXISTS.to_string(),
+        resource: external_id.to_string(),
+        resource_type: RESOURCE_TYPE_ACCESS.to_string(),
+    }
+}
+
+impl ComAmazonawsTransferTransferserviceState {
+    /// The access grants stored for `server_id`, in `ListAccesses` paging order.
+    ///
+    /// A RANGE scan over the contiguous run of the `(ServerId, ExternalId)` key, on
+    /// the same basis as [`Self::users_of`].
+    pub fn accesses_of<'a>(&'a self, server_id: &'a str) -> impl Iterator<Item = &'a Access> + 'a {
+        use ::std::ops::Bound;
+        let lower = (server_id.to_string(), String::new());
+        self.accesses
+            .range((Bound::Included(lower), Bound::Unbounded))
+            .take_while(move |((sid, _), _)| sid == server_id)
+            .map(|(_, access)| access)
+    }
+
+    /// Whether `server_id` can take another access grant, i.e. is below
+    /// [`MAX_ACCESSES_PER_SERVER`].
+    pub fn server_has_access_capacity(&self, server_id: &str) -> bool {
+        self.accesses_of(server_id).count() < MAX_ACCESSES_PER_SERVER
+    }
+}

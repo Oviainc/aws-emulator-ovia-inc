@@ -10,6 +10,21 @@
 //! exist." `@idempotent` describes the EFFECT of repeating the call, which the model's
 //! own wording already fixes as a 404 for an absent record, not a 200.
 //!
+//! ## A workflow with a job in progress is not deletable
+//!
+//! This operation models `ConflictException` (400), whose own doc gives "Workflow is
+//! currently running" as an example of the conflicting state it reports
+//! (`smithy_query(query="operation",operation="DeleteMatchingWorkflow")`). A workflow
+//! that still has a matching job in a non-terminal status is therefore refused: its
+//! run would lose the configuration it is running against. The refusal NAMES that
+//! workflow (`crate::state::messages::delete_matching_workflow_running`), is decided
+//! before anything is removed, so a refused delete leaves the store exactly as it was,
+//! and it clears itself as soon as the job reaches a terminal status.
+//!
+//! A delete that DOES go through takes that workflow's job history with it: a job
+//! belongs to the workflow it runs, so leaving its jobs behind would let a workflow
+//! recreated under the same name inherit runs it never had.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -158,12 +173,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        let now = crate::state::now_millis();
         let mut store = state.lock();
-        if store
-            .matching_workflows
-            .remove(&input.workflow_name)
-            .is_none()
-        {
+
+        if !store.matching_workflows.contains_key(&input.workflow_name) {
             return Err(DeleteMatchingWorkflowErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::messages::delete_matching_workflow_not_found(
@@ -173,6 +186,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // Decided on the CURRENT status of this workflow's jobs, so the clock-owed
+        // transitions are materialised first: a run that is already over does not keep
+        // blocking the delete.
+        if store
+            .matching_jobs_of_mut(&input.workflow_name, now)
+            .any(|job| job.is_in_progress())
+        {
+            return Err(DeleteMatchingWorkflowErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        crate::state::messages::delete_matching_workflow_running(
+                            &input.workflow_name,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        store.matching_workflows.remove(&input.workflow_name);
+        // The workflow's jobs go with it: a job belongs to the workflow it runs, so a
+        // workflow recreated under the same name must inherit none of them.
+        store.remove_jobs_of(&input.workflow_name);
 
         // `message` is a modelled @required output member carrying this operation's
         // own constant success text, not a sentence about the removed record.

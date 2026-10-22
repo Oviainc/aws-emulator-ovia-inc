@@ -34,7 +34,8 @@ use service_com_amazonaws_sfn_awsstepfunctions::state::{
 };
 
 use crate::state_machine_lifecycle::{
-    string, Emulator, ACCOUNT, HELLO_DEFINITION, PAST_THE_DELETE_DELAY, REGION, ROLE_ARN,
+    discriminated, string, Emulator, ACCOUNT, HELLO_DEFINITION, PAST_THE_DELETE_DELAY, REGION,
+    ROLE_ARN,
 };
 
 /// A key ARN in the emulator's own account, one of the four forms `kmsKeyId`
@@ -155,10 +156,13 @@ async fn create_state_machine_checks_the_encryption_configuration() {
                 &json!({ "stateMachineArn": string(&body, "stateMachineArn") }),
             )
             .await;
-        let expected = options
-            .get("encryptionConfiguration")
-            .cloned()
-            .unwrap_or(json!({ "type": "AWS_OWNED_KEY" }));
+        let expected = discriminated(
+            "EncryptionConfiguration",
+            options
+                .get("encryptionConfiguration")
+                .cloned()
+                .unwrap_or(json!({ "type": "AWS_OWNED_KEY" })),
+        );
         assert_eq!(
             described.get("encryptionConfiguration"),
             Some(&expected),

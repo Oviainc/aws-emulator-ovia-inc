@@ -35,7 +35,9 @@ use service_com_amazonaws_sfn_awsstepfunctions::state::{
     EXECUTION_SETTLE_DELAY, NOT_REDRIVABLE_RUNNING, NOT_REDRIVABLE_SUCCEEDED,
 };
 
-use crate::state_machine_lifecycle::{create_machine, string, Emulator, HELLO_DEFINITION, ROLE_ARN};
+use crate::state_machine_lifecycle::{
+    create_machine, discriminated, string, Emulator, HELLO_DEFINITION, ROLE_ARN,
+};
 
 /// Long enough that an outcome the clock owed has become due.
 ///
@@ -236,17 +238,21 @@ async fn the_redrive_projection_reports_whether_a_redrive_would_succeed() {
         );
         // "Indicates whether input or output was included in the response. Always
         // true for API calls" — and `outputDetails` only where there is an output.
+        let details = discriminated(
+            "CloudWatchEventsExecutionDataDetails",
+            json!({ "included": true }),
+        );
         assert_eq!(
             described.get("inputDetails"),
-            Some(&json!({ "included": true })),
-            "case {label:?}: expected inputDetails {{included:true}}, got {described:?}"
+            Some(&details),
+            "case {label:?}: expected inputDetails {details}, got {described:?}"
         );
         let has_output = described
             .get("output")
             .is_some_and(|output| !output.is_null());
         assert_eq!(
             described.get("outputDetails").cloned(),
-            has_output.then(|| json!({ "included": true })),
+            has_output.then(|| details.clone()),
             "case {label:?}: outputDetails must accompany an output and only an output, got {described:?}"
         );
     }

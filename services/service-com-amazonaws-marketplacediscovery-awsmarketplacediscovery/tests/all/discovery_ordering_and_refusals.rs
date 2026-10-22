@@ -270,9 +270,15 @@ async fn a_not_found_message_names_only_the_kind_of_resource() {
     // Rows: every operation that looks a resource up by id, with the resource KIND its
     // message names. Each is tried with several well-formed-but-unknown ids (all matching
     // the modelled ^[\w\-]+$), so a message built from the request fails here.
-    let cases: [(&str, &str, &str, &str); 4] = [
+    let cases: [(&str, &str, &str, &str); 5] = [
         ("getListing", "listingId", "Listing", &listing_id),
         ("getProduct", "productId", "Product", &product_id),
+        (
+            "listFulfillmentOptions",
+            "productId",
+            "Product",
+            &product_id,
+        ),
         ("getOffer", "offerId", "Offer", &offer_id),
         ("getOfferTerms", "offerId", "Offer", &offer_id),
     ];

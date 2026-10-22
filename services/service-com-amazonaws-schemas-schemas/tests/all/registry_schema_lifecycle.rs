@@ -70,6 +70,14 @@ impl Emulator {
             .expect("a well-formed test request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        // The exception SHAPE name travels in this header; the error body's own `Code`
+        // member carries the service's code for the condition. A suite that asserts
+        // one against the other needs both, so the harness keeps the header.
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let raw = response.body().clone();
         let body = if raw.is_empty() {
             Value::Null
@@ -81,7 +89,11 @@ impl Emulator {
                 )
             })
         };
-        Answer { status, body }
+        Answer {
+            status,
+            body,
+            error_type,
+        }
     }
 }
 
@@ -90,6 +102,8 @@ impl Emulator {
 pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) body: Value,
+    /// The `x-amzn-errortype` header, where the exception shape name travels.
+    pub(crate) error_type: Option<String>,
 }
 
 impl Answer {
@@ -105,6 +119,21 @@ impl Answer {
             .to_string()
     }
 
+    /// The exception shape name the `x-amzn-errortype` header carries, with any
+    /// `#`-qualified namespace and any `:`-suffixed URI dropped, as a client reads it.
+    pub(crate) fn error_type(&self) -> String {
+        self.error_type
+            .as_deref()
+            .unwrap_or("<no x-amzn-errortype>")
+            .rsplit('#')
+            .next()
+            .unwrap_or_default()
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
     pub(crate) fn str_at(&self, member: &str) -> String {
         self.body
             .get(member)
@@ -115,10 +144,10 @@ impl Answer {
 
     /// A member that must be present and non-null, whatever its JSON type.
     ///
-    /// Timestamps are read through this rather than [`Self::str_at`]: the wire form
-    /// of a timestamp is the framework's (the generated member schema carries no
-    /// `@timestampFormat`, so the JSON codec writes epoch seconds), and what this
-    /// service owns is the VALUE — fixed at write time and stable across reads.
+    /// Timestamps are read through this rather than [`Self::str_at`] because what these
+    /// cases own is the VALUE — fixed at write time and stable across reads — not its
+    /// rendering. The WIRE FORM of a `date-time` member is pinned on its own, over every
+    /// operation that answers one, in `tests/all/iso8601_timestamps.rs`.
     pub(crate) fn value_at(&self, member: &str) -> &Value {
         let value = self
             .body

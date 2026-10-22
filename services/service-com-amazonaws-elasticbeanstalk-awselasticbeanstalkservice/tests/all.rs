@@ -17,9 +17,15 @@ mod abort_environment_update;
 mod application_versions;
 #[path = "all/environment_operations.rs"]
 mod environment_operations;
+// Not a suite of its own: the name the suites below import the shared harness
+// by. Declared here because every file under `tests/all/` must be.
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/lifecycle.rs"]
 mod lifecycle;
 #[path = "all/platform_branches.rs"]
 mod platform_branches;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/swap_environment_cnames.rs"]
+mod swap_environment_cnames;

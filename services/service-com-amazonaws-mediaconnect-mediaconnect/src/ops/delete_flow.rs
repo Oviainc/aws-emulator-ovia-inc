@@ -165,14 +165,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        // Free the flow's name for reuse, but only while it still points at this flow.
-        if store
-            .flow_arns_by_name
-            .get(&flow.name)
-            .is_some_and(|arn| arn == &flow.flow_arn)
-        {
-            store.flow_arns_by_name.remove(&flow.name);
-        }
 
         Ok(DeleteFlowOutput {
             flow_arn: Some(flow.flow_arn),

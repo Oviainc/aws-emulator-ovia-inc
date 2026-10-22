@@ -17,6 +17,14 @@
 //! the clock already made due. Nothing sleeps, and no read invents a transition that
 //! was not owed.
 //!
+//! The resource-policy slice hangs off the same record. A function's resource-based
+//! policy is attached to the ARN the permission names, so [`FunctionRecord::policies`]
+//! holds one [`PolicyRecord`] per qualifier a statement was added to — the
+//! function-level policy under [`VERSION_LATEST`], and one per published version or
+//! alias. `AddPermission` appends exactly the statement its request described and
+//! `GetPolicy` reports the document those statements make up, so no policy text is ever
+//! echoed back out of a request body.
+//!
 //! `GetAccountSettings` reports on the same records at the account level:
 //! "Retrieves details about your account's limits and usage in an Amazon Web Services
 //! Region", so its usage is what the store holds and its unreserved concurrency is what
@@ -161,6 +169,26 @@ pub const CODE_SIZE_ZIPPED_LIMIT: i64 = 52_428_800;
 /// as [`TOTAL_CODE_SIZE_LIMIT`].
 pub const CONCURRENT_EXECUTIONS_LIMIT: i32 = 1_000;
 
+/// The IAM policy language version a resource-based policy document carries.
+/// `2012-10-17` is the current version of the language every AWS policy document is
+/// written in.
+pub const POLICY_LANGUAGE_VERSION: &str = "2012-10-17";
+
+/// The `Id` of the resource-based policy Lambda maintains for a function.
+pub const POLICY_ID: &str = "default";
+
+/// The `Effect` of every statement `AddPermission` writes: the operation "Grants a
+/// principal permission to use a function", so the statement it adds is a grant and
+/// never a denial.
+pub const STATEMENT_EFFECT_ALLOW: &str = "Allow";
+
+/// The largest a function's resource-based policy may get, in bytes.
+///
+/// AWS publishes the quota as 20 KB (Lambda quotas, "Function resource-based policy"),
+/// and answers `PolicyLengthExceededException` ("The permissions policy for the resource
+/// is too large") for a call that would push the policy past it. Not adjustable.
+pub const MAX_POLICY_SIZE_BYTES: usize = 20_480;
+
 /// Where the code of a function came from.
 ///
 /// `zip_bytes` is the only variant whose bytes this emulator holds, so it is the only
@@ -246,6 +274,197 @@ pub struct FunctionVersionRecord {
     pub created: String,
 }
 
+/// `value` as a JSON string literal, escaped by the JSON serializer rather than by
+/// hand.
+fn json_string(value: &str) -> String {
+    ::serde_json::Value::String(value.to_string()).to_string()
+}
+
+/// A JSON object whose members keep the order they are given in.
+///
+/// A `serde_json::Value` map would sort them by key, and a policy document reads in a
+/// fixed order (`Sid`, `Effect`, `Principal`, `Action`, `Resource`, `Condition`), so the
+/// members are rendered in order while every VALUE is still serialized by `serde_json`.
+fn json_object(members: &[(&str, String)]) -> String {
+    let rendered: Vec<String> = members
+        .iter()
+        .map(|(name, value)| format!("{}:{value}", json_string(name)))
+        .collect();
+    format!("{{{}}}", rendered.join(","))
+}
+
+/// The `Principal` of a policy statement for the principal `AddPermission` was given.
+///
+/// The model documents the forms the member takes — "The Amazon Web Services service,
+/// Amazon Web Services account, IAM user, or IAM role that invokes the function", where
+/// "For Amazon Web Services services, the principal is a domain-style identifier that
+/// the service defines, such as s3.amazonaws.com" — and the policy language spells each
+/// of them differently:
+///
+/// * an account id is that account's root principal, written as its ARN;
+/// * an IAM user or role is already an ARN, and is used as given;
+/// * anything else is the domain-style identifier of a service principal;
+/// * `*` is every principal, which the language writes as the bare string.
+#[must_use]
+pub fn principal_json(principal: &str) -> String {
+    if principal == "*" {
+        return json_string(principal);
+    }
+    let is_account_id = principal.len() == 12 && principal.bytes().all(|byte| byte.is_ascii_digit());
+    if is_account_id {
+        return json_object(&[(
+            "AWS",
+            json_string(&format!("arn:aws:iam::{principal}:root")),
+        )]);
+    }
+    if principal.starts_with("arn:") {
+        return json_object(&[("AWS", json_string(principal))]);
+    }
+    json_object(&[("Service", json_string(principal))])
+}
+
+/// One statement of a function's resource-based policy: exactly the grant one
+/// `AddPermission` call described, plus the ARN it was granted on.
+#[derive(Debug, Clone)]
+pub struct PolicyStatement {
+    /// The `StatementId`, which "differentiates the statement from others in the same
+    /// policy" and is the statement's `Sid`.
+    pub sid: String,
+    /// The action the principal may use on the function.
+    pub action: String,
+    /// The principal, as supplied; [`principal_json`] renders it.
+    pub principal: String,
+    /// The ARN the permission is granted on: the function's unqualified ARN for a
+    /// function-level statement, and the qualified one for a version or alias.
+    pub resource: String,
+    /// `SourceArn`, when the caller limited the grant to one invoking resource.
+    pub source_arn: Option<String>,
+    /// `SourceAccount`, when the caller limited the grant to one owning account.
+    pub source_account: Option<String>,
+    /// `PrincipalOrgID`, when the caller limited the grant to one organization.
+    pub principal_org_id: Option<String>,
+    /// `EventSourceToken`, when the caller required one.
+    pub event_source_token: Option<String>,
+    /// `FunctionUrlAuthType`, when the grant is about a function URL.
+    pub function_url_auth_type: Option<String>,
+    /// `InvokedViaFunctionUrl`, when the caller restricted the grant to invocations
+    /// that come through a function URL.
+    pub invoked_via_function_url: Option<bool>,
+}
+
+impl PolicyStatement {
+    /// The `Condition` block of this statement, or `None` when the grant carries no
+    /// restriction at all.
+    ///
+    /// Each optional member of the request restricts the grant, and each is written as
+    /// the IAM condition key that expresses it. `SourceArn` is compared as an ARN — the
+    /// model's note "Lambda configures the comparison using the `StringLike` operator"
+    /// is why wildcards in the ARN match, which is what the ARN-typed `ArnLike` operator
+    /// does — the remaining string-valued keys are compared for equality, and the
+    /// boolean one with `Bool`.
+    fn condition_json(&self) -> Option<String> {
+        let mut operators: Vec<(&str, String)> = Vec::new();
+        if let Some(source_arn) = &self.source_arn {
+            operators.push((
+                "ArnLike",
+                json_object(&[("AWS:SourceArn", json_string(source_arn))]),
+            ));
+        }
+
+        let mut equals: Vec<(&str, String)> = Vec::new();
+        if let Some(source_account) = &self.source_account {
+            equals.push(("AWS:SourceAccount", json_string(source_account)));
+        }
+        if let Some(org_id) = &self.principal_org_id {
+            equals.push(("aws:PrincipalOrgID", json_string(org_id)));
+        }
+        if let Some(token) = &self.event_source_token {
+            equals.push(("lambda:EventSourceToken", json_string(token)));
+        }
+        if let Some(auth_type) = &self.function_url_auth_type {
+            equals.push(("lambda:FunctionUrlAuthType", json_string(auth_type)));
+        }
+        if !equals.is_empty() {
+            operators.push(("StringEquals", json_object(&equals)));
+        }
+
+        if let Some(via_function_url) = self.invoked_via_function_url {
+            operators.push((
+                "Bool",
+                json_object(&[(
+                    "lambda:InvokedViaFunctionUrl",
+                    json_string(&via_function_url.to_string()),
+                )]),
+            ));
+        }
+
+        (!operators.is_empty()).then(|| json_object(&operators))
+    }
+
+    /// This statement as the JSON `AddPermission` answers with and `GetPolicy` embeds:
+    /// "The permission statement that's added to the function policy".
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let mut members = vec![
+            ("Sid", json_string(&self.sid)),
+            ("Effect", json_string(STATEMENT_EFFECT_ALLOW)),
+            ("Principal", principal_json(&self.principal)),
+            ("Action", json_string(&self.action)),
+            ("Resource", json_string(&self.resource)),
+        ];
+        if let Some(condition) = self.condition_json() {
+            members.push(("Condition", condition));
+        }
+        json_object(&members)
+    }
+}
+
+/// The resource-based policy of one function, version or alias: the statements
+/// `AddPermission` has added to it, and the revision they are at.
+#[derive(Debug, Clone)]
+pub struct PolicyRecord {
+    /// The statements, in the order they were added, so the document reports them
+    /// deterministically.
+    pub statements: Vec<PolicyStatement>,
+    /// The revision this policy is at. `GetPolicy` reports it, and `AddPermission`'s
+    /// `RevisionId` precondition is checked against it ("For AddPermission and
+    /// RemovePermission API operations: Call GetPolicy to retrieve the latest RevisionId
+    /// for your resource"); a fresh one is minted on every change.
+    pub revision_id: String,
+}
+
+impl Default for PolicyRecord {
+    fn default() -> Self {
+        Self {
+            statements: Vec::new(),
+            revision_id: mint_revision_id(),
+        }
+    }
+}
+
+impl PolicyRecord {
+    /// Whether this policy already holds a statement with `sid`.
+    #[must_use]
+    pub fn holds(&self, sid: &str) -> bool {
+        self.statements.iter().any(|statement| statement.sid == sid)
+    }
+
+    /// The whole policy document, which is what `GetPolicy`'s `Policy` member carries.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let statements: Vec<String> = self
+            .statements
+            .iter()
+            .map(PolicyStatement::to_json)
+            .collect();
+        json_object(&[
+            ("Version", json_string(POLICY_LANGUAGE_VERSION)),
+            ("Id", json_string(POLICY_ID)),
+            ("Statement", format!("[{}]", statements.join(","))),
+        ])
+    }
+}
+
 /// One Lambda function: its unpublished (`$LATEST`) configuration, its code, its
 /// lifecycle state, its tags and its published versions.
 #[derive(Debug, Clone)]
@@ -277,6 +496,11 @@ pub struct FunctionRecord {
     pub latest_version: u64,
     /// The published versions, ordered by version number.
     pub versions: BTreeMap<u64, FunctionVersionRecord>,
+    /// The resource-based policy of each qualifier that has one, keyed by the version
+    /// label the permission was granted on: the function-level policy under
+    /// [`VERSION_LATEST`], and one per published version or alias. A policy is attached
+    /// to the ARN the permission names, so two qualifiers never share one.
+    pub policies: BTreeMap<String, PolicyRecord>,
 }
 
 impl FunctionRecord {

@@ -223,10 +223,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every rule below comes from the member's own modelled documentation.
-        // The enum checks are defence in depth: for a member the model types as
-        // an enum the boundary validator already refused a bad value before this
-        // handler ran, so they only fire for one the model types as a plain
-        // string — they never produce a second wording for the same refusal.
+        // The enum checks are this request's ONLY check of those members: the
+        // input schema skips the framework's boundary check for each of them
+        // (`skip_validation` in `super::types::create_broker_types`), because a
+        // refusal raised before this handler cannot carry
+        // `BadRequestException$errorAttribute` and so could not name the member
+        // at fault.
         state::validate_broker_name(&input.broker_name).map_err(bad_request)?;
         state::validate_enum("engineType", &input.engine_type, ENGINE_TYPE_VALUES)
             .map_err(bad_request)?;
@@ -319,10 +321,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state::validate_list_size("tags", tags.len(), 0, state::MAX_TAGS)
                 .map_err(bad_request)?;
         }
-        if let Some(requested) = &input.users {
-            state::validate_list_size("users", requested.len(), 0, state::MAX_USERS_PER_BROKER)
-                .map_err(bad_request)?;
-        }
+        // A broker is created together with its initial user, so a request that
+        // names none is refused rather than provisioning a broker no user can
+        // reach — an absent `users` member and an empty list are the same
+        // request. The upper bound is the documented per-broker user quota.
+        state::validate_users_requested(input.users.as_deref().unwrap_or_default().len())
+            .map_err(bad_request)?;
 
         // The broker's initial users, as `CreateBroker` accepts them inline.
         // Every refusal names the member a client can match on — `users` — and

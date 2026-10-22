@@ -32,11 +32,14 @@ async fn create_source(router: &MultiServiceRouter, body: Value) -> (u16, Value)
 }
 
 /// A created SdiSource, with the create itself asserted to have succeeded.
+///
+/// `201 Created` is the recorded status of a MediaLive create (see
+/// `CreateSdiSource`'s `SUCCESS_STATUS`).
 async fn created(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
     let (status, source) = create_source(router, body).await;
     assert_eq!(
-        status, 200,
-        "case {case:?}: CreateSdiSource: expected 200, got {status}: {source}"
+        status, 201,
+        "case {case:?}: CreateSdiSource: expected 201, got {status}: {source}"
     );
     source
 }
@@ -66,7 +69,7 @@ async fn update_source(
 
 async fn delete_source(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     let (status, response) = call(router, "DELETE", &format!("{SDI_SOURCES}/{id}"), None).await;
-    if status == 202 {
+    if status == 200 {
         (status, response["sdiSource"].clone())
     } else {
         (status, response)
@@ -514,7 +517,7 @@ async fn a_source_an_input_uses_is_in_use_by_that_input() {
     }
 }
 
-/// Rule: `DeleteSdiSource` answers 202 with the source it deleted, which settles
+/// Rule: `DeleteSdiSource` answers 200 with the source it deleted, which settles
 /// into the terminal `DELETED` state with no attached inputs and stays in the
 /// account under that state; an `SdiSourceId` that names no live source is
 /// refused with `NotFoundException`.
@@ -533,8 +536,8 @@ async fn a_deleted_source_settles_into_the_terminal_deleted_state() {
 
     let (status, deleted) = delete_source(&router, &removed).await;
     assert_eq!(
-        status, 202,
-        "DeleteSdiSource: expected 202, got {status}: {deleted}"
+        status, 200,
+        "DeleteSdiSource: expected 200, got {status}: {deleted}"
     );
     assert_eq!(
         deleted["state"],
@@ -571,8 +574,8 @@ async fn a_deleted_source_settles_into_the_terminal_deleted_state() {
     // Deleting it again changes nothing — it is already DELETED.
     let (status, again) = delete_source(&router, &removed).await;
     assert_eq!(
-        status, 202,
-        "DeleteSdiSource on a DELETED source: expected 202, got {status}: {again}"
+        status, 200,
+        "DeleteSdiSource on a DELETED source: expected 200, got {status}: {again}"
     );
     assert_eq!(
         again, deleted,

@@ -210,6 +210,16 @@ pub const MAX_CLUSTERS: usize = 100;
 /// live cluster.
 pub const MAX_RETIRED_CLUSTERS: usize = MAX_CLUSTERS;
 
+/// The most tags one resource holds.
+///
+/// Not a guess: `TagMap` is modelled `@length(min: 0, max: 200)`
+/// (`smithy_query(query="shape", shape="TagMap")`), and every reader of a
+/// resource's tags reports them through that shape, so a resource holding more
+/// tags than the map admits could not be reported at all. A write that would
+/// leave a resource past this ceiling is refused with the tagging operation's
+/// own `ServiceQuotaExceededException`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// The most `clientToken` entries one ledger keeps.
 ///
 /// At most one token is recorded per call that carried one, and a token is
@@ -618,9 +628,12 @@ pub fn cluster_arn(region: &str, identifier: &str) -> String {
     )
 }
 
-/// The resource an Aurora DSQL ARN names: its type segment and the id after it.
+/// The resource an Aurora DSQL ARN names: the region it is scoped to, its type
+/// segment and the id after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArnResource {
+    /// The region segment, as the ARN spells it (empty when the ARN carries none).
+    pub region: String,
     /// The resource type, e.g. [`RESOURCE_TYPE_CLUSTER`].
     pub resource_type: String,
     /// The resource's own identifier.
@@ -636,9 +649,11 @@ pub struct ArnResource {
 /// service field that is not this service's, a resource field with no type —
 /// names nothing here.
 ///
-/// The partition, region and account fields take no part in the lookup: this
-/// emulator serves a single account, and a resource id already names at most one
-/// stored resource, so the type and the id are what resolve it.
+/// The partition and account fields take no part in the lookup: this emulator
+/// serves a single account, and a resource id already names at most one stored
+/// resource, so the type and the id are what resolve it. The region is reported
+/// rather than matched on, for a caller that needs the region an ARN was minted
+/// in (see [`arn_region`]).
 pub fn parse_resource_arn(arn: &str) -> Option<ArnResource> {
     // `splitn(6, ..)` keeps the resource field whole: it is the only field that
     // may itself contain a colon.
@@ -650,13 +665,14 @@ pub fn parse_resource_arn(arn: &str) -> Option<ArnResource> {
     if fields.next()? != ARN_SERVICE {
         return None;
     }
-    let _region = fields.next()?;
+    let region = fields.next()?;
     let _account = fields.next()?;
     let (resource_type, resource_id) = fields.next()?.split_once(['/', ':'])?;
     if resource_type.is_empty() || resource_id.is_empty() {
         return None;
     }
     Some(ArnResource {
+        region: region.to_string(),
         resource_type: resource_type.to_string(),
         resource_id: resource_id.to_string(),
     })
@@ -682,6 +698,49 @@ pub fn stream_arn(region: &str, cluster_identifier: &str, stream_identifier: &st
 /// `^[a-zA-Z0-9.-]+$`.
 pub fn cluster_endpoint(region: &str, identifier: &str) -> String {
     format!("{identifier}.dsql.{region}.on.aws")
+}
+
+/// The region segment of an ARN this service minted
+/// (`arn:aws:dsql:{region}:{account}:cluster/{identifier}`), when the ARN is one of
+/// this service's and carries a region `ClusterArn`'s pattern accepts.
+///
+/// A thin accessor over [`parse_resource_arn`], so this module walks an ARN's fields
+/// in exactly one place; an ARN of another service names nothing here, for the same
+/// reason it names no resource. The segment is narrowed the way [`request_region`]
+/// narrows a signing region, so a region read out of an ARN can only ever be
+/// interpolated into another well-formed value; anything else answers `None`, and the
+/// caller falls back to the request's own region.
+pub fn arn_region(arn: &str) -> Option<String> {
+    parse_resource_arn(arn)
+        .map(|resource| resource.region)
+        .filter(|region| is_arn_region_segment(region))
+}
+
+/// Whether `value` is what `ClusterArn`'s pattern accepts for its region segment:
+/// `[a-z0-9-]{1,20}`.
+fn is_arn_region_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 20
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// The VPC endpoint service that fronts one cluster:
+/// `com.amazonaws.{region}.dsql-{identifier}`.
+///
+/// An interface VPC endpoint service is named `com.amazonaws.{region}.{service}`, and
+/// Aurora DSQL qualifies that per cluster: `GetVpcEndpointServiceName` is keyed by a
+/// cluster id and answers `ResourceNotFoundException` for an unknown one, and
+/// `ServiceName`'s pattern (`smithy_query(query="shape", shape="ServiceName")`:
+/// `^com\.amazonaws\.[a-z0-9-]+\.dsql[a-z0-9-]*$`) admits exactly such a suffix after
+/// `dsql`. The cluster's own identifier is the qualifier, so the name is derived from
+/// persisted state, stable across reads and distinct per cluster.
+///
+/// `region` is at most 20 characters and `identifier` is 26, so the result is at most
+/// 66 characters — inside `ServiceName`'s `@length(1, 128)`.
+pub fn vpc_endpoint_service_name(region: &str, identifier: &str) -> String {
+    format!("com.amazonaws.{region}.dsql-{identifier}")
 }
 
 /// The `EncryptionDetails` of a cluster, derived from the `kmsEncryptionKey` the

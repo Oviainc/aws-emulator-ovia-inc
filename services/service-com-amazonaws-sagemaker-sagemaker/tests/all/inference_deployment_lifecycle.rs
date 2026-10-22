@@ -22,11 +22,11 @@ use smithy_server_runtime::MultiServiceRouter;
 pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// Long enough to pass `state::ENDPOINT_IN_SERVICE_AFTER` (300 ms).
-const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
+pub(crate) const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
 
 /// Spacing between creates, so `CreationTime` ordering is unambiguous and a filter
 /// bound can be placed strictly between two models.
-const CREATE_SPACING: Duration = Duration::from_millis(5);
+pub(crate) const CREATE_SPACING: Duration = Duration::from_millis(5);
 
 /// One emulator: the shared engine plus the SageMaker service mounted on the router.
 ///

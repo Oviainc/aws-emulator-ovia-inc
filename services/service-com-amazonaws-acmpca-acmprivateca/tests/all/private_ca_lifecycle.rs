@@ -44,8 +44,13 @@ pub(crate) fn wait_for_the_clock() {
 }
 
 /// One emulator with this service mounted.
+///
+/// `pub(crate)` so every suite in this test target drives the emulator through ONE
+/// harness: a sibling suite reaches it as `crate::private_ca_lifecycle::Emulator`.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The ONE engine every operation of this emulator reads and writes, so a suite can
+    /// seed a resource into a state only an unimplemented operation would put it in.
     engine: Arc<engine::InMemoryEngine>,
 }
 
@@ -1098,6 +1103,8 @@ async fn ca_arns_are_refused_by_form_and_then_by_existence() {
                 "Validity": {"Value": 7, "Type": "DAYS"},
             }),
         ),
+        ("RestoreCertificateAuthority", json!({})),
+        ("DeleteCertificateAuthority", json!({})),
     ] {
         for (case, arn) in &malformed {
             let case = format!("{operation}: {case}");

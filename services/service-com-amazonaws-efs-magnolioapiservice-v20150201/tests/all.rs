@@ -15,9 +15,15 @@
 mod error_message_construction;
 #[path = "all/file_system_lifecycle.rs"]
 mod file_system_lifecycle;
+#[path = "all/harness.rs"]
+mod harness;
 #[path = "all/lifecycle_configuration.rs"]
 mod lifecycle_configuration;
+#[path = "all/replication_configuration.rs"]
+mod replication_configuration;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tags.rs"]
 mod tags;
+#[path = "all/update_file_system.rs"]
+mod update_file_system;

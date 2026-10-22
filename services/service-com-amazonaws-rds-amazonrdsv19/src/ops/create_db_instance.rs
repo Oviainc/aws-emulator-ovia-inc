@@ -603,9 +603,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             db_security_group_names: input.db_security_groups.unwrap_or_default(),
             db_cluster_identifier: input.db_cluster_identifier,
             domain: input.domain,
-            ca_certificate_identifier: input
-                .ca_certificate_identifier
-                .unwrap_or_else(|| crate::state::DEFAULT_CA_CERTIFICATE_IDENTIFIER.to_string()),
+            ca_certificate_identifier: input.ca_certificate_identifier.unwrap_or_else(|| {
+                // No `CACertificateIdentifier`: the instance is created under the CA that
+                // is the default for new launches in this region — the account's
+                // `ModifyCertificates` override when one is set, else the published
+                // system default.
+                store.default_ca_certificate(&region).to_string()
+            }),
             // `MonitoringInterval`: "Default: 0" — Enhanced Monitoring off.
             monitoring_interval: input
                 .monitoring_interval

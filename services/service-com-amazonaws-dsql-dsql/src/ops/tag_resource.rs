@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Tags the resource an ARN names: the key/value pairs the request carries are MERGED
+//! into the resource's tag set — a key the resource already holds takes the request's
+//! value, a key the request does not name is left alone — and the result is persisted
+//! where every reader of that resource reports it. `UntagResource`, not an omission
+//! here, is how a tag is removed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The resource an ARN names is resolved the way this service's other ARN-addressed
+//! operations resolve it, through [`crate::state::parse_resource_arn`]: an ARN that
+//! names no Aurora DSQL resource at all is a bad request (400 `ValidationException`),
+//! and a well-formed one naming nothing this store holds answers the modelled 404.
+//! Only the cluster is resolved, exactly as in `ListTagsForResource`; a stream's
+//! nested ARN answers that 404 (see the lookup below). A tag is resource metadata
+//! rather than cluster configuration, so tagging drives no status change and is
+//! accepted for any cluster that exists, including one the clock still owes its
+//! `ACTIVE` status.
 //!
 //! ## Shape of an operation
 //!
@@ -101,11 +107,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#TagResource")]
+// The operation's MODELED errors, plus the service-common `InternalServerException`
+// widened in with `extra_errors`: the service declares it for every operation (its
+// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
+// per-operation list the macro checks against does not repeat it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#TagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -159,18 +173,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // The ARN carries the resource, so this operation reads nothing from the
+        // request's credential scope.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server_error());
+        };
+
+        // `Arn`'s modelled pattern is only `^arn:.+$`, so an ARN naming another
+        // service's resource reaches this handler. That is a bad request rather than
+        // a missing resource: no Aurora DSQL resource can carry such an ARN. Same
+        // refusal, in the same words, as `ListTagsForResource`.
+        let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "resourceArn must be the ARN of an Aurora DSQL resource \
+                 (arn:<partition>:{}:<region>:<account>:<type>/<id>), got {}",
+                crate::state::ARN_SERVICE,
+                input.resource_arn,
+            )));
+        };
+
+        let mut state = state.lock();
+        // Materialise what the clock already owes before the lookup, so a cluster
+        // whose deletion came due is not found here either.
+        state.settle(std::time::SystemTime::now());
+
+        let held = match resource.resource_type.as_str() {
+            crate::state::RESOURCE_TYPE_CLUSTER => state
+                .clusters
+                .get_mut(&resource.resource_id)
+                .map(|cluster| &mut cluster.tags),
+            // Any OTHER type segment names no resource this operation resolves, so
+            // the answer is the modelled 404. A stream is addressed by the nested
+            // ARN `cluster/{cluster}/stream/{stream}` (`crate::state::stream_arn`),
+            // which the parser splits at the first `/` and so arrives above as the
+            // `cluster` type with a compound id that matches no stored cluster: tags
+            // on a stream are reachable through neither this operation nor the
+            // `ListTagsForResource` beside it yet, and belong to that gap's own
+            // issue rather than to this one.
+            _ => None,
+        };
+        let Some(held) = held else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    &input.resource_arn,
+                    &resource.resource_id,
+                    &resource.resource_type,
+                ),
+            )
+            .into());
+        };
+
+        // The write is all-or-nothing: a request that would leave the resource
+        // holding more tags than `TagMap` admits is refused in full, before any pair
+        // is applied, so a refused call changes nothing. Only the keys the resource
+        // does not already hold grow it.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !held.contains_key(*key))
+            .count();
+        let merged = held.len() + added;
+        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would leave the resource with {merged} tags, which exceeds \
+                         the maximum of {} tags per resource.",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    ),
+                    resource_id: resource.resource_id.clone(),
+                    resource_type: resource.resource_type.clone(),
+                    service_code: crate::state::ARN_SERVICE.to_string(),
+                    quota_code: "tags-per-resource".to_string(),
+                },
+            )
+            .into());
+        }
+
+        for (key, value) in input.tags {
+            held.insert(key, value);
+        }
+
+        // `@idempotent`: the merge is a set of assignments, so repeating the same
+        // call leaves the resource in the same state and answers the same way.
+        Ok(TagResourceOutput)
     }
+}
+
+/// The modelled server fault for a store this handler cannot reach, worded as the
+/// cluster handlers word it.
+fn internal_server_error() -> TagResourceError {
+    TagResourceErrorModeled::InternalServerException(InternalServerException {
+        message: "the dsql cluster store is unavailable".to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
 }

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/flow_entitlements.rs"]
 mod flow_entitlements;
+#[path = "all/flow_identity_and_description.rs"]
+mod flow_identity_and_description;
 #[path = "all/flow_lifecycle.rs"]
 mod flow_lifecycle;
 #[path = "all/flow_media_streams.rs"]

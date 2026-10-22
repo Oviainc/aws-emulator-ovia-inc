@@ -7,6 +7,7 @@
 //! modules, and `types/mod.rs` re-exports them all.
 #![allow(unused_imports)]
 
+use super::shared_types::schemas_member;
 use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-schemas-schemas.json");
@@ -20,7 +21,10 @@ pub struct PutCodeBindingInput {
     pub schema_version: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.schemas#PutCodeBindingResponse")]
+/// `PutCodeBindingResponse`, written out by hand rather than produced by
+/// `#[smithy_macros::smithy(shape = ...)]` because `CreationDate` and `LastModified`
+/// target `__timestampIso8601` and so carry `@timestampFormat("date-time")` — see the
+/// block over `schemas_member!` in `shared_types`.
 #[derive(Debug, Clone, Default)]
 pub struct PutCodeBindingOutput {
     pub creation_date: Option<::aws_smithy_types::DateTime>,
@@ -29,10 +33,82 @@ pub struct PutCodeBindingOutput {
     pub status: Option<String>,
 }
 
+#[allow(non_upper_case_globals)]
+impl PutCodeBindingOutput {
+    /// `@timestampFormat("date-time")` from `__timestampIso8601`.
+    pub const M_CREATION_DATE: ::aws_smithy_schema::Schema =
+        schemas_member!(iso8601 "PutCodeBindingResponse", "CreationDate", 0);
+    /// `@timestampFormat("date-time")`, as for `CreationDate`.
+    pub const M_LAST_MODIFIED: ::aws_smithy_schema::Schema =
+        schemas_member!(iso8601 "PutCodeBindingResponse", "LastModified", 1);
+    pub const M_SCHEMA_VERSION: ::aws_smithy_schema::Schema =
+        schemas_member!("PutCodeBindingResponse", "SchemaVersion", String, 2);
+    /// `CodeGenerationStatus`, an enum: a string on the wire.
+    pub const M_STATUS: ::aws_smithy_schema::Schema =
+        schemas_member!("PutCodeBindingResponse", "Status", String, 3);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.schemas#PutCodeBindingResponse",
+            "com.amazonaws.schemas",
+            "PutCodeBindingResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_CREATION_DATE,
+            &Self::M_LAST_MODIFIED,
+            &Self::M_SCHEMA_VERSION,
+            &Self::M_STATUS,
+        ],
+    );
+}
+
+pub static PUT_CODE_BINDING_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &PutCodeBindingOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for PutCodeBindingOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.creation_date.as_ref() {
+            s.write_timestamp(&Self::M_CREATION_DATE, v)?;
+        }
+        if let Some(v) = self.last_modified.as_ref() {
+            s.write_timestamp(&Self::M_LAST_MODIFIED, v)?;
+        }
+        if let Some(v) = self.schema_version.as_ref() {
+            s.write_string(&Self::M_SCHEMA_VERSION, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for PutCodeBindingOutput {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.creation_date = Some(d.read_timestamp(&Self::M_CREATION_DATE)?),
+                Some(1) => out.last_modified = Some(d.read_timestamp(&Self::M_LAST_MODIFIED)?),
+                Some(2) => out.schema_version = Some(d.read_string(&Self::M_SCHEMA_VERSION)?),
+                Some(3) => out.status = Some(d.read_string(&Self::M_STATUS)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.schemas#GoneException")]
 #[derive(Debug, Clone, Default)]
 pub struct GoneException {
     pub code: String,
     pub message: String,
 }
-

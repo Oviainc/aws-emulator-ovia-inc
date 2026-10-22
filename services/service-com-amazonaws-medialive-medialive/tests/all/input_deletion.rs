@@ -379,7 +379,9 @@ async fn a_deleted_input_stops_using_the_resources_it_referenced() {
         Some(json!({ "name": "wired", "type": "SINGLE" })),
     )
     .await;
-    assert_eq!(status, 200, "CreateSdiSource: got {status}: {sdi}");
+    // `201 Created` is the recorded status of a MediaLive create (see
+    // `CreateSdiSource`'s `SUCCESS_STATUS`).
+    assert_eq!(status, 201, "CreateSdiSource: got {status}: {sdi}");
     let sdi_id = sdi["sdiSource"]["id"]
         .as_str()
         .unwrap_or_default()

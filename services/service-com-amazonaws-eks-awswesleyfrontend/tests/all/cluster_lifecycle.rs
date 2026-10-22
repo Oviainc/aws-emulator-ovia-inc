@@ -9,121 +9,31 @@
 //! request: the rows differ along what the rule generalises over (which optional
 //! members are supplied, name shape and length, page size, tag-merge shape, IP
 //! family), and each assertion names its case and prints the actual value.
+//!
+//! The request harness ([`Answer`], [`emulator`], [`call`], [`encode_label`],
+//! [`create`], [`describe`], [`minimal_request`]) is `pub(crate)` so the other
+//! suites in this test binary drive the same router the same way instead of each
+//! growing its own copy.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
     CLUSTER_ACTIVATION_DELAY, MAX_CLUSTERS, MAX_STORED_CLUSTERS, MAX_TAGS_PER_RESOURCE,
 };
-use service_com_amazonaws_eks_awswesleyfrontend::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// One answer from the emulator, reduced to what a client branches on.
-///
-/// `pub(crate)` because every suite in this test binary branches on the same three
-/// things (including the `cluster_versions` suite); a second suite reuses this one
-/// rather than restating it.
-#[derive(Debug)]
-pub(crate) struct Answer {
-    pub(crate) status: u16,
-    /// The restJson1 error envelope's `__type`, absent on success.
-    pub(crate) error_type: Option<String>,
-    pub(crate) body: serde_json::Value,
-}
-
-impl Answer {
-    fn cluster(&self) -> &serde_json::Value {
-        &self.body["cluster"]
-    }
-}
-
-/// The emulator under test: one shared engine, one service, authentication off so a
-/// test signs nothing (the credential scope below is still parsed for its region).
-pub(crate) fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Percent-encode a value that travels in ONE path segment, the way an AWS SDK
-/// encodes an `@httpLabel`: `/` must not look like a segment separator.
-///
-/// Written out rather than pulled from `percent-encoding`, because a new
-/// dependency means a new `Cargo.lock` entry and this fix deliberately leaves
-/// that file — the one every concurrent fix also edits — untouched. The rule is
-/// the one an SDK applies to a non-greedy label: keep the unreserved set
-/// (`A-Za-z0-9`, which is a subset of RFC 3986's, so this is a superset of what
-/// must be escaped) and percent-encode every other byte; the server
-/// percent-decodes the segment either way.
-fn encode_label(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() {
-                (byte as char).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect()
-}
-
-pub(crate) async fn call(
-    router: &MultiServiceRouter,
-    region: &str,
-    method: &str,
-    uri: &str,
-    body: &str,
-) -> Answer {
-    let request = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/eks/aws4_request, \
-                 SignedHeaders=host, Signature=deadbeef"
-            ),
-        )
-        .body(bytes::Bytes::from(body.to_owned()))
-        .expect("a well-formed test request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get("x-amzn-errortype")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let bytes = response.body();
-    let body = if bytes.is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::from_slice(bytes).unwrap_or(serde_json::Value::Null)
-    };
-    let error_type = error_type.or_else(|| {
-        body.get("__type")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    });
-    Answer {
-        status,
-        error_type,
-        body,
-    }
-}
+// The wire plumbing (one shared engine behind the production router, label
+// encoding, the reduced `Answer`) is shared with every other suite in this
+// crate — see `tests/all/wire.rs`.
+use crate::wire::{call, emulator, encode_label, Answer};
 
 pub(crate) const REGION: &str = "us-west-2";
 
-async fn create(router: &MultiServiceRouter, body: &serde_json::Value) -> Answer {
+pub(crate) async fn create(router: &MultiServiceRouter, body: &serde_json::Value) -> Answer {
     call(router, REGION, "POST", "/clusters", &body.to_string()).await
 }
 
-async fn describe(router: &MultiServiceRouter, name: &str) -> Answer {
+pub(crate) async fn describe(router: &MultiServiceRouter, name: &str) -> Answer {
     call(
         router,
         REGION,
@@ -155,7 +65,7 @@ async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
 }
 
 /// The smallest request `CreateCluster` accepts: just the three required members.
-fn minimal_request(name: &str) -> serde_json::Value {
+pub(crate) fn minimal_request(name: &str) -> serde_json::Value {
     serde_json::json!({
         "name": name,
         "roleArn": "arn:aws:iam::000000000000:role/eksClusterRole",

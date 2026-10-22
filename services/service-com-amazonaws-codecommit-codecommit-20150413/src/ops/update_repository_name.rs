@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRepositoryName
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRepositoryName`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRepositoryName::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Renames a repository that is already in the store: the repository keeps its
+//! identity (id, creation date, description, tags and history) and takes the new
+//! name, so every field CodeCommit derives from the name — the ARN and both clone
+//! URLs — is rebuilt, and the repository answers to the new name and no longer to
+//! the old one. The new name must be one the account does not already hold.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +164,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRepositoryName` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRepositoryNameErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRepositoryName"))
+        // The rename is addressed entirely by the two names in the body; the
+        // request's region is not consulted, because a repository keeps the region
+        // its ARN and clone URLs were built for.
+        let _ = ctx;
+
+        // Both names' modelled length and pattern are refused by the boundary
+        // validator before this handler runs. What is left is the documented rule
+        // the model cannot express: "The suffix .git is prohibited."
+        for (member, name) in [("oldName", &input.old_name), ("newName", &input.new_name)] {
+            if crate::state::has_prohibited_git_suffix(name) {
+                return Err(UpdateRepositoryNameErrorModeled::InvalidRepositoryNameException(
+                    InvalidRepositoryNameException {
+                        message: Some(format!(
+                            "the {member} {name} is not valid: the suffix .git is prohibited"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        // `oldName` has to address a repository this account holds.
+        if !store.repositories.contains_key(&input.old_name) {
+            return Err(UpdateRepositoryNameErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(format!("the repository {} does not exist", input.old_name)),
+                },
+            )
+            .into());
+        }
+
+        // "The repository name must be unique across the calling Amazon Web Services
+        // account", so a name the account already holds cannot be taken — including
+        // the renamed repository's own current name, which is a name in use like any
+        // other. The store is left exactly as it was.
+        if store.repositories.contains_key(&input.new_name) {
+            return Err(UpdateRepositoryNameErrorModeled::RepositoryNameExistsException(
+                RepositoryNameExistsException {
+                    message: Some(format!(
+                        "the repository name {} already exists",
+                        input.new_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Re-key the stored repository: the store is keyed by `repositoryName`, and
+        // the resource itself carries over, with only the name-derived fields and the
+        // last-modified instant recomputed (see `Repository::rename`). The `remove`
+        // cannot miss — the key was found just above, under this same lock.
+        if let Some(mut repository) = store.repositories.remove(&input.old_name) {
+            repository.rename(&input.new_name, std::time::SystemTime::now());
+            store
+                .repositories
+                .insert(input.new_name.clone(), repository);
+        }
+
+        Ok(UpdateRepositoryNameOutput)
     }
 }

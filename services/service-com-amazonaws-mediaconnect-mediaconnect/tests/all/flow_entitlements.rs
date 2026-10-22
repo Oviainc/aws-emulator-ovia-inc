@@ -240,8 +240,8 @@ async fn grant_flow_entitlements_persists_what_it_returns() {
         .await;
         assert_eq!(
             (status, code.as_deref()),
-            (200, None),
-            "case {case:?}: granting expected 200, got {status} {code:?}: {body}"
+            (201, None),
+            "case {case:?}: granting expected 201, got {status} {code:?}: {body}"
         );
         assert_eq!(
             body["flowArn"].as_str(),
@@ -460,8 +460,8 @@ async fn grant_flow_entitlements_refuses_past_the_entitlement_ceiling() {
     let (status, code, body) = grant(&emulator, &flow_arn, many("fill", CEILING - 1)).await;
     assert_eq!(
         (status, code.as_deref()),
-        (200, None),
-        "filling the flow to the ceiling expected 200, got {status} {code:?}: {body}"
+        (201, None),
+        "filling the flow to the ceiling expected 201, got {status} {code:?}: {body}"
     );
     assert_eq!(
         entitlements(&body).len(),
@@ -537,8 +537,8 @@ async fn generated_entitlement_names_stay_unique_across_calls() {
         let (status, code, response) = grant(&emulator, &flow_arn, body).await;
         assert_eq!(
             (status, code.as_deref()),
-            (200, None),
-            "case {case:?}: granting expected 200, got {status} {code:?}: {response}"
+            (201, None),
+            "case {case:?}: granting expected 201, got {status} {code:?}: {response}"
         );
         assert_eq!(
             entitlement_names(&response),

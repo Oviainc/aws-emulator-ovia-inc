@@ -482,20 +482,42 @@ impl VersionProfile {
     }
 }
 
-/// The `SupportedFeatureNames` of an RDS for MySQL version.
+/// The `SupportedFeatureNames` of an RDS for MySQL or MariaDB version: NONE.
 ///
 /// `SupportedFeatureNames` is the list a caller reads to find the `FeatureName` values
-/// `AddRoleToDBInstance` takes for that engine version (the member's documentation
-/// states the list "vary[ies] by DB engine and DB engine version"), so each list below is
-/// the IAM-role features this emulator publishes for that engine.
-const MYSQL_FEATURE_NAMES: &[&str] = &["s3Import"];
+/// `AddRoleToDBInstance`/`AddRoleToDBCluster` take for that engine version (the member's
+/// documentation states the list "vary[ies] by DB engine and DB engine version"), so each
+/// list below is the IAM-role features that engine associates a role for. RDS for MySQL
+/// and RDS for MariaDB are the engines that have none: loading from and unloading to
+/// Amazon S3 is configured there through the DB parameter group's
+/// `aws_default_s3_role`-style parameters rather than by associating a role with a
+/// feature, so there is no feature name to name. The empty list is still REPORTED (the
+/// member is a list, and an engine with no feature reports it empty, not absent).
+const NO_FEATURE_NAMES: &[&str] = &[];
 
-/// The `SupportedFeatureNames` of an Aurora MySQL version, which loads from and unloads
-/// to Amazon S3.
-const AURORA_MYSQL_FEATURE_NAMES: &[&str] = &["s3Import", "s3Export"];
+/// The `SupportedFeatureNames` of an Aurora MySQL version: it associates a role per
+/// feature for the Amazon S3 load/unload integrations and for the three Aurora machine
+/// learning services Aurora MySQL integrates with (Amazon Bedrock, Amazon Comprehend and
+/// SageMaker). Lexicographic order, which is the only order this list can state a source
+/// for — the model documents none.
+const AURORA_MYSQL_FEATURE_NAMES: &[&str] =
+    &["Bedrock", "Comprehend", "SageMaker", "s3Export", "s3Import"];
 
-/// The `SupportedFeatureNames` of a PostgreSQL version, Aurora PostgreSQL included.
-const POSTGRESQL_FEATURE_NAMES: &[&str] = &["s3Import", "s3Export", "Lambda"];
+/// The `SupportedFeatureNames` of an RDS for PostgreSQL version: the `aws_s3` extension's
+/// import and export, and `aws_lambda`'s invoke.
+const POSTGRESQL_FEATURE_NAMES: &[&str] = &["Lambda", "s3Export", "s3Import"];
+
+/// The `SupportedFeatureNames` of an Aurora PostgreSQL version: the RDS for PostgreSQL
+/// features plus the Aurora machine learning integrations (Amazon Bedrock, Amazon
+/// Comprehend and SageMaker), in the same lexicographic order.
+const AURORA_POSTGRESQL_FEATURE_NAMES: &[&str] = &[
+    "Bedrock",
+    "Comprehend",
+    "Lambda",
+    "SageMaker",
+    "s3Export",
+    "s3Import",
+];
 
 /// The `SupportedFeatureNames` of an Oracle version.
 const ORACLE_FEATURE_NAMES: &[&str] = &["S3_INTEGRATION"];
@@ -512,7 +534,7 @@ const SQLSERVER_FEATURE_NAMES: &[&str] = &["S3_INTEGRATION", "SQLSERVER_BACKUP_R
 const MYSQL_5_7: VersionProfile = VersionProfile::provisioned()
     .read_replica()
     .certificate_rotation_without_restart()
-    .features(MYSQL_FEATURE_NAMES);
+    .features(NO_FEATURE_NAMES);
 
 /// RDS for MySQL 8.0 and later, which also supports a zero-ETL integration.
 const MYSQL_8: VersionProfile = MYSQL_5_7.integrations();
@@ -566,11 +588,24 @@ const DOCDB: VersionProfile = VersionProfile::provisioned()
 /// Amazon Neptune, the same kind of cluster engine with its own global database.
 const NEPTUNE: VersionProfile = DOCDB;
 
-/// Aurora capacity bounds for Serverless v2: "Aurora Capacity Units" from half an ACU to
-/// the largest capacity this emulator publishes.
+/// The lower Serverless v2 bound of an Aurora version that does NOT scale to zero: half
+/// an Aurora Capacity Unit, the smallest capacity a cluster of such a version can be
+/// configured with.
 const SERVERLESS_V2_MIN_CAPACITY: f64 = 0.5;
 
+/// The lower Serverless v2 bound of an Aurora version that scales to ZERO capacity.
+///
+/// `ServerlessV2FeaturesSupport$MinCapacity` is what reports it: "If the minimum capacity
+/// is 0 ACUs, the engine version or platform version supports the automatic pause/resume
+/// feature of Aurora Serverless v2." A version that supports pause/resume therefore
+/// reports 0, and one that does not reports [`SERVERLESS_V2_MIN_CAPACITY`] — which is
+/// exactly the kind of per-version difference this member exists to report.
+const SERVERLESS_V2_PAUSE_MIN_CAPACITY: f64 = 0.0;
+
 /// The upper Serverless v2 bound of a current Aurora version.
+///
+/// `ServerlessV2FeaturesSupport$MaxCapacity`: "Depending on the engine version, the
+/// maximum capacity for an Aurora Serverless v2 cluster might be `256` or `128`."
 const SERVERLESS_V2_MAX_CAPACITY: f64 = 256.0;
 
 /// The upper Serverless v2 bound of an earlier Aurora version, before the maximum was
@@ -597,36 +632,49 @@ const AURORA_MYSQL_5_7_SERVERLESS_V1: VersionProfile = VersionProfile::provision
 
 /// Aurora MySQL 3 (MySQL 8.0 compatible): Serverless v2, local write forwarding and a
 /// zero-ETL integration, beside the Aurora MySQL 2 capabilities.
+///
+/// The Serverless v2 limits are the EARLIER ones: the 256-ACU maximum and the scale-to-
+/// zero minimum each arrived in a later 3.x minor version, so the rows below pick the
+/// profile that matches the version they carry.
 const AURORA_MYSQL_8: VersionProfile = AURORA_MYSQL_5_7
-    .serverless_v2(SERVERLESS_V2_MIN_CAPACITY, SERVERLESS_V2_MAX_CAPACITY)
+    .serverless_v2(SERVERLESS_V2_MIN_CAPACITY, SERVERLESS_V2_EARLIER_MAX_CAPACITY)
     .local_write_forwarding()
     .integrations();
+
+/// An Aurora MySQL 3 version whose Serverless v2 capacity reaches the current maximum.
+const AURORA_MYSQL_8_LARGE_CAPACITY: VersionProfile =
+    AURORA_MYSQL_8.serverless_v2(SERVERLESS_V2_MIN_CAPACITY, SERVERLESS_V2_MAX_CAPACITY);
+
+/// An Aurora MySQL 3 version that also scales to zero capacity (Serverless v2
+/// pause/resume).
+const AURORA_MYSQL_8_PAUSE: VersionProfile = AURORA_MYSQL_8
+    .serverless_v2(SERVERLESS_V2_PAUSE_MIN_CAPACITY, SERVERLESS_V2_MAX_CAPACITY);
 
 /// Aurora PostgreSQL 11: a provisioned cluster engine with global databases, before
 /// Babelfish and before Serverless v2.
 const AURORA_POSTGRESQL_11: VersionProfile = VersionProfile::provisioned()
     .global_databases()
     .certificate_rotation_without_restart()
-    .features(POSTGRESQL_FEATURE_NAMES);
+    .features(AURORA_POSTGRESQL_FEATURE_NAMES);
 
 /// An Aurora PostgreSQL 11 version that also runs Aurora Serverless v1, which is
 /// single-region.
 const AURORA_POSTGRESQL_11_SERVERLESS_V1: VersionProfile = VersionProfile::provisioned()
     .serverless_v1()
     .certificate_rotation_without_restart()
-    .features(POSTGRESQL_FEATURE_NAMES);
+    .features(AURORA_POSTGRESQL_FEATURE_NAMES);
 
-/// Aurora PostgreSQL 13 and 14: Babelfish and Serverless v2, at the earlier capacity
-/// maximum.
+/// Aurora PostgreSQL 13 and later: Babelfish and Serverless v2, which on these versions
+/// scales to zero and reaches the current 256-ACU maximum.
 const AURORA_POSTGRESQL_13: VersionProfile = AURORA_POSTGRESQL_11
     .babelfish()
-    .serverless_v2(SERVERLESS_V2_MIN_CAPACITY, SERVERLESS_V2_EARLIER_MAX_CAPACITY);
+    .serverless_v2(SERVERLESS_V2_PAUSE_MIN_CAPACITY, SERVERLESS_V2_MAX_CAPACITY);
 
-/// Aurora PostgreSQL 15 and later: the current Serverless v2 maximum, local write
+/// Aurora PostgreSQL 15 and later: the current Serverless v2 limits, local write
 /// forwarding and a zero-ETL integration.
 const AURORA_POSTGRESQL_15: VersionProfile = AURORA_POSTGRESQL_11
     .babelfish()
-    .serverless_v2(SERVERLESS_V2_MIN_CAPACITY, SERVERLESS_V2_MAX_CAPACITY)
+    .serverless_v2(SERVERLESS_V2_PAUSE_MIN_CAPACITY, SERVERLESS_V2_MAX_CAPACITY)
     .local_write_forwarding()
     .integrations();
 
@@ -677,6 +725,13 @@ const SQLSERVER_LOG_TYPES: &[&str] = &["agent", "error"];
 /// The log types a Db2 engine can export to CloudWatch Logs.
 const DB2_LOG_TYPES: &[&str] = &["diag.log", "notify.log"];
 
+/// The log types an Aurora PostgreSQL engine can export to CloudWatch Logs.
+///
+/// `EnableCloudwatchLogsExports` for Aurora PostgreSQL publishes three: the PostgreSQL
+/// log, the `instance` log and the `iam-db-auth-error` log. Lexicographic order, which is
+/// the only order this list can state a source for — the model documents none.
+const AURORA_POSTGRESQL_LOG_TYPES: &[&str] = &["iam-db-auth-error", "instance", "postgresql"];
+
 /// The log types an Amazon DocumentDB engine can export to CloudWatch Logs
 /// (`EnableCloudwatchLogsExports` in the DocumentDB model: the audit and profiler logs).
 const DOCDB_LOG_TYPES: &[&str] = &["audit", "profiler"];
@@ -714,8 +769,8 @@ pub(crate) const ENGINES: &[EngineFacts] = &[
     EngineFacts {
         engine: "aurora-postgresql",
         product: "Aurora PostgreSQL",
-        description: "Aurora PostgreSQL",
-        exportable_log_types: &["postgresql"],
+        description: "Aurora (PostgreSQL)",
+        exportable_log_types: AURORA_POSTGRESQL_LOG_TYPES,
         character_sets: &[],
         timezones: &[],
     },
@@ -964,7 +1019,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "aurora-mysql8.0",
         STATUS_AVAILABLE,
         DefaultLevel::Neither,
-        &AURORA_MYSQL_8,
+        &AURORA_MYSQL_8_LARGE_CAPACITY,
     ),
     row(
         "aurora-mysql",
@@ -973,7 +1028,7 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "aurora-mysql8.0",
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
-        &AURORA_MYSQL_8,
+        &AURORA_MYSQL_8_PAUSE,
     ),
     // --- Aurora PostgreSQL ------------------------------------------------
     row(
@@ -1791,7 +1846,7 @@ fn valid_upgrade_targets(
             UpgradeTarget {
                 engine: Some(target.engine.to_string()),
                 engine_version: Some(target.engine_version.to_string()),
-                description: Some(format!("{} {}", facts.product, target.engine_version)),
+                description: Some(version_description(facts, target.engine_version)),
                 // An automatic MINOR upgrade only ever moves within one major version,
                 // and only onto that major version's default.
                 auto_upgrade: Some(within_one_major && target.default_level.is_major_default()),
@@ -1808,6 +1863,23 @@ fn valid_upgrade_targets(
             }
         })
         .collect()
+}
+
+/// `DBEngineVersionDescription` — "The description of the database engine version."
+///
+/// An Aurora PostgreSQL version string IS the community PostgreSQL version that version
+/// is compatible with (`16.4`), and that compatibility is what the description states, as
+/// AWS publishes it for this engine. Every other engine's version string names its own
+/// release (`8.0.39`, `8.0.mysql_aurora.3.08.0`, `19.0.0.0.ru-2024-10.rur-2024-10.r1`),
+/// so there the description is the product and that version.
+fn version_description(facts: &EngineFacts, engine_version: &str) -> String {
+    if facts.engine == "aurora-postgresql" {
+        return format!(
+            "{} (Compatible with PostgreSQL {engine_version})",
+            facts.product
+        );
+    }
+    format!("{} {engine_version}", facts.product)
 }
 
 /// Project one catalogue entry onto the modelled `DBEngineVersion` wire shape.
@@ -1845,10 +1917,7 @@ fn to_wire(
         major_engine_version: Some(entry.major_engine_version.to_string()),
         db_parameter_group_family: Some(entry.parameter_group_family.to_string()),
         db_engine_description: Some(facts.description.to_string()),
-        db_engine_version_description: Some(format!(
-            "{} {}",
-            facts.product, entry.engine_version
-        )),
+        db_engine_version_description: Some(version_description(facts, entry.engine_version)),
         status: Some(entry.status.to_string()),
         supported_engine_modes: Some(strings(profile.engine_modes)),
         supported_feature_names: Some(strings(profile.feature_names)),

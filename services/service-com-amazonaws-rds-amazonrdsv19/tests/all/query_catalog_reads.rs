@@ -42,6 +42,10 @@ use crate::db_instances::{
 /// testing what happens when it names another.
 const API_VERSION: &str = "2014-10-31";
 
+/// A `DescribeEventCategories` call that names no `SourceType`, so it reports every
+/// published map.
+const NO_SOURCE_TYPE: [(&str, &str); 0] = [];
+
 /// The query parameters one table row sends beyond `Action` and `Version`.
 type Params = Vec<(&'static str, &'static str)>;
 
@@ -97,7 +101,6 @@ async fn call_versioned(
 #[tokio::test]
 async fn describe_certificates_reports_the_published_ca_catalog() {
     let router = emulator();
-    let account = engine::emulator_account_id();
 
     // (case, parameters, the certificate identifiers the answer must carry, in order)
     let rows: Vec<CatalogRow> = vec![
@@ -145,8 +148,9 @@ async fn describe_certificates_reports_the_published_ca_catalog() {
         let default = text(&body, "DefaultCertificateForNewLaunches");
         assert_eq!(
             default,
-            state::DEFAULT_CA_CERTIFICATE_FOR_NEW_LAUNCHES,
-            "case {case:?}: expected the published default CA, got {default:?} in {body}"
+            state::DEFAULT_CA_CERTIFICATE_IDENTIFIER,
+            "case {case:?}: no override is set here, so the report must name the system \
+             default CA, got {default:?} in {body}"
         );
         assert_eq!(
             optional_text(&body, "Marker"),
@@ -156,11 +160,13 @@ async fn describe_certificates_reports_the_published_ca_catalog() {
         for certificate in subtrees(&body, "Certificate") {
             let identifier = text(&certificate, "CertificateIdentifier");
             let arn = text(&certificate, "CertificateArn");
+            // A CA certificate is published BY the service, so its ARN names no owning
+            // account: the account field is empty, unlike every other RDS resource ARN.
             assert_eq!(
                 arn,
-                format!("arn:aws:rds:{REGION}:{account}:cert:{identifier}"),
-                "case {case:?}: expected {identifier} to carry its ARN in the signed \
-                 region, got {arn:?}"
+                format!("arn:aws:rds:{REGION}::cert:{identifier}"),
+                "case {case:?}: expected {identifier} to carry its service-owned ARN in the \
+                 signed region, got {arn:?}"
             );
             let (valid_from, valid_till) = (
                 text(&certificate, "ValidFrom"),
@@ -294,6 +300,111 @@ async fn describe_event_categories_reports_the_published_source_types() {
         400,
         "InvalidParameterValue",
     );
+}
+
+#[tokio::test]
+async fn the_published_event_categories_are_the_documented_ones() {
+    let router = emulator();
+
+    // (source type, every event category AWS publishes for it, in the order the
+    // published "Amazon RDS event categories and event messages" table lists them).
+    //
+    // This table states the catalog INDEPENDENTLY of `state::EVENT_CATEGORIES`, which is
+    // what the sibling test above compares the answer against: a row here is what the
+    // published table says, so a change to the catalog that drops or invents a category
+    // fails here rather than agreeing with itself. Every published source type is a row,
+    // including the ones no issue cited (`db-cluster`, `db-parameter-group`,
+    // `db-security-group`, `db-proxy`).
+    let rows: Vec<(&str, Vec<&str>)> = vec![
+        (
+            "db-instance",
+            vec![
+                "availability",
+                "backtrack",
+                "backup",
+                "configuration change",
+                "creation",
+                "deletion",
+                "failover",
+                "failure",
+                "low storage",
+                "maintenance",
+                "notification",
+                "read replica",
+                "recovery",
+                "restoration",
+                "security",
+                "security patching",
+            ],
+        ),
+        (
+            "db-cluster",
+            vec![
+                "configuration change",
+                "creation",
+                "deletion",
+                "failover",
+                "failure",
+                "global-failover",
+                "maintenance",
+                "notification",
+            ],
+        ),
+        ("db-parameter-group", vec!["configuration change"]),
+        ("db-security-group", vec!["configuration change", "failure"]),
+        (
+            "db-snapshot",
+            vec!["creation", "deletion", "notification", "restoration"],
+        ),
+        ("db-cluster-snapshot", vec!["backup", "notification"]),
+        (
+            "db-proxy",
+            vec!["configuration change", "creation", "deletion", "failure"],
+        ),
+    ];
+
+    // The whole catalog, so each row is checked both narrowed to its source type and as
+    // the map the unfiltered report carries.
+    let whole = expect_ok(
+        "every published source type",
+        call(&router, "DescribeEventCategories", &NO_SOURCE_TYPE).await,
+    );
+    let maps: Vec<String> = subtrees(&whole, "EventCategoriesMap");
+    assert_eq!(
+        maps.len(),
+        rows.len(),
+        "the unfiltered report carries one map per published source type, got {whole}"
+    );
+
+    for (source_type, expected) in rows {
+        let narrowed = expect_ok(
+            source_type,
+            call(
+                &router,
+                "DescribeEventCategories",
+                &[("SourceType", source_type)],
+            )
+            .await,
+        );
+        let reported = texts(&narrowed, "EventCategory");
+        assert_eq!(
+            reported, expected,
+            "case {source_type:?}: expected the published categories {expected:?}, got \
+             {reported:?} in {narrowed}"
+        );
+        let from_whole = maps
+            .iter()
+            .find(|map| text(map, "SourceType") == source_type)
+            .unwrap_or_else(|| {
+                panic!("case {source_type:?}: the unfiltered report must carry its map: {whole}")
+            });
+        assert_eq!(
+            texts(from_whole, "EventCategory"),
+            expected,
+            "case {source_type:?}: the unfiltered report must carry the same categories as \
+             the narrowed one, got {from_whole}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -70,8 +70,8 @@ pub(crate) const REGION: &str = "us-east-1";
 ///
 /// Other suites in this test crate drive the same front door through it (see
 /// `tests/all/flow_outputs.rs`, `tests/all/update_flow.rs` and
-/// `tests/all/flow_entitlements.rs` and `tests/all/gateway_lifecycle.rs`), so there is one
-/// harness rather than one per file.
+/// `tests/all/flow_entitlements.rs`, `tests/all/flow_identity_and_description.rs` and
+/// `tests/all/gateway_lifecycle.rs`), so there is one harness rather than one per file.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The same engine the mounted service holds, so a suite that needs a particular
@@ -112,15 +112,12 @@ impl Emulator {
                 REGION,
                 &mc::flow_resource_fragment(suffix, &name),
             );
-            store
-                .flow_arns_by_name
-                .insert(name.clone(), flow_arn.clone());
             store.flows.insert(
                 flow_arn.clone(),
                 mc::StoredFlow {
                     flow_arn,
                     name: name.clone(),
-                    description: None,
+                    description: mc::derived_flow_description(&name, &name, None),
                     availability_zone: format!("{REGION}a"),
                     status: mc::STATUS_STANDBY.to_string(),
                     pending: None,
@@ -190,7 +187,7 @@ impl Emulator {
         self.send("GET", &format!("/v1/flows/{flow_arn}"), None).await
     }
 
-    async fn list_flows(&self, query: &str) -> (u16, Option<String>, Value) {
+    pub(crate) async fn list_flows(&self, query: &str) -> (u16, Option<String>, Value) {
         self.send("GET", &format!("/v1/flows{query}"), None).await
     }
 }
@@ -795,17 +792,6 @@ async fn refusals_name_the_modelled_error() {
             code: "BadRequestException",
         },
         RefusalCase {
-            case: "create a flow whose name is already taken",
-            method: "POST",
-            uri: "/v1/flows".to_string(),
-            body: Some(json!({
-                "name": "taken-name",
-                "source": { "name": "src", "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" }
-            })),
-            status: 400,
-            code: "BadRequestException",
-        },
-        RefusalCase {
             case: "create a flow with no name at all",
             method: "POST",
             uri: "/v1/flows".to_string(),
@@ -891,17 +877,10 @@ async fn refusals_name_the_modelled_error() {
         );
     }
 
-    // The name of a deleted flow is free again — the refusal above was about the live
-    // flow, not a permanent reservation.
-    let (_, _, list) = emulator.list_flows("").await;
-    let taken = listed(&list)
-        .into_iter()
-        .find(|(_, name, ..)| name == "taken-name")
-        .expect("the live flow is listed");
-    let (status, _, _) = emulator
-        .send("DELETE", &format!("/v1/flows/{}", taken.0), None)
-        .await;
-    assert_eq!(status, 202, "delete expected 202, got {status}");
+    // Not one refusal above was about the flow that already exists: a flow name is not
+    // a reservation, so creating a second flow with the same name succeeds (the ARN's
+    // generated id keeps the two apart). The rule is asserted over a table of names in
+    // `tests/all/flow_identity_and_description.rs`; here it only has to not be refused.
     let (status, code, body) = emulator
         .create_flow(json!({
             "name": "taken-name",
@@ -911,7 +890,7 @@ async fn refusals_name_the_modelled_error() {
     assert_eq!(
         (status, code.as_deref()),
         (201, None),
-        "recreating a deleted flow's name expected 201, got {status} {code:?}: {body}"
+        "reusing a live flow's name expected 201, got {status} {code:?}: {body}"
     );
 }
 

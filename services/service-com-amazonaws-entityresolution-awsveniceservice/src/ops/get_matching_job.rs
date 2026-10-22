@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMatchingJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMatchingJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMatchingJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one matching job of one workflow from PERSISTED state: the status its
+//! clock-driven lifecycle has reached, when it started and (once terminal) ended, the
+//! `errorDetails` of a failed run, and the `outputSourceConfig` recorded for that run.
+//!
+//! ## A read that materialises only what the clock already owed
+//!
+//! `GetMatchingJob` is `@readonly`. The one write it performs is the status transition
+//! the clock had ALREADY made due at the moment of the call
+//! ([`crate::state::MatchingJob::materialize_due`]) — the same state a caller would
+//! have seen had nobody polled at all — so polling neither advances a job nor changes
+//! what a later caller sees.
+//!
+//! ## What it does NOT claim
+//!
+//! `metrics` is absent on every job: `JobMetrics` counts input records, records
+//! processed and `matchID`s generated, and this emulator runs no matching (see
+//! [`crate::state::JOB_NOT_EXECUTED_MESSAGE`]), so there is nothing to count. Reporting
+//! zeros — or any other number — would claim a run that never happened.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +166,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMatchingJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMatchingJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMatchingJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetMatchingJobErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+
+        // The job is addressed by (workflowName, jobId), so a workflow that does not
+        // exist is reported as the missing WORKFLOW rather than as a missing job.
+        if !store.matching_workflows.contains_key(&input.workflow_name) {
+            return Err(GetMatchingJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(
+                        crate::state::messages::GET_MATCHING_JOB_WORKFLOW_NOT_FOUND.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let job = store
+            .matching_job_mut(&input.workflow_name, &input.job_id, now)
+            .ok_or_else(|| {
+                GetMatchingJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::messages::GET_MATCHING_JOB_NOT_FOUND.to_string()),
+                })
+            })?;
+
+        Ok(GetMatchingJobOutput {
+            job_id: job.job_id.clone(),
+            status: job.status.clone(),
+            start_time: ::aws_smithy_types::DateTime::from_millis(job.start_time),
+            // Set only once the status is terminal, which is where the record sets it.
+            end_time: job.end_time.map(::aws_smithy_types::DateTime::from_millis),
+            // Nothing ran, so there is nothing to count: see the module docs.
+            metrics: None,
+            error_details: job.error_message.clone().map(|error_message| ErrorDetails {
+                error_message: Some(error_message),
+            }),
+            output_source_config: job.output_source_config.clone(),
+        })
     }
 }

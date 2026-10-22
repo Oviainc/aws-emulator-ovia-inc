@@ -151,7 +151,36 @@ pub struct RedundantIngestCredential {
     pub stream_key: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#ParticipantToken")]
+// `ParticipantToken` is the ONE shape in this module whose schema is written out by
+// hand rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and the reason
+// is a single trait the macro does not read: `@timestampFormat`.
+//
+// The model targets `expirationTime` at `ParticipantTokenExpirationTime`, which carries
+// `@timestampFormat("date-time")` (`smithy_query(query="shape",shape="ParticipantToken")`
+// reports `"timestampFormat": "date-time"` on that member, and its doc says "ISO 8601
+// timestamp (returned as a string)"). The vendored codegen never emits
+// `with_timestamp_format`, so a macro-built member schema reports no format and the
+// restJson1 JSON codec falls back to its protocol default, epoch seconds — a NUMBER
+// where the model, and every AWS SDK's generated deserializer for a `date-time` member,
+// requires an ISO-8601 string. The hand-written member schemas below differ from the
+// macro's output in exactly that one chain call.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
+// schema per member (index = position in the member list, with the `key`/`value` and
+// `member` sub-schemas a map and a list member carry), a `SCHEMA` naming them in order,
+// the `<SHAPE>_SCHEMA` alias, and the serialize/deserialize pair. Constraint traits are
+// deliberately absent: the validating walk runs on operation INPUTS only, and
+// `ParticipantToken` is an output shape, so the macro's captured constraints would be
+// inert here too.
+//
+// REMOVE THIS BLOCK when the vendored codegen learns `smithy.api#timestampFormat`: the
+// fix belongs there, not here, because every `@timestampFormat` member of every service
+// has the same defect and `vendor/` is outside what a fix may change. Once
+// `vendor/smithy-macros` emits `with_timestamp_format`, delete the hand-written schema,
+// the two impls and this comment, and put
+// `#[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#ParticipantToken")]` back
+// on the struct — `tests/all/stages.rs` pins the rendering, so it fails if the attribute
+// does not carry it.
 #[derive(Debug, Clone, Default)]
 pub struct ParticipantToken {
     pub participant_id: Option<String>,
@@ -161,6 +190,224 @@ pub struct ParticipantToken {
     pub duration: Option<i32>,
     pub capabilities: Option<Vec<String>>,
     pub expiration_time: Option<::aws_smithy_types::DateTime>,
+}
+
+#[allow(non_upper_case_globals)]
+impl ParticipantToken {
+    const SHAPE_ID: &'static str = "com.amazonaws.ivsrealtime#ParticipantToken";
+    const NAMESPACE: &'static str = "com.amazonaws.ivsrealtime";
+
+    pub const M_PARTICIPANT_ID: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#ParticipantToken$participantId",
+                Self::NAMESPACE,
+                "participantId",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "participantId",
+            0,
+        );
+    pub const M_TOKEN: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.ivsrealtime#ParticipantToken$token",
+            Self::NAMESPACE,
+            "token",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "token",
+        1,
+    );
+    pub const M_USER_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.ivsrealtime#ParticipantToken$userId",
+            Self::NAMESPACE,
+            "userId",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "userId",
+        2,
+    );
+    const M_ATTRIBUTES_KEY: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#ParticipantToken$attributes$key",
+                Self::NAMESPACE,
+                "key",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "key",
+            0,
+        );
+    const M_ATTRIBUTES_VALUE: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#ParticipantToken$attributes$value",
+                Self::NAMESPACE,
+                "value",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "value",
+            0,
+        );
+    pub const M_ATTRIBUTES: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#ParticipantToken$attributes",
+                Self::NAMESPACE,
+                "attributes",
+            ),
+            ::aws_smithy_schema::ShapeType::Map,
+            "attributes",
+            3,
+        )
+        .with_map_members(&Self::M_ATTRIBUTES_KEY, &Self::M_ATTRIBUTES_VALUE);
+    pub const M_DURATION: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.ivsrealtime#ParticipantToken$duration",
+            Self::NAMESPACE,
+            "duration",
+        ),
+        ::aws_smithy_schema::ShapeType::Integer,
+        "duration",
+        4,
+    );
+    const M_CAPABILITIES_MEMBER: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#ParticipantToken$capabilities$member",
+                Self::NAMESPACE,
+                "member",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "member",
+            0,
+        );
+    pub const M_CAPABILITIES: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#ParticipantToken$capabilities",
+                Self::NAMESPACE,
+                "capabilities",
+            ),
+            ::aws_smithy_schema::ShapeType::List,
+            "capabilities",
+            5,
+        )
+        .with_list_member(&Self::M_CAPABILITIES_MEMBER);
+    /// `@timestampFormat("date-time")` from `ParticipantTokenExpirationTime` — the
+    /// chain the macro cannot emit, and the whole reason this schema is hand-written.
+    pub const M_EXPIRATION_TIME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.ivsrealtime#ParticipantToken$expirationTime",
+                Self::NAMESPACE,
+                "expirationTime",
+            ),
+            ::aws_smithy_schema::ShapeType::Timestamp,
+            "expirationTime",
+            6,
+        )
+        .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "ParticipantToken",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_PARTICIPANT_ID,
+            &Self::M_TOKEN,
+            &Self::M_USER_ID,
+            &Self::M_ATTRIBUTES,
+            &Self::M_DURATION,
+            &Self::M_CAPABILITIES,
+            &Self::M_EXPIRATION_TIME,
+        ],
+    );
+}
+
+pub static PARTICIPANT_TOKEN_SCHEMA: &::aws_smithy_schema::Schema = &ParticipantToken::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ParticipantToken {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.participant_id.as_ref() {
+            s.write_string(&Self::M_PARTICIPANT_ID, v.as_str())?;
+        }
+        if let Some(v) = self.token.as_ref() {
+            s.write_string(&Self::M_TOKEN, v.as_str())?;
+        }
+        if let Some(v) = self.user_id.as_ref() {
+            s.write_string(&Self::M_USER_ID, v.as_str())?;
+        }
+        if let Some(v) = self.attributes.as_ref() {
+            s.write_map(&Self::M_ATTRIBUTES, &|__sm| {
+                for (__k, __v) in v.iter() {
+                    __sm.write_string(&Self::M_ATTRIBUTES, __k.as_str())?;
+                    __sm.write_string(&Self::M_ATTRIBUTES, __v.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.duration.as_ref() {
+            s.write_integer(&Self::M_DURATION, *v)?;
+        }
+        if let Some(v) = self.capabilities.as_ref() {
+            s.write_list(&Self::M_CAPABILITIES, &|__sl| {
+                for __it in v.iter() {
+                    __sl.write_string(&Self::M_CAPABILITIES, __it.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.expiration_time.as_ref() {
+            s.write_timestamp(&Self::M_EXPIRATION_TIME, v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ParticipantToken {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.participant_id = Some(d.read_string(&Self::M_PARTICIPANT_ID)?),
+                Some(1) => out.token = Some(d.read_string(&Self::M_TOKEN)?),
+                Some(2) => out.user_id = Some(d.read_string(&Self::M_USER_ID)?),
+                Some(3) => {
+                    let mut __out: std::collections::HashMap<String, String> =
+                        ::std::default::Default::default();
+                    d.read_map(&Self::M_ATTRIBUTES, &mut |__k, __dm| {
+                        let __value = __dm.read_string(&Self::M_ATTRIBUTES)?;
+                        __out.insert(__k, __value);
+                        Ok(())
+                    })?;
+                    out.attributes = Some(__out);
+                }
+                Some(4) => out.duration = Some(d.read_integer(&Self::M_DURATION)?),
+                Some(5) => {
+                    let mut __out: Vec<String> = Vec::new();
+                    d.read_list(&Self::M_CAPABILITIES, &mut |__dl| {
+                        __out.push(__dl.read_string(&Self::M_CAPABILITIES)?);
+                        Ok(())
+                    })?;
+                    out.capabilities = Some(__out);
+                }
+                Some(6) => out.expiration_time = Some(d.read_timestamp(&Self::M_EXPIRATION_TIME)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ivsrealtime#AutoParticipantRecordingConfiguration")]

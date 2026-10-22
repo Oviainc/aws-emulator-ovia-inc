@@ -16,7 +16,7 @@ use service_com_amazonaws_configservice_starlingdoveservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// A role ARN that is well formed; its value is never asserted on, only read back.
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/config-role";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/config-role";
 
 /// Every published `MaximumExecutionFrequency` value, from
 /// `smithy_query(query="shape", shape="MaximumExecutionFrequency")` on this service's
@@ -40,14 +40,14 @@ const PAGE_SIZE: usize = 25;
 
 /// One emulator instance: a shared engine behind the router, plus the Region its
 /// requests are signed for, so an ARN this emulator mints can be checked against it.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    region: String,
+    pub(crate) region: String,
 }
 
 impl Emulator {
     /// An emulator serving requests signed for `region`.
-    fn in_region(region: &str) -> Self {
+    pub(crate) fn in_region(region: &str) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -59,7 +59,7 @@ impl Emulator {
     }
 
     /// An emulator in the default test Region.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::in_region("us-east-1")
     }
 
@@ -74,7 +74,7 @@ impl Emulator {
     }
 
     /// Call `operation`, returning the HTTP status and the parsed response body.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -94,7 +94,7 @@ impl Emulator {
     }
 
     /// Call `operation` and require a 200, returning the response body.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -104,7 +104,7 @@ impl Emulator {
     }
 
     /// Call `operation` and require a refusal, returning its status and error code.
-    async fn refused(&self, operation: &str, body: &Value) -> (u16, String) {
+    pub(crate) async fn refused(&self, operation: &str, body: &Value) -> (u16, String) {
         let (status, parsed) = self.call(operation, body).await;
         let code = parsed
             .get("__type")
@@ -120,13 +120,37 @@ fn flag(value: &Value, key: &str) -> bool {
     value.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// `recorder`'s ARN, checked against the form Config mints for a configuration
+/// recorder — `arn:aws:config:<region>:<account>:configuration-recorder/<name>/<id>`,
+/// whose id segment is assigned by the server.
+fn recorder_arn_of(recorder: &Value, region: &str, name: &str) -> String {
+    let prefix = emulator_server::emulator_arn(
+        "config",
+        region,
+        &format!("configuration-recorder/{name}/"),
+    );
+    let arn = recorder["arn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the recorder must carry an arn, got {recorder}"))
+        .to_string();
+    assert!(
+        arn.starts_with(&prefix),
+        "case {name:?}: expected the recorder ARN to start with {prefix:?}, got {arn:?}"
+    );
+    assert!(
+        !arn[prefix.len()..].is_empty(),
+        "case {name:?}: expected the recorder ARN to carry the assigned recorder id, got {arn:?}"
+    );
+    arn
+}
+
 /// The recorder body for `PutConfigurationRecorder`.
-fn recorder_request(recorder: Value) -> Value {
+pub(crate) fn recorder_request(recorder: Value) -> Value {
     json!({ "ConfigurationRecorder": recorder })
 }
 
 /// A minimal managed Config rule named `name`.
-fn managed_rule(name: &str) -> Value {
+pub(crate) fn managed_rule(name: &str) -> Value {
     json!({
         "ConfigRule": {
             "ConfigRuleName": name,
@@ -136,7 +160,7 @@ fn managed_rule(name: &str) -> Value {
 }
 
 /// Put the recorder and the delivery channel every rule case needs.
-async fn with_recorder_and_channel(emulator: &Emulator) {
+pub(crate) async fn with_recorder_and_channel(emulator: &Emulator) {
     emulator
         .ok(
             "PutConfigurationRecorder",
@@ -177,11 +201,6 @@ async fn the_setup_and_rule_loop_round_trips_through_state() {
         "one recorder was created, got {described}"
     );
     let recorder = &recorders[0];
-    let expected_arn = emulator_server::emulator_arn(
-        "config",
-        &emulator.region,
-        "config-recorder/default",
-    );
     assert_eq!(
         recorder["name"], "default",
         "the stored recorder name must come back, got {recorder}"
@@ -190,10 +209,7 @@ async fn the_setup_and_rule_loop_round_trips_through_state() {
         recorder["roleARN"], ROLE_ARN,
         "the stored roleARN must come back, got {recorder}"
     );
-    assert_eq!(
-        recorder["arn"], expected_arn,
-        "the recorder ARN must carry this request's Region, got {recorder}"
-    );
+    let recorder_arn = recorder_arn_of(recorder, &emulator.region, "default");
     assert_eq!(
         recorder["recordingGroup"]["includeGlobalResourceTypes"],
         json!(true),
@@ -214,7 +230,7 @@ async fn the_setup_and_rule_loop_round_trips_through_state() {
         "a recorder that was never started has no lastStartTime, got {status}"
     );
     assert_eq!(
-        first["arn"], expected_arn,
+        first["arn"], json!(recorder_arn),
         "the status must report the recorder's stored ARN, got {status}"
     );
 
@@ -450,15 +466,7 @@ async fn a_recorder_is_read_back_exactly_as_it_was_put() {
             recorder["roleARN"], ROLE_ARN,
             "case {case:?}: expected the stored roleARN, got {described}"
         );
-        assert_eq!(
-            recorder["arn"],
-            json!(emulator_server::emulator_arn(
-                "config",
-                &emulator.region,
-                &format!("config-recorder/{expected_name}")
-            )),
-            "case {case:?}: expected the minted recorder ARN, got {described}"
-        );
+        recorder_arn_of(recorder, &emulator.region, expected_name);
         for (member, expected) in expected_group
             .as_object()
             .expect("the expected recording group is an object")
@@ -671,13 +679,20 @@ async fn a_rule_is_read_back_exactly_as_it_was_put() {
             .await;
         let stored = &described["ConfigRules"][0];
 
-        // Every member the request carried comes back as it was stored.
+        // Every member the request carried comes back as it was stored, except the
+        // Guard policy body: `DescribeConfigRules` reports
+        // `Source.CustomPolicyDetails.PolicyText` empty rather than handing the stored
+        // policy back.
         for (member, expected) in rule.as_object().expect("the case rule is an object") {
             if member == "EvaluationModes" {
                 continue;
             }
+            let mut expected = expected.clone();
+            if let Some(policy_text) = expected.pointer_mut("/CustomPolicyDetails/PolicyText") {
+                *policy_text = json!("");
+            }
             assert_eq!(
-                &stored[member], expected,
+                &stored[member], &expected,
                 "case {case:?}: expected {member} = {expected}, got {described}"
             );
         }
@@ -1097,7 +1112,9 @@ async fn each_modelled_refusal_is_answered_with_its_own_error() {
             case: "describing a recorder by an ARN that names none",
             prelude: vec![recorder()],
             operation: "DescribeConfigurationRecorders",
-            body: json!({ "Arn": "arn:aws:config:us-east-1:000000000000:config-recorder/other" }),
+            body: json!({
+                "Arn": "arn:aws:config:us-east-1:000000000000:configuration-recorder/other/vyzjmv9fhzv5rc1g",
+            }),
             expected: "NoSuchConfigurationRecorderException",
         },
         Refusal {

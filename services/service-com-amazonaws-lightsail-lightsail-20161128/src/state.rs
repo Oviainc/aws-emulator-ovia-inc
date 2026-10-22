@@ -7,7 +7,8 @@
 //! instance can attach), the **domain** (a DNS zone the account holds
 //! recordsets in), the **container service** (a compute resource containers are
 //! deployed to), the **bucket** (an object-storage resource of the Lightsail
-//! object storage service), the append-only **operation log** every mutating call
+//! object storage service) together with the **access keys** it grants
+//! programmatic access through, the append-only **operation log** every mutating call
 //! writes, and the service's static **Region catalog** — the Regions and
 //! Availability Zones `GetRegions` lists and every other operation validates a
 //! location against. Everything mutable in this module is reached through
@@ -29,7 +30,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AccessRules, AccountLevelBpaSync, AddOn, AddOnRequest, AvailabilityZone, Blueprint, Bucket,
+    AccessKey, AccessKeyLastUsed, AccessRules, AccountLevelBpaSync, AddOn, AddOnRequest,
+    AvailabilityZone, Blueprint, Bucket,
     BucketAccessLogConfig, BucketBundle, BucketCorsConfig, BucketCorsRule, BucketState, Container,
     ContainerImage,
     ContainerService, ContainerServiceDeployment, ContainerServiceDeploymentRequest,
@@ -253,6 +255,10 @@ pub const OPERATION_TYPE_CREATE_DOMAIN: &str = "CreateDomain";
 pub const OPERATION_TYPE_CREATE_BUCKET: &str = "CreateBucket";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK: &str = "CreateDisk";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_BUCKET_ACCESS_KEY: &str = "CreateBucketAccessKey";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_BUCKET_ACCESS_KEY: &str = "DeleteBucketAccessKey";
 /// The `operationType` the log entry of a change to a zone's recordsets carries.
 ///
 /// The modelled `OperationType` enum has `UpdateDomainEntry` and
@@ -596,6 +602,24 @@ pub const ACCOUNT_LEVEL_BPA_NEVER_SYNCED: &str = "NeverSynced";
 /// after you create your first Lightsail bucket."
 pub const ACCOUNT_LEVEL_BPA_SYNC_ON_HOLD: &str = "SYNC_ON_HOLD";
 
+/// The `AccessKey$status` of a bucket access key that is valid, from that
+/// member's own documentation: "A status of `Active` means that the key is valid,
+/// while `Inactive` means it is not." One of the two values of the modelled
+/// `StatusType` enum the member targets.
+pub const ACCESS_KEY_STATUS_ACTIVE: &str = "Active";
+
+/// The `AccessKeyLastUsed$region` and `$serviceName` of an access key nothing has
+/// signed a request with, from those members' own documentation: "This value is
+/// `N/A` if the access key has not been used."
+pub const ACCESS_KEY_LAST_USED_NEVER: &str = "N/A";
+
+/// The most access keys one bucket may hold, from the modelled `AccessKey`
+/// documentation: "You can have a maximum of two access keys per bucket."
+///
+/// An AWS limit, not an emulator guard: a create past it is refused and mints
+/// nothing.
+pub const MAX_BUCKET_ACCESS_KEYS: usize = 2;
+
 /// The most buckets this emulator will hold, across every Region together.
 ///
 /// Emulator resource guard on the store as a whole, NOT an AWS quota (which is
@@ -683,6 +707,64 @@ pub fn account_level_bpa_sync() -> AccountLevelBpaSync {
     }
 }
 
+/// One access key of a bucket: what `CreateBucketAccessKey` minted and
+/// `GetBucketAccessKeys` reports.
+///
+/// The key's SECRET is deliberately NOT a field here. Both the id and the secret
+/// are minted by the emulator's credential store, which is the only thing that
+/// creates credential material, and the secret "is returned only in response to
+/// the `CreateBucketAccessKey` action" — so the create hands it to its caller and
+/// this record keeps only the id, exactly as AWS keeps no retrievable copy.
+#[derive(Debug, Clone)]
+pub struct StoredBucketAccessKey {
+    /// The id the credential store minted, which is this key's identity and the
+    /// `accessKeyId` every read reports.
+    pub access_key_id: String,
+    /// One of the modelled `StatusType` values — see [`ACCESS_KEY_STATUS_ACTIVE`].
+    pub status: String,
+    pub created_at_ms: i64,
+}
+
+impl StoredBucketAccessKey {
+    /// This record as the modelled `AccessKey`, for a read of the bucket's keys.
+    ///
+    /// No `secretAccessKey`: `GetBucketAccessKeys` "does not return the secret
+    /// access key value of an access key", and nothing here holds one to return.
+    ///
+    /// `lastUsed` reports the never-used form the member documents (`N/A` region
+    /// and service name, null `lastUsedDate`): this emulator records no use of a
+    /// credential — a bucket's object data plane is not served here, so no request
+    /// against this bucket can have been signed with the key — and claiming a use
+    /// instant for work nothing did would be worse than saying it has not been
+    /// used.
+    pub fn view(&self) -> AccessKey {
+        AccessKey {
+            access_key_id: Some(self.access_key_id.clone()),
+            secret_access_key: None,
+            status: Some(self.status.clone()),
+            created_at: Some(timestamp(self.created_at_ms)),
+            last_used: Some(AccessKeyLastUsed {
+                last_used_date: None,
+                region: Some(ACCESS_KEY_LAST_USED_NEVER.to_string()),
+                service_name: Some(ACCESS_KEY_LAST_USED_NEVER.to_string()),
+            }),
+        }
+    }
+
+    /// This record as the modelled `AccessKey` answered by the create that minted
+    /// it: the one response that carries `secret_access_key`, and the one that
+    /// carries NO `lastUsed` — the modelled `AccessKeyLastUsed` documents that
+    /// "this object does not include data in the response of a
+    /// `CreateBucketAccessKey` action".
+    pub fn created_view(&self, secret_access_key: String) -> AccessKey {
+        AccessKey {
+            secret_access_key: Some(secret_access_key),
+            last_used: None,
+            ..self.view()
+        }
+    }
+}
+
 /// One stored bucket: the object-storage resource `CreateBucket` created.
 ///
 /// What the caller asked for — name, bundle, tags, whether to version objects —
@@ -719,6 +801,9 @@ pub struct StoredBucket {
     pub access_log_config: BucketAccessLogConfig,
     /// The cross-origin resource sharing rules of the bucket.
     pub cors_rules: Vec<BucketCorsRule>,
+    /// The access keys `CreateBucketAccessKey` minted for this bucket, in the
+    /// order they were created — at most [`MAX_BUCKET_ACCESS_KEYS`] of them.
+    pub access_keys: Vec<StoredBucketAccessKey>,
     /// One of the modelled `BucketState$code` values — see [`BUCKET_STATE_OK`].
     pub state_code: String,
 }
@@ -3346,6 +3431,17 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// The bucket `name` names in `region`, for a reporting operation.
     pub fn bucket(&self, region: &str, name: &str) -> Option<&StoredBucket> {
         self.buckets.get(&(region.to_string(), name.to_string()))
+    }
+
+    /// The bucket `name` names in `region`, for an operation the spec says
+    /// mutates it — minting or withdrawing one of its access keys.
+    ///
+    /// `name` and the bucket's region are this record's store key, so neither may
+    /// be reassigned through this handle; no operation in this slice renames or
+    /// moves a bucket.
+    pub fn bucket_mut(&mut self, region: &str, name: &str) -> Option<&mut StoredBucket> {
+        self.buckets
+            .get_mut(&(region.to_string(), name.to_string()))
     }
 
     /// Store a newly created bucket.

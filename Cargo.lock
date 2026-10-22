@@ -2509,6 +2509,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonc-parser"
+version = "0.26.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d6d80e6d70e7911a29f3cf3f44f452df85d06f73572b494ca99a2cad3fcf8f4"
+
+[[package]]
 name = "keccak"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3556,6 +3562,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "jsonc-parser",
  "percent-encoding",
  "serde_json",
  "sha2 0.10.9",
@@ -8337,10 +8344,8 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
- "hex",
  "http",
  "serde_json",
- "sha2 0.10.9",
  "tokio",
  "tracing",
 ]

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the named user is removed from this service's store AND from the
+//! `UserNames` of every ACL that listed it, and the response reports that user as the
+//! caller last had it, in the terminal `deleting` status. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +138,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUser"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than reporting a deletion that never ran.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        state.settle(std::time::Instant::now());
+        // The users the account ALREADY HAD before any call (MemoryDB's built-in
+        // `default` user) are materialised on first touch, exactly as `CreateUser` and
+        // `DescribeUsers` do, so a delete naming one of them acts on the user the
+        // account really has instead of answering not-found for it. The materialisation
+        // flag makes that a one-off, so the removal below is not undone by a later call.
+        state.ensure_builtin_users(&region);
+
+        let Some(user) = state.users.get(&input.user_name) else {
+            return Err(DeleteUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                message: Some(format!("User {} not found.", input.user_name)),
+            })
+            .into());
+        };
+        // Only a user AWS reports `active` can be deleted: one already on its way out,
+        // or mid-update, is refused with the modelled state fault rather than deleted
+        // twice. Every user this store holds is `active` today (`CreateUser` answers
+        // with it usable at once, and a delete removes it outright), so this guard
+        // states the rule for whichever operation first parks a user off `active`.
+        if user.status != crate::state::user_status::ACTIVE {
+            return Err(DeleteUserErrorModeled::InvalidUserStateFault(
+                InvalidUserStateFault {
+                    message: Some(format!(
+                        "User {} is in status {} and cannot be deleted; it must be {}.",
+                        input.user_name,
+                        user.status,
+                        crate::state::user_status::ACTIVE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Gone from the store, so no later call reports it and `DescribeUsers` answers
+        // the modelled not-found fault for its name.
+        let Some(mut user) = state.users.remove(&input.user_name) else {
+            // Unreachable: the entry was read under this same lock just above.
+            return Err(DeleteUserErrorModeled::UserNotFoundFault(UserNotFoundFault {
+                message: Some(format!("User {} not found.", input.user_name)),
+            })
+            .into());
+        };
+        // "The user will be removed from all ACLs and in turn removed from all
+        // clusters": membership is held ONCE, on each ACL's `UserNames`, and a cluster
+        // reaches users only through the ACL it references, so taking the name out of
+        // every ACL is what removes the user from the clusters too.
+        let acl_names = state.remove_user_from_every_acl(&input.user_name);
+        // Its tags go with it: a tag store keyed by an ARN nothing resolves would be
+        // read by a later `ListTags` for a resource that no longer exists.
+        state.tags.remove(&user.arn);
+        // The response describes the user as the caller last had it, in the terminal
+        // `deleting` status and with the membership it held up to this call -- the same
+        // choice `DeleteCluster` makes for a cluster it has just removed. Nothing
+        // settles a removed user, so it carries no due transition.
+        user.status = crate::state::user_status::DELETING.to_string();
+        Ok(DeleteUserOutput {
+            user: Some(user.to_api(acl_names)),
+        })
     }
 }

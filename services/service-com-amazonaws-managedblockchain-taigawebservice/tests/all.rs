@@ -17,6 +17,8 @@ mod accessor_lifecycle;
 mod harness;
 #[path = "all/invitations.rs"]
 mod invitations;
+#[path = "all/list_accessors.rs"]
+mod list_accessors;
 #[path = "all/list_members.rs"]
 mod list_members;
 #[path = "all/modelled_error_payloads.rs"]

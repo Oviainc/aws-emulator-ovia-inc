@@ -925,6 +925,262 @@ fn version_key(version: &str) -> Vec<Component> {
 }
 
 #[tokio::test]
+async fn the_envelope_reports_the_published_per_engine_and_per_version_reference_data() {
+    let router = emulator();
+
+    // One row per (engine, version) whose published envelope data this table pins, with
+    // the member values AWS publishes for it. The rows span the four kinds of member the
+    // envelope carries reference data in — the engine's description prose, its exportable
+    // log types, the version's feature names and its Aurora Serverless v2 limits — over
+    // engines and versions that disagree about each.
+    //
+    // Sources, per member:
+    //
+    // * `ExportableLogTypes` — the log types `EnableCloudwatchLogsExports` takes for that
+    //   engine (`smithy_query(query="doc",shape="CreateDBInstanceMessage",
+    //   member="EnableCloudwatchLogsExports")` points at the per-engine published list).
+    // * `SupportedFeatureNames` — the `FeatureName` values `AddRoleToDBInstance` /
+    //   `AddRoleToDBCluster` take for that engine; an engine that associates a role with
+    //   no feature reports the list EMPTY (`<SupportedFeatureNames/>`), not absent.
+    // * `ServerlessV2FeaturesSupport` — `MinCapacity` is 0 for a version that supports
+    //   Aurora Serverless v2 pause/resume ("if the minimum capacity is 0 ACUs, the engine
+    //   version … supports the automatic pause/resume feature") and half an ACU for one
+    //   that does not; `MaxCapacity` is one of the two the member documents ("might be
+    //   `256` or `128`").
+    //
+    // (case, engine, engine version, exportable log types, feature names, Serverless v2
+    // limits as reported on the wire)
+    type Row = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+        Option<(&'static str, &'static str)>,
+    );
+    const MYSQL_LOGS: &[&str] = &["audit", "error", "general", "slowquery"];
+    const AURORA_POSTGRESQL_LOGS: &[&str] = &["iam-db-auth-error", "instance", "postgresql"];
+    const POSTGRESQL_FEATURES: &[&str] = &["Lambda", "s3Export", "s3Import"];
+    const AURORA_POSTGRESQL_FEATURES: &[&str] = &[
+        "Bedrock",
+        "Comprehend",
+        "Lambda",
+        "SageMaker",
+        "s3Export",
+        "s3Import",
+    ];
+    const AURORA_MYSQL_FEATURES: &[&str] =
+        &["Bedrock", "Comprehend", "SageMaker", "s3Export", "s3Import"];
+    let rows: Vec<Row> = vec![
+        // RDS for MySQL and MariaDB associate a role with no feature at all.
+        ("RDS for MySQL", "mysql", "8.0.40", MYSQL_LOGS, &[], None),
+        ("RDS for MariaDB", "mariadb", "11.4.4", MYSQL_LOGS, &[], None),
+        // RDS for PostgreSQL has the `aws_s3` and `aws_lambda` features, and no Aurora
+        // Serverless v2 limits: it is not an Aurora engine.
+        (
+            "RDS for PostgreSQL",
+            "postgres",
+            "17.2",
+            &["postgresql", "upgrade"],
+            POSTGRESQL_FEATURES,
+            None,
+        ),
+        // Aurora PostgreSQL: three exportable log types, the machine learning features
+        // beside the S3 and Lambda ones, and the current Serverless v2 limits.
+        (
+            "Aurora PostgreSQL 16",
+            "aurora-postgresql",
+            "16.6",
+            AURORA_POSTGRESQL_LOGS,
+            AURORA_POSTGRESQL_FEATURES,
+            Some(("0", "256")),
+        ),
+        (
+            "Aurora PostgreSQL 13",
+            "aurora-postgresql",
+            "13.15",
+            AURORA_POSTGRESQL_LOGS,
+            AURORA_POSTGRESQL_FEATURES,
+            Some(("0", "256")),
+        ),
+        // Aurora PostgreSQL 11 ran before Aurora Serverless v2 existed.
+        (
+            "Aurora PostgreSQL 11",
+            "aurora-postgresql",
+            "11.21",
+            AURORA_POSTGRESQL_LOGS,
+            AURORA_POSTGRESQL_FEATURES,
+            None,
+        ),
+        // Aurora MySQL 3: the Serverless v2 limits are the VERSION's, and these three
+        // versions disagree about both bounds.
+        (
+            "Aurora MySQL before the raised maximum",
+            "aurora-mysql",
+            "8.0.mysql_aurora.3.05.2",
+            MYSQL_LOGS,
+            AURORA_MYSQL_FEATURES,
+            Some(("0.5", "128")),
+        ),
+        (
+            "Aurora MySQL at the raised maximum",
+            "aurora-mysql",
+            "8.0.mysql_aurora.3.07.1",
+            MYSQL_LOGS,
+            AURORA_MYSQL_FEATURES,
+            Some(("0.5", "256")),
+        ),
+        (
+            "Aurora MySQL with pause/resume",
+            "aurora-mysql",
+            "8.0.mysql_aurora.3.08.0",
+            MYSQL_LOGS,
+            AURORA_MYSQL_FEATURES,
+            Some(("0", "256")),
+        ),
+        // Aurora MySQL 2 is a cluster engine without Serverless v2.
+        (
+            "Aurora MySQL 2",
+            "aurora-mysql",
+            "5.7.mysql_aurora.2.11.6",
+            MYSQL_LOGS,
+            AURORA_MYSQL_FEATURES,
+            None,
+        ),
+    ];
+
+    for (case, engine, engine_version, log_types, features, serverless_v2) in rows {
+        let (reported, _) = describe(
+            &router,
+            case,
+            &[
+                ("Engine", engine.to_string()),
+                ("EngineVersion", engine_version.to_string()),
+                ("IncludeAll", "true".to_string()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: one engine version is one entry, got {reported:?}"
+        );
+        let version = &reported[0];
+        assert_eq!(
+            list_members(&version.scalars, "ExportableLogTypes"),
+            log_types,
+            "case {case:?}: expected the published exportable log types, got {}",
+            version.scalars
+        );
+        assert_eq!(
+            list_members(&version.scalars, "SupportedFeatureNames"),
+            features,
+            "case {case:?}: expected the published feature names, got {}",
+            version.scalars
+        );
+        // A list member with no entries is still REPORTED: an SDK reading it gets an
+        // empty list rather than a null.
+        assert!(
+            version.scalars.contains("SupportedFeatureNames"),
+            "case {case:?}: SupportedFeatureNames must be reported even when empty, got {}",
+            version.scalars
+        );
+        match serverless_v2 {
+            Some((min, max)) => {
+                let limits = subtrees(&version.scalars, "ServerlessV2FeaturesSupport")
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: an Aurora Serverless v2 version reports its \
+                             limits, got {}",
+                            version.scalars
+                        )
+                    });
+                assert_eq!(
+                    (
+                        text(&limits, "MinCapacity").as_str(),
+                        text(&limits, "MaxCapacity").as_str()
+                    ),
+                    (min, max),
+                    "case {case:?}: expected the published Serverless v2 limits, got {limits}"
+                );
+            }
+            None => assert!(
+                subtrees(&version.scalars, "ServerlessV2FeaturesSupport").is_empty(),
+                "case {case:?}: a version that does not run Aurora Serverless v2 reports \
+                 no limits at all, got {}",
+                version.scalars
+            ),
+        }
+    }
+
+    // The engine's own description prose, which every version of that engine repeats, and
+    // the version description built from it. (case, engine, engine version, the
+    // DBEngineDescription, the DBEngineVersionDescription)
+    let descriptions: [(&str, &str, &str, &str, &str); 4] = [
+        (
+            // Aurora PostgreSQL's version string IS the community PostgreSQL version it
+            // is compatible with, which is how AWS describes it.
+            "Aurora PostgreSQL",
+            "aurora-postgresql",
+            "16.6",
+            "Aurora (PostgreSQL)",
+            "Aurora PostgreSQL (Compatible with PostgreSQL 16.6)",
+        ),
+        (
+            "Aurora MySQL",
+            "aurora-mysql",
+            "8.0.mysql_aurora.3.08.0",
+            "Aurora MySQL",
+            "Aurora MySQL 8.0.mysql_aurora.3.08.0",
+        ),
+        (
+            "RDS for MySQL",
+            "mysql",
+            "8.0.40",
+            "MySQL Community Edition",
+            "MySQL 8.0.40",
+        ),
+        (
+            "RDS for PostgreSQL",
+            "postgres",
+            "17.2",
+            "PostgreSQL",
+            "PostgreSQL 17.2",
+        ),
+    ];
+
+    for (case, engine, engine_version, engine_description, version_description) in descriptions {
+        let (reported, _) = describe(
+            &router,
+            case,
+            &[
+                ("Engine", engine.to_string()),
+                ("EngineVersion", engine_version.to_string()),
+                ("IncludeAll", "true".to_string()),
+            ],
+        )
+        .await;
+        let version = reported
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: expected one entry, got {reported:?}"));
+        assert_eq!(
+            text(&version.scalars, "DBEngineDescription"),
+            engine_description,
+            "case {case:?}: expected the published engine description, got {}",
+            version.scalars
+        );
+        assert_eq!(
+            text(&version.scalars, "DBEngineVersionDescription"),
+            version_description,
+            "case {case:?}: expected the published version description, got {}",
+            version.scalars
+        );
+    }
+}
+
+#[tokio::test]
 async fn every_entry_answers_every_capability_member_a_client_gates_on() {
     let router = emulator();
 
@@ -1065,7 +1321,10 @@ async fn a_capability_is_the_versions_own_and_not_its_engines() {
 
             // "Specifies any Aurora Serverless v2 properties or limits that differ
             // between Aurora engine versions": when reported, the limits are a usable
-            // capacity range.
+            // capacity range. The minimum may be ZERO — "if the minimum capacity is 0
+            // ACUs, the engine version … supports the automatic pause/resume feature of
+            // Aurora Serverless v2" — and the maximum is one of the two the member
+            // documents ("might be 256 or 128").
             if let Some(limits) = subtrees(&version.scalars, "ServerlessV2FeaturesSupport").first()
             {
                 let min: f64 = text(limits, "MinCapacity")
@@ -1075,9 +1334,16 @@ async fn a_capability_is_the_versions_own_and_not_its_engines() {
                     .parse()
                     .expect("MaxCapacity is a number");
                 assert!(
-                    min > 0.0 && min <= max,
+                    min >= 0.0 && min < max,
                     "case {case:?}: the Serverless v2 capacity range must be usable, got \
                      {min}..{max} in {}",
+                    version.scalars
+                );
+                let reported_max = text(limits, "MaxCapacity");
+                assert!(
+                    matches!(reported_max.as_str(), "256" | "128"),
+                    "case {case:?}: the Serverless v2 maximum is one of the two published \
+                     capacities, got {reported_max:?} in {}",
                     version.scalars
                 );
             }

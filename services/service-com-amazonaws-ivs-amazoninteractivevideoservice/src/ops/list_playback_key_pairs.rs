@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPlaybackKeyPairs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPlaybackKeyPairs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPlaybackKeyPairs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure read over the imported playback key pairs, in one stable order (ARN), cut
+//! into pages of at most `maxResults`. The `nextToken` it issues names the last ARN of
+//! the page, so the following page is everything ordered strictly after it — the same
+//! page contract `ListChannels` and `ListStreamKeys` follow, through the one helper in
+//! [`crate::state::page`].
 //!
 //! ## Shape of an operation
 //!
@@ -86,10 +83,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivs-amazoninteractivevi
 // here — hence the `ListPlaybackKeyPairsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#ListPlaybackKeyPairs")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#ListPlaybackKeyPairs",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListPlaybackKeyPairsErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    InternalServerException(InternalServerException),
     ValidationException(ValidationException),
 }
 
@@ -144,18 +145,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPlaybackKeyPairs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPlaybackKeyPairsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPlaybackKeyPairs"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                ListPlaybackKeyPairsErrorModeled::InternalServerException,
+            )
+        })?;
+
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::PLAYBACK_KEY_PAIR_PAGE, token)
+                    .ok_or_else(|| {
+                        crate::state::validation(
+                            ListPlaybackKeyPairsErrorModeled::ValidationException,
+                            UNISSUED_PAGE_TOKEN.to_string(),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        // `MaxPlaybackKeyPairResults` is modelled `range(1..100)`, so the framework has
+        // already refused anything outside it; an absent value means the whole page.
+        // The bound comes from the shared helper every list in this crate uses.
+        let page_size = crate::state::page_size(input.max_results, MAX_PLAYBACK_KEY_PAIR_RESULTS);
+
+        let store = state.lock();
+        let (window, next_token) = crate::state::page(
+            crate::state::PLAYBACK_KEY_PAIR_PAGE,
+            store.playback_key_pairs.iter(),
+            after.as_deref(),
+            page_size,
+        );
+
+        Ok(ListPlaybackKeyPairsOutput {
+            key_pairs: window.into_iter().map(summary).collect(),
+            next_token,
+        })
+    }
+}
+
+/// The `maxResults` ceiling the model declares for this operation
+/// (`MaxPlaybackKeyPairResults`, `range(min: 1, max: 100)`), and so also the page size
+/// an absent `maxResults` means — the model documents the default as "your service
+/// quota or 100, whichever is smaller", and this emulator's own cap on stored key pairs
+/// is far above 100.
+const MAX_PLAYBACK_KEY_PAIR_RESULTS: i32 = 100;
+
+/// What this operation says about a `nextToken` it did not issue: a bad request, which
+/// is a different answer from a page that happens to be empty. The same sentence
+/// `ListChannels` and `ListStreamKeys` state, because it is one rule of the service.
+const UNISSUED_PAGE_TOKEN: &str = "nextToken is not a pagination token this service issued";
+
+/// The `PlaybackKeyPairSummary` projection of a persisted key pair: every member
+/// `PlaybackKeyPairSummary` declares, read off the stored record. `fingerprint` is NOT
+/// one of them, so a summary omits it — `GetPlaybackKeyPair` is where it is answered.
+fn summary(key_pair: &PlaybackKeyPair) -> PlaybackKeyPairSummary {
+    PlaybackKeyPairSummary {
+        arn: key_pair.arn.clone(),
+        name: key_pair.name.clone(),
+        tags: key_pair.tags.clone(),
     }
 }

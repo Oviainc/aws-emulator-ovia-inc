@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CreateFileSystemOutput, CreateMountTargetOutput, FileSystemSize, LifecyclePolicy, Tag,
+    CreateFileSystemOutput, CreateMountTargetOutput, CreateReplicationConfigurationOutput,
+    Destination, FileSystemSize, LifecyclePolicy, Tag, UpdateFileSystemOutput,
+    UpdateFileSystemProtectionOutput,
 };
 
 /// Values of the modelled `LifeCycleState` enum this slice produces
@@ -28,6 +30,40 @@ use crate::ops::types::{
 pub const LIFE_CYCLE_CREATING: &str = "creating";
 /// See [`LIFE_CYCLE_CREATING`].
 pub const LIFE_CYCLE_AVAILABLE: &str = "available";
+/// See [`LIFE_CYCLE_CREATING`]. The phase a file system is in while a change the
+/// service applies in the background — a throughput change — is still settling.
+pub const LIFE_CYCLE_UPDATING: &str = "updating";
+
+/// Values of the modelled `ReplicationStatus` enum this slice produces
+/// (`smithy_query(query="shape",shape="ReplicationStatus")` -> ENABLED | ENABLING |
+/// DELETING | ERROR | PAUSED | PAUSING).
+pub const REPLICATION_STATUS_ENABLING: &str = "ENABLING";
+/// See [`REPLICATION_STATUS_ENABLING`].
+pub const REPLICATION_STATUS_ENABLED: &str = "ENABLED";
+
+/// Values of the modelled `ReplicationOverwriteProtection` enum
+/// (`smithy_query(query="shape",shape="ReplicationOverwriteProtection")` -> ENABLED |
+/// DISABLED | REPLICATING). `FileSystemProtectionDescription$ReplicationOverwriteProtection`:
+/// "ENABLED – The file system cannot be used as the destination file system in a
+/// replication configuration. The file system is writeable. Replication overwrite
+/// protection is ENABLED by default."
+pub const PROTECTION_ENABLED: &str = "ENABLED";
+/// "DISABLED – The file system can be used as the destination file system in a
+/// replication configuration. The file system is read-only and can only be modified by
+/// EFS replication." See [`PROTECTION_ENABLED`].
+pub const PROTECTION_DISABLED: &str = "DISABLED";
+/// "REPLICATING – The file system is being used as the destination file system in a
+/// replication configuration." See [`PROTECTION_ENABLED`].
+pub const PROTECTION_REPLICATING: &str = "REPLICATING";
+
+/// `CreateReplicationConfiguration`: "There can only be one destination file system in a
+/// replication configuration", and its `Destinations` member: "Only one destination
+/// configuration object is supported." The modelled list carries no length bound, so a
+/// handler enforces the documented count itself.
+pub const MAX_REPLICATION_DESTINATIONS: usize = 1;
+
+/// `DescribeReplicationConfigurations$MaxResults`: "The default value is 100."
+pub const DEFAULT_REPLICATION_PAGE_SIZE: usize = 100;
 
 /// `PerformanceMode` value `generalPurpose`, the only one the Archive storage class is
 /// available for.
@@ -100,13 +136,20 @@ pub const DEFAULT_MOUNT_TARGET_PAGE_SIZE: usize = 10;
 /// request walk the whole store.
 pub const MAX_PAGE_SIZE: usize = 100;
 
-/// How long a resource this service creates stays in `creating` before the clock owes
-/// it `available`. AWS publishes no duration for the transition, so this span is the
+/// How long a resource this service creates stays in `creating`, and a file system a
+/// throughput change stays in `updating`, before the clock owes it `available`. AWS
+/// publishes no duration for either transition, so this span is the
 /// emulator's own choice inside the band the project fixes for a clock-owed
 /// transition (250-750 ms). It is never zero, so a caller that acts immediately after
 /// a create still observes `creating` and the state errors that go with it; the due
 /// instant is stored on the record and materialised on the next call, never slept for.
 pub const CREATING_FOR: Duration = Duration::from_millis(500);
+
+/// `UpdateFileSystem`'s `TooManyRequests` (HTTP 429): "Returned if you don't wait at
+/// least 24 hours before either changing the throughput mode, or decreasing the
+/// Provisioned Throughput value." The duration is the one that error documents, so it
+/// is kept as published rather than chosen by this emulator.
+pub const THROUGHPUT_CHANGE_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Availability Zone name suffixes. An Availability Zone name is the Region code
 /// followed by a letter identifier ("Regions and Zones", Amazon EC2 User Guide); every
@@ -170,12 +213,17 @@ pub struct FileSystem {
     pub owner_id: String,
     pub creation_token: String,
     pub creation_time: SystemTime,
-    /// When the clock owes this file system `available`; see [`CREATING_FOR`].
+    /// When the clock owes this file system `available` again, whether it is `creating`
+    /// or `updating`; see [`CREATING_FOR`].
     pub available_at: SystemTime,
     pub life_cycle_state: String,
     pub name: Option<String>,
     pub performance_mode: String,
     pub throughput_mode: String,
+    /// When a throughput change the 24-hour restriction covers — a throughput-mode
+    /// change, or a decrease of provisioned throughput — was last applied to this file
+    /// system, and `None` while none has been. See [`THROUGHPUT_CHANGE_COOLDOWN`].
+    pub last_restricted_throughput_change: Option<SystemTime>,
     pub provisioned_throughput_in_mibps: Option<f64>,
     pub encrypted: Option<bool>,
     pub kms_key_id: Option<String>,
@@ -189,6 +237,10 @@ pub struct FileSystem {
     pub size_measured_at: SystemTime,
     pub tags: Vec<Tag>,
     pub mount_target_ids: Vec<String>,
+    /// This file system's replication overwrite protection: one of
+    /// [`PROTECTION_ENABLED`], [`PROTECTION_DISABLED`] or [`PROTECTION_REPLICATING`].
+    /// "Replication overwrite protection is ENABLED by default."
+    pub replication_overwrite_protection: String,
     /// This file system's `LifecycleConfiguration`, as PutLifecycleConfiguration last
     /// stored it. "Each Amazon EFS file system supports one lifecycle configuration,
     /// which applies to all files in the file system", so it lives on the file-system
@@ -225,8 +277,126 @@ impl FileSystem {
             availability_zone_name: self.availability_zone_name.clone(),
             availability_zone_id: self.availability_zone_id.clone(),
             tags: self.tags.clone(),
-            file_system_protection: None,
+            // "Describes the protection on a file system" — every file system carries a
+            // replication overwrite protection status, so the member is always reported.
+            file_system_protection: Some(UpdateFileSystemProtectionOutput {
+                replication_overwrite_protection: Some(
+                    self.replication_overwrite_protection.clone(),
+                ),
+            }),
         }
+    }
+
+    /// This record as the modelled `FileSystemDescription`, in the per-operation shape
+    /// `UpdateFileSystem` answers with.
+    ///
+    /// The model binds `CreateFileSystem`, `DescribeFileSystems` and `UpdateFileSystem`
+    /// to the SAME `FileSystemDescription` output shape, but the generated types are
+    /// per operation, so this is a projection of [`Self::describe`] rather than a second
+    /// description: the two can never disagree.
+    pub fn describe_update(&self) -> UpdateFileSystemOutput {
+        let described = self.describe();
+        UpdateFileSystemOutput {
+            owner_id: described.owner_id,
+            creation_token: described.creation_token,
+            file_system_id: described.file_system_id,
+            file_system_arn: described.file_system_arn,
+            creation_time: described.creation_time,
+            life_cycle_state: described.life_cycle_state,
+            name: described.name,
+            number_of_mount_targets: described.number_of_mount_targets,
+            size_in_bytes: described.size_in_bytes,
+            performance_mode: described.performance_mode,
+            encrypted: described.encrypted,
+            kms_key_id: described.kms_key_id,
+            throughput_mode: described.throughput_mode,
+            provisioned_throughput_in_mibps: described.provisioned_throughput_in_mibps,
+            availability_zone_name: described.availability_zone_name,
+            availability_zone_id: described.availability_zone_id,
+            tags: described.tags,
+            file_system_protection: described.file_system_protection,
+        }
+    }
+}
+
+/// One destination of a stored replication configuration. "There can only be one
+/// destination file system in a replication configuration", so a configuration holds at
+/// most [`MAX_REPLICATION_DESTINATIONS`] of these.
+#[derive(Debug, Clone)]
+pub struct ReplicationDestination {
+    pub file_system_id: String,
+    pub region: String,
+    pub owner_id: String,
+    /// The IAM role Amazon EFS performs replication under on a cross-account
+    /// destination, when the request named one.
+    pub role_arn: Option<String>,
+    /// One of [`REPLICATION_STATUS_ENABLING`] / [`REPLICATION_STATUS_ENABLED`].
+    pub status: String,
+    /// When the clock owes this destination [`REPLICATION_STATUS_ENABLED`]; see
+    /// [`CREATING_FOR`].
+    pub enabled_at: SystemTime,
+}
+
+impl ReplicationDestination {
+    /// This record as the modelled `Destination`.
+    pub fn describe(&self) -> Destination {
+        Destination {
+            status: self.status.clone(),
+            file_system_id: self.file_system_id.clone(),
+            region: self.region.clone(),
+            // `Destination$LastReplicatedTimestamp` is the time of the last successful
+            // sync: this emulator moves no file data between file systems, so there is
+            // no such instant and the member stays absent rather than carrying a time
+            // nothing happened at.
+            last_replicated_timestamp: None,
+            owner_id: Some(self.owner_id.clone()),
+            status_message: None,
+            role_arn: self.role_arn.clone(),
+        }
+    }
+}
+
+/// One stored EFS replication configuration.
+#[derive(Debug, Clone)]
+pub struct ReplicationConfiguration {
+    /// Creation order, which fixes the order `DescribeReplicationConfigurations` pages
+    /// in.
+    pub ordinal: u64,
+    pub source_file_system_id: String,
+    pub source_file_system_arn: String,
+    pub original_source_file_system_arn: String,
+    pub source_file_system_region: String,
+    pub source_file_system_owner_id: String,
+    pub creation_time: SystemTime,
+    pub destinations: Vec<ReplicationDestination>,
+}
+
+impl ReplicationConfiguration {
+    /// This record as the modelled `ReplicationConfigurationDescription`.
+    pub fn describe(&self) -> CreateReplicationConfigurationOutput {
+        CreateReplicationConfigurationOutput {
+            source_file_system_id: self.source_file_system_id.clone(),
+            source_file_system_region: self.source_file_system_region.clone(),
+            source_file_system_arn: self.source_file_system_arn.clone(),
+            original_source_file_system_arn: self.original_source_file_system_arn.clone(),
+            creation_time: epoch_seconds(self.creation_time),
+            destinations: self
+                .destinations
+                .iter()
+                .map(ReplicationDestination::describe)
+                .collect(),
+            source_file_system_owner_id: Some(self.source_file_system_owner_id.clone()),
+        }
+    }
+
+    /// Whether `file_system_id` takes part in this configuration, as its source or as
+    /// its destination.
+    pub fn holds(&self, file_system_id: &str) -> bool {
+        self.source_file_system_id == file_system_id
+            || self
+                .destinations
+                .iter()
+                .any(|destination| destination.file_system_id == file_system_id)
     }
 }
 
@@ -301,6 +471,10 @@ pub struct ComAmazonawsEfsMagnolioapiserviceV20150201State {
     pub mount_targets: BTreeMap<String, MountTarget>,
     /// Keyed by `subnet-…` id, recorded on first reference.
     pub subnets: BTreeMap<String, Subnet>,
+    /// Keyed by the SOURCE `fs-…` id — the resource a replication configuration is
+    /// addressed by, and the key its uniqueness rule is stated over: "A file system can
+    /// be part of only one replication configuration."
+    pub replications: BTreeMap<String, ReplicationConfiguration>,
     /// Drives [`Self::mint_hex`]; see there for why it is not a plain counter.
     next_id_seed: u64,
     /// Drives [`Self::next_ordinal`].
@@ -378,11 +552,13 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
     }
 
     /// Materialise every lifecycle transition the clock has already made due: a
-    /// resource whose `creating` span has elapsed becomes `available`. Owed at the same
-    /// instant whether or not anybody called, so a reporting operation may apply it.
+    /// resource whose `creating` span has elapsed becomes `available`, as does a file
+    /// system whose `updating` span has. Owed at the same instant whether or not anybody
+    /// called, so a reporting operation may apply it.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
         for file_system in self.file_systems.values_mut() {
-            if file_system.life_cycle_state == LIFE_CYCLE_CREATING
+            if (file_system.life_cycle_state == LIFE_CYCLE_CREATING
+                || file_system.life_cycle_state == LIFE_CYCLE_UPDATING)
                 && file_system.available_at <= now
             {
                 file_system.life_cycle_state = LIFE_CYCLE_AVAILABLE.to_string();
@@ -395,6 +571,33 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
                 mount_target.life_cycle_state = LIFE_CYCLE_AVAILABLE.to_string();
             }
         }
+        for replication in self.replications.values_mut() {
+            for destination in &mut replication.destinations {
+                if destination.status == REPLICATION_STATUS_ENABLING
+                    && destination.enabled_at <= now
+                {
+                    destination.status = REPLICATION_STATUS_ENABLED.to_string();
+                }
+            }
+        }
+    }
+
+    /// The replication configuration `file_system_id` takes part in, as its source or as
+    /// its destination. "A file system can be part of only one replication
+    /// configuration", so there is at most one.
+    pub fn replication_of(&self, file_system_id: &str) -> Option<&ReplicationConfiguration> {
+        self.replications
+            .values()
+            .find(|replication| replication.holds(file_system_id))
+    }
+
+    /// The stored replication configurations, in creation order — the order
+    /// `DescribeReplicationConfigurations` pages in.
+    pub fn replications_in_order(&self) -> Vec<&ReplicationConfiguration> {
+        let mut replications: Vec<&ReplicationConfiguration> =
+            self.replications.values().collect();
+        replications.sort_by_key(|replication| replication.ordinal);
+        replications
     }
 
     /// Whether any mount target in `subnet_id` already holds `address`.
@@ -461,6 +664,12 @@ pub fn file_system_id_of(value: &str) -> &str {
         Some((_, id)) => id,
         None => value,
     }
+}
+
+/// The Region segment of an ARN: `arn:<partition>:<service>:<region>:<account>:<resource>`
+/// — the Region a resource this emulator minted an ARN for lives in.
+pub fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3).filter(|region| !region.is_empty())
 }
 
 /// An `AccessPointId` member accepts an id or an ARN; reduce either to the bare id.
@@ -615,6 +824,16 @@ pub fn mount_target_not_found_message(mount_target_id: &str) -> String {
 /// doesn't exist in the requester's Amazon Web Services account".
 pub fn access_point_not_found_message(access_point_id: &str) -> String {
     does_not_exist(ACCESS_POINT_NOUN, access_point_id)
+}
+
+/// `ReplicationNotFound`'s message — "Returned if the specified file system does not
+/// have a replication configuration": the file system the request named, rendered by
+/// [`quoted`] as every other message of this service renders a requested id.
+pub fn replication_not_found_message(file_system_id: &str) -> String {
+    format!(
+        "{FILE_SYSTEM_NOUN} {} does not have a replication configuration.",
+        quoted(file_system_id)
+    )
 }
 
 /// `FileSystemAlreadyExists`' message — "Returned if the file system you are trying to

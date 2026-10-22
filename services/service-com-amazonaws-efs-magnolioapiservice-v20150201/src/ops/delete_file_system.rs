@@ -209,6 +209,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             Some(_) => {}
         }
+        // "You cannot delete a file system that is part of an EFS replication
+        // configuration. You need to delete the replication configuration first." That
+        // holds for either side of it: the source replicates out of this file system and
+        // the destination is replicated into.
+        if let Some(replication) = state.replication_of(&file_system_id) {
+            let source = replication.source_file_system_id.clone();
+            return Err(DeleteFileSystemErrorModeled::FileSystemInUse(FileSystemInUse {
+                error_code: "FileSystemInUse".to_string(),
+                message: Some(format!(
+                    "File system {} is part of the replication configuration of source file \
+                     system {}; delete that configuration first",
+                    efs::quoted(&file_system_id),
+                    efs::quoted(&source)
+                )),
+            })
+            .into());
+        }
 
         if let Some(removed) = state.file_systems.remove(&file_system_id) {
             // The token is what made the create idempotent; freeing it lets the same

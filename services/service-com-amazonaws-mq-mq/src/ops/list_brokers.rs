@@ -150,6 +150,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // `maxResults` carries the modelled `@range(min: 1, max: 100)`, which
+        // this handler enforces rather than the boundary validator, so the
+        // refusal names the member the way Amazon MQ does.
+        if let Some(max_results) = input.max_results {
+            state::validate_range(
+                "maxResults",
+                max_results,
+                state::MIN_MAX_RESULTS,
+                state::MAX_MAX_RESULTS,
+            )
+            .map_err(|invalid| {
+                ListBrokersErrorModeled::BadRequestException(BadRequestException {
+                    error_attribute: invalid.attribute,
+                    message: Some(invalid.message),
+                    resource_share_errors: None,
+                })
+            })?;
+        }
+
         // Only a token this service issued names an offset; anything else is a
         // client error, not an empty page.
         let offset = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
@@ -160,11 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(ListBrokersErrorModeled::BadRequestException(
                         BadRequestException {
                             error_attribute: Some("nextToken".to_string()),
-                            message: Some(
-                                "nextToken is not a token this service issued; \
-                                 pass back the nextToken from a previous ListBrokers response"
-                                    .to_string(),
-                            ),
+                            message: Some(state::invalid_page_token_message(token)),
                             resource_share_errors: None,
                         },
                     )

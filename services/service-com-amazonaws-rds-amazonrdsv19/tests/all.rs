@@ -11,6 +11,8 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+#[path = "all/certificate_override.rs"]
+mod certificate_override;
 #[path = "all/db_engine_versions.rs"]
 mod db_engine_versions;
 #[path = "all/db_instance_deletion.rs"]
@@ -27,6 +29,8 @@ mod existence_and_parameter_guards;
 mod not_found_paths;
 #[path = "all/option_group_options.rs"]
 mod option_group_options;
+#[path = "all/option_group_setting_catalog.rs"]
+mod option_group_setting_catalog;
 #[path = "all/option_groups.rs"]
 mod option_groups;
 #[path = "all/orderable_db_instance_options.rs"]
