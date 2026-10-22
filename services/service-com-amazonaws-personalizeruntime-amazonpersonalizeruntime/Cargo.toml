@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Deterministic, request-derived scoring and opaque recommendation ids
+# (`src/state/scoring.rs`): SHA-256 as a stable mixing function, hex for the id.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

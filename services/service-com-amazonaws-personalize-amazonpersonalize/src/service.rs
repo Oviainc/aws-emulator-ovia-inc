@@ -45,6 +45,14 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The service key `::emulator_server::service_from_target` reads out of the
+/// `X-Amz-Target` header this service's awsJson1_1 operations carry: that reader takes
+/// the segment before the `.`, strips any `_<version>` suffix and lower-cases it, so
+/// `AmazonPersonalize.<OperationName>` (`OPERATIONS.md`, "Request routing")
+/// normalises to this key — while the two Personalize data-plane services that share
+/// this signing name send no `X-Amz-Target` at all.
+const TARGET_SERVICE_KEY: &str = "amazonpersonalize";
+
 /// The `com-amazonaws-personalize-amazonpersonalize` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,12 +82,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // THREE services sit behind ONE SigV4 signing name `personalize`: this control
+        // plane (endpoint `personalize`), Amazon Personalize Runtime (endpoint
+        // `personalize-runtime`) and Amazon Personalize Events (endpoint
+        // `personalize-events`). No Smithy trait expresses that, and the router's
+        // routing key comes from the SigV4 credential scope first, so matching on the
+        // signing name ALONE makes all three claim every Personalize-signed request —
+        // which the router answers `500 AmbiguousService` for, so NONE of the three is
+        // reachable.
+        //
+        // This service is awsJson1_1: every operation posts to `/` and names itself in
+        // `X-Amz-Target` (`AmazonPersonalize.<Operation>`), so that prefix is the
+        // discriminator here — the same rule DynamoDB uses against DynamoDB Streams.
+        // Its two restJson1 siblings carry no target header and claim their own URI
+        // path spaces instead, so each family member claims only its own requests.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => {
+                ::emulator_server::service_from_target(&parts.headers).as_deref()
+                    == Some(TARGET_SERVICE_KEY)
+            }
+            _ => false,
         }
     }
 

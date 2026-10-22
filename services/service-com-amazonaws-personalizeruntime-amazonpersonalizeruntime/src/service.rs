@@ -45,6 +45,34 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The first path segment of a URI, or `None` for the root path.
+fn first_path_segment(path: &str) -> Option<&str> {
+    let segment = path.trim_start_matches('/').split('/').next()?;
+    (!segment.is_empty()).then_some(segment)
+}
+
+/// Whether `parts` addresses a path inside `path_segments` — the model-derived first
+/// URI path segments this service declares (`crate::ROUTE_PATH_SEGMENTS`).
+///
+/// This mirrors the framework's own discriminator,
+/// `emulator_server::can_handle_based_on_route_key_and_path`, which the generated
+/// `can_handle` entry point uses. The framework helper takes a whole buffered
+/// `http::Request`, which the `Service::can_handle` seam below does not receive, so the
+/// rule is applied here over `Parts` instead of called. It is kept identical, including
+/// both edge cases: an EMPTY list means the model published no usable discriminator and
+/// is "no constraint", and the framework's own `ROOT_PATH_SEGMENT` sentinel is how a
+/// service that must answer `POST /` claims the root path without claiming every path.
+/// Matching is EXACT segment equality, deliberately never a prefix test.
+fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> bool {
+    if path_segments.is_empty() {
+        return true;
+    }
+    match first_path_segment(parts.uri.path()) {
+        Some(segment) => path_segments.contains(&segment),
+        None => path_segments.contains(&emulator_server::ROOT_PATH_SEGMENT),
+    }
+}
+
 /// The `com-amazonaws-personalizeruntime-amazonpersonalizeruntime` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,12 +102,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // THREE services sit behind ONE SigV4 signing name `personalize`: Amazon
+        // Personalize (the control plane, endpoint `personalize`), Amazon Personalize
+        // Events (endpoint `personalize-events`) and this one (endpoint
+        // `personalize-runtime`). No Smithy trait expresses that, and the router's
+        // routing key comes from the SigV4 credential scope first, so matching on the
+        // signing name ALONE makes all three claim every Personalize-signed request —
+        // which the router answers `500 AmbiguousService` for, including the three
+        // inference calls this service exists to serve.
+        //
+        // So the claim is narrowed the way the framework narrows every other
+        // signing-name collision: the signing name must match AND the request must
+        // address this service's own modeled URI path space — `/recommendations`,
+        // `/personalize-ranking`, `/action-recommendations` (see
+        // `crate::ROUTE_PATH_SEGMENTS`, generated from the model). The control plane
+        // tells its awsJson1_1 traffic apart by `X-Amz-Target` and Personalize Events
+        // claims its own paths, so each family member claims only its own requests.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => {
+                claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
+            }
+            _ => false,
         }
     }
 

@@ -21,5 +21,7 @@ mod connect_signing_name_routing;
 mod dynamodb_streams_routing;
 #[path = "all/marketplace_signing_name_routing.rs"]
 mod marketplace_signing_name_routing;
+#[path = "all/personalize_signing_name_routing.rs"]
+mod personalize_signing_name_routing;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;
