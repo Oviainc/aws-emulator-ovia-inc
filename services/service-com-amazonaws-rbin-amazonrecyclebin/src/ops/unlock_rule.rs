@@ -195,10 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // An unlock delay that has already run out leaves the rule `unlocked` whether or
-        // not anybody called, so materialise that before the guard below reads the lock
+        // An unlock delay that has already run out leaves the rule `unlocked`, and a
+        // `pending` rule whose transition span has elapsed is `available`, whether or
+        // not anybody called; so materialise both before the guard below reads the lock
         // state: a rule whose delay has expired is no longer unlockable either.
-        rule.settle_lock_state(now);
+        rule.settle(now);
 
         // Only a `locked` rule can be unlocked: a rule that has never been locked, one
         // already `unlocked`, and one already serving its unlock delay have no lock to
