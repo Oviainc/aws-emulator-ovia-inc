@@ -12,6 +12,10 @@
 //! through a read, and a delete is observable by its absence. The tables below span the
 //! inputs the rule generalises over (value, count, region, page bound, port), not the one
 //! request the issue quoted.
+//!
+//! The harness below (the emulator, the signed call, the error-code reader and the two
+//! create helpers) is `pub(crate)` because the other suites in this test crate drive the
+//! same wire path; see `tests/all/snapshot_and_usage_limit.rs`.
 
 use std::sync::Arc;
 
@@ -19,7 +23,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The account every ARN this emulator mints carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A SigV4 `Authorization` header scoped to this service in `region`. It is what routes
 /// the request to this service AND what names the region its ARNs carry; signatures are
@@ -33,7 +37,7 @@ fn authorization(region: &str) -> String {
 
 /// One emulator with an empty store: the shared engine the router builds in production,
 /// carrying only this service.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -45,7 +49,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// Call `operation` with `body`, signed for `region`; answer its HTTP status and parsed
 /// JSON body.
-async fn call_in(
+pub(crate) async fn call_in(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -68,13 +72,13 @@ async fn call_in(
 }
 
 /// [`call_in`] in `us-east-1`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     call_in(router, "us-east-1", operation, body).await
 }
 
 /// The error shape name out of an awsJson error envelope, with any namespace prefix
 /// dropped (`com.amazonaws.redshiftserverless#ConflictException` -> `ConflictException`).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -96,7 +100,7 @@ fn merged(base: Value, extra: &Value) -> Value {
 }
 
 /// A canonical hyphenated UUID: 8-4-4-4-12 hex groups.
-fn is_uuid(value: &str) -> bool {
+pub(crate) fn is_uuid(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == 5
         && groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12])
@@ -106,7 +110,7 @@ fn is_uuid(value: &str) -> bool {
 }
 
 /// The member of `value` named by `path` (`"endpoint.address"`), or `Value::Null`.
-fn at<'a>(value: &'a Value, path: &str) -> &'a Value {
+pub(crate) fn at<'a>(value: &'a Value, path: &str) -> &'a Value {
     let mut current = value;
     for segment in path.split('.') {
         current = current.get(segment).unwrap_or(&Value::Null);
@@ -115,7 +119,7 @@ fn at<'a>(value: &'a Value, path: &str) -> &'a Value {
 }
 
 /// Create a namespace with `name`, asserting it succeeded.
-async fn create_namespace(router: &MultiServiceRouter, name: &str) -> Value {
+pub(crate) async fn create_namespace(router: &MultiServiceRouter, name: &str) -> Value {
     let (status, body) = call(router, "CreateNamespace", json!({ "namespaceName": name })).await;
     assert_eq!(
         status, 200,
@@ -125,7 +129,7 @@ async fn create_namespace(router: &MultiServiceRouter, name: &str) -> Value {
 }
 
 /// Create a workgroup with `name` in `namespace`, asserting it succeeded.
-async fn create_workgroup(router: &MultiServiceRouter, name: &str, namespace: &str) -> Value {
+pub(crate) async fn create_workgroup(router: &MultiServiceRouter, name: &str, namespace: &str) -> Value {
     let (status, body) = call(
         router,
         "CreateWorkgroup",

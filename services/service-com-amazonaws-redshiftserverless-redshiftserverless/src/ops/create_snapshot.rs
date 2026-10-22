@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes a snapshot of the named namespace THROUGH the compute attached to
+//! it, inserting a record keyed by `snapshotName` into
+//! [`crate::state::ComAmazonawsRedshiftserverlessRedshiftserverlessState::snapshots`]
+//! that `GetSnapshot` / `ListSnapshots` then report.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A namespace with no workgroup has no compute to snapshot through, so the create is
+//! refused with the 404-status `ResourceNotFoundException` and stores NOTHING; the same
+//! request succeeds once a workgroup on that namespace exists.
+//!
+//! The snapshot is minted in `CREATING` status — one of the `SnapshotStatus` values — and
+//! reaches `AVAILABLE` on its own a moment later, with nobody calling; see
+//! [`crate::state::SnapshotRecord::settle`].
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +154,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSnapshot"))
+        // The retention period's admissible values are documented, not modelled, so the
+        // boundary validator cannot have refused a bad one.
+        if let Some(retention) = input.retention_period {
+            if retention != crate::state::SNAPSHOT_RETENTION_INDEFINITE
+                && !(1..=crate::state::MAX_SNAPSHOT_RETENTION_DAYS).contains(&retention)
+            {
+                return Err(CreateSnapshotErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "retentionPeriod {retention} must be either {} (retain \
+                             indefinitely) or between 1 and {} days",
+                            crate::state::SNAPSHOT_RETENTION_INDEFINITE,
+                            crate::state::MAX_SNAPSHOT_RETENTION_DAYS
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSnapshotErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.settle_due_transitions();
+        // The store grows one record per create, so a quota bounds it. Read before the
+        // `entry` below takes the borrow; it bounds only a NEW record.
+        let stored_snapshots = state.snapshots.len();
+
+        let Some(namespace) = state
+            .namespaces
+            .get(&input.namespace_name)
+            .map(|record| record.namespace.clone())
+        else {
+            return Err(CreateSnapshotErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no namespace named {}", input.namespace_name),
+                    resource_name: Some(input.namespace_name.clone()),
+                },
+            )
+            .into());
+        };
+
+        // A snapshot of a namespace is taken through the compute attached to it, so a
+        // namespace carrying no workgroup has nothing to take it with. The refusal comes
+        // BEFORE any write, so the rejected call leaves the snapshot store untouched.
+        if state.workgroups_in_namespace(&input.namespace_name).is_empty() {
+            return Err(CreateSnapshotErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "You can't create a snapshot because there isn't a workgroup \
+                         created for the namespace {}.",
+                        input.namespace_name
+                    ),
+                    resource_name: Some(input.namespace_name.clone()),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let snapshot_id = crate::state::new_resource_id();
+        let taken_at = crate::state::now_timestamp();
+        let retention = input
+            .retention_period
+            .unwrap_or(crate::state::SNAPSHOT_RETENTION_INDEFINITE);
+        // Every namespace-derived member comes off the namespace record, so the snapshot
+        // describes the database it was taken from rather than anything in the request.
+        let snapshot = Snapshot {
+            namespace_name: namespace.namespace_name.clone(),
+            namespace_arn: namespace.namespace_arn.clone(),
+            snapshot_name: Some(input.snapshot_name.clone()),
+            snapshot_create_time: Some(taken_at),
+            admin_username: namespace.admin_username.clone(),
+            kms_key_id: namespace.kms_key_id.clone(),
+            owner_account: Some(::engine::emulator_account_id().to_string()),
+            snapshot_retention_period: Some(retention),
+            // Retention starts when the snapshot is taken, so the countdown starts full;
+            // `SnapshotRecord::reported` is what walks it down with the clock.
+            snapshot_remaining_days: Some(retention),
+            snapshot_retention_start_time: Some(taken_at),
+            snapshot_arn: Some(crate::state::snapshot_arn(&region, &snapshot_id)),
+            // A fresh snapshot is shared with nobody: granting restore access to another
+            // account is a separate call, and not one this API models.
+            accounts_with_restore_access: Some(Vec::new()),
+            accounts_with_provisioned_restore_access: Some(Vec::new()),
+            admin_password_secret_arn: namespace.admin_password_secret_arn.clone(),
+            admin_password_secret_kms_key_id: namespace.admin_password_secret_kms_key_id.clone(),
+            // `status` is set by the CREATING -> AVAILABLE transition below. The backup
+            // size and rate members report how much data moved; this emulator holds no
+            // database contents, so there is no measurement to report and they stay unset
+            // rather than carrying a number nothing produced.
+            ..Snapshot::default()
+        };
+
+        let mut record = crate::state::SnapshotRecord {
+            snapshot,
+            tags: input.tags.unwrap_or_default(),
+            pending_status: None,
+            created_at: ::std::time::Instant::now(),
+        };
+        record.begin_transition(
+            crate::state::SNAPSHOT_CREATING,
+            crate::state::SNAPSHOT_AVAILABLE,
+        );
+
+        // The name is the snapshot's identity in this account, so an occupied slot IS the
+        // conflict. The answer comes out of the STORED record, so what the caller reads is
+        // what a later GetSnapshot reads.
+        match state.snapshots.entry(input.snapshot_name) {
+            ::std::collections::btree_map::Entry::Occupied(occupied) => {
+                Err(CreateSnapshotErrorModeled::ConflictException(ConflictException {
+                    message: format!("a snapshot named {} already exists", occupied.key()),
+                })
+                .into())
+            }
+            ::std::collections::btree_map::Entry::Vacant(slot) => {
+                if stored_snapshots >= crate::state::MAX_SNAPSHOTS {
+                    return Err(CreateSnapshotErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "this account has reached its limit of {} snapshots in \
+                                 this Region",
+                                crate::state::MAX_SNAPSHOTS
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                let now = ::std::time::Instant::now();
+                Ok(CreateSnapshotOutput {
+                    snapshot: Some(slot.insert(record).reported(now)),
+                })
+            }
+        }
     }
 }

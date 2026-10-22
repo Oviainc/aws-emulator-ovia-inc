@@ -12,6 +12,10 @@
 //! conflict rather than a second record. Those two rules also bound the store: the
 //! account's namespace and workgroup quotas times the modelled usage types and periods.
 //!
+//! A `resourceArn` that names no such resource is refused with the 400-status
+//! `ValidationException` and leaves the store untouched: the ARN is the input that is
+//! wrong, not a resource the caller asked this call to address.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -181,15 +185,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // A usage limit caps the usage of an EXISTING resource of this service, named by
-        // its ARN; there is nothing to cap on a resource the account does not hold.
+        // its ARN; an ARN that names no resource the account holds is a bad `resourceArn`
+        // rather than a resource this call addressed, which is why it is refused with the
+        // 400 and not with the 404 the operation also models.
         if !state.holds_resource_arn(&input.resource_arn) {
-            return Err(CreateUsageLimitErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
+            return Err(CreateUsageLimitErrorModeled::ValidationException(
+                ValidationException {
                     message: format!(
-                        "no Amazon Redshift Serverless resource with the ARN {}",
+                        "resourceArn {} does not name a namespace or workgroup in this \
+                         account and Region",
                         input.resource_arn
                     ),
-                    resource_name: Some(input.resource_arn.clone()),
                 },
             )
             .into());
