@@ -11,7 +11,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{CrossAccountConfiguration, EncryptionConfiguration};
+use smithy_server_runtime::{Violation, ViolationKind};
+
+use crate::ops::types::{
+    CrossAccountConfiguration, EncryptionConfiguration, ResourceNotFoundException,
+};
 
 /// Characters an investigation-group id is built from.
 ///
@@ -234,6 +238,206 @@ impl ComAmazonawsAiopsAiopsState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// How this service words a refusal
+//
+// Two wordings, each single-homed here so every operation states the same failure
+// the same way: the `ValidationException` message a bad input is refused with
+// ([`validation_exception_message`], [`validation_message`]) and the
+// `ResourceNotFoundException` message an absent resource is reported with
+// ([`investigation_group_not_found`], [`investigation_group_policy_not_found`]).
+//
+// Neither carries anything the request sent. A `ValidationException` names the
+// member and the requirement it violated and withholds the value that violated it;
+// a `ResourceNotFoundException` names the RESOURCE TYPE that is absent and withholds
+// the identifier that named it. Recorded 4xx responses from this service are built
+// that way across every operation, and both messages are the whole machine-readable
+// detail a client gets, so a caller's own bytes must not be copied into them.
+// ---------------------------------------------------------------------------
+
+/// The modelled name of this service's primary resource
+/// (`com.amazonaws.aiops#InvestigationGroup`, the resource every `{identifier}`
+/// member carries a `@references` entry for), which is how a not-found answer names
+/// it.
+pub const INVESTIGATION_GROUP_RESOURCE: &str = "InvestigationGroup";
+
+/// The modelled name of the resource policy attached to a group
+/// (`com.amazonaws.aiops#InvestigationGroupPolicy`, the second `@references` entry on
+/// the policy operations' inputs).
+pub const INVESTIGATION_GROUP_POLICY_RESOURCE: &str = "InvestigationGroupPolicy";
+
+/// The `ResourceNotFoundException` for an absent `resource`.
+///
+/// The message states the resource TYPE that does not exist and nothing else: the
+/// recorded 404 for a group that was never created reads
+/// `InvestigationGroup does not exist.` in every operation and every fixture, with
+/// nothing drawn from the request in it. So the message varies only with WHICH
+/// modelled resource is missing, never with the identifier that named it.
+fn resource_not_found(resource: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("{resource} does not exist.")),
+    }
+}
+
+/// The 404 every operation answers when the investigation group `{identifier}` names
+/// does not exist — including the policy operations, where the GROUP is what is
+/// missing and so is what gets reported.
+pub fn investigation_group_not_found() -> ResourceNotFoundException {
+    resource_not_found(INVESTIGATION_GROUP_RESOURCE)
+}
+
+/// The 404 `GetInvestigationGroupPolicy` answers when the group EXISTS and carries no
+/// resource policy: a different condition from an absent group, and so a different
+/// resource named, which is what lets a client tell the two apart.
+pub fn investigation_group_policy_not_found() -> ResourceNotFoundException {
+    resource_not_found(INVESTIGATION_GROUP_POLICY_RESOURCE)
+}
+
+/// The text separating a clause's subject from the requirement it states.
+const CONSTRAINT_SEPARATOR: &str = " failed to satisfy constraint: ";
+
+/// The prefix the requirement half carries when the constraint violated is a
+/// `@pattern`; the expression follows it.
+const PATTERN_REQUIREMENT: &str = "Member must satisfy regular expression pattern: ";
+
+/// The `@pattern` expressions this service APPLIES, as
+/// `(modelled expression, applied expression)`, for the members whose live constraint
+/// differs from the one the model publishes.
+///
+/// `name` is the one such member: recorded 400 `ValidationException` responses quote
+/// `[\-_A-Za-z0-9\[\]\(\)\{\}\.:!?@; ]+`, which is the modelled class
+/// (`smithy_query(query="shape",shape="StringWithPatternAndLengthLimits")`:
+/// `^[\-_A-Za-z0-9\[\]\(\)\{\}\.: ]+$`) plus `!`, `?`, `@` and `;`, and without the
+/// anchors.
+///
+/// REPORTED, not ENFORCED: the constraint walk at the request boundary applies the
+/// member's own modelled trait, read off the operation's generated input schema, which
+/// no service crate can widen — so for `name` the expression reported here is the
+/// WIDER of the two and the emulator still refuses a name this expression admits and
+/// the model's does not. The reported form is what a caller is told the service
+/// enforces; do not read it as what was checked.
+///
+/// The lookup is keyed on the model's EXACT expression, so a model that changes one
+/// misses here and is reported through its own expression rather than through a stale
+/// override.
+const APPLIED_PATTERNS: &[(&str, &str)] = &[(
+    r"^[\-_A-Za-z0-9\[\]\(\)\{\}\.: ]+$",
+    r"[\-_A-Za-z0-9\[\]\(\)\{\}\.:!?@; ]+",
+)];
+
+/// The expression this service reports for the modelled `@pattern` `modelled`: its
+/// [`APPLIED_PATTERNS`] entry when it has one, else the modelled expression with its
+/// anchors dropped.
+pub fn applied_pattern(modelled: &str) -> &str {
+    APPLIED_PATTERNS
+        .iter()
+        .find(|(declared, _)| *declared == modelled)
+        .map_or_else(|| unanchored(modelled), |(_, applied)| *applied)
+}
+
+/// A `@pattern` expression without the anchors a model spells it with: Smithy's
+/// `@pattern` is an unanchored find, so `^`/`$` are how a model demands a whole-string
+/// match rather than part of the expression a value has to satisfy.
+///
+/// A trailing `$` that is ESCAPED is a literal dollar sign inside the expression, not
+/// the end anchor, so it stays: the run of backslashes before it decides.
+///
+/// (Sibling service crates carry their own copies of this helper — `grep -rln 'fn
+/// unanchored' services/*/src` — because none is reachable from another;
+/// `services/common/src/validation.rs` is the staged home for the one shared copy.)
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) if trimmed.chars().rev().take_while(|c| *c == '\\').count() % 2 == 0 => {
+            trimmed
+        }
+        _ => body,
+    }
+}
+
+/// The requirement half of a clause: what the value had to satisfy.
+///
+/// Read off the FRAMEWORK's own rendering of `kind` — with an empty path and no value,
+/// so every word of the sentence is the framework's or the model's and none of it is
+/// anything a caller sent — and then cut at the clause separator. A constraint class
+/// the framework learns to check therefore cannot drift from this wording, and
+/// [`ViolationKind`] being `#[non_exhaustive]` costs nothing here.
+///
+/// A `@pattern` requirement is restated through [`applied_pattern`].
+pub fn requirement_text(kind: ViolationKind) -> String {
+    let rendered = Violation {
+        path: String::new(),
+        kind,
+        value: None,
+    }
+    .message();
+    let requirement = rendered
+        .split_once(CONSTRAINT_SEPARATOR)
+        .map_or(rendered.as_str(), |(_, requirement)| requirement);
+    match requirement.strip_prefix(PATTERN_REQUIREMENT) {
+        Some(pattern) => format!("{PATTERN_REQUIREMENT}{}", applied_pattern(pattern)),
+        None => requirement.to_string(),
+    }
+}
+
+/// One clause of a `ValidationException` message: the member whose value violated a
+/// constraint, and the requirement it violated — and NOTHING of the value itself.
+pub fn constraint_clause(member_path: &str, requirement: &str) -> String {
+    format!("Value at '{member_path}'{CONSTRAINT_SEPARATOR}{requirement}")
+}
+
+/// [`constraint_clause`] for a member that was ABSENT from the request.
+///
+/// The subject is `Value null`, because there was no value: the request carried
+/// nothing at that path, which is a fact about the request's SHAPE rather than a value
+/// echoed back from it.
+pub fn absent_member_clause(member_path: &str, requirement: &str) -> String {
+    format!("Value null at '{member_path}'{CONSTRAINT_SEPARATOR}{requirement}")
+}
+
+/// The AWS `ValidationException` envelope over one or more clauses: how many
+/// constraints were violated, then the clauses.
+pub fn validation_envelope(clauses: &[String]) -> String {
+    match clauses {
+        [clause] => format!("1 validation error detected: {clause}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
+}
+
+/// The whole `ValidationException` message for ONE member that failed ONE
+/// requirement, for a rule a handler enforces itself (one the model does not express,
+/// so the boundary walk passed it through). Worded through the same builders as a
+/// boundary refusal, so the two cannot drift.
+pub fn validation_message(member_path: &str, requirement: &str) -> String {
+    validation_envelope(&[constraint_clause(member_path, requirement)])
+}
+
+/// The `ValidationException` message for a refusal the constraint walk made at the
+/// request boundary: one clause per violation, in the AWS envelope.
+///
+/// `None` when there is nothing to state, which keeps the framework's own wording.
+pub fn validation_exception_message(violations: &[Violation]) -> Option<String> {
+    if violations.is_empty() {
+        return None;
+    }
+    let clauses: Vec<String> = violations
+        .iter()
+        .map(|violation| {
+            let requirement = requirement_text(violation.kind.clone());
+            match violation.value {
+                // No value at that path: the member was absent from the request.
+                None => absent_member_clause(&violation.path, &requirement),
+                Some(_) => constraint_clause(&violation.path, &requirement),
+            }
+        })
+        .collect();
+    Some(validation_envelope(&clauses))
+}
+
 /// Why an `encryptionConfiguration` is unacceptable, or `None` when it is fine.
 ///
 /// `EncryptionConfiguration.type` targets the modelled `EncryptionConfigurationType`
@@ -242,6 +446,11 @@ impl ComAmazonawsAiopsAiopsState {
 /// values `smithy_query(query="shape",shape="EncryptionConfigurationType")` reports.
 /// Every operation that accepts the structure applies this one rule, each rendering
 /// the refusal as its own modelled `ValidationException`.
+///
+/// The refusal is the service's own `ValidationException` MESSAGE, worded through
+/// [`validation_message`]: the member path and the value set it had to satisfy, with
+/// the rejected value withheld, exactly as a boundary refusal for the same class of
+/// violation reads.
 ///
 /// `type` is NOT `@required` on the structure, so a configuration that omits it is a
 /// request the model admits and this rule has nothing to say about — hence the early
@@ -253,9 +462,13 @@ pub fn encryption_configuration_rejection(
     if crate::ops::types::ENCRYPTION_CONFIGURATION_TYPE_VALUES.contains(&supplied) {
         return None;
     }
-    Some(format!(
-        "encryptionConfiguration.type must be one of [{}], got '{supplied}'",
-        crate::ops::types::ENCRYPTION_CONFIGURATION_TYPE_VALUES.join(", ")
+    let allowed = crate::ops::types::ENCRYPTION_CONFIGURATION_TYPE_VALUES
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    Some(validation_message(
+        "encryptionConfiguration.type",
+        &requirement_text(ViolationKind::EnumValue(allowed)),
     ))
 }
 
@@ -267,13 +480,23 @@ pub fn encryption_configuration_rejection(
 /// oversized one and this is where the bound lives. Every operation that stores any
 /// of them applies this one rule, each rendering the refusal as its own modelled
 /// `ValidationException`. Pass `None` for a member the operation does not accept.
+///
+/// The refusal is worded through [`validation_message`] too: the member path and the
+/// bound it exceeded, in the same clause a modelled `@length` maximum would be refused
+/// with at the boundary — so a client reads one grammar for both, and the entry count
+/// the request carried is not echoed back.
 pub fn collection_bounds_rejection(
     tags: Option<&std::collections::HashMap<String, String>>,
     tag_key_boundaries: Option<&[String]>,
     chatbot_notification_channel: Option<&std::collections::HashMap<String, Vec<String>>>,
 ) -> Option<String> {
     let too_many = |member: &str, actual: usize, cap: usize| {
-        (actual > cap).then(|| format!("{member} carries {actual} entries, more than the {cap} this service accepts"))
+        (actual > cap).then(|| {
+            validation_message(
+                member,
+                &requirement_text(ViolationKind::MaxLength(cap as i64)),
+            )
+        })
     };
     too_many("tags", tags.map_or(0, std::collections::HashMap::len), MAX_TAGS)
         .or_else(|| {

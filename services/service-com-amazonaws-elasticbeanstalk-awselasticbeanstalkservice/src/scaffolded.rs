@@ -43,8 +43,9 @@
 //!
 //! This service uses that channel for the awsQuery service-level errors its
 //! model declares no shape for but its own documentation (or its recorded
-//! behaviour) names: `InvalidParameterValue`, `MissingRequiredParameter`,
-//! `MissingParameter` and `InternalFailure`. See [`Scaffolded::Service`].
+//! behaviour) names: `ValidationError`, `InvalidParameterValue`,
+//! `MissingRequiredParameter`, `MissingParameter` and `InternalFailure`. See
+//! [`Scaffolded::Service`].
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -219,6 +220,16 @@ pub static SERVICE_ERROR_SCHEMA: Schema = Schema::new_struct(
 /// awsQuery family's service-level client errors), so it is named here, where the
 /// wrapper already carries the errors a model does not declare.
 pub const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// `ValidationError`: the request itself does not satisfy the rules the MODEL
+/// declares — a value outside an enumerated set, outside a `@length` or `@range`
+/// bound, or outside a `@pattern`. It is the code the awsQuery family's
+/// request-validation layer answers with, raised before any handler runs and so
+/// before the request's resources are resolved, which is what separates it from
+/// [`INVALID_PARAMETER_VALUE`]: that one says a well-formed parameter cannot be
+/// used against this account's state, this one says the request is malformed.
+/// Like the two below, a service-level awsQuery error with no shape in the model.
+pub const VALIDATION_ERROR: &str = "ValidationError";
 
 /// `MissingRequiredParameter`: a parameter this operation requires for the
 /// combination of values supplied was absent. The model documents this code for

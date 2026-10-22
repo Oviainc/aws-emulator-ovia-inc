@@ -10,7 +10,11 @@
 //!
 //! A configuration is addressed by the `type`/`name` pair of
 //! `IdentityProviderConfig`, within the cluster named by the path. `oidc` is the only
-//! type this API defines, so any other type names no configuration.
+//! type this API defines, so any other type names no configuration. That pair is ONE
+//! resource, so a describe whose cluster or whose configuration name is not in the
+//! store answers the same way, with the service's generic
+//! [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] rather than naming the half it could
+//! not find.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
@@ -57,7 +61,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{self, IDENTITY_PROVIDER_CONFIG_TYPE_OIDC};
+use crate::state::{self, IDENTITY_PROVIDER_CONFIG_TYPE_OIDC, RESOURCE_NOT_FOUND_MESSAGE};
 use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -152,15 +156,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The cluster is resolved first: a configuration is a sub-resource of its
         // cluster, and a cluster name identifies a cluster only within one region.
+        // An unknown cluster and a name no configuration on it carries are the same
+        // answer, in the same wording: this operation addresses ONE resource — the
+        // `(cluster, configuration)` pair — so it reports the service's generic
+        // not-found sentence ([`crate::state::RESOURCE_NOT_FOUND_MESSAGE`], shared
+        // with the access-entry reads) rather than naming the half it could not
+        // find, which is what `DescribeCluster`, resolving a cluster by name alone,
+        // does instead.
         let Some(cluster) = guard.clusters.get(&(region, input.cluster_name.clone())) else {
             return Err(
                 DescribeIdentityProviderConfigErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(format!(
-                            "No cluster found for name: {}.",
-                            input.cluster_name
-                        )),
+                        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                         ..Default::default()
                     },
                 )
@@ -200,10 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DescribeIdentityProviderConfigErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         cluster_name: Some(input.cluster_name.clone()),
-                        message: Some(format!(
-                            "No identity provider config found for name: {}.",
-                            requested.name
-                        )),
+                        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                         ..Default::default()
                     },
                 )

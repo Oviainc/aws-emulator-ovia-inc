@@ -45,6 +45,12 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code this service answers an input-constraint violation with: the
+/// modelled `ValidationException` (HTTP 400), which is also the code the framework
+/// would have chosen — restated here because `override_refusal` replaces the code and
+/// the message together.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
 /// The `com-amazonaws-aiops-aiops` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -98,15 +104,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // This service states a constraint violation WITHOUT the value that violated
+        // it, and states a `@pattern` requirement as the expression it applies rather
+        // than the anchored form the model spells — both single-homed in
+        // `crate::state`, so a refusal made at the boundary and one a handler makes
+        // itself read alike. The code stays the modelled `ValidationException`
+        // (`smithy_query(query="shape",shape="ValidationException")`: `@error client`,
+        // `@httpError 400`), which is also what the framework would have answered:
+        // only the wording changes.
+        //
+        // An authentication refusal keeps the framework's wording — it is not an
+        // input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: VALIDATION_EXCEPTION.to_string(),
+                message: crate::state::validation_exception_message(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

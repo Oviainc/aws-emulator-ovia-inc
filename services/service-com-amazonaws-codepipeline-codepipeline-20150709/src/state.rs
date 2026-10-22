@@ -10,7 +10,7 @@
 //! store reached through [`service_state`], so every handler computes its answer
 //! from persisted state rather than from the request it is answering.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -97,6 +97,18 @@ pub fn invalid_transition_type_message(transition_type: &str) -> Option<String> 
 /// number of 1. This number is incremented when a pipeline is updated."
 pub const FIRST_PIPELINE_VERSION: i32 = 1;
 
+/// The most declaration versions this emulator retains per pipeline; accepting
+/// another `UpdatePipeline` drops the oldest version beyond this window, so a
+/// `GetPipeline` naming it answers `PipelineVersionNotFoundException`.
+///
+/// A bound is required: `Pipeline::versions` grows by one on every accepted update
+/// and is released only when the pipeline is deleted, so without a cap a caller
+/// could grow the store without limit by updating one pipeline. AWS publishes no
+/// retained-version count, so the figure is this emulator's bound rather than a
+/// documented constant; the current version is always retained, since the window is
+/// larger than one.
+pub const MAX_PIPELINE_VERSIONS_RETAINED: usize = 1000;
+
 /// The most pipelines this emulator holds for the account before `CreatePipeline`
 /// refuses another one.
 ///
@@ -109,6 +121,22 @@ pub const FIRST_PIPELINE_VERSION: i32 = 1;
 /// pipelines per Region per account. AWS adjusts that quota per account, so the
 /// value here is this emulator's bound rather than a universal constant.
 pub const MAX_PIPELINES_PER_ACCOUNT: usize = 1000;
+
+/// The most action types this emulator registers for the account before another
+/// registration is refused.
+///
+/// A bound is required for the same reason the pipeline cap is: `action_types`
+/// grows by one on every accepted registration, each entry carrying the
+/// caller-supplied `ActionTypeId` members and the action's configuration
+/// properties, and it is released only by forgetting that id — so without a cap a
+/// caller could grow the store without limit. The refusal a handler answers past it
+/// is the one `CreateCustomActionType` models for exactly this condition,
+/// `LimitExceededException`. AWS adjusts its custom-action quota per account, so the
+/// figure here is this emulator's bound rather than a documented constant.
+///
+/// [`ComAmazonawsCodepipelineCodepipeline20150709State::register_action_type`] is the
+/// one way into the map, so the bound holds whatever registers.
+pub const MAX_ACTION_TYPES_PER_ACCOUNT: usize = 1000;
 
 /// The most recent executions this emulator retains per pipeline; starting another
 /// one drops the oldest beyond this window, together with the `clientRequestToken`
@@ -147,7 +175,12 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// types the service itself provides are not account state and live in
     /// [`BUILT_IN_ACTION_TYPES`]; [`ComAmazonawsCodepipelineCodepipeline20150709State::action_type_catalog`]
     /// is the one place the two are put in a single order.
-    pub action_types: BTreeMap<ActionTypeKey, ActionTypeRecord>,
+    ///
+    /// PRIVATE, unlike the maps above, so that every registration goes through
+    /// [`ComAmazonawsCodepipelineCodepipeline20150709State::register_action_type`]
+    /// and the [`MAX_ACTION_TYPES_PER_ACCOUNT`] bound cannot be bypassed; read it
+    /// through `action_type_catalog` or `registered_action_type`.
+    action_types: BTreeMap<ActionTypeKey, ActionTypeRecord>,
     /// The partner integrations registered with this service: the identity of a
     /// `ThirdParty` action type -> the AWS account id of the partner whose job worker
     /// CodePipeline serves that action type's jobs to.
@@ -298,6 +331,43 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         }
         self.idempotency
             .retain(|(pipeline_name, _), _| pipeline_name != name);
+    }
+
+    /// Register `record` under `key`, answering whether the store took it.
+    ///
+    /// `false` means the account is already holding [`MAX_ACTION_TYPES_PER_ACCOUNT`]
+    /// action types and this id is not one of them, so the registration must be
+    /// refused with `LimitExceededException` rather than accepted — the same shape
+    /// `CreatePipeline` answers at its own cap. Re-registering an id the store
+    /// already holds REPLACES that record and is always accepted: it grows nothing.
+    pub fn register_action_type(&mut self, key: ActionTypeKey, record: ActionTypeRecord) -> bool {
+        if !self.action_types.contains_key(&key)
+            && self.action_types.len() >= MAX_ACTION_TYPES_PER_ACCOUNT
+        {
+            return false;
+        }
+        self.action_types.insert(key, record);
+        true
+    }
+
+    /// Forget the action type registered under `key`, answering whether one was
+    /// registered. The release path the bound needs: without it a registration
+    /// could never be given back.
+    pub fn forget_action_type(&mut self, key: &ActionTypeKey) -> bool {
+        self.action_types.remove(key).is_some()
+    }
+
+    /// The record registered under `key`, or `None` when this account registered no
+    /// action type with that id. Reads the registrations only — the action types the
+    /// service itself provides are in [`BUILT_IN_ACTION_TYPES`].
+    pub fn registered_action_type(&self, key: &ActionTypeKey) -> Option<&ActionTypeRecord> {
+        self.action_types.get(key)
+    }
+
+    /// How many action types this account has registered, of at most
+    /// [`MAX_ACTION_TYPES_PER_ACCOUNT`].
+    pub fn registered_action_type_count(&self) -> usize {
+        self.action_types.len()
     }
 
     /// Every action type this account can use, in one total order over the
@@ -683,6 +753,72 @@ impl Pipeline {
             // enabled.
             transitions: BTreeMap::new(),
         }
+    }
+
+    /// Replace this pipeline's structure with `declaration` and return the
+    /// declaration as stored.
+    ///
+    /// `UpdatePipeline` documents "Use a JSON file with the pipeline structure and
+    /// UpdatePipeline to provide the full structure of the pipeline. Updating the
+    /// pipeline increases the version number of the pipeline by 1" — so the stored
+    /// declaration is REPLACED rather than merged, the version is the previous one
+    /// plus 1 (whatever `version` the caller's declaration carried, which may be a
+    /// stale one read back from `GetPipeline`), and the new declaration is kept
+    /// beside the earlier versions so a `GetPipeline` naming one of them still reads
+    /// it. `created` is untouched and `updated` moves to `now`.
+    ///
+    /// A stage the replacement structure no longer declares also takes its persisted
+    /// `transitions` record with it: a transition belongs to a declared stage, so a
+    /// later structure reusing that stage name must not inherit an enablement a call
+    /// against a different structure left behind.
+    ///
+    /// The members the service resolves rather than the caller — `version`,
+    /// `pipelineType`, `executionMode` — are resolved from the declaration the same
+    /// way a create resolves them, which is what `PipelineDeclaration$pipelineType`
+    /// documents ("Including V2 parameters ... when creating or updating a pipeline
+    /// will result in the pipeline having the V2 type of pipeline").
+    pub fn update(
+        &mut self,
+        declaration: PipelineDeclaration,
+        now: SystemTime,
+    ) -> PipelineDeclaration {
+        let pipeline_type = resolved_pipeline_type(&declaration);
+        let execution_mode = resolved_execution_mode(&declaration);
+        // A saturating step keeps `version` inside `PipelineVersion`'s modelled
+        // range instead of wrapping; reaching `i32::MAX` updates is not a path a
+        // caller can walk, so the saturation is a safety net, not a behaviour.
+        let version = self.version.saturating_add(1);
+        let mut declaration = declaration;
+        declaration.version = Some(version);
+        declaration.pipeline_type = Some(pipeline_type);
+        declaration.execution_mode = Some(execution_mode);
+
+        self.versions.insert(version, declaration.clone());
+        // Oldest first: `versions` is keyed by the ascending version number.
+        while self.versions.len() > MAX_PIPELINE_VERSIONS_RETAINED {
+            self.versions.pop_first();
+        }
+
+        self.declaration = declaration;
+        self.version = version;
+        self.updated = now;
+
+        // A persisted transition belongs to a stage the pipeline DECLARES, so a
+        // stage the replacement structure no longer names takes its transition
+        // record with it: otherwise a later structure that reuses that stage name
+        // would inherit an `enabled`/`disabledReason` a call against a different
+        // structure left behind, and the first stage — which has no inbound edge —
+        // could report an inbound transition state.
+        let declared: BTreeSet<String> = self
+            .declaration
+            .stages
+            .iter()
+            .map(|stage| stage.name.clone())
+            .collect();
+        self.transitions
+            .retain(|(stage_name, _), _| declared.contains(stage_name));
+
+        self.declaration.clone()
     }
 
     /// Whether this pipeline declares a stage named `stage_name`.

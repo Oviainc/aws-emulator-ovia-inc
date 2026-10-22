@@ -39,6 +39,8 @@ mod model_card_governance;
 mod model_package_group_lifecycle;
 #[path = "all/model_package_registry.rs"]
 mod model_package_registry;
+#[path = "all/notebook_instance_lifecycle.rs"]
+mod notebook_instance_lifecycle;
 #[path = "all/notebook_lifecycle_config.rs"]
 mod notebook_lifecycle_config;
 #[path = "all/pipeline_lifecycle.rs"]

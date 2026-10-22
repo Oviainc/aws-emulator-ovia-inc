@@ -2,7 +2,8 @@
 
 //! @op DeleteApplication
 //! Implemented: deletes the application and its versions from the store, terminating its
-//! environments when `TerminateEnvByForce` asks for it. This is the ONLY file to touch for
+//! environments when `TerminateEnvByForce` asks for it, and succeeding as a no-op when no
+//! application exists under the name. This is the ONLY file to touch for
 //! this operation.
 //!
 //! ## Shape of an operation
@@ -158,10 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
 
         if !store.applications.contains_key(&input.application_name) {
-            return Err(DeleteApplicationError::invalid_parameter_value(format!(
-                "No Application named '{}' found.",
-                input.application_name
-            )));
+            // The model declares NO not-found error for this operation (its only
+            // modelled error is `OperationInProgressException`), and deleting a
+            // name no application exists under succeeds: there is nothing left to
+            // delete, which is the post-condition the caller asked for. So this is
+            // a no-op success — it creates nothing, touches no environment, and
+            // answers the same way however many times it is repeated, which is
+            // what makes a re-run teardown converge instead of aborting.
+            return Ok(DeleteApplicationOutput);
         }
 
         // "You cannot delete an application that has a running environment" —

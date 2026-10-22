@@ -97,18 +97,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound). The framework's
-        // default codes for the query protocols are `MalformedInput` /
-        // `ValidationError`; Elastic Beanstalk names these two refusals itself,
-        // and its model says which code for which case:
+        // required member, or a value outside a rule the model declares). Two
+        // DIFFERENT failures arrive here and Elastic Beanstalk names them with two
+        // different codes:
         //
-        // * a value that cannot be used -> `InvalidParameterValue`
-        //   (`CreateEnvironment$EnvironmentName`: "If the specified name already
-        //   exists in the region, Elastic Beanstalk returns an
-        //   InvalidParameterValue error.")
         // * an absent required parameter -> `MissingRequiredParameter`
         //   (`TerminateEnvironment$EnvironmentId`: "If you do not specify
         //   either, Elastic Beanstalk returns MissingRequiredParameter error.")
+        // * a value outside a modelled constraint (an enumerated value set, a
+        //   `@length` or `@range` bound, a `@pattern`) -> `ValidationError`, the
+        //   awsQuery request-validation code. This refusal is raised BEFORE any
+        //   handler runs, so it is a statement about the SHAPE of the request and
+        //   not about the account's state — which is why it must not borrow
+        //   `InvalidParameterValue`, the code this service documents for a
+        //   well-formed parameter that cannot be used (`CreateEnvironment`
+        //   `$EnvironmentName`: "If the specified name already exists in the
+        //   region, Elastic Beanstalk returns an InvalidParameterValue error").
+        //   Handlers raise that one themselves, once identity is resolved.
         //
         // Both the code and the message are replaced together, so a client that
         // branches on the code reads one that matches the prose. An
@@ -118,19 +123,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 let all_absent = violations.iter().all(|violation| {
                     violation.kind == smithy_server_runtime::ViolationKind::MissingRequiredMember
                 });
-                let code = if all_absent {
-                    crate::scaffolded::MISSING_REQUIRED_PARAMETER
-                } else {
-                    crate::scaffolded::INVALID_PARAMETER_VALUE
-                };
-                let message = violations
-                    .iter()
-                    .map(smithy_server_runtime::Violation::message)
-                    .collect::<Vec<String>>()
-                    .join(" ");
+                if all_absent {
+                    return Some(Refused {
+                        code: crate::scaffolded::MISSING_REQUIRED_PARAMETER.to_string(),
+                        message: violations
+                            .iter()
+                            .map(smithy_server_runtime::Violation::message)
+                            .collect::<Vec<String>>()
+                            .join(" "),
+                    });
+                }
+                // Reaching here means at least one value was read and failed a
+                // constraint. A refusal that mixes the two classes does not arrive
+                // from the wire: absence is found while READING the request, which
+                // stops before the constraint walk over what was read, so an
+                // absent required member is always refused on its own.
                 Some(Refused {
-                    code: code.to_string(),
-                    message,
+                    code: crate::scaffolded::VALIDATION_ERROR.to_string(),
+                    message: validation_error_message(violations),
                 })
             }
             _ => None,
@@ -164,4 +174,141 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         let _ = error;
         None
     }
+}
+
+/// The marker the framework's own clause is built
+/// around: [`smithy_server_runtime::Violation::message`] renders
+/// `Value '<v>' at '<path>' failed to satisfy constraint: <requirement>`, and the
+/// requirement itself is what AWS nests when the offending value is a COLLECTION
+/// ELEMENT. `Violation::requirement` is private to the framework, so the
+/// requirement is recovered from the one rendering that states it rather than
+/// spelled a second way here (which would let the two drift apart).
+const CONSTRAINT_MARKER: &str = "failed to satisfy constraint: ";
+
+/// AWS's standard request-validation message, built from the request:
+///
+/// ```text
+/// <N> validation error(s) detected: Value '<value>' at '<member path>' failed to
+/// satisfy constraint: <requirement>[; …]
+/// ```
+///
+/// `N` counts the MEMBERS that failed, not the values: several bad elements of
+/// one list are one violation of that list member, reported with the offending
+/// elements bracketed and the element requirement nested, which is the form AWS
+/// answers a list-of-enum member with
+/// (`Value '[<bad>]' at 'attributeNames' failed to satisfy constraint: Member must
+/// satisfy constraint: [Member must satisfy enum value set: [...]]`).
+///
+/// Every violation yields exactly one clause, so for the non-empty violation list
+/// this is only ever called with (see `override_refusal`'s guard) the count is at
+/// least one and the envelope's noun is never read off an empty list.
+fn validation_error_message(violations: &[smithy_server_runtime::Violation]) -> String {
+    let clauses = violation_clauses(violations);
+    let noun = if clauses.len() == 1 {
+        "validation error"
+    } else {
+        "validation errors"
+    };
+    format!(
+        "{} {noun} detected: {}",
+        clauses.len(),
+        clauses.join("; ")
+    )
+}
+
+/// One clause per failing MEMBER, in the order the walk found them.
+///
+/// A violation whose path ends at a collection ELEMENT (`<member>.<index>.member`)
+/// is attributed to the collection member itself, so two bad elements of one list
+/// collapse into a single clause listing both values.
+fn violation_clauses(violations: &[smithy_server_runtime::Violation]) -> Vec<String> {
+    /// One collection member's violations: where its clause belongs in the
+    /// output, which member and requirement identify the group, and the elements
+    /// that failed. The slot lives on the group, so the clause can only ever be
+    /// written where the group was opened.
+    struct Collapsed {
+        slot: usize,
+        member: String,
+        requirement: String,
+        values: Vec<String>,
+    }
+
+    let mut collapsed: Vec<Collapsed> = Vec::new();
+    let mut clauses: Vec<String> = Vec::new();
+    for violation in violations {
+        let Some(member) = collection_member_path(&violation.path) else {
+            clauses.push(violation.message());
+            continue;
+        };
+        let requirement = requirement_of(violation);
+        let value = violation.value.clone().unwrap_or_else(|| "null".to_string());
+        if let Some(group) = collapsed
+            .iter_mut()
+            .find(|group| group.member == member && group.requirement == requirement)
+        {
+            group.values.push(value);
+            continue;
+        }
+        collapsed.push(Collapsed {
+            // The clause is rendered once the group is complete; its place in the
+            // output is taken now, so the order the violations arrived in holds.
+            slot: clauses.len(),
+            member: member.to_string(),
+            requirement,
+            values: vec![value],
+        });
+        clauses.push(String::new());
+    }
+    for group in collapsed {
+        clauses[group.slot] = format!(
+            "Value '[{}]' at '{}' failed to satisfy constraint: \
+             Member must satisfy constraint: [{}]",
+            group.values.join(", "),
+            group.member,
+            group.requirement
+        );
+    }
+    clauses
+}
+
+/// The requirement the framework states for `violation` — the text after the LAST
+/// [`CONSTRAINT_MARKER`] in a clause rendered with NO value attached.
+///
+/// Both halves of that matter: a clause rendered WITH the value starts with the
+/// caller's own bytes (`Value '<value>' at '<path>' …`), and a member path can
+/// carry a caller-chosen map key, so splitting at the FIRST marker would let
+/// request text become the "requirement" this nests into a collapsed clause.
+/// Dropping the value and splitting at the LAST marker leaves nothing a caller
+/// controls on the requirement side.
+///
+/// This is the requirement half of a validation message, which
+/// `services/common/src/validation.rs` lists under "Still to migrate here" —
+/// every service words it identically. Delete this function in favour of that
+/// module's own once it carries it; only the envelope around the clauses
+/// (`N validation error(s) detected`, the collapse of collection elements) is
+/// this service's dialect.
+fn requirement_of(violation: &smithy_server_runtime::Violation) -> String {
+    let stated = smithy_server_runtime::Violation {
+        path: violation.path.clone(),
+        kind: violation.kind.clone(),
+        value: None,
+    }
+    .message();
+    match stated.rsplit_once(CONSTRAINT_MARKER) {
+        Some((_, requirement)) => requirement.to_string(),
+        // Not a clause this framework built: keep what it said rather than
+        // inventing a requirement for it.
+        None => violation.message(),
+    }
+}
+
+/// The collection member a dotted path ends in an ELEMENT of, if it does:
+/// `attributeNames.1.member` -> `attributeNames`. A path that ends anywhere else
+/// — a plain member, or a struct member inside a list element
+/// (`optionSettings.1.member.namespace`, which AWS reports at that full path) —
+/// yields `None`.
+fn collection_member_path(path: &str) -> Option<&str> {
+    let (head, index) = path.strip_suffix(".member")?.rsplit_once('.')?;
+    let indexed = !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit());
+    indexed.then_some(head)
 }

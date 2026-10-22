@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePlatformVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePlatformVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: records a custom platform version for this account and reports it as
+//! `Creating` until the clock makes the build completion due. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePlatformVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The platform definition archive named by `PlatformDefinitionBundle` is NOT read and no
+//! builder environment is launched, so every value a built platform would report from the
+//! archive (its category, maintainer, operating system, languages, frameworks) and the
+//! `Builder` of the response are absent rather than invented.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +152,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePlatformVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePlatformVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePlatformVersion"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePlatformVersionError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        let arn = crate::state::platform_version_arn(
+            &region,
+            &input.platform_name,
+            &input.platform_version,
+        );
+        if store.platform_versions.contains_key(&arn) {
+            return Err(CreatePlatformVersionError::invalid_parameter_value(format!(
+                "Platform version '{}' of platform '{}' already exists.",
+                input.platform_version, input.platform_name
+            )));
+        }
+        // "TooManyPlatformsException: You have exceeded the maximum number of
+        // allowed platforms associated with the account." Enforcing the bound is
+        // also what keeps the platform store bounded.
+        if store.platform_versions.len() >= crate::state::MAX_PLATFORM_VERSIONS {
+            return Err(CreatePlatformVersionErrorModeled::TooManyPlatformsException(
+                TooManyPlatformsException {
+                    message: Some(format!(
+                        "The number of custom platform versions in this account has reached \
+                         the limit of {}.",
+                        crate::state::MAX_PLATFORM_VERSIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let created = crate::state::now();
+        let platform_version = crate::state::PlatformVersion {
+            arn: arn.clone(),
+            platform_name: input.platform_name.clone(),
+            platform_version: input.platform_version.clone(),
+            platform_owner: ::engine::emulator_account_id().to_string(),
+            // The version is built before it can be used, so it starts `Creating`
+            // and the move to `Ready` is what the clock owes.
+            status: crate::state::PLATFORM_STATUS_CREATING.to_string(),
+            definition_bundle: Some(input.platform_definition_bundle.clone()),
+            option_settings: input.option_settings.clone().unwrap_or_default(),
+            builder_environment_name: input.environment_name.clone(),
+            date_created: created,
+            date_updated: created,
+            tags: input.tags.clone().unwrap_or_default(),
+            pending_status: Some(crate::state::PendingPlatformStatus::build_completion()),
+        };
+        let summary = platform_version.to_summary();
+        store.platform_versions.insert(arn, platform_version);
+
+        Ok(CreatePlatformVersionOutput {
+            platform_summary: Some(summary),
+            // "Builder: The builder used to create the custom platform" — no
+            // builder environment is launched here, so there is none to report.
+            builder: None,
+        })
     }
 }

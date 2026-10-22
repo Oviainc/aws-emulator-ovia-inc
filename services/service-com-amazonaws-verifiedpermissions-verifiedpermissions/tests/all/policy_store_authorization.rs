@@ -983,8 +983,9 @@ async fn policy_operations_refuse_what_the_model_says_they_refuse() {
         "case \"STRICT store with no schema\": expected 400, got {status} {response}"
     );
 
-    // A template-linked definition has no template to link to yet, so it answers
-    // the scaffold's 501 rather than a fabricated policy.
+    // A template-linked definition names the template it instantiates, so one
+    // naming a template the store does not hold is a 404 for that template —
+    // never a 501, which would say the operation is unimplemented.
     let (status, response) = call(
         &router,
         "CreatePolicy",
@@ -995,8 +996,15 @@ async fn policy_operations_refuse_what_the_model_says_they_refuse() {
     )
     .await;
     assert_eq!(
-        status, 501,
-        "case \"templateLinked definition\": expected 501, got {status} {response}"
+        status, 404,
+        "case \"templateLinked definition naming no template\": expected 404, got {status} \
+         {response}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "ResourceNotFoundException",
+        "case \"templateLinked definition naming no template\": unexpected error code, got \
+         {response}"
     );
 }
 

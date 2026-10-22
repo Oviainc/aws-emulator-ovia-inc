@@ -149,6 +149,12 @@ pub struct Domain {
 }
 
 /// A persisted `Subscription`, stored under its own `Domain`.
+///
+/// `activated_at` / `deactivated_at` are a HISTORY of the explicit
+/// `ActivateSubscription` / `DeactivateSubscription` transitions, not a view of
+/// `status`: each is stamped when its transition happens and is never cleared, so both
+/// boundaries of a billing interval remain readable after the opposite transition. A
+/// freshly created subscription has made neither transition, so it carries neither.
 #[derive(Debug, Clone)]
 pub struct Subscription {
     pub domain_id: String,

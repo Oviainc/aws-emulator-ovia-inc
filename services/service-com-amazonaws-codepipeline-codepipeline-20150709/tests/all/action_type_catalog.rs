@@ -24,7 +24,7 @@ use service_com_amazonaws_codepipeline_codepipeline_20150709::ops::types::{
     ActionConfigurationProperty, ActionTypeSettings, ArtifactDetails,
 };
 use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
-    ActionTypeKey, ActionTypeRecord, BUILT_IN_ACTION_TYPES,
+    ActionTypeKey, ActionTypeRecord, BUILT_IN_ACTION_TYPES, MAX_ACTION_TYPES_PER_ACCOUNT,
 };
 use service_com_amazonaws_codepipeline_codepipeline_20150709::ComAmazonawsCodepipelineCodepipeline20150709State as ServiceState;
 
@@ -113,13 +113,18 @@ impl Emulator {
     }
 
     /// Register one action type in this account's store, the way
-    /// `CreateCustomActionType` will once it is implemented.
+    /// `CreateCustomActionType` will once it is implemented — through the gate that
+    /// enforces `MAX_ACTION_TYPES_PER_ACCOUNT`.
     fn register(&self, key: ActionTypeKey, record: ActionTypeRecord) {
-        self.engine
+        let accepted = self
+            .engine
             .state::<ServiceState>()
             .lock()
-            .action_types
-            .insert(key, record);
+            .register_action_type(key.clone(), record);
+        assert!(
+            accepted,
+            "registering {key:?} must be accepted below the account's action-type bound"
+        );
     }
 }
 
@@ -549,5 +554,100 @@ async fn a_next_token_this_listing_never_issued_is_refused() {
     assert!(
         !second_ids.is_empty() && second_ids[0] > first_ids[first_ids.len() - 1],
         "the second page resumes after the first, got {second}"
+    );
+}
+
+/// This account's registration store is BOUNDED: a registration is taken while the
+/// account holds fewer than `MAX_ACTION_TYPES_PER_ACCOUNT` action types and refused
+/// past that, re-registering an id already held replaces it (it grows nothing), and
+/// forgetting one gives the slot back. Without the bound a registration path would
+/// grow the process heap for as long as the emulator runs.
+#[tokio::test]
+async fn the_accounts_registration_store_is_bounded() {
+    let emulator = Emulator::new();
+    let state = emulator.engine.state::<ServiceState>();
+
+    // Fill the account to the bound through the one way into the store.
+    for index in 0..MAX_ACTION_TYPES_PER_ACCOUNT {
+        let (key, record) = custom("Build", &format!("provider-{index}"), "1", "us-east-1");
+        assert!(
+            state.lock().register_action_type(key, record),
+            "registration {index} is inside the bound and must be taken"
+        );
+    }
+    assert_eq!(
+        state.lock().registered_action_type_count(),
+        MAX_ACTION_TYPES_PER_ACCOUNT,
+        "the account holds exactly the registrations it was given"
+    );
+
+    // One id past the bound is refused, and stores nothing.
+    let (extra, record) = custom("Build", "one-too-many", "1", "us-east-1");
+    assert!(
+        !state.lock().register_action_type(extra.clone(), record),
+        "a registration past the bound must be refused, got it accepted"
+    );
+    assert!(
+        state.lock().registered_action_type(&extra).is_none(),
+        "a refused registration must store nothing"
+    );
+    assert_eq!(
+        state.lock().registered_action_type_count(),
+        MAX_ACTION_TYPES_PER_ACCOUNT,
+        "a refused registration must not grow the store"
+    );
+
+    // Replacing an id the store already holds grows nothing, so it is taken even at
+    // the bound — and the record it reports is the new one.
+    let (held, replacement) = custom("Build", "provider-0", "1", "eu-west-1");
+    assert!(
+        state.lock().register_action_type(held.clone(), replacement),
+        "re-registering a held id must be taken at the bound"
+    );
+    assert_eq!(
+        state
+            .lock()
+            .registered_action_type(&held)
+            .and_then(|record| record.region.clone()),
+        Some("eu-west-1".to_string()),
+        "the replacement record must be the one the store reports"
+    );
+    assert_eq!(
+        state.lock().registered_action_type_count(),
+        MAX_ACTION_TYPES_PER_ACCOUNT,
+        "a replacement must not grow the store"
+    );
+
+    // Forgetting a registration releases its slot, and forgetting it twice reports
+    // that there was nothing left to forget.
+    assert!(
+        state.lock().forget_action_type(&held),
+        "a held registration must be forgotten"
+    );
+    assert!(
+        !state.lock().forget_action_type(&held),
+        "forgetting an id the store no longer holds must report nothing forgotten"
+    );
+    let (extra, record) = custom("Build", "one-too-many", "1", "us-east-1");
+    assert!(
+        state.lock().register_action_type(extra.clone(), record),
+        "the slot a forgotten registration released must be usable again"
+    );
+    assert_eq!(
+        state.lock().registered_action_type_count(),
+        MAX_ACTION_TYPES_PER_ACCOUNT,
+        "the store is back at the bound, never past it"
+    );
+
+    // The listing still answers from the store, so the bound did not break the read
+    // path: the id that replaced a slot is reported for its Region.
+    let listed = emulator
+        .list(&json!({"actionOwnerFilter": "Custom", "regionFilter": "us-east-1"}))
+        .await;
+    assert!(
+        ids(&listed)
+            .iter()
+            .all(|(_, owner, _, _)| owner == "Custom"),
+        "the listing must report only the registrations it was asked for, got {listed}"
     );
 }

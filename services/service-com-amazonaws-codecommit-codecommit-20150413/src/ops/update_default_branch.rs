@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDefaultBranch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDefaultBranch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDefaultBranch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: points the stored repository's `defaultBranch` at a branch the
+//! repository holds, so a later `GetRepository` reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +174,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDefaultBranch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDefaultBranchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDefaultBranch"))
+        let _ = ctx;
+        // Both members are `@required`, so an ABSENT name is already refused at the
+        // boundary as `RepositoryNameRequiredException` /
+        // `BranchNameRequiredException`, and a name outside its modelled constraints
+        // — `RepositoryName`'s length and pattern, `BranchName`'s length 1..256, so
+        // including an empty string — as `InvalidRepositoryNameException` /
+        // `InvalidBranchNameException` (see `crate::service`).
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        let repository = store
+            .repositories
+            .get_mut(&input.repository_name)
+            .ok_or_else(|| {
+                UpdateDefaultBranchErrorModeled::RepositoryDoesNotExistException(
+                    RepositoryDoesNotExistException {
+                        message: Some(format!(
+                            "the repository {} does not exist",
+                            input.repository_name
+                        )),
+                    },
+                )
+            })?;
+
+        // The default branch names a branch OF THIS REPOSITORY, so only a branch the
+        // repository holds can become it.
+        if !repository.branches.contains_key(&input.default_branch_name) {
+            return Err(UpdateDefaultBranchErrorModeled::BranchDoesNotExistException(
+                BranchDoesNotExistException {
+                    message: Some(format!(
+                        "the branch {} does not exist in the repository {}",
+                        input.default_branch_name, input.repository_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "If you use this operation to change the default branch name to the current
+        // default branch name, a success message is returned even though the default
+        // branch did not change": the call is idempotent, and the repository's
+        // `lastModifiedDate` moves only when the stored default branch really moved.
+        if repository.default_branch.as_deref() != Some(input.default_branch_name.as_str()) {
+            repository.default_branch = Some(input.default_branch_name.clone());
+            repository.last_modified_date = std::time::SystemTime::now();
+        }
+
+        Ok(UpdateDefaultBranchOutput)
     }
 }

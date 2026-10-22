@@ -168,6 +168,21 @@ impl Answer {
     pub(crate) fn error_code(&self) -> &str {
         self.value("Error/Code").unwrap_or_default()
     }
+
+    /// The awsQuery error envelope's `<Message>`, or `""` on a success envelope,
+    /// with the five predefined XML entities decoded — the envelope escapes the
+    /// quotes an AWS validation message puts around a value, and a caller's SDK
+    /// hands it back unescaped.
+    pub(crate) fn error_message(&self) -> String {
+        self.value("Error/Message")
+            .unwrap_or_default()
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            // Last, so a decoded entity is not decoded a second time.
+            .replace("&amp;", "&")
+    }
 }
 
 /// The content of every `<tag>…</tag>` in `xml`, in document order.
@@ -1058,7 +1073,11 @@ async fn bad_requests_are_refused_with_the_services_own_error_codes() {
 
     // Rows span the classes of refusal: a name that is already used, a name that
     // names nothing, an absent either/or parameter, an absent required member,
-    // and a value outside a modelled bound.
+    // and a value outside a modelled bound. A value the MODEL refuses is a
+    // `ValidationError` (the request is malformed); a value the STORE refuses is
+    // an `InvalidParameterValue` (the request is well formed and names something
+    // that cannot be used). Deleting an application that does not exist is in
+    // neither class — see `request_refusals.rs`.
     let cases = vec![
         RefusalCase {
             case: "duplicate application",
@@ -1117,13 +1136,6 @@ async fn bad_requests_are_refused_with_the_services_own_error_codes() {
             code: "InvalidParameterValue",
         },
         RefusalCase {
-            case: "delete an unknown application",
-            action: "DeleteApplication",
-            params: vec![("ApplicationName", "nope")],
-            status: 400,
-            code: "InvalidParameterValue",
-        },
-        RefusalCase {
             case: "terminate with neither id nor name",
             action: "TerminateEnvironment",
             params: vec![],
@@ -1149,7 +1161,7 @@ async fn bad_requests_are_refused_with_the_services_own_error_codes() {
             action: "CreateEnvironment",
             params: vec![("ApplicationName", "taken"), ("EnvironmentName", "ab")],
             status: 400,
-            code: "InvalidParameterValue",
+            code: "ValidationError",
         },
         RefusalCase {
             // The modelled maximum for `ApplicationName` is 100 characters.
@@ -1160,14 +1172,14 @@ async fn bad_requests_are_refused_with_the_services_own_error_codes() {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )],
             status: 400,
-            code: "InvalidParameterValue",
+            code: "ValidationError",
         },
         RefusalCase {
             case: "MaxRecords over the modelled maximum of 1000",
             action: "DescribeEnvironments",
             params: vec![("MaxRecords", "1001")],
             status: 400,
-            code: "InvalidParameterValue",
+            code: "ValidationError",
         },
     ];
 

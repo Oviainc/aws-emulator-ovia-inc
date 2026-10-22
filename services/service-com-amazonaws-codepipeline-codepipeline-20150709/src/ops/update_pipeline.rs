@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces a stored pipeline's `PipelineDeclaration` with the full structure the
+//! caller sent, at the previous version plus 1, keeping the earlier versions readable
+//! through `GetPipeline` — so the answer is computed from the persisted pipeline, not
+//! from the request alone.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +69,8 @@
 //! * `LimitExceededException` (HTTP 400) — The number of pipelines associated with the Amazon
 //!   Web Services account has exceeded the limit allowed for the account.
 //! * `ValidationException` (HTTP 400) — The validation was specified in an invalid format.
+//! * `PipelineNotFoundException` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): the pipeline was specified in an invalid format or cannot be found.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -88,9 +86,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codepipeline-codepipeli
 // here — hence the `UpdatePipelineError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codepipeline#UpdatePipeline")]
+// `PipelineNotFoundException` is widened in through `extra_errors`: `pipeline.name`
+// names an existing pipeline whose structure this call replaces, so a name no
+// pipeline carries has to be refused, and this SERVICE models exactly that condition
+// ("The pipeline was specified in an invalid format or cannot be found", declared by
+// `GetPipeline`, `GetPipelineState` and the rest of the name-taking operations). The
+// alternative — the generic `ValidationException` — would tell the caller nothing
+// about which name failed to resolve.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codepipeline#UpdatePipeline",
+    extra_errors = ["PipelineNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdatePipelineErrorModeled {
+    PipelineNotFoundException(PipelineNotFoundException),
     InvalidActionDeclarationException(InvalidActionDeclarationException),
     InvalidBlockerDeclarationException(InvalidBlockerDeclarationException),
     InvalidStageDeclarationException(InvalidStageDeclarationException),
@@ -150,18 +159,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePipeline"))
+        // The pipeline's ARN and its creation instant are fixed at create time, so
+        // this call reads no request metadata: the region a request names cannot move
+        // a stored resource.
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+
+        // The same structural rules a create is held to: the declaration the caller
+        // sends is the FULL structure of the pipeline, so a structure that cannot
+        // describe a pipeline is refused with the error shape modelling that defect.
+        if let Err(problem) = crate::state::validate_declaration(&input.pipeline) {
+            let message = Some(problem.message().to_string());
+            return Err(match problem {
+                crate::state::DeclarationProblem::Structure(_) => {
+                    UpdatePipelineErrorModeled::InvalidStructureException(
+                        InvalidStructureException { message },
+                    )
+                }
+                crate::state::DeclarationProblem::Stage(_) => {
+                    UpdatePipelineErrorModeled::InvalidStageDeclarationException(
+                        InvalidStageDeclarationException { message },
+                    )
+                }
+            }
+            .into());
+        }
+
+        let name = input.pipeline.name.clone();
+        let mut state = state.lock();
+        let pipeline = state.pipelines.get_mut(&name).ok_or_else(|| {
+            UpdatePipelineError::from(UpdatePipelineErrorModeled::PipelineNotFoundException(
+                PipelineNotFoundException {
+                    message: Some(format!("pipeline {name} does not exist")),
+                },
+            ))
+        })?;
+
+        let stored = pipeline.update(input.pipeline, ::std::time::SystemTime::now());
+
+        Ok(UpdatePipelineOutput {
+            pipeline: Some(stored),
+        })
     }
 }

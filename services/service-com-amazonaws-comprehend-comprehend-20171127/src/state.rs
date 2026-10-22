@@ -10,6 +10,15 @@
 //! [`AnalysisJob::settle`] is the ONE place a job's clock-owed status change is
 //! materialised.
 //!
+//! ## What a job's terminal status says
+//!
+//! A job's terminal status is never assumed: [`AnalysisJob::terminal_outcome`] holds
+//! the outcome of the run the `Start*DetectionJob` handler actually performed —
+//! `COMPLETED` only when this emulator really read the input documents and wrote the
+//! output archive, `FAILED` with a reason when it could not — and [`AnalysisJob::settle`]
+//! reveals it once the clock owes the transition. A job whose run has not reported yet
+//! stays `IN_PROGRESS`, because it is still running.
+//!
 //! ## Bounds
 //!
 //! Every collection here is bounded, so no sequence of requests can grow this store
@@ -48,8 +57,9 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     ClassifierMetadata, DocumentClassifierInputDataConfig, DocumentClassifierOutputDataConfig,
-    DocumentClassifierProperties, InputDataConfig, KeyPhrasesDetectionJobProperties,
-    OutputDataConfig, SentimentDetectionJobProperties, Tag, VpcConfig,
+    DocumentClassifierProperties, DominantLanguageDetectionJobProperties, InputDataConfig,
+    KeyPhrasesDetectionJobProperties, OutputDataConfig, SentimentDetectionJobProperties, Tag,
+    VpcConfig,
 };
 
 /// How long a freshly submitted job stays `SUBMITTED` before the clock owes it
@@ -91,6 +101,29 @@ pub fn too_many_tags_message(tags: &[Tag]) -> Option<String> {
             tags.len()
         )
     })
+}
+
+/// Why a job whose batch run this emulator does not perform ends in the modelled
+/// `FAILED` state, naming the analysis that was not carried out and both S3
+/// locations the submission pointed at.
+///
+/// Running one of these jobs means reading the documents from the Amazon S3 location
+/// `InputDataConfig` names, analysing each one and writing the analysed output back
+/// to `OutputDataConfig`. The family whose run this emulator DOES perform —
+/// dominant-language detection — records what its run actually did; every other
+/// family's job ends with this reason instead of reporting a `COMPLETED` run that
+/// nothing performed. `analysis` names the family's work ("Sentiment analysis",
+/// "Key-phrase extraction", …).
+pub fn unperformed_run_message(
+    analysis: &str,
+    input: &InputDataConfig,
+    output: &OutputDataConfig,
+) -> String {
+    format!(
+        "{analysis} of the documents at {} was not performed by this emulator, so no \
+         document was analyzed and no output was written to {}.",
+        input.s3_uri, output.s3_uri,
+    )
 }
 
 /// The statuses an analysis job can never leave, out of
@@ -143,12 +176,14 @@ pub const MAX_DOCUMENT_CLASSIFIER_RECORDS: usize = 1000;
 /// Which `Start*DetectionJob` family a persisted [`AnalysisJob`] belongs to.
 ///
 /// The variant also carries the ARN resource type the family's `JobArn` uses, so
-/// the ARN form is stated once. Sibling families (dominant-language, entities,
-/// topics, …) are added as their own issues implement them.
+/// the ARN form is stated once. Sibling families (entities, topics, …) are added as
+/// their own issues implement them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JobFamily {
     /// `StartSentimentDetectionJob` and its Describe/List/Stop operations.
     SentimentDetection,
+    /// `StartDominantLanguageDetectionJob` and its Describe operation.
+    DominantLanguageDetection,
     /// `StartKeyPhrasesDetectionJob` and its Describe/List/Stop operations.
     KeyPhrasesDetection,
 }
@@ -159,8 +194,210 @@ impl JobFamily {
     pub fn arn_resource_type(self) -> &'static str {
         match self {
             Self::SentimentDetection => "sentiment-detection-job",
+            Self::DominantLanguageDetection => "dominant-language-detection-job",
             Self::KeyPhrasesDetection => "key-phrases-detection-job",
         }
+    }
+
+    /// The analysis type this family's output folder is named for.
+    ///
+    /// `OutputDataConfig$S3Uri` documents that the submitted URI "is used as the
+    /// prefix for the actual location of the output file" and that "the service
+    /// creates an output file in a directory specific to the job"; AWS names that
+    /// directory `<account-id>-<ANALYSIS_TYPE>-<JobId>`, which is what
+    /// [`output_archive_key`] builds from this token.
+    pub fn output_analysis_type(self) -> &'static str {
+        match self {
+            Self::SentimentDetection => "SENTIMENT",
+            Self::DominantLanguageDetection => "LANGUAGE",
+            Self::KeyPhrasesDetection => "KEY_PHRASES",
+        }
+    }
+}
+
+/// The outcome of the run a `Start*DetectionJob` handler performed for a job: the
+/// terminal status the clock reveals once the job's processing span is over, the
+/// `Message` that says why, and where the output it wrote went.
+///
+/// Held separately from [`AnalysisJob::job_status`] because a status is only reported
+/// for work that ran: until the run reports, the job is still processing.
+#[derive(Debug, Clone)]
+pub struct JobOutcome {
+    /// One of `super::ops::types::JOB_STATUS_VALUES`, and terminal:
+    /// `COMPLETED` or `FAILED`.
+    pub status: String,
+    /// What the run has to say — the failure's reason, or nothing for a run that
+    /// completed.
+    pub message: Option<String>,
+    /// The output archive's own location, for a run that wrote one. Revealed with
+    /// the terminal status by [`AnalysisJob::settle`], never before it: the
+    /// configuration a job reports has to match the status it reports, and
+    /// `OutputDataConfig$S3Uri` names the archive only once the job is finished.
+    pub output_s3_uri: Option<String>,
+}
+
+impl JobOutcome {
+    /// The outcome of a run that read every input document and wrote its output to
+    /// `output_s3_uri`.
+    pub fn completed(output_s3_uri: String) -> Self {
+        Self {
+            status: "COMPLETED".to_string(),
+            message: None,
+            output_s3_uri: Some(output_s3_uri),
+        }
+    }
+
+    /// The outcome of a run that could not be carried out, naming `reason`. Nothing
+    /// was written, so the job keeps reporting the output configuration it was
+    /// submitted with.
+    pub fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            status: "FAILED".to_string(),
+            message: Some(reason.into()),
+            output_s3_uri: None,
+        }
+    }
+}
+
+/// Everything a `Start*DetectionJob` request asks for, borrowed from its input.
+///
+/// Carried as one value so [`Self::digest`] — the thing that decides whether a
+/// repeated `ClientRequestToken` names the submission it already created — is
+/// written once for every family rather than once per handler.
+#[derive(Debug)]
+pub struct JobSubmission<'a> {
+    pub family: JobFamily,
+    pub job_name: Option<&'a str>,
+    pub input_data_config: &'a InputDataConfig,
+    pub output_data_config: &'a OutputDataConfig,
+    /// The family's `LanguageCode`, for a family that takes one;
+    /// `StartDominantLanguageDetectionJob` models none, because detecting the
+    /// language is the job.
+    pub language_code: Option<&'a str>,
+    pub data_access_role_arn: &'a str,
+    pub volume_kms_key_id: Option<&'a str>,
+    pub vpc_config: Option<&'a VpcConfig>,
+    pub tags: &'a [Tag],
+}
+
+impl JobSubmission<'_> {
+    /// The digest of this submission: the second half of the idempotency key, so a
+    /// `ClientRequestToken` re-presented with the SAME request names the job it
+    /// already created, and the same token carrying a different request is a
+    /// different submission (which mints its own job rather than being refused —
+    /// the model declares no error for it).
+    ///
+    /// The family takes part, so one token presented to two families is two
+    /// submissions. Every part is length-prefixed and an optional member renders
+    /// its presence, so no two different requests can render alike by splitting
+    /// their values differently.
+    ///
+    /// Each structural member is rendered from ITS OWN members, named one by one —
+    /// never through a `Debug` rendering, which is no serialization contract: a
+    /// derive or model change would silently move every digest and turn a retry into
+    /// a second job.
+    pub fn digest(&self) -> String {
+        let mut tags: Vec<String> = self
+            .tags
+            .iter()
+            .map(|tag| format!("{}={}", tag.key, rendered(tag.value.as_deref())))
+            .collect();
+        // A resource's tags are a set, so the same tags in another order are the
+        // same request.
+        tags.sort();
+        let input_data_config = [
+            self.input_data_config.s3_uri.clone(),
+            rendered(self.input_data_config.input_format.as_deref()),
+            self.input_data_config
+                .document_reader_config
+                .as_ref()
+                .map_or_else(
+                    || "absent".to_string(),
+                    |reader| {
+                        format!(
+                            "{}|{}|{}",
+                            reader.document_read_action,
+                            rendered(reader.document_read_mode.as_deref()),
+                            reader
+                                .feature_types
+                                .as_ref()
+                                .map_or_else(|| "absent".to_string(), |types| types.join("+")),
+                        )
+                    },
+                ),
+        ]
+        .join("|");
+        let output_data_config = [
+            self.output_data_config.s3_uri.clone(),
+            rendered(self.output_data_config.kms_key_id.as_deref()),
+        ]
+        .join("|");
+        let vpc_config = self.vpc_config.map_or_else(
+            || "absent".to_string(),
+            |vpc| {
+                format!(
+                    "{}|{}",
+                    vpc.security_group_ids.join("+"),
+                    vpc.subnets.join("+"),
+                )
+            },
+        );
+        let parts: Vec<String> = vec![
+            self.family.arn_resource_type().to_string(),
+            rendered(self.job_name),
+            input_data_config,
+            output_data_config,
+            rendered(self.language_code),
+            self.data_access_role_arn.to_string(),
+            rendered(self.volume_kms_key_id),
+            vpc_config,
+            tags.join(","),
+        ];
+        let mut hasher = Sha256::new();
+        for part in &parts {
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        hex::encode(hasher.finalize())
+    }
+}
+
+/// An optional value rendered so a present empty string cannot render like an absent
+/// member.
+fn rendered(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("present:{value}"),
+        None => "absent".to_string(),
+    }
+}
+
+/// What a `Start*DetectionJob` submission is indexed under, so a retried request
+/// resolves to the job it already created.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SubmissionKey {
+    pub family: JobFamily,
+    /// The request's `ClientRequestToken`; a request carrying none is never indexed.
+    pub client_request_token: String,
+    /// [`JobSubmission::digest`] of the request the token was used with.
+    pub request_digest: String,
+}
+
+/// The S3 object key an analysis job's output archive is written to under the
+/// submitted output prefix.
+///
+/// `OutputDataConfig$S3Uri` documents the layout: the submitted URI "is used as the
+/// prefix for the actual location of the output file", the service "creates an output
+/// file in a directory specific to the job", and that file is "called
+/// `output.tar.gz`". The per-job directory is `<account-id>-<ANALYSIS_TYPE>-<JobId>`.
+pub fn output_archive_key(prefix: &str, family: JobFamily, job_id: &str) -> String {
+    let directory = format!(
+        "{}-{}-{job_id}/output/output.tar.gz",
+        ::engine::EMULATOR_ACCOUNT_ID,
+        family.output_analysis_type(),
+    );
+    match prefix.trim_end_matches('/') {
+        "" => directory,
+        prefix => format!("{prefix}/{directory}"),
     }
 }
 
@@ -183,15 +420,26 @@ pub struct AnalysisJob {
     pub end_time: Option<SystemTime>,
     /// When the clock owes `SUBMITTED` -> `IN_PROGRESS`.
     pub in_progress_due_at: SystemTime,
-    /// When the clock owes `IN_PROGRESS` -> its terminal status.
+    /// When the clock owes `IN_PROGRESS` -> the status [`Self::terminal_outcome`]
+    /// reports.
     pub terminal_due_at: SystemTime,
     /// When the clock owes `STOP_REQUESTED` -> `STOPPED`; `None` until a stop is
     /// requested.
     pub stopped_due_at: Option<SystemTime>,
+    /// What the run this job's `Start*DetectionJob` performed reported, or `None`
+    /// while it is still running.
+    pub terminal_outcome: Option<JobOutcome>,
     pub input_data_config: InputDataConfig,
+    /// Where the output goes: the SUBMITTED configuration, until the clock reveals a
+    /// terminal status whose run wrote an archive, at which point `S3Uri` becomes
+    /// that archive's own location — what `OutputDataConfig$S3Uri` documents a
+    /// FINISHED job reports ("the location is used as the prefix for the actual
+    /// location of the output file"). A job still being processed therefore reports
+    /// the prefix it was given, which is the location its status matches.
     pub output_data_config: OutputDataConfig,
-    /// One of `super::ops::types::LANGUAGE_CODE_VALUES`.
-    pub language_code: String,
+    /// One of `super::ops::types::LANGUAGE_CODE_VALUES`, for a family whose
+    /// submission names one.
+    pub language_code: Option<String>,
     pub data_access_role_arn: String,
     pub volume_kms_key_id: Option<String>,
     pub vpc_config: Option<VpcConfig>,
@@ -199,49 +447,12 @@ pub struct AnalysisJob {
     /// The `ClientRequestToken` this job was submitted under, if any. Held so the
     /// idempotency-index entry can be dropped with the record it points at.
     pub client_request_token: Option<String>,
-    /// The digest of the parameters this job was submitted with, from
-    /// [`Submission::fingerprint`]. Held for the same reason as
-    /// `client_request_token`: together they are this job's idempotency-index key.
-    pub submission_fingerprint: String,
-}
-
-/// The submitted parameters a `Start*DetectionJob` is deduplicated on, beside its
-/// `ClientRequestToken`.
-///
-/// A retried submission is one that repeats BOTH the token and the parameters: a
-/// token re-sent with the same request names the job it already created, while the
-/// same token sent with different parameters is a different submission and gets a
-/// job of its own. Nothing modelled says otherwise — `ClientRequestToken`'s
-/// documentation describes only "a unique identifier for the request" and no error
-/// is declared for a reused token — and that is the behaviour recorded for the
-/// service.
-#[derive(Debug)]
-pub struct Submission<'a> {
-    pub job_name: Option<&'a str>,
-    pub language_code: &'a str,
-    pub input_data_config: &'a InputDataConfig,
-    pub output_data_config: &'a OutputDataConfig,
-    pub data_access_role_arn: &'a str,
-    pub volume_kms_key_id: Option<&'a str>,
-    pub vpc_config: Option<&'a VpcConfig>,
-    pub tags: &'a [Tag],
-}
-
-impl Submission<'_> {
-    /// A digest over every parameter of this submission, as 32 lowercase hex
-    /// characters.
-    ///
-    /// Two submissions fingerprint alike exactly when they carry the same values
-    /// in the same members, so the digest answers "is this the same request
-    /// again?" without the index holding a copy of the request. It is taken over
-    /// the shapes' own derived debug rendering, which is total over every member
-    /// (no member can be left out of the digest by accident) and order-sensitive,
-    /// so a reordered tag or subnet list is a different submission.
-    pub fn fingerprint(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(format!("{self:?}").as_bytes());
-        hex::encode(&hasher.finalize()[..16])
-    }
+    /// [`JobSubmission::digest`] of the request that created this job — the other
+    /// half of its idempotency-index key. Held for the same reason as
+    /// `client_request_token`: together they identify the submission, so a retried
+    /// request resolves to the job it already created while the same token carrying
+    /// a different request gets a job of its own.
+    pub request_digest: String,
 }
 
 impl AnalysisJob {
@@ -251,21 +462,25 @@ impl AnalysisJob {
     /// transition was due at `now` whether or not anybody called, so applying it on
     /// read reports the status the job already had rather than advancing it.
     ///
-    /// The terminal status of a started job is `FAILED`: running it means reading
-    /// the documents from the Amazon S3 location `InputDataConfig` names and writing
-    /// analysed output back to `OutputDataConfig`, and this emulator serves no object
-    /// storage for batch jobs, so no document is ever read and no output is ever
-    /// written. The job therefore ends in the modelled failure state with a `Message`
-    /// that says exactly that, rather than reporting a `COMPLETED` run that nothing
-    /// performed.
+    /// The terminal transition is only owed once the job's run has reported an
+    /// outcome ([`Self::terminal_outcome`]): a job whose run has not finished is
+    /// still `IN_PROGRESS`, and no status is ever reported for work nothing
+    /// performed. Revealing that status is also what moves `OutputDataConfig$S3Uri`
+    /// onto the archive the run wrote, so the location a job reports always matches
+    /// the status it reports.
     pub fn settle(&mut self, now: SystemTime) {
         if self.job_status == "SUBMITTED" && now >= self.in_progress_due_at {
             self.job_status = "IN_PROGRESS".to_string();
         }
         if self.job_status == "IN_PROGRESS" && now >= self.terminal_due_at {
-            self.job_status = "FAILED".to_string();
-            self.end_time = Some(self.terminal_due_at);
-            self.message = Some(self.unreadable_input_message());
+            if let Some(outcome) = self.terminal_outcome.clone() {
+                self.job_status = outcome.status;
+                self.message = outcome.message;
+                self.end_time = Some(self.terminal_due_at);
+                if let Some(output_s3_uri) = outcome.output_s3_uri {
+                    self.output_data_config.s3_uri = output_s3_uri;
+                }
+            }
         }
         if self.job_status == "STOP_REQUESTED"
             && self.stopped_due_at.is_some_and(|due| now >= due)
@@ -315,24 +530,26 @@ impl AnalysisJob {
         TERMINAL_JOB_STATUSES.contains(&self.job_status.as_str())
     }
 
-    /// Why a started job fails: the input it was pointed at was never read, so no
-    /// output was ever written.
-    fn unreadable_input_message(&self) -> String {
-        format!(
-            "Could not read the input documents from {}: this emulator serves no object \
-             storage for asynchronous analysis jobs, so no document was analyzed and no \
-             output was written to {}.",
-            self.input_data_config.s3_uri, self.output_data_config.s3_uri,
-        )
+    /// The idempotency-index key this job was submitted under, for a job submitted
+    /// with a `ClientRequestToken`.
+    pub fn submission_key(&self, family: JobFamily) -> Option<SubmissionKey> {
+        self.client_request_token
+            .clone()
+            .map(|client_request_token| SubmissionKey {
+                family,
+                client_request_token,
+                request_digest: self.request_digest.clone(),
+            })
     }
 }
 
 /// Write the record -> `*JobProperties` projection ONCE, per family shape.
 ///
-/// Comprehend models a separate properties structure per job family, but the
-/// families this record serves declare exactly the same members, so each family's
-/// projection is an instantiation of this one body rather than a copy of it: a
-/// member added to [`AnalysisJob`] is reported by every family or by none.
+/// Comprehend models a separate properties structure per job family, and the
+/// families whose shape declares the same members share this one body rather than a
+/// copy of it: a member added to [`AnalysisJob`] is reported by every one of them or
+/// by none. A family whose shape differs — dominant-language, which models no
+/// `LanguageCode` because detecting it is the job — has its own projection below.
 macro_rules! job_properties_projections {
     ($($method:ident -> $shape:ident,)+) => {
         impl AnalysisJob {
@@ -353,7 +570,7 @@ macro_rules! job_properties_projections {
                         end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
                         input_data_config: Some(self.input_data_config.clone()),
                         output_data_config: Some(self.output_data_config.clone()),
-                        language_code: Some(self.language_code.clone()),
+                        language_code: self.language_code.clone(),
                         data_access_role_arn: Some(self.data_access_role_arn.clone()),
                         volume_kms_key_id: self.volume_kms_key_id.clone(),
                         vpc_config: self.vpc_config.clone(),
@@ -367,6 +584,30 @@ macro_rules! job_properties_projections {
 job_properties_projections! {
     sentiment_detection_job_properties -> SentimentDetectionJobProperties,
     key_phrases_detection_job_properties -> KeyPhrasesDetectionJobProperties,
+}
+
+impl AnalysisJob {
+    /// Project this record into the dominant-language family's modelled properties
+    /// shape, which models no `LanguageCode`: the language is what the job detects.
+    /// Every other member is the one the macro above projects.
+    pub fn dominant_language_detection_job_properties(
+        &self,
+    ) -> DominantLanguageDetectionJobProperties {
+        DominantLanguageDetectionJobProperties {
+            job_id: Some(self.job_id.clone()),
+            job_arn: Some(self.job_arn.clone()),
+            job_name: self.job_name.clone(),
+            job_status: Some(self.job_status.clone()),
+            message: self.message.clone(),
+            submit_time: Some(::aws_smithy_types::DateTime::from(self.submit_time)),
+            end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
+            input_data_config: Some(self.input_data_config.clone()),
+            output_data_config: Some(self.output_data_config.clone()),
+            data_access_role_arn: Some(self.data_access_role_arn.clone()),
+            volume_kms_key_id: self.volume_kms_key_id.clone(),
+            vpc_config: self.vpc_config.clone(),
+        }
+    }
 }
 
 /// One persisted custom document classifier.
@@ -509,12 +750,12 @@ pub struct ComAmazonawsComprehendComprehend20171127State {
     /// Bounded by [`MAX_ANALYSIS_JOB_RECORDS`]: insert through
     /// [`Self::insert_analysis_job`], never directly.
     pub analysis_jobs: BTreeMap<(JobFamily, String), AnalysisJob>,
-    /// The `JobId` minted for a `(family, ClientRequestToken, submission
-    /// fingerprint)` triple, so a retried `Start*DetectionJob` — the same token
-    /// with the same parameters — resolves to the job it already created, while
-    /// the same token with different parameters is a submission of its own. An
-    /// entry is dropped with the job it points at.
-    pub idempotency_tokens: HashMap<(JobFamily, String, String), String>,
+    /// The `JobId` each `(family, ClientRequestToken, request digest)` submission
+    /// minted, so a retried `Start*DetectionJob` — the same token with the same
+    /// request — resolves to the job it already created, while the same token with a
+    /// different request is a submission of its own. An entry is dropped with the
+    /// job it points at.
+    pub idempotency_tokens: HashMap<SubmissionKey, String>,
     /// Monotonic submission counter: the source of both a job's `seq` and the
     /// uniqueness of a minted `JobId`.
     pub job_id_seq: u64,
@@ -547,9 +788,18 @@ impl ComAmazonawsComprehendComprehend20171127State {
         (self.job_id_seq, hex::encode(&digest[..16]))
     }
 
-    /// Persist a submitted job, index it under its `ClientRequestToken` and
-    /// submission fingerprint, and evict the oldest records once the store passes
-    /// [`MAX_ANALYSIS_JOB_RECORDS`].
+    /// The `JobId` an earlier submission under exactly this key minted, if the job
+    /// it created is still held.
+    pub fn replayed_job_id(&self, key: &SubmissionKey) -> Option<String> {
+        let job_id = self.idempotency_tokens.get(key)?;
+        self.analysis_jobs
+            .contains_key(&(key.family, job_id.clone()))
+            .then(|| job_id.clone())
+    }
+
+    /// Persist a submitted job, index it under its submission key — its
+    /// `ClientRequestToken` and request digest — and evict the oldest records once
+    /// the store passes [`MAX_ANALYSIS_JOB_RECORDS`].
     ///
     /// The ONE insertion path for [`Self::analysis_jobs`], so the bound cannot be
     /// bypassed by a handler. Submission never fails for the bound: AWS refuses no
@@ -557,11 +807,8 @@ impl ComAmazonawsComprehendComprehend20171127State {
     /// is trimmed.
     pub fn insert_analysis_job(&mut self, family: JobFamily, job: AnalysisJob) {
         let job_id = job.job_id.clone();
-        if let Some(token) = job.client_request_token.clone() {
-            self.idempotency_tokens.insert(
-                (family, token, job.submission_fingerprint.clone()),
-                job_id.clone(),
-            );
+        if let Some(key) = job.submission_key(family) {
+            self.idempotency_tokens.insert(key, job_id.clone());
         }
         self.analysis_jobs.insert((family, job_id), job);
         while self.analysis_jobs.len() > MAX_ANALYSIS_JOB_RECORDS {
@@ -580,16 +827,13 @@ impl ComAmazonawsComprehendComprehend20171127State {
             let evicted = self.analysis_jobs.remove(&oldest);
             // Drop the index entry only while it still points at the evicted
             // record: a later submission may have taken the same key over.
-            if let Some(job) = evicted {
-                if let Some(token) = job.client_request_token {
-                    let index_key = (oldest.0, token, job.submission_fingerprint);
-                    if self
-                        .idempotency_tokens
-                        .get(&index_key)
-                        .is_some_and(|id| *id == oldest.1)
-                    {
-                        self.idempotency_tokens.remove(&index_key);
-                    }
+            if let Some(key) = evicted.and_then(|job| job.submission_key(oldest.0)) {
+                if self
+                    .idempotency_tokens
+                    .get(&key)
+                    .is_some_and(|id| *id == oldest.1)
+                {
+                    self.idempotency_tokens.remove(&key);
                 }
             }
         }

@@ -27,6 +27,8 @@ mod channel_reset;
 mod channel_update;
 #[path = "all/control_plane_validation.rs"]
 mod control_plane_validation;
+#[path = "all/data_plane_credentials.rs"]
+mod data_plane_credentials;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
 #[path = "all/origin_endpoint_policy.rs"]

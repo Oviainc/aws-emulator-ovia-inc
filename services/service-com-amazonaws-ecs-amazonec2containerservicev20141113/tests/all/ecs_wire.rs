@@ -80,14 +80,15 @@ pub(crate) async fn ok(
     parsed
 }
 
-/// A call that must be refused with HTTP 400 and the named modelled error code.
+/// A call that must be refused with HTTP 400 and the named modelled error code,
+/// returning its error body so a caller can assert the message too.
 pub(crate) async fn refused(
     router: &MultiServiceRouter,
     operation: &str,
     body: Value,
     expected_code: &str,
     case: &str,
-) {
+) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 400,
@@ -98,6 +99,7 @@ pub(crate) async fn refused(
         wire_type.contains(expected_code),
         "case {case:?}: expected a {expected_code} from {operation}, got {parsed}"
     );
+    parsed
 }
 
 /// A call that must be refused with HTTP 400, returning the modelled error code (the
@@ -167,6 +169,27 @@ pub(crate) fn identity_document(instance_id: &str) -> String {
         "availabilityZone": format!("{SIGNED_REGION}a"),
     })
     .to_string()
+}
+
+/// Register one container instance into `cluster` through the agent's own operation and
+/// return its ARN.
+pub(crate) async fn register_instance(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    instance_id: &str,
+    case: &str,
+) -> String {
+    let body = ok(
+        router,
+        "RegisterContainerInstance",
+        json!({
+            "cluster": cluster,
+            "instanceIdentityDocument": identity_document(instance_id),
+        }),
+        case,
+    )
+    .await;
+    string(&body["containerInstance"], "containerInstanceArn", case)
 }
 
 /// Create a cluster and return its ARN.

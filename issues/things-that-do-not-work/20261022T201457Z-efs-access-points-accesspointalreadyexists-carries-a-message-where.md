@@ -1,0 +1,70 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: efs.create-access-point-token-reuse-conflict efs.create-access-point-token-reuse-mismatched-params-rejected efs.delete-access-point-concurrent-delete-idempotent
+Issue-Shape-Id: com.amazonaws.efs#MagnolioAPIService_v20150201
+Issue-Key: efs.create-access-point-token-reuse-conflict|run#14|AssertionError|assert msg == expected_msg, f"expected message {expected_msg!r}, got {msg!r}"
+Issue-Key: efs|CreateAccessPoint|AccessPointAlreadyExists
+Issue-Key: efs.delete-access-point-concurrent-delete-idempotent|run#11|AssertionError|assert codes == {"ok"}, f"expected every concurrent delete of a live access point to be accepted, got {results}"
+Issue-Commit: dbb62b31e7ded4dc3fd01bf9d9c68db3eae6690c
+
+# EFS access points: AccessPointAlreadyExists carries a Message where AWS sends none; DeleteAccessPoint concurrency/idempotency semantics unreachable
+
+> _Note: this issue was identified against the code base at commit `dbb62b31e7ded4dc3fd01bf9d9c68db3eae6690c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateAccessPoint
+
+## Description
+Replay of the behavioral suite simparity-behavioral-aws-v1 against the emulator built from this checkout (11/27 passed, bootstrap_signal=false — the emulator was serving: CreateFileSystem, DescribeFileSystems, CreateAccessPoint and DescribeAccessPoints all answered) found two distinct EFS access-point root causes among the failures that the report did NOT mark as already filed or owned. THIS ISSUE HAS 2 CAUSES; both must be fixed before it is closed.
+
+Service token `efs` (Smithy sdkId EFS, sigv4Name elasticfilesystem, api 2015-02-01, restJson1); model consulted: services/service-com-amazonaws-efs-magnolioapiservice-v20150201/smithy-model/com-amazonaws-efs-magnolioapiservice-v20150201.json.
+
+Cause 1 of 2 — the AccessPointAlreadyExists refusal populates the optional Message member, where AWS's recorded refusal carries no Message member at all (checks efs.create-access-point-token-reuse-conflict, efs.create-access-point-token-reuse-mismatched-params-rejected).
+AWS: Smithy CreateAccessPoint = POST /2015-02-01/access-points, success 200, input ClientToken (required, @idempotencyToken, @length 1..64) and FileSystemId (required); modeled errors AccessPointAlreadyExists (client, httpError 409), AccessPointLimitExceeded (403), BadRequest (400), FileSystemNotFound (404), IncorrectFileSystemLifeCycleState (409), ThrottlingException (429), InternalServerError (500). Shape AccessPointAlreadyExists: errorKind client, httpError 409, required members ErrorCode and AccessPointId, OPTIONAL member Message -> ErrorMessage; doc "Returned if the access point that you are trying to create already exists, with the creation token you provided in the request." Recorded behavior only (the model does not prescribe a message): in BOTH recordings — the identical-parameter retry and the mismatched-RootDirectory retry — real EFS answers 409 AccessPointAlreadyExists with the Message member ABSENT, i.e. botocore reports Error.Message as missing/None. The requirement here is the absence of the member on this error, not any particular sentence.
+Emulator: status 409 and error code AccessPointAlreadyExists match, but the response body carries a Message. Recorded example: "Access point 'fsap-6e789e6aa1b965f4' already exists with creation token 'sim2real-efs-ap-9db5d814c2b9'" (the access-point id and token are environment-specific; the divergence is that the member is emitted at all). Both checks fail on the same assertion, `expected message None, got "..."`, before any of their later assertions run — so the identical-token conflict's downstream requirements (exactly one access point survives the rejected retry; the original access point's RootDirectory is untouched after a mismatched-parameter retry; a fresh token with the new parameters succeeds) are left unexercised by this one divergence.
+Why: a client that classifies an EFS error by probing for an explanatory Message — or a conformance/diff harness comparing the serialized error body against AWS — sees a member AWS never sends on this error class, so the emulator's conflict response is not byte-comparable with AWS and "has a message" cannot be used to discriminate error classes.
+Fix: the CreateAccessPoint handler's idempotency-conflict path, in its error construction — services/service-com-amazonaws-efs-magnolioapiservice-v20150201/src/ops/create_access_point.rs builds the refusal at the `state.access_point_tokens` hit with `message: Some(efs::access_point_already_exists_message(...))`; AccessPointAlreadyExists must be constructed with ErrorCode and the existing AccessPointId only and no Message. Note this is the opposite direction from the file-system message causes in the open issue 20261022T154034Z-efs-control-plane-backup-policy-file-system-policy.md (Causes 5/6), where AWS DOES send a request-derived message and the emulator's was malformed; that issue does not cover this error class, so the two should be fixed together without copying the file-system construction onto the access-point error.
+Traces: efs.create-access-point-token-reuse-conflict, efs.create-access-point-token-reuse-mismatched-params-rejected.
+
+Cause 2 of 2 — DeleteAccessPoint's concurrency and post-deletion semantics are unreachable: every concurrent delete of a LIVE access point answers NotImplemented (check efs.delete-access-point-concurrent-delete-idempotent). The bare fact that DeleteAccessPoint is a scaffold stub is already filed by this run's own stub issue for services/service-com-amazonaws-efs-magnolioapiservice-v20150201/src/ops/delete_access_point.rs (the report attributed only efs.delete-access-point-lifecycle-transition to it); the requirement recorded HERE and not covered there is the concurrent-delete convergence plus the post-deletion refusal class.
+AWS: Smithy DeleteAccessPoint = DELETE /2015-02-01/access-points/{AccessPointId}, input AccessPointId (required, @httpLabel), output Unit with success status 204; modeled errors AccessPointNotFound (client, httpError 404 — doc "Returned if the specified AccessPointId value doesn't exist in the requester's Amazon Web Services account"), BadRequest (client, 400), InternalServerError (server, 500). Recorded behavior only for the race: 8 DeleteAccessPoint calls issued concurrently against the SAME still-existing access point are ALL accepted — real AWS measured 8/8 accepted, never a collision/conflict error, unlike CreateFileSystem's same-token race which has exactly one winner. They converge on exactly one deletion: the access point ends up gone (DescribeAccessPoints on the id then refuses 404 AccessPointNotFound) and a FURTHER delete of the now-dead id is refused 404 AccessPointNotFound rather than silently accepted again — so acceptance is conditional on the resource being live, not unconditional.
+Emulator: all 8 concurrent calls fail with error code 'NotImplemented' ("operation DeleteAccessPoint is scaffolded but not implemented in this emulator") — observed result list [('NotImplemented', None) x 8] — so neither the all-accepted race, the convergence to a single deletion, nor the 404 on a redelete exists.
+Why: a client that tears down access points from multiple workers (or retries a delete after a timeout) relies on the delete being accepted by every racer and on the 404 as the terminal "already gone" signal; against the emulator every racer gets an unclassifiable error, so teardown never completes and the access point is never released from its file system (blocking DeleteFileSystem too).
+Fix: implement the DeleteAccessPoint handler over the access-point state in services/service-com-amazonaws-efs-magnolioapiservice-v20150201/src/state.rs — delete under the state lock so concurrent callers all succeed while the record is still present, drop the access point and its ClientToken binding from `access_points`/`access_point_tokens`, answer 204, and refuse with AccessPointNotFound (404) once the record is gone, which is also what DescribeAccessPoints on the dead id must answer.
+Traces: efs.delete-access-point-concurrent-delete-idempotent.
+
+## Evidence
+Behavioral suite simparity-behavioral-aws-v1, replayed against the emulator built from this checkout. Overall 11/27 passed (40.7%); mismatched 7, errored 9, skipped 0, unloadable 0; bootstrap_signal=false. Per-service: efs 11/25 (44%, 14 failed). Failures excluded from this issue: those the report marked ALREADY FILED against scaffold stubs (efs.delete-access-point-lifecycle-transition -> DeleteAccessPoint, efs.tag-resource-and-list-tags-round-trip -> ListTagsForResource, ecs__efs__logs.* -> ec2 ModifyVpcAttribute) and those marked OWNED by 20261022T154034Z-efs-control-plane-backup-policy-file-system-policy.md (efs.backup-policy-status-transitions, efs.put-file-system-policy-lockout-rejected).
+
+Cause 1 — two failing checks, same assertion:
+
+1) [mismatch] efs.create-access-point-token-reuse-conflict
+   File "check_efs_create_access_point_token_reuse_conflict.py", line 44, in run
+     assert msg == expected_msg, f"expected message {expected_msg!r}, got {msg!r}"
+   AssertionError: expected message None, got "Access point 'fsap-6e789e6aa1b965f4' already exists with creation token 'sim2real-efs-ap-9db5d814c2b9'"
+   (the preceding assertion, error code == 'AccessPointAlreadyExists', PASSED; the check's comment on the expectation is "AWS sends this error with no Message member")
+
+2) [mismatch] efs.create-access-point-token-reuse-mismatched-params-rejected
+   File "check_efs_create_access_point_token_reuse_mismatched_params_rejected.py", line 47, in run
+     assert msg == expected_msg, f"expected message {expected_msg!r}, got {msg!r}"
+   AssertionError: expected message None, got "Access point 'fsap-6e789e6aa1b965f4' already exists with creation token 'sim2real-efs-ap-0dfd4065556a'"
+   (same: code 'AccessPointAlreadyExists' matched; the retry reused the ClientToken with RootDirectory '/different-path' against an original '/original-path')
+
+Cause 2 — one failing check:
+
+3) [mismatch] efs.delete-access-point-concurrent-delete-idempotent
+   File "check_efs_delete_access_point_concurrent_delete_idempotent.py", line 46, in run
+     assert codes == {"ok"}, f"expected every concurrent delete of a live access point to be accepted, got {results}"
+   AssertionError: expected every concurrent delete of a live access point to be accepted, got [('NotImplemented', None), ('NotImplemented', None), ('NotImplemented', None), ('NotImplemented', None), ('NotImplemented', None), ('NotImplemented', None), ('NotImplemented', None), ('NotImplemented', None)]
+   (the setup legs — CreateFileSystem, wait for LifeCycleState=available, CreateAccessPoint, wait for the access point to reach available — all succeeded, so the access point was live when the 8 deletes were issued)
+
+Model consulted (services/service-com-amazonaws-efs-magnolioapiservice-v20150201/smithy-model/com-amazonaws-efs-magnolioapiservice-v20150201.json): CreateAccessPoint = POST /2015-02-01/access-points, success 200, errors incl. AccessPointAlreadyExists client/409; shape AccessPointAlreadyExists { ErrorCode required, AccessPointId required, Message optional -> ErrorMessage }; DeleteAccessPoint = DELETE /2015-02-01/access-points/{AccessPointId}, success 204, errors AccessPointNotFound client/404, BadRequest client/400, InternalServerError server/500; shape AccessPointNotFound { ErrorCode required, Message optional }, httpError 404. Emulator code read: services/service-com-amazonaws-efs-magnolioapiservice-v20150201/src/ops/create_access_point.rs (the conflict path constructs AccessPointAlreadyExists with `message: Some(efs::access_point_already_exists_message(existing, &input.client_token))`). Generated file-system/access-point ids and creation tokens above are environment-specific examples, not requirements; the statuses, the error codes, the absence of the Message member on AccessPointAlreadyExists and the concurrent-delete outcome are.
+
+## Steps to Reproduce
+1. git clone the repo and build/boot the emulator from this checkout.
+2. Replay the behavioral suite simparity-behavioral-aws-v1 (run_behavioral_suite) and look at the efs service group.
+3. Cause 1: run check efs.create-access-point-token-reuse-conflict — CreateFileSystem, wait for LifeCycleState=available, CreateAccessPoint(ClientToken=T, FileSystemId=fs, RootDirectory={'Path': '/idempotent-test'}), then re-issue the IDENTICAL CreateAccessPoint. Expect HTTP 409 with error code AccessPointAlreadyExists and NO Message member in the error body (botocore: e.response['Error'].get('Message') is None); the emulator returns 409/AccessPointAlreadyExists WITH a Message.
+4. Cause 1 again, independently: run efs.create-access-point-token-reuse-mismatched-params-rejected — same first create, then CreateAccessPoint with the same ClientToken but RootDirectory={'Path': '/different-path'}; same expectation (409, AccessPointAlreadyExists, no Message member). Once the member is gone, the checks continue into their later legs: exactly one access point exists for the token, the original access point's RootDirectory is still '/original-path', and a FRESH ClientToken with '/different-path' succeeds and reads back from DescribeAccessPoints.
+5. Cause 2: run efs.delete-access-point-concurrent-delete-idempotent — CreateFileSystem, wait available, CreateAccessPoint, wait for the access point's LifeCycleState=available, then issue 8 DeleteAccessPoint(AccessPointId=ap) calls concurrently from a ThreadPoolExecutor(max_workers=8). Expect ALL 8 to be accepted (204, no collision error); the emulator answers NotImplemented to all 8.
+6. Then assert the convergence: DescribeAccessPoints(AccessPointId=ap) must refuse 404 AccessPointNotFound, and a further DeleteAccessPoint(AccessPointId=ap) must also refuse 404 AccessPointNotFound rather than being accepted again.

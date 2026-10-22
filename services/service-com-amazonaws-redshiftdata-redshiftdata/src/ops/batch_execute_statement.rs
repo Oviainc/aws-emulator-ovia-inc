@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchExecuteStatement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchExecuteStatement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchExecuteStatement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Submits one or more SQL statements to the database the request names and answers
+//! with ONE `Id` for the batch, whose statements are read back as `SubStatements` (and
+//! individually as `<Id>:<n>`). The statements run serially, in order, on this
+//! emulator's in-process SQL engine (see [`crate::state`]), under the `ExecutionMode`
+//! the request asked for: `TRANSACTION` (the default) commits them together and rolls
+//! every one of them back as soon as one fails, `AUTO_COMMIT` commits each on its own.
+//! The Data API's own lifecycle is asynchronous, so the response reports `SUBMITTED`
+//! and the clock owes the terminal status [`crate::state::COMPLETION_SPAN`] later; a
+//! caller that supplies `WaitTimeSeconds` has asked to wait longer than that span, so
+//! for that caller the batch is already complete when the response is built.
 //!
 //! ## Shape of an operation
 //!
@@ -170,6 +171,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    non_empty, to_timestamp, BadConnection, ConnectionRequest, ExecutionMode, NoDatabase,
+    Statement, Submission, SubmissionKind,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -244,18 +249,269 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchExecuteStatement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchExecuteStatementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchExecuteStatement"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable());
+        };
+
+        // A batch runs against exactly one data warehouse, one database and one
+        // authorization method, resolved exactly as `ExecuteStatement`'s are:
+        // the documentation names the same combinations for both. The
+        // session-reuse form, where a caller that already holds a `SessionId`
+        // names neither warehouse, is a VALID request this slice cannot serve
+        // (no session store exists yet, so the warehouse and database its
+        // session was opened with are not knowable), so it is answered with the
+        // scaffold's `NotImplemented` rather than blamed on the caller.
+        let connection = match (ConnectionRequest {
+            cluster_identifier: input.cluster_identifier.as_ref(),
+            workgroup_name: input.workgroup_name.as_ref(),
+            session_id: input.session_id.as_ref(),
+            database: input.database.as_ref(),
+            db_user: input.db_user.as_ref(),
+            secret_arn: input.secret_arn.as_ref(),
+        })
+        .resolve()
+        {
+            Ok(connection) => connection,
+            Err(BadConnection::SessionOnly) => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "BatchExecuteStatement with only a SessionId as its connection target",
+                ))
+            }
+            Err(problem) => return Err(validation(problem.message())),
+        };
+
+        // `Sqls` holds "one or more SQL statements to run", so every entry has
+        // to be one; the modelled 1..40 length is already enforced before this
+        // handler runs. The position is named so a caller knows which entry is
+        // at fault.
+        for (index, sql) in input.sqls.iter().enumerate() {
+            if sql.trim().is_empty() {
+                return Err(validation(&format!(
+                    "Sqls[{index}] must contain a SQL statement"
+                )));
+            }
+        }
+
+        // "If set to TRANSACTION (the default), all SQL statements are run as a
+        // single transaction". A value outside the modelled set names no mode.
+        let execution_mode = match non_empty(input.execution_mode.as_ref()) {
+            None => ExecutionMode::Transaction,
+            Some(requested) => match ExecutionMode::parse(&requested) {
+                Some(mode) => mode,
+                None => {
+                    return Err(validation(&format!(
+                        "ExecutionMode must be one of {}",
+                        EXECUTION_MODE_VALUES.join(", ")
+                    )))
+                }
+            },
+        };
+
+        let client_token = non_empty(input.client_token.as_ref());
+
+        // An idempotent replay answers with the batch the first call submitted,
+        // read back out of state — it never submits a second one. A token that
+        // names a statement submitted by `ExecuteStatement` is not a replay of
+        // a batch, so it is not answered as one.
+        if let Some(token) = client_token.as_deref() {
+            let mut store = state.lock();
+            store.materialise_due_transitions();
+            let replayed = store.statement_id_for_client_token(token).map(str::to_string);
+            if let Some(output) = replayed
+                .as_deref()
+                .and_then(|id| store.statement(id))
+                .filter(|statement| statement.is_batch)
+                .map(output_for)
+            {
+                return Ok(output);
+            }
+        }
+
+        // `SessionKeepAliveSeconds` asks for a session, which the Data API
+        // identifies with a UUID the caller passes back on later statements. A
+        // `SessionId` the caller supplies is recorded as given and reported back
+        // unchanged: session identity is not modelled in this slice, so this
+        // operation neither validates it against state nor derives anything
+        // from it beyond what it was sent.
+        let session_id = non_empty(input.session_id.as_ref()).or_else(|| {
+            input
+                .session_keep_alive_seconds
+                .map(|_| crate::state::new_uuid())
+        });
+
+        let submission = Submission {
+            statements: input.sqls.clone(),
+            kind: SubmissionKind::Batch(execution_mode),
+            target: connection.target,
+            database: connection.database,
+            db_user: connection.db_user,
+            secret_arn: connection.secret_arn,
+            statement_name: non_empty(input.statement_name.as_ref()),
+            // "The parameters are available to all SQL statements in the batch.
+            // Each statement can reference any subset of the provided
+            // parameters", so each statement is bound only the parameters the
+            // ENGINE reports it references. The batch-level rule that every
+            // provided parameter must be referenced by at least one statement is
+            // NOT enforced: the names a statement references are known only once
+            // the engine can prepare it, and a batch's later statements often
+            // cannot be prepared until its earlier ones have run (a SELECT from
+            // a table the first statement creates), so a parameter no statement
+            // reads is accepted and bound to nothing.
+            parameters: input.parameters.unwrap_or_default(),
+            with_event: input.with_event.unwrap_or(false),
+            // "If no format is specified, the default is JSON."
+            result_format: non_empty(input.result_format.as_ref())
+                .unwrap_or_else(|| "JSON".to_string()),
+            session_id,
+            client_token,
+            wait_for_completion: input.wait_time_seconds.is_some(),
+        };
+
+        // Resolve the engine under the state lock, then RELEASE it: the batch
+        // runs on a blocking pool with only its own database's lock held, so a
+        // slow statement starves no async worker and serialises no other caller.
+        let (handle, pid) =
+            match state.lock().reserve_database(&submission.target, &submission.database) {
+                Ok(reserved) => reserved,
+                // A capacity limit of this emulator, not a malformed request, so
+                // it is answered with the modelled capacity error rather than a
+                // ValidationException that would tell the client its
+                // ClusterIdentifier or Database was wrong.
+                Err(NoDatabase::TooManyOpen(limit)) => {
+                    return Err(
+                        BatchExecuteStatementErrorModeled::ActiveStatementsExceededException(
+                            ActiveStatementsExceededException {
+                                message: Some(format!(
+                                    "this emulator holds at most {limit} databases at once; no \
+                                     further ClusterIdentifier/WorkgroupName and Database \
+                                     combination can be opened"
+                                )),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+                Err(NoDatabase::EngineUnavailable(reason)) => {
+                    return Err(BatchExecuteStatementErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: format!(
+                                "the SQL engine could not open the database for this batch: \
+                                 {reason}"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            };
+
+        let sqls = submission.statements.clone();
+        let parameters = submission.parameters.clone();
+        // The engine bounds its own execution (a wall-clock deadline and a step
+        // budget, enforced by its progress handler), and THIS bounds how long
+        // the request waits for it: a batch queued behind another statement on
+        // the same database must not pin this request — or a blocking-pool
+        // thread — for longer than a caller could ever ask to wait. The modelled
+        // ceiling for `WaitTimeSeconds` is 30 seconds, so the wait is that
+        // ceiling at most, and the whole batch shares the engine deadline inside
+        // it.
+        let budget = crate::state::wait_budget(input.wait_time_seconds);
+        let engine_timeout = crate::state::engine_timeout(budget);
+        // The bound belongs to THIS batch, and the handler keeps the handle that
+        // abandons it, so giving up on the wait abandons this batch and never
+        // another request's.
+        let bound = crate::state::ExecutionBound::new();
+        let interrupt = bound.interrupt();
+        let joined = tokio::time::timeout(
+            budget,
+            tokio::task::spawn_blocking(move || {
+                crate::state::run_batch_on(
+                    &handle,
+                    &sqls,
+                    &parameters,
+                    execution_mode,
+                    engine_timeout,
+                    &bound,
+                )
+            }),
+        )
+        .await;
+        let executions = match joined {
+            Ok(Ok(executions)) => executions,
+            // The wait expired. The engine is told to abandon the statement it
+            // is running at its next progress callback, so nothing of this batch
+            // can commit behind this error response, and the caller is told the
+            // service could not take on another running statement right now.
+            Err(_elapsed) => {
+                interrupt.now();
+                return Err(
+                    BatchExecuteStatementErrorModeled::ActiveStatementsExceededException(
+                        ActiveStatementsExceededException {
+                            message: Some(format!(
+                                "the batch was abandoned after {} seconds; too many statements \
+                                 are already running on this database",
+                                budget.as_secs()
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Ok(Err(_panicked)) => {
+                return Err(BatchExecuteStatementErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the SQL engine did not return a result for this batch"
+                            .to_string(),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let mut store = state.lock();
+        let id = store.record(submission, pid, executions);
+        let Some(statement) = store.statement(&id) else {
+            return Err(unavailable());
+        };
+        Ok(output_for(statement))
     }
+}
+
+/// The response, assembled from the stored batch — never from the request.
+fn output_for(statement: &Statement) -> BatchExecuteStatementOutput {
+    BatchExecuteStatementOutput {
+        id: Some(statement.id.clone()),
+        created_at: Some(to_timestamp(statement.created_at)),
+        cluster_identifier: statement.target.cluster_identifier(),
+        db_user: statement.db_user.clone(),
+        // Redshift derives `DbGroups` from the database user's group
+        // membership, which this emulator does not model, so no groups are
+        // reported rather than an invented list.
+        db_groups: None,
+        database: statement.database.clone(),
+        secret_arn: statement.secret_arn.clone(),
+        workgroup_name: statement.target.workgroup_name(),
+        session_id: statement.session_id.clone(),
+        status: Some(statement.status.as_str().to_string()),
+        redshift_pid: Some(statement.redshift_pid),
+        // "The value is true if any substatement returns a result set."
+        has_result_set: statement.has_result_set(),
+    }
+}
+
+/// Refuse the request as invalid, with the `ValidationException` this operation
+/// models.
+fn validation(message: &str) -> BatchExecuteStatementError {
+    BatchExecuteStatementErrorModeled::ValidationException(ValidationException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The state store could not be reached — a server fault, not a client error.
+fn unavailable() -> BatchExecuteStatementError {
+    BatchExecuteStatementErrorModeled::InternalServerException(InternalServerException {
+        message: "the Redshift Data API state store is unavailable".to_string(),
+    })
+    .into()
 }

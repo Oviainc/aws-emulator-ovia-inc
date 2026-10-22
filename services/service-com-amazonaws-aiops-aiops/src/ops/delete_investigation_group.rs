@@ -174,12 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // index entry, so the name becomes available to a later create.
         if store.remove_group(&input.identifier).is_none() {
             return Err(DeleteInvestigationGroupErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no investigation group matches identifier '{}'",
-                        input.identifier
-                    )),
-                },
+                crate::state::investigation_group_not_found(),
             )
             .into());
         }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutClusterCapacityProviders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutClusterCapacityProviders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutClusterCapacityProviders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies the available capacity providers and the default capacity provider strategy
+//! for a cluster.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +182,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutClusterCapacityProviders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutClusterCapacityProvidersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutClusterCapacityProviders"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutClusterCapacityProvidersErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        let cluster_name = crate::state::cluster_name_from_reference(Some(&input.cluster));
+
+        // The caller chooses both list lengths, and every check below walks one against
+        // the other, so the magnitudes are capped BEFORE any of that work: Amazon ECS
+        // quotas the capacity providers a cluster may hold, and the default strategy
+        // cannot be longer, since each of its entries must name one of them.
+        for (member, len) in [
+            ("capacityProviders", input.capacity_providers.len()),
+            (
+                "defaultCapacityProviderStrategy",
+                input.default_capacity_provider_strategy.len(),
+            ),
+        ] {
+            if len > crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS {
+                return Err(
+                    PutClusterCapacityProvidersErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "{member} must name at most {} capacity providers; got {len}",
+                                crate::state::MAX_CLUSTER_CAPACITY_PROVIDERS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "A capacity provider must be associated with the cluster to be used in a
+        // capacity provider strategy" — and this call is what associates them, so the
+        // strategy may only name providers this same request associates. Membership is
+        // probed through a set, so the check costs one pass over each list rather than
+        // one pass per entry.
+        let associated: ::std::collections::HashSet<&str> = input
+            .capacity_providers
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for item in &input.default_capacity_provider_strategy {
+            if !associated.contains(item.capacity_provider.as_str()) {
+                return Err(
+                    PutClusterCapacityProvidersErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "defaultCapacityProviderStrategy names capacity provider \
+                                 {:?}, which is not among the capacityProviders associated \
+                                 with the cluster",
+                                item.capacity_provider
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `CapacityProviderStrategyItem$base`: "Only one capacity provider in a capacity
+        // provider strategy can have a base defined." `base` is a non-boxed integer whose
+        // modelled default is 0, so "defined" cannot be told from "sent as zero" at this
+        // layer: the check is on a non-zero base, which is the only one that places tasks.
+        let with_base = input
+            .default_capacity_provider_strategy
+            .iter()
+            .filter(|item| item.base > 0)
+            .count();
+        if with_base > 1 {
+            return Err(
+                PutClusterCapacityProvidersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "only one capacity provider of \
+                             defaultCapacityProviderStrategy may define a base; got \
+                             {with_base}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        // A deleted cluster is not one this operation may act in ("The cluster has been
+        // deleted"), so a tombstone is refused exactly as a name that never existed is.
+        let Some(cluster) = guard.active_cluster(&cluster_name) else {
+            return Err(
+                PutClusterCapacityProvidersErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Cluster attachments must be in UPDATE_COMPLETE or UPDATE_FAILED state before
+        // they can be updated": an association already in flight is not replaced by the
+        // next one, it refuses it.
+        if cluster.attachments_updating() {
+            return Err(
+                PutClusterCapacityProvidersErrorModeled::UpdateInProgressException(
+                    UpdateInProgressException {
+                        message: Some(crate::state::CLUSTER_BUSY_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Any existing capacity providers that are associated with a cluster that are
+        // omitted from a PutClusterCapacityProviders API call will be disassociated with
+        // the cluster. You can only disassociate an existing capacity provider from a
+        // cluster if it's not being used by any existing tasks." The providers in use are
+        // collected in ONE pass over the task map, so the lock is held for a time that
+        // grows with the records that exist and not with the product of the two lists.
+        let disassociated: Vec<String> = cluster
+            .capacity_providers
+            .iter()
+            .filter(|provider| !associated.contains(provider.as_str()))
+            .cloned()
+            .collect();
+        if !disassociated.is_empty() {
+            let in_use = guard.capacity_providers_in_use(&cluster_name);
+            if let Some(provider) = disassociated
+                .iter()
+                .find(|provider| in_use.contains(*provider))
+            {
+                return Err(
+                    PutClusterCapacityProvidersErrorModeled::ResourceInUseException(
+                        ResourceInUseException {
+                            message: Some(format!(
+                                "capacity provider {provider:?} is still used by a task of \
+                                 cluster {cluster_name:?} and cannot be disassociated"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let cluster = guard
+            .clusters
+            .get_mut(&cluster_name)
+            .expect("the cluster was just read out of the map under this lock");
+        // "You must specify both the available capacity providers and a default capacity
+        // provider strategy for the cluster": what the request carries REPLACES the
+        // association, rather than being merged into it.
+        cluster.capacity_providers = input.capacity_providers.clone();
+        cluster.default_capacity_provider_strategy =
+            input.default_capacity_provider_strategy.clone();
+        cluster.start_attachments_update(::std::time::SystemTime::now());
+        let record = cluster.clone();
+        // `PutClusterCapacityProviders` takes neither `tags` nor an `include`, so the
+        // response reports no tag set — only the cluster's own configured state.
+        let view = guard.cluster_mutation_view(&record, false);
+
+        Ok(PutClusterCapacityProvidersOutput {
+            cluster: Some(view),
+        })
     }
 }

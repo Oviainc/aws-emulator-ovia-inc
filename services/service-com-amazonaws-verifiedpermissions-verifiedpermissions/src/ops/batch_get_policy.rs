@@ -177,16 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             };
 
-            // The union arm follows the stored `policyType`; a template-linked
-            // policy would need the template it was instantiated from, which
-            // `CreatePolicyTemplate` does not create yet, so no store holds one.
-            // `BatchGetPolicyOutputItem` models no per-item code for "this
-            // emulator cannot render it", so the whole call says so instead.
-            let definition = super::get_policy::policy_definition_detail(policy).ok_or_else(|| {
-                crate::scaffolded::Scaffolded::not_implemented(
-                    "BatchGetPolicy for a templateLinked policy",
-                )
-            })?;
+            // The union arm follows what the stored policy HOLDS: its own Cedar
+            // text, or the template it was instantiated from.
+            let definition = super::get_policy::policy_definition_detail(policy);
 
             results.push(BatchGetPolicyOutputItem {
                 // The RESOLVED store id and policy id, not the references the

@@ -2,8 +2,9 @@
 
 //! @op CreateSubscription
 //! IMPLEMENTED: mints a `subscriptionId`, builds its ARN under the parent domain's,
-//! and PERSISTS the subscription under that domain in [`crate::state`]. A domain no
-//! live record carries is a 404 `ResourceNotFoundException`.
+//! and PERSISTS the subscription — in the `ACTIVE` status creation establishes — under
+//! that domain in [`crate::state`]. A domain no live record carries is a 404
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -201,10 +202,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain_id: domain.domain_id.clone(),
             subscription_id: subscription_id.clone(),
             arn: crate::state::subscription_arn(&domain.arn, &subscription_id),
-            // A new subscription is not billable until it is activated.
-            status: crate::state::SubscriptionStatus::Inactive,
+            // `CreateSubscription` "Creates a new Subscription within a Domain for
+            // billing and user management": creating one ENABLES billing for the user,
+            // so the subscription is born in its enabled terminal status. It is not a
+            // two-step create-then-activate resource, and `ActivateSubscription` exists
+            // to re-enable one a `DeactivateSubscription` turned off.
+            status: crate::state::SubscriptionStatus::Active,
             created_at: now,
             last_updated_at: now,
+            // `activatedAt` / `deactivatedAt` record the explicit transition calls, so a
+            // subscription that has never been activated or deactivated carries neither;
+            // the initial status is not one of those transitions.
             activated_at: None,
             deactivated_at: None,
         };

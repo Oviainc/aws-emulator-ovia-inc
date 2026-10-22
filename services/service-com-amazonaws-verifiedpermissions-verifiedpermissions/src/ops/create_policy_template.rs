@@ -9,6 +9,11 @@
 //! never holds a template that is not valid Cedar, and every response field is
 //! read back out of what was persisted.
 //!
+//! Text this operation refuses answers with the model's own
+//! `ValidationException`, whose `fieldList` names `/statement`: one entry for
+//! text the parser refuses, and one entry per validation reason when the store's
+//! schema refuses it in `STRICT` mode.
+//!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ---
@@ -97,7 +102,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-verifiedpermissions-ver
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.verifiedpermissions#CreatePolicyTemplate",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum CreatePolicyTemplateErrorModeled {
@@ -105,6 +110,7 @@ pub enum CreatePolicyTemplateErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -168,6 +174,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the service state store is unavailable".to_string(),
             })
         };
+        // Every refusal of the caller's template text answers with the model's
+        // own `ValidationException`, whose `fieldList` names the member at fault:
+        // `/statement` for text the Cedar template parser refuses, and one entry
+        // per validation reason — also at `/statement`, the member whose content
+        // was validated — when the store's schema refuses it.
+        let invalid = |invalid: crate::ops::InvalidInput| -> CreatePolicyTemplateError {
+            CreatePolicyTemplateErrorModeled::ValidationException(
+                crate::ops::validation_exception([invalid]),
+            )
+            .into()
+        };
+        let refused = |refusal: crate::state::cedar::Refusal| -> CreatePolicyTemplateError {
+            match refusal {
+                crate::state::cedar::Refusal::InvalidInput(field) => invalid(field),
+                crate::state::cedar::Refusal::SchemaValidation(reasons) => {
+                    CreatePolicyTemplateErrorModeled::ValidationException(
+                        crate::ops::schema_validation_exception(
+                            crate::ops::paths::TEMPLATE_STATEMENT,
+                            reasons,
+                        ),
+                    )
+                    .into()
+                }
+                crate::state::cedar::Refusal::ServiceFault(message) => {
+                    CreatePolicyTemplateErrorModeled::InternalServerException(
+                        InternalServerException { message },
+                    )
+                    .into()
+                }
+            }
+        };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let mut state = state.lock();
@@ -218,8 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whatever else the store already holds. (The `clientToken` replay above
         // comes first, as it does in `CreatePolicy`: a token reused with different
         // parameters is a conflict however well-formed this statement is.)
-        crate::state::cedar::parse_policy_template(&input.statement)
-            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        crate::state::cedar::parse_policy_template(&input.statement).map_err(invalid)?;
 
         // `ValidationSettings` documents this exactly: "STRICT — Requires a schema
         // to be present in the policy store. Cedar performs validation on all
@@ -233,9 +269,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.validation_mode == "STRICT" {
             match store.schema.as_ref() {
                 None => {
-                    return Err(crate::scaffolded::Scaffolded::validation(format!(
-                        "policy store {store_id} has validation mode STRICT but contains no \
-                         schema, so the policy template cannot be validated"
+                    // Nothing is wrong with the statement here: the STORE the
+                    // request named holds no schema, which is the member the
+                    // caller can act on.
+                    return Err(invalid(crate::ops::InvalidInput::new(
+                        crate::ops::paths::POLICY_STORE_ID,
+                        "its validation mode is STRICT and it contains no schema, so there \
+                         is nothing to validate a policy template against",
                     )));
                 }
                 Some(schema) => {
@@ -243,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &schema.cedar_json,
                         &input.statement,
                     )
-                    .map_err(crate::scaffolded::Scaffolded::validation)?;
+                    .map_err(refused)?;
                 }
             }
         }

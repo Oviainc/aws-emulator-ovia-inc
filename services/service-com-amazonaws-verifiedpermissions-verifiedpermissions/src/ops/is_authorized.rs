@@ -188,16 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.policy_stores.get(&store_id).ok_or_else(not_found)?;
 
         let verdict = crate::state::cedar::authorize(
-            &store.policies,
+            store,
             &principal,
             &action,
             &resource,
             context,
             entities,
-            // The store's schema, when it holds one: it is what types the
-            // request's entities and context, so the evaluation is made against
-            // it rather than untyped.
-            store.schema.as_ref().map(|schema| schema.cedar_json.as_str()),
         )
         .map_err(|refusal| match refusal {
             // A request member the caller can fix is the modelled
@@ -208,6 +204,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::cedar::Refusal::ServiceFault(message) => {
                 IsAuthorizedErrorModeled::InternalServerException(InternalServerException {
                     message,
+                })
+                .into()
+            }
+            // An authorization request carries no policy content, so the store's
+            // schema has no member of this REQUEST to refuse: reasons reaching
+            // here are about policies the store already holds, which is
+            // service-side state and not something the caller sent.
+            crate::state::cedar::Refusal::SchemaValidation(reasons) => {
+                IsAuthorizedErrorModeled::InternalServerException(InternalServerException {
+                    message: reasons.join("; "),
                 })
                 .into()
             }

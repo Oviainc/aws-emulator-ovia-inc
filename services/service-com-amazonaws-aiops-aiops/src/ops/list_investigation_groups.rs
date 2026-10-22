@@ -113,6 +113,14 @@ impl From<ListInvestigationGroupsErrorModeled> for ListInvestigationGroupsError 
 /// allocates is decided by the server, never by the request.
 const MAX_PAGE_SIZE: usize = 50;
 
+/// What a `nextToken` has to be, for the refusal of one this operation did not issue.
+///
+/// The model constrains the member's length only (`SensitiveStringWithLengthLimits`,
+/// 0..2048), so this requirement is the service's own: the opaque token is meaningful
+/// only to the operation that minted it.
+const NEXT_TOKEN_REQUIREMENT: &str =
+    "Member must be a pagination token returned by a previous ListInvestigationGroups call";
+
 /// A page token naming the group the NEXT page starts at.
 ///
 /// `nextToken` is modelled opaque, so the id is hex-encoded rather than handed back
@@ -124,7 +132,10 @@ fn encode_page_token(id: &str) -> String {
 }
 
 /// The group id a page token names, or a 400 refusal when the token is not one this
-/// operation issued. The token's own text is never echoed back: it is `@sensitive`.
+/// operation issued. The token's own text is never echoed back: it is `@sensitive` —
+/// and the refusal is worded through [`crate::state::validation_message`], so a token
+/// this operation rejects reads like every other refusal this service makes (the
+/// member and the requirement, with no value).
 fn decode_page_token(token: &str) -> Result<String, ListInvestigationGroupsError> {
     hex::decode(token)
         .ok()
@@ -133,9 +144,10 @@ fn decode_page_token(token: &str) -> Result<String, ListInvestigationGroupsError
             id.len() == crate::state::GROUP_ID_LEN && id.bytes().all(|b| b.is_ascii_alphanumeric())
         })
         .ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation(
-                "nextToken is not a pagination token issued by ListInvestigationGroups",
-            )
+            crate::scaffolded::Scaffolded::validation(crate::state::validation_message(
+                "nextToken",
+                NEXT_TOKEN_REQUIREMENT,
+            ))
         })
 }
 

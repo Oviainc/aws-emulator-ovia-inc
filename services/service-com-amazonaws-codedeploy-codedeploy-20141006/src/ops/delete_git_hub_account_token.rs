@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGitHubAccountToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGitHubAccountToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the named connection to a GitHub account from this service's store and
+//! answers the name it deleted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGitHubAccountToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGitHubAccountToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGitHubAccountTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGitHubAccountToken"))
+        let _ = ctx;
+        // `tokenName` is neither @required nor length-constrained in the model
+        // (`smithy_query(query="shape",shape="GitHubAccountTokenName")` is a bare
+        // string), so an absent or blank name reaches this handler — which is exactly
+        // what `GitHubAccountTokenNameRequiredException` is for, and what the recorded
+        // check `codedeploy.delete-github-account-token-nonexistent-fails` asks of a
+        // call that names nothing. Treating whitespace as naming nothing is this
+        // emulator's reading of "missing", not a modelled constraint, and is the same
+        // reading `get_deployment` and `list_deployments` take of their own names. The
+        // name's FORMAT is otherwise unconstrained by the model, so no non-blank name
+        // is refused as invalid.
+        let token_name = input.token_name.unwrap_or_default();
+        if token_name.trim().is_empty() {
+            return Err(
+                DeleteGitHubAccountTokenErrorModeled::GitHubAccountTokenNameRequiredException(
+                    GitHubAccountTokenNameRequiredException {
+                        message: Some(
+                            "The GitHub account connection name was not specified".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Deleting a connection the store does not hold is a success that changes
+        // nothing — the recorded check
+        // `codedeploy.delete-github-account-token-nonexistent-is-noop` passes this step
+        // on a name no connection exists under — so the delete is idempotent and
+        // `GitHubAccountTokenDoesNotExistException` is never raised here. The only
+        // write is the removal; the name answered is the one deleted.
+        crate::state::with_state(&*self.engine, |state| {
+            state.remove_git_hub_account_token(&token_name);
+        })
+        .ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        Ok(DeleteGitHubAccountTokenOutput {
+            token_name: Some(token_name),
+        })
     }
 }

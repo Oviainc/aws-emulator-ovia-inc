@@ -17,6 +17,8 @@ mod blob_content;
 mod commit_reads;
 #[path = "all/compared_commit_comments.rs"]
 mod compared_commit_comments;
+#[path = "all/default_branch.rs"]
+mod default_branch;
 #[path = "all/file_commit_history.rs"]
 mod file_commit_history;
 #[path = "all/repository_lifecycle.rs"]

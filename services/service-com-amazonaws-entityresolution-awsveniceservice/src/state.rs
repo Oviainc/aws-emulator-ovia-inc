@@ -887,6 +887,31 @@ pub mod messages {
     /// [`GET_MATCHING_WORKFLOW_NOT_FOUND`] form rather than the templated delete one.
     pub const UPDATE_MATCHING_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
 
+    /// `ListTagsForResource`'s `ResourceNotFoundException$message` (HTTP 404) when the
+    /// `resourceArn` names no resource this service holds.
+    ///
+    /// Not recorded, and AWS documents no template for it, so this is this
+    /// operation's own constant; the HTTP 404 and the `ResourceNotFoundException`
+    /// code are what a client branches on. It names the resource TYPES the tagging
+    /// surface covers the way the API spells them, and carries no value from the
+    /// request.
+    pub const LIST_TAGS_FOR_RESOURCE_NOT_FOUND: &str =
+        "The resource ARN does not identify a SchemaMapping, MatchingWorkflow, \
+         IdMappingWorkflow or IdNamespace that exists";
+
+    /// `TagResource`'s `ResourceNotFoundException$message` (HTTP 404) for the same
+    /// condition, kept as this operation's OWN constant rather than shared with
+    /// [`LIST_TAGS_FOR_RESOURCE_NOT_FOUND`]: nothing says AWS words the two alike.
+    pub const TAG_RESOURCE_NOT_FOUND: &str =
+        "The resource ARN does not identify a SchemaMapping, MatchingWorkflow, \
+         IdMappingWorkflow or IdNamespace that can be tagged";
+
+    /// `UntagResource`'s `ResourceNotFoundException$message` (HTTP 404), this
+    /// operation's own constant for the same reason.
+    pub const UNTAG_RESOURCE_NOT_FOUND: &str =
+        "The resource ARN does not identify a SchemaMapping, MatchingWorkflow, \
+         IdMappingWorkflow or IdNamespace that can be untagged";
+
     /// `DeleteSchemaMapping`'s `ResourceNotFoundException$message` (HTTP 404) — the
     /// refusal its doc describes ("This operation returns a ResourceNotFoundException
     /// if a schema with the given name does not exist"). Not itself recorded; this
@@ -951,6 +976,18 @@ pub const MAX_ID_MAPPING_WORKFLOWS: usize = 100;
 /// The name of the quota [`MAX_ID_MAPPING_WORKFLOWS`] enforces, reported on
 /// `ExceedsLimitException$quotaName`.
 pub const ID_MAPPING_WORKFLOWS_QUOTA_NAME: &str = "ID mapping workflows";
+
+/// How many tags one resource may carry, past which `TagResource` refuses the merge
+/// whole with the modelled `ValidationException` (HTTP 400).
+///
+/// It is the maximum the model states for a tag map: `TagMap` is `length 0..200`
+/// (`smithy_query(query="shape",shape="TagMap")`), which is both the most pairs one
+/// request may carry and the most `ListTagsForResource` may report, since its `tags`
+/// member targets that same shape. A merge is therefore bounded by the same figure as
+/// a single request, so repeated `TagResource` calls cannot grow a record's tag map
+/// without limit. The bound is self-healing: `UntagResource` releases keys, so room
+/// comes back without a TTL or eviction.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
 /// A quota value as `ExceedsLimitException$quotaValue` models it (an `Integer`).
 ///
@@ -1039,6 +1076,89 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
                 .iter()
                 .any(|source| source.schema_name == schema_name)
         })
+    }
+
+    /// The tags stored on the resource `resource_arn` names, or `None` when no stored
+    /// resource carries that ARN.
+    ///
+    /// The tagging surface is keyed by ARN, not by name: `resourceArn` is modelled as
+    /// a `VeniceGlobalArn`
+    /// (`^arn:…:entityresolution:<region>:<account>:((schemamapping|matchingworkflow|idmappingworkflow|idnamespace)/<name>)$`,
+    /// `smithy_query(query="operation",operation="TagResource")`), so the lookup
+    /// compares against the ARN that was MINTED for a record when it was created. A
+    /// well-formed ARN whose partition, region, account, type or name does not match a
+    /// stored record therefore names nothing, which is the 404 condition for all three
+    /// tagging operations. Resolution spans EVERY resource type that pattern admits: a
+    /// schema mapping, a matching workflow, an ID mapping workflow and an ID namespace
+    /// each carry their own `tags` member, so each is reached here.
+    ///
+    /// `tags` is optional on a stored record (a create that carried none stores
+    /// `None`), while `ListTagsForResourceOutput$tags` is @required, so an untagged
+    /// resource reads back as the EMPTY map rather than as a missing member.
+    pub fn resource_tags(&self, resource_arn: &str) -> Option<HashMap<String, String>> {
+        if let Some(mapping) = self
+            .schema_mappings
+            .values()
+            .find(|mapping| mapping.schema_arn == resource_arn)
+        {
+            return Some(mapping.tags.clone().unwrap_or_default());
+        }
+        if let Some(workflow) = self
+            .matching_workflows
+            .values()
+            .find(|workflow| workflow.workflow_arn == resource_arn)
+        {
+            return Some(workflow.tags.clone().unwrap_or_default());
+        }
+        if let Some(workflow) = self
+            .id_mapping_workflows
+            .values()
+            .find(|workflow| workflow.workflow_arn == resource_arn)
+        {
+            return Some(workflow.tags.clone().unwrap_or_default());
+        }
+        self.id_namespaces
+            .values()
+            .find(|namespace| namespace.id_namespace_arn == resource_arn)
+            .map(|namespace| namespace.tags.clone().unwrap_or_default())
+    }
+
+    /// The tag SLOT of the resource `resource_arn` names, for a writer.
+    ///
+    /// Resolution is exactly [`Self::resource_tags`]'s, so a tag write and a tag read
+    /// agree about which record an ARN names. The slot is handed back as the stored
+    /// `Option` rather than as a map, so a caller decides whether a write is owed at
+    /// all: materialising an empty map here would make `GetSchemaMapping` report
+    /// `tags: {}` on a resource whose tags were never touched.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource_arn: &str,
+    ) -> Option<&mut Option<HashMap<String, String>>> {
+        if let Some(mapping) = self
+            .schema_mappings
+            .values_mut()
+            .find(|mapping| mapping.schema_arn == resource_arn)
+        {
+            return Some(&mut mapping.tags);
+        }
+        if let Some(workflow) = self
+            .matching_workflows
+            .values_mut()
+            .find(|workflow| workflow.workflow_arn == resource_arn)
+        {
+            return Some(&mut workflow.tags);
+        }
+        if let Some(workflow) = self
+            .id_mapping_workflows
+            .values_mut()
+            .find(|workflow| workflow.workflow_arn == resource_arn)
+        {
+            return Some(&mut workflow.tags);
+        }
+        self.id_namespaces
+            .values_mut()
+            .find(|namespace| namespace.id_namespace_arn == resource_arn)
+            .map(|namespace| &mut namespace.tags)
     }
 
     /// Materialise the clock-owed transitions of the job named by
