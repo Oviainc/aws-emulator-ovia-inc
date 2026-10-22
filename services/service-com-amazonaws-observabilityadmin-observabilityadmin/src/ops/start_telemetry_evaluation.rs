@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartTelemetryEvaluation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartTelemetryEvaluation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartTelemetryEvaluation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What it does
+//!
+//! It MUTATES: onboarding the caller's account to the telemetry-config feature is
+//! what this call is for. It records the onboarding of the region the request was
+//! signed for — the home region — plus every spoke region the request's
+//! `Regions`/`AllRegions` scope names, so `GetTelemetryEvaluationStatus` reports
+//! `STARTING` until that onboarding comes due
+//! ([`crate::state::EVALUATION_TRANSITION_DELAY_MS`]) and `RUNNING` from then on.
+//!
+//! One rule the model states but cannot express as a constraint is refused here
+//! with the modelled `ValidationException`: `Regions` and `AllRegions` are "mutually
+//! exclusive", and each named region must be a region of the home region's own
+//! partition — [`crate::state::multi_region_rejection`], the same check a telemetry
+//! rule's scope goes through. The current region named in `Regions` is NOT refused:
+//! it "is always implicitly included", so naming it asks for nothing the call does
+//! not already do, and it is simply not a spoke of its own configuration.
+//!
+//! Repeating the same start is the same onboarding: it does not push a running
+//! feature back into `STARTING`.
+//!
+//! Authorization is deliberately out of scope for this emulator: the framework
+//! verifies every request signature, but no IAM principal is evaluated, so the
+//! modelled `AccessDeniedException` is never answered. The modelled
+//! `TooManyRequestsException` is answered for one reason only — the emulator's own
+//! finite feature store ([`crate::state::MAX_TELEMETRY_FEATURE_REGIONS`]) — and never
+//! as a request-rate limit, which this emulator does not enforce.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +195,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartTelemetryEvaluation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartTelemetryEvaluationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartTelemetryEvaluation"))
+        // `Regions`' 1.. length and its `uniqueItems` are modelled, so the
+        // centralized walk has already refused anything outside them with a 400
+        // `ValidationException` before this body runs. What is left — the
+        // `Regions`/`AllRegions` exclusion and the partition each named region must
+        // belong to — is below.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartTelemetryEvaluationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the telemetry evaluation store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_epoch_millis();
+        let all_regions = input.all_regions == Some(true);
+        let named = input.regions.as_deref().unwrap_or_default();
+
+        if let Some(why) = crate::state::multi_region_rejection("", all_regions, named, &region) {
+            return Err(StartTelemetryEvaluationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(why),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // The spoke set is computed, bounded and de-duplicated by the server before
+        // anything is written, so the number of regions one request onboards is
+        // decided here and not by the length of the list it sent. The current region
+        // is never a spoke of its own configuration: it "is always implicitly
+        // included", so naming it in `Regions` asks for nothing the call does not
+        // already do.
+        let spoke_regions = crate::state::multi_region_targets(all_regions, named, &region);
+        if !state.lock().start_telemetry_evaluation(
+            crate::state::EvaluationScope::Account,
+            &region,
+            spoke_regions,
+            now,
+        ) {
+            // The feature store is finite ([`crate::state::MAX_TELEMETRY_FEATURE_REGIONS`]):
+            // an onboarding that would take it past its cap is refused BEFORE a
+            // record is allocated. `TooManyRequestsException` is the modelled error
+            // for "the service will not take this request now" — this operation
+            // models no quota error — and it is the retryable one, which is what a
+            // caller should do once another region is offboarded.
+            return Err(
+                StartTelemetryEvaluationErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        message: Some(format!(
+                            "this emulator holds the telemetry-config feature of at most {} \
+                             regions",
+                            crate::state::MAX_TELEMETRY_FEATURE_REGIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(StartTelemetryEvaluationOutput)
     }
 }

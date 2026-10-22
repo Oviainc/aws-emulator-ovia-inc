@@ -17,5 +17,8 @@ mod centralization_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 
+#[path = "all/telemetry_feature_status.rs"]
+mod telemetry_feature_status;
+
 #[path = "all/telemetry_rules.rs"]
 mod telemetry_rules;
