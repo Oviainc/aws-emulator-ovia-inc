@@ -61,6 +61,8 @@ mod personalize_signing_name_routing;
 mod rds_docdb_neptune_signing_name_routing;
 #[path = "all/rds_shared_query_front_door_routing.rs"]
 mod rds_shared_query_front_door_routing;
+#[path = "all/rds_shared_query_surface_routing.rs"]
+mod rds_shared_query_surface_routing;
 #[path = "all/rds_shared_signing_name_routing.rs"]
 mod rds_shared_signing_name_routing;
 #[path = "all/rds_signing_name_routing.rs"]

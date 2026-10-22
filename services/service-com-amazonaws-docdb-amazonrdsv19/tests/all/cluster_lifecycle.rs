@@ -119,7 +119,10 @@ impl Docdb {
 /// changes the workspace `Cargo.lock`, which every concurrent landing in this repository
 /// also changes, and that collision is what keeps this fix from being squash-merged. The
 /// encoder is three lines and the decoder it feeds is the framework's own.
-fn form_encode(value: &str) -> String {
+///
+/// `pub(crate)` so the sibling suites of this one test target encode their form bodies the
+/// same way rather than each deriving an encoder.
+pub(crate) fn form_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -144,7 +147,7 @@ pub(crate) fn let_the_clock_catch_up() {
 }
 
 /// Unescape the five XML entities the response serializer emits.
-fn unescape(text: &str) -> String {
+pub(crate) fn unescape(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -161,6 +164,9 @@ fn unescape(text: &str) -> String {
 /// of the same name — and it matches the element's FULL name (the character after it must
 /// end the start tag or separate an attribute), so `<Status>` never matches
 /// `<StatusInfos>` while `<DBCluster xmlns="...">` still does match `DBCluster`.
+///
+/// `pub(crate)` so the sibling suites of this one test target read a response with the same
+/// reader rather than each deriving one.
 pub(crate) fn texts(xml: &str, tag: &str) -> Vec<String> {
     let needle = format!("<{tag}");
     let close = format!("</{tag}>");

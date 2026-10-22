@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBClusterParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBClusterParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a cluster parameter group: a named, family-scoped set of engine parameters the
+//! cluster that carries the group runs with. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBClusterParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A group starts carrying no parameters of its own: the defaults belong to the engine
+//! FAMILY, which publishes them (`crate::state::published_parameters`), so a describe of a
+//! fresh group reports an empty `Parameters` list until `ModifyDBClusterParameterGroup`
+//! sets one.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +154,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBClusterParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBClusterParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBClusterParameterGroup"))
+        use crate::state as docdb;
+
+        // The model constrains none of these members, so the rules their own documentation
+        // states are enforced here, and nothing caller-sized reaches the store unchecked;
+        // see the "Store bounds" block in `src/state.rs`.
+        docdb::validate_parameter_group_name(
+            "DBClusterParameterGroupName",
+            &input.db_cluster_parameter_group_name,
+        )
+        .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+        docdb::validate_parameter_group_family(&input.db_parameter_group_family)
+            .map_err(crate::scaffolded::Scaffolded::invalid_parameter_value)?;
+        for (member, value) in [
+            ("DBParameterGroupFamily", &input.db_parameter_group_family),
+            ("Description", &input.description),
+        ] {
+            docdb::bound_chars(member, value, docdb::MAX_STRING_CHARS)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+        }
+        docdb::bound_tags(input.tags.as_ref()).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let region = docdb::request_region(ctx);
+        // `DBClusterParameterGroupName`: "This value is stored as a lowercase string."
+        let name = input.db_cluster_parameter_group_name.to_ascii_lowercase();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+
+        // `DBClusterParameterGroupName` constraint: "Must not match the name of an existing
+        // DBClusterParameterGroup." The message names the group the caller asked for, as the
+        // caller spelled it: the name is MATCHED lowercased ("This value is stored as a
+        // lowercase string"), but a message built from the request quotes the request.
+        if store.cluster_parameter_groups.contains_key(&name) {
+            return Err(
+                CreateDBClusterParameterGroupErrorModeled::DBParameterGroupAlreadyExistsFault(
+                    DBParameterGroupAlreadyExistsFault {
+                        message: Some(format!(
+                            "Parameter group {} already exists",
+                            input.db_cluster_parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store's own cap: an over-cap create is refused, never stored.
+        if store.cluster_parameter_groups.len() >= docdb::MAX_DB_CLUSTER_PARAMETER_GROUPS {
+            return Err(
+                CreateDBClusterParameterGroupErrorModeled::DBParameterGroupQuotaExceededFault(
+                    DBParameterGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} cluster parameter groups",
+                            docdb::MAX_DB_CLUSTER_PARAMETER_GROUPS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = docdb::DbClusterParameterGroupRecord {
+            name: name.clone(),
+            family: input.db_parameter_group_family,
+            description: input.description,
+            region,
+            parameters: ::std::collections::BTreeMap::new(),
+            tags: docdb::tag_pairs(input.tags),
+        };
+        store.cluster_parameter_groups.insert(name.clone(), record);
+
+        let stored = store
+            .cluster_parameter_groups
+            .get(&name)
+            .expect("the group was inserted on the line above");
+        Ok(CreateDBClusterParameterGroupOutput {
+            db_cluster_parameter_group: Some(stored.to_shape()),
+        })
     }
 }

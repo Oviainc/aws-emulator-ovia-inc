@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the parameters of one cluster parameter group. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A group carries the parameters a CALLER set (reported `Source` `user`); the engine's own
+//! defaults belong to the FAMILY and are published by it
+//! (`crate::state::published_parameters`), so a freshly created group reports an empty
+//! `Parameters` list and a `Source` naming the engine reports the family's published
+//! defaults instead of the group's own set.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +155,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterParameters"))
+        let region =
+            crate::state::request_region(ctx).map_err(DescribeDBClusterParametersError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBClusterParametersError::validation)?;
+        // `Filters`: "This parameter is not currently supported", so a request that carries
+        // one is refused rather than served as though the filter had been applied.
+        if input.filters.iter().flatten().next().is_some() {
+            return Err(DescribeDBClusterParametersError::validation(
+                "Filters is not currently supported by DescribeDBClusterParameters",
+            ));
+        }
+        // `Source`: a filter over the sources this API names, not a constraint — so a value
+        // naming none of them selects nothing instead of refusing the request, and a
+        // describe of a group that is not there still answers the modelled 404.
+        let source = crate::state::parameter_source_filter(input.source.as_deref());
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let store = state.lock();
+
+        let name = input.db_cluster_parameter_group_name.to_ascii_lowercase();
+        let Some(group) = store.db_cluster_parameter_groups.get(&(region, name)) else {
+            return Err(
+                DescribeDBClusterParametersErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "DBClusterParameterGroup not found: {}",
+                            input.db_cluster_parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Which source the caller asked for decides what is reported: the group's own
+        // parameters (`customer`/`user`, and the default when the caller names no source),
+        // the family's published defaults (`engine`/`engine-default`), or nothing — for
+        // `service`/`system`, because this emulator sets no service-sourced parameter, and
+        // for a value naming no source at all.
+        let parameters: Vec<(String, Parameter)> = match source {
+            crate::state::ParameterSourceFilter::Engine => {
+                crate::state::published_parameters(&group.family)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|spec| {
+                        (
+                            spec.name.to_string(),
+                            crate::state::engine_default_parameter_to_wire(spec),
+                        )
+                    })
+                    .collect()
+            }
+            crate::state::ParameterSourceFilter::Customer => group
+                .parameters
+                .keys()
+                .map(|name| (name.clone(), group.parameter_to_wire(name)))
+                .collect(),
+            crate::state::ParameterSourceFilter::Service
+            | crate::state::ParameterSourceFilter::Unknown => Vec::new(),
+        };
+
+        let page = crate::state::paginate(parameters, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBClusterParametersError::invalid_parameter_value)?;
+        Ok(DescribeDBClusterParametersOutput {
+            parameters: Some(page.items),
+            marker: page.next_marker,
+        })
     }
 }

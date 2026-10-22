@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBClusterParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBClusterParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes a cluster parameter group. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBClusterParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "The cluster parameter group to be deleted can't be associated with any clusters", and
+//! `DBClusterParameterGroupName`'s own constraints add "You can't delete a default cluster
+//! parameter group" — either refusal is the modelled `InvalidDBParameterGroupStateFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBClusterParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBClusterParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBClusterParameterGroup"))
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let mut store = state.lock();
+
+        // A group exists if a caller CREATED it or the engine provides it as a family's
+        // default, which is the one resolver every operation naming a group by name uses.
+        let key = input.db_cluster_parameter_group_name.to_ascii_lowercase();
+        if crate::state::resolve_parameter_group_in(
+            &store,
+            &input.db_cluster_parameter_group_name,
+            &region,
+        )
+        .is_none()
+        {
+            return Err(
+                DeleteDBClusterParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "DBClusterParameterGroup not found: {}",
+                            input.db_cluster_parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "You can't delete a default cluster parameter group." The engine's own groups are
+        // the `default.<family>` ones, which exist in every account without a create (see
+        // `crate::state::default_parameter_groups`): one of them resolves above, and is
+        // refused HERE rather than removed from a store it was never in.
+        if key.starts_with(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX) {
+            return Err(
+                DeleteDBClusterParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
+                    InvalidDBParameterGroupStateFault {
+                        message: Some(format!(
+                            "DB cluster parameter group {key} is a default group and cannot be \
+                             deleted"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The cluster parameter group to be deleted can't be associated with any clusters."
+        let in_use = store.clusters_using_parameter_group(&key);
+        if !in_use.is_empty() {
+            return Err(
+                DeleteDBClusterParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
+                    InvalidDBParameterGroupStateFault {
+                        message: Some(format!(
+                            "DB cluster parameter group {key} is in use by {} and cannot be \
+                             deleted",
+                            in_use.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.cluster_parameter_groups.remove(&key);
+        Ok(DeleteDBClusterParameterGroupOutput)
     }
 }

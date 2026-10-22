@@ -177,6 +177,68 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the `InvalidParameterValue` error shape.
+static INVALID_PARAMETER_VALUE_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterValue$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the `InvalidParameterValue` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the shape
+/// is not in this service's model, so it must not collide with a modelled one. The wire
+/// `<Code>` comes from [`OperationError::shape_name`] below, which answers the AWS code.
+pub static INVALID_PARAMETER_VALUE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InvalidParameterValue",
+        "smithy.framework",
+        "InvalidParameterValue",
+    ),
+    ShapeType::Structure,
+    &[&INVALID_PARAMETER_VALUE_MESSAGE],
+);
+
+/// The payload of an `InvalidParameterValue`: which value the request carried that the
+/// service does not admit, and what it admits instead.
+#[derive(Debug, Clone)]
+pub struct InvalidParameterValue {
+    pub message: String,
+}
+
+impl InvalidParameterValue {
+    /// An `InvalidParameterValue` carrying `message`.
+    ///
+    /// Name the member (or the engine parameter) and the values it admits: the caller has
+    /// to fix the request from this text alone.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidParameterValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InvalidParameterValue: {}", self.message)
+    }
+}
+
+impl std::error::Error for InvalidParameterValue {}
+
+impl SerializableStruct for InvalidParameterValue {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&INVALID_PARAMETER_VALUE_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// The `message` member of the synthetic `InternalFailure` error shape.
 static INTERNAL_FAILURE_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
@@ -325,6 +387,17 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// The request named a value this service does not admit. Renders as HTTP 400 with the
+    /// error code `InvalidParameterValue`.
+    ///
+    /// `InvalidParameterValue` is the code the AWS Query APIs answer for a value outside
+    /// the set a parameter admits — the `Sender` fault every awsQuery client branches on —
+    /// and this service's model declares no error shape for it, so it lives here beside
+    /// `validation` rather than being answered under a different code. Use it where the
+    /// service admits a KNOWN set of values and the request named something outside it;
+    /// `ValidationException` stays the code for a request that is malformed in a way the
+    /// model cannot express.
+    InvalidParameterValue(InvalidParameterValue),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -379,6 +452,12 @@ impl<E> Scaffolded<E> {
         Self::ValidationException(ValidationException::new(message))
     }
 
+    /// Refuse a value outside the set this service admits, with HTTP 400
+    /// `InvalidParameterValue`; see the variant's own note for when it is the right code.
+    pub fn invalid_parameter_value(message: impl Into<String>) -> Self {
+        Self::InvalidParameterValue(InvalidParameterValue::new(message))
+    }
+
     /// Report that the emulator itself could not serve the request, with HTTP 500
     /// `InternalFailure`.
     ///
@@ -405,6 +484,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::InvalidParameterValue(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::InternalFailure(e) => write!(f, "{e}"),
             Self::QueryCommon(e) => write!(f, "{e}"),
@@ -419,6 +499,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::InvalidParameterValue(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::InternalFailure(e) => e.source(),
             Self::QueryCommon(e) => e.source(),
@@ -435,6 +516,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::InvalidParameterValue(e) => e,
             Self::ValidationException(e) => e,
             Self::InternalFailure(e) => e,
             Self::QueryCommon(e) => e,
@@ -445,6 +527,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::InvalidParameterValue(_) => &INVALID_PARAMETER_VALUE_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::InternalFailure(_) => &INTERNAL_FAILURE_SCHEMA,
             Self::QueryCommon(_) => &QUERY_COMMON_SCHEMA,
@@ -459,6 +542,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::InvalidParameterValue(_) => "InvalidParameterValue",
             Self::ValidationException(_) => "ValidationException",
             Self::InternalFailure(_) => "InternalFailure",
             // The documented common-error code; see [`QueryCommonError::code`].
@@ -474,6 +558,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::InvalidParameterValue(_) => 400,
             Self::ValidationException(_) => 400,
             Self::InternalFailure(_) => 500,
             // Every awsQuery common error is a client fault; AWS answers all of them 400.
@@ -488,6 +573,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // The `<Code>` an awsQuery client reads is `shape_name` above, which already
+            // answers the AWS code for this one, so there is no separate query code to
+            // override it with.
+            Self::InvalidParameterValue(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
             // Same reason again: the synthetic shape carries no `awsQueryError` trait.

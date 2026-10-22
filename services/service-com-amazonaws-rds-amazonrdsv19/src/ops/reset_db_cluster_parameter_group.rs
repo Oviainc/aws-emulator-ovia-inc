@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetDBClusterParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetDBClusterParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Resets a cluster parameter group's parameters to their family defaults. This is the
+//! ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetDBClusterParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A group that carries a parameter change still waiting on a reboot is NOT in a state
+//! that can be reset: the recorded AWS answer for that call is `400`
+//! `InvalidDBParameterGroupState` naming the pending parameter, which is what
+//! `InvalidDBParameterGroupStateFault` documents ("the parameter group is in use, or it is
+//! in a state that is not valid"). A group whose changes were applied immediately — the
+//! method a dynamic parameter admits — resets.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +158,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetDBClusterParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetDBClusterParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetDBClusterParameterGroup"))
+        let region = crate::state::request_region(ctx)
+            .map_err(ResetDBClusterParameterGroupError::validation)?;
+        let named: Vec<&Parameter> = input.parameters.iter().flatten().collect();
+        let reset_all = input.reset_all_parameters.unwrap_or(false);
+        // `ResetAllParameters`: "You can't use this parameter if there is a list of
+        // parameter names specified for the Parameters parameter."
+        if reset_all && !named.is_empty() {
+            return Err(ResetDBClusterParameterGroupError::validation(
+                "ResetAllParameters cannot be used together with a list of Parameters",
+            ));
+        }
+        if named.len() > crate::state::MAX_PARAMETERS_PER_MODIFY {
+            return Err(ResetDBClusterParameterGroupError::validation(format!(
+                "Parameters carries {} entries: a maximum of {} parameters can be reset in a \
+                 single request",
+                named.len(),
+                crate::state::MAX_PARAMETERS_PER_MODIFY
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+
+        let key = (
+            region,
+            input.db_cluster_parameter_group_name.to_ascii_lowercase(),
+        );
+        let Some(group) = store.db_cluster_parameter_groups.get(&key) else {
+            return Err(
+                ResetDBClusterParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "DBClusterParameterGroup not found: {}",
+                            input.db_cluster_parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A change that has not been applied yet is the group's invalid state: it cannot be
+        // reset until the reboot it is waiting for. The message names the parameters the
+        // group is pending on, so the caller knows what to reboot for.
+        let pending = group.pending_parameters();
+        if !pending.is_empty() {
+            return Err(
+                ResetDBClusterParameterGroupErrorModeled::InvalidDBParameterGroupStateFault(
+                    InvalidDBParameterGroupStateFault {
+                        message: Some(format!(
+                            "DB cluster parameter group {} has pending changes to {} that \
+                             require a reboot before it can be reset",
+                            group.name,
+                            pending.join(", ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let family = group.family.clone();
+        // A named parameter must be one the family publishes; resetting it drops the value
+        // the group carried, so the family's own default applies again.
+        let mut to_clear: Vec<String> = Vec::with_capacity(named.len());
+        for parameter in &named {
+            let Some(name) = parameter.parameter_name.as_deref() else {
+                return Err(ResetDBClusterParameterGroupError::validation(
+                    "each entry of Parameters must carry a ParameterName",
+                ));
+            };
+            crate::state::validate_parameter_name(&family, name)
+                .map_err(ResetDBClusterParameterGroupError::invalid_parameter_value)?;
+            to_clear.push(name.to_string());
+        }
+
+        let Some(group) = store.db_cluster_parameter_groups.get_mut(&key) else {
+            // See the modify handler: the group was read under this same lock, so its
+            // disappearance would be this emulator's own failure, not the caller's.
+            return Err(ResetDBClusterParameterGroupError::internal_failure(
+                "the cluster parameter group was read a moment ago and is now gone",
+            ));
+        };
+        if reset_all {
+            group.parameters.clear();
+        } else {
+            for name in to_clear {
+                group.parameters.remove(&name);
+            }
+        }
+
+        Ok(ResetDBClusterParameterGroupOutput {
+            db_cluster_parameter_group_name: Some(group.name.clone()),
+        })
     }
 }

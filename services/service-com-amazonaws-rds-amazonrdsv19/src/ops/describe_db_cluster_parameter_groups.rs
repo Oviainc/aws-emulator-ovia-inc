@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterParameterGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterParameterGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterParameterGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the cluster parameter groups this service holds. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +146,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterParameterGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterParameterGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterParameterGroups"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBClusterParameterGroupsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBClusterParameterGroupsError::validation)?;
+        // `Filters`: "This parameter is not currently supported", so a request that carries
+        // one is refused rather than served as though the filter had been applied.
+        if input.filters.iter().flatten().next().is_some() {
+            return Err(DescribeDBClusterParameterGroupsError::validation(
+                "Filters is not currently supported by DescribeDBClusterParameterGroups",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let store = state.lock();
+
+        // `DBClusterParameterGroupName` constraint: "If provided, must match the name of an
+        // existing DBClusterParameterGroup" — a name that matches none is the modelled 404,
+        // not an empty page.
+        let selected: Vec<(String, crate::state::DbClusterParameterGroupRecord)> =
+            match &input.db_cluster_parameter_group_name {
+                Some(requested) => {
+                    let name = requested.to_ascii_lowercase();
+                    let Some(record) = store
+                        .db_cluster_parameter_groups
+                        .get(&(region.clone(), name.clone()))
+                    else {
+                        return Err(
+                        DescribeDBClusterParameterGroupsErrorModeled::DBParameterGroupNotFoundFault(
+                            DBParameterGroupNotFoundFault {
+                                message: Some(format!(
+                                    "DBClusterParameterGroup not found: {requested}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                    };
+                    vec![(name, record.clone())]
+                }
+                None => store
+                    .cluster_parameter_groups_in(&region)
+                    .into_iter()
+                    .map(|record| (record.name.clone(), record.clone()))
+                    .collect(),
+            };
+
+        let page = crate::state::paginate(selected, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBClusterParameterGroupsError::invalid_parameter_value)?;
+        Ok(DescribeDBClusterParameterGroupsOutput {
+            marker: page.next_marker,
+            db_cluster_parameter_groups: Some(
+                page.items
+                    .iter()
+                    .map(crate::state::DbClusterParameterGroupRecord::to_wire)
+                    .collect(),
+            ),
+        })
     }
 }

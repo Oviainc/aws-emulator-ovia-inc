@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/certificate_override.rs"]
 mod certificate_override;
+#[path = "all/cluster_parameter_groups.rs"]
+mod cluster_parameter_groups;
 #[path = "all/db_engine_versions.rs"]
 mod db_engine_versions;
 #[path = "all/db_instance_deletion.rs"]

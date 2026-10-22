@@ -430,7 +430,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved name is kept for the same reason.
         let db_cluster_parameter_group = match &input.db_cluster_parameter_group_name {
             Some(requested) => {
-                let Some(group) = docdb::resolve_parameter_group(requested, &region) else {
+                let Some(group) = docdb::resolve_parameter_group_in(&store, requested, &region)
+                else {
                     return Err(
                         CreateDBClusterErrorModeled::DBClusterParameterGroupNotFoundFault(
                             DBClusterParameterGroupNotFoundFault {

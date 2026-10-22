@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     DBCluster, DBClusterMember, DBClusterParameterGroup, DBClusterSnapshot, DBInstance,
-    DBSubnetGroup, Endpoint, ServerlessV2ScalingConfigurationInfo, Subnet, Tag,
+    DBSubnetGroup, Endpoint, Parameter, ServerlessV2ScalingConfigurationInfo, Subnet, Tag,
     VpcSecurityGroupMembership,
 };
 
@@ -201,6 +201,18 @@ pub const MAX_TAG_KEY_CHARS: usize = 128;
 
 /// AWS's tagging limit: a tag value is at most 256 characters.
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// Emulator resource guard, NOT an AWS quota: the most cluster parameter groups this
+/// emulator will store. Amazon DocumentDB publishes no quota for them, so an over-cap
+/// create is refused with the modelled `DBParameterGroupQuotaExceededFault` rather than
+/// stored.
+///
+/// The number of parameters inside one group is bounded separately, by
+/// [`MAX_COLLECTION_ENTRIES`]; the number a single request may set is
+/// `service_common::rds_cluster_parameters::MAX_PARAMETERS_PER_MODIFY`, re-exported below,
+/// which `ModifyDBClusterParameterGroup`'s own documentation states ("A maximum of 20
+/// parameters can be modified in a single request").
+pub const MAX_DB_CLUSTER_PARAMETER_GROUPS: usize = 100;
 
 /// Emulator resource guard, NOT an AWS quota: the most entries this emulator will store
 /// for a caller-sized list whose length the service publishes no limit for.
@@ -614,6 +626,9 @@ pub struct ComAmazonawsDocdbAmazonrdsv19State {
     pub instances: BTreeMap<String, DbInstanceRecord>,
     /// Final cluster snapshots, keyed by `DBClusterSnapshotIdentifier`.
     pub snapshots: BTreeMap<String, DbClusterSnapshotRecord>,
+    /// Cluster parameter groups, keyed by their lowercased
+    /// `DBClusterParameterGroupName`.
+    pub cluster_parameter_groups: BTreeMap<String, DbClusterParameterGroupRecord>,
     /// Subnet groups, keyed by lowercased `DBSubnetGroupName`.
     pub subnet_groups: BTreeMap<String, DbSubnetGroupRecord>,
     /// Monotonic counter behind every minted resource id, so ids are deterministic.
@@ -705,6 +720,24 @@ impl ComAmazonawsDocdbAmazonrdsv19State {
                     .db_subnet_group
                     .as_deref()
                     .is_some_and(|name| name.eq_ignore_ascii_case(key))
+            })
+            .map(|cluster| cluster.identifier.clone())
+            .collect()
+    }
+
+    /// The identifiers of the clusters that carry the cluster parameter group `name`, in
+    /// identifier order. A group one of them carries is in use, so it cannot be deleted.
+    ///
+    /// `DBClusterParameterGroupName` is stored lowercased on the group, and a cluster's
+    /// reference is matched case-insensitively against it for the same reason.
+    pub fn clusters_using_parameter_group(&self, name: &str) -> Vec<String> {
+        self.clusters
+            .values()
+            .filter(|cluster| {
+                cluster
+                    .db_cluster_parameter_group
+                    .as_deref()
+                    .is_some_and(|carried| carried.eq_ignore_ascii_case(name))
             })
             .map(|cluster| cluster.identifier.clone())
             .collect()
@@ -970,9 +1003,11 @@ pub fn default_parameter_groups(region: &str) -> Vec<DBClusterParameterGroup> {
         .collect()
 }
 
-/// The cluster parameter group `name` names, or `None` when there is no such group.
+/// The cluster parameter group `name` names among the engine's DEFAULTS, or `None`.
 ///
 /// Matching is case-insensitive on the name, as every parameter-group name member is.
+/// A caller-CREATED group is a stored record, which [`resolve_parameter_group_in`] reads
+/// alongside these; reach for that one wherever the store is in hand.
 pub fn resolve_parameter_group(name: &str, region: &str) -> Option<DBClusterParameterGroup> {
     default_parameter_groups(region).into_iter().find(|group| {
         group
@@ -980,6 +1015,24 @@ pub fn resolve_parameter_group(name: &str, region: &str) -> Option<DBClusterPara
             .as_deref()
             .is_some_and(|stored| stored.eq_ignore_ascii_case(name))
     })
+}
+
+/// The cluster parameter group `name` names, whether a caller CREATED it
+/// (`CreateDBClusterParameterGroup` stored it) or the engine provides it as the default of
+/// a family, or `None` when there is no such group.
+///
+/// One resolver over both sets, so every operation that names a group by name — a cluster
+/// create or modify, a describe — agrees about which groups exist.
+pub fn resolve_parameter_group_in(
+    store: &ComAmazonawsDocdbAmazonrdsv19State,
+    name: &str,
+    region: &str,
+) -> Option<DBClusterParameterGroup> {
+    store
+        .cluster_parameter_groups
+        .get(&name.to_ascii_lowercase())
+        .map(DbClusterParameterGroupRecord::to_shape)
+        .or_else(|| resolve_parameter_group(name, region))
 }
 
 /// Whether `family` is a parameter-group family THIS model publishes (`docdb5.0`).
@@ -1277,5 +1330,142 @@ pub fn instance_to_shape(
         certificate_details: None,
         performance_insights_enabled: Some(record.performance_insights_enabled),
         performance_insights_kms_key_id: record.performance_insights_kms_key_id.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cluster parameter groups
+//
+// A cluster parameter group is a named, family-scoped set of engine parameters that
+// `CreateDBClusterParameterGroup` mints, `ModifyDBClusterParameterGroup` writes into,
+// `ResetDBClusterParameterGroup` clears, the two describes report and
+// `DeleteDBClusterParameterGroup` removes. The group carries the parameters a CALLER has
+// set; the engine's own defaults are published by the family (see
+// [`DOCDB_CLUSTER_PARAMETERS`]) and are not materialised into a group, which is why a
+// freshly created group reports an EMPTY `Parameters` list.
+// ---------------------------------------------------------------------------
+
+// The catalog of engine parameters each family publishes, and the rules over it, are
+// SHARED with the Amazon RDS and Amazon Neptune models of the same front door (an AWS SDK
+// DocumentDB client signs `rds`, so its traffic is served there), so they live once in
+// `service_common::rds_cluster_parameters` and are re-exported here: a handler reads them
+// as `crate::state::<name>` exactly as before.
+pub use service_common::rds_cluster_parameters::{
+    change_is_pending, default_apply_method, parameter_source_filter, published_parameter,
+    published_parameters, validate_parameter_group_family, validate_parameter_group_name,
+    validate_parameter_name, validate_parameter_setting, ClusterParameterSpec,
+    ParameterSourceFilter, APPLY_METHOD_IMMEDIATE, APPLY_METHOD_PENDING_REBOOT,
+    APPLY_TYPE_DYNAMIC, APPLY_TYPE_STATIC, DOCDB_CLUSTER_PARAMETERS,
+    DOCDB_PARAMETER_GROUP_FAMILIES, MAX_PARAMETERS_PER_MODIFY, MAX_PARAMETER_GROUP_NAME_LEN,
+    PARAMETER_SOURCE_ENGINE_DEFAULT, PARAMETER_SOURCE_SYSTEM, PARAMETER_SOURCE_USER,
+};
+
+/// One parameter value a caller set on a group.
+#[derive(Debug, Clone)]
+pub struct ParameterSetting {
+    /// `Parameter$ParameterValue`, as the caller set it.
+    pub value: String,
+    /// `Parameter$ApplyMethod`, as the caller asked for it (see
+    /// [`APPLY_METHOD_PENDING_REBOOT`] for what an absent one becomes).
+    pub apply_method: String,
+}
+
+/// A persisted cluster parameter group.
+///
+/// The name is stored lowercased and is this record's key:
+/// `CreateDBClusterParameterGroupMessage$DBClusterParameterGroupName` states "This value is
+/// stored as a lowercase string."
+#[derive(Debug, Clone)]
+pub struct DbClusterParameterGroupRecord {
+    /// The lowercased `DBClusterParameterGroupName`.
+    pub name: String,
+    /// `DBParameterGroupFamily`, as the caller named it.
+    pub family: String,
+    /// `Description`.
+    pub description: String,
+    /// The region whose credential scope the create was signed with.
+    pub region: String,
+    /// The parameters a caller has set, by `ParameterName`.
+    pub parameters: BTreeMap<String, ParameterSetting>,
+    /// The group's tags, as (key, value).
+    pub tags: Vec<(String, String)>,
+}
+
+impl DbClusterParameterGroupRecord {
+    /// `DBClusterParameterGroupArn`. The resource type is `cluster-pg`, the one AWS uses
+    /// for a cluster parameter group under the `rds` ARN namespace this service shares.
+    pub fn arn(&self) -> String {
+        ::engine::emulator_arn(
+            ARN_NAMESPACE,
+            &self.region,
+            &format!("cluster-pg:{}", self.name),
+        )
+    }
+
+    /// This record as the modelled `DBClusterParameterGroup`.
+    pub fn to_shape(&self) -> DBClusterParameterGroup {
+        DBClusterParameterGroup {
+            db_cluster_parameter_group_name: Some(self.name.clone()),
+            db_parameter_group_family: Some(self.family.clone()),
+            description: Some(self.description.clone()),
+            db_cluster_parameter_group_arn: Some(self.arn()),
+        }
+    }
+
+    /// Whether the change to `name` is still waiting on a reboot of the cluster's
+    /// instances; see `service_common::rds_cluster_parameters::change_is_pending` for the
+    /// documented rule.
+    pub fn parameter_is_pending(&self, name: &str) -> bool {
+        let Some(setting) = self.parameters.get(name) else {
+            return false;
+        };
+        change_is_pending(&self.family, name, &setting.apply_method)
+    }
+
+    /// The names of the parameter changes this group is still waiting on a reboot for, in
+    /// name order; see [`Self::parameter_is_pending`].
+    pub fn pending_parameters(&self) -> Vec<String> {
+        self.parameters
+            .keys()
+            .filter(|name| self.parameter_is_pending(name))
+            .cloned()
+            .collect()
+    }
+
+    /// The parameter `name` as the modelled `Parameter`: the value and apply method the
+    /// caller set, plus the metadata the family publishes for it when it publishes any.
+    pub fn parameter_to_shape(&self, name: &str) -> Parameter {
+        let setting = self.parameters.get(name);
+        let spec = published_parameter(&self.family, name);
+        Parameter {
+            parameter_name: Some(name.to_string()),
+            parameter_value: setting.map(|setting| setting.value.clone()),
+            description: spec.map(|spec| spec.description.to_string()),
+            source: Some(PARAMETER_SOURCE_USER.to_string()),
+            apply_type: spec.map(|spec| spec.apply_type.to_string()),
+            data_type: spec.map(|spec| spec.data_type.to_string()),
+            allowed_values: spec.map(|spec| spec.allowed_values.to_string()),
+            is_modifiable: spec.map(|spec| spec.is_modifiable),
+            minimum_engine_version: spec.map(|spec| spec.minimum_engine_version.to_string()),
+            apply_method: setting.map(|setting| setting.apply_method.clone()),
+        }
+    }
+}
+
+/// A parameter the engine publishes for `family`, as the modelled `Parameter` with its
+/// default value and `Source` [`PARAMETER_SOURCE_ENGINE_DEFAULT`]: what a describe reports
+/// when the caller asks for the engine's own parameters rather than the group's.
+pub fn engine_default_parameter_to_shape(spec: &ClusterParameterSpec) -> Parameter {
+    Parameter {
+        parameter_name: Some(spec.name.to_string()),
+        parameter_value: Some(spec.default_value.to_string()),
+        description: Some(spec.description.to_string()),
+        source: Some(PARAMETER_SOURCE_ENGINE_DEFAULT.to_string()),
+        apply_type: Some(spec.apply_type.to_string()),
+        data_type: Some(spec.data_type.to_string()),
+        allowed_values: Some(spec.allowed_values.to_string()),
+        is_modifiable: Some(spec.is_modifiable),
+        minimum_engine_version: Some(spec.minimum_engine_version.to_string()),
+        apply_method: None,
     }
 }

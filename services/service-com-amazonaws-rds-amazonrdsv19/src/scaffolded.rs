@@ -177,6 +177,32 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the synthetic `InternalFailure` error shape.
+static INTERNAL_FAILURE_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#InternalFailure$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `InternalFailure` error shape. In the `smithy.framework`
+/// namespace for the same reason as `NotImplemented`: the shape is not in this service's
+/// model, so it must not collide with a modelled one.
+pub static INTERNAL_FAILURE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#InternalFailure",
+        "smithy.framework",
+        "InternalFailure",
+    ),
+    ShapeType::Structure,
+    &[&INTERNAL_FAILURE_MESSAGE],
+);
+
 /// The `message` member of the synthetic `InvalidParameterValue` error shape.
 static INVALID_PARAMETER_VALUE_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
@@ -265,6 +291,14 @@ pub enum Scaffolded<E> {
     /// error code `InvalidParameterCombination` — the code Amazon RDS answers that with.
     /// The payload is the same single `message` member.
     InvalidParameterCombination(ValidationException),
+    /// The emulator itself could not serve the request. Renders as HTTP 500 with the error
+    /// code `InternalFailure`.
+    ///
+    /// Reach for this ONLY for a failure of this emulator — an invariant of its own store
+    /// that cannot hold, such as a record read under the state lock that is then gone —
+    /// never for anything a request carries: a 501 would claim the operation was never
+    /// written (and is grepped as that), and a 400 would blame the caller.
+    InternalFailure(ValidationException),
 }
 
 impl<E> Scaffolded<E> {
@@ -313,6 +347,12 @@ impl<E> Scaffolded<E> {
     pub fn invalid_parameter_combination(message: impl Into<String>) -> Self {
         Self::InvalidParameterCombination(ValidationException::new(message))
     }
+
+    /// Report that this emulator itself could not serve the request, with HTTP 500
+    /// `InternalFailure`; see the variant's own note for when that is the honest answer.
+    pub fn internal_failure(message: impl Into<String>) -> Self {
+        Self::InternalFailure(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -323,6 +363,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::InvalidParameterValue(e) => write!(f, "{e}"),
             Self::InvalidParameterCombination(e) => write!(f, "{e}"),
+            Self::InternalFailure(e) => write!(f, "{e}"),
         }
     }
 }
@@ -336,6 +377,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::InvalidParameterValue(e) | Self::InvalidParameterCombination(e) => e.source(),
+            Self::InternalFailure(e) => e.source(),
         }
     }
 }
@@ -351,6 +393,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::InvalidParameterValue(e) | Self::InvalidParameterCombination(e) => e,
+            Self::InternalFailure(e) => e,
         }
     }
 
@@ -361,6 +404,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::InvalidParameterValue(_) => &INVALID_PARAMETER_VALUE_SCHEMA,
             Self::InvalidParameterCombination(_) => &INVALID_PARAMETER_COMBINATION_SCHEMA,
+            Self::InternalFailure(_) => &INTERNAL_FAILURE_SCHEMA,
         }
     }
 
@@ -375,6 +419,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::ValidationException(_) => "ValidationException",
             Self::InvalidParameterValue(_) => "InvalidParameterValue",
             Self::InvalidParameterCombination(_) => "InvalidParameterCombination",
+            Self::InternalFailure(_) => "InternalFailure",
         }
     }
 
@@ -388,6 +433,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::InvalidParameterValue(_) | Self::InvalidParameterCombination(_) => 400,
+            Self::InternalFailure(_) => 500,
         }
     }
 
@@ -403,6 +449,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // Same reason again — and none is needed: the `<Code>` these two render,
             // from `shape_name` above, is already the code AWS answers with.
             Self::InvalidParameterValue(_) | Self::InvalidParameterCombination(_) => None,
+            // Same reason again: the synthetic shape carries no `awsQueryError` trait.
+            Self::InternalFailure(_) => None,
         }
     }
 }

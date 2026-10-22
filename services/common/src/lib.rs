@@ -98,6 +98,16 @@
 //! left in place here only because this change does not own those services' issues and
 //! each is covered by its own routing suite under `core/router/tests/all/`. Nothing new
 //! should inline the rule again — call this crate.
+//!
+//! # Beside the claim rule
+//!
+//! [`rds_cluster_parameters`] is the second thing more than one service needs: the engine
+//! parameter catalog and the parameter rules of the ONE AWS `rds` front door, which Amazon
+//! RDS, Amazon DocumentDB and Amazon Neptune are three Smithy models of. The data is pure
+//! — no modelled shape appears in it — so each of those crates keeps its own generated
+//! shapes and state while the catalog and the rules over it live here once.
+
+pub mod rds_cluster_parameters;
 
 pub mod arn;
 pub mod bedrock;

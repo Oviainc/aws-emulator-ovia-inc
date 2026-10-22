@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyDBClusterParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyDBClusterParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Sets parameter values on a cluster parameter group. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyDBClusterParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation's own documentation fixes two rules this handler enforces: "A maximum of
+//! 20 parameters can be modified in a single request", and "changes to dynamic parameters
+//! are applied immediately. Changes to static parameters require a reboot" — so a change to
+//! a static parameter, or one the caller asks to apply `pending-reboot`, leaves the group
+//! with a pending change until that reboot.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +161,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyDBClusterParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyDBClusterParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyDBClusterParameterGroup"))
+        let region = crate::state::request_region(ctx)
+            .map_err(ModifyDBClusterParameterGroupError::validation)?;
+        // "A maximum of 20 parameters can be modified in a single request."
+        if input.parameters.len() > crate::state::MAX_PARAMETERS_PER_MODIFY {
+            return Err(ModifyDBClusterParameterGroupError::validation(format!(
+                "Parameters carries {} entries: a maximum of {} parameters can be modified in a \
+                 single request",
+                input.parameters.len(),
+                crate::state::MAX_PARAMETERS_PER_MODIFY
+            )));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+
+        let key = (
+            region,
+            input.db_cluster_parameter_group_name.to_ascii_lowercase(),
+        );
+        let Some(group) = store.db_cluster_parameter_groups.get(&key) else {
+            return Err(
+                ModifyDBClusterParameterGroupErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "DBClusterParameterGroup not found: {}",
+                            input.db_cluster_parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let family = group.family.clone();
+
+        // Every parameter in the request is checked BEFORE any of them is written, so a
+        // request carrying one bad value changes nothing at all.
+        let mut settings: Vec<(String, crate::state::ParameterSetting)> =
+            Vec::with_capacity(input.parameters.len());
+        for parameter in &input.parameters {
+            let Some(name) = parameter.parameter_name.as_deref() else {
+                return Err(ModifyDBClusterParameterGroupError::validation(
+                    "each entry of Parameters must carry a ParameterName",
+                ));
+            };
+            let Some(value) = parameter.parameter_value.as_deref() else {
+                return Err(ModifyDBClusterParameterGroupError::validation(format!(
+                    "parameter '{name}' must carry a ParameterValue"
+                )));
+            };
+            crate::state::check_free_form("ParameterName", name)
+                .map_err(ModifyDBClusterParameterGroupError::validation)?;
+            crate::state::check_free_form("ParameterValue", value)
+                .map_err(ModifyDBClusterParameterGroupError::validation)?;
+            // The parameter must be one the group's family publishes, and the value one
+            // that parameter admits: anything else is the AWS Query `InvalidParameterValue`,
+            // whose message names the parameter and what it admits.
+            crate::state::validate_parameter_setting(&family, name, value)
+                .map_err(ModifyDBClusterParameterGroupError::invalid_parameter_value)?;
+            let apply_method = match parameter.apply_method.as_deref() {
+                // The model types `ApplyMethod` as an enum, so a value outside
+                // `immediate | pending-reboot` is already refused at the boundary before
+                // this handler runs.
+                Some(asked) => asked.to_string(),
+                // With no method asked for, the change gets the one its parameter's apply
+                // type implies: a dynamic parameter is applied immediately, a static one
+                // waits for the reboot (`crate::state::default_apply_method` carries the
+                // documented rule). Defaulting a dynamic change to the reboot would leave
+                // the group pending on a change the engine already applied.
+                None => crate::state::default_apply_method(&family, name).to_string(),
+            };
+            settings.push((
+                name.to_string(),
+                crate::state::ParameterSetting {
+                    value: value.to_string(),
+                    apply_method,
+                },
+            ));
+        }
+
+        let Some(group) = store.db_cluster_parameter_groups.get_mut(&key) else {
+            // The group was read a moment ago with this same lock held, so it cannot be
+            // gone: that would be a failure of this emulator's own store, not of the
+            // request, and a 501 would misreport an implemented operation as unwritten.
+            return Err(ModifyDBClusterParameterGroupError::internal_failure(
+                "the cluster parameter group was read a moment ago and is now gone",
+            ));
+        };
+        // The group's parameter map is a growth site: a repeat call naming fresh parameters
+        // would grow it without limit for a family that publishes no catalog to refuse an
+        // unknown name against. So the MERGED total — the keys this request does not
+        // overwrite, plus the ones it sets — is bounded before anything is written.
+        let merged = group
+            .parameters
+            .keys()
+            .filter(|name| !settings.iter().any(|(set, _)| set == *name))
+            .count()
+            + settings.len();
+        if merged > crate::state::MAX_PARAMETERS_PER_GROUP {
+            return Err(ModifyDBClusterParameterGroupError::validation(format!(
+                "a cluster parameter group carries at most {} parameters in this emulator, and \
+                 this request would leave it with {merged}",
+                crate::state::MAX_PARAMETERS_PER_GROUP
+            )));
+        }
+        for (name, setting) in settings {
+            group.parameters.insert(name, setting);
+        }
+
+        Ok(ModifyDBClusterParameterGroupOutput {
+            db_cluster_parameter_group_name: Some(group.name.clone()),
+        })
     }
 }

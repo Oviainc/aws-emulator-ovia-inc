@@ -2,17 +2,18 @@
 
 //! Engine state for the com-amazonaws-rds-amazonrdsv19 service.
 //!
-//! The DB instance, DB snapshot, option group, DB subnet group, event subscription and
-//! global cluster records the implemented handlers read and write, plus the projection of
-//! a stored record onto the modelled `DBInstance` / `DBSnapshot` / `OptionGroup` /
-//! `DBSubnetGroup` / `EventSubscription` / `GlobalCluster` wire shapes. These live here
-//! rather than in one operation file because every implemented operation shares them:
-//! `CreateDBInstance`, `DescribeDBInstances`,
+//! The DB instance, DB snapshot, option group, DB subnet group, cluster parameter group,
+//! event subscription and global cluster records the implemented handlers read and write,
+//! plus the projection of a stored record onto the modelled `DBInstance` / `DBSnapshot` /
+//! `OptionGroup` / `DBSubnetGroup` / `DBClusterParameterGroup` / `EventSubscription` /
+//! `GlobalCluster` wire shapes. These live here rather than in one operation file because
+//! every implemented operation shares them: `CreateDBInstance`, `DescribeDBInstances`,
 //! `ModifyDBInstance`, `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBInstance`,
 //! `CreateOptionGroup`, `ModifyOptionGroup`, `DescribeOptionGroups`,
-//! `DeleteOptionGroup`, `CreateDBSubnetGroup`, `DescribeDBSubnetGroups`,
-//! `CreateEventSubscription`, `DescribeEventSubscriptions`, `CreateGlobalCluster` and
-//! `DescribeGlobalClusters` all project the same records.
+//! `DeleteOptionGroup`, `CreateDBSubnetGroup`, `DescribeDBSubnetGroups`, the six
+//! cluster-parameter-group operations, `CreateEventSubscription`,
+//! `DescribeEventSubscriptions`, `CreateGlobalCluster` and `DescribeGlobalClusters` all
+//! project the same records.
 //!
 //! RDS is a REGIONAL service, so every map is keyed by `(region, identifier)`: the
 //! region a request is signed for scopes what it can see and create, one identifier
@@ -28,18 +29,39 @@
 //! `MAX_REGIONS * DB_INSTANCE_QUOTA_PER_REGION` instances,
 //! `MAX_REGIONS * DB_SNAPSHOT_QUOTA_PER_REGION` snapshots,
 //! `MAX_REGIONS * OPTION_GROUP_QUOTA_PER_REGION` option groups and
-//! `MAX_REGIONS * DB_SUBNET_GROUP_QUOTA_PER_REGION` DB subnet groups, and at most one
-//! CA certificate override per region, whatever sequence of requests arrives, and every
+//! `MAX_REGIONS * DB_SUBNET_GROUP_QUOTA_PER_REGION` DB subnet groups,
+//! `MAX_REGIONS * DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION` cluster parameter groups
+//! — each of those carrying at most [`MAX_PARAMETERS_PER_GROUP`] parameters of at most
+//! [`MAX_FREE_FORM_LEN`] characters, a family string of at most [`MAX_FREE_FORM_LEN`]
+//! characters and at most [`MAX_TAGS_PER_RESOURCE`] tags of at most [`MAX_TAG_KEY_LEN`] /
+//! [`MAX_TAG_VALUE_LEN`] characters — and at most one CA certificate override per region,
+//! whatever sequence of requests arrives, and every
 //! per-request scan reads one region's ordered range rather than the whole map.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Certificate, CertificateDetails, DBInstance, DBParameterGroupStatus, DBSecurityGroupMembership,
-    DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint, EventCategoriesMap, EventSubscription,
-    GlobalCluster, GlobalClusterMember, Option2, OptionGroup, OptionGroupMembership, OptionSetting,
-    PendingModifiedValues, Subnet, Tag, VpcSecurityGroupMembership,
+    Certificate, CertificateDetails, DBClusterParameterGroup, DBInstance, DBParameterGroupStatus,
+    DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint,
+    EventCategoriesMap, EventSubscription, GlobalCluster, GlobalClusterMember, Option2,
+    OptionGroup, OptionGroupMembership, OptionSetting, Parameter, PendingModifiedValues, Subnet,
+    Tag, VpcSecurityGroupMembership,
+};
+
+// The catalog of engine parameters each family publishes, and the rules over it, are
+// SHARED with the Amazon DocumentDB and Amazon Neptune models of the same front door —
+// this service serves their SDK clients' traffic too, since all three sign `rds` — so they
+// live once in `service_common::rds_cluster_parameters` and are re-exported here: a handler
+// reads them as `crate::state::<name>`.
+pub use service_common::rds_cluster_parameters::{
+    change_is_pending, default_apply_method, parameter_source_filter, published_parameter,
+    published_parameters, validate_parameter_group_family, validate_parameter_group_name,
+    validate_parameter_name, validate_parameter_setting, ClusterParameterSpec,
+    ParameterSourceFilter, APPLY_METHOD_IMMEDIATE, APPLY_METHOD_PENDING_REBOOT,
+    APPLY_TYPE_DYNAMIC, APPLY_TYPE_STATIC, DOCDB_CLUSTER_PARAMETERS,
+    DOCDB_PARAMETER_GROUP_FAMILIES, MAX_PARAMETERS_PER_MODIFY, MAX_PARAMETER_GROUP_NAME_LEN,
+    PARAMETER_SOURCE_ENGINE_DEFAULT, PARAMETER_SOURCE_SYSTEM, PARAMETER_SOURCE_USER,
 };
 
 pub mod option_catalog;
@@ -75,6 +97,25 @@ pub const DB_INSTANCE_QUOTA_PER_REGION: usize = 40;
 /// `SnapshotQuotaExceededFault`, which both `CreateDBSnapshot` and `DeleteDBInstance`
 /// declare.
 pub const DB_SNAPSHOT_QUOTA_PER_REGION: usize = 100;
+
+/// How many cluster parameter groups one region may hold.
+///
+/// Emulator resource guard, NOT an AWS quota: AWS publishes none for cluster parameter
+/// groups, and every group is created by a caller and reclaimed only by an explicit delete,
+/// so the growth site carries a cap. Reaching it is the modelled
+/// `DBParameterGroupQuotaExceededFault` — "this request would cause you to exceed the
+/// allowed number of parameter groups" — rather than an unbounded store.
+pub const DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION: usize = 100;
+
+/// How many parameters one cluster parameter group may carry.
+///
+/// Emulator resource guard, NOT an AWS quota: a group's parameter map is a growth site a
+/// caller drives (`ModifyDBClusterParameterGroup` sets up to 20 parameters per call, and a
+/// family this emulator publishes no catalog for admits any parameter name), so the group's
+/// TOTAL is capped as well as each request's. It is comfortably above the seven parameters
+/// the DocumentDB families publish; a modify that would leave a group past it is refused
+/// with a 400 rather than stored.
+pub const MAX_PARAMETERS_PER_GROUP: usize = 64;
 
 /// How many option groups one region may hold: the allowance `CreateOptionGroup`
 /// documents ("You can create up to 20 option groups"), which its modelled
@@ -428,6 +469,10 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     pub db_instances: BTreeMap<RegionalKey, DbInstanceRecord>,
     /// DB snapshots by `(region, DBSnapshotIdentifier)`. Ordered, for the same reason.
     pub db_snapshots: BTreeMap<RegionalKey, DbSnapshotRecord>,
+    /// Cluster parameter groups by `(region, DBClusterParameterGroupName)` — the name
+    /// always stored lowercased, as the model documents. Ordered, so
+    /// `DescribeDBClusterParameterGroups` pages deterministically within a region.
+    pub db_cluster_parameter_groups: BTreeMap<RegionalKey, DbClusterParameterGroupRecord>,
     /// Event notification subscriptions by `(region, SubscriptionName)`. Ordered, so
     /// `DescribeEventSubscriptions` pages deterministically within a region.
     ///
@@ -549,6 +594,11 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         range_in(&self.db_snapshots, region)
     }
 
+    /// The cluster parameter groups stored in `region`, in name order.
+    pub fn cluster_parameter_groups_in(&self, region: &str) -> Vec<&DbClusterParameterGroupRecord> {
+        range_in(&self.db_cluster_parameter_groups, region)
+    }
+
     /// The event notification subscriptions stored in `region`, in subscription-name
     /// order.
     pub fn event_subscriptions_in(&self, region: &str) -> Vec<&EventSubscriptionRecord> {
@@ -617,9 +667,10 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .db_instances
             .keys()
             .chain(self.db_snapshots.keys())
+            .chain(self.db_cluster_parameter_groups.keys())
+            .chain(self.event_subscriptions.keys())
             .chain(self.option_groups.keys())
             .chain(self.db_subnet_groups.keys())
-            .chain(self.event_subscriptions.keys())
             .map(|(stored, _)| stored.as_str())
             .chain(self.certificate_overrides.keys().map(String::as_str))
             .collect();
@@ -1068,6 +1119,134 @@ impl DbSnapshotRecord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cluster parameter groups
+//
+// A cluster parameter group is a named, family-scoped set of engine parameters that
+// `CreateDBClusterParameterGroup` mints, `ModifyDBClusterParameterGroup` writes into,
+// `ResetDBClusterParameterGroup` clears, the two describes report and
+// `DeleteDBClusterParameterGroup` removes. The group carries the parameters a CALLER has
+// set; the engine's own defaults belong to the FAMILY, which publishes them
+// (`published_parameters`), and are not materialised into a group — which is why a freshly
+// created group reports an EMPTY `Parameters` list.
+//
+// This is the control plane an AWS SDK Amazon RDS, Amazon DocumentDB or Amazon Neptune
+// client reaches: all three sign `rds`, which resolves to this service (see
+// `src/service.rs`), exactly as all three APIs are served on the RDS endpoint by AWS.
+// ---------------------------------------------------------------------------
+
+/// One parameter value a caller set on a group.
+#[derive(Debug, Clone)]
+pub struct ParameterSetting {
+    /// `Parameter$ParameterValue`, as the caller set it.
+    pub value: String,
+    /// `Parameter$ApplyMethod`, as the caller asked for it (see
+    /// [`APPLY_METHOD_PENDING_REBOOT`] for what an absent one becomes).
+    pub apply_method: String,
+}
+
+/// A persisted cluster parameter group.
+///
+/// The name is stored lowercased and is half of this record's key:
+/// `CreateDBClusterParameterGroupMessage$DBClusterParameterGroupName` states "This value is
+/// stored as a lowercase string."
+#[derive(Debug, Clone)]
+pub struct DbClusterParameterGroupRecord {
+    /// The lowercased `DBClusterParameterGroupName`.
+    pub name: String,
+    /// `DBParameterGroupFamily`, as the caller named it.
+    pub family: String,
+    /// `Description`.
+    pub description: String,
+    /// The region whose credential scope the create was signed with.
+    pub region: String,
+    /// The parameters a caller has set, by `ParameterName`.
+    pub parameters: BTreeMap<String, ParameterSetting>,
+    /// The group's tags.
+    pub tags: Vec<Tag>,
+}
+
+impl DbClusterParameterGroupRecord {
+    /// `DBClusterParameterGroupArn`. The resource type is `cluster-pg`, the one AWS uses
+    /// for a cluster parameter group under this service's `rds` ARN namespace.
+    pub fn arn(&self) -> String {
+        emulator_server::emulator_arn(
+            ARN_NAMESPACE,
+            &self.region,
+            &format!("cluster-pg:{}", self.name),
+        )
+    }
+
+    /// This record as the modelled `DBClusterParameterGroup`.
+    pub fn to_wire(&self) -> DBClusterParameterGroup {
+        DBClusterParameterGroup {
+            db_cluster_parameter_group_name: Some(self.name.clone()),
+            db_parameter_group_family: Some(self.family.clone()),
+            description: Some(self.description.clone()),
+            db_cluster_parameter_group_arn: Some(self.arn()),
+        }
+    }
+
+    /// Whether the change to `name` is still waiting on a reboot of the cluster's
+    /// instances; see `service_common::rds_cluster_parameters::change_is_pending` for the
+    /// documented rule.
+    pub fn parameter_is_pending(&self, name: &str) -> bool {
+        let Some(setting) = self.parameters.get(name) else {
+            return false;
+        };
+        change_is_pending(&self.family, name, &setting.apply_method)
+    }
+
+    /// The names of the parameter changes this group is still waiting on a reboot for, in
+    /// name order; see [`Self::parameter_is_pending`].
+    pub fn pending_parameters(&self) -> Vec<String> {
+        self.parameters
+            .keys()
+            .filter(|name| self.parameter_is_pending(name))
+            .cloned()
+            .collect()
+    }
+
+    /// The parameter `name` as the modelled `Parameter`: the value and apply method the
+    /// caller set, plus the metadata the family publishes for it when it publishes any.
+    pub fn parameter_to_wire(&self, name: &str) -> Parameter {
+        let setting = self.parameters.get(name);
+        let spec = published_parameter(&self.family, name);
+        Parameter {
+            parameter_name: Some(name.to_string()),
+            parameter_value: setting.map(|setting| setting.value.clone()),
+            description: spec.map(|spec| spec.description.to_string()),
+            source: Some(PARAMETER_SOURCE_USER.to_string()),
+            apply_type: spec.map(|spec| spec.apply_type.to_string()),
+            data_type: spec.map(|spec| spec.data_type.to_string()),
+            allowed_values: spec.map(|spec| spec.allowed_values.to_string()),
+            is_modifiable: spec.map(|spec| spec.is_modifiable),
+            minimum_engine_version: spec.map(|spec| spec.minimum_engine_version.to_string()),
+            apply_method: setting.map(|setting| setting.apply_method.clone()),
+            supported_engine_modes: None,
+        }
+    }
+}
+
+/// A parameter the engine publishes for a family, as the modelled `Parameter` with its
+/// default value and `Source` [`PARAMETER_SOURCE_ENGINE_DEFAULT`]: what a describe reports
+/// when the caller asks for the engine's own parameters rather than a group's.
+pub fn engine_default_parameter_to_wire(spec: &ClusterParameterSpec) -> Parameter {
+    Parameter {
+        parameter_name: Some(spec.name.to_string()),
+        parameter_value: Some(spec.default_value.to_string()),
+        description: Some(spec.description.to_string()),
+        source: Some(PARAMETER_SOURCE_ENGINE_DEFAULT.to_string()),
+        apply_type: Some(spec.apply_type.to_string()),
+        data_type: Some(spec.data_type.to_string()),
+        allowed_values: Some(spec.allowed_values.to_string()),
+        is_modifiable: Some(spec.is_modifiable),
+        minimum_engine_version: Some(spec.minimum_engine_version.to_string()),
+        apply_method: None,
+        supported_engine_modes: None,
+    }
+}
+
 /// A stored RDS event notification subscription: the record `DescribeEventSubscriptions`
 /// reports.
 ///
@@ -1233,6 +1412,23 @@ impl OptionGroupRecord {
             ..OptionGroup::default()
         }
     }
+}
+
+/// Emulator resource guard, NOT an AWS bound: the longest caller-supplied free-form string
+/// this service stores for a member whose length the API publishes no limit for (a
+/// parameter group's `Description` or `DBParameterGroupFamily`, a parameter's name or
+/// value). Nothing caller-sized reaches the store unchecked.
+pub const MAX_FREE_FORM_LEN: usize = 512;
+
+/// Refuse a caller-supplied free-form string longer than [`MAX_FREE_FORM_LEN`].
+pub fn check_free_form(member: &str, value: &str) -> Result<(), String> {
+    let length = value.chars().count();
+    if length > MAX_FREE_FORM_LEN {
+        return Err(format!(
+            "{member} may be at most {MAX_FREE_FORM_LEN} characters, got {length}"
+        ));
+    }
+    Ok(())
 }
 
 /// The name AWS gives the DB subnet group it creates alongside an account's default

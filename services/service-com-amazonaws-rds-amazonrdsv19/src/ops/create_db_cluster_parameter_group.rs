@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBClusterParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBClusterParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a cluster parameter group: a named, family-scoped set of engine parameters the
+//! cluster that carries the group runs with. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBClusterParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A group starts carrying no parameters of its own: the defaults belong to the engine
+//! FAMILY, which publishes them (`crate::state::published_parameters`), so a describe of a
+//! fresh group reports an empty `Parameters` list until `ModifyDBClusterParameterGroup`
+//! sets one.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +176,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBClusterParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBClusterParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBClusterParameterGroup"))
+        let region = crate::state::request_region(ctx)
+            .map_err(CreateDBClusterParameterGroupError::validation)?;
+        // The model constrains neither member, so the rules their own documentation states
+        // are enforced here: the name rule the API publishes for a cluster parameter group,
+        // and a family that names a DocumentDB engine version that exists (a family of
+        // another engine this front door serves is accepted — see
+        // `validate_parameter_group_family`).
+        crate::state::validate_parameter_group_name(
+            "DBClusterParameterGroupName",
+            &input.db_cluster_parameter_group_name,
+        )
+        .map_err(CreateDBClusterParameterGroupError::invalid_parameter_value)?;
+        crate::state::validate_parameter_group_family(&input.db_parameter_group_family)
+            .map_err(CreateDBClusterParameterGroupError::invalid_parameter_value)?;
+        // Nothing caller-sized reaches the store unchecked: the family string and the
+        // description are length-bounded and the tag list is count- and length-bounded
+        // (see the "store bounds" paragraph in `src/state.rs`).
+        crate::state::check_free_form(
+            "DBParameterGroupFamily",
+            &input.db_parameter_group_family,
+        )
+        .map_err(CreateDBClusterParameterGroupError::validation)?;
+        crate::state::check_free_form("Description", &input.description)
+            .map_err(CreateDBClusterParameterGroupError::validation)?;
+        crate::state::check_tags(input.tags.as_deref().unwrap_or_default())
+            .map_err(CreateDBClusterParameterGroupError::validation)?;
+        // `DBClusterParameterGroupName`: "This value is stored as a lowercase string."
+        let name = input.db_cluster_parameter_group_name.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated group.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), name.clone());
+        if store.db_cluster_parameter_groups.contains_key(&key) {
+            return Err(
+                CreateDBClusterParameterGroupErrorModeled::DBParameterGroupAlreadyExistsFault(
+                    DBParameterGroupAlreadyExistsFault {
+                        message: Some(format!("Parameter group {name} already exists")),
+                    },
+                )
+                .into(),
+            );
+        }
+        let in_region = store.cluster_parameter_groups_in(&region).len();
+        if in_region >= crate::state::DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION
+            || !store.has_room_for_region(&region)
+        {
+            return Err(
+                CreateDBClusterParameterGroupErrorModeled::DBParameterGroupQuotaExceededFault(
+                    DBParameterGroupQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} cluster parameter groups in {region}",
+                            crate::state::DB_CLUSTER_PARAMETER_GROUP_QUOTA_PER_REGION
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::DbClusterParameterGroupRecord {
+            name: name.clone(),
+            family: input.db_parameter_group_family,
+            description: input.description,
+            region: region.clone(),
+            parameters: ::std::collections::BTreeMap::new(),
+            tags: input.tags.unwrap_or_default(),
+        };
+        store.db_cluster_parameter_groups.insert(key.clone(), record);
+
+        let stored = store
+            .db_cluster_parameter_groups
+            .get(&key)
+            .expect("the group was inserted on the line above");
+        Ok(CreateDBClusterParameterGroupOutput {
+            db_cluster_parameter_group: Some(stored.to_wire()),
+        })
     }
 }

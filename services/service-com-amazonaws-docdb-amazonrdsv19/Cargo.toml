@@ -21,6 +21,9 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `rds_cluster_parameters`: the cluster parameter catalog and the parameter rules the
+# Amazon RDS, DocumentDB and Neptune models of the one `rds` front door share
+# (`src/state.rs`).
 # `db_data_sources`: the shared directory a minted `DbClusterResourceId` /
 # `DbiResourceId` is recorded in, so a monitoring service (Performance Insights) can
 # tell which service owns that id.

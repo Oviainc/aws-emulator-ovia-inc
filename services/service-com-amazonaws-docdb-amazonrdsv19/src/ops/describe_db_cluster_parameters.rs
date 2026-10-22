@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the parameters of one cluster parameter group. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A group carries the parameters a CALLER set (reported `Source` `user`); the engine's own
+//! defaults belong to the FAMILY and are published by it
+//! (`crate::state::published_parameters`), so a freshly created group reports an empty
+//! `Parameters` list and a `Source` naming the engine reports the family's published
+//! defaults instead of the group's own set.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +150,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterParameters"))
+        use crate::state as docdb;
+
+        let page_size =
+            docdb::page_size(input.max_records).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // `Filters`: "This parameter is not currently supported", so a request that carries
+        // one is refused rather than served as though the filter had been applied.
+        if input.filters.iter().flatten().next().is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Filters is not currently supported by DescribeDBClusterParameters",
+            ));
+        }
+        // `Source`: a filter over the sources this API names, not a constraint — so a value
+        // naming none of them selects nothing instead of refusing the request, and a
+        // describe of a group that is not there still answers the modelled 404.
+        let source = docdb::parameter_source_filter(input.source.as_deref());
+        let region = docdb::request_region(ctx);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let store = state.lock();
+
+        // A group exists if a caller CREATED it or the engine provides it as a family's
+        // default, so existence is decided by the one resolver every operation naming a
+        // group by name uses; anything else is the modelled 404.
+        let name = &input.db_cluster_parameter_group_name;
+        let Some(resolved) = docdb::resolve_parameter_group_in(&store, name, &region) else {
+            return Err(
+                DescribeDBClusterParametersErrorModeled::DBParameterGroupNotFoundFault(
+                    DBParameterGroupNotFoundFault {
+                        message: Some(format!("DBClusterParameterGroup not found: {name}")),
+                    },
+                )
+                .into(),
+            );
+        };
+        let family = resolved.db_parameter_group_family.clone().unwrap_or_default();
+        // A caller-created group carries the parameters that caller set; one of the engine's
+        // OWN `default.<family>` groups carries the family's published defaults and nothing
+        // a caller set, which is why it is not a stored record.
+        let stored = store
+            .cluster_parameter_groups
+            .get(&name.to_ascii_lowercase());
+
+        // Which source the caller asked for decides what is reported: the group's own
+        // parameters (`customer`/`user`, and the default when the caller names no source),
+        // the family's published defaults (`engine`/`engine-default`), or nothing — for
+        // `service`/`system`, because this emulator sets no service-sourced parameter, and
+        // for a value naming no source at all. A default group has no caller-set parameters,
+        // so its own set IS the family's published defaults.
+        let published: Vec<String> = docdb::published_parameters(&family)
+            .unwrap_or_default()
+            .iter()
+            .map(|spec| spec.name.to_string())
+            .collect();
+        let as_engine_defaults =
+            matches!(source, docdb::ParameterSourceFilter::Engine) || stored.is_none();
+        let names: Vec<String> = match source {
+            docdb::ParameterSourceFilter::Engine => published.clone(),
+            docdb::ParameterSourceFilter::Customer => match stored {
+                Some(group) => group.parameters.keys().cloned().collect(),
+                None => published.clone(),
+            },
+            docdb::ParameterSourceFilter::Service | docdb::ParameterSourceFilter::Unknown => {
+                Vec::new()
+            }
+        };
+
+        let (page, marker) = docdb::paginate(&names, input.marker.as_deref(), page_size);
+        let parameters = page
+            .iter()
+            .filter_map(|name| {
+                if as_engine_defaults {
+                    return docdb::published_parameter(&family, name)
+                        .map(docdb::engine_default_parameter_to_shape);
+                }
+                stored.map(|group| group.parameter_to_shape(name))
+            })
+            .collect();
+
+        Ok(DescribeDBClusterParametersOutput {
+            parameters: Some(parameters),
+            marker,
+        })
     }
 }

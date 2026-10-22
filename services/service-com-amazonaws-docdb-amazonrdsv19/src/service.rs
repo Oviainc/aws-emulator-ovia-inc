@@ -67,11 +67,14 @@ use std::sync::Arc;
 /// An AWS SDK DocumentDB client signs `rds` (the model gives it no other name), so its
 /// traffic reaches Amazon RDS, exactly as it does against AWS. Amazon RDS serves it from
 /// the co-located model that implements the resource the request names — the DB subnet
-/// group and DB cluster parameter group surfaces are served from THIS model, over the one
-/// shared engine, so there is one store per AWS resource rather than one per crate (see
-/// `services/service-com-amazonaws-rds-amazonrdsv19/src/service.rs`). Where Amazon RDS
-/// answers 501 for an operation this service implements, that is the RDS operation's own
-/// stub issue, not this routing rule.
+/// group surface is served from THIS model, over the one shared engine, so there is one
+/// store per AWS resource rather than one per crate (see
+/// `services/service-com-amazonaws-rds-amazonrdsv19/src/service.rs`). The cluster
+/// parameter group surface is implemented in BOTH models over the same documented
+/// catalog (`service_common::rds_cluster_parameters`): the Amazon RDS one answers an
+/// SDK client, and this one answers a `docdb`-keyed request. Where Amazon RDS answers 501
+/// for an operation this service implements, that is the RDS operation's own stub issue,
+/// not this routing rule.
 const ROUTE_KEY: &str = "docdb";
 
 /// The `com-amazonaws-docdb-amazonrdsv19` emulated service: the generated [`ServiceDefinition`] plus

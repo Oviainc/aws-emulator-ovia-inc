@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterParameterGroups
-//! IMPLEMENTED: this operation reports the cluster parameter groups that exist — today the
-//! default group of each engine-version family, which AWS provides in every account and
-//! Region without a create (`crate::state::default_parameter_groups`) — or the one
-//! `DBClusterParameterGroupName` names, which is the modelled 404 when there is no such
-//! group. A caller-created group will come from `CreateDBClusterParameterGroup`, which is
-//! still scaffolded; when it lands, its stored records are read here beside the defaults.
+//! IMPLEMENTED: this operation reports the cluster parameter groups that exist — the ones
+//! `CreateDBClusterParameterGroup` stored AND the default group of each engine-version
+//! family, which AWS provides in every account and Region without a create
+//! (`crate::state::default_parameter_groups`) — or the one `DBClusterParameterGroupName`
+//! names, which is the modelled 404 when there is no such group.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -152,7 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as docdb;
 
-        let _ = &self.engine;
         let page_size =
             docdb::page_size(input.max_records).map_err(crate::scaffolded::Scaffolded::validation)?;
 
@@ -166,7 +164,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The groups sit in the region the caller signed for, which is where their ARNs are.
         let region = docdb::request_region(ctx);
-        let groups = docdb::default_parameter_groups(&region);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The emulator's own failure, not the caller's: a 500 `InternalFailure`
+            // rather than a 400 that would blame the request or a 501 that would claim
+            // this operation was never written.
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                "the docdb emulator could not reach its state store",
+            ));
+        };
+        let store = state.lock();
+
+        // What exists is the union of two sets: the groups a caller CREATED (stored) and the
+        // engine's own `default.<family>` groups, which AWS provides without a create. A
+        // stored group shadows a default of the same name, so neither is reported twice.
+        let stored: Vec<DBClusterParameterGroup> = store
+            .cluster_parameter_groups
+            .values()
+            .map(docdb::DbClusterParameterGroupRecord::to_shape)
+            .collect();
+        let stored_names: Vec<String> = store.cluster_parameter_groups.keys().cloned().collect();
+        let mut groups = stored;
+        groups.extend(
+            docdb::default_parameter_groups(&region)
+                .into_iter()
+                .filter(|group| {
+                    group
+                        .db_cluster_parameter_group_name
+                        .as_ref()
+                        .is_none_or(|name| !stored_names.contains(&name.to_ascii_lowercase()))
+                }),
+        );
+        groups.sort_by(|left, right| {
+            left.db_cluster_parameter_group_name
+                .cmp(&right.db_cluster_parameter_group_name)
+        });
 
         // "If a DBClusterParameterGroupName parameter is specified, the list contains only
         // the description of the specified cluster parameter group" — and "If provided, must
@@ -175,7 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let selected: Vec<DBClusterParameterGroup> = match &input.db_cluster_parameter_group_name
         {
             Some(requested) => {
-                let Some(group) = docdb::resolve_parameter_group(requested, &region) else {
+                let found = docdb::resolve_parameter_group_in(&store, requested, &region);
+                let Some(group) = found else {
                     return Err(
                         DescribeDBClusterParameterGroupsErrorModeled::DBParameterGroupNotFoundFault(
                             DBParameterGroupNotFoundFault {
