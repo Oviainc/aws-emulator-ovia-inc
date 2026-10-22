@@ -148,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         let Some(removed) = state.assets.remove(&input.id) else {
             return Err(DeleteAssetErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Asset with Id {} does not exist.", input.id)),
+                message: Some(crate::scaffolded::not_found_message("Asset", &input.id)),
             })
             .into());
         };

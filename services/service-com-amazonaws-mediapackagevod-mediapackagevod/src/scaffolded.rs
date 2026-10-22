@@ -41,6 +41,8 @@
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
 
+use std::collections::BTreeMap;
+
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
 use smithy_server_runtime::OperationError;
@@ -177,6 +179,160 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+// =============================================================================
+// How this service words a request-validation refusal
+// =============================================================================
+//
+// MediaPackage VOD answers a request whose MEMBERS do not validate with HTTP 422
+// `UnprocessableEntityException` carrying, beside `message`, an `errors` map that
+// attributes each violation to the input member it is about — or to `base` when the
+// violation is about the request as a whole. The modelled shape declares only
+// `Message`, so the map cannot be carried by the generated error type; it is carried
+// by the synthetic shape below, which renders with the SAME error code and status as
+// the modelled one.
+//
+// The two message builders under it word the failures the MODELLED errors carry:
+// a resource the request named that does not exist, and one that already does. Both
+// live here rather than in a handler so every operation words the same failure the
+// same way (`lib.rs` is generated, so this crate cannot declare a module of its own).
+
+/// The `errors` key a violation of the request AS A WHOLE is attributed to — as
+/// opposed to one attributed to a single input member.
+///
+/// Recorded behaviour: a `CreatePackagingConfiguration` carrying more than one
+/// package block is answered with `errors: {"base": [...]}`, because no single
+/// member is at fault.
+pub const BASE_ATTRIBUTE: &str = "base";
+
+/// The `message` member of the synthetic `UnprocessableEntityException` shape.
+///
+/// Named and `@jsonName`d exactly like the modelled
+/// `UnprocessableEntityException$Message` (`jsonName: message`), so the body reads
+/// the same to a client whichever of the two shapes answered.
+static UNPROCESSABLE_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnprocessableEntityWithErrors$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("message");
+
+/// The `errors` member of the synthetic `UnprocessableEntityException` shape: a map
+/// from an input member's wire name (or [`BASE_ATTRIBUTE`]) to the constraint
+/// phrases that member violated.
+static UNPROCESSABLE_ERRORS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnprocessableEntityWithErrors$errors",
+        "smithy.framework",
+        "errors",
+    ),
+    ShapeType::Map,
+    "errors",
+    1,
+)
+.with_xml_name("Errors")
+.with_json_name("errors");
+
+/// Schema for the synthetic `UnprocessableEntityException` shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the
+/// `errors` member is recorded behaviour the model does not declare, so there is no
+/// modelled shape that can carry it and the synthetic one must not collide with a
+/// modelled name. The wire error code is still
+/// `UnprocessableEntityException` — it comes from [`OperationError::shape_name`]
+/// below, not from this schema.
+pub static UNPROCESSABLE_ENTITY_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#UnprocessableEntityWithErrors",
+        "smithy.framework",
+        "UnprocessableEntityWithErrors",
+    ),
+    ShapeType::Structure,
+    &[&UNPROCESSABLE_MESSAGE, &UNPROCESSABLE_ERRORS],
+);
+
+/// A request whose members did not validate: the per-attribute `errors` map, and the
+/// `message` that states the same attribution as one line of text.
+#[derive(Debug, Clone)]
+pub struct UnprocessableEntity {
+    /// The violation as one line: `<member_name> <phrase>` for a member-level
+    /// violation, `<ResourceType> <phrase>` for a whole-request one.
+    pub message: String,
+    /// The violated attribute (an input member's wire name, or [`BASE_ATTRIBUTE`])
+    /// mapped to the constraint phrases it violated.
+    pub errors: BTreeMap<String, Vec<String>>,
+}
+
+impl UnprocessableEntity {
+    /// A violation of ONE input member: `errors` is `{<wire name>: [<phrase>]}` and
+    /// the message is the member's name in snake case followed by the phrase.
+    ///
+    /// `member` is the member's WIRE name (its `@jsonName`, e.g. `packagingGroupId`),
+    /// which is what a client keys its per-field rendering on; the message spells the
+    /// same member in snake case (`packaging_group_id does not exist`). `phrase` is
+    /// the constraint that was violated, stated as a verb phrase about the member
+    /// (`does not exist`, `must not be empty`) and carrying no trailing period.
+    pub fn member(member: &str, phrase: impl Into<String>) -> Self {
+        let phrase = phrase.into();
+        Self {
+            message: format!("{} {phrase}", snake_case(member)),
+            errors: BTreeMap::from([(member.to_string(), vec![phrase])]),
+        }
+    }
+
+    /// A violation of the request AS A WHOLE — no single member is at fault, so
+    /// `errors` is keyed by [`BASE_ATTRIBUTE`] and the message names the resource
+    /// type the request would have created instead of a member.
+    pub fn request(resource: &str, phrase: impl Into<String>) -> Self {
+        let phrase = phrase.into();
+        Self {
+            message: format!("{resource} {phrase}"),
+            errors: BTreeMap::from([(BASE_ATTRIBUTE.to_string(), vec![phrase])]),
+        }
+    }
+}
+
+/// An input member's wire name (`packagingGroupId`) as the message spells it
+/// (`packaging_group_id`).
+fn snake_case(member: &str) -> String {
+    let mut out = String::with_capacity(member.len() + 4);
+    for ch in member.chars() {
+        if ch.is_ascii_uppercase() {
+            if !out.is_empty() {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The message a `NotFoundException` carries for a resource the request named and
+/// this service holds none of: `<ResourceType> with id=<requested id> not found`.
+///
+/// Built from the id the REQUEST asked for, never from a stored record — there is no
+/// stored record to read. `resource` is the modelled resource type (`Asset`,
+/// `PackagingGroup`, `PackagingConfiguration`).
+pub fn not_found_message(resource: &str, id: &str) -> String {
+    format!("{resource} with id={id} not found")
+}
+
+/// The message the conflict refusal carries when a create re-uses an id this service
+/// already holds: `<ResourceType> with id=<requested id> already exists`.
+///
+/// Same binding form as [`not_found_message`], so a client extracting the id from
+/// either rejection parses one form.
+pub fn already_exists_message(resource: &str, id: &str) -> String {
+    format!("{resource} with id={id} already exists")
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +341,10 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A request whose members did not validate. Renders as HTTP 422 with the error
+    /// code `UnprocessableEntityException` — the modelled status and code — plus the
+    /// `errors` map the modelled shape cannot carry.
+    Unprocessable(UnprocessableEntity),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -223,11 +383,49 @@ impl<E> Scaffolded<E> {
     }
 }
 
+/// Lets `?` and `.into()` lift a validation refusal — built by
+/// [`UnprocessableEntity`], which names no operation — into ANY operation's error
+/// channel, the way the per-operation `From<{Op}ErrorModeled>` impls lift a modelled
+/// failure.
+impl<E> From<UnprocessableEntity> for Scaffolded<E> {
+    fn from(invalid: UnprocessableEntity) -> Self {
+        Self::Unprocessable(invalid)
+    }
+}
+
+impl std::fmt::Display for UnprocessableEntity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UnprocessableEntityException: {}", self.message)
+    }
+}
+
+impl std::error::Error for UnprocessableEntity {}
+
+impl SerializableStruct for UnprocessableEntity {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&UNPROCESSABLE_MESSAGE, self.message.as_str())?;
+        s.write_map(&UNPROCESSABLE_ERRORS, &|entries| {
+            for (attribute, phrases) in &self.errors {
+                entries.write_string(&UNPROCESSABLE_ERRORS, attribute.as_str())?;
+                entries.write_list(&UNPROCESSABLE_ERRORS, &|elements| {
+                    for phrase in phrases {
+                        elements.write_string(&UNPROCESSABLE_ERRORS, phrase.as_str())?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::Unprocessable(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +438,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::Unprocessable(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +453,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::Unprocessable(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +462,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::Unprocessable(_) => &UNPROCESSABLE_ENTITY_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +475,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            // The MODELLED error code: this variant differs from the generated
+            // `UnprocessableEntityException` only in carrying the `errors` member,
+            // so a client branching on the code cannot tell which one answered.
+            Self::Unprocessable(_) => "UnprocessableEntityException",
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +491,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            // `UnprocessableEntityException`'s modelled `httpError`.
+            Self::Unprocessable(_) => 422,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,7 +504,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
-            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            // Same reason: neither synthetic shape carries an `awsQueryError` trait
+            // (and this service is restJson1, which has no query error code).
+            Self::Unprocessable(_) => None,
             Self::ValidationException(_) => None,
         }
     }

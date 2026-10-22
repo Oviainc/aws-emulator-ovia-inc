@@ -2,8 +2,10 @@
 
 //! @op CreatePackagingConfiguration
 //! IMPLEMENTED: mints a PackagingConfiguration against an existing PackagingGroup.
-//! Refuses an unknown `PackagingGroupId` with `NotFoundException` (404), persists the
-//! package block verbatim, and answers with the record just stored.
+//! Refuses a `PackagingGroupId` that resolves to nothing — and a request that does
+//! not carry exactly one package block — as a request-parameter violation,
+//! `UnprocessableEntityException` (422), persists the package block verbatim, and
+//! answers with the record just stored.
 //!
 //! ## Shape of an operation
 //!
@@ -173,38 +175,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
 
         // Exactly one package block decides the packaging format, and so the parent
-        // manifest the egress endpoints of every asset in the group expose.
+        // manifest the egress endpoints of every asset in the group expose. No single
+        // member is at fault when that does not hold, so the violation is attributed
+        // to the request as a whole (`base`).
         let package_blocks = usize::from(input.hls_package.is_some())
             + usize::from(input.dash_package.is_some())
             + usize::from(input.cmaf_package.is_some())
             + usize::from(input.mss_package.is_some());
-        if input.id.is_empty() || package_blocks != 1 {
-            return Err(
-                CreatePackagingConfigurationErrorModeled::UnprocessableEntityException(
-                    UnprocessableEntityException {
-                        message: Some(if input.id.is_empty() {
-                            "Id must not be empty.".to_string()
-                        } else {
-                            "Exactly one of CmafPackage, DashPackage, HlsPackage or MssPackage \
-                             must be specified."
-                                .to_string()
-                        }),
-                    },
-                )
-                .into(),
-            );
+        if input.id.is_empty() {
+            return Err(crate::scaffolded::UnprocessableEntity::member(
+                "id",
+                "must not be empty",
+            )
+            .into());
         }
+        if package_blocks != 1 {
+            return Err(crate::scaffolded::UnprocessableEntity::request(
+                "PackagingConfiguration",
+                "must include one single type of packaging settings",
+            )
+            .into());
+        }
+        // The group id arrives in the request BODY, so one that resolves to nothing
+        // is a violation of that PARAMETER rather than a missing addressed resource.
         if !state
             .packaging_groups
             .contains_key(&input.packaging_group_id)
         {
-            return Err(CreatePackagingConfigurationErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "PackagingGroup with Id {} does not exist.",
-                        input.packaging_group_id
-                    )),
-                },
+            return Err(crate::scaffolded::UnprocessableEntity::member(
+                "packagingGroupId",
+                "does not exist",
             )
             .into());
         }
@@ -212,9 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreatePackagingConfigurationErrorModeled::UnprocessableEntityException(
                     UnprocessableEntityException {
-                        message: Some(format!(
-                            "A PackagingConfiguration with Id {} already exists.",
-                            input.id
+                        message: Some(crate::scaffolded::already_exists_message(
+                            "PackagingConfiguration",
+                            &input.id,
                         )),
                     },
                 )

@@ -172,11 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => match crate::state::decode_page_token(token) {
                 Some(after) => Some(after),
                 None => {
-                    return Err(ListAssetsErrorModeled::UnprocessableEntityException(
-                        UnprocessableEntityException {
-                            message: Some("NextToken is not a cursor this service issued."
-                                .to_string()),
-                        },
+                    return Err(crate::scaffolded::UnprocessableEntity::member(
+                        "nextToken",
+                        "is not a cursor this service issued",
                     )
                     .into())
                 }
@@ -191,13 +189,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(max) => match usize::try_from(max) {
                 Ok(max) if (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&max) => max,
                 _ => {
-                    return Err(ListAssetsErrorModeled::UnprocessableEntityException(
-                        UnprocessableEntityException {
-                            message: Some(format!(
-                                "MaxResults must be between {MIN_PAGE_SIZE} and \
-                                 {MAX_PAGE_SIZE}."
-                            )),
-                        },
+                    return Err(crate::scaffolded::UnprocessableEntity::member(
+                        "maxResults",
+                        format!("must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"),
                     )
                     .into())
                 }
