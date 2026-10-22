@@ -428,17 +428,29 @@ async fn a_handler_stated_validation_exception_keeps_its_reason() {
     );
 }
 
-/// A request that names no modelled operation still answers the routing default: the
-/// envelope wrapper claims only what the generated routing table answers for.
+/// A request that names no modelled operation is not claimed by the envelope wrapper:
+/// it reaches this service's own request layer, which answers the unknown-operation
+/// envelope rather than any handler (the layer itself is covered in
+/// `request_layer_envelopes`).
 #[tokio::test]
 async fn a_request_naming_no_modelled_operation_is_not_claimed() {
     let router = emulator();
 
     let answer = call(&router, "/Users/NoSuchOperation", DIRECTORY, &json!({})).await;
     assert_eq!(
-        answer.status, 501,
-        "an unmodelled route must keep the framework's routing answer, got {} with {:?}",
+        answer.status, 200,
+        "an unmodelled route must reach the request layer, got {} with {:?}",
         answer.status, answer.body
+    );
+    assert_eq!(
+        answer
+            .body
+            .get("Output")
+            .and_then(|output| output.get("__type"))
+            .and_then(Value::as_str),
+        Some("com.amazon.coral.service#UnknownOperationException"),
+        "an unmodelled route must answer the unknown-operation envelope, got {:?}",
+        answer.body
     );
 }
 
