@@ -18,7 +18,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A fresh emulator: one shared engine, this service mounted, signature checking off
 /// (the tests are about the service's behaviour, not SigV4).
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -31,7 +31,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Call one operation and return `(status, body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -65,7 +65,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// Call one operation and require a 200.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(
         status, 200,
@@ -75,7 +75,7 @@ async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value 
 }
 
 /// The wire error code out of an awsJson error envelope's `__type`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -86,7 +86,7 @@ fn error_code(body: &Value) -> String {
 }
 
 /// Create one accelerator and return its record.
-async fn create_accelerator(router: &MultiServiceRouter, name: &str, token: &str) -> Value {
+pub(crate) async fn create_accelerator(router: &MultiServiceRouter, name: &str, token: &str) -> Value {
     ok(
         router,
         "CreateAccelerator",
@@ -96,7 +96,7 @@ async fn create_accelerator(router: &MultiServiceRouter, name: &str, token: &str
         .clone()
 }
 
-fn arn_of(accelerator: &Value) -> String {
+pub(crate) fn arn_of(accelerator: &Value) -> String {
     accelerator["AcceleratorArn"]
         .as_str()
         .unwrap_or_else(|| panic!("AcceleratorArn missing from {accelerator}"))

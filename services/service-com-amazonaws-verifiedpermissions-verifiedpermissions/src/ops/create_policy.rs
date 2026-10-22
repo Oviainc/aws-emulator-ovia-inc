@@ -254,16 +254,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.as_deref() {
             if let Some(record) = state.idempotency_replay("CreatePolicy", token) {
                 if record.parameters != parameters {
+                    // Fixed message; the policy the token already created is
+                    // reported in `resources`.
                     return Err(CreatePolicyErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "the client token {token} was already used with different parameters"
-                            ),
-                            resources: vec![ResourceConflict {
-                                resource_id: record.resource_id.clone(),
-                                resource_type: "POLICY".to_string(),
-                            }],
-                        },
+                        crate::ops::conflict([crate::ops::resource_conflict(
+                            &record.resource_id,
+                            crate::state::RESOURCE_TYPE_POLICY,
+                        )]),
                     )
                     .into());
                 }
@@ -341,15 +338,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .find(|p| p.name.as_deref() == Some(name))
             {
                 return Err(CreatePolicyErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "a policy named {name} already exists in policy store {store_id}"
-                        ),
-                        resources: vec![ResourceConflict {
-                            resource_id: clash.policy_id.clone(),
-                            resource_type: "POLICY".to_string(),
-                        }],
-                    },
+                    crate::ops::conflict([crate::ops::resource_conflict(
+                        &clash.policy_id,
+                        crate::state::RESOURCE_TYPE_POLICY,
+                    )]),
                 )
                 .into());
             }

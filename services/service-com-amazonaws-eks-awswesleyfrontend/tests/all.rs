@@ -17,6 +17,8 @@ mod access_policy_catalog;
 mod cluster_lifecycle;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
+#[path = "all/connected_clusters.rs"]
+mod connected_clusters;
 #[path = "all/encryption_config_association.rs"]
 mod encryption_config_association;
 #[path = "all/identity_provider_config.rs"]

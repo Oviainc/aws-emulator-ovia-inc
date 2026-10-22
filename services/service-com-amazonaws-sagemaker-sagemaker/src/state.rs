@@ -266,6 +266,93 @@ pub const APP_STATUS_IN_SERVICE: &str = "InService";
 /// whose creation is still in flight, which never happens here.
 pub const STATUS_COMPLETED: &str = "Completed";
 
+// ---------------------------------------------------------------------------
+// The hub slice: the records `ListHubContents` reports. Kept here, beside the first
+// resource record rather than at either end of the module, so it does not sit in the
+// region every new resource slice is appended to.
+// ---------------------------------------------------------------------------
+
+/// A hub, as `DescribeHub` replays it and `ListHubContents` resolves it.
+///
+/// Only the hub's identity and lifecycle live here: `CreateHub` (its own open issue)
+/// extends this record with the description, display name, search keywords and S3
+/// storage configuration it stores.
+#[derive(Debug, Clone)]
+pub struct Hub {
+    pub name: String,
+    pub arn: String,
+    /// A `HubStatus` member (the model's enum: `InService`, `Creating`, `Updating`,
+    /// `Deleting`, `CreateFailed`, `UpdateFailed`, `DeleteFailed`).
+    pub status: String,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+}
+
+/// The identity of ONE stored hub content version.
+///
+/// A hub content is identified by its hub, its `HubContentType` and its
+/// `HubContentName` — the three members every hub-content operation requires — and
+/// versioned by `HubContentVersion`. The version is held BOTH as its three parsed dotted
+/// components (see [`version_key`]), so the map orders `1.10.0` AFTER `1.9.0`, and
+/// verbatim, so two versions whose components parse the same are still two records rather
+/// than one overwriting the other.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HubContentKey {
+    pub hub_name: String,
+    pub hub_content_type: String,
+    pub hub_content_name: String,
+    pub version: (u32, u32, u32),
+    /// `HubContentVersion` verbatim — the tie-break that keeps the identity total.
+    pub version_text: String,
+}
+
+/// One version of a hub content, as `ListHubContents` summarises it.
+///
+/// The members are `HubContentInfo`'s (the summary shape `ListHubContents` returns);
+/// `ImportHubContent`, `CreateHubContentReference` and `DescribeHubContent` (each its own
+/// open issue) extend this record with the document, markdown and dependencies they store.
+#[derive(Debug, Clone)]
+pub struct HubContent {
+    pub name: String,
+    pub arn: String,
+    /// A `HubContentType` member: `Model`, `Notebook`, `ModelReference`, `DataSet` or
+    /// `JsonDoc`.
+    pub content_type: String,
+    /// `HubContentVersion`, verbatim as stored, e.g. `1.0.0`.
+    pub version: String,
+    pub document_schema_version: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    /// A `HubContentSupportStatus` member: `Supported`, `Deprecated` or `Restricted`.
+    pub support_status: Option<String>,
+    pub search_keywords: Option<Vec<String>>,
+    /// A `HubContentStatus` member: `Available`, `Importing`, `Deleting`,
+    /// `ImportFailed`, `DeleteFailed`, `PendingImport` or `PendingDelete`.
+    pub status: String,
+    /// When THIS version was created.
+    pub creation_time: SystemTime,
+    /// When the content was first created, before any later version replaced it; absent
+    /// on a content that was never revised.
+    pub original_creation_time: Option<SystemTime>,
+    /// The public hub content this one references, for a `ModelReference`.
+    pub sage_maker_public_hub_content_arn: Option<String>,
+}
+
+/// A dotted `<major>.<minor>.<patch>` version (`HubContentVersion`,
+/// `DocumentSchemaVersion`, both `^\d{1,4}.\d{1,4}.\d{1,4}$`) as a comparable key, so
+/// `1.10.0` orders ABOVE `1.9.0` rather than below it as the strings would.
+///
+/// A component that is not a number counts as 0: the model refuses a malformed version
+/// before a handler sees it, so this only keeps the ordering total.
+pub fn version_key(version: &str) -> (u32, u32, u32) {
+    let mut components = version.split('.').map(|part| part.parse::<u32>().unwrap_or(0));
+    (
+        components.next().unwrap_or(0),
+        components.next().unwrap_or(0),
+        components.next().unwrap_or(0),
+    )
+}
+
 /// A model created by `CreateModel`, as `DescribeModel` and `ListModels` replay it.
 #[derive(Debug, Clone)]
 pub struct Model {
@@ -862,6 +949,10 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// Keyed by `AIWorkloadConfigName`. See [`AIWorkloadConfig`], at the end of this
     /// module with the rest of the AI-benchmarking workload-configuration slice.
     pub ai_workload_configs: BTreeMap<String, AIWorkloadConfig>,
+    /// Keyed by `HubName`. See [`Hub`].
+    pub hubs: BTreeMap<String, Hub>,
+    /// Every stored hub content VERSION, keyed by [`HubContentKey`].
+    pub hub_contents: BTreeMap<HubContentKey, HubContent>,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -1138,7 +1229,8 @@ pub fn mint_opaque_resource_id() -> String {
 /// The resource NAME an `ArnOrName`-typed member addresses.
 ///
 /// Several SageMaker readers accept either a bare name or the resource's full ARN for the
-/// same resource (the `ArnOrName` shape), and the store is keyed by the name — so an ARN is
+/// same resource (the `ArnOrName` and `HubNameOrArn` shapes, the latter modelled
+/// `^(arn:…:hub\/)?<name>$`), and the store is keyed by the name — so an ARN is
 /// reduced to the resource portion after its final `/`. A value that is not an ARN is
 /// already a name and is returned unchanged.
 pub fn name_from_arn_or_name(value: &str) -> &str {

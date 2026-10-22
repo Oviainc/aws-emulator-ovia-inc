@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::ops::types::{
+    ActionConfigurationProperty, ActionType, ActionTypeId, ActionTypeSettings, ArtifactDetails,
     ExecutionTrigger, PipelineDeclaration, PipelineExecution, PipelineExecutionSummary,
     PipelineMetadata, PipelineSummary, ResolvedPipelineVariable, SourceRevision, Tag,
 };
@@ -107,6 +108,12 @@ pub struct ComAmazonawsCodepipelineCodepipeline20150709State {
     /// so repeating an idempotency token returns the same execution. An entry lives
     /// exactly as long as the execution it names.
     pub idempotency: BTreeMap<(String, String), String>,
+    /// The action types this ACCOUNT registered — the custom ones
+    /// `CreateCustomActionType` mints — keyed by their `ActionTypeId`. The action
+    /// types the service itself provides are not account state and live in
+    /// [`BUILT_IN_ACTION_TYPES`]; [`ComAmazonawsCodepipelineCodepipeline20150709State::action_type_catalog`]
+    /// is the one place the two are put in a single order.
+    pub action_types: BTreeMap<ActionTypeKey, ActionTypeRecord>,
 }
 
 impl ComAmazonawsCodepipelineCodepipeline20150709State {
@@ -178,7 +185,317 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
         self.idempotency
             .retain(|(pipeline_name, _), _| pipeline_name != name);
     }
+
+    /// Every action type this account can use, in one total order over the
+    /// `ActionTypeId` members: the catalog the service itself provides
+    /// ([`BUILT_IN_ACTION_TYPES`]) overlaid with the action types registered in this
+    /// store, so a registration of an id the catalog also names wins over it.
+    ///
+    /// One order over both is what lets a listing page through them with an opaque
+    /// cursor that names a position rather than an offset.
+    pub fn action_type_catalog(&self) -> BTreeMap<ActionTypeKey, ActionTypeRecord> {
+        let mut catalog: BTreeMap<ActionTypeKey, ActionTypeRecord> = BUILT_IN_ACTION_TYPES
+            .iter()
+            .map(|entry| (entry.key(), entry.record()))
+            .collect();
+        for (key, record) in &self.action_types {
+            catalog.insert(key.clone(), record.clone());
+        }
+        catalog
+    }
 }
+
+/// An action type's identity: the four `ActionTypeId` members, in the order the
+/// shape declares them (`smithy_query query="shape" shape="ActionTypeId"` ->
+/// `category`, `owner`, `provider`, `version`).
+///
+/// Ordered, so a map keyed by it pages deterministically, and the order a listing
+/// reports is the same across calls.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ActionTypeKey {
+    /// An `ActionCategory` value.
+    pub category: String,
+    /// An `ActionOwner` value.
+    pub owner: String,
+    /// The provider of the service the action calls.
+    pub provider: String,
+    /// The action type's version.
+    pub version: String,
+}
+
+impl ActionTypeKey {
+    /// The identity a request's `ActionTypeId` names.
+    pub fn from_id(id: &ActionTypeId) -> Self {
+        Self {
+            category: id.category.clone(),
+            owner: id.owner.clone(),
+            provider: id.provider.clone(),
+            version: id.version.clone(),
+        }
+    }
+
+    /// This identity as the modelled `ActionTypeId` a response carries.
+    pub fn to_id(&self) -> ActionTypeId {
+        ActionTypeId {
+            category: self.category.clone(),
+            owner: self.owner.clone(),
+            provider: self.provider.clone(),
+            version: self.version.clone(),
+        }
+    }
+
+    /// This identity as the ordered key a pagination cursor names.
+    ///
+    /// `/` separates the members because neither `ActionProvider` nor `Version` can
+    /// contain one (both are `@pattern("^[0-9A-Za-z_-]+$")`) and `ActionCategory` and
+    /// `ActionOwner` are enums of bare words, so the rendering is unambiguous and
+    /// [`ActionTypeKey::from_cursor`] recovers exactly the four members.
+    pub fn cursor(&self) -> String {
+        format!(
+            "{}/{}/{}/{}",
+            self.category, self.owner, self.provider, self.version
+        )
+    }
+
+    /// The identity a cursor key names, or `None` when it is not one
+    /// [`ActionTypeKey::cursor`] produced.
+    pub fn from_cursor(cursor: &str) -> Option<Self> {
+        let mut parts = cursor.split('/');
+        let key = Self {
+            category: parts.next()?.to_string(),
+            owner: parts.next()?.to_string(),
+            provider: parts.next()?.to_string(),
+            version: parts.next()?.to_string(),
+        };
+        if parts.next().is_some()
+            || [&key.category, &key.owner, &key.provider, &key.version]
+                .iter()
+                .any(|member| member.is_empty())
+        {
+            return None;
+        }
+        Some(key)
+    }
+}
+
+/// One action type as this service holds it: everything `ActionType` reports beside
+/// its id (which is the key it is stored under), plus the Region it is available in.
+#[derive(Debug, Clone, Default)]
+pub struct ActionTypeRecord {
+    /// URLs that tell a user about this action type, when it has any.
+    pub settings: Option<ActionTypeSettings>,
+    /// The configuration properties the action accepts.
+    pub configuration_properties: Vec<ActionConfigurationProperty>,
+    /// How many input artifacts the action takes.
+    pub input_artifact_details: ArtifactDetails,
+    /// How many output artifacts the action produces.
+    pub output_artifact_details: ArtifactDetails,
+    /// The Region this action type is registered in, or `None` for one the service
+    /// offers in every Region. `ListActionTypes$regionFilter` ("The Region to filter
+    /// on for the list of action types") is what reads it.
+    pub region: Option<String>,
+}
+
+impl ActionTypeRecord {
+    /// Whether this action type is one a caller in `region` can use: a registration
+    /// belongs to the Region it was made in, and an action type the service offers
+    /// everywhere belongs to all of them.
+    pub fn available_in(&self, region: &str) -> bool {
+        self.region.as_deref().is_none_or(|own| own == region)
+    }
+
+    /// This action type as `ListActionTypes` and `CreateCustomActionType` report it.
+    pub fn to_action_type(&self, key: &ActionTypeKey) -> ActionType {
+        ActionType {
+            id: key.to_id(),
+            settings: self.settings.clone(),
+            // An absent list and an empty one state the same fact, and AWS omits the
+            // member.
+            action_configuration_properties: optional_list(self.configuration_properties.clone()),
+            input_artifact_details: self.input_artifact_details.clone(),
+            output_artifact_details: self.output_artifact_details.clone(),
+        }
+    }
+}
+
+/// One entry of the catalog of action types this service provides itself: the four
+/// `ActionTypeId` members and the artifact counts the action's reference page
+/// documents.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltInActionType {
+    /// An `ActionCategory` value.
+    pub category: &'static str,
+    /// An `ActionOwner` value — `AWS` for an action the service runs itself,
+    /// `ThirdParty` for one a partner integration runs.
+    pub owner: &'static str,
+    /// The provider of the service the action calls.
+    pub provider: &'static str,
+    /// The action type's version.
+    pub version: &'static str,
+    /// `(minimumCount, maximumCount)` of the action's input artifacts.
+    pub input_artifacts: (i32, i32),
+    /// `(minimumCount, maximumCount)` of the action's output artifacts.
+    pub output_artifacts: (i32, i32),
+}
+
+impl BuiltInActionType {
+    /// This entry's identity.
+    pub fn key(&self) -> ActionTypeKey {
+        ActionTypeKey {
+            category: self.category.to_string(),
+            owner: self.owner.to_string(),
+            provider: self.provider.to_string(),
+            version: self.version.to_string(),
+        }
+    }
+
+    /// This entry as a stored record: available in every Region, and carrying no
+    /// `settings` or configuration properties, because those are per-provider detail
+    /// this emulator does not model rather than values to invent.
+    pub fn record(&self) -> ActionTypeRecord {
+        ActionTypeRecord {
+            settings: None,
+            configuration_properties: Vec::new(),
+            input_artifact_details: ArtifactDetails {
+                minimum_count: self.input_artifacts.0,
+                maximum_count: self.input_artifacts.1,
+            },
+            output_artifact_details: ArtifactDetails {
+                minimum_count: self.output_artifacts.0,
+                maximum_count: self.output_artifacts.1,
+            },
+            region: None,
+        }
+    }
+}
+
+/// The action types this service provides on its own — the ones no caller created —
+/// as `ListActionTypes` ("a summary of all CodePipeline action types associated with
+/// your account") reports them beside the account's own registrations.
+///
+/// Source: the page `ActionTypeId$provider` and `ActionTypeId$owner` both link to in
+/// their model documentation, "Valid action types and providers in CodePipeline"
+/// (<https://docs.aws.amazon.com/codepipeline/latest/userguide/reference-pipeline-structure.html#actions-valid-providers>),
+/// which lists each category's providers and their owners; the artifact counts are
+/// the input- and output-artifact counts that page's per-action structure reference
+/// documents for each one. Every version is `1`, the only version those actions
+/// publish. Providers whose documented input-artifact count exceeds
+/// `MaximumArtifactCount`'s modelled `@range(max: 5)` are left out rather than
+/// reported with a count the model cannot carry.
+pub const BUILT_IN_ACTION_TYPES: [BuiltInActionType; 14] = [
+    BuiltInActionType {
+        category: "Approval",
+        owner: "AWS",
+        provider: "Manual",
+        version: "1",
+        input_artifacts: (0, 0),
+        output_artifacts: (0, 0),
+    },
+    BuiltInActionType {
+        category: "Build",
+        owner: "AWS",
+        provider: "CodeBuild",
+        version: "1",
+        input_artifacts: (1, 5),
+        output_artifacts: (0, 5),
+    },
+    BuiltInActionType {
+        category: "Deploy",
+        owner: "AWS",
+        provider: "CodeDeploy",
+        version: "1",
+        input_artifacts: (1, 1),
+        output_artifacts: (0, 0),
+    },
+    BuiltInActionType {
+        category: "Deploy",
+        owner: "AWS",
+        provider: "ECS",
+        version: "1",
+        input_artifacts: (1, 1),
+        output_artifacts: (0, 0),
+    },
+    BuiltInActionType {
+        category: "Deploy",
+        owner: "AWS",
+        provider: "ElasticBeanstalk",
+        version: "1",
+        input_artifacts: (1, 1),
+        output_artifacts: (0, 0),
+    },
+    BuiltInActionType {
+        category: "Deploy",
+        owner: "AWS",
+        provider: "S3",
+        version: "1",
+        input_artifacts: (1, 1),
+        output_artifacts: (0, 0),
+    },
+    BuiltInActionType {
+        category: "Invoke",
+        owner: "AWS",
+        provider: "Lambda",
+        version: "1",
+        input_artifacts: (0, 5),
+        output_artifacts: (0, 5),
+    },
+    BuiltInActionType {
+        category: "Source",
+        owner: "AWS",
+        provider: "CodeCommit",
+        version: "1",
+        input_artifacts: (0, 0),
+        output_artifacts: (1, 1),
+    },
+    BuiltInActionType {
+        category: "Source",
+        owner: "AWS",
+        provider: "CodeStarSourceConnection",
+        version: "1",
+        input_artifacts: (0, 0),
+        output_artifacts: (1, 1),
+    },
+    BuiltInActionType {
+        category: "Source",
+        owner: "AWS",
+        provider: "ECR",
+        version: "1",
+        input_artifacts: (0, 0),
+        output_artifacts: (1, 1),
+    },
+    BuiltInActionType {
+        category: "Source",
+        owner: "AWS",
+        provider: "S3",
+        version: "1",
+        input_artifacts: (0, 0),
+        output_artifacts: (1, 1),
+    },
+    BuiltInActionType {
+        category: "Source",
+        owner: "ThirdParty",
+        provider: "GitHub",
+        version: "1",
+        input_artifacts: (0, 0),
+        output_artifacts: (1, 1),
+    },
+    BuiltInActionType {
+        category: "Test",
+        owner: "AWS",
+        provider: "CodeBuild",
+        version: "1",
+        input_artifacts: (1, 5),
+        output_artifacts: (0, 5),
+    },
+    BuiltInActionType {
+        category: "Test",
+        owner: "AWS",
+        provider: "DeviceFarm",
+        version: "1",
+        input_artifacts: (1, 1),
+        output_artifacts: (0, 0),
+    },
+];
 
 /// One stored pipeline: the declaration exactly as the caller sent it (with the
 /// members the service itself resolves filled in), plus the service-owned metadata
@@ -513,12 +830,16 @@ pub const CURSOR_PIPELINE: &str = "pipeline";
 /// The cursor kind a `ListPipelineExecutions` token carries.
 pub const CURSOR_EXECUTION: &str = "execution";
 
+/// The cursor kind a `ListActionTypes` token carries.
+pub const CURSOR_ACTION_TYPE: &str = "actionType";
+
 /// An opaque pagination cursor naming the ordered key the next page starts at.
 ///
 /// Base64 of `<kind>:<key>` (the encoding AWS's own opaque tokens use, from
 /// `aws_smithy_types::base64`): opaque to the caller, round-trips exactly, and stays
 /// inside `NextToken`'s modelled 1..2048 length for every key this service pages
-/// over (a pipeline name is at most 100 characters, an execution id 36). The kind
+/// over (a pipeline name is at most 100 characters, an execution id 36, and an
+/// action type's four `ActionTypeId` members at most 8 + 10 + 35 + 9). The kind
 /// prefix is what lets [`decode_page_token`] reject a token this listing never
 /// issued; neither a `PipelineName` nor a `PipelineExecutionId` can contain `:`,
 /// so the prefix is unambiguous.
