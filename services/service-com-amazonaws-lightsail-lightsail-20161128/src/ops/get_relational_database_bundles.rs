@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRelationalDatabaseBundles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRelationalDatabaseBundles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRelationalDatabaseBundles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the managed-database bundle catalog in `crate::state`
+//! ([`crate::state::RELATIONAL_DATABASE_BUNDLE_SPECS`]) — the performance
+//! specifications and the monthly price a database can be created with. The
+//! catalog is service-published data, the same for every account, so this
+//! operation reads it rather than the per-account store and writes NOTHING: a
+//! read of it leaves every later caller exactly the answer it would have had.
+//!
+//! `includeInactive` selects the slice of that catalog a call reports — every
+//! active plan, plus the retired ones when the flag is set. One page is that
+//! slice from the entry `pageToken` names onward, at most
+//! [`crate::state::RELATIONAL_DATABASE_BUNDLE_PAGE_SIZE`] entries, and
+//! `nextPageToken` names the first entry of the next page — present only while
+//! entries remain. A token that names no bundle of the slice is refused with the
+//! modelled `InvalidInputException`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +176,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRelationalDatabaseBundles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRelationalDatabaseBundlesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRelationalDatabaseBundles"))
+        // The catalog is service-wide published data (see this module's docs), so
+        // neither the store nor the request metadata takes part in the answer.
+        let _ = (ctx, &self.engine);
+
+        // `includeInactive` is "A Boolean value that indicates whether to include
+        // inactive (unavailable) bundles in the response of your request", and the
+        // member is optional — so an absent flag reports the active bundles only,
+        // exactly as `false` does.
+        let include_inactive = input.include_inactive.unwrap_or(false);
+        let page_token = input.page_token.as_deref();
+
+        let page = crate::state::relational_database_bundle_page(
+            crate::state::RELATIONAL_DATABASE_BUNDLE_SPECS,
+            include_inactive,
+            page_token,
+            crate::state::RELATIONAL_DATABASE_BUNDLE_PAGE_SIZE,
+        )
+        .ok_or_else(|| invalid_page_token(page_token.unwrap_or_default(), include_inactive))?;
+
+        Ok(GetRelationalDatabaseBundlesOutput {
+            // A page always reports a list, empty or not: the caller asked what
+            // the catalog holds, and an absent member would say nothing.
+            bundles: Some(page.bundles),
+            next_page_token: page.next_page_token,
+        })
     }
+}
+
+/// `pageToken` names no bundle of the slice the request asked for, so there is no
+/// page to answer: the modelled `InvalidInputException`, documented as "user
+/// input does not conform to the validation rules of an input field".
+fn invalid_page_token(token: &str, include_inactive: bool) -> GetRelationalDatabaseBundlesError {
+    let reportable = crate::state::relational_database_bundles(include_inactive);
+    GetRelationalDatabaseBundlesErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(format!(
+            "pageToken {token:?} does not name a database bundle in this response; a page token is the bundle id a previous page reported as nextPageToken, one of: {}",
+            crate::state::relational_database_bundle_ids(&reportable)
+        )),
+        ..Default::default()
+    })
+    .into()
 }
