@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptAgreementRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptAgreementRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptAgreementRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Finalises the agreement: the stored agreement request's terms become the new
+//! agreement's accepted terms, and the record every other operation reports on is
+//! persisted in [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptAgreementRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptAgreementRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptAgreementRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AcceptAgreementRequestErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(request) = store.agreement_requests.get(&input.agreement_request_id).cloned()
+        else {
+            return Err(AcceptAgreementRequestErrorModeled::ResourceNotFoundException(
+                crate::state::agreement_request_not_found(&input.agreement_request_id),
+            )
+            .into());
+        };
+
+        // A quote is accepted once: the second accept would mint a second
+        // agreement from the same request.
+        if let Some(agreement_id) = request.accepted_agreement_id.as_deref() {
+            return Err(AcceptAgreementRequestErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::RESOURCE_TYPE_AGREEMENT_REQUEST,
+                    &request.id,
+                    format!(
+                        "agreement request {} was already accepted as agreement {agreement_id}",
+                        request.id
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // What an amendment or replacement inherits from the agreement it acts
+        // upon: the chain's first id, and the proposal the chain was created
+        // from (an `AMEND` request names no proposal of its own). The agreement
+        // the request acts upon must still be there — a request naming one that
+        // is not is unresolvable, not a new chain of its own.
+        let mut source = None;
+        if let Some(id) = request.source_agreement_identifier.as_deref() {
+            let Some(stored) = store.agreements.get(id) else {
+                return Err(AcceptAgreementRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(id),
+                )
+                .into());
+            };
+            source = Some(stored.clone());
+        }
+
+        let id = store.mint_agreement_id();
+        let proposal_summary = ProposalSummary {
+            // The only identity of the proposal this emulator holds is the
+            // identifier the request named; its resources and offer set live in
+            // the agreement proposal, which is not this service's resource.
+            offer_id: request
+                .agreement_proposal_identifier
+                .clone()
+                .or_else(|| {
+                    source
+                        .as_ref()
+                        .and_then(|source| source.proposal_summary.offer_id.clone())
+                }),
+            resources: source
+                .as_ref()
+                .and_then(|source| source.proposal_summary.resources.clone()),
+            offer_set_id: source
+                .as_ref()
+                .and_then(|source| source.proposal_summary.offer_set_id.clone()),
+        };
+        let agreement = crate::state::Agreement {
+            // "When an agreement isn't derived from another agreement, its
+            // InitialAgreementId is its own AgreementId."
+            initial_agreement_id: source
+                .as_ref()
+                .map_or_else(|| id.clone(), |source| source.initial_agreement_id.clone()),
+            id: id.clone(),
+            agreement_request_id: request.id.clone(),
+            agreement_type: crate::state::AGREEMENT_TYPE.to_string(),
+            catalog: crate::state::CATALOG.to_string(),
+            // The caller accepted these terms, so the emulator's account is the
+            // acceptor. The proposer is the seller who published the proposal,
+            // whose account this emulator holds no record of.
+            acceptor: Acceptor {
+                account_id: Some(::engine::emulator_account_id().to_string()),
+            },
+            proposer: Proposer { account_id: None },
+            status: crate::state::STATUS_ACTIVE.to_string(),
+            // "AcceptanceTime and StartTime can differ for future dated
+            // agreements"; the accepted terms carry no start date, so this
+            // agreement starts when it was accepted.
+            start_time: now,
+            acceptance_time: now,
+            // "The field is null for pay-as-you-go agreements, which don't have
+            // end dates" — see `crate::state::Agreement::end_time`.
+            end_time: None,
+            proposal_summary,
+            accepted_terms: request
+                .requested_terms
+                .iter()
+                .map(crate::state::accepted_term)
+                .collect(),
+            purchase_orders: input
+                .purchase_orders
+                .unwrap_or_default()
+                .into_iter()
+                .map(|order| PurchaseOrder {
+                    // "The unique identifier of the agreement associated with
+                    // this charge": the agreement being accepted.
+                    agreement_id: Some(id.clone()),
+                    ..order
+                })
+                .collect(),
+            updated_at: now,
+        };
+
+        store.agreements.insert(id.clone(), agreement);
+        if let Some(request) = store.agreement_requests.get_mut(&input.agreement_request_id) {
+            request.accepted_agreement_id = Some(id.clone());
+        }
+        crate::state::audit("AcceptAgreementRequest", "accepted", &id, ctx.parts());
+
+        // `AgreementStatus` documents the status the agreement a replacement
+        // acts upon carries from then on: "REPLACED – The agreement was replaced
+        // using an agreement replacement offer." What an AMEND leaves its source
+        // in is not documented, so the emulator does not move it.
+        if request.intent == crate::state::INTENT_REPLACE {
+            if let Some(source) = request
+                .source_agreement_identifier
+                .as_deref()
+                .and_then(|source| store.agreements.get_mut(source))
+            {
+                source.status = crate::state::STATUS_REPLACED.to_string();
+                source.updated_at = now;
+                let replaced = source.id.clone();
+                crate::state::audit(
+                    "AcceptAgreementRequest",
+                    "replaced",
+                    &replaced,
+                    ctx.parts(),
+                );
+            }
+        }
+
+        Ok(AcceptAgreementRequestOutput {
+            agreement_id: Some(id),
+        })
     }
 }

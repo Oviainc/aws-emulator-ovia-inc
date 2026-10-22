@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAgreementRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAgreementRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAgreementRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints the quote: the agreement request is persisted in [`crate::state`] and the
+//! `chargeSummary` it answers with is computed from the requested terms it stored. A
+//! repeated call carrying the same `clientToken` answers with the request that token
+//! already created.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAgreementRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAgreementRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateAgreementRequestErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        // The two cross-member rules the model states but cannot express.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAgreementRequest"))
+        // `agreementProposalIdentifier`: "This parameter is required if the
+        // intent is not AMEND."
+        if input.intent != crate::state::INTENT_AMEND
+            && input.agreement_proposal_identifier.is_none()
+        {
+            return Err(CreateAgreementRequestErrorModeled::ValidationException(
+                crate::state::validation_exception(
+                    "MISSING_AGREEMENT_PROPOSAL_IDENTIFIER",
+                    "agreementProposalIdentifier",
+                    format!(
+                        "required when intent is {}, because the request has no source \
+                         agreement to take its terms from",
+                        input.intent
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // `sourceAgreementIdentifier`: "This parameter is required for all
+        // non-NEW intents (i.e., AMEND or REPLACE). Don't provide this parameter
+        // if the intent is NEW."
+        match input.source_agreement_identifier.as_deref() {
+            Some(source) if input.intent == crate::state::INTENT_NEW => {
+                return Err(CreateAgreementRequestErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        "INVALID_SOURCE_AGREEMENT_IDENTIFIER",
+                        "sourceAgreementIdentifier",
+                        format!(
+                            "must not be provided when intent is {}, but names {source}",
+                            crate::state::INTENT_NEW
+                        ),
+                    ),
+                )
+                .into());
+            }
+            None if input.intent != crate::state::INTENT_NEW => {
+                return Err(CreateAgreementRequestErrorModeled::ValidationException(
+                    crate::state::validation_exception(
+                        "MISSING_SOURCE_AGREEMENT_IDENTIFIER",
+                        "sourceAgreementIdentifier",
+                        format!(
+                            "required when intent is {}, which acts upon an existing agreement",
+                            input.intent
+                        ),
+                    ),
+                )
+                .into());
+            }
+            _ => {}
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: the same token names the same quote, so a retried
+        // create reports the first request rather than minting a second.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.idempotency.get(token).cloned())
+            .and_then(|id| store.agreement_requests.get(&id))
+            .map(|request| (request.id.clone(), request.charge_summary.clone()));
+        if let Some((id, charge_summary)) = replayed {
+            return Ok(CreateAgreementRequestOutput {
+                agreement_request_id: Some(id),
+                charge_summary: Some(charge_summary),
+            });
+        }
+
+        // An amendment or replacement "acts upon" an agreement that must exist:
+        // the quantities it already holds are what the new quote is measured
+        // against.
+        if let Some(source) = input.source_agreement_identifier.as_deref() {
+            if !store.agreements.contains_key(source) {
+                return Err(
+                    CreateAgreementRequestErrorModeled::ResourceNotFoundException(
+                        crate::state::agreement_not_found(source),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The store is bounded: past its quota a create is refused rather than
+        // adding another record.
+        if store.agreement_requests.len() >= crate::state::AGREEMENT_REQUEST_QUOTA {
+            return Err(
+                CreateAgreementRequestErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        request_id: None,
+                        message: Some(format!(
+                            "this account already holds the maximum of {} agreement requests",
+                            crate::state::AGREEMENT_REQUEST_QUOTA
+                        )),
+                        quota_code: Some(crate::state::AGREEMENT_REQUEST_QUOTA_CODE.to_string()),
+                        service_code: Some(crate::state::SERVICE_CODE.to_string()),
+                        resource_type: Some(
+                            crate::state::RESOURCE_TYPE_AGREEMENT_REQUEST.to_string(),
+                        ),
+                        // The quota is per account, so the account is the
+                        // resource that reached it.
+                        resource_id: Some(::engine::emulator_account_id().to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let charge_summary = store.charge_summary(
+            &input.requested_terms,
+            &input.intent,
+            input.source_agreement_identifier.as_deref(),
+        );
+        let id = store.mint_agreement_request_id();
+        let request = crate::state::AgreementRequest {
+            id: id.clone(),
+            intent: input.intent,
+            requested_terms: input.requested_terms,
+            source_agreement_identifier: input.source_agreement_identifier,
+            agreement_proposal_identifier: input.agreement_proposal_identifier,
+            tax_configuration: input.tax_configuration,
+            charge_summary: charge_summary.clone(),
+            client_token: input.client_token.clone(),
+            // Nothing is accepted until `AcceptAgreementRequest` runs.
+            accepted_agreement_id: None,
+            created_at: now,
+        };
+        store.agreement_requests.insert(id.clone(), request);
+        if let Some(token) = input.client_token {
+            store.idempotency.insert(token, id.clone());
+        }
+        crate::state::audit("CreateAgreementRequest", "created", &id, ctx.parts());
+
+        Ok(CreateAgreementRequestOutput {
+            agreement_request_id: Some(id),
+            charge_summary: Some(charge_summary),
+        })
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchAgreements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchAgreements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchAgreements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Scans the stored agreements, applying the request's filters, sort and page size.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +156,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchAgreements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchAgreementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchAgreements"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(SearchAgreementsErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+
+        let sort = input.sort.unwrap_or_default();
+        let sort_by = sort
+            .sort_by
+            .unwrap_or_else(|| crate::state::DEFAULT_SORT_BY.to_string());
+        if !crate::state::SORT_BY_VALUES.contains(&sort_by.as_str()) {
+            return Err(SearchAgreementsErrorModeled::ValidationException(
+                crate::state::validation_exception(
+                    "INVALID_SORT_BY",
+                    "sort.sortBy",
+                    format!(
+                        "{sort_by:?} is not one of {}",
+                        crate::state::SORT_BY_VALUES.join(", ")
+                    ),
+                ),
+            )
+            .into());
+        }
+        // `sortOrder` is a modelled enum, so the boundary validator already
+        // refused anything but its two values; only an absent one is left.
+        let sort_order = sort
+            .sort_order
+            .unwrap_or_else(|| crate::state::SORT_ORDER_ASCENDING.to_string());
+        let ascending = sort_order == crate::state::SORT_ORDER_ASCENDING;
+
+        let filters = input.filters.unwrap_or_default();
+        // The filter list is refused before any agreement is scanned, so a
+        // filter this service cannot interpret answers the same 400 whatever
+        // the store happens to hold — including nothing at all.
+        if let Err(refusal) = crate::state::validate_filters(&filters) {
+            return Err(SearchAgreementsErrorModeled::ValidationException(
+                crate::state::validation_exception(refusal.reason, "filters", refusal.detail),
+            )
+            .into());
+        }
+
+        // A pure report: it reads the stored agreements and writes nothing.
+        let store = state.lock();
+        let mut matched: Vec<&crate::state::Agreement> = Vec::new();
+        for agreement in store.agreements.values() {
+            // "The catalog in which the agreement was created": every agreement
+            // is created in the one catalog AWS Marketplace exposes, so a search
+            // naming another one selects nothing.
+            if input
+                .catalog
+                .as_deref()
+                .is_some_and(|catalog| catalog != agreement.catalog)
+            {
+                continue;
+            }
+            if crate::state::matches_filters(agreement, &filters) {
+                matched.push(agreement);
+            }
+        }
+
+        // Order by the requested attribute, then by id so the order is total and
+        // a page token indexes into the same sequence on every call. An
+        // agreement with no value for the attribute (a pay-as-you-go agreement
+        // has no end time) sorts last in `ASCENDING` order and, because the
+        // whole comparison is reversed, first in `DESCENDING`.
+        matched.sort_by(|left, right| {
+            let key = |agreement: &crate::state::Agreement| {
+                let instant = agreement.sort_key(&sort_by);
+                (instant.is_none(), instant)
+            };
+            let ordering = key(left).cmp(&key(right));
+            if ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+            .then_with(|| left.id.cmp(&right.id))
+        });
+
+        // The token resumes THIS search: a token minted for a different query
+        // would index into a different sequence.
+        let scope =
+            crate::state::search_scope(input.catalog.as_deref(), &filters, &sort_by, &sort_order);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::page_offset(&scope, token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(SearchAgreementsErrorModeled::ValidationException(
+                        crate::state::validation_exception(
+                            "INVALID_NEXT_TOKEN",
+                            "nextToken",
+                            "not a token SearchAgreements returned for this same search",
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let summaries: Vec<AgreementViewSummary> = matched
+            .iter()
+            .map(|agreement| agreement.to_view_summary())
+            .collect();
+        let Some((agreement_view_summaries, next_token)) = crate::state::paginate(
+            &summaries,
+            &scope,
+            offset,
+            crate::state::page_size(input.max_results),
+        ) else {
+            // The offset is past the end of what this search selects, which no
+            // token this operation minted for it ever named.
+            return Err(SearchAgreementsErrorModeled::ValidationException(
+                crate::state::validation_exception(
+                    "INVALID_NEXT_TOKEN",
+                    "nextToken",
+                    "names a page past the end of what this search selects",
+                ),
+            )
+            .into());
+        };
+
+        Ok(SearchAgreementsOutput {
+            agreement_view_summaries: Some(agreement_view_summaries),
+            next_token,
+        })
     }
 }
