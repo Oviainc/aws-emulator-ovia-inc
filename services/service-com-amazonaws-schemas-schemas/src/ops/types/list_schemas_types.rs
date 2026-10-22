@@ -7,6 +7,7 @@
 //! modules, and `types/mod.rs` re-exports them all.
 #![allow(unused_imports)]
 
+use super::shared_types::schemas_member;
 use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-schemas-schemas.json");
@@ -27,7 +28,12 @@ pub struct ListSchemasOutput {
     pub schemas: Option<Vec<SchemaSummary>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.schemas#SchemaSummary")]
+/// `SchemaSummary`, written out by hand rather than produced by
+/// `#[smithy_macros::smithy(shape = ...)]` because `LastModified` targets
+/// `__timestampIso8601` and so carries `@timestampFormat("date-time")` — see the block
+/// over `schemas_member!` in `shared_types`. The format has to reach the member schema
+/// of the list ELEMENT too: a `date-time` member renders the same whether it is answered
+/// at the top level of a response or inside a summary list.
 #[derive(Debug, Clone, Default)]
 pub struct SchemaSummary {
     pub last_modified: Option<::aws_smithy_types::DateTime>,
@@ -37,3 +43,94 @@ pub struct SchemaSummary {
     pub version_count: Option<i64>,
 }
 
+#[allow(non_upper_case_globals)]
+impl SchemaSummary {
+    /// `@timestampFormat("date-time")` from `__timestampIso8601`.
+    pub const M_LAST_MODIFIED: ::aws_smithy_schema::Schema =
+        schemas_member!(iso8601 "SchemaSummary", "LastModified", 0);
+    pub const M_SCHEMA_ARN: ::aws_smithy_schema::Schema =
+        schemas_member!("SchemaSummary", "SchemaArn", String, 1);
+    pub const M_SCHEMA_NAME: ::aws_smithy_schema::Schema =
+        schemas_member!("SchemaSummary", "SchemaName", String, 2);
+    pub const M_TAGS: ::aws_smithy_schema::Schema = schemas_member!(tags "SchemaSummary", "Tags", 3);
+    /// `__long` — a JSON number, not a timestamp.
+    pub const M_VERSION_COUNT: ::aws_smithy_schema::Schema =
+        schemas_member!("SchemaSummary", "VersionCount", Long, 4);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.schemas#SchemaSummary",
+            "com.amazonaws.schemas",
+            "SchemaSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_LAST_MODIFIED,
+            &Self::M_SCHEMA_ARN,
+            &Self::M_SCHEMA_NAME,
+            &Self::M_TAGS,
+            &Self::M_VERSION_COUNT,
+        ],
+    );
+}
+
+pub static SCHEMA_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &SchemaSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for SchemaSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.last_modified.as_ref() {
+            s.write_timestamp(&Self::M_LAST_MODIFIED, v)?;
+        }
+        if let Some(v) = self.schema_arn.as_ref() {
+            s.write_string(&Self::M_SCHEMA_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.schema_name.as_ref() {
+            s.write_string(&Self::M_SCHEMA_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|sm| {
+                for (key, value) in v.iter() {
+                    sm.write_string(&Self::M_TAGS, key.as_str())?;
+                    sm.write_string(&Self::M_TAGS, value.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(v) = self.version_count.as_ref() {
+            s.write_long(&Self::M_VERSION_COUNT, *v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for SchemaSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.last_modified = Some(d.read_timestamp(&Self::M_LAST_MODIFIED)?),
+                Some(1) => out.schema_arn = Some(d.read_string(&Self::M_SCHEMA_ARN)?),
+                Some(2) => out.schema_name = Some(d.read_string(&Self::M_SCHEMA_NAME)?),
+                Some(3) => {
+                    let mut entries: std::collections::HashMap<String, String> =
+                        ::std::default::Default::default();
+                    d.read_map(&Self::M_TAGS, &mut |key, dm| {
+                        let value = dm.read_string(&Self::M_TAGS)?;
+                        entries.insert(key, value);
+                        Ok(())
+                    })?;
+                    out.tags = Some(entries);
+                }
+                Some(4) => out.version_count = Some(d.read_long(&Self::M_VERSION_COUNT)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
