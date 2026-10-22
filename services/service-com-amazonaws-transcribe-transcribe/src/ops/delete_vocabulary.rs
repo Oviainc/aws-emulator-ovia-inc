@@ -157,7 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "DeleteVocabulary";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_VOCABULARY_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_VOCABULARY_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 204u16;
+    // 200, not the model's `@http` `code: 204`: this service speaks awsJson1_1, an RPC
+    // protocol, so its `@http` traits are inert on the wire (`smithy_query` reports
+    // `httpBindingsInert: true` for every operation) and a success answers that
+    // protocol's own status, 200. The error side of the same rule is
+    // [`crate::scaffolded::wire_status`].
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
@@ -183,13 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // processing was already due is deleted rather than refused for a state it had
         // left.
         let Some(record) = store.vocabulary_mut(&input.vocabulary_name, now) else {
-            return Err(DeleteVocabularyErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "The requested vocabulary {} couldn't be found. Check the vocabulary \
-                     name and try your request again.",
-                    input.vocabulary_name
-                )),
-            })
+            // "This can occur when the entity you're trying to delete doesn't exist"
+            // (`BadRequestException`'s own documentation): a vocabulary this account
+            // does not hold is that error, not the modelled `NotFoundException`.
+            return Err(DeleteVocabularyErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::not_found_message(
+                        crate::state::KIND_VOCABULARY,
+                    )),
+                },
+            )
             .into());
         };
 

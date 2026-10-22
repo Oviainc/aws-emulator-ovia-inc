@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSpeechSynthesisTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSpeechSynthesisTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSpeechSynthesisTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one speech synthesis task out of the task store, by its `TaskId`.
+//!
+//! This is a REPORTING operation: it creates nothing and consumes nothing. The one
+//! write it may make is materialising the status transition the CLOCK has already
+//! made due on the task it reads ([`crate::state::settle_task_status`]) — a change
+//! that was owed at that instant whether or not anybody polled.
+//!
+//! A `TaskId` that satisfies the model's pattern but names no stored task is
+//! `SynthesisTaskNotFoundException` (HTTP 400), the error the model declares for
+//! exactly that case; a `TaskId` that does not satisfy the pattern never reaches this
+//! handler, because the framework refuses it at the boundary.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +148,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSpeechSynthesisTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSpeechSynthesisTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSpeechSynthesisTask"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSpeechSynthesisTaskErrorModeled::ServiceFailureException(
+                crate::service::errors::service_failure(),
+            )
+        })?;
+
+        let mut guard = state.lock();
+        let stored = guard.synthesis_tasks.get_mut(&input.task_id).ok_or_else(|| {
+            // The `TaskId` is well-formed (the model's pattern was enforced at the
+            // boundary) and names no task, which is this error rather than
+            // `InvalidTaskIdException`.
+            GetSpeechSynthesisTaskErrorModeled::SynthesisTaskNotFoundException(
+                crate::service::errors::synthesis_task_not_found(),
+            )
+        })?;
+        // The task's status as of NOW: a transition the clock owed it is reported the
+        // first time a read arrives after it fell due, not when some other call
+        // happens to run.
+        crate::state::settle_task_status(stored, ::std::time::SystemTime::now());
+
+        Ok(GetSpeechSynthesisTaskOutput {
+            synthesis_task: Some(crate::state::synthesis_task(stored)),
+        })
     }
 }

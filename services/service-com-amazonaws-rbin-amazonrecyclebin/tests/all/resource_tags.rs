@@ -82,7 +82,7 @@ fn authorization() -> String {
 /// `services/service-com-amazonaws-pcaconnectorscep-pcaconnectorscep/tests/all/connector_lifecycle.rs`
 /// documents for its own copy of this helper: a test-only encoder is not worth a new
 /// dev-dependency.
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {
@@ -144,7 +144,7 @@ async fn delete_rule(router: &MultiServiceRouter, identifier: &str) -> (u16, Val
 }
 
 /// `GET /tags/{ResourceArn}` — `ListTagsForResource`.
-async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> (u16, Value) {
     call(
         router,
         "GET",

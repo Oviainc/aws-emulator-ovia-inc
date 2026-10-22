@@ -17,17 +17,25 @@
 //! pinned is the branch and not one recorded value. The boundary case is here too:
 //! a target the store DOES hold is authorized, so the same operations proceed —
 //! the refusal is computed from the store, not returned unconditionally.
+//!
+//! The same ordering decides the branch a REPORTING operation on a named target
+//! takes, which is where the two refusals separate: `GetManagedResource` can only be
+//! authorized on an identifier shaped like a resource ARN (`ResourceArn`'s
+//! `@pattern`, `^arn:.*$`), because that is what an IAM policy grants an ARC action
+//! on, so an identifier that is not ARN-shaped is denied 403 before the store is
+//! consulted, while an ARN-shaped identifier ARC holds no record of is resolved and
+//! reported as `ResourceNotFoundException` (404).
 
 use super::zonal_shift_lifecycle::{call, emulator, encoded, error_code, seeded, start_body};
 use service_com_amazonaws_arczonalshift_percdataplane::state::TARGET_UNAVAILABLE_MESSAGE;
 
-/// `resourceIdentifier`s no managed resource carries, as `(identifier, class)`.
+/// ARN-shaped `resourceIdentifier`s no managed resource carries, as
+/// `(identifier, class)`.
 ///
-/// The sizes come from the model: `ResourceIdentifier` is length 8..1024 with no
-/// pattern (`smithy_query(query="shape", shape="ResourceIdentifier")`), so the
-/// shortest value it accepts is 8 characters and a value that is not an ARN at all
-/// still reaches the handler.
-const UNKNOWN_RESOURCE_IDENTIFIERS: &[(&str, &str)] = &[
+/// "ARN-shaped" is what `ResourceArn`'s `@pattern` requires — `^arn:.*$`
+/// (`smithy_query(query="shape", shape="ResourceArn")`) — so each row names a
+/// resource that could have been granted to a caller and simply is not registered.
+const UNKNOWN_RESOURCE_ARNS: &[(&str, &str)] = &[
     (
         "arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/absent/73e2d6bc24d8a067",
         "a load balancer ARN in another account",
@@ -40,9 +48,43 @@ const UNKNOWN_RESOURCE_IDENTIFIERS: &[(&str, &str)] = &[
         "arn:aws:eks:us-east-1:111111111111:cluster/absent",
         "an EKS cluster ARN ARC has no record of",
     ),
+    (
+        "arn:this-is-not-a-well-formed-arn",
+        "an ARN-prefixed value with no further structure",
+    ),
+];
+
+/// `resourceIdentifier`s that are not shaped like a resource ARN at all, as
+/// `(identifier, class)`.
+///
+/// The sizes come from the model: `ResourceIdentifier` is length 8..1024 with no
+/// pattern (`smithy_query(query="shape", shape="ResourceIdentifier")`), so the
+/// shortest value it accepts is 8 characters and a value that is not an ARN at all
+/// still reaches the handler. `ResourceArn`'s `^arn:.*$` is case-sensitive, so an
+/// upper-cased prefix is not ARN-shaped either.
+const NON_ARN_RESOURCE_IDENTIFIERS: &[(&str, &str)] = &[
     ("abcdefgh", "the shortest identifier the model accepts"),
     ("not-an-arn-at-all", "a value that is not an ARN"),
+    ("zonal-shift-alb", "a resource name rather than its ARN"),
+    (
+        "ARN:aws:eks:us-east-1:111111111111:cluster/absent",
+        "an upper-cased arn: prefix, which the pattern does not admit",
+    ),
+    (
+        "i-0123456789abcdef0",
+        "an instance id: an AWS identifier that is not an ARN",
+    ),
 ];
+
+/// Every identifier no managed resource carries, ARN-shaped or not: what a MUTATION
+/// refuses alike, whichever form the target took.
+fn unknown_resource_identifiers() -> Vec<(&'static str, &'static str)> {
+    UNKNOWN_RESOURCE_ARNS
+        .iter()
+        .chain(NON_ARN_RESOURCE_IDENTIFIERS)
+        .copied()
+        .collect()
+}
 
 /// `zonalShiftId`s no stored shift carries, as `(id, class)`.
 ///
@@ -98,7 +140,7 @@ fn assert_refused(case: &str, target: &str, status: u16, body: &serde_json::Valu
 #[tokio::test]
 async fn starting_a_shift_for_a_target_arc_holds_nothing_for_is_refused_403() {
     let (router, engine) = emulator();
-    let mut targets: Vec<(String, String)> = UNKNOWN_RESOURCE_IDENTIFIERS
+    let mut targets: Vec<(String, String)> = unknown_resource_identifiers()
         .iter()
         .map(|(identifier, class)| ((*identifier).to_string(), (*class).to_string()))
         .collect();
@@ -273,12 +315,22 @@ async fn a_target_the_store_holds_is_authorized_and_the_mutation_proceeds() {
 }
 
 #[tokio::test]
-async fn a_read_of_an_unknown_managed_resource_is_still_reported_as_not_found() {
-    // The boundary of the rule: it orders the branch of an operation that ACTS on its
-    // target. `GetManagedResource` reports rather than acts, and the model declares
-    // `ResourceNotFoundException` (404) for it, which is what it keeps answering.
-    let (router, _engine) = emulator();
-    for (identifier, class) in UNKNOWN_RESOURCE_IDENTIFIERS {
+async fn a_read_of_an_arn_shaped_resource_arc_has_no_record_of_is_reported_as_not_found() {
+    // The boundary of the rule: an ARN-shaped identifier is one authorization CAN be
+    // decided on, so `GetManagedResource` resolves it, and the model declares
+    // `ResourceNotFoundException` (404) for a resource ARC holds no record of.
+    let (router, engine) = emulator();
+    let mut arns: Vec<(String, String)> = UNKNOWN_RESOURCE_ARNS
+        .iter()
+        .map(|(identifier, class)| ((*identifier).to_string(), (*class).to_string()))
+        .collect();
+    // A near miss on an ARN the store DOES hold: still ARN-shaped, still unregistered.
+    let (held, _zones) = seeded(&engine)[0].clone();
+    arns.push((
+        format!("{held}0"),
+        "a near miss on an ARN the store holds".to_string(),
+    ));
+    for (identifier, class) in &arns {
         let (status, body) = call(
             &router,
             "GET",
@@ -294,6 +346,44 @@ async fn a_read_of_an_unknown_managed_resource_is_still_reported_as_not_found() 
             error_code(&body),
             "ResourceNotFoundException",
             "case {class:?}: expected ResourceNotFoundException, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_read_of_an_identifier_that_is_not_arn_shaped_is_denied_403() {
+    // The rule's other side: authorization on the named target is decided BEFORE the
+    // target is resolved, and an identifier that is not shaped like a resource ARN
+    // (`ResourceArn`'s `@pattern`, `^arn:.*$`) matches no resource ARN an IAM policy
+    // could have granted this action on — so the read is denied rather than looked up,
+    // and never reports whether anything is registered.
+    let (router, _engine) = emulator();
+    for (identifier, class) in NON_ARN_RESOURCE_IDENTIFIERS {
+        let (status, body) = call(
+            &router,
+            "GET",
+            &format!("/managedresources/{}", encoded(identifier)),
+            "",
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "case {class:?}: a non-ARN identifier is denied 403, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "AccessDeniedException",
+            "case {class:?}: expected AccessDeniedException, got {body}"
+        );
+        // `AccessDeniedException$message` is optional, and a denial taken before the
+        // target was resolved reports nothing about it.
+        assert!(
+            body["message"].is_null() || body["message"].as_str() == Some(""),
+            "case {class:?}: the denial carries no message, got {body}"
+        );
+        assert!(
+            !body.to_string().contains(identifier),
+            "case {class:?}: the denial must not disclose the identifier, got {body}"
         );
     }
 }

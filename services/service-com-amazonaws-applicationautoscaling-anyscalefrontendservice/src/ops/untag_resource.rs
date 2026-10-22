@@ -135,7 +135,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            check_tag_key, check_tag_keys_unreserved, unknown_resource_arn_message,
+            check_tag_key, check_tag_keys_unreserved, SCALABLE_TARGET_NOT_FOUND_MESSAGE,
         };
 
         // `TagKeyList` carries its own `@length(0..200)`, refused at the boundary, and a
@@ -153,13 +153,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An engine that holds no state holds no scalable target either: the same
         // refusal as an ARN that names no registered target (see `tag_resource`).
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(validation(unknown_resource_arn_message(&input.resource_arn)));
+            return Err(validation(SCALABLE_TARGET_NOT_FOUND_MESSAGE));
         };
         let mut state = state.lock();
 
         let resolved = state.arn_index.get(&input.resource_arn).cloned();
         let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
-            return Err(validation(unknown_resource_arn_message(&input.resource_arn)));
+            return Err(validation(SCALABLE_TARGET_NOT_FOUND_MESSAGE));
         };
 
         // "To delete a tag, specify the tag key and the Application Auto Scaling

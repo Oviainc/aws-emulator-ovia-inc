@@ -142,7 +142,9 @@ fn template_body(label: &str, role_arn: &str) -> Value {
         "description": format!("target account configuration refusal suite: {label}"),
         "roleArn": role_arn,
         "stopConditions": [{ "source": "none" }],
-        "actions": { "wait": { "actionId": "aws:fis:wait" } }
+        // `aws:fis:wait` takes a required `duration` parameter (an ISO 8601 duration
+        // within the documented 1 to 720 minutes), which the create refuses without.
+        "actions": { "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT5M" } } }
     })
 }
 

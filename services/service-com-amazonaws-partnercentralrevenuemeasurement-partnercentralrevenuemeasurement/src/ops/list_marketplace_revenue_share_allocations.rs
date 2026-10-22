@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMarketplaceRevenueShareAllocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMarketplaceRevenueShareAllocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMarketplaceRevenueShareAllocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the allocations stored under one revenue share,
+//! honouring the status and effective-date filters, the sort members and a
+//! historical parent revision.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +166,182 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMarketplaceRevenueShareAllocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMarketplaceRevenueShareAllocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMarketplaceRevenueShareAllocations"))
+        // A reporting operation: it reads the store and writes nothing.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListMarketplaceRevenueShareAllocationsErrorModeled::InternalServerException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let catalog = crate::state::parse_catalog(&input.catalog).map_err(validation)?;
+        let status_filter = match input.status.as_deref() {
+            None | Some("") => None,
+            Some(value) => match crate::state::AllocationStatus::from_wire(value) {
+                Some(status) => Some(status),
+                None => {
+                    return Err(validation(crate::state::invalid_enum(
+                        "Status",
+                        ALLOCATION_STATUS_VALUES,
+                    )))
+                }
+            },
+        };
+        // `SortBy` declares exactly one field; absent, the list is in creation
+        // order, which is also the order the stored ids sort in.
+        let sort_by_effective_from = match input.sort_by.as_deref() {
+            None | Some("") => false,
+            Some("EffectiveFrom") => true,
+            Some(_) => {
+                return Err(validation(crate::state::invalid_enum(
+                    "SortBy",
+                    MARKETPLACE_REVENUE_SHARE_ALLOCATION_SORT_FIELD_VALUES,
+                )))
+            }
+        };
+        // The model documents "Defaults to DESCENDING".
+        let sort_order = match input.sort_order.as_deref() {
+            None | Some("") => crate::state::SortOrder::Descending,
+            Some(value) => match crate::state::SortOrder::from_wire(value) {
+                Some(order) => order,
+                None => {
+                    return Err(validation(crate::state::invalid_enum(
+                        "SortOrder",
+                        SORT_ORDER_VALUES,
+                    )))
+                }
+            },
+        };
+        if let Some(requested) = input.max_results.filter(|value| *value < 1) {
+            return Err(validation(crate::state::invalid_max_results(requested)));
+        }
+        if let Some(after) = input.after_effective_from.as_deref() {
+            if crate::state::parse_date(after).is_none() {
+                return Err(validation(crate::state::invalid_value(
+                    "AfterEffectiveFrom",
+                    format!("{after:?} is not a calendar date in YYYY-MM-DD"),
+                )));
+            }
+        }
+        if let Some(before) = input.before_effective_from.as_deref() {
+            if crate::state::parse_date(before).is_none() {
+                return Err(validation(crate::state::invalid_value(
+                    "BeforeEffectiveFrom",
+                    format!("{before:?} is not a calendar date in YYYY-MM-DD"),
+                )));
+            }
+        }
+
+        let state = state.lock();
+        let Some(share) = state.share(catalog, &input.product_id) else {
+            return Err(
+                ListMarketplaceRevenueShareAllocationsErrorModeled::ResourceNotFoundException(
+                    crate::state::share_not_found(catalog, &input.product_id),
+                )
+                .into(),
+            );
+        };
+        let revision = match input.marketplace_revenue_share_revision.as_deref() {
+            None => share.revision,
+            Some(token) => match crate::state::parse_revision_token(token)
+                .filter(|revision| *revision <= share.revision)
+            {
+                Some(revision) => revision,
+                None => {
+                    return Err(
+                        ListMarketplaceRevenueShareAllocationsErrorModeled::ResourceNotFoundException(
+                            crate::state::revision_not_found(
+                                "MarketplaceRevenueShareRevision",
+                                &input.product_id,
+                                token,
+                                share.revision,
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        // Every row is the allocation as it stood at `revision`, so the filters
+        // and the sort key read the historical version, not the current one.
+        let mut rows: Vec<(String, String, crate::state::AllocationView)> = Vec::new();
+        for (allocation, version) in share.allocations_at(revision) {
+            if status_filter.is_some_and(|wanted| version.status != wanted) {
+                continue;
+            }
+            // The two bounds are MODELLED, and the contract header above quotes
+            // them verbatim: `AfterEffectiveFrom` is the "Inclusive lower bound
+            // for EffectiveFrom date filter" and `BeforeEffectiveFrom` the
+            // "Exclusive upper bound for EffectiveFrom date filter (half-open
+            // range)". `YYYY-MM-DD` orders chronologically as a string.
+            if input
+                .after_effective_from
+                .as_deref()
+                .is_some_and(|after| version.effective_from.as_str() < after)
+            {
+                continue;
+            }
+            if input
+                .before_effective_from
+                .as_deref()
+                .is_some_and(|before| version.effective_from.as_str() >= before)
+            {
+                continue;
+            }
+            let sort_key = if sort_by_effective_from {
+                version.effective_from.clone()
+            } else {
+                allocation.allocation_id.clone()
+            };
+            rows.push((
+                sort_key,
+                allocation.allocation_id.clone(),
+                crate::state::allocation_view(share, allocation, version),
+            ));
+        }
+        // The allocation id breaks every tie, so the order is total and a page
+        // resumes at exactly the item the previous one stopped before.
+        rows.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        if sort_order == crate::state::SortOrder::Descending {
+            rows.reverse();
+        }
+
+        let cursors: Vec<String> = rows.iter().map(|row| row.1.clone()).collect();
+        let page = crate::state::page(&cursors, input.next_token.as_deref(), input.max_results)
+            .ok_or_else(|| validation(crate::state::invalid_next_token()))?;
+        let summaries = rows[page.start..page.end]
+            .iter()
+            .map(|row| summary(&row.2))
+            .collect();
+        Ok(ListMarketplaceRevenueShareAllocationsOutput {
+            marketplace_revenue_share_allocation_summaries: summaries,
+            next_token: page.next_token,
+        })
+    }
+}
+
+/// Lift a modelled `ValidationException` into this operation's error channel.
+fn validation(error: ValidationException) -> ListMarketplaceRevenueShareAllocationsError {
+    ListMarketplaceRevenueShareAllocationsErrorModeled::ValidationException(error).into()
+}
+
+/// One summary, read off the stored allocation view.
+fn summary(view: &crate::state::AllocationView) -> MarketplaceRevenueShareAllocationSummary {
+    MarketplaceRevenueShareAllocationSummary {
+        marketplace_revenue_share_allocation_id: view.allocation_id.clone(),
+        product_id: view.product_id.clone(),
+        // Absent: see the note on `ProductName` in `crate::state`.
+        product_name: None,
+        arn: view.arn.clone(),
+        effective_from: view.effective_from.clone(),
+        effective_until: view.effective_until.clone(),
+        revenue_share_percent: view.revenue_share_percent.clone(),
+        status: view.status.clone(),
+        created_date: Some(crate::state::wire_timestamp(view.created_date)),
+        last_modified_date: Some(crate::state::wire_timestamp(view.last_modified_date)),
     }
 }

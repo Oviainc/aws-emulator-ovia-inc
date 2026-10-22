@@ -187,6 +187,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
 
         let region = crate::state::request_region(ctx);
+        // The request's tag keys are refused before the user is created: `Tag$Key` may
+        // not be null, and the `aws:` prefix is reserved for AWS.
+        if let Some(message) = crate::state::tags_rejection(input.tags.as_ref()) {
+            return Err(CreateUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let now = std::time::Instant::now();
         let mut state = state.lock();
         state.settle(now);
@@ -235,10 +245,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
         };
 
-        let tags = crate::state::tag_pairs(input.tags.as_ref());
-        if !tags.is_empty() {
-            state.tags.insert(arn, tags);
-        }
+        // The request's tags, under the ARN the tagging operations resolve this
+        // resource by. An empty set leaves NO entry, so the user starts with exactly
+        // the tags this request gave it.
+        state.set_tags(&arn, crate::state::tag_map(input.tags.as_ref()));
         // An ACL created earlier may already list this user name, so the membership is
         // derived rather than assumed empty: `User$ACLNames` comes from the ACLs that
         // list the user, through the one rule `DescribeUsers` reads it with.

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replaces the stored session's metadata map and stamps
+//! `lastUpdatedAt`. AWS documents that an ended session's content can still be read
+//! but not added to (`smithy_query(query="doc",shape="EndSession")`), so updating a
+//! session that is not `ACTIVE` is a 409 `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSession"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the session store is unavailable".to_string()),
+                    reason: None,
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        let key = crate::state::session_id_from_identifier(&input.session_identifier);
+        let Some(session) = guard.sessions.get_mut(key) else {
+            return Err(UpdateSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Session with identifier {} was not found.",
+                        input.session_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+        if session.status != crate::state::SessionStatus::Active {
+            return Err(UpdateSessionErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Session {} has status {} and can no longer be modified.",
+                    session.session_id,
+                    session.status.as_wire()
+                )),
+            })
+            .into());
+        }
+
+        // `sessionMetadata` is the whole map, not a patch: the request carries no
+        // per-key directive, so a supplied map replaces what was stored (an empty one
+        // included) and an omitted one leaves it alone.
+        if let Some(metadata) = input.session_metadata {
+            session.session_metadata = Some(metadata.into_iter().collect());
+        }
+        session.last_updated_at = crate::state::now();
+
+        Ok(UpdateSessionOutput {
+            session_id: session.session_id.clone(),
+            session_arn: session.session_arn.clone(),
+            session_status: session.status.as_wire().to_string(),
+            created_at: session.created_at,
+            last_updated_at: session.last_updated_at,
+        })
     }
 }

@@ -323,6 +323,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             region: region.clone(),
             versions: ::std::collections::BTreeMap::new(),
             latest_version: None,
+            // A published application starts private: a permission policy is granted
+            // only by a later `PutApplicationPolicy`.
+            policy_statements: Vec::new(),
         };
 
         // "optionally including an AWS SAM file to create the first application version

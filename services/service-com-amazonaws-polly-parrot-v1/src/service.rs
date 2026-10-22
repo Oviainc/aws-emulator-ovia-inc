@@ -39,6 +39,11 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Beside the seams, this file owns one more piece of wording: [`errors`], the fixed
+//! message Amazon Polly puts on each modelled exception. Every handler in `ops/`
+//! builds its modelled failures through it, so one error code cannot acquire two
+//! different messages.
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -135,5 +140,293 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+/// How this service words the modelled exceptions its handlers return.
+///
+/// Amazon Polly's error shapes all carry one generic `message` member, and the
+/// service fills it with ONE FIXED SENTENCE PER ERROR CODE: the text is a property of
+/// the error, not of the request, so a lexicon name, a pagination token, a size, a
+/// sample rate or a character count is never interpolated into it (and never echoed
+/// back to the caller). Every handler in `ops/` builds its modelled failures through
+/// the constructors below, so one error code cannot acquire two different messages.
+///
+/// Where a sentence is marked OBSERVED it is the text Amazon Polly's own responses
+/// carry for that code. The rest are the sentence this service's Smithy model
+/// documents for that error shape — equally fixed per code, and the only wording the
+/// contract offers. One code carries NO message at all
+/// (`SynthesisTaskNotFoundException`), which is likewise what Amazon Polly answers.
+///
+/// Two modelled errors are deliberately absent: `UnsupportedPlsAlphabetException` and
+/// `EngineNotSupportedException`. Amazon Polly does not answer with either —
+/// a lexicon declaring an alphabet it does not support is refused as an invalid PLS
+/// document (`InvalidLexiconException`) and a voice/engine mismatch is refused as a
+/// request-shape failure (`ValidationException`, whose message the framework builds
+/// from the request) — so there is nothing here to construct them with.
+pub mod errors {
+    #[allow(unused_imports)]
+    use crate::ops::types::*;
+
+    /// OBSERVED: `InvalidLexiconException`.
+    pub const INVALID_LEXICON: &str = "Invalid PLS Lexicon";
+    /// OBSERVED: `InvalidNextTokenException`.
+    pub const INVALID_NEXT_TOKEN: &str = "Invalid NextToken parameter";
+    /// OBSERVED: `InvalidSampleRateException`.
+    pub const INVALID_SAMPLE_RATE: &str = "Invalid SampleRate parameter";
+    /// OBSERVED: `InvalidSsmlException`.
+    pub const INVALID_SSML: &str = "Invalid SSML request";
+    /// OBSERVED: `LexiconNotFoundException`.
+    pub const LEXICON_NOT_FOUND: &str = "Lexicon not found";
+    /// OBSERVED: `LexiconSizeExceededException`.
+    pub const LEXICON_SIZE_EXCEEDED: &str = "Maximum lexicons size has been exceeded";
+    /// OBSERVED: `MarksNotSupportedForFormatException`.
+    pub const MARKS_NOT_SUPPORTED_FOR_FORMAT: &str =
+        "Speech marks are not supported for this format";
+    /// OBSERVED: `MaxLexiconsNumberExceededException`.
+    pub const MAX_LEXICONS_NUMBER_EXCEEDED: &str = "Max lexicon number has been exceeded";
+    /// OBSERVED: `SsmlMarksNotSupportedForTextTypeException`.
+    pub const SSML_MARKS_NOT_SUPPORTED_FOR_TEXT_TYPE: &str =
+        "SSML Speech marks are not supported for this text type";
+    /// OBSERVED: `TextLengthExceededException`.
+    pub const TEXT_LENGTH_EXCEEDED: &str = "Maximum text length has been exceeded";
+    /// OBSERVED: `UnsupportedPlsLanguageException`.
+    pub const UNSUPPORTED_PLS_LANGUAGE: &str = "Unsupported PLS language";
+    /// The model's own sentence for `MaxLexemeLengthExceededException`.
+    pub const MAX_LEXEME_LENGTH_EXCEEDED: &str =
+        "The maximum size of the lexeme would be exceeded by this operation.";
+    /// The model's own sentence for `LanguageNotSupportedException`.
+    pub const LANGUAGE_NOT_SUPPORTED: &str =
+        "The language specified is not currently supported by Amazon Polly in this capacity.";
+    /// The model's own sentence for `ServiceFailureException`.
+    pub const SERVICE_FAILURE: &str = "An unknown condition has caused a service failure.";
+
+    /// Every error code this service answers with, paired with the message it carries
+    /// — `None` where Amazon Polly sends the error with no message at all.
+    ///
+    /// This is the table, and the constructors below are its only users, so a test can
+    /// walk it and a reader can see the whole error vocabulary in one place.
+    pub const CANONICAL_MESSAGES: &[(&str, Option<&str>)] = &[
+        ("InvalidLexiconException", Some(INVALID_LEXICON)),
+        ("InvalidNextTokenException", Some(INVALID_NEXT_TOKEN)),
+        ("InvalidSampleRateException", Some(INVALID_SAMPLE_RATE)),
+        ("InvalidSsmlException", Some(INVALID_SSML)),
+        ("LanguageNotSupportedException", Some(LANGUAGE_NOT_SUPPORTED)),
+        ("LexiconNotFoundException", Some(LEXICON_NOT_FOUND)),
+        ("LexiconSizeExceededException", Some(LEXICON_SIZE_EXCEEDED)),
+        (
+            "MarksNotSupportedForFormatException",
+            Some(MARKS_NOT_SUPPORTED_FOR_FORMAT),
+        ),
+        (
+            "MaxLexemeLengthExceededException",
+            Some(MAX_LEXEME_LENGTH_EXCEEDED),
+        ),
+        (
+            "MaxLexiconsNumberExceededException",
+            Some(MAX_LEXICONS_NUMBER_EXCEEDED),
+        ),
+        ("ServiceFailureException", Some(SERVICE_FAILURE)),
+        (
+            "SsmlMarksNotSupportedForTextTypeException",
+            Some(SSML_MARKS_NOT_SUPPORTED_FOR_TEXT_TYPE),
+        ),
+        // Amazon Polly answers this one with a null message body.
+        ("SynthesisTaskNotFoundException", None),
+        ("TextLengthExceededException", Some(TEXT_LENGTH_EXCEEDED)),
+        ("UnsupportedPlsLanguageException", Some(UNSUPPORTED_PLS_LANGUAGE)),
+    ];
+
+    /// The PLS document is not a lexicon Amazon Polly can read.
+    pub fn invalid_lexicon() -> InvalidLexiconException {
+        InvalidLexiconException {
+            message: Some(INVALID_LEXICON.to_string()),
+        }
+    }
+
+    /// The `NextToken` was not one this service minted for this query.
+    pub fn invalid_next_token() -> InvalidNextTokenException {
+        InvalidNextTokenException {
+            message: Some(INVALID_NEXT_TOKEN.to_string()),
+        }
+    }
+
+    /// The `SampleRate` is not one the chosen `OutputFormat` accepts.
+    pub fn invalid_sample_rate() -> InvalidSampleRateException {
+        InvalidSampleRateException {
+            message: Some(INVALID_SAMPLE_RATE.to_string()),
+        }
+    }
+
+    /// The SSML input is not well-formed.
+    pub fn invalid_ssml() -> InvalidSsmlException {
+        InvalidSsmlException {
+            message: Some(INVALID_SSML.to_string()),
+        }
+    }
+
+    /// The voice does not speak the requested language.
+    pub fn language_not_supported() -> LanguageNotSupportedException {
+        LanguageNotSupportedException {
+            message: Some(LANGUAGE_NOT_SUPPORTED.to_string()),
+        }
+    }
+
+    /// No lexicon is stored under the requested name.
+    pub fn lexicon_not_found() -> LexiconNotFoundException {
+        LexiconNotFoundException {
+            message: Some(LEXICON_NOT_FOUND.to_string()),
+        }
+    }
+
+    /// The lexicon is larger than the published per-lexicon size quota.
+    pub fn lexicon_size_exceeded() -> LexiconSizeExceededException {
+        LexiconSizeExceededException {
+            message: Some(LEXICON_SIZE_EXCEEDED.to_string()),
+        }
+    }
+
+    /// Speech marks were asked for with an audio `OutputFormat`.
+    pub fn marks_not_supported_for_format() -> MarksNotSupportedForFormatException {
+        MarksNotSupportedForFormatException {
+            message: Some(MARKS_NOT_SUPPORTED_FOR_FORMAT.to_string()),
+        }
+    }
+
+    /// A lexeme in the document is longer than the published lexeme quota.
+    pub fn max_lexeme_length_exceeded() -> MaxLexemeLengthExceededException {
+        MaxLexemeLengthExceededException {
+            message: Some(MAX_LEXEME_LENGTH_EXCEEDED.to_string()),
+        }
+    }
+
+    /// Storing another lexicon would pass the published per-Region count quota.
+    pub fn max_lexicons_number_exceeded() -> MaxLexiconsNumberExceededException {
+        MaxLexiconsNumberExceededException {
+            message: Some(MAX_LEXICONS_NUMBER_EXCEEDED.to_string()),
+        }
+    }
+
+    /// This service's own state could not be reached (an HTTP 500 server fault).
+    pub fn service_failure() -> ServiceFailureException {
+        ServiceFailureException {
+            message: Some(SERVICE_FAILURE.to_string()),
+        }
+    }
+
+    /// SSML speech marks were asked for over plain-text input.
+    pub fn ssml_marks_not_supported_for_text_type() -> SsmlMarksNotSupportedForTextTypeException {
+        SsmlMarksNotSupportedForTextTypeException {
+            message: Some(SSML_MARKS_NOT_SUPPORTED_FOR_TEXT_TYPE.to_string()),
+        }
+    }
+
+    /// No synthesis task is stored under the requested `TaskId`.
+    pub fn synthesis_task_not_found() -> SynthesisTaskNotFoundException {
+        // No message: Amazon Polly answers this error with a null message body, so
+        // inventing one here would be a difference a client can see.
+        SynthesisTaskNotFoundException { message: None }
+    }
+
+    /// The text is longer than the published synthesis limits.
+    pub fn text_length_exceeded() -> TextLengthExceededException {
+        TextLengthExceededException {
+            message: Some(TEXT_LENGTH_EXCEEDED.to_string()),
+        }
+    }
+
+    /// The lexicon declares a language Amazon Polly does not support.
+    pub fn unsupported_pls_language() -> UnsupportedPlsLanguageException {
+        UnsupportedPlsLanguageException {
+            message: Some(UNSUPPORTED_PLS_LANGUAGE.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Every constructor must carry exactly the table's entry for its code: the
+        /// message is a function of the code and of nothing else.
+        #[test]
+        fn every_constructor_carries_its_table_entry() {
+            let built: Vec<(&str, Option<String>)> = vec![
+                ("InvalidLexiconException", invalid_lexicon().message),
+                ("InvalidNextTokenException", invalid_next_token().message),
+                ("InvalidSampleRateException", invalid_sample_rate().message),
+                ("InvalidSsmlException", invalid_ssml().message),
+                (
+                    "LanguageNotSupportedException",
+                    language_not_supported().message,
+                ),
+                ("LexiconNotFoundException", lexicon_not_found().message),
+                (
+                    "LexiconSizeExceededException",
+                    lexicon_size_exceeded().message,
+                ),
+                (
+                    "MarksNotSupportedForFormatException",
+                    marks_not_supported_for_format().message,
+                ),
+                (
+                    "MaxLexemeLengthExceededException",
+                    max_lexeme_length_exceeded().message,
+                ),
+                (
+                    "MaxLexiconsNumberExceededException",
+                    max_lexicons_number_exceeded().message,
+                ),
+                ("ServiceFailureException", service_failure().message),
+                (
+                    "SsmlMarksNotSupportedForTextTypeException",
+                    ssml_marks_not_supported_for_text_type().message,
+                ),
+                (
+                    "SynthesisTaskNotFoundException",
+                    synthesis_task_not_found().message,
+                ),
+                ("TextLengthExceededException", text_length_exceeded().message),
+                (
+                    "UnsupportedPlsLanguageException",
+                    unsupported_pls_language().message,
+                ),
+            ];
+            assert_eq!(
+                built.len(),
+                CANONICAL_MESSAGES.len(),
+                "every code in the table needs a constructor and the reverse"
+            );
+            for (code, message) in built {
+                let expected = CANONICAL_MESSAGES
+                    .iter()
+                    .find(|(table_code, _)| *table_code == code)
+                    .map(|(_, message)| message.map(str::to_string))
+                    .unwrap_or_else(|| panic!("code {code:?} is not in CANONICAL_MESSAGES"));
+                assert_eq!(
+                    message, expected,
+                    "code {code:?}: the constructed message must be the table's"
+                );
+            }
+        }
+
+        /// A fixed message says nothing about the request, so none of them may carry
+        /// a placeholder or an interpolation marker.
+        #[test]
+        fn no_canonical_message_is_request_shaped() {
+            for (code, message) in CANONICAL_MESSAGES {
+                let Some(message) = message else { continue };
+                assert!(
+                    !message.is_empty(),
+                    "code {code:?}: the message must not be empty"
+                );
+                for marker in ['{', '}', ':'] {
+                    assert!(
+                        !message.contains(marker),
+                        "code {code:?}: message {message:?} looks built from the request \
+                         (it contains {marker:?})"
+                    );
+                }
+            }
+        }
     }
 }

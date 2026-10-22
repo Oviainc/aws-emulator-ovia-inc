@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGlobalCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteGlobalCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation removes the stored Aurora global database cluster from this
+//! service's store, after which `DescribeGlobalClusters` no longer finds it. It is the
+//! ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteGlobalCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +138,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteGlobalCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteGlobalClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteGlobalCluster"))
+        // A global cluster is ACCOUNT-scoped, so the region the request was signed for
+        // does not scope what it can delete. It is still read, so a malformed credential
+        // scope is refused here as it is everywhere else in this service.
+        let _region =
+            crate::state::request_region(ctx).map_err(DeleteGlobalClusterError::validation)?;
+        // `CreateGlobalCluster` stores the identifier "as a lowercase string", so a
+        // delete resolves the name the same way every other lookup of it does.
+        let identifier = input.global_cluster_identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router
+        // builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+
+        // An identifier no create stored is the modelled 404 — the same answer a second
+        // delete of one global cluster gets, which is what lets a caller tell "deleted"
+        // from "never existed" at the first call.
+        let Some(record) = store.global_clusters.get(&identifier) else {
+            return Err(DeleteGlobalClusterErrorModeled::GlobalClusterNotFoundFault(
+                GlobalClusterNotFoundFault {
+                    message: Some(format!("Global cluster '{identifier}' not found")),
+                },
+            )
+            .into());
+        };
+        // "The global database can't be deleted when deletion protection is enabled"
+        // (`CreateGlobalCluster$DeletionProtection`) — a state the global cluster is in,
+        // which is the modelled `InvalidGlobalClusterStateFault` rather than a not-found.
+        if record.deletion_protection {
+            return Err(
+                DeleteGlobalClusterErrorModeled::InvalidGlobalClusterStateFault(
+                    InvalidGlobalClusterStateFault {
+                        message: Some(format!(
+                            "Global cluster {identifier} can't be deleted because deletion \
+                             protection is enabled"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A global database still holding member clusters is not deletable either: its
+        // primary and secondary clusters have to be detached first
+        // (`RemoveFromGlobalCluster`), and until they are the delete names a cluster that
+        // is in use.
+        if !record.member_cluster_arns.is_empty() {
+            return Err(
+                DeleteGlobalClusterErrorModeled::InvalidGlobalClusterStateFault(
+                    InvalidGlobalClusterStateFault {
+                        message: Some(format!(
+                            "Global cluster {identifier} can't be deleted because it still has \
+                             {} member cluster(s): detach them first",
+                            record.member_cluster_arns.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The answer reports the global cluster with the `deleting` status that says the
+        // delete was accepted. A global database that holds no member cluster has nothing
+        // provisioned to tear down, so the record leaves the store with this call rather
+        // than a span later — and every later lookup of the identifier is the modelled
+        // not-found above.
+        let deleted = record.deleting();
+        store
+            .global_clusters
+            .remove(&identifier)
+            .expect("the record was found above and the store is locked");
+
+        Ok(DeleteGlobalClusterOutput {
+            global_cluster: Some(deleted.to_wire()),
+        })
     }
 }

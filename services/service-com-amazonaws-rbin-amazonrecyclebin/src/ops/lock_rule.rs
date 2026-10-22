@@ -195,10 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // An unlock delay that has already run out leaves the rule `unlocked` whether or
-        // not anybody called, so materialise that before the guards below read the lock
+        // An unlock delay that has already run out leaves the rule `unlocked`, and a
+        // `pending` rule whose transition span has elapsed is `available`, whether or
+        // not anybody called; so materialise both before the guards below read the lock
         // state: they must decide on the state the clock has actually reached.
-        rule.settle_lock_state(now);
+        rule.settle(now);
 
         // "You can't lock tag-level retention rules, or Region-level retention rules
         // that have exclusion tags." A rule carrying resource tags is tag-level; one

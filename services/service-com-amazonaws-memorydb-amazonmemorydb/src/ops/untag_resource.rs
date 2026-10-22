@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the tags `TagKeys` names from the tags [`crate::state`] holds
+//! for the resource `ResourceArn` names, and answers with the tag set the resource is
+//! LEFT with (what the recorded service answers, where the model's own `TagList` doc
+//! says "The list of tags removed"). ATOMIC: a request naming any key the resource does
+//! not carry is the modelled `TagNotFoundFault` and removes NOTHING, so the resource
+//! never ends up half untagged; a key under AWS's reserved `aws:` prefix is not a
+//! caller's to remove at all, and a `TagKeys` list longer than the most tags a resource
+//! can carry is refused before any per-key work (the model puts no `@length` on
+//! `KeyList`, so this handler is what bounds it).
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +139,64 @@ impl From<UntagResourceErrorModeled> for UntagResourceError {
     }
 }
 
+/// This operation's answer to a `ResourceArn` that names no resource of this service.
+///
+/// The classification is [`crate::state::ComAmazonawsMemorydbAmazonmemorydbState::tag_target`]'s,
+/// shared with `ListTags` and `TagResource`; only the lift into THIS operation's error
+/// enum lives here, because each tagging operation declares its own.
+fn reject(rejection: crate::state::TagTargetRejection) -> UntagResourceError {
+    use crate::state::{ResourceKind, TagTargetRejection};
+    match rejection {
+        TagTargetRejection::InvalidArn(message) => {
+            UntagResourceErrorModeled::InvalidARNFault(InvalidARNFault {
+                message: Some(message),
+            })
+        }
+        TagTargetRejection::NotFound(kind, text) => {
+            let message = Some(text);
+            match kind {
+                ResourceKind::Cluster => {
+                    UntagResourceErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault {
+                        message,
+                    })
+                }
+                ResourceKind::Acl => {
+                    UntagResourceErrorModeled::ACLNotFoundFault(ACLNotFoundFault { message })
+                }
+                ResourceKind::User => {
+                    UntagResourceErrorModeled::UserNotFoundFault(UserNotFoundFault { message })
+                }
+                ResourceKind::ParameterGroup => {
+                    UntagResourceErrorModeled::ParameterGroupNotFoundFault(
+                        ParameterGroupNotFoundFault { message },
+                    )
+                }
+                ResourceKind::Snapshot => {
+                    UntagResourceErrorModeled::SnapshotNotFoundFault(SnapshotNotFoundFault {
+                        message,
+                    })
+                }
+                ResourceKind::SubnetGroup => {
+                    UntagResourceErrorModeled::SubnetGroupNotFoundFault(SubnetGroupNotFoundFault {
+                        message,
+                    })
+                }
+                ResourceKind::MultiRegionCluster => {
+                    UntagResourceErrorModeled::MultiRegionClusterNotFoundFault(
+                        MultiRegionClusterNotFoundFault { message },
+                    )
+                }
+                ResourceKind::MultiRegionParameterGroup => {
+                    UntagResourceErrorModeled::MultiRegionParameterGroupNotFoundFault(
+                        MultiRegionParameterGroupNotFoundFault { message },
+                    )
+                }
+            }
+        }
+    }
+    .into()
+}
+
 /// The `UntagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -175,18 +233,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than reporting a removal that never ran.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let region = crate::state::request_region(ctx);
+        // BOUND THE CALLER'S KEY LIST BEFORE ANY PER-KEY WORK. `KeyList` carries no
+        // `@length` of its own (unlike `TagList`), so the boundary validator does not
+        // cap `TagKeys`, and every loop below — and the refusal message one of them
+        // builds — would otherwise be sized by the request. A resource can never carry
+        // more than `MAX_TAGS_PER_RESOURCE` tags, so a longer list always names keys the
+        // resource does not carry and can never succeed: it is refused here rather than
+        // scanned, before the store is locked.
+        if input.tag_keys.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(UntagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(format!(
+                        "TagKeys names {} keys, more than the maximum of {} tags a resource \
+                         can carry.",
+                        input.tag_keys.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+        // A key no caller may remove is refused BEFORE anything is removed: `Tag$Key`
+        // may not be null, and a key under the reserved `aws:` prefix is AWS's own.
+        if let Some(message) = input
+            .tag_keys
+            .iter()
+            .find_map(|key| crate::state::tag_key_rejection(key))
+        {
+            return Err(UntagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // The service's own default resources are not a caller's to untag either.
+        if let Some(message) = crate::state::default_resource_rejection(&input.resource_arn) {
+            return Err(UntagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        let mut state = state.lock();
+        state.settle(std::time::Instant::now());
+        state.ensure_builtin_users(&region);
+
+        let resource_arn = state.tag_target(&input.resource_arn).map_err(reject)?;
+        let mut remaining = state.tags.get(&resource_arn).cloned().unwrap_or_default();
+        // EVERY key is resolved against the resource's tags BEFORE any is removed, so a
+        // request naming one tag the resource does not carry removes none of the others:
+        // the caller retries the whole request rather than discovering which half ran.
+        // The refusal NAMES the keys that are missing, in the order the request listed
+        // them, so one round trip tells the caller what to fix. Both the scan and the
+        // message are bounded: the key list is capped above, duplicates are recognised
+        // through a set rather than a rescan of `missing`, and the message names at most
+        // `MESSAGE_KEYS` of them.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        /// How many missing keys the refusal spells out before it falls back to a count,
+        /// so one message cannot grow with the whole key list.
+        const MESSAGE_KEYS: usize = 10;
+        let mut missing: Vec<&str> = Vec::new();
+        let mut reported: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for key in &input.tag_keys {
+            if !remaining.contains_key(key.as_str()) && reported.insert(key.as_str()) {
+                missing.push(key.as_str());
+            }
+        }
+        if !missing.is_empty() {
+            let named = missing
+                .iter()
+                .take(MESSAGE_KEYS)
+                .copied()
+                .collect::<Vec<&str>>()
+                .join(",");
+            let message = match missing.len().checked_sub(MESSAGE_KEYS) {
+                Some(0) | None => {
+                    format!("Failing request. These tags are not present : {named}")
+                }
+                Some(unnamed) => format!(
+                    "Failing request. These tags are not present : {named} and {unnamed} more"
+                ),
+            };
+            return Err(UntagResourceErrorModeled::TagNotFoundFault(TagNotFoundFault {
+                message: Some(message),
+            })
+            .into());
+        }
+        // A key named twice removes one tag: the second `remove` finds nothing.
+        for key in &input.tag_keys {
+            remaining.remove(key);
+        }
+        state.set_tags(&resource_arn, remaining);
+        // The resource's tag set AFTER the removal, read back from the store.
+        //
+        // The model DOCUMENTS `UntagResourceResponse$TagList` as "The list of tags
+        // removed", but the recorded service answers the tags the resource is LEFT
+        // with — the same thing `TagResource` and `ListTags` answer, which is also what
+        // the shared `TagList` doc ("A list of tags as key-value pairs") says. The
+        // recorded behaviour is what a client sees, so it is what this reports.
+        Ok(UntagResourceOutput {
+            tag_list: Some(state.tag_list(&resource_arn)),
+        })
     }
 }

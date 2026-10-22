@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPipelineState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPipelineState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPipelineState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored pipeline's state: its name, the stored version, the instants
+//! the store holds for it, and one `StageState` per stage of the stored declaration
+//! — in declaration order, each carrying the stage's action names and the inbound
+//! transition state the transition calls persisted.
+//!
+//! Reporting only: the answer is computed from the store and nothing is written, so
+//! two consecutive calls on an untouched store answer the same thing.
+//!
+//! The members the stage- and action-execution plane owns (`latestExecution`,
+//! `inboundExecution(s)`, an action's `currentRevision` / `latestExecution`, the
+//! condition states) stay ABSENT: this slice runs no such plane, so there is no
+//! outcome to report for them and inventing one would claim work nothing ran. The
+//! issue `issues/things-that-do-not-work/20261022T173520Z-codepipeline-getpipelinestate-stub.md`
+//! owns filling them in once that plane exists.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +155,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPipelineState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPipelineStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPipelineState"))
+        let _ = ctx;
+        let state = crate::state::require_state(&*self.engine)?;
+        let state = state.lock();
+
+        let pipeline = state.pipelines.get(&input.name).ok_or_else(|| {
+            GetPipelineStateError::from(
+                GetPipelineStateErrorModeled::PipelineNotFoundException(
+                    PipelineNotFoundException {
+                        message: Some(format!("pipeline {} does not exist", input.name)),
+                    },
+                ),
+            )
+        })?;
+
+        Ok(GetPipelineStateOutput {
+            pipeline_name: Some(pipeline.declaration.name.clone()),
+            pipeline_version: Some(pipeline.version),
+            stage_states: Some(pipeline.stage_states()),
+            created: Some(crate::state::to_date_time(pipeline.created)),
+            updated: Some(crate::state::to_date_time(pipeline.updated)),
+        })
     }
 }

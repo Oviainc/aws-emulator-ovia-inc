@@ -15,6 +15,8 @@
 mod control_plane_rules;
 #[path = "all/emulator.rs"]
 mod emulator;
+#[path = "all/refusal_messages.rs"]
+mod refusal_messages;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/scalable_target_lifecycle.rs"]

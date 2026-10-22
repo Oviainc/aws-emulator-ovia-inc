@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             check_tag_count, check_tag_key, check_tag_keys_unreserved, check_tag_value,
-            unknown_resource_arn_message, MAX_TAGS_PER_RESOURCE,
+            MAX_TAGS_PER_RESOURCE, SCALABLE_TARGET_NOT_FOUND_MESSAGE,
         };
 
         // Input validation first, so a request no resource could accept is refused the
@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // addressed to it resolves to nothing — the same refusal as an ARN that names no
         // registered target, rather than a server error this operation does not model.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(validation(unknown_resource_arn_message(&input.resource_arn)));
+            return Err(validation(SCALABLE_TARGET_NOT_FOUND_MESSAGE));
         };
         let mut state = state.lock();
 
@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // target is a 400 `ValidationException`, not the 404 `ResourceNotFoundException`.
         let resolved = state.arn_index.get(&input.resource_arn).cloned();
         let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
-            return Err(validation(unknown_resource_arn_message(&input.resource_arn)));
+            return Err(validation(SCALABLE_TARGET_NOT_FOUND_MESSAGE));
         };
 
         // The merge is computed before anything is stored: "To add a tag, specify a new

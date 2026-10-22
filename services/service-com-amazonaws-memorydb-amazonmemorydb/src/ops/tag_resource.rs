@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: MERGES the request's tags into the tags [`crate::state`] holds for the
+//! resource `ResourceArn` names — a new key is added, an existing key takes the new
+//! value, and an untouched key is left alone — then answers with that resource's whole
+//! tag set. ATOMIC: a request that cannot be honoured in full (an ARN naming nothing,
+//! a tag key that is null or under AWS's reserved `aws:` prefix, or a merge past the
+//! per-resource tag quota) changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +139,62 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
+/// This operation's answer to a `ResourceArn` that names no resource of this service.
+///
+/// The classification is [`crate::state::ComAmazonawsMemorydbAmazonmemorydbState::tag_target`]'s,
+/// shared with `ListTags` and `UntagResource`; only the lift into THIS operation's
+/// error enum lives here, because each tagging operation declares its own.
+fn reject(rejection: crate::state::TagTargetRejection) -> TagResourceError {
+    use crate::state::{ResourceKind, TagTargetRejection};
+    match rejection {
+        TagTargetRejection::InvalidArn(message) => {
+            TagResourceErrorModeled::InvalidARNFault(InvalidARNFault {
+                message: Some(message),
+            })
+        }
+        TagTargetRejection::NotFound(kind, text) => {
+            let message = Some(text);
+            match kind {
+                ResourceKind::Cluster => {
+                    TagResourceErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault { message })
+                }
+                ResourceKind::Acl => {
+                    TagResourceErrorModeled::ACLNotFoundFault(ACLNotFoundFault { message })
+                }
+                ResourceKind::User => {
+                    TagResourceErrorModeled::UserNotFoundFault(UserNotFoundFault { message })
+                }
+                ResourceKind::ParameterGroup => {
+                    TagResourceErrorModeled::ParameterGroupNotFoundFault(
+                        ParameterGroupNotFoundFault { message },
+                    )
+                }
+                ResourceKind::Snapshot => {
+                    TagResourceErrorModeled::SnapshotNotFoundFault(SnapshotNotFoundFault {
+                        message,
+                    })
+                }
+                ResourceKind::SubnetGroup => {
+                    TagResourceErrorModeled::SubnetGroupNotFoundFault(SubnetGroupNotFoundFault {
+                        message,
+                    })
+                }
+                ResourceKind::MultiRegionCluster => {
+                    TagResourceErrorModeled::MultiRegionClusterNotFoundFault(
+                        MultiRegionClusterNotFoundFault { message },
+                    )
+                }
+                ResourceKind::MultiRegionParameterGroup => {
+                    TagResourceErrorModeled::MultiRegionParameterGroupNotFoundFault(
+                        MultiRegionParameterGroupNotFoundFault { message },
+                    )
+                }
+            }
+        }
+    }
+    .into()
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -178,18 +231,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than reporting tags it never wrote.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        // A caller's tag keys are refused BEFORE anything is written, so the resource
+        // keeps the tags it had: `Tag$Key` may not be null, and the `aws:` prefix is
+        // reserved for AWS.
+        if let Some(message) = crate::state::tags_rejection(Some(&input.tags)) {
+            return Err(TagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        let requested = crate::state::tag_map(Some(&input.tags));
+        // The service's own default resources are not a caller's to tag.
+        if let Some(message) = crate::state::default_resource_rejection(&input.resource_arn) {
+            return Err(TagResourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        state.settle(std::time::Instant::now());
+        state.ensure_builtin_users(&region);
+
+        let resource_arn = state.tag_target(&input.resource_arn).map_err(reject)?;
+        // MERGE, not replace: the resource keeps every key this request does not name,
+        // and a key it does name takes the new value.
+        let mut merged = state.tags.get(&resource_arn).cloned().unwrap_or_default();
+        merged.extend(requested);
+        // The quota is checked on the MERGED set, before it is stored: re-tagging a key
+        // the resource already has adds no tag, so only a merge that really would push
+        // the resource past the quota is refused — and refusing it leaves the stored
+        // tags untouched.
+        if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::TagQuotaPerResourceExceeded(
+                TagQuotaPerResourceExceeded {
+                    message: Some(format!(
+                        "Adding these tags would give {resource_arn} {} tags, more than the \
+                         maximum of {} tags per resource.",
+                        merged.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+        state.set_tags(&resource_arn, merged);
+        // `TagResourceResponse$TagList`: "A list of tags as key-value pairs" — the
+        // resource's whole tag set after the merge, read back from the store.
+        Ok(TagResourceOutput {
+            tag_list: Some(state.tag_list(&resource_arn)),
+        })
     }
 }

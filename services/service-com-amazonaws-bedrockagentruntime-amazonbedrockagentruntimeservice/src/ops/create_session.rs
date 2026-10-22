@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a session, persists it in [`crate::state`], and reads the
+//! response back out of the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +172,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSession"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the session store is unavailable".to_string()),
+                    reason: None,
+                },
+            )
+            .into());
+        };
+
+        // The model gives CreateSession no idempotency token, so every call mints a
+        // new session: a fresh UUID, and the ARN built from it with the canonical
+        // emulator account and the region the caller signed for.
+        let session_id = crate::state::new_uuid();
+        let session_arn = ::engine::emulator_arn(
+            crate::state::ARN_NAMESPACE,
+            &crate::state::request_region(ctx),
+            &format!("session/{session_id}"),
+        );
+        let created_at = crate::state::now();
+
+        let mut guard = state.lock();
+        if guard.sessions.len() >= crate::state::MAX_SESSIONS {
+            // Resource guard, not an AWS quota: see `state::MAX_SESSIONS`. The store
+            // has no TTL and is released only by DeleteSession, so this is where
+            // unbounded growth is refused rather than allocated.
+            return Err(CreateSessionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "This emulator holds at most {} sessions at once. Delete a session before creating another.",
+                        crate::state::MAX_SESSIONS
+                    )),
+                },
+            )
+            .into());
+        }
+        let order = crate::state::next_order(&mut guard.order_counter);
+        let record = crate::state::Session {
+            session_id: session_id.clone(),
+            session_arn,
+            status: crate::state::SessionStatus::Active,
+            created_at,
+            last_updated_at: created_at,
+            // Stored exactly as supplied: an absent member stays absent, and a
+            // supplied empty map stays a stored empty map, so GetSession can tell the
+            // two apart.
+            session_metadata: input
+                .session_metadata
+                .map(|metadata| metadata.into_iter().collect()),
+            encryption_key_arn: input.encryption_key_arn,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            invocations: ::std::collections::BTreeMap::new(),
+            order,
+        };
+        // The response is the record being persisted, field for field, so nothing can
+        // be answered that did not reach the store. `session_id` was just minted, so
+        // the insert is always a fresh entry.
+        let out = CreateSessionOutput {
+            session_id: record.session_id.clone(),
+            session_arn: record.session_arn.clone(),
+            session_status: record.status.as_wire().to_string(),
+            created_at: record.created_at,
+        };
+        guard.sessions.insert(session_id, record);
+        Ok(out)
     }
 }

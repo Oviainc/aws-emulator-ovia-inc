@@ -22,14 +22,14 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Encodes a list operation's `nextToken`, so the opaque token is URL-safe whatever
-# the key it names contains.
+# the key it names contains, and renders the bytes of a minted `StatementId`.
 hex = { workspace = true }
+# Digests the entropy behind the uuid-shaped `StatementId` PutApplicationPolicy mints
+# for a statement the request did not name one for (`state::new_statement_id`).
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMarketplaceRevenueShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMarketplaceRevenueShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMarketplaceRevenueShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a marketplace revenue share into [`crate::state`] at
+//! revision 1 and answers with the record it stored, so the following
+//! `GetMarketplaceRevenueShare` answers the same values.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +166,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMarketplaceRevenueShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMarketplaceRevenueShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMarketplaceRevenueShare"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateMarketplaceRevenueShareErrorModeled::InternalServerException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // `CatalogName` is an enum SHAPE: the boundary validator does not check
+        // its membership, and the deserializer materializes an absent member as
+        // the empty string, so both cases are the handler's to refuse.
+        let catalog = crate::state::parse_catalog(&input.catalog).map_err(validation)?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // The `@idempotent` replay: the same `ClientToken` answers with the share
+        // it already minted, and only when this request asks for the same share —
+        // a token reused with different parameters is a conflict.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some((minted_catalog, minted_product)) =
+                state.share_idempotency.get(token).cloned()
+            {
+                if let Some(share) = state.share(minted_catalog, &minted_product) {
+                    if share.matches_create(catalog, &input.product_id, input.tags.as_ref()) {
+                        let answer = output(share);
+                        crate::state::audit(
+                            ctx.parts(),
+                            Self::NAME,
+                            &answer.arn,
+                            "replayed: no change",
+                        );
+                        return Ok(answer);
+                    }
+                    return Err(CreateMarketplaceRevenueShareErrorModeled::ConflictException(
+                        crate::state::client_token_conflict(),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // A `(Catalog, ProductId)` pair identifies the resource, so a second
+        // create for one the catalog already holds is a conflict rather than an
+        // overwrite.
+        if state.share(catalog, &input.product_id).is_some() {
+            return Err(CreateMarketplaceRevenueShareErrorModeled::ConflictException(
+                crate::state::already_exists(catalog, &input.product_id),
+            )
+            .into());
+        }
+
+        if state.marketplace_revenue_shares.len() >= crate::state::MAX_REVENUE_SHARES {
+            return Err(
+                CreateMarketplaceRevenueShareErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        crate::state::MARKETPLACE_REVENUE_SHARE_RESOURCE,
+                        crate::state::MAX_REVENUE_SHARES,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let share = crate::state::MarketplaceRevenueShare {
+            arn: crate::state::share_arn(&region, catalog, &input.product_id),
+            product_id: input.product_id.clone(),
+            catalog,
+            product_code: crate::state::product_code(&input.product_id),
+            created_date: now,
+            // A share is created ready: revision 1 is written by this call, and
+            // every later revision by an allocation write.
+            revision: 1,
+            revision_dates: vec![now],
+            tags: input.tags.clone().unwrap_or_default(),
+            allocations: ::std::collections::BTreeMap::new(),
+        };
+
+        let key = (catalog, input.product_id.clone());
+        // Only a token the CALLER sent is recorded: an absent
+        // `@idempotencyToken` member means this create has no idempotency key,
+        // so there is nothing a later request could replay.
+        if let Some(token) = input.client_token.clone() {
+            state.share_idempotency.insert(token, key.clone());
+        }
+        state.marketplace_revenue_shares.insert(key, share);
+        // Read the stored record back, so the response is the state rather than
+        // the values that went into it.
+        let stored = state.share(catalog, &input.product_id).ok_or_else(|| {
+            CreateMarketplaceRevenueShareError::from(
+                CreateMarketplaceRevenueShareErrorModeled::InternalServerException(
+                    crate::state::state_unavailable(),
+                ),
+            )
+        })?;
+        let answer = output(stored);
+        crate::state::audit(ctx.parts(), Self::NAME, &answer.arn, "created");
+        Ok(answer)
+    }
+}
+
+/// Lift a modelled `ValidationException` into this operation's error channel.
+fn validation(error: ValidationException) -> CreateMarketplaceRevenueShareError {
+    CreateMarketplaceRevenueShareErrorModeled::ValidationException(error).into()
+}
+
+/// This operation's output for a stored share — every member read off the
+/// record, so a create answers exactly what the following get answers.
+fn output(share: &crate::state::MarketplaceRevenueShare) -> CreateMarketplaceRevenueShareOutput {
+    CreateMarketplaceRevenueShareOutput {
+        product_id: share.product_id.clone(),
+        arn: share.arn.clone(),
+        catalog: Some(share.catalog.as_wire().to_string()),
+        product_code: Some(share.product_code.clone()),
+        // Absent: see the note on `ProductName` in `crate::state`.
+        product_name: None,
+        created_date: Some(crate::state::wire_timestamp(share.created_date)),
+        last_modified_date: Some(crate::state::wire_timestamp(share.last_modified_date())),
+        revision: Some(share.revision),
     }
 }
