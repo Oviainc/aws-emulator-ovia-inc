@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListQueues
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListQueues`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListQueues::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation answers with the urls of the queues actually held in
+//! [`crate::state`], prefix-filtered and paginated. It is the ONLY file to touch for
+//! `ListQueues`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListQueues` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListQueuesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListQueues"))
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListQueuesErrorModeled::UnsupportedOperation(crate::state::store_unavailable())
+        })?;
+        let state = store.lock();
+
+        let prefix = input.queue_name_prefix.unwrap_or_default();
+        // `queues` is name-ordered, so a page boundary means the same thing on the
+        // next call.
+        let names: Vec<&String> = state
+            .queues
+            .keys()
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+
+        // `NextToken` is this listing's own cursor: the count of entries already
+        // returned. A token that is not such a count — unparseable, or past the end of
+        // the listing it claims to continue — is refused rather than silently treated as
+        // "start again", which would loop a paging client forever.
+        let start: usize = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match token.parse() {
+                Ok(start) if start <= names.len() => start,
+                _ => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "NextToken {token:?} was not issued by this listing."
+                    )))
+                }
+            },
+        };
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .filter(|max| *max > 0)
+            // A request that names no page size still cannot make one answer grow with
+            // the stored queue count; the caller walks the rest with `NextToken`.
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE);
+
+        let page: Vec<String> = names
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .filter_map(|name| state.queues.get(*name).map(|queue| queue.url.clone()))
+            .collect();
+        let next = start + page.len();
+        let next_token = (next < names.len()).then(|| next.to_string());
+
+        Ok(ListQueuesOutput {
+            queue_urls: (!page.is_empty()).then_some(page),
+            next_token,
+        })
     }
 }

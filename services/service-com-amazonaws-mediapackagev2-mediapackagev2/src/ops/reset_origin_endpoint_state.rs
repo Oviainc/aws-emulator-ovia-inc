@@ -195,13 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
             return Err(
                 ResetOriginEndpointStateErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Channel group {} not found",
-                            input.channel_group_name
-                        )),
-                        resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
-                    },
+                    crate::state::ResourceKind::ChannelGroup.not_found(),
                 )
                 .into(),
             );
@@ -209,13 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(channel) = group.channels.get_mut(&input.channel_name) else {
             return Err(
                 ResetOriginEndpointStateErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Channel {} not found in channel group {}",
-                            input.channel_name, input.channel_group_name
-                        )),
-                        resource_type_not_found: Some("CHANNEL".to_string()),
-                    },
+                    crate::state::ResourceKind::Channel.not_found(),
                 )
                 .into(),
             );
@@ -223,15 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(endpoint) = channel.origin_endpoints.get_mut(&input.origin_endpoint_name) else {
             return Err(
                 ResetOriginEndpointStateErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Origin endpoint {} not found on channel {} in channel group {}",
-                            input.origin_endpoint_name,
-                            input.channel_name,
-                            input.channel_group_name
-                        )),
-                        resource_type_not_found: Some("ORIGIN_ENDPOINT".to_string()),
-                    },
+                    crate::state::ResourceKind::OriginEndpoint.not_found(),
                 )
                 .into(),
             );

@@ -147,13 +147,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
-        let mut names: Vec<String> = store.tables.keys().cloned().collect();
+        // Table names are per-region, so a ListTables answers with the names this
+        // request's own region holds.
+        let mut names: Vec<String> = store.table_names_in(&region);
         names.sort();
 
         // "The first table name that this operation will evaluate" is the one AFTER

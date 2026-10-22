@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
@@ -178,11 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.apply_due_transitions(now);
         let table = store
-            .tables
-            .get_mut(&name)
-            .ok_or_else(|| lift(crate::state::RequestError::NotFound(format!(
-                "Requested resource not found: Table: {name} not found"
-            ))))?;
+            .table_mut(&region, &name)
+            .map_err(lift)?;
 
         match table.status(now) {
             crate::state::TableStatus::Creating => {
@@ -191,6 +188,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(format!(
                             "Attempt to change a resource which is still in use: Table is being \
                              created: {name}"
+                        )),
+                    },
+                )
+                .into())
+            }
+            crate::state::TableStatus::Updating => {
+                // "You tried to update a resource that was already being updated"
+                // (`ResourceInUseException`): a table with an UpdateTable still in
+                // flight cannot be deleted until that update finishes.
+                return Err(DeleteTableErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "Attempt to change a resource which is still in use: Table is being \
+                             updated: {name}"
                         )),
                     },
                 )

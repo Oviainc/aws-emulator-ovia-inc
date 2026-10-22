@@ -171,8 +171,8 @@ async fn a_created_queue_reports_its_url_arn_supplied_attributes_and_documented_
         }
 
         // Every attribute the record derives is reported; the three that count
-        // messages are reported by no value at all, because this crate has no
-        // message plane for them to count.
+        // messages are reported too, as the counts over the queue's own message deque,
+        // and a freshly created queue holds nothing.
         for derived in DERIVED_ATTRIBUTES {
             assert!(
                 reported.contains_key(*derived),
@@ -181,9 +181,10 @@ async fn a_created_queue_reports_its_url_arn_supplied_attributes_and_documented_
             );
         }
         for counter in MESSAGE_PLANE_ATTRIBUTES {
-            assert!(
-                !reported.contains_key(*counter),
-                "case {}: {counter} counts messages this crate cannot hold, so it must carry no value, got {reported:?}",
+            assert_eq!(
+                reported.get(*counter).map(String::as_str),
+                Some("0"),
+                "case {}: {counter} must count the queue's messages, and a new queue holds none, got {reported:?}",
                 row.case
             );
         }

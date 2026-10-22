@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartTelemetryEvaluationForOrganization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartTelemetryEvaluationForOrganization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartTelemetryEvaluationForOrganization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What it does
+//!
+//! The organization-scoped twin of `StartTelemetryEvaluation`, and it MUTATES for
+//! the same reason: onboarding the organization to the telemetry-config feature is
+//! what the call is for. It records the onboarding of the region the request was
+//! signed for plus every spoke region its `Regions`/`AllRegions` scope names, under
+//! the organization scope ([`crate::state::EvaluationScope::Organization`]) — a
+//! separate record from the caller's own account feature, so onboarding the
+//! organization does not report the account as onboarded or the other way round.
+//! `GetTelemetryEvaluationStatusForOrganization` reports `STARTING` until the
+//! onboarding comes due and `RUNNING` from then on.
+//!
+//! The one unmodellable rule is refused with the modelled `ValidationException`:
+//! `Regions` and `AllRegions` are mutually exclusive, and every named region must
+//! belong to the home region's partition. The current region named in `Regions` is
+//! not refused — it is always implicitly included, so it is simply not a spoke of
+//! its own configuration.
+//!
+//! Authorization is deliberately out of scope for this emulator: the framework
+//! verifies every request signature, but no IAM principal is evaluated — nor is the
+//! management-account restriction the organization surface documents, since this
+//! emulator has one account — so the modelled `AccessDeniedException` is never
+//! answered. The modelled `TooManyRequestsException` is answered for one reason only:
+//! the emulator's own finite feature store
+//! ([`crate::state::MAX_TELEMETRY_FEATURE_REGIONS`]).
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +195,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartTelemetryEvaluationForOrganization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartTelemetryEvaluationForOrganizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartTelemetryEvaluationForOrganization"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartTelemetryEvaluationForOrganizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the telemetry evaluation store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_epoch_millis();
+        let all_regions = input.all_regions == Some(true);
+        let named = input.regions.as_deref().unwrap_or_default();
+
+        if let Some(why) = crate::state::multi_region_rejection("", all_regions, named, &region) {
+            return Err(
+                StartTelemetryEvaluationForOrganizationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(why),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let spoke_regions = crate::state::multi_region_targets(all_regions, named, &region);
+        if !state.lock().start_telemetry_evaluation(
+            crate::state::EvaluationScope::Organization,
+            &region,
+            spoke_regions,
+            now,
+        ) {
+            // The feature store is finite ([`crate::state::MAX_TELEMETRY_FEATURE_REGIONS`]):
+            // an onboarding past its cap is refused before a record is allocated,
+            // with the modelled retryable error (this operation models no quota one).
+            return Err(
+                StartTelemetryEvaluationForOrganizationErrorModeled::TooManyRequestsException(
+                    TooManyRequestsException {
+                        message: Some(format!(
+                            "this emulator holds the telemetry-config feature of at most {} \
+                             regions",
+                            crate::state::MAX_TELEMETRY_FEATURE_REGIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        Ok(StartTelemetryEvaluationForOrganizationOutput)
     }
 }

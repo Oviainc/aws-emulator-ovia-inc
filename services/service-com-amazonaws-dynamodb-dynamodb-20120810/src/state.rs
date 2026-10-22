@@ -14,8 +14,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AttributeDefinition, AttributeValue, BillingModeSummary, Capacity, ConsumedCapacity,
-    KeySchemaElement, ProvisionedThroughput, ProvisionedThroughputDescription, Tag,
-    TableClassSummary, TableDescription,
+    GlobalSecondaryIndexDescription, KeySchemaElement, Projection, ProvisionedThroughput,
+    ProvisionedThroughputDescription, Tag, TableClassSummary, TableDescription,
 };
 
 /// A DynamoDB item: the attribute-name -> attribute-value map a client put.
@@ -46,10 +46,48 @@ pub const MAX_ITEM_SIZE_BYTES: i64 = 400 * 1024;
 /// depth.
 pub const MAX_ATTRIBUTE_DEPTH: usize = 32;
 
-/// The most tables this emulator will hold: "There is a soft account quota of 2,500
-/// tables" (the `LimitExceededException` doc). Reaching it answers that modelled
-/// error instead of growing without end.
+/// The most tables this emulator will hold IN ONE REGION: "There is a soft account
+/// quota of 2,500 tables" (the `LimitExceededException` doc), a quota AWS applies per
+/// account and region. Reaching it answers that modelled error instead of growing
+/// without end.
 pub const MAX_TABLES: usize = 2500;
+
+/// How many distinct regions this store keeps tables for.
+///
+/// [`MAX_TABLES`] alone would not bound the store: the region keying it is the
+/// request's own SigV4 credential-scope region, which this emulator does not
+/// authenticate, so without this cap a caller could open a fresh per-region bucket per
+/// request. With it the store holds at most `MAX_REGIONS` buckets, and so at most
+/// `MAX_REGIONS * MAX_TABLES` tables in total. AWS operates on the order of 36
+/// commercial regions, so this bound is this emulator's and is comfortably above the
+/// real surface; reaching it answers the same modelled `LimitExceededException` AWS
+/// answers when a create would exceed an allowance.
+pub const MAX_REGIONS: usize = 64;
+
+/// The most global secondary indexes one table may carry: "One or more global
+/// secondary indexes (the maximum is 20) to be created on the table" (the
+/// `CreateTable$GlobalSecondaryIndexes` doc).
+pub const MAX_GLOBAL_SECONDARY_INDEXES: usize = 20;
+
+/// The most `HASH` and the most `RANGE` elements one global secondary index's key
+/// schema may carry: "Each global secondary index supports up to 4 partition keys and
+/// up to 4 sort keys" (`CreateTable$GlobalSecondaryIndexes`).
+pub const MAX_INDEX_PARTITION_KEYS: usize = 4;
+pub const MAX_INDEX_SORT_KEYS: usize = 4;
+
+/// The most key elements one index's key schema may carry, from the two counts above.
+pub const MAX_INDEX_KEY_ELEMENTS: usize = MAX_INDEX_PARTITION_KEYS + MAX_INDEX_SORT_KEYS;
+
+/// The most attribute definitions one table may declare.
+///
+/// "The attributes in KeySchema must also be defined in the AttributeDefinitions
+/// array", and a definition no key schema uses is refused, so a table's definitions can
+/// never outnumber the key attributes of its own key schema (one `HASH` and at most one
+/// `RANGE`) plus those of its indexes. A request declaring more than that is already
+/// invalid, and clamping it up front is what bounds the work matching definitions
+/// against key schemas: both counts come from the request body.
+pub const MAX_ATTRIBUTE_DEFINITIONS: usize =
+    2 + MAX_GLOBAL_SECONDARY_INDEXES * MAX_INDEX_KEY_ELEMENTS;
 
 /// What one table, and the whole store, may hold in items.
 ///
@@ -72,6 +110,24 @@ pub const MAX_STORE_SIZE_BYTES: i64 = 64 * 1024 * 1024;
 const MAX_SIGNIFICANT_DIGITS: usize = 38;
 const MIN_POINT: i32 = -129;
 const MAX_POINT: i32 = 126;
+
+/// The most DIGITS one `N` value's text may carry, before normalisation strips its
+/// leading and trailing zeros. This is the EMULATOR's own input-size limit, not an AWS
+/// quota: AWS bounds the significant digits and the exponent (above) and normalises the
+/// zeros away, so it accepts a text this refuses.
+///
+/// The quota above bounds the SIGNIFICANT digits and the exponent, not the text: a run
+/// of zeros normalises to the value zero however long it is, so without this bound a
+/// caller could store an arbitrarily long numeric text whose accounted size
+/// ([`attribute_value_size`], which sizes a number from its significant digits) is one
+/// byte — growing what the process retains without moving the budgets measured against
+/// it. A text with more digits than 38 significant ones plus the whole exponent span
+/// denotes no value inside the documented range that a shorter text does not also
+/// denote, so refusing it costs a caller nothing it could not spell another way; the
+/// refusal is the `ValidationException` every caller of [`NumberKey::parse`] renders,
+/// and its message names this limit.
+const MAX_NUMBER_TEXT_DIGITS: usize =
+    MAX_SIGNIFICANT_DIGITS + (MAX_POINT - MIN_POINT) as usize;
 
 /// One write capacity unit covers a write of up to 1 KB (DynamoDB Developer Guide,
 /// "Read/write capacity mode").
@@ -108,6 +164,7 @@ impl RequestError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableStatus {
     Creating,
+    Updating,
     Active,
     Deleting,
 }
@@ -117,8 +174,45 @@ impl TableStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Creating => "CREATING",
+            Self::Updating => "UPDATING",
             Self::Active => "ACTIVE",
             Self::Deleting => "DELETING",
+        }
+    }
+
+    /// Whether an item operation may run against a table in this status.
+    ///
+    /// "You can perform read and write operations only on an ACTIVE table" (the
+    /// `CreateTable` doc) rules out `CREATING` and `DELETING`; an `UpdateTable` in
+    /// flight only rules out another table-level change ("While it's UPDATING, you
+    /// can't issue another UpdateTable request" — the `UpdateTable` doc), so a table
+    /// being updated keeps serving its items.
+    pub fn serves_items(self) -> bool {
+        matches!(self, Self::Active | Self::Updating)
+    }
+}
+
+/// A secondary index's lifecycle status, as the model's `IndexStatus` enum names it.
+///
+/// `CREATING`, `UPDATING` and `DELETING` are the transient statuses the
+/// `GlobalSecondaryIndexDescription$IndexStatus` doc lists ("CREATING - The index is
+/// being created. UPDATING - The index is being updated. DELETING - The index is being
+/// deleted. ACTIVE - The index is ready for use"); which transient status an index is
+/// in is recorded on it, and the move to `ACTIVE` is owed by the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexStatus {
+    Creating,
+    Updating,
+    Active,
+}
+
+impl IndexStatus {
+    /// The wire value, one of the model's `IndexStatus` enum values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Updating => "UPDATING",
+            Self::Active => "ACTIVE",
         }
     }
 }
@@ -185,6 +279,13 @@ impl NumberKey {
             return None;
         }
         if !integral.bytes().chain(fractional.bytes()).all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // The TEXT is bounded before anything is normalised: the digits a longer one
+        // carries cannot change which documented value it denotes, and the parsed
+        // value's accounted size is computed from its significant digits, not its
+        // text. Both terms come from the request.
+        if integral.len().saturating_add(fractional.len()) > MAX_NUMBER_TEXT_DIGITS {
             return None;
         }
         let mut digits: Vec<u8> = integral
@@ -261,22 +362,188 @@ impl PartialOrd for NumberKey {
     }
 }
 
+/// One stored global secondary index: its configuration, its lifecycle instants and
+/// the throughput a later `UpdateTable` can move.
+///
+/// An index holds no items of its own — "attributes that are copied (projected) from
+/// the table into the global secondary index" (the `GlobalSecondaryIndex$Projection`
+/// doc) — so `ItemCount` and `IndexSizeBytes` are DERIVED from the table's items here
+/// rather than stored and bumped.
+#[derive(Debug, Clone)]
+pub struct GlobalSecondaryIndex {
+    pub name: String,
+    pub arn: String,
+    pub key_schema: Vec<KeySchemaElement>,
+    pub projection: Projection,
+    pub provisioned_throughput: Option<ProvisionedThroughput>,
+    /// The transient status this index is in until [`Self::active_at`] falls due.
+    pub transient_status: IndexStatus,
+    /// When the clock owes this index its transient -> `ACTIVE` transition.
+    pub active_at: SystemTime,
+    /// When the last throughput increase and decrease were applied, and how many
+    /// decreases have been applied today, as `ProvisionedThroughputDescription`
+    /// reports them.
+    pub throughput_history: ThroughputHistory,
+}
+
+impl GlobalSecondaryIndex {
+    /// The status at `now`, derived from the stored instants.
+    pub fn status(&self, now: SystemTime) -> IndexStatus {
+        if now >= self.active_at {
+            IndexStatus::Active
+        } else {
+            self.transient_status
+        }
+    }
+
+    /// Whether `item` is projected into this index: an item reaches a global secondary
+    /// index only when it carries every attribute of the index's key schema ("Not all
+    /// items will qualify: For example, a partition key cannot have any duplicate
+    /// values" — the `Backfilling` doc).
+    fn covers(&self, item: &Item) -> bool {
+        self.key_schema
+            .iter()
+            .all(|element| item.contains_key(&element.attribute_name))
+    }
+
+    /// The bytes this index stores for one covered item: the attributes the index
+    /// projects, which are the index and table key attributes plus whatever
+    /// `Projection` adds.
+    fn projected_size(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> i64 {
+        let projection_type = self.projection.projection_type.as_deref().unwrap_or("ALL");
+        if projection_type == "ALL" {
+            return item_size(item);
+        }
+        let non_key = self
+            .projection
+            .non_key_attributes
+            .as_deref()
+            .unwrap_or_default();
+        let projected: Item = item
+            .iter()
+            .filter(|(name, _)| {
+                self.key_schema
+                    .iter()
+                    .chain(table_key_schema)
+                    .any(|element| &element.attribute_name == *name)
+                    || (projection_type == "INCLUDE" && non_key.iter().any(|kept| kept == *name))
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        item_size(&projected)
+    }
+}
+
+/// What a `ProvisionedThroughputDescription` reports about past capacity changes: the
+/// instants of the last increase and decrease, and the number of decreases applied in
+/// the current UTC day ("The number of provisioned throughput decreases for this table
+/// during this UTC calendar day").
+///
+/// The day's count is held as ONE `(day, count)` pair rather than a list of instants,
+/// so recording a decrease is O(1) and the record cannot grow with the number of
+/// decreases a caller makes: a decrease on a later day replaces the pair instead of
+/// appending to it.
+#[derive(Debug, Clone, Default)]
+pub struct ThroughputHistory {
+    pub last_increase: Option<SystemTime>,
+    pub last_decrease: Option<SystemTime>,
+    /// The UTC day the count below belongs to, and how many decreases were applied on
+    /// it. A read on a later day reports zero without anything having had to run at
+    /// midnight.
+    decreases_day: i64,
+    decreases_on_day: i64,
+}
+
+impl ThroughputHistory {
+    /// Record a move from `before` to `after` at `now`.
+    pub fn record(
+        &mut self,
+        now: SystemTime,
+        before: &ProvisionedThroughput,
+        after: &ProvisionedThroughput,
+    ) {
+        // A single call can raise one dimension and lower the other, so both sides are
+        // tested rather than one being the negation of the other.
+        if after.read_capacity_units > before.read_capacity_units
+            || after.write_capacity_units > before.write_capacity_units
+        {
+            self.last_increase = Some(now);
+        }
+        if after.read_capacity_units < before.read_capacity_units
+            || after.write_capacity_units < before.write_capacity_units
+        {
+            self.last_decrease = Some(now);
+            let day = utc_day(now);
+            if self.decreases_day == day {
+                self.decreases_on_day = self.decreases_on_day.saturating_add(1);
+            } else {
+                self.decreases_day = day;
+                self.decreases_on_day = 1;
+            }
+        }
+    }
+
+    /// How many decreases fall in the same UTC calendar day as `now`.
+    pub fn decreases_today(&self, now: SystemTime) -> i64 {
+        if self.decreases_day == utc_day(now) {
+            self.decreases_on_day
+        } else {
+            0
+        }
+    }
+
+    /// The description members a `ProvisionedThroughputDescription` carries.
+    fn describe(&self, now: SystemTime) -> (Option<i64>, Option<::aws_smithy_types::DateTime>, Option<::aws_smithy_types::DateTime>) {
+        let decreases = self.decreases_today(now);
+        (
+            // `NumberOfDecreasesToday` is modelled `PositiveLongObject` (range min 1),
+            // so a table that has had none reports no value rather than zero.
+            (decreases > 0).then_some(decreases),
+            self.last_increase.map(::aws_smithy_types::DateTime::from),
+            self.last_decrease.map(::aws_smithy_types::DateTime::from),
+        )
+    }
+}
+
+/// The UTC day `instant` falls in, as a whole number of days since the epoch.
+fn utc_day(instant: SystemTime) -> i64 {
+    const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+    instant
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs() / SECONDS_PER_DAY).unwrap_or(i64::MAX)
+        })
+}
+
 /// One stored table: its configuration, its lifecycle instants, and its items.
 #[derive(Debug)]
 pub struct Table {
     pub name: String,
     pub arn: String,
+    /// The region this table lives in. A table name is unique only within a region
+    /// ("table names must be unique within each Region" — the `CreateTable` doc), so
+    /// the store keys by region and the table remembers which one it answers for.
+    pub region: String,
     pub key_schema: Vec<KeySchemaElement>,
     pub attribute_definitions: Vec<AttributeDefinition>,
     /// `PROVISIONED` or `PAY_PER_REQUEST`, as resolved at CreateTable.
     pub billing_mode: String,
     pub provisioned_throughput: Option<ProvisionedThroughput>,
+    /// The table's own past capacity changes, as `ProvisionedThroughputDescription`
+    /// reports them.
+    pub throughput_history: ThroughputHistory,
+    /// The global secondary indexes defined on this table, in the order they were
+    /// declared.
+    pub global_secondary_indexes: Vec<GlobalSecondaryIndex>,
     pub table_class: Option<String>,
     pub deletion_protection_enabled: bool,
     pub tags: Vec<Tag>,
     pub creation_date_time: SystemTime,
     /// When the clock owes this table its `CREATING` -> `ACTIVE` transition.
     pub active_at: SystemTime,
+    /// When the clock owes this table the end of an `UpdateTable` — its `UPDATING` ->
+    /// `ACTIVE` transition. `None` once no update is in flight.
+    pub updated_at: Option<SystemTime>,
     /// When the clock owes this table its removal, set by `DeleteTable`.
     pub removed_at: Option<SystemTime>,
     pub items: BTreeMap<ItemKey, Item>,
@@ -294,10 +561,12 @@ impl Table {
     pub fn status(&self, now: SystemTime) -> TableStatus {
         if self.removed_at.is_some() {
             TableStatus::Deleting
-        } else if now >= self.active_at {
-            TableStatus::Active
-        } else {
+        } else if now < self.active_at {
             TableStatus::Creating
+        } else if self.updated_at.is_some_and(|due| now < due) {
+            TableStatus::Updating
+        } else {
+            TableStatus::Active
         }
     }
 
@@ -351,8 +620,15 @@ impl Table {
             ("N", AttributeValue::N(text)) => NumberKey::parse(text)
                 .map(AttributeValueKey::N)
                 .ok_or_else(|| {
+                    // A text longer than this emulator's own numeric-text limit is
+                    // refused here too, so the message names that limit as well as the
+                    // documented form.
                     RequestError::Validation(format!(
-                        "The parameter cannot be converted to a numeric value: {text}"
+                        "The parameter cannot be converted to a numeric value: {text} \
+                         (a number must carry at most {MAX_SIGNIFICANT_DIGITS} significant \
+                         digits, an exponent within 10^{MIN_POINT}..10^{MAX_POINT}, and at \
+                         most {MAX_NUMBER_TEXT_DIGITS} digits of text, this emulator's \
+                         input-size limit)"
                     ))
                 }),
             (_, actual) => Err(RequestError::Validation(format!(
@@ -422,9 +698,74 @@ impl Table {
         self.items.values().map(item_size).sum()
     }
 
+    /// The index by that name, as `UpdateTable` and the index describes need it.
+    pub fn index(&self, name: &str) -> Option<&GlobalSecondaryIndex> {
+        self.global_secondary_indexes
+            .iter()
+            .find(|index| index.name == name)
+    }
+
+    /// The same, mutably, for the operations that move an index's throughput.
+    pub fn index_mut(&mut self, name: &str) -> Option<&mut GlobalSecondaryIndex> {
+        self.global_secondary_indexes
+            .iter_mut()
+            .find(|index| index.name == name)
+    }
+
+    /// Project one global secondary index into the description `DescribeTable` and the
+    /// table-mutating operations report. `ItemCount` and `IndexSizeBytes` are computed
+    /// from the table's items, never stored.
+    fn describe_index(
+        &self,
+        index: &GlobalSecondaryIndex,
+        now: SystemTime,
+    ) -> GlobalSecondaryIndexDescription {
+        let covered = self.items.values().filter(|item| index.covers(item));
+        let item_count = i64::try_from(covered.clone().count()).unwrap_or(i64::MAX);
+        let index_size_bytes = covered
+            .map(|item| index.projected_size(item, &self.key_schema))
+            .sum();
+        let (number_of_decreases_today, last_increase_date_time, last_decrease_date_time) =
+            index.throughput_history.describe(now);
+        GlobalSecondaryIndexDescription {
+            index_name: Some(index.name.clone()),
+            index_arn: Some(index.arn.clone()),
+            key_schema: Some(index.key_schema.clone()),
+            projection: Some(index.projection.clone()),
+            index_status: Some(index.status(now).as_str().to_string()),
+            // "For indexes that were created during a CreateTable operation, the
+            // Backfilling attribute does not appear in the DescribeTable output" (the
+            // `Backfilling` doc), and this emulator projects an index's items from the
+            // table on every read, so no index is ever backfilling.
+            backfilling: None,
+            provisioned_throughput: Some(ProvisionedThroughputDescription {
+                read_capacity_units: Some(
+                    index
+                        .provisioned_throughput
+                        .as_ref()
+                        .map_or(0, |throughput| throughput.read_capacity_units),
+                ),
+                write_capacity_units: Some(
+                    index
+                        .provisioned_throughput
+                        .as_ref()
+                        .map_or(0, |throughput| throughput.write_capacity_units),
+                ),
+                number_of_decreases_today,
+                last_increase_date_time,
+                last_decrease_date_time,
+            }),
+            item_count: Some(item_count),
+            index_size_bytes: Some(index_size_bytes),
+            ..GlobalSecondaryIndexDescription::default()
+        }
+    }
+
     /// Project this table into the `TableDescription` every table operation returns.
     /// `ItemCount` and `TableSizeBytes` are derived from `items` here, never stored.
     pub fn describe(&self, now: SystemTime) -> TableDescription {
+        let (number_of_decreases_today, last_increase_date_time, last_decrease_date_time) =
+            self.throughput_history.describe(now);
         TableDescription {
             table_name: Some(self.name.clone()),
             table_arn: Some(self.arn.clone()),
@@ -451,9 +792,17 @@ impl Table {
                         .as_ref()
                         .map_or(0, |throughput| throughput.write_capacity_units),
                 ),
-                number_of_decreases_today: Some(0),
-                last_increase_date_time: None,
-                last_decrease_date_time: None,
+                number_of_decreases_today,
+                last_increase_date_time,
+                last_decrease_date_time,
+            }),
+            // A table with no secondary index reports no list at all, which is what
+            // DescribeTable does for a table that has none.
+            global_secondary_indexes: (!self.global_secondary_indexes.is_empty()).then(|| {
+                self.global_secondary_indexes
+                    .iter()
+                    .map(|index| self.describe_index(index, now))
+                    .collect()
             }),
             table_class_summary: self.table_class.as_ref().map(|class| TableClassSummary {
                 table_class: Some(class.clone()),
@@ -466,10 +815,18 @@ impl Table {
 }
 
 /// Per-service state for com-amazonaws-dynamodb-dynamodb-20120810. A handler reaches it through [`service_state`].
+///
+/// Tables are keyed by REGION and then by name, because that is the scope a DynamoDB
+/// table name is unique in: "In an Amazon Web Services account, table names must be
+/// unique within each Region. That is, you can have two tables with same name if you
+/// create the tables in different Regions" (the `CreateTable` doc). The account is not
+/// part of the key because this emulator serves exactly one account — the canonical
+/// account [`::engine::emulator_arn`] mints every ARN for — so every request's tables
+/// already belong to it.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDynamodbDynamodb20120810State {
-    /// Every table this emulator holds, keyed by table name.
-    pub tables: HashMap<String, Table>,
+    /// Every table this emulator holds, keyed by region and then by table name.
+    pub regions: HashMap<String, HashMap<String, Table>>,
 }
 
 impl ComAmazonawsDynamodbDynamodb20120810State {
@@ -479,22 +836,83 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// This is the only write a reporting operation makes — it finishes a transition
     /// that was owed at this instant whether or not anybody called.
     pub fn apply_due_transitions(&mut self, now: SystemTime) {
-        self.tables.retain(|_, table| !table.removal_due(now));
+        for tables in self.regions.values_mut() {
+            tables.retain(|_, table| !table.removal_due(now));
+        }
+        self.regions.retain(|_, tables| !tables.is_empty());
     }
 
-    /// The table by that name, whatever its status — what `DescribeTable` reports.
-    pub fn table(&self, name: &str) -> Result<&Table, RequestError> {
-        self.tables.get(name).ok_or_else(|| not_found(name))
+    /// The tables of one region, which is the only scope a table name resolves in.
+    pub fn tables_in(&self, region: &str) -> Option<&HashMap<String, Table>> {
+        self.regions.get(region)
     }
 
-    /// The table by that name, which must be `ACTIVE`.
+    /// How many tables that region already holds — what the per-region table quota is
+    /// measured against.
+    pub fn table_count_in(&self, region: &str) -> usize {
+        self.tables_in(region).map_or(0, HashMap::len)
+    }
+
+    /// The names of that region's tables, sorted, as `ListTables` reports them.
+    pub fn table_names_in(&self, region: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tables_in(region)
+            .map(|tables| tables.keys().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Whether that region already holds a table by that name.
+    pub fn contains_table(&self, region: &str, name: &str) -> bool {
+        self.tables_in(region)
+            .is_some_and(|tables| tables.contains_key(name))
+    }
+
+    /// Whether storing a table in `region` would open a new per-region bucket beyond
+    /// [`MAX_REGIONS`]. The region comes from the request's own credential scope, so
+    /// the number of buckets is capped as well as the tables in each.
+    pub fn region_bucket_exhausted(&self, region: &str) -> bool {
+        !self.regions.contains_key(region) && self.regions.len() >= MAX_REGIONS
+    }
+
+    /// Store a new table in its own region.
+    pub fn insert_table(&mut self, table: Table) {
+        self.regions
+            .entry(table.region.clone())
+            .or_default()
+            .insert(table.name.clone(), table);
+    }
+
+    /// The table by that name in that region, whatever its status — what
+    /// `DescribeTable` reports.
+    pub fn table(&self, region: &str, name: &str) -> Result<&Table, RequestError> {
+        self.tables_in(region)
+            .and_then(|tables| tables.get(name))
+            .ok_or_else(|| not_found(name))
+    }
+
+    /// The same, mutably, for the operations that change a table's configuration.
+    pub fn table_mut(&mut self, region: &str, name: &str) -> Result<&mut Table, RequestError> {
+        self.regions
+            .get_mut(region)
+            .and_then(|tables| tables.get_mut(name))
+            .ok_or_else(|| not_found(name))
+    }
+
+    /// The table by that name in that region, which must be `ACTIVE`.
     ///
     /// An item operation on a table that is still `CREATING`, or already `DELETING`,
     /// is answered as if the table were not there: the `CreateTable` doc says "You
     /// can perform read and write operations only on an ACTIVE table".
-    pub fn active_table(&self, name: &str, now: SystemTime) -> Result<&Table, RequestError> {
-        let table = self.table(name)?;
-        if table.status(now) == TableStatus::Active {
+    pub fn active_table(
+        &self,
+        region: &str,
+        name: &str,
+        now: SystemTime,
+    ) -> Result<&Table, RequestError> {
+        let table = self.table(region, name)?;
+        if table.status(now).serves_items() {
             Ok(table)
         } else {
             Err(not_found(name))
@@ -504,11 +922,12 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// The same, mutably, for the operations that write items.
     pub fn active_table_mut(
         &mut self,
+        region: &str,
         name: &str,
         now: SystemTime,
     ) -> Result<&mut Table, RequestError> {
-        match self.tables.get_mut(name) {
-            Some(table) if table.status(now) == TableStatus::Active => Ok(table),
+        match self.table_mut(region, name) {
+            Ok(table) if table.status(now).serves_items() => Ok(table),
             _ => Err(not_found(name)),
         }
     }
@@ -516,8 +935,9 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// The bytes every table together holds — the store-wide figure admission
     /// control measures against. O(tables), because each table keeps its own total.
     pub fn stored_bytes(&self) -> i64 {
-        self.tables
+        self.regions
             .values()
+            .flat_map(HashMap::values)
             .map(|table| table.stored_bytes)
             .fold(0, i64::saturating_add)
     }
@@ -532,6 +952,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// refused.
     pub fn put_item(
         &mut self,
+        region: &str,
         name: &str,
         now: SystemTime,
         key: ItemKey,
@@ -539,7 +960,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     ) -> Result<Option<Item>, RequestError> {
         let size = item_size(&item);
         let stored = self.stored_bytes();
-        let table = self.active_table_mut(name, now)?;
+        let table = self.active_table_mut(region, name, now)?;
         let replaced_size = table.items.get(&key).map_or(0, item_size);
         if replaced_size == 0 && table.items.len() >= MAX_ITEMS_PER_TABLE {
             return Err(RequestError::Validation(format!(
@@ -571,11 +992,12 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// table's budget.
     pub fn delete_item(
         &mut self,
+        region: &str,
         name: &str,
         now: SystemTime,
         key: &ItemKey,
     ) -> Result<Option<Item>, RequestError> {
-        let table = self.active_table_mut(name, now)?;
+        let table = self.active_table_mut(region, name, now)?;
         let removed = table.items.remove(key);
         table.stored_bytes = table
             .stored_bytes
@@ -613,6 +1035,17 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// helper so the account segment is the canonical emulator account.
 pub fn table_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn("dynamodb", region, &format!("table/{name}"))
+}
+
+/// `arn:aws:dynamodb:<region>:<account>:table/<table>/index/<index>` — the form the
+/// `GlobalSecondaryIndexDescription$IndexArn` member carries, and the resource id
+/// Application Auto Scaling names an index scalable target by.
+pub fn index_arn(region: &str, table: &str, index: &str) -> String {
+    ::engine::emulator_arn(
+        "dynamodb",
+        region,
+        &format!("table/{table}/index/{index}"),
+    )
 }
 
 /// The `TableName` member accepts a bare table name or the table's ARN ("You can

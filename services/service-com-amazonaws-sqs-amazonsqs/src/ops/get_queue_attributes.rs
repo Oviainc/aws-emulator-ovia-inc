@@ -12,11 +12,13 @@
 //! - "`All` – Returns all values", and every other name returns just that attribute.
 //!
 //! An attribute the queue has no value for is absent from the map rather than present
-//! and empty — which is also how the three `ApproximateNumberOfMessages*` counters
-//! answer, because this crate has no message plane for them to count yet. See
+//! and empty. The three `ApproximateNumberOfMessages*` counters ARE reported: they are
+//! counts over the messages the queue holds — see
 //! [`crate::state::MESSAGE_PLANE_ATTRIBUTES`].
 //!
-//! A pure read: nothing about reporting a queue changes what a later caller sees.
+//! A reporting call: the only state it writes is what the CLOCK already made due
+//! (retention lapses, visibility timeouts), so the counts are the ones a caller would
+//! have seen at this instant anyway.
 //!
 //! ## Shape of an operation
 //!
@@ -173,15 +175,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state::service_state(&*self.engine).ok_or_else(|| {
             GetQueueAttributesErrorModeled::UnsupportedOperation(state::store_unavailable())
         })?;
-        let store = store.lock();
+        let mut store = store.lock();
 
+        let now = ::std::time::SystemTime::now();
         let queue = state::queue_name_from_url(&input.queue_url)
-            .and_then(|name| store.queues.get(name))
+            .and_then(|name| store.queues.get_mut(name))
             .ok_or_else(|| {
                 GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(
                     &input.queue_url,
                 ))
             })?;
+        // Retention lapses and visibility timeouts were owed by the clock whether or
+        // not anybody asked, so applying them here is what makes the message counters
+        // below the counts a caller would have seen at this instant anyway. Nothing
+        // else about reporting a queue changes what a later caller sees.
+        queue.materialise_due(now);
 
         let requested = input.attribute_names.unwrap_or_default();
         if requested.is_empty() {
@@ -206,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let reported = queue.reported_attributes();
+        let reported = queue.reported_attributes(now);
         let attributes = if requested
             .iter()
             .any(|name| name == state::ALL_ATTRIBUTES)

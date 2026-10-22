@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
+#[path = "all/channel_listing.rs"]
+mod channel_listing;
 #[path = "all/channel_policy.rs"]
 mod channel_policy;
 #[path = "all/channel_policy_delete.rs"]
@@ -21,6 +23,8 @@ mod channel_policy_delete;
 mod channel_policy_lifecycle;
 #[path = "all/channel_reset.rs"]
 mod channel_reset;
+#[path = "all/channel_update.rs"]
+mod channel_update;
 #[path = "all/control_plane_validation.rs"]
 mod control_plane_validation;
 #[path = "all/error_bodies.rs"]

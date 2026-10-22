@@ -7,9 +7,16 @@
 //!
 //! The table is reported `CREATING`, as the doc below states: the status becomes
 //! `ACTIVE` once [`crate::state::STATUS_TRANSITION`] has elapsed, so a caller that
-//! writes an item immediately still sees the transient status. Secondary indexes,
-//! streams, SSE, resource policies and the other members this slice does not store
-//! are refused with the scaffold's 501 and filed as their own gap issues.
+//! writes an item immediately still sees the transient status. `GlobalSecondaryIndexes`
+//! are stored with the table and reported back in its `TableDescription`; local and
+//! vector indexes, streams, SSE, resource policies and the other members this slice
+//! does not store are refused with the scaffold's 501 and filed as their own gap
+//! issues.
+//!
+//! The table is stored under the REGION the request was signed for, because that is
+//! the scope a table name is unique in ("table names must be unique within each
+//! Region" — the doc below), so the same name in a second region is a second,
+//! independent table rather than a conflict.
 //!
 //! The scaffold channel in [`crate::scaffolded`] still carries this operation's
 //! refusals: `validation` for a bad request, and `not_implemented` for a member of
@@ -268,13 +275,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // Every list this request carries is clamped BEFORE anything walks it, so the
+        // work that follows is bounded by constants rather than by the request body.
+        clamped_lists(&input).map_err(lift)?;
+
         let key_schema = validated_key_schema(&input).map_err(lift)?;
         let (billing_mode, provisioned_throughput) = validated_throughput(&input).map_err(lift)?;
         let region = crate::state::request_region(ctx.parts());
+        let global_secondary_indexes =
+            validated_indexes(&input, &billing_mode, &region, &name, now).map_err(lift)?;
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
-        if store.tables.contains_key(&name) {
+        if store.contains_table(&region, &name) {
             return Err(CreateTableErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     message: Some(format!("Table already exists: {name}")),
@@ -283,15 +296,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // "There is a soft account quota of 2,500 tables" (the
-        // `LimitExceededException` doc): past it the modelled error is the answer,
-        // rather than letting the store grow without any limit at all.
-        if store.tables.len() >= crate::state::MAX_TABLES {
+        // `LimitExceededException` doc), which AWS applies per account and region: past
+        // it the modelled error is the answer, rather than letting the store grow
+        // without any limit at all.
+        if store.table_count_in(&region) >= crate::state::MAX_TABLES {
             return Err(CreateTableErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
                         "Subscriber limit exceeded: this account already holds the maximum of {} \
-                         tables",
+                         tables in {region}",
                         crate::state::MAX_TABLES
+                    )),
+                },
+            )
+            .into());
+        }
+        // The region comes from the request's own (unauthenticated) credential scope,
+        // so the per-region quota above bounds the store only together with a cap on
+        // how many regions it keeps tables for.
+        if store.region_bucket_exhausted(&region) {
+            return Err(CreateTableErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Subscriber limit exceeded: this emulator holds tables for at most {} \
+                         regions, and {region} is not one of them",
+                        crate::state::MAX_REGIONS
                     )),
                 },
             )
@@ -301,21 +330,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let table = crate::state::Table {
             arn: crate::state::table_arn(&region, &name),
             name: name.clone(),
+            region,
             key_schema,
             attribute_definitions: input.attribute_definitions.clone().unwrap_or_default(),
             billing_mode,
             provisioned_throughput,
+            throughput_history: crate::state::ThroughputHistory::default(),
+            global_secondary_indexes,
             table_class: input.table_class.clone(),
             deletion_protection_enabled: input.deletion_protection_enabled.unwrap_or(false),
             tags: input.tags.clone().unwrap_or_default(),
             creation_date_time: now,
             active_at: now + crate::state::STATUS_TRANSITION,
+            updated_at: None,
             removed_at: None,
             items: ::std::collections::BTreeMap::new(),
             stored_bytes: 0,
         };
         let description = table.describe(now);
-        store.tables.insert(name, table);
+        store.insert_table(table);
 
         Ok(CreateTableOutput {
             table_description: Some(description),
@@ -345,13 +378,6 @@ fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
         .is_some_and(|indexes| !indexes.is_empty())
     {
         return Some("LocalSecondaryIndexes");
-    }
-    if input
-        .global_secondary_indexes
-        .as_ref()
-        .is_some_and(|indexes| !indexes.is_empty())
-    {
-        return Some("GlobalSecondaryIndexes");
     }
     if input
         .vector_indexes
@@ -391,13 +417,66 @@ fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
     if input.warm_throughput.is_some() {
         return Some("WarmThroughput");
     }
+    // The same two members an index may carry: this slice stores an index's
+    // PROVISIONED throughput only, so an on-demand or warm throughput asked for per
+    // index is "not written yet" rather than accepted and dropped.
+    for index in input.global_secondary_indexes.iter().flatten() {
+        if index.on_demand_throughput.is_some() {
+            return Some("GlobalSecondaryIndexes carrying OnDemandThroughput");
+        }
+        if index.warm_throughput.is_some() {
+            return Some("GlobalSecondaryIndexes carrying WarmThroughput");
+        }
+    }
     None
+}
+
+/// Clamp every caller-sized list this operation walks, before anything walks it.
+///
+/// Each count comes straight from the request body, and the checks that follow match
+/// definitions against key schemas, so the work would otherwise be the PRODUCT of two
+/// request-chosen counts. Every bound here is one the contract already implies, so a
+/// list past it is invalid whatever its contents: at most
+/// [`crate::state::MAX_GLOBAL_SECONDARY_INDEXES`] indexes, at most
+/// [`crate::state::MAX_INDEX_KEY_ELEMENTS`] key elements per index, and at most
+/// [`crate::state::MAX_ATTRIBUTE_DEFINITIONS`] attribute definitions.
+fn clamped_lists(input: &CreateTableInput) -> Result<(), crate::state::RequestError> {
+    let definitions = input.attribute_definitions.as_ref().map_or(0, Vec::len);
+    if definitions > crate::state::MAX_ATTRIBUTE_DEFINITIONS {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid AttributeDefinitions: a table may declare at most {} attribute \
+             definitions, got {definitions}",
+            crate::state::MAX_ATTRIBUTE_DEFINITIONS
+        )));
+    }
+    let indexes = input.global_secondary_indexes.as_ref().map_or(0, Vec::len);
+    if indexes > crate::state::MAX_GLOBAL_SECONDARY_INDEXES {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid GlobalSecondaryIndexes: a table may carry at most {} global secondary \
+             indexes, got {indexes}",
+            crate::state::MAX_GLOBAL_SECONDARY_INDEXES
+        )));
+    }
+    for index in input.global_secondary_indexes.iter().flatten() {
+        if index.key_schema.len() > crate::state::MAX_INDEX_KEY_ELEMENTS {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid KeySchema for index {}: an index key may carry at most {} elements, \
+                 got {}",
+                index.index_name,
+                crate::state::MAX_INDEX_KEY_ELEMENTS,
+                index.key_schema.len()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The table's key schema, refused unless it is one `HASH` attribute optionally
 /// followed by one `RANGE` attribute, each defined in `AttributeDefinitions` as a
 /// scalar type — "The attributes in KeySchema must also be defined in the
 /// AttributeDefinitions array" (`CreateTable$KeySchema`).
+///
+/// [`clamped_lists`] has already bounded every list this walks.
 fn validated_key_schema(
     input: &CreateTableInput,
 ) -> Result<Vec<KeySchemaElement>, crate::state::RequestError> {
@@ -445,11 +524,25 @@ fn validated_key_schema(
             )));
         }
     }
+    // The key attributes of every requested index, collected ONCE: the loop below asks
+    // whether each definition is used, and a per-definition scan of every index's key
+    // schema would be the product of two request-chosen counts.
+    let index_key_attributes: ::std::collections::HashSet<&str> = input
+        .global_secondary_indexes
+        .iter()
+        .flatten()
+        .flat_map(|index| index.key_schema.iter())
+        .map(|element| element.attribute_name.as_str())
+        .collect();
     for definition in &definitions {
-        if !key_schema
+        // "Some AttributeDefinitions are not used in any KeySchema": every defined
+        // attribute must be a key of the table or of one of its secondary indexes,
+        // whose key attributes are declared in the same array.
+        let used_by_table = key_schema
             .iter()
-            .any(|element| element.attribute_name == definition.attribute_name)
-        {
+            .any(|element| element.attribute_name == definition.attribute_name);
+        let used_by_index = index_key_attributes.contains(definition.attribute_name.as_str());
+        if !used_by_table && !used_by_index {
             return Err(crate::state::RequestError::Validation(format!(
                 "Some AttributeDefinitions are not used in any KeySchema: {}",
                 definition.attribute_name
@@ -457,6 +550,160 @@ fn validated_key_schema(
         }
     }
     Ok(key_schema)
+}
+
+/// The global secondary indexes to store with the table.
+///
+/// Each one is refused unless its name is unique on the table, its key schema names
+/// attributes `AttributeDefinitions` declares with a scalar type, its `Projection` is
+/// one the model's `ProjectionType` enum names, and its throughput matches the table's
+/// billing mode — "You must use either OnDemandThroughput or ProvisionedThroughput
+/// based on your table's capacity mode" (`GlobalSecondaryIndex$ProvisionedThroughput`).
+/// An index created with the table is reported `CREATING` and becomes `ACTIVE` on the
+/// same clock-owed transition as the table.
+fn validated_indexes(
+    input: &CreateTableInput,
+    billing_mode: &str,
+    region: &str,
+    table: &str,
+    now: ::std::time::SystemTime,
+) -> Result<Vec<crate::state::GlobalSecondaryIndex>, crate::state::RequestError> {
+    let requested = input.global_secondary_indexes.clone().unwrap_or_default();
+    let definitions = input.attribute_definitions.clone().unwrap_or_default();
+    let mut indexes: Vec<crate::state::GlobalSecondaryIndex> = Vec::new();
+    for index in &requested {
+        if indexes.iter().any(|stored| stored.name == index.index_name) {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid GlobalSecondaryIndex: duplicate index name {}",
+                index.index_name
+            )));
+        }
+        validated_index_key_schema(&index.index_name, &index.key_schema, &definitions)?;
+        validated_projection(&index.index_name, &index.projection)?;
+        let throughput = validated_index_throughput(
+            &index.index_name,
+            billing_mode,
+            index.provisioned_throughput.clone(),
+        )?;
+        indexes.push(crate::state::GlobalSecondaryIndex {
+            arn: crate::state::index_arn(region, table, &index.index_name),
+            name: index.index_name.clone(),
+            key_schema: index.key_schema.clone(),
+            projection: index.projection.clone(),
+            provisioned_throughput: throughput,
+            transient_status: crate::state::IndexStatus::Creating,
+            active_at: now + crate::state::STATUS_TRANSITION,
+            throughput_history: crate::state::ThroughputHistory::default(),
+        });
+    }
+    Ok(indexes)
+}
+
+/// One index's key schema: at least one `HASH` element, within the documented key
+/// counts, with every attribute declared in `AttributeDefinitions` as a scalar type.
+pub(crate) fn validated_index_key_schema(
+    index_name: &str,
+    key_schema: &[KeySchemaElement],
+    definitions: &[AttributeDefinition],
+) -> Result<(), crate::state::RequestError> {
+    let hash_keys = key_schema
+        .iter()
+        .filter(|element| element.key_type == "HASH")
+        .count();
+    let range_keys = key_schema
+        .iter()
+        .filter(|element| element.key_type == "RANGE")
+        .count();
+    if hash_keys == 0
+        || hash_keys > crate::state::MAX_INDEX_PARTITION_KEYS
+        || range_keys > crate::state::MAX_INDEX_SORT_KEYS
+        || key_schema.len() != hash_keys + range_keys
+    {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid KeySchema for index {index_name}: an index key must be 1 to {} HASH \
+             attribute(s) and at most {} RANGE attribute(s), got {} element(s)",
+            crate::state::MAX_INDEX_PARTITION_KEYS,
+            crate::state::MAX_INDEX_SORT_KEYS,
+            key_schema.len()
+        )));
+    }
+    for element in key_schema {
+        let name = element.attribute_name.as_str();
+        let Some(definition) = definitions
+            .iter()
+            .find(|definition| definition.attribute_name == name)
+        else {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid KeySchema for index {index_name}: no AttributeDefinition was provided \
+                 for key attribute {name}"
+            )));
+        };
+        if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid AttributeDefinition: {name} must have AttributeType S, N or B, got {}",
+                definition.attribute_type
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One index's projection: `ProjectionType` must be a value the model's enum names,
+/// and `NonKeyAttributes` belongs to `INCLUDE` alone — "This limit only applies when
+/// you specify the ProjectionType of INCLUDE" (`Projection$NonKeyAttributes`).
+pub(crate) fn validated_projection(
+    index_name: &str,
+    projection: &Projection,
+) -> Result<(), crate::state::RequestError> {
+    let projection_type = projection.projection_type.as_deref().unwrap_or("ALL");
+    if !matches!(projection_type, "ALL" | "KEYS_ONLY" | "INCLUDE") {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid Projection for index {index_name}: ProjectionType {projection_type} must be \
+             ALL, KEYS_ONLY or INCLUDE"
+        )));
+    }
+    let non_key = projection
+        .non_key_attributes
+        .as_ref()
+        .is_some_and(|attributes| !attributes.is_empty());
+    if non_key && projection_type != "INCLUDE" {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid Projection for index {index_name}: NonKeyAttributes can only be specified \
+             with a ProjectionType of INCLUDE"
+        )));
+    }
+    Ok(())
+}
+
+/// One index's provisioned throughput, held to the table's billing mode: a
+/// `PROVISIONED` table's index must carry one (with both dimensions at least 1), and a
+/// `PAY_PER_REQUEST` table's index must not.
+pub(crate) fn validated_index_throughput(
+    index_name: &str,
+    billing_mode: &str,
+    throughput: Option<ProvisionedThroughput>,
+) -> Result<Option<ProvisionedThroughput>, crate::state::RequestError> {
+    match (billing_mode, throughput) {
+        ("PAY_PER_REQUEST", None) => Ok(None),
+        ("PAY_PER_REQUEST", Some(_)) => Err(crate::state::RequestError::Validation(format!(
+            "ProvisionedThroughput cannot be specified for index {index_name} when BillingMode \
+             is PAY_PER_REQUEST"
+        ))),
+        (_, Some(throughput)) => {
+            if throughput.read_capacity_units < 1 || throughput.write_capacity_units < 1 {
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Invalid ProvisionedThroughput for index {index_name}: ReadCapacityUnits and \
+                     WriteCapacityUnits must be at least 1, got {} and {}",
+                    throughput.read_capacity_units, throughput.write_capacity_units
+                )));
+            }
+            Ok(Some(throughput))
+        }
+        (_, None) => Err(crate::state::RequestError::Validation(format!(
+            "ProvisionedThroughput must be specified for index {index_name} when BillingMode is \
+             PROVISIONED"
+        ))),
+    }
 }
 
 /// The billing mode and the provisioned throughput to store: "If you set BillingMode

@@ -25,3 +25,14 @@ handler returns an error, so it never has to construct a value.
 // SKIPPED: StopTelemetryEnrichment — unsupported shape construct: operation 'StopTelemetryEnrichment' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: StopTelemetryEvaluation — unsupported shape construct: operation 'StopTelemetryEvaluation' has a Unit/absent input, which the generator does not emit yet
 // SKIPPED: StopTelemetryEvaluationForOrganization — unsupported shape construct: operation 'StopTelemetryEvaluationForOrganization' has a Unit/absent input, which the generator does not emit yet
+
+## Since hand-authored
+
+Every operation the generator declined above is now hand-authored in
+`ops/<op>.rs`, so each one is routed and served rather than answered by the
+framework's unroutable-operation path: `GetTelemetryEnrichmentStatus`,
+`GetTelemetryEvaluationStatus`, `GetTelemetryEvaluationStatusForOrganization`,
+`StartTelemetryEnrichment`, `StopTelemetryEnrichment`, `StopTelemetryEvaluation`
+and `StopTelemetryEvaluationForOrganization`. The `SKIPPED:` lines are left as
+the generator wrote them — they record what the generator did, not what the
+crate holds today.

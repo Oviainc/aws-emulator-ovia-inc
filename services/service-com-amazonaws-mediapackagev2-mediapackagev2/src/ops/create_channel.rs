@@ -219,82 +219,6 @@ impl From<CreateChannelErrorModeled> for CreateChannelError {
     }
 }
 
-/// A channel member the service only lets a particular set of input types carry.
-struct InputTypeRule {
-    /// The member, as a validation message names it (lowerCamel, as on the wire).
-    member: &'static str,
-    /// The `InputType` values that may carry it, from the model's `InputType` enum.
-    allowed: &'static [&'static str],
-    /// The `ValidationExceptionType` the model declares for this combination.
-    exception_type: &'static str,
-    /// What the member is called in the sentence the refusal states.
-    label: &'static str,
-    /// Whether the request carries the member at all.
-    present: fn(&CreateChannelInput) -> bool,
-}
-
-/// Every `InputType` restriction the model states for a `CreateChannel` member, one row
-/// per `ValidationExceptionType` that names one.
-///
-/// The rows are read off the model, not guessed: each member's own doc says which input
-/// types may carry it (`OutputLockingMode` — "only configurable when the channel
-/// InputType is CMAF or MULTIVIEW"; `MQCSInputSwitching` / `PublishMQCS` — "valid only
-/// when InputType is CMAF"; `MultiviewConfiguration` — "required when InputType is
-/// MULTIVIEW, and can't be set for any other input type"), and
-/// `ValidationExceptionType` carries exactly one discriminator per row.
-const INPUT_TYPE_RULES: &[InputTypeRule] = &[
-    InputTypeRule {
-        member: "outputLockingMode",
-        allowed: &["CMAF", "MULTIVIEW"],
-        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE",
-        label: "OutputLockingMode",
-        present: |input| input.output_locking_mode.is_some(),
-    },
-    InputTypeRule {
-        member: "inputSwitchConfiguration.mqcsInputSwitching",
-        allowed: &["CMAF"],
-        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_INPUT_SWITCHING",
-        label: "MQCS input switching",
-        present: |input| {
-            input
-                .input_switch_configuration
-                .as_ref()
-                .is_some_and(|switch| switch.mqcs_input_switching.is_some())
-        },
-    },
-    InputTypeRule {
-        member: "inputSwitchConfiguration.preferredInput",
-        allowed: &["CMAF"],
-        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_PREFERRED_INPUT_CONFIGURATION",
-        label: "PreferredInput",
-        present: |input| {
-            input
-                .input_switch_configuration
-                .as_ref()
-                .is_some_and(|switch| switch.preferred_input.is_some())
-        },
-    },
-    InputTypeRule {
-        member: "outputHeaderConfiguration.publishMqcs",
-        allowed: &["CMAF"],
-        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_OUTPUT_CONFIGURATION",
-        label: "PublishMQCS",
-        present: |input| {
-            input
-                .output_header_configuration
-                .as_ref()
-                .is_some_and(|header| header.publish_mqcs.is_some())
-        },
-    },
-    InputTypeRule {
-        member: "multiviewConfiguration",
-        allowed: &["MULTIVIEW"],
-        exception_type: "MULTIVIEW_CONFIGURATION_NOT_ALLOWED",
-        label: "MultiviewConfiguration",
-        present: |input| input.multiview_configuration.is_some(),
-    },
-];
-
 /// The input type a channel is created with: the request's own, or the HLS the model's
 /// `InputType` doc declares for an unprovided value ("If unprovided, the value defaults
 /// to HLS"). A cross-member rule is checked against this, so omitting `InputType` cannot
@@ -306,37 +230,53 @@ fn effective_input_type(input: &CreateChannelInput) -> &str {
         .unwrap_or(crate::state::DEFAULT_INPUT_TYPE)
 }
 
+/// Which of the restricted channel members this request carries, for the shared
+/// `InputType` rule table in [`crate::state`].
+fn submitted_members(input: &CreateChannelInput) -> crate::state::SubmittedChannelMembers {
+    crate::state::SubmittedChannelMembers {
+        output_locking_mode: input.output_locking_mode.is_some(),
+        mqcs_input_switching: input
+            .input_switch_configuration
+            .as_ref()
+            .is_some_and(|switch| switch.mqcs_input_switching.is_some()),
+        preferred_input: input
+            .input_switch_configuration
+            .as_ref()
+            .is_some_and(|switch| switch.preferred_input.is_some()),
+        publish_mqcs: input
+            .output_header_configuration
+            .as_ref()
+            .is_some_and(|header| header.publish_mqcs.is_some()),
+        multiview_configuration: input.multiview_configuration.is_some(),
+    }
+}
+
 /// The first `InputType` restriction this request breaks, as the modeled
 /// `ValidationException` to answer it with.
 fn input_type_violation(input: &CreateChannelInput) -> Option<ValidationException> {
-    let input_type = effective_input_type(input);
-    INPUT_TYPE_RULES
-        .iter()
-        .find(|rule| (rule.present)(input) && !rule.allowed.contains(&input_type))
-        .map(|rule| ValidationException {
-            message: Some(crate::state::validation_message(
-                Some(rule.member),
-                &format!(
-                    "{} can only be configured when the channel InputType is {}. To use \
-                     {}, create a channel with {} input type",
-                    rule.label,
-                    rule.allowed.join(" or "),
-                    rule.label,
-                    rule.allowed.join(" or ")
-                ),
-            )),
-            validation_exception_type: Some(rule.exception_type.to_string()),
-        })
+    crate::state::channel_input_type_violation(
+        submitted_members(input),
+        effective_input_type(input),
+    )
 }
 
 /// The response for a stored channel. Both the create and its idempotent replay answer
 /// from the SAME stored record through here, so a retry cannot report anything the
 /// original did not.
-fn channel_output(channel: &crate::state::Channel) -> CreateChannelOutput {
+fn channel_output(
+    group: &crate::state::ChannelGroup,
+    channel: &crate::state::Channel,
+) -> CreateChannelOutput {
     CreateChannelOutput {
         multiview_configuration: channel.multiview_configuration.clone(),
-        // Creating a channel attaches no multiview source channels to it.
-        attached_multiview_channels: None,
+        // Read-only and derived from the group's multiview source lists on every read,
+        // the same way every other channel reader reports it: normally nothing attaches a
+        // channel the moment it is created, but an idempotent replay of this create can
+        // land after a multiview channel has named it.
+        attached_multiview_channels: crate::state::attached_multiview_channels(
+            group,
+            &channel.name,
+        ),
         arn: channel.arn.clone(),
         channel_name: channel.name.clone(),
         channel_group_name: channel.group_name.clone(),
@@ -451,7 +391,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
         ) {
             crate::state::TokenMatch::Replay(name) => {
-                return Ok(channel_output(&group.channels[&name]));
+                return Ok(channel_output(group, &group.channels[&name]));
             }
             crate::state::TokenMatch::Mismatch => {
                 return Err(CreateChannelErrorModeled::ConflictException(
@@ -541,6 +481,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         group.channels.insert(name.clone(), channel);
         // Answer from what was stored, so the response can only carry what a later
         // `GetChannel` will read.
-        Ok(channel_output(&group.channels[&name]))
+        Ok(channel_output(group, &group.channels[&name]))
     }
 }

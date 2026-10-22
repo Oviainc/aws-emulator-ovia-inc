@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation appends a message to the queue's arrival-order deque in
+//! [`crate::state`] and answers with its id and content digests. It is the ONLY file to
+//! touch for `SendMessage`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,6 +147,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as sqs;
+use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -165,7 +162,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sqs-amazonsqs.json");
 // here — hence the `SendMessageError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sqs#SendMessage")]
+// `OverLimit` is widened in with `extra_errors`: it is a shape this SERVICE models (it
+// is declared on ReceiveMessage and AddPermission) that SendMessage does not list, and
+// it is the shape whose own documentation states the refusal this emulator needs — "The
+// specified action violates a limit" — when a queue is already holding as much as
+// `crate::state`'s message bounds allow.
+#[smithy_macros::operation_error("com.amazonaws.sqs#SendMessage", extra_errors = ["OverLimit"])]
 #[derive(Debug)]
 pub enum SendMessageErrorModeled {
     InvalidAddress(InvalidAddress),
@@ -178,6 +180,7 @@ pub enum SendMessageErrorModeled {
     KmsNotFound(KmsNotFound),
     KmsOptInRequired(KmsOptInRequired),
     KmsThrottled(KmsThrottled),
+    OverLimit(OverLimit),
     QueueDoesNotExist(QueueDoesNotExist),
     RequestThrottled(RequestThrottled),
     UnsupportedOperation(UnsupportedOperation),
@@ -234,18 +237,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendMessage"))
+        let _ = ctx;
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            SendMessageErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+        let mut state = store.lock();
+
+        let now = SystemTime::now();
+        // Retention and visibility are owed by the clock, not by this call. Applied
+        // across the whole store, so the store-wide byte budget below is measured
+        // against what the store actually still holds.
+        state.materialise_due(now);
+        let store_bytes = state.retained_message_bytes();
+        let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+            return Err(SendMessageErrorModeled::QueueDoesNotExist(
+                sqs::queue_does_not_exist(&input.queue_url),
+            )
+            .into());
+        };
+
+        // A FIFO queue delivers in message-group order and deduplicates, neither of
+        // which is written yet: answer the scaffold's 501 for that path rather than
+        // accepting a message this emulator would deliver out of order.
+        if queue.is_fifo() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SendMessage to a FIFO queue",
+            ));
+        }
+
+        // FIFO-only parameters, and members this emulator does not honour, are refused
+        // rather than silently dropped on a 200.
+        for (member, present) in [
+            ("MessageGroupId", input.message_group_id.is_some()),
+            (
+                "MessageDeduplicationId",
+                input.message_deduplication_id.is_some(),
+            ),
+            (
+                "MessageSystemAttributes",
+                input
+                    .message_system_attributes
+                    .as_ref()
+                    .is_some_and(|attributes| !attributes.is_empty()),
+            ),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "The request includes {member}, which this emulator does not support yet: \
+                     MessageGroupId and MessageDeduplicationId apply only to a FIFO queue, and \
+                     MessageSystemAttributes carries the X-Ray trace header, which nothing here \
+                     propagates."
+                )));
+            }
+        }
+
+        // The queue's own DelaySeconds applies when the request names none; either way
+        // the value must be inside the range the model documents for the attribute.
+        let (min_delay, max_delay) = sqs::integer_bounds(sqs::DELAY_SECONDS);
+        let delay = match input.delay_seconds {
+            Some(requested) => i64::from(requested),
+            None => queue.integer(sqs::DELAY_SECONDS),
+        };
+        if delay < min_delay || delay > max_delay {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "DelaySeconds must be an integer from {min_delay} to {max_delay}; got {delay}."
+            )));
+        }
+
+        let message_attributes: BTreeMap<String, MessageAttributeValue> = input
+            .message_attributes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if message_attributes.len() > sqs::MAX_MESSAGE_ATTRIBUTES {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "A message can have up to {} attributes; got {}.",
+                sqs::MAX_MESSAGE_ATTRIBUTES,
+                message_attributes.len()
+            )));
+        }
+        // Name-ordered, so a message with two bad attributes is always refused for the
+        // same one.
+        if let Some(reason) = message_attributes
+            .iter()
+            .find_map(|(name, value)| sqs::message_attribute_refusal(name, value))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
+        // Everything the message carries counts toward the queue's MaximumMessageSize:
+        // "All parts of a message are included in the ... size limit: the message body,
+        // the message attributes". A message over it is rejected rather than stored.
+        let maximum = queue.integer(sqs::MAXIMUM_MESSAGE_SIZE);
+        let attribute_bytes = sqs::message_attribute_bytes(&message_attributes);
+        let size = input.message_body.len().saturating_add(attribute_bytes);
+        if i64::try_from(size).unwrap_or(i64::MAX) > maximum {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "The message body and its attributes must be at most {maximum} bytes together; \
+                 got {size} bytes ({attribute_bytes} of them in attributes)."
+            )));
+        }
+
+        // What this in-memory store can be made to hold is bounded, counting every byte
+        // the message retains; a message over the bound is refused rather than accepted
+        // and silently evicted later.
+        if let Some(reason) = queue.message_rejection(size, store_bytes) {
+            return Err(SendMessageErrorModeled::OverLimit(OverLimit {
+                message: Some(reason),
+            })
+            .into());
+        }
+
+        let md5_of_body = sqs::md5_hex(input.message_body.as_bytes());
+        let md5_of_message_attributes = sqs::md5_of_message_attributes(&message_attributes);
+        let message_id = sqs::new_identifier();
+
+        queue.messages.push_back(sqs::StoredMessage {
+            message_id: message_id.clone(),
+            body: input.message_body,
+            md5_of_body: md5_of_body.clone(),
+            message_attributes,
+            sent_at: now,
+            available_at: sqs::after(now, delay),
+            invisible_until: None,
+            receive_count: 0,
+            first_received_at: None,
+        });
+
+        Ok(SendMessageOutput {
+            md5_of_message_body: Some(md5_of_body),
+            md5_of_message_attributes,
+            md5_of_message_system_attributes: None,
+            message_id: Some(message_id),
+            sequence_number: None,
+        })
     }
 }

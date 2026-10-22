@@ -942,6 +942,9 @@ pub fn now() -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_millis() as f64 / 1000.0)
 }
 
+// The fixed not-found sentence for each resource type lives with the rest of this
+// service's refusal bodies, as `ResourceKind::not_found`.
+
 /// The ARN of a channel group.
 pub fn channel_group_arn(region: &str, group: &str) -> String {
     ::engine::emulator_arn(SIGNING_NAME, region, &format!("channelGroup/{group}"))
@@ -1542,6 +1545,35 @@ pub fn stored_mss_manifest(
     }
 }
 
+/// The names of the multiview channels in `group` that list `channel_name` among their
+/// `MultiviewConfiguration.AvailableSources`.
+///
+/// The model calls `AttachedMultiviewChannels` a read-only field: it is the inverse of
+/// the available-source lists the group's other channels were created or updated with, so
+/// every channel reader DERIVES it from the store rather than storing it on the channel.
+/// `None` when nothing references the channel, so the member is reported only once there
+/// is an attachment to report.
+pub fn attached_multiview_channels(group: &ChannelGroup, channel_name: &str) -> Option<Vec<String>> {
+    // `channels` is a BTreeMap, so the names come out in name order.
+    let attached: Vec<String> = group
+        .channels
+        .values()
+        .filter(|candidate| {
+            candidate
+                .multiview_configuration
+                .as_ref()
+                .is_some_and(|multiview| {
+                    multiview
+                        .available_sources
+                        .iter()
+                        .any(|source| source == channel_name)
+                })
+        })
+        .map(|candidate| candidate.name.clone())
+        .collect();
+    (!attached.is_empty()).then_some(attached)
+}
+
 /// An entity tag over a resource's own content.
 ///
 /// Derived from the fields the resource is made of, so it is stable for as long as the
@@ -2014,6 +2046,112 @@ pub fn refusal_message(violations: &[Violation]) -> String {
             "The input failed to meet the constraints specified by the AWS service",
         ),
     }
+}
+
+/// Which of a channel's restricted members a request carries.
+///
+/// The `InputType` restrictions below are about the REQUEST, not about any one
+/// operation's input shape, so each handler reduces its own generated input to this and
+/// the rule table is written once. `CreateChannel` and `UpdateChannel` therefore cannot
+/// disagree about which input type may carry which member.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubmittedChannelMembers {
+    pub output_locking_mode: bool,
+    pub mqcs_input_switching: bool,
+    pub preferred_input: bool,
+    pub publish_mqcs: bool,
+    pub multiview_configuration: bool,
+}
+
+/// A channel member the service only lets a particular set of input types carry.
+struct ChannelInputTypeRule {
+    /// The member, as a validation message names it (lowerCamel, as on the wire).
+    member: &'static str,
+    /// The `InputType` values that may carry it, from the model's `InputType` enum.
+    allowed: &'static [&'static str],
+    /// The `ValidationExceptionType` the model declares for this combination.
+    exception_type: &'static str,
+    /// What the member is called in the sentence the refusal states.
+    label: &'static str,
+    /// Whether the request carries the member at all.
+    present: fn(&SubmittedChannelMembers) -> bool,
+}
+
+/// Every `InputType` restriction the model states for a channel member, one row per
+/// `ValidationExceptionType` that names one.
+///
+/// The rows are read off the model, not guessed: each member's own doc says which input
+/// types may carry it (`OutputLockingMode` — "only configurable when the channel
+/// InputType is CMAF or MULTIVIEW"; `MQCSInputSwitching` / `PreferredInput` /
+/// `PublishMQCS` — "valid only when InputType is CMAF"; `MultiviewConfiguration` —
+/// "required when InputType is MULTIVIEW, and can't be set for any other input type"),
+/// and `ValidationExceptionType` carries exactly one discriminator per row.
+const CHANNEL_INPUT_TYPE_RULES: &[ChannelInputTypeRule] = &[
+    ChannelInputTypeRule {
+        member: "outputLockingMode",
+        allowed: &["CMAF", "MULTIVIEW"],
+        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE",
+        label: "OutputLockingMode",
+        present: |submitted| submitted.output_locking_mode,
+    },
+    ChannelInputTypeRule {
+        member: "inputSwitchConfiguration.mqcsInputSwitching",
+        allowed: &["CMAF"],
+        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_INPUT_SWITCHING",
+        label: "MQCS input switching",
+        present: |submitted| submitted.mqcs_input_switching,
+    },
+    ChannelInputTypeRule {
+        member: "inputSwitchConfiguration.preferredInput",
+        allowed: &["CMAF"],
+        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_PREFERRED_INPUT_CONFIGURATION",
+        label: "PreferredInput",
+        present: |submitted| submitted.preferred_input,
+    },
+    ChannelInputTypeRule {
+        member: "outputHeaderConfiguration.publishMqcs",
+        allowed: &["CMAF"],
+        exception_type: "ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_OUTPUT_CONFIGURATION",
+        label: "PublishMQCS",
+        present: |submitted| submitted.publish_mqcs,
+    },
+    ChannelInputTypeRule {
+        member: "multiviewConfiguration",
+        allowed: &[INPUT_TYPE_MULTIVIEW],
+        exception_type: "MULTIVIEW_CONFIGURATION_NOT_ALLOWED",
+        label: "MultiviewConfiguration",
+        present: |submitted| submitted.multiview_configuration,
+    },
+];
+
+/// The `InputType` whose channels are the only ones that carry a multiview
+/// configuration, and which require one, from the model's `InputType` enum.
+pub const INPUT_TYPE_MULTIVIEW: &str = "MULTIVIEW";
+
+/// The first `InputType` restriction a request breaks, as the modeled
+/// `ValidationException` to answer it with, or `None` when every member it carries is
+/// allowed on `input_type`.
+pub fn channel_input_type_violation(
+    submitted: SubmittedChannelMembers,
+    input_type: &str,
+) -> Option<ValidationException> {
+    CHANNEL_INPUT_TYPE_RULES
+        .iter()
+        .find(|rule| (rule.present)(&submitted) && !rule.allowed.contains(&input_type))
+        .map(|rule| {
+            validation_failed(
+                rule.member,
+                &format!(
+                    "{} can only be configured when the channel InputType is {}. To use \
+                     {}, create a channel with {} input type",
+                    rule.label,
+                    rule.allowed.join(" or "),
+                    rule.label,
+                    rule.allowed.join(" or ")
+                ),
+                rule.exception_type,
+            )
+        })
 }
 
 /// Why a pagination token this service did not issue is refused — the detail

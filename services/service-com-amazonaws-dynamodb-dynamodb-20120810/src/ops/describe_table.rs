@@ -143,7 +143,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name(&input.table_name).map_err(lift)?;
@@ -153,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose DeleteTable span has elapsed is gone, and this is a read, so that is
         // the only write it makes.
         store.apply_due_transitions(now);
-        let table = store.table(&name).map_err(lift)?;
+        let table = store.table(&region, &name).map_err(lift)?;
 
         Ok(DescribeTableOutput {
             table: Some(table.describe(now)),

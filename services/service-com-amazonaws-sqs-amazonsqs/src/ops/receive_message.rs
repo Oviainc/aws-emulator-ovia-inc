@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReceiveMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReceiveMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReceiveMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation hands out the queue's currently visible messages from
+//! [`crate::state`], makes each one invisible for the effective visibility timeout and
+//! mints a receipt handle per delivery. It is the ONLY file to touch for
+//! `ReceiveMessage`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,6 +164,36 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as sqs;
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
+
+/// How long a long-polling receive waits between looks at the queue. Short enough that
+/// a message sent during the wait is handed over promptly, long enough not to spin.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Does `requested` ask for the message attribute (or system attribute) `name`?
+///
+/// The forms Amazon SQS accepts in `MessageAttributeNames`: `All` and `.*` select every
+/// attribute, `prefix.*` selects every attribute whose name starts with `prefix.`, and
+/// anything else is an exact name.
+fn selects(requested: &[String], name: &str) -> bool {
+    requested.iter().any(|pattern| {
+        if pattern == sqs::ALL_ATTRIBUTES || pattern == ".*" {
+            return true;
+        }
+        // The documented selector forms are `All`, `.*` and `prefix.*`; anything else
+        // is an exact name. The `*` alone is stripped, so the `.` stays part of the
+        // prefix: `bar.*` selects `bar.baz`, while `bar*` is an exact name.
+        match pattern
+            .strip_suffix('*')
+            .filter(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
+        {
+            Some(prefix) => name.starts_with(prefix) && name.len() > prefix.len(),
+            None => pattern == name,
+        }
+    })
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -250,18 +275,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReceiveMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReceiveMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReceiveMessage"))
+        let _ = ctx;
+
+        // "The maximum number of messages to return. ... Valid values: 1 to 10.
+        // Default: 1." (ReceiveMessageRequest$MaxNumberOfMessages)
+        let max_messages = input.max_number_of_messages.unwrap_or(1);
+        if !(1..=10).contains(&max_messages) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "MaxNumberOfMessages must be an integer from 1 to 10; got {max_messages}."
+            )));
+        }
+        // Each caller-chosen span is clamped against the range the model documents for
+        // the queue attribute that carries the same meaning, BEFORE anything waits on it.
+        for (member, value, attribute) in [
+            (
+                "VisibilityTimeout",
+                input.visibility_timeout,
+                sqs::VISIBILITY_TIMEOUT,
+            ),
+            (
+                "WaitTimeSeconds",
+                input.wait_time_seconds,
+                sqs::RECEIVE_MESSAGE_WAIT_TIME_SECONDS,
+            ),
+        ] {
+            let (min, max) = sqs::integer_bounds(attribute);
+            if let Some(given) = value.map(i64::from).filter(|v| *v < min || *v > max) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "{member} must be an integer from {min} to {max}; got {given}."
+                )));
+            }
+        }
+
+        // `AttributeNames` is the deprecated spelling of `MessageSystemAttributeNames`;
+        // a request may use either, so both select the same system attributes.
+        let mut system_requested: Vec<String> =
+            input.message_system_attribute_names.unwrap_or_default();
+        system_requested.extend(input.attribute_names.unwrap_or_default());
+        let attribute_requested: Vec<String> = input.message_attribute_names.unwrap_or_default();
+
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            ReceiveMessageErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+
+        let started = SystemTime::now();
+        loop {
+            let now = SystemTime::now();
+            let (messages, wait) = {
+                let mut state = store.lock();
+                let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+                    return Err(ReceiveMessageErrorModeled::QueueDoesNotExist(
+                        sqs::queue_does_not_exist(&input.queue_url),
+                    )
+                    .into());
+                };
+                // Retention lapses and visibility timeouts are owed by the clock: this
+                // materialises what was already due, it does not consume anything.
+                queue.materialise_due(now);
+
+                let visibility_timeout = input
+                    .visibility_timeout
+                    .map_or_else(|| queue.integer(sqs::VISIBILITY_TIMEOUT), i64::from);
+                let wait = sqs::seconds(input.wait_time_seconds.map_or_else(
+                    || queue.integer(sqs::RECEIVE_MESSAGE_WAIT_TIME_SECONDS),
+                    i64::from,
+                ));
+
+                let taking: Vec<usize> = queue
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| message.visibility(now) == sqs::Visibility::Visible)
+                    .map(|(index, _)| index)
+                    .take(usize::try_from(max_messages).unwrap_or(1))
+                    .collect();
+
+                let mut delivered = Vec::with_capacity(taking.len());
+                let mut minted = Vec::with_capacity(taking.len());
+                for index in taking {
+                    let receipt_handle = sqs::new_identifier();
+                    let message = &mut queue.messages[index];
+                    message.receive_count = message.receive_count.saturating_add(1);
+                    if message.first_received_at.is_none() {
+                        message.first_received_at = Some(now);
+                    }
+                    message.invisible_until = Some(sqs::after(now, visibility_timeout));
+                    minted.push((receipt_handle.clone(), message.message_id.clone()));
+
+                    let attributes = system_attributes(message, &system_requested);
+                    // The digest covers the attributes this answer RETURNS, which is what
+                    // an SDK verifies it against; a request that selects a subset therefore
+                    // gets the digest of that subset, not of the stored set.
+                    let message_attributes: BTreeMap<String, MessageAttributeValue> = message
+                        .message_attributes
+                        .iter()
+                        .filter(|(name, _)| selects(&attribute_requested, name))
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect();
+                    delivered.push(Message {
+                        message_id: Some(message.message_id.clone()),
+                        receipt_handle: Some(receipt_handle),
+                        md5_of_body: Some(message.md5_of_body.clone()),
+                        body: Some(message.body.clone()),
+                        attributes: (!attributes.is_empty())
+                            .then(|| attributes.into_iter().collect()),
+                        md5_of_message_attributes: sqs::md5_of_message_attributes(
+                            &message_attributes,
+                        ),
+                        message_attributes: (!message_attributes.is_empty())
+                            .then(|| message_attributes.into_iter().collect()),
+                    });
+                }
+                for (receipt_handle, message_id) in minted {
+                    // Replaces the handle an earlier receive minted for this message, so
+                    // re-receiving cannot accumulate handles.
+                    queue.record_receipt_handle(receipt_handle, &message_id);
+                }
+                (delivered, wait)
+            };
+
+            if !messages.is_empty() {
+                return Ok(ReceiveMessageOutput {
+                    messages: Some(messages),
+                });
+            }
+            let elapsed = now.duration_since(started).unwrap_or_default();
+            if elapsed >= wait {
+                // An empty queue is an empty success, not an error: the output simply
+                // carries no `Messages` member.
+                return Ok(ReceiveMessageOutput { messages: None });
+            }
+            tokio::time::sleep((wait - elapsed).min(POLL_INTERVAL)).await;
+        }
     }
+}
+
+/// The message system attributes this emulator holds, filtered to the ones `requested`
+/// selects.
+///
+/// Only the attributes the emulator genuinely records are reported:
+/// `SentTimestamp`, `ApproximateReceiveCount` and `ApproximateFirstReceiveTimestamp`.
+/// The rest of the `MessageSystemAttributeName` set belongs to behaviour that is not
+/// implemented (FIFO sequencing and deduplication, X-Ray trace headers, dead-letter
+/// redrive, caller principals), so it is omitted rather than invented.
+fn system_attributes(
+    message: &sqs::StoredMessage,
+    requested: &[String],
+) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::new();
+    let mut offer = |name: &str, value: String| {
+        if selects(requested, name) {
+            attributes.insert(name.to_string(), value);
+        }
+    };
+    offer("SentTimestamp", sqs::epoch_millis(message.sent_at));
+    offer(
+        "ApproximateReceiveCount",
+        message.receive_count.to_string(),
+    );
+    if let Some(first) = message.first_received_at {
+        offer("ApproximateFirstReceiveTimestamp", sqs::epoch_millis(first));
+    }
+    attributes
 }

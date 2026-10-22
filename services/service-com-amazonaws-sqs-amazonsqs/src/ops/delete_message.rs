@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation removes the message a receipt handle refers to from the
+//! queue in [`crate::state`], permanently. It is the ONLY file to touch for
+//! `DeleteMessage`.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +85,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as sqs;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -185,18 +181,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMessage"))
+        let _ = ctx;
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            DeleteMessageErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+        let mut state = store.lock();
+
+        let now = SystemTime::now();
+        let Some(queue) = state.queue_by_url_mut(&input.queue_url) else {
+            return Err(DeleteMessageErrorModeled::QueueDoesNotExist(
+                sqs::queue_does_not_exist(&input.queue_url),
+            )
+            .into());
+        };
+        queue.materialise_due(now);
+
+        // Only a handle this queue currently holds names a message; anything else — a
+        // superseded handle, or one for an already-deleted message — is invalid.
+        let Some(message_id) = queue.handles.get(&input.receipt_handle).cloned() else {
+            return Err(DeleteMessageErrorModeled::ReceiptHandleIsInvalid(
+                sqs::receipt_handle_is_invalid(&input.receipt_handle),
+            )
+            .into());
+        };
+        // The message goes for good, so the lapsing visibility timeout cannot bring it
+        // back; every other handle minted for it goes with it.
+        queue.remove_message(&message_id);
+
+        Ok(DeleteMessageOutput)
     }
 }

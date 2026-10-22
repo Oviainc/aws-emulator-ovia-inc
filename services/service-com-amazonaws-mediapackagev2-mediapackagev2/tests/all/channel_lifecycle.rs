@@ -34,7 +34,8 @@ const REGION: &str = "us-west-2";
 ///
 /// `pub(crate)` so the crate's other suites drive the emulator through this one client
 /// rather than each growing its own copy of it (see `tests/all/channel_reset.rs`,
-/// `tests/all/control_plane_validation.rs` and `tests/all/origin_endpoint_reset.rs`).
+/// `tests/all/control_plane_validation.rs`, `tests/all/origin_endpoint_reset.rs`,
+/// `tests/all/channel_listing.rs` and `tests/all/channel_update.rs`).
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
@@ -133,7 +134,7 @@ impl Emulator {
             .await
     }
 
-    async fn delete_channel(&self, group: &str, name: &str) -> (u16, Value) {
+    pub(crate) async fn delete_channel(&self, group: &str, name: &str) -> (u16, Value) {
         self.call(
             "DELETE",
             &format!("/channelGroup/{group}/channel/{name}/"),

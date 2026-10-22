@@ -16,11 +16,18 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time` is needed for ReceiveMessage long polling (WaitTimeSeconds).
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# MD5 of a message body / of the message-attribute encoding, which SQS returns.
+md-5 = "0.10"
+# Hex rendering of those digests.
+hex = { workspace = true }
+# MessageId / ReceiptHandle identifiers.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
