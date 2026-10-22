@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPricingRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPricingRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPricingRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the pricing rules this service holds, one page at a time — the read that
+//! `CreatePricingRule` and `DeletePricingRule` are observable through.
 //!
 //! ## Shape of an operation
 //!
@@ -119,6 +112,35 @@ impl From<ListPricingRulesErrorModeled> for ListPricingRulesError {
     }
 }
 
+/// The modelled view of a stored rule. `AssociatedPricingPlanCount` is derived from
+/// the pricing plans that name the rule, never stored beside it.
+fn element(
+    rule: &crate::state::PricingRuleRecord,
+    associated_pricing_plan_count: i64,
+) -> PricingRuleListElement {
+    PricingRuleListElement {
+        name: Some(rule.name.clone()),
+        arn: Some(rule.arn.clone()),
+        description: rule.description.clone(),
+        scope: Some(rule.scope.clone()),
+        r#type: Some(rule.rule_type.clone()),
+        modifier_percentage: rule.modifier_percentage,
+        service: rule.service.clone(),
+        associated_pricing_plan_count,
+        creation_time: rule.creation_time_millis,
+        last_modified_time: rule.last_modified_time_millis,
+        billing_entity: rule.billing_entity.clone(),
+        tiering: rule.tiering.as_ref().map(|tiering| Tiering {
+            free_tier: tiering
+                .free_tier_activated
+                .map(|activated| FreeTierConfig { activated }),
+            custom_tiers: tiering.custom_tiers.clone(),
+        }),
+        usage_type: rule.usage_type.clone(),
+        operation: rule.operation.clone(),
+    }
+}
+
 /// The `ListPricingRules` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,18 +177,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPricingRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPricingRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPricingRules"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPricingRulesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // `Filters.Arns` is "a list containing the pricing rule Amazon Resource Names
+        // (ARNs) to include in the API response": an absent filter includes every
+        // rule, and an ARN may be given in either spelling the `PricingRuleArn`
+        // pattern allows, so both sides are normalised before they are compared.
+        let wanted: Option<Vec<String>> = input
+            .filters
+            .and_then(|filters| filters.arns)
+            .map(|arns| {
+                arns.iter()
+                    .map(|arn| crate::state::normalize_pricing_rule_arn(arn))
+                    .collect()
+            });
+
+        // `pricing_rules` is ordered by ARN, and an ARN carries the monotonic id this
+        // service mints, so the sequence is creation order and a `NextToken` names the
+        // same cut point on the next call.
+        let selected: Vec<(String, PricingRuleListElement)> = state
+            .pricing_rules
+            .iter()
+            .filter(|(arn, _)| wanted.as_ref().is_none_or(|wanted| wanted.contains(arn)))
+            .map(|(arn, rule)| {
+                (
+                    arn.clone(),
+                    element(rule, state.associated_pricing_plan_count(arn)),
+                )
+            })
+            .collect();
+
+        let (pricing_rules, next_token) =
+            crate::state::paginate(selected, input.next_token.as_deref(), input.max_results);
+
+        Ok(ListPricingRulesOutput {
+            // "The billing period for which the described pricing rules are
+            // applicable." This emulator keeps no per-billing-period history of a
+            // rule, so every period reports the rules as they stand now and the answer
+            // names the period the request asked about; a request that named none
+            // leaves it absent rather than inventing one.
+            billing_period: input.billing_period,
+            pricing_rules: Some(pricing_rules),
+            next_token,
+        })
     }
 }

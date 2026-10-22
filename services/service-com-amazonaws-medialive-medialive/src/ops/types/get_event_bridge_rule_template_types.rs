@@ -17,7 +17,11 @@ pub struct GetEventBridgeRuleTemplateInput {
     pub identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#GetEventBridgeRuleTemplateResponse")]
+/// `GetEventBridgeRuleTemplateResponse`, with its schema written out instead of derived
+/// because `CreatedAt` and `ModifiedAt` target `__timestampIso8601`, which is
+/// `@timestampFormat("date-time")`; the note in `shared_types` says why that cannot be
+/// derived here. Member for member this is the model's shape: same ids, same order, same
+/// indices.
 #[derive(Debug, Clone, Default)]
 pub struct GetEventBridgeRuleTemplateOutput {
     pub arn: Option<String>,
@@ -31,4 +35,10 @@ pub struct GetEventBridgeRuleTemplateOutput {
     pub name: Option<String>,
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
+
+shared_types::event_bridge_rule_template_response!(
+    GetEventBridgeRuleTemplateOutput,
+    GET_EVENT_BRIDGE_RULE_TEMPLATE_OUTPUT_SCHEMA,
+    "GetEventBridgeRuleTemplateResponse"
+);
 

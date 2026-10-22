@@ -15,6 +15,8 @@
 mod error_response_bodies;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/retention_rule_fidelity.rs"]
+mod retention_rule_fidelity;
 #[path = "all/retention_rule_lifecycle.rs"]
 mod retention_rule_lifecycle;
 #[path = "all/rule_lock_transitions.rs"]

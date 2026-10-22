@@ -33,7 +33,7 @@ use crate::schema_mapping_workflow_lifecycle::{
 
 /// `POST /idmappingworkflows` — `CreateIdMappingWorkflow`'s modelled HTTP binding
 /// (`smithy_query(query="operation",operation="CreateIdMappingWorkflow")`).
-async fn create_id_mapping_workflow(emulator: &Emulator, request: &Value) -> Reply {
+pub(crate) async fn create_id_mapping_workflow(emulator: &Emulator, request: &Value) -> Reply {
     emulator
         .call("POST", "/idmappingworkflows", Some(request))
         .await
@@ -41,7 +41,7 @@ async fn create_id_mapping_workflow(emulator: &Emulator, request: &Value) -> Rep
 
 /// `GET /idmappingworkflows/{workflowName}` — `GetIdMappingWorkflow`'s modelled HTTP
 /// binding.
-async fn get_id_mapping_workflow(emulator: &Emulator, workflow_name: &str) -> Reply {
+pub(crate) async fn get_id_mapping_workflow(emulator: &Emulator, workflow_name: &str) -> Reply {
     emulator
         .call("GET", &format!("/idmappingworkflows/{workflow_name}"), None)
         .await
@@ -55,14 +55,15 @@ pub(crate) const ID_MAPPING_TYPES: &[&str] = &["PROVIDER", "RULE_BASED"];
 
 /// The values `IdMappingWorkflowRuleDefinitionType` accepts on the wire, from
 /// `smithy_query(query="shape",shape="IdMappingRuleBasedProperties")`.
-const RULE_DEFINITION_TYPES: &[&str] = &["SOURCE", "TARGET"];
+pub(crate) const RULE_DEFINITION_TYPES: &[&str] = &["SOURCE", "TARGET"];
 
 /// The values `AttributeMatchingModel` accepts on the wire, same source.
-const ATTRIBUTE_MATCHING_MODELS: &[&str] = &["MANY_TO_MANY", "ONE_TO_ONE"];
+pub(crate) const ATTRIBUTE_MATCHING_MODELS: &[&str] = &["MANY_TO_MANY", "ONE_TO_ONE"];
 
 /// The values `RecordMatchingModel` accepts on the wire, from
 /// `smithy_query(query="shape",shape="RecordMatchingModel")`.
-const RECORD_MATCHING_MODELS: &[&str] = &["ONE_SOURCE_TO_ONE_TARGET", "MANY_SOURCE_TO_ONE_TARGET"];
+pub(crate) const RECORD_MATCHING_MODELS: &[&str] =
+    &["ONE_SOURCE_TO_ONE_TARGET", "MANY_SOURCE_TO_ONE_TARGET"];
 
 /// The values `IdNamespaceType` accepts on `IdMappingWorkflowInputSource$type`, from
 /// `smithy_query(query="shape",shape="IdMappingWorkflowInputSource")`. `pub(crate)`
@@ -79,7 +80,7 @@ pub(crate) fn provider_service_arn(provider: &str, service: &str) -> String {
 
 /// A customer KMS key ARN for `IdMappingWorkflowOutputSource$KMSArn`, whose modelled
 /// pattern is `^arn:aws:kms:.*:[0-9]+:.*$`.
-fn kms_arn() -> String {
+pub(crate) fn kms_arn() -> String {
     format!("arn:aws:kms:{REGION}:{}:key/er-output", account_id())
 }
 
@@ -153,7 +154,7 @@ impl WorkflowCase {
 }
 
 /// A rule-based `IdMappingTechniques`, with each enum taken from its own catalog.
-fn rule_based(
+pub(crate) fn rule_based(
     rule_definition_type: &str,
     attribute_matching_model: &str,
     record_matching_model: &str,

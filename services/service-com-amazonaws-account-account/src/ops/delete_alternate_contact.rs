@@ -206,10 +206,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if removed.is_none() {
             // Nothing of that type was stored, so there was no resource to delete —
-            // which is also what a second delete of the same type sees.
+            // which is also what a second delete of the same type sees. The message
+            // is the one constant sentence this service states for an unset contact
+            // (`state::ALTERNATE_CONTACT_NOT_FOUND_MESSAGE`), identical to the one
+            // `GetAlternateContact` answers with.
             return Err(
                 DeleteAlternateContactErrorModeled::ResourceNotFoundException(
-                    crate::state::alternate_contact_not_found(&account_id, contact_type.as_wire()),
+                    crate::state::alternate_contact_not_found(),
                 )
                 .into(),
             );

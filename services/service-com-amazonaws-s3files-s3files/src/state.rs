@@ -106,6 +106,14 @@ pub struct FileSystem {
     /// present", so it is never stored independently of [`Self::tags`].
     pub name: Option<String>,
     pub tags: Vec<Tag>,
+    /// The IAM resource policy attached to this file system, if one is attached.
+    ///
+    /// The policy is a sub-resource of the file system (`PutFileSystemPolicy` is bound
+    /// to `/file-systems/{fileSystemId}/policy`), so it lives on the record and is
+    /// released with it rather than in a map of its own. The document is stored exactly
+    /// as it was put — the service is given an opaque JSON document, so re-rendering it
+    /// would change what the caller gets back.
+    pub policy: Option<String>,
     /// Creation order, so a listing paginates deterministically.
     pub sequence: u64,
 }
@@ -406,6 +414,54 @@ pub fn not_found(message: impl Into<String>) -> ResourceNotFoundException {
         error_code: "ResourceNotFoundException".to_string(),
         message: Some(message.into()),
     }
+}
+
+/// The `message` the modelled `ResourceNotFoundException` reports for a file system
+/// that holds no IAM resource policy.
+///
+/// ONE constant sentence naming the kind of resource that is missing, carrying nothing
+/// from the request: the policy sub-resource has no id of its own to report, and the
+/// file system is already named by the request's own path label. This is the sentence
+/// S3 Files answers with, so a client matching on it keeps working.
+pub const POLICY_NOT_FOUND_MESSAGE: &str = "File system policy does not exist.";
+
+/// Why `policy` is not a document `PutFileSystemPolicy` can accept, or `None` when it
+/// is one.
+///
+/// `PutFileSystemPolicyRequest$policy` documents: "The policy must be a valid JSON
+/// document that follows IAM policy syntax." The IAM JSON policy grammar makes the
+/// top-level element a single JSON object whose `Statement` element is required and
+/// holds either one statement block or an array of statement blocks. Nothing beyond
+/// that is checked here: the remaining elements are free-form to this service, which
+/// stores the document rather than evaluating it.
+pub fn policy_document_rejection(policy: &str) -> Option<String> {
+    let document = match ::serde_json::from_str::<::serde_json::Value>(policy) {
+        Ok(document) => document,
+        Err(error) => return Some(format!("it is not a valid JSON document ({error})")),
+    };
+    let Some(elements) = document.as_object() else {
+        return Some("the top-level element of an IAM policy document is a JSON object".to_string());
+    };
+    let Some(statement) = elements.get("Statement") else {
+        return Some("an IAM policy document requires a Statement element".to_string());
+    };
+    let blocks: Vec<&::serde_json::Value> = match statement {
+        ::serde_json::Value::Object(_) => vec![statement],
+        ::serde_json::Value::Array(blocks) => blocks.iter().collect(),
+        _ => {
+            return Some(
+                "Statement holds one statement block or an array of statement blocks"
+                    .to_string(),
+            )
+        }
+    };
+    if blocks.is_empty() {
+        return Some("Statement holds at least one statement block".to_string());
+    }
+    if blocks.iter().any(|block| !block.is_object()) {
+        return Some("every statement block in Statement is a JSON object".to_string());
+    }
+    None
 }
 
 /// The modelled 400 for a request value this service cannot accept.

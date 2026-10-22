@@ -275,6 +275,12 @@ pub const OBJECT_TAG_SET_LIMITS: TagSetLimits = TagSetLimits {
 pub enum TagSetRejectionCause {
     /// The tag set carries more tags than its resource's [`TagSetLimits::max_tags`].
     TooManyTags { count: usize },
+    /// A tag carries an EMPTY key. `Tag$Key` targets `ObjectKey`, `length {min 1}`
+    /// (`smithy_query(query="shape",shape="Tag")`), so the modelled `Tagging` container
+    /// can never carry one — but a tag set that arrives as the URL-encoded
+    /// `x-amz-tagging` header is not a modelled `Tag` list, so this is where such a pair
+    /// is caught (see [`tag_set_from_header`]).
+    EmptyKey,
     /// A key is longer than [`MAX_TAG_KEY_CHARS`] Unicode characters.
     KeyTooLong { chars: usize },
     /// A value is longer than [`MAX_TAG_VALUE_CHARS`] Unicode characters.
@@ -301,6 +307,11 @@ impl std::fmt::Display for TagSetRejection {
                 f,
                 "Tagging.TagSet carries {count} tags, more than the {max_tags} \
                  tags one {resource} may hold"
+            ),
+            TagSetRejectionCause::EmptyKey => write!(
+                f,
+                "Tagging.TagSet has a Tag with an empty Tag.Key; a {resource} tag key \
+                 holds at least one character"
             ),
             TagSetRejectionCause::KeyTooLong { chars } => write!(
                 f,
@@ -339,6 +350,9 @@ pub fn validate_tag_set(
     }
     let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for tag in tags {
+        if tag.key.is_empty() {
+            return refuse(TagSetRejectionCause::EmptyKey);
+        }
         let key_chars = tag.key.chars().count();
         if key_chars > MAX_TAG_KEY_CHARS {
             return refuse(TagSetRejectionCause::KeyTooLong { chars: key_chars });
@@ -357,6 +371,45 @@ pub fn validate_tag_set(
         }
     }
     Ok(())
+}
+
+/// The tag set a write's `x-amz-tagging` header names, or which published restriction it
+/// breaks — the ONE seam a handler uses, so no handler can store a header-delivered tag
+/// set the limits would have refused.
+///
+/// "The tag-set for the object. The tag-set must be encoded as URL Query parameters. (For
+/// example, "Key1=Value1")" — `PutObjectRequest$Tagging`, and the same sentence on
+/// `CopyObjectRequest$Tagging` and `CreateMultipartUploadRequest$Tagging`. So the header
+/// is an `application/x-www-form-urlencoded` string, read with the runtime's own parser
+/// for that grammar (`aws_smithy_schema_server::query::parse_form_urlencoded`, which the
+/// query-protocol services already read their bodies with): each `&`-separated pair is
+/// one tag, percent escapes and `+` are decoded, and a pair with no `=` is a key with an
+/// empty value. An EMPTY header carries no pairs and so is an empty tag set — the same
+/// state as no tag set at all.
+///
+/// The PAIR COUNT is judged BEFORE the set is materialised, by counting the `&`-separated
+/// pairs the same grammar defines — which allocates nothing — so a header naming more
+/// pairs than the resource may hold is refused for exactly that without this process ever
+/// holding a tag set it would never store. What is then materialised is at most
+/// `limits.max_tags` tags, each judged by [`validate_tag_set`] like any other tag set.
+pub fn tag_set_from_header(
+    header: &str,
+    limits: TagSetLimits,
+) -> Result<Vec<ResourceTag>, TagSetRejection> {
+    let pairs = header.split('&').filter(|pair| !pair.is_empty()).count();
+    if pairs > limits.max_tags {
+        return Err(TagSetRejection {
+            limits,
+            cause: TagSetRejectionCause::TooManyTags { count: pairs },
+        });
+    }
+    let tags: Vec<ResourceTag> =
+        ::aws_smithy_schema_server::query::parse_form_urlencoded(header.as_bytes())
+            .into_iter()
+            .map(|(key, value)| ResourceTag { key, value })
+            .collect();
+    validate_tag_set(&tags, limits)?;
+    Ok(tags)
 }
 
 /// The versioning state a bucket carries once `PutBucketVersioning` has set one.
@@ -1310,6 +1363,18 @@ impl Object {
             .filter_map(|header| header.as_ref())
             .map(String::len)
             .sum::<usize>()
+    }
+
+    /// How many tags this object's tag set carries, or `None` when it carries none —
+    /// what `GetObject`'s and `HeadObject`'s `TagCount` reports: "The number of tags, if
+    /// any, on the object", so an object with no tags reports no count rather than a zero.
+    ///
+    /// ONE place, so the two readers of this member cannot drift. The count fits an `i32`
+    /// for any tag set this store accepts ([`validate_tag_set`] bounds it at
+    /// [`MAX_TAGS_PER_OBJECT`]), and a set that somehow grew past that reports the largest
+    /// count the member can carry rather than a wrapped one.
+    pub fn tag_count(&self) -> Option<i32> {
+        (!self.tags.is_empty()).then(|| i32::try_from(self.tags.len()).unwrap_or(i32::MAX))
     }
 
     /// How large this object's user-defined metadata is, in UTF-8 bytes summed over every

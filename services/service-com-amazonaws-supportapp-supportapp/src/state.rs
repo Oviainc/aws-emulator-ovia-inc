@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::SlackChannelConfiguration;
+use crate::ops::types::{SlackChannelConfiguration, SlackWorkspaceConfiguration};
 
 /// The most Slack channel configurations this account can hold.
 ///
@@ -38,6 +38,15 @@ pub const CHANNEL_PAGE_SIZE: usize = 10;
 /// `ValidationException`), so a registration past this quota is refused with that
 /// operation's modelled `ValidationException`.
 pub const MAX_SLACK_WORKSPACE_CONFIGURATIONS: usize = 5;
+
+/// How many Slack workspace configurations one `ListSlackWorkspaceConfigurations`
+/// page reports.
+///
+/// The service publishes no page size, so this is a CHOSEN value, picked the same way
+/// [`CHANNEL_PAGE_SIZE`] is: half the documented quota above, which keeps the modelled
+/// `nextToken` path reachable for an account that is within its quota instead of
+/// making it dead code.
+pub const WORKSPACE_PAGE_SIZE: usize = MAX_SLACK_WORKSPACE_CONFIGURATIONS / 2;
 
 /// Whether the single account this emulator presents is an organization's management
 /// or member account, as `RegisterSlackWorkspaceForOrganization` reports it in
@@ -85,13 +94,23 @@ impl SlackChannelConfig {
 
 /// One stored Slack workspace configuration, as
 /// `RegisterSlackWorkspaceForOrganization` records it and
-/// `ListSlackWorkspaceConfigurations` will report it (that operation is still
-/// scaffolded and carries its own gap issue).
+/// `ListSlackWorkspaceConfigurations` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlackWorkspaceConfig {
     pub team_id: String,
     pub team_name: Option<String>,
     pub allow_organization_member_account: Option<bool>,
+}
+
+impl SlackWorkspaceConfig {
+    /// This record as the modelled `SlackWorkspaceConfiguration`.
+    pub fn to_modeled(&self) -> SlackWorkspaceConfiguration {
+        SlackWorkspaceConfiguration {
+            team_id: self.team_id.clone(),
+            team_name: self.team_name.clone(),
+            allow_organization_member_account: self.allow_organization_member_account,
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-supportapp-supportapp. A handler reaches it through [`service_state`].
@@ -128,25 +147,33 @@ pub fn workspace_not_registered_message(team_id: &str) -> String {
     )
 }
 
-/// The pagination cursor for a page that starts at `(team_id, channel_id)`.
+/// The pagination cursor for a page that resumes after `reported_so_far` records of a
+/// listing, shared by every paginated operation of this service.
 ///
-/// Hex of the composite key rather than the key itself, so a caller cannot read
-/// structure into the token and has nothing to build one from: a `nextToken` is
-/// opaque and only ever travels back unchanged. `teamId` and `channelId` are both
-/// `pattern ^\S+$`, so a single space separates them unambiguously.
-pub fn encode_cursor(team_id: &str, channel_id: &str) -> String {
-    ::hex::encode(format!("{team_id} {channel_id}").as_bytes())
+/// Hex of the count rather than the count itself, so a caller cannot read structure
+/// into the token and has nothing to build one from: a `nextToken` is opaque and only
+/// ever travels back unchanged.
+///
+/// A COUNT is what the token can carry, rather than the start key itself: every
+/// `nextToken` targets `paginationToken`, which is `len 1..256`, while a key-derived
+/// token costs two characters per key byte and a `teamId` alone is `len 1..256`
+/// (`smithy_query(query="operation",operation="ListSlackWorkspaceConfigurations")`),
+/// so a token built from a key leaves the modelled constraint for ids this API
+/// accepts. Each listing walks its store in key order (a `BTreeMap`), so the count
+/// names the position the next page resumes at.
+pub fn encode_cursor(reported_so_far: usize) -> String {
+    ::hex::encode(reported_so_far.to_string().as_bytes())
 }
 
-/// The inclusive start key a cursor minted by [`encode_cursor`] carries, or `None`
-/// when the token was not minted by this service.
-pub fn decode_cursor(token: &str) -> Option<(String, String)> {
+/// How many records a cursor minted by [`encode_cursor`] skips, or `None` when the
+/// token was not minted by this service.
+///
+/// Only the canonical spelling this service mints decodes: `parse` alone would also
+/// accept a leading `+` or `007`, which no minted token carries.
+pub fn decode_cursor(token: &str) -> Option<usize> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let (team_id, channel_id) = decoded.split_once(' ')?;
-    if team_id.is_empty() || channel_id.is_empty() {
-        return None;
-    }
-    Some((team_id.to_string(), channel_id.to_string()))
+    let position: usize = decoded.parse().ok()?;
+    (position.to_string() == decoded).then_some(position)
 }
 
 /// The three notification flags as this service's PROSE names them.

@@ -273,6 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             // No telemetry has arrived for a monitor this call just created.
             events: ::std::collections::VecDeque::new(),
+            // A monitor is created with no resource policy: `PutResourcePolicy` is the
+            // only call that attaches one.
+            resource_policy: None,
         });
 
         // The id was minted and stored under the SAME lock this call still holds, so the

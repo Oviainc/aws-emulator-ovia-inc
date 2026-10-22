@@ -35,7 +35,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// A region that is NOT the emulator default, so an ARN built from the request's own
 /// SigV4 credential scope is distinguishable from a hardcoded one.
-const REGION: &str = "eu-west-2";
+pub(crate) const REGION: &str = "eu-west-2";
 
 /// The canonical emulator account id every ARN carries
 /// (`engine::emulator_account_id()`).
@@ -51,23 +51,23 @@ const PAST_PROVISIONING: Duration = Duration::from_millis(900);
 
 /// An IAM role ARN satisfying `RoleArn`'s pattern
 /// `^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
-const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/S3FilesRole";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/S3FilesRole";
 
 /// What one call answered: the HTTP status, the modelled error shape (empty on success)
 /// and the parsed body (`Value::Null` for an empty body).
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    error_type: String,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) error_type: String,
+    pub(crate) body: Value,
 }
 
 impl Answer {
-    fn field(&self, name: &str) -> &Value {
+    pub(crate) fn field(&self, name: &str) -> &Value {
         &self.body[name]
     }
 
-    fn text(&self, name: &str) -> String {
+    pub(crate) fn text(&self, name: &str) -> String {
         self.body[name]
             .as_str()
             .unwrap_or_else(|| panic!("expected a string `{name}` in {:?}", self.body))
@@ -75,7 +75,7 @@ impl Answer {
     }
 }
 
-fn new_router() -> MultiServiceRouter {
+pub(crate) fn new_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signature verification is the emulator's own concern and is exercised elsewhere;
@@ -87,7 +87,12 @@ fn new_router() -> MultiServiceRouter {
     router
 }
 
-async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: Option<Value>) -> Answer {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Answer {
     let payload = match body {
         Some(value) => bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")),
         None => bytes::Bytes::new(),
@@ -155,12 +160,12 @@ fn file_system_arn_prefix() -> String {
 }
 
 /// `CreateFileSystem`.
-async fn create_file_system(router: &MultiServiceRouter, body: Value) -> Answer {
+pub(crate) async fn create_file_system(router: &MultiServiceRouter, body: Value) -> Answer {
     call(router, "PUT", "/file-systems", Some(body)).await
 }
 
 /// `CreateFileSystem` on `bucket`, asserting it was accepted, and returning its id.
-async fn created_file_system_id(
+pub(crate) async fn created_file_system_id(
     router: &MultiServiceRouter,
     bucket: &str,
     client_token: Option<&str>,

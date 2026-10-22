@@ -23,20 +23,20 @@ use smithy_server_runtime::MultiServiceRouter;
 const ACCOUNT_ID: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The region the test signs for; the handler reads it from the SigV4 credential scope.
-const REGION: &str = "eu-west-2";
+pub(crate) const REGION: &str = "eu-west-2";
 
 /// `ResourceType` accepts exactly these values.
 /// Source: smithy_query(query="shape", shape="ResourceType") — enum values.
-const RESOURCE_TYPES: [&str; 3] = ["EBS_SNAPSHOT", "EBS_VOLUME", "EC2_IMAGE"];
+pub(crate) const RESOURCE_TYPES: [&str; 3] = ["EBS_SNAPSHOT", "EBS_VOLUME", "EC2_IMAGE"];
 
 /// Published bounds of `RetentionPeriod$RetentionPeriodValue`.
 /// Source: smithy_query(query="shape", shape="RetentionPeriod") — range {min: 1, max: 3650}.
-const RETENTION_VALUE_MIN: i64 = 1;
-const RETENTION_VALUE_MAX: i64 = 3650;
+pub(crate) const RETENTION_VALUE_MIN: i64 = 1;
+pub(crate) const RETENTION_VALUE_MAX: i64 = 3650;
 
 /// Published bounds of `UnlockDelay$UnlockDelayValue`.
 /// Source: smithy_query(query="shape", shape="UnlockDelay") — range {min: 7, max: 30}.
-const UNLOCK_DELAY_MIN: i64 = 7;
+pub(crate) const UNLOCK_DELAY_MIN: i64 = 7;
 
 pub(crate) fn router() -> MultiServiceRouter {
     // The single shared engine the production router builds and hands to every
@@ -104,7 +104,7 @@ pub(crate) async fn get_rule(router: &MultiServiceRouter, identifier: &str) -> (
     call(router, "GET", &format!("/rules/{identifier}"), None).await
 }
 
-async fn list_rules(
+pub(crate) async fn list_rules(
     router: &MultiServiceRouter,
     body: serde_json::Value,
 ) -> (u16, serde_json::Value) {
@@ -222,7 +222,10 @@ fn create_cases() -> Vec<CreateCase> {
 
 /// A response's list member, with a member the response does not carry read as the
 /// empty list — which `Tags` is for a rule that carries no tags.
-fn list_of(value: &serde_json::Value, member: &str) -> Vec<serde_json::Value> {
+///
+/// `pub(crate)` like the request helpers above: the sibling suites of this test target
+/// read a response the same way.
+pub(crate) fn list_of(value: &serde_json::Value, member: &str) -> Vec<serde_json::Value> {
     value
         .get(member)
         .and_then(serde_json::Value::as_array)

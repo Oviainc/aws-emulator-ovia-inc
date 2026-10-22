@@ -24,7 +24,7 @@ use crate::ops::types::{
     PackageOriginConfiguration, PackageOriginRestrictions, PackageSummary,
     PackageVersionDescription, PackageVersionOrigin, RepositoryDescription,
     RepositoryExternalConnectionInfo, RepositorySummary, ResourcePolicy, Tag,
-    UpstreamRepositoryInfo, PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES,
+    UpstreamRepositoryInfo, ValidationException, PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES,
 };
 
 /// This service's SigV4 signing name, which is also the service segment of every ARN
@@ -282,6 +282,12 @@ pub struct Domain {
     pub s3_bucket_arn: String,
     pub tags: Vec<Tag>,
     pub policy: Option<ResourcePolicy>,
+    /// How many resource policies this domain has ever had attached, counting the one
+    /// attached now. Never reset — not by replacing the policy and not by deleting it —
+    /// because it is what the revision in [`attached_policy`] is derived from: a revision
+    /// a caller held before a delete must not start matching again when the same document
+    /// is re-attached.
+    pub policy_attachments: u64,
     /// The domain's repositories, keyed by repository name. `repositoryCount` is
     /// derived from this map's length and never stored beside it.
     pub repositories: BTreeMap<String, Repository>,
@@ -297,6 +303,18 @@ pub struct Domain {
 }
 
 impl Domain {
+    /// Attach `document` as this domain's resource policy, replacing any policy it already
+    /// holds, and answer with the record that was stored.
+    ///
+    /// The counter advances first, so the minted revision is one this domain has never
+    /// reported — see [`attached_policy`].
+    pub fn attach_policy(&mut self, document: String) -> ResourcePolicy {
+        self.policy_attachments = self.policy_attachments.saturating_add(1);
+        let policy = attached_policy(&self.arn, document, self.policy_attachments);
+        self.policy = Some(policy.clone());
+        policy
+    }
+
     /// The modelled `DomainDescription` for this record.
     pub fn description(&self) -> DomainDescription {
         DomainDescription {
@@ -613,6 +631,9 @@ pub struct Repository {
     pub created_time: SystemTime,
     pub tags: Vec<Tag>,
     pub policy: Option<ResourcePolicy>,
+    /// How many resource policies this repository has ever had attached, counting the one
+    /// attached now — see [`Domain::policy_attachments`] for why it is never reset.
+    pub policy_attachments: u64,
     /// The packages held in this repository, keyed by [`package_key`]. Sorted for the
     /// same reason as the maps above: `ListPackages` is `@paginated`, and a stable key
     /// order is what makes its opaque `nextToken` resolve to the same place next call.
@@ -620,6 +641,19 @@ pub struct Repository {
 }
 
 impl Repository {
+    /// Attach `document` as this repository's resource policy, replacing any policy it
+    /// already holds, and answer with the record that was stored.
+    ///
+    /// The counter advances first, so the minted revision is one this repository has
+    /// never reported. Both policy-bearing records attach a policy through this one rule
+    /// ([`Domain::attach_policy`]), so a revision minted on a domain and one minted on a
+    /// repository cannot follow different schemes.
+    pub fn attach_policy(&mut self, document: String) -> ResourcePolicy {
+        self.policy_attachments = self.policy_attachments.saturating_add(1);
+        let policy = attached_policy(&self.arn, document, self.policy_attachments);
+        self.policy = Some(policy.clone());
+        policy
+    }
     /// The modelled `RepositoryDescription` for this record.
     pub fn description(&self) -> RepositoryDescription {
         RepositoryDescription {
@@ -955,6 +989,68 @@ pub fn package_cursor_scope(domain: &str, repository: &str) -> String {
 // so a revision minted by one operation is the revision the next one accepts.
 // ---------------------------------------------------------------------------
 
+/// The `ResourceType` enum member naming a domain, reported as `resourceType` beside
+/// `resourceId` on a domain-scoped policy failure and named in the messages below.
+/// `ResourceType` models exactly `domain`, `repository`, `package`, `package-version` and
+/// `asset` (`smithy_query(query="shape",shape="ResourceType")`).
+pub const DOMAIN_RESOURCE_TYPE: &str = "domain";
+
+/// The not-found message a domain-scoped policy operation reports when the domain it
+/// resolved holds no policy: the type of resource whose policy was asked for, and the name
+/// the request addressed it by. Shared by the read and the delete, so the two cannot report
+/// one domain's unset policy differently.
+pub fn no_policy_message(resource_type: &str, resource: &str) -> String {
+    format!("No policy found for ({resource_type}): ({resource})")
+}
+
+/// The conflict message a domain-scoped policy write or delete reports when the
+/// `policyRevision` the caller supplied is not the revision currently attached — the
+/// optimistic-locking refusal [`policy_revision_matches`] decides.
+pub fn policy_revision_conflict_message(resource_type: &str, resource: &str) -> String {
+    format!(
+        "The policy revision supplied for ({resource_type}): ({resource}) is not the current revision of its resource policy."
+    )
+}
+
+/// The refusal a resource-policy write owes a `policyDocument` that is not a policy, or
+/// `None` when the document is one.
+///
+/// `policyDocument` is documented as "A valid displayable JSON Aspen policy string" and
+/// the modelled pattern (`^[\P{C}\s]+$`) only forbids control characters, so JSON
+/// well-formedness is the service's own rule — checked here, once, for every resource a
+/// policy can hang off, so the modelled `reason` cannot differ between the domain and the
+/// repository families. The document is parsed ONLY to check it: what the caller sent is
+/// what gets stored ([`attached_policy`]).
+pub fn policy_document_refusal(document: &str) -> Option<ValidationException> {
+    match serde_json::from_str::<serde_json::Value>(document) {
+        Ok(serde_json::Value::Object(_)) => None,
+        Ok(other) => Some(ValidationException {
+            message: format!(
+                "policyDocument must be a JSON policy object; got a JSON {}.",
+                json_type_name(&other)
+            ),
+            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        }),
+        Err(error) => Some(ValidationException {
+            message: format!("policyDocument is not valid JSON: {error}."),
+            reason: Some("CANNOT_PARSE".to_string()),
+        }),
+    }
+}
+
+/// The JSON type name of a `policyDocument` that parsed but is not a policy object, so
+/// the refusal says what the caller actually sent.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 /// Whether a caller-supplied `policyRevision` authorises writing over the policy a
 /// resource currently holds (`current`).
 ///
@@ -972,18 +1068,13 @@ pub fn policy_revision_matches(current: Option<&ResourcePolicy>, supplied: Optio
 }
 
 /// The policy to store on the resource `resource_arn` names: `document` as the caller
-/// sent it, under a freshly minted revision that replaces `current`'s.
+/// sent it, under the revision minted for this resource's `attachment`-th policy.
 ///
 /// The document is stored VERBATIM — a resource policy is reported back as the string
 /// that was submitted, never as a re-serialised or normalised rendering of it.
-pub fn attached_policy(
-    resource_arn: &str,
-    document: String,
-    current: Option<&ResourcePolicy>,
-) -> ResourcePolicy {
-    let replaced = current.and_then(|policy| policy.revision.as_deref());
+pub fn attached_policy(resource_arn: &str, document: String, attachment: u64) -> ResourcePolicy {
     ResourcePolicy {
-        revision: Some(policy_revision(resource_arn, &document, replaced)),
+        revision: Some(policy_revision(resource_arn, &document, attachment)),
         resource_arn: Some(resource_arn.to_string()),
         document: Some(document),
     }
@@ -991,17 +1082,20 @@ pub fn attached_policy(
 
 /// The revision a resource policy carries once it is written.
 ///
-/// Derived from the resource the policy hangs off, the document being written and the
-/// revision being replaced, so it is stable across every read of the same policy (nothing
-/// per-call goes into it), differs from the revision it replaces — that revision is one of
-/// its inputs, so even re-writing a byte-identical document mints a new one, which is what
-/// makes the revision a usable optimistic lock — and is distinct between resources.
-fn policy_revision(resource_arn: &str, document: &str, replaced: Option<&str>) -> String {
+/// Derived from the resource the policy hangs off, the document being written and
+/// `attachment` — how many policies that resource has ever had attached — so it is stable
+/// across every read of the same policy (nothing per-call goes into it) and distinct
+/// between resources. The counter is what makes the revision a usable optimistic lock: it
+/// only ever grows, so every write mints a revision this resource has never reported,
+/// even one that rewrites a byte-identical document or re-attaches, after a delete, the
+/// document that was attached before it — a revision a caller still holds can therefore
+/// never start matching again.
+fn policy_revision(resource_arn: &str, document: &str, attachment: u64) -> String {
     let digest = identity_digest(&[
         "policy-revision",
         resource_arn,
         document,
-        replaced.unwrap_or_default(),
+        &attachment.to_string(),
     ]);
     // 16 bytes rendered as 32 hex characters: inside `PolicyRevision`'s modelled 1..100
     // length and matching its `^\S+$` pattern.

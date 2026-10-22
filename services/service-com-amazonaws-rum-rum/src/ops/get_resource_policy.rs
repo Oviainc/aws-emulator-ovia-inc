@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one resource-based policy an app monitor carries, read off the
+//! [`crate::state::ResourcePolicyRecord`] `PutResourcePolicy` wrote. `@readonly`: it
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +148,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        // A pure read of this service's own state; the request's metadata says nothing
+        // about which policy is reported.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `@readonly`: the lock is taken for reading only, so what this call reports is
+        // exactly what the next caller sees.
+        let store = state.lock();
+        let Some(record) = store.app_monitors.get(&input.name) else {
+            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::app_monitor_not_found(&input.name),
+            )
+            .into());
+        };
+        // The monitor exists but carries no policy: that is the modelled
+        // `PolicyNotFoundException`, distinct from the monitor itself not existing.
+        let Some(policy) = record.resource_policy.as_ref() else {
+            return Err(GetResourcePolicyErrorModeled::PolicyNotFoundException(
+                crate::state::policy_not_found(&input.name),
+            )
+            .into());
+        };
+
+        Ok(GetResourcePolicyOutput {
+            policy_document: Some(policy.document.clone()),
+            policy_revision_id: Some(policy.revision_id.clone()),
+        })
     }
 }

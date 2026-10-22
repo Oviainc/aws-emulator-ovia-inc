@@ -13,5 +13,9 @@
 // points it into `tests/all/`.
 #[path = "all/agent_runtime_lifecycle.rs"]
 mod agent_runtime_lifecycle;
+#[path = "all/gateway_lifecycle.rs"]
+mod gateway_lifecycle;
+#[path = "all/signing_name_routing.rs"]
+mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

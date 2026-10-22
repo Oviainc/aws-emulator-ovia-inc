@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
-use aws_smithy_schema_server::constraints::Violation;
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 
 use crate::ops::types::{
     ConflictException, LockConfiguration, ResourceNotFoundException, ResourceTag, RetentionPeriod,
@@ -478,8 +478,10 @@ const CONSTRAINT_MARKER: &str = " failed to satisfy constraint: ";
 /// The REQUIREMENT half is the framework's own wording for that constraint class
 /// ([`Violation::message`]), which is where the model's declared bound — a range
 /// endpoint, a `@pattern`, an enum's value set — is rendered, so no bound text is
-/// restated here. Only the SUBJECT changes: Recycle Bin names the member that failed
-/// without quoting the submitted value back.
+/// restated here. Two things change: Recycle Bin names the member that failed without
+/// quoting the submitted value back, and it reports a `@pattern` as the expression a
+/// value has to satisfy, without the `^`/`$` anchors a model spells it with (see
+/// [`unanchored`]).
 ///
 /// The requirement is read off the wording for the SAME violation with no value
 /// attached, so the submitted value is nowhere in the text this splits and cannot leak
@@ -491,7 +493,12 @@ const CONSTRAINT_MARKER: &str = " failed to satisfy constraint: ";
 fn constraint_clause(violation: &Violation) -> String {
     let unechoed = Violation {
         path: violation.path.clone(),
-        kind: violation.kind.clone(),
+        kind: match &violation.kind {
+            ViolationKind::Pattern(pattern) => {
+                ViolationKind::Pattern(unanchored(pattern).to_string())
+            }
+            other => other.clone(),
+        },
         value: None,
     };
     let stated = unechoed.message();
@@ -503,6 +510,34 @@ fn constraint_clause(violation: &Violation) -> String {
         // The framework no longer words a clause with that marker: keep its sentence,
         // which (built with no value attached) still echoes nothing of the request.
         None => stated,
+    }
+}
+
+/// A `@pattern` as Recycle Bin reports it in a validation message: the expression
+/// without the `^` and `$` anchors a model spells it with.
+///
+/// The anchors say WHERE the expression had to match, which is a fact of the constraint
+/// and not of the input; the expression a caller has to satisfy is what is left. A `$`
+/// escaped by a backslash is a literal dollar sign inside the expression, not the end
+/// anchor, so it stays.
+///
+/// MIGRATION NOTE, as `services/common/src/validation.rs` ("Still to migrate here") asks
+/// of anything that inlines this again: this rule — like the subject half and the
+/// requirement half of a clause — is the same for every service and belongs in that
+/// shared module; it is inlined here because the migration is one change of its own, and
+/// this copy is to be deleted by it rather than copied further.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
     }
 }
 

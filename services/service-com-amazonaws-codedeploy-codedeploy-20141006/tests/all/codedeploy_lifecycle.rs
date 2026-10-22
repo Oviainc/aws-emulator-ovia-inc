@@ -109,6 +109,46 @@ pub(crate) async fn seeded_group(
     group
 }
 
+/// How long a suite waits for a transition the clock owes, and how often it
+/// looks: the emulator owes a deployment its terminal status well inside this.
+pub(crate) const POLL_DEADLINE: Duration = Duration::from_secs(5);
+/// See [`POLL_DEADLINE`].
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Poll `GetDeployment` until `deployment_id` holds a terminal status, answering
+/// its `deploymentInfo`.
+///
+/// The ONE poll loop every suite of this target uses, so "what a deployment ends
+/// as" is read the same way everywhere. The terminal statuses are the members of
+/// the model's `DeploymentStatus` enum that no further transition leaves
+/// (`smithy_query(query="shape",shape="DeploymentStatus")`: Created | Queued |
+/// InProgress | Baking | Succeeded | Failed | Stopped | Ready).
+pub(crate) async fn terminal_deployment(
+    emulator: &Emulator,
+    deployment_id: &str,
+    case: &str,
+) -> Value {
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        let info = emulator
+            .ok("GetDeployment", json!({"deploymentId": deployment_id}))
+            .await["deploymentInfo"]
+            .clone();
+        if matches!(
+            info["status"].as_str(),
+            Some("Succeeded" | "Failed" | "Stopped")
+        ) {
+            return info;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected a terminal status within {POLL_DEADLINE:?}, got {:?}",
+            info["status"]
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Applications
 // ---------------------------------------------------------------------------
@@ -715,9 +755,12 @@ async fn a_deployment_group_reads_back_as_it_was_created() {
                 "case {application}: expected terminationHookEnabled true, got {info:?}"
             );
         } else {
-            assert!(
-                info["ec2TagFilters"].is_null(),
-                "case {application}: expected no ec2TagFilters, got {info:?}"
+            // A list member the request did not carry reads back as the empty
+            // list, not as an absent member.
+            assert_eq!(
+                info["ec2TagFilters"].as_array().map(Vec::len),
+                Some(0),
+                "case {application}: expected an empty ec2TagFilters, got {info:?}"
             );
             assert!(
                 info["autoRollbackConfiguration"].is_null(),
@@ -915,12 +958,15 @@ async fn a_deployment_reads_back_as_it_was_created() {
 }
 
 /// RULE: a deployment the emulator created starts non-terminal and the clock
-/// owes it its terminal `Succeeded` status, with a start and a completion time,
-/// after which reading it reports the same record every time.
+/// owes it its terminal status, with a start and a completion time, after which
+/// reading it reports the same record every time. The row here is a deployment
+/// whose group resolves a target, so its terminal status is `Succeeded`; which
+/// terminal status a group's targets imply is covered in
+/// `codedeploy_deployment_outcome`.
 #[tokio::test]
 async fn a_deployment_reaches_a_terminal_status() {
     let emulator = Emulator::new();
-    let group = seeded_group(&emulator, "waited-on", "Server").await;
+    let group = seeded_group(&emulator, "waited-on", "Lambda").await;
     let created = emulator
         .ok(
             "CreateDeployment",
@@ -1047,7 +1093,10 @@ async fn a_deployment_needs_an_application_a_group_and_a_revision() {
         );
     }
 
-    for unknown in ["d-NOTREAL1", "d-ZZZZZZZZZ"] {
+    // Both ids are WELL FORMED (`d-` and nine characters of the deployment-id
+    // alphabet), so they are answered on existence rather than on format; the
+    // format gate itself is covered in `codedeploy_deployment_outcome`.
+    for unknown in ["d-NOTREAL12", "d-ZZZZZZZZZ"] {
         let (status, body) = emulator
             .call("GetDeployment", json!({"deploymentId": unknown}))
             .await;
@@ -1175,18 +1224,20 @@ async fn listing_deployments_orders_and_filters_by_the_stored_records() {
         );
     }
 
-    // A status every deployment eventually holds selects them all.
+    // A status every deployment eventually holds selects them all. Every group
+    // here is an EC2/on-premises one that resolves no target, so the status they
+    // all reach is `Failed`.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let succeeded = ids(&emulator
-            .ok("ListDeployments", json!({"includeOnlyStatuses": ["Succeeded"]}))
+            .ok("ListDeployments", json!({"includeOnlyStatuses": ["Failed"]}))
             .await);
         if succeeded == newest_first {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "case by status Succeeded: expected every deployment within 5s, got {succeeded:?}"
+            "case by status Failed: expected every deployment within 5s, got {succeeded:?}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -1239,7 +1290,7 @@ async fn listing_deployments_orders_and_filters_by_the_stored_records() {
 #[tokio::test]
 async fn a_deployment_group_reports_its_last_deployment() {
     let emulator = Emulator::new();
-    let group = seeded_group(&emulator, "tracked", "Server").await;
+    let group = seeded_group(&emulator, "tracked", "Lambda").await;
 
     let before = emulator
         .ok(
@@ -1306,6 +1357,52 @@ async fn a_deployment_group_reports_its_last_deployment() {
         assert!(
             Instant::now() < deadline,
             "case succeeded deployment: expected a lastSuccessfulDeployment within 5s, got {successful:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // A deployment that FAILED is the group's last attempt but never its last
+    // success: both members are derived from the stored deployments, not from the
+    // fact that one was made.
+    let failing_group = seeded_group(&emulator, "tracked-server", "Server").await;
+    let failed = emulator
+        .ok(
+            "CreateDeployment",
+            json!({
+                "applicationName": "tracked-server",
+                "deploymentGroupName": failing_group,
+                "revision": revision,
+            }),
+        )
+        .await;
+    let failed_id = failed["deploymentId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let polled = emulator
+            .ok(
+                "GetDeploymentGroup",
+                json!({"applicationName": "tracked-server", "deploymentGroupName": failing_group}),
+            )
+            .await;
+        let info = &polled["deploymentGroupInfo"];
+        if info["lastAttemptedDeployment"]["status"].as_str() == Some("Failed") {
+            assert_eq!(
+                info["lastAttemptedDeployment"]["deploymentId"].as_str(),
+                Some(failed_id.as_str()),
+                "case failed deployment: expected it as lastAttemptedDeployment, got {info:?}"
+            );
+            assert!(
+                info["lastSuccessfulDeployment"].is_null(),
+                "case failed deployment: expected no lastSuccessfulDeployment, got {info:?}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case failed deployment: expected a terminal lastAttemptedDeployment within 5s, got {info:?}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

@@ -91,19 +91,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The JSON type name of a `policyDocument` that parsed but is not a policy object, so
-/// the refusal says what the caller actually sent.
-fn json_type_name(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -191,33 +178,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `policyDocument` is documented as "A valid displayable JSON Aspen policy
         // string", and the modelled pattern (`^[\P{C}\s]+$`) only forbids control
-        // characters — so JSON well-formedness is the service's own rule and is checked
-        // here, before anything is written. The document is parsed ONLY to check it: what
-        // gets stored and reported is the string the caller sent, never a re-serialised
-        // rendering of it.
-        match serde_json::from_str::<serde_json::Value>(&input.policy_document) {
-            Ok(serde_json::Value::Object(_)) => {}
-            Ok(other) => {
-                return Err(PutRepositoryPermissionsPolicyErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!(
-                            "policyDocument must be a JSON policy object; got a JSON {}.",
-                            json_type_name(&other)
-                        ),
-                        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
-                    },
-                )
-                .into());
-            }
-            Err(error) => {
-                return Err(PutRepositoryPermissionsPolicyErrorModeled::ValidationException(
-                    ValidationException {
-                        message: format!("policyDocument is not valid JSON: {error}."),
-                        reason: Some("CANNOT_PARSE".to_string()),
-                    },
-                )
-                .into());
-            }
+        // characters — so JSON well-formedness is the service's own rule, applied through
+        // the one check the whole policy family shares, before anything is written. The
+        // document is parsed ONLY to check it: what gets stored and reported is the string
+        // the caller sent, never a re-serialised rendering of it.
+        if let Some(refusal) = crate::state::policy_document_refusal(&input.policy_document) {
+            return Err(
+                PutRepositoryPermissionsPolicyErrorModeled::ValidationException(refusal).into(),
+            );
         }
 
         let mut store = state.lock();
@@ -286,12 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The response is the policy that was just STORED, so a later
         // `GetRepositoryPermissionsPolicy` answers with the same document, ARN and
         // revision.
-        let policy = crate::state::attached_policy(
-            &repository.arn,
-            input.policy_document,
-            repository.policy.as_ref(),
-        );
-        repository.policy = Some(policy.clone());
+        let policy = repository.attach_policy(input.policy_document);
 
         Ok(PutRepositoryPermissionsPolicyOutput {
             policy: Some(policy),

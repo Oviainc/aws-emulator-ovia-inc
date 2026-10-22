@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateImageVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateImageVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateImageVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: adds the next numbered version of an existing image to `crate::state`,
+//! minting the `ImageVersionArn` from the request's region, refusing an unknown
+//! `ImageName` with the modelled `ResourceNotFound` and an alias already attached to
+//! another version of the same image with `ResourceInUse`, and answering a retry that
+//! repeats a `ClientToken` with the version that token already minted. A created version
+//! is reported `CREATING` until the instant the clock owes it the move to `CREATED`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +171,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateImageVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateImageVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let aliases = input.aliases.unwrap_or_default();
+
+        let mut store = state.lock();
+
+        // A version only exists as a version OF an image, so an `ImageName` no image is
+        // stored under is the "resource being access is not found" this operation models
+        // — nothing is persisted for it.
+        let Some(image) = store.images.get(&input.image_name) else {
+            let arn = crate::state::resource_arn(&region, "image", &input.image_name);
+            return Err(CreateImageVersionErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Could not find image \"{arn}\".")),
+            })
+            .into());
+        };
+        let image_arn = image.arn.clone();
+        let next_version = image.next_version;
+
+        // `ClientToken` is an `@idempotencyToken`: a retry of the same create carries the
+        // token the first attempt sent, and answers with the version that attempt minted
+        // rather than minting a second one.
+        if let Some(existing) = store
+            .versions_of(&input.image_name)
+            .find(|version| version.client_token == input.client_token)
+        {
+            return Ok(CreateImageVersionOutput {
+                image_version_arn: Some(existing.arn.clone()),
+            });
+        }
+
+        // The per-image store is bounded, so a caller repeating the call cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.image_versions_below_quota(&input.image_name) {
+            return Err(CreateImageVersionErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for versions of one image is {}, \
+                         with current utilization of {} and a request delta of 1.",
+                        crate::state::IMAGE_VERSION_QUOTA,
+                        store.versions_of(&input.image_name).count()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `Aliases` is the one member of this request the model gives no length, so the
+        // boundary validator cannot refuse an oversized list and the request would
+        // otherwise choose how much is stored per version and how much work the collision
+        // check below does. The service applies its own bound FIRST, so both are bounded
+        // by constants.
+        if aliases.len() > crate::state::MAX_ALIASES_PER_IMAGE_VERSION {
+            return Err(CreateImageVersionErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The service limit for aliases on one image version is {}, and the \
+                         request carries {}.",
+                        crate::state::MAX_ALIASES_PER_IMAGE_VERSION,
+                        aliases.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An alias resolves to at most one version of an image (`DescribeImageVersion`
+        // takes an `Alias` INSTEAD of a `Version`), so an alias already attached to
+        // another version of the same image is in use and the create is refused whole:
+        // no version is minted and no alias moves.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateImageVersion"))
+        // ONE pass over the image's versions builds the alias -> owning version index, so
+        // the check costs one lookup per requested alias instead of a scan per pair; the
+        // index itself is bounded by the version quota times the alias bound above.
+        let collision = {
+            let taken: ::std::collections::BTreeMap<&str, &str> = store
+                .versions_of(&input.image_name)
+                .flat_map(|version| {
+                    version
+                        .aliases
+                        .iter()
+                        .map(|alias| (alias.as_str(), version.arn.as_str()))
+                })
+                .collect();
+            aliases.iter().find_map(|alias| {
+                taken
+                    .get(alias.as_str())
+                    .map(|holder| (alias.clone(), (*holder).to_string()))
+            })
+        };
+        if let Some((alias, holder_arn)) = collision {
+            return Err(CreateImageVersionErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "Alias \"{alias}\" is already in use by image version \"{holder_arn}\"."
+                )),
+            })
+            .into());
+        }
+
+        // The version ARN's modelled pattern spells the image name in lowercase
+        // (`image-version/[a-z0-9]([-.]?[a-z0-9])*/[0-9]+`) where the image ARN's keeps
+        // the name's own case, so the name is lowercased for this ARN only.
+        let arn = crate::state::resource_arn(
+            &region,
+            "image-version",
+            &format!("{}/{next_version}", input.image_name.to_lowercase()),
+        );
+
+        store.image_versions.insert(
+            (input.image_name.clone(), next_version),
+            crate::state::ImageVersion {
+                image_name: input.image_name.clone(),
+                image_arn,
+                version: next_version,
+                arn: arn.clone(),
+                base_image: input.base_image,
+                client_token: input.client_token,
+                aliases,
+                // The model documents `NOT_PROVIDED` as "the maintainers did not provide
+                // a status for image version stability", which is exactly a version
+                // created without `VendorGuidance`.
+                vendor_guidance: input
+                    .vendor_guidance
+                    .unwrap_or_else(|| crate::state::VENDOR_GUIDANCE_NOT_PROVIDED.to_string()),
+                job_type: input.job_type,
+                ml_framework: input.ml_framework,
+                programming_lang: input.programming_lang,
+                processor: input.processor,
+                horovod: input.horovod,
+                release_notes: input.release_notes,
+                status: crate::state::IMAGE_STATUS_CREATING.to_string(),
+                failure_reason: None,
+                creation_time: now,
+                last_modified_time: now,
+                created_at: now + crate::state::IMAGE_CREATED_AFTER,
+            },
+        );
+        // A version number is never reused, even once the version it named is deleted:
+        // the number is part of the version's ARN, so reusing it would let two different
+        // container images share one identity.
+        if let Some(image) = store.images.get_mut(&input.image_name) {
+            image.next_version = next_version.saturating_add(1);
+        }
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateImageVersionOutput {
+            image_version_arn: Some(arn),
+        })
     }
 }

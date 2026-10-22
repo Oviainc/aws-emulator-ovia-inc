@@ -53,12 +53,18 @@ const MAX_RESULTS_MAX: i64 = 1000;
 const UNLOCK_DELAY_MIN: i64 = 7;
 const UNLOCK_DELAY_MAX: i64 = 30;
 
-/// The `@pattern` each constrained member declares, as the model declares it.
-/// Source: smithy_query(query="shape", shape="RuleIdentifier,NextToken,Description,RuleArn").
-const RULE_IDENTIFIER_PATTERN: &str = "^[0-9a-zA-Z]{11}$";
-const NEXT_TOKEN_PATTERN: &str = "^[A-Za-z0-9+/=]{1,2048}$";
-const DESCRIPTION_PATTERN: &str = r"^[\S ]{0,255}$";
-const RULE_ARN_PATTERN: &str = r"^arn:\S+:rbin:[a-z\-0-9]{0,63}:[0-9]{12}:rule/[0-9a-zA-Z]{11}{0,1011}$";
+/// The `@pattern` each constrained member declares, as the service REPORTS it: the
+/// model's expression without the `^`/`$` anchors a model spells it with. The anchors say
+/// WHERE the expression had to match, which is a fact of the constraint and not of the
+/// input, and the recorded AWS refusal for a pattern violation carries the unanchored
+/// form (`…failed to satisfy constraint: Member must satisfy regular expression pattern:
+/// [0-9a-zA-Z]{11}` for `RuleIdentifier`).
+/// Source: smithy_query(query="shape", shape="RuleIdentifier,NextToken,Description,RuleArn"),
+/// unanchored by `crate::state`'s one clause renderer.
+const RULE_IDENTIFIER_PATTERN: &str = "[0-9a-zA-Z]{11}";
+const NEXT_TOKEN_PATTERN: &str = "[A-Za-z0-9+/=]{1,2048}";
+const DESCRIPTION_PATTERN: &str = r"[\S ]{0,255}";
+const RULE_ARN_PATTERN: &str = r"arn:\S+:rbin:[a-z\-0-9]{0,63}:[0-9]{12}:rule/[0-9a-zA-Z]{11}{0,1011}";
 
 /// `ResourceType` accepts exactly these values, in this order.
 /// Source: smithy_query(query="shape", shape="ResourceType") — enum values.

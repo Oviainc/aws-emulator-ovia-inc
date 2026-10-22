@@ -13,5 +13,9 @@
 // points it into `tests/all/`.
 #[path = "all/pricing_catalog.rs"]
 mod pricing_catalog;
+#[path = "all/pricing_fidelity.rs"]
+mod pricing_fidelity;
+#[path = "all/pricing_support.rs"]
+mod pricing_support;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

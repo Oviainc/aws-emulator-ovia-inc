@@ -357,8 +357,14 @@ impl ComAmazonawsMedialiveMedialiveState {
 ///
 /// One macro rather than a hand-written copy per operation, so a create and the
 /// read that follows it cannot report the same stored template differently.
-/// `Tags` and `EventTargets` are reported only when the template carries them: an
-/// empty map or list would claim a value the caller never supplied.
+///
+/// `Tags` reports the template's tag set WHATEVER it holds — an untagged template
+/// reports the empty map, not an absent member — for the reason the shared
+/// `template_group_output` states: the member is modelled as a `TagMap`, zero
+/// tags is an empty map rather than an unknown one, and this service's other
+/// resources already report it that way. `EventTargets` keeps its own rule: it
+/// is reported only when the template carries targets, because an empty list
+/// would claim a target set the caller never supplied.
 macro_rules! event_bridge_rule_template_output {
     ($out:ident, $template:expr) => {{
         let template: &$crate::state::EventBridgeRuleTemplateRecord = $template;
@@ -384,11 +390,7 @@ macro_rules! event_bridge_rule_template_output {
             id: Some(template.id.clone()),
             modified_at: Some(::aws_smithy_types::DateTime::from(template.modified_at)),
             name: Some(template.name.clone()),
-            tags: if template.tags.is_empty() {
-                None
-            } else {
-                Some(template.tags.clone())
-            },
+            tags: Some(template.tags.clone()),
         }
     }};
 }

@@ -80,6 +80,9 @@ mod template_deletion;
 #[path = "all/support.rs"]
 mod support;
 
+#[path = "all/timestamp_wire_form.rs"]
+mod timestamp_wire_form;
+
 /// The shared restJson1 harness the suites above drive the service through.
 #[path = "all/wire.rs"]
 mod wire;

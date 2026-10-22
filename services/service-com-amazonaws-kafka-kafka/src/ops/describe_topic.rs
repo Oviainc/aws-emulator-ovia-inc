@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTopic
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTopic`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one topic of a stored cluster, computed from the registered record:
+//! the ARN the create minted, the partition count and replication factor it was
+//! created with, the `Configs` string it was given, and the topic's state.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTopic::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The cluster is resolved the same way as in `CreateTopic` / `DeleteTopic`, and
+//! after the checks the request alone decides: a `ClusterArn` that is not an MSK
+//! cluster ARN, or a `TopicName` Apache Kafka itself would refuse, is a
+//! `BadRequestException`, while a well-formed ARN this endpoint's region holds no
+//! cluster for and a legal name the cluster holds no topic for are both this
+//! operation's only modelled 404, `NotFoundException`.
+//!
+//! REPORTING ONLY: the one write it makes materialises a transition the clock
+//! already owed THIS topic -- `CREATING` -> `ACTIVE` once the activation instant
+//! has passed, and the removal a `DeleteTopic` scheduled once its instant has --
+//! each of which was due at the same moment whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +157,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTopic` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTopicErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTopic"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeTopicErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(
+                DescribeTopicErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(format!(
+                        "{} is not a valid Amazon MSK cluster ARN.",
+                        input.cluster_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+        if let Some(reason) = crate::state::topic_name_error(&input.topic_name) {
+            return Err(
+                DescribeTopicErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some("TopicName".to_string()),
+                    message: Some(reason),
+                })
+                .into(),
+            );
+        }
+        let mut state = state.lock();
+
+        if state.cluster_in(&region, &input.cluster_arn).is_none() {
+            return Err(
+                DescribeTopicErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // Reporting only: the writes this makes materialise the transitions the
+        // clock already owed THIS topic, each of which was due at the same instant
+        // whether or not anybody called.
+        let Some(topic) = state.settled_topic_in(
+            &input.cluster_arn,
+            &input.topic_name,
+            std::time::SystemTime::now(),
+        ) else {
+            return Err(
+                DescribeTopicErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("TopicName".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        };
+        Ok(DescribeTopicOutput {
+            topic_arn: Some(topic.arn.clone()),
+            topic_name: Some(topic.name.clone()),
+            replication_factor: Some(topic.replication_factor),
+            partition_count: Some(topic.partition_count),
+            configs: topic.configs.clone(),
+            status: Some(topic.state.clone()),
+        })
     }
 }

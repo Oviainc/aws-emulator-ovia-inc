@@ -307,6 +307,8 @@ pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE: &str = "CreateRelationalDat
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_CREATE_DISK_FROM_SNAPSHOT: &str = "CreateDiskFromSnapshot";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_BUCKET_ACCESS_KEY: &str = "CreateBucketAccessKey";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_DELETE_BUCKET_ACCESS_KEY: &str = "DeleteBucketAccessKey";
@@ -4812,6 +4814,59 @@ pub fn add_ons_from_requests(
             )),
         })
         .collect()
+}
+
+/// The one modelled `AddOnType` member a block storage disk can carry: the
+/// automatic snapshot add-on.
+///
+/// The other member stops a virtual computer after an idle period
+/// (`StopInstanceOnIdleRequest` — "the amount of idle time in minutes after
+/// which your virtual computer will automatically stop"), which a block storage
+/// disk does not have.
+pub const ADD_ON_TYPE_AUTO_SNAPSHOT: &str = "AutoSnapshot";
+
+/// The add-ons `requests` enable on a DISK, or a refusal naming the member that
+/// is wrong.
+///
+/// The same conversion as [`add_ons_from_requests`], narrowed to the one add-on
+/// a disk can carry ([`ADD_ON_TYPE_AUTO_SNAPSHOT`]): asking a disk for the
+/// idle-stop add-on is refused rather than stored as an add-on that can never
+/// act. Every operation that creates a disk goes through here, so `CreateDisk`
+/// and `CreateDiskFromSnapshot` accept exactly the same add-ons.
+pub fn disk_add_ons_from_requests(
+    disk_name: &str,
+    requests: &[AddOnRequest],
+) -> Result<Vec<AddOn>, String> {
+    if let Some(request) = requests
+        .iter()
+        .find(|request| request.add_on_type != ADD_ON_TYPE_AUTO_SNAPSHOT)
+    {
+        return Err(format!(
+            "addOns[].addOnType '{}' cannot be enabled on a disk: a disk accepts only \
+             {ADD_ON_TYPE_AUTO_SNAPSHOT}",
+            request.add_on_type
+        ));
+    }
+    add_ons_from_requests(disk_name, requests)
+}
+
+/// Whether `value` is a date in the `YYYY-MM-DD` form an automatic snapshot is
+/// addressed by.
+///
+/// The form is the modelled `AutoSnapshotDate` pattern
+/// `^[0-9]{4}-[0-9]{2}-[0-9]{2}$`; the members that carry a restore date
+/// (`CreateDiskFromSnapshot$restoreDate` and its siblings) target a plain
+/// `string`, whose documentation says "Must be specified in YYYY-MM-DD format",
+/// so the constraint is enforced here rather than by the modelled-constraint
+/// walk.
+pub fn is_auto_snapshot_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && [0, 1, 2, 3, 5, 6, 8, 9]
+            .iter()
+            .all(|index| bytes[*index].is_ascii_digit())
 }
 
 /// The daily automatic-snapshot hour for `resource_name`, in the `HH:00` form the

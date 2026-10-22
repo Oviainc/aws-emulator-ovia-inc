@@ -191,6 +191,55 @@ impl ZonalAutoshiftStatus {
     }
 }
 
+/// Whether ARC notifies the account, through Amazon EventBridge, about EVERY
+/// autoshift or only about the autoshifts that include one of its resources.
+///
+/// The model's `AutoshiftObserverNotificationStatus` enum (`ENABLED`,
+/// `DISABLED`): "If the status is ENABLED, ARC includes all autoshift events
+/// when you use the Amazon EventBridge pattern Autoshift In Progress. When the
+/// status is DISABLED, ARC includes only autoshift events for autoshifts when
+/// one or more of your resources is included in the autoshift." It is an
+/// account-wide setting — neither operation that reads or writes it names a
+/// resource — so the store holds exactly one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoshiftObserverNotificationStatus {
+    Disabled,
+    Enabled,
+}
+
+impl AutoshiftObserverNotificationStatus {
+    /// The value this status takes on the wire.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Disabled => "DISABLED",
+            Self::Enabled => "ENABLED",
+        }
+    }
+
+    /// The status a wire value names, or `None` when it is not one of the two
+    /// the model declares (`AUTOSHIFT_OBSERVER_NOTIFICATION_STATUS_VALUES`).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "DISABLED" => Some(Self::Disabled),
+            "ENABLED" => Some(Self::Enabled),
+            _ => None,
+        }
+    }
+}
+
+/// The autoshift observer notification status of an account that has never set
+/// one: `DISABLED`, the narrower of the two.
+///
+/// `ENABLED` is what widens the EventBridge `Autoshift In Progress` pattern from
+/// the autoshifts that include one of the account's resources to ALL autoshifts
+/// (the `UpdateAutoshiftObserverNotificationStatus` documentation), so it is the
+/// setting a caller opts in to; until a caller does, the store reports the
+/// un-opted-in value.
+pub const DEFAULT_AUTOSHIFT_OBSERVER_NOTIFICATION_STATUS: AutoshiftObserverNotificationStatus =
+    AutoshiftObserverNotificationStatus::Disabled;
+
 /// A resource Amazon Web Services registered with ARC for zonal shift.
 #[derive(Debug, Clone)]
 pub struct ManagedResource {
@@ -254,6 +303,10 @@ pub struct ComAmazonawsArczonalshiftPercdataplaneState {
     pub zonal_shifts: BTreeMap<String, ZonalShift>,
     /// The source of unique `zonalShiftId`s; see [`Self::next_zonal_shift_id`].
     pub next_shift_seq: u64,
+    /// The account-wide autoshift observer notification setting:
+    /// `UpdateAutoshiftObserverNotificationStatus` writes it and
+    /// `GetAutoshiftObserverNotificationStatus` reports it.
+    pub autoshift_observer_notification_status: AutoshiftObserverNotificationStatus,
 }
 
 impl Default for ComAmazonawsArczonalshiftPercdataplaneState {
@@ -266,6 +319,8 @@ impl Default for ComAmazonawsArczonalshiftPercdataplaneState {
             managed_resources,
             zonal_shifts: BTreeMap::new(),
             next_shift_seq: 0,
+            autoshift_observer_notification_status:
+                DEFAULT_AUTOSHIFT_OBSERVER_NOTIFICATION_STATUS,
         }
     }
 }

@@ -28,17 +28,19 @@ use serde_json::{json, Value};
 
 use super::canary_lifecycle::{create_body, Synthetics};
 
-/// `CanaryName`'s `@pattern` (`CreateCanary$Name`, `GetCanary$Name`).
-const CANARY_NAME_PATTERN: &str = r"^[0-9a-z_\-]+$";
+/// `CanaryName`'s `@pattern` (`CreateCanary$Name`, `GetCanary$Name`), as the service
+/// STATES it: the expression a value has to satisfy, without the `^` / `$` the model
+/// spells it with. See `tests/all/server_side_validation.rs` for that rule itself.
+const CANARY_NAME_PATTERN: &str = r"[0-9a-z_\-]+";
 
-/// `RoleArn`'s `@pattern` (`CreateCanary$ExecutionRoleArn`).
-const ROLE_ARN_PATTERN: &str = r"^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$";
+/// `RoleArn`'s `@pattern` (`CreateCanary$ExecutionRoleArn`), likewise unanchored.
+const ROLE_ARN_PATTERN: &str = r"arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+";
 
-/// `UUID`'s `@pattern` (`GetCanary$DryRunId`).
-const UUID_PATTERN: &str = r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$";
+/// `UUID`'s `@pattern` (`GetCanary$DryRunId`), likewise unanchored.
+const UUID_PATTERN: &str = r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}";
 
-/// `ResourceArn`'s `@pattern` (`TagResource$ResourceArn`).
-const RESOURCE_ARN_PATTERN: &str = r"^arn:(aws[a-zA-Z-]*)?:synthetics:[a-z]{2,4}(-[a-z]{2,4})?-[a-z]+-\d{1}:\d{12}:(canary|group):[0-9a-z_\-]+$";
+/// `ResourceArn`'s `@pattern` (`TagResource$ResourceArn`), likewise unanchored.
+const RESOURCE_ARN_PATTERN: &str = r"arn:(aws[a-zA-Z-]*)?:synthetics:[a-z]{2,4}(-[a-z]{2,4})?-[a-z]+-\d{1}:\d{12}:(canary|group):[0-9a-z_\-]+";
 
 /// How Synthetics words a malformed artifact location (`src/state.rs`).
 const ARTIFACT_LOCATION_MALFORMED: &str = "ArtifactS3Location: The location is malformed.";
@@ -240,16 +242,18 @@ async fn a_refused_request_carries_the_modelled_validation_exception_message() {
                 &pattern_requirement(UUID_PATTERN),
             )]),
         },
-        // `@range` on a different operation's paging member (`MaxCanaryResults`, 1..20).
+        // A paging member on a different operation, past the ceiling the SERVICE applies
+        // (1000) rather than the modelled `MaxCanaryResults` maximum of 20, which the
+        // recorded service does not enforce — see `tests/all/server_side_validation.rs`.
         Refused {
-            case: "describe-max-results-above-range",
+            case: "describe-max-results-above-ceiling",
             method: "POST",
             path: "/canaries".to_string(),
-            body: Some(json!({ "MaxResults": 21 })),
+            body: Some(json!({ "MaxResults": 1001 })),
             message: envelope(&[clause(
-                Some("21"),
+                Some("1001"),
                 "maxResults",
-                &max_value_requirement(20),
+                &max_value_requirement(1000),
             )]),
         },
         // An operation that is still scaffolded: a constraint belongs to the INPUT SHAPE,

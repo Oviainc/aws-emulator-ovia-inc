@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConfigurationRecorders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConfigurationRecorders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConfigurationRecorders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Summarises the configuration recorders [`crate::state`] holds: each summary's
+//! `arn`, `name`, `servicePrincipal`, `recordingScope` and `provider` as the call that
+//! created the recorder persisted them, never an echo of this request, narrowed by the
+//! `recordingScope` filters the request carries and cut into pages of `MaxResults`.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +145,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConfigurationRecorders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConfigurationRecordersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConfigurationRecorders"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // Each filter the request carries narrows the answer to the recording scopes it
+        // lists; a filter naming another member, or a value that names no recording
+        // scope at all, selects nothing this API can report and is refused rather than
+        // served an empty page.
+        let mut scope_filters: Vec<Vec<String>> = Vec::new();
+        for filter in input.filters.as_deref().unwrap_or_default() {
+            let filter_name = filter.filter_name.as_deref().unwrap_or_default();
+            if filter_name != crate::state::CONFIGURATION_RECORDER_FILTER_RECORDING_SCOPE {
+                return Err(validation(format!(
+                    "Filters.filterName must be '{}', got {filter_name:?}",
+                    crate::state::CONFIGURATION_RECORDER_FILTER_RECORDING_SCOPE,
+                )));
+            }
+            let values = filter.filter_value.clone().unwrap_or_default();
+            for value in &values {
+                if !crate::state::RECORDING_SCOPES.contains(&value.as_str()) {
+                    return Err(validation(format!(
+                        "Filters.filterValue must name a recording scope, one of {:?}, \
+                         got {value:?}",
+                        crate::state::RECORDING_SCOPES,
+                    )));
+                }
+            }
+            // A filter that lists no value narrows nothing.
+            if !values.is_empty() {
+                scope_filters.push(values);
+            }
+        }
+
+        // `MaxResults` is the page size; the member's own default of 0 — and a request
+        // that carries no `MaxResults` at all — asks for this operation's maximum, since
+        // a page of zero would report no recorder the store holds. A value outside the
+        // modelled 0..20 range is refused before this handler runs.
+        let page_size = match input.max_results {
+            None | Some(0) => crate::state::LIST_CONFIGURATION_RECORDERS_PAGE_SIZE,
+            Some(max_results) => usize::try_from(max_results)
+                .unwrap_or(crate::state::LIST_CONFIGURATION_RECORDERS_PAGE_SIZE),
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed, and
+        // `ValidationException` is the only refusal this operation models.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(resume_at) => Some(resume_at),
+                None => {
+                    return Err(validation(
+                        "the specified NextToken is not valid; use the NextToken a previous \
+                         ListConfigurationRecorders response returned"
+                            .to_string(),
+                    ));
+                }
+            },
+        };
+
+        let store = state.lock();
+
+        // Page over the recorders' own name ordering, so a token holds the NAME the next
+        // page resumes at and survives recorders created or deleted between pages.
+        let mut recorders: Vec<&crate::state::RecorderEntry> = store.recorders.values().collect();
+        recorders.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let mut page: Vec<ConfigurationRecorderSummary> = Vec::new();
+        let mut next_token = None;
+        for entry in recorders {
+            if resume_at
+                .as_ref()
+                .is_some_and(|resume_at| &entry.name < resume_at)
+            {
+                continue;
+            }
+            let summary = entry.to_summary();
+            // Every filter has to hold (they narrow each other), and one holds when the
+            // recorder's scope is among the values that filter lists.
+            let selected = scope_filters
+                .iter()
+                .all(|values| values.contains(&summary.recording_scope));
+            if !selected {
+                continue;
+            }
+            if page.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(&entry.name));
+                break;
+            }
+            page.push(summary);
+        }
+
+        Ok(ListConfigurationRecordersOutput {
+            configuration_recorder_summaries: page,
+            next_token,
+        })
     }
+}
+
+/// The modelled `ValidationException` carrying `message`, lifted into this operation's
+/// error channel — the only refusal `ListConfigurationRecorders` models.
+fn validation(message: String) -> ListConfigurationRecordersError {
+    ListConfigurationRecordersErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

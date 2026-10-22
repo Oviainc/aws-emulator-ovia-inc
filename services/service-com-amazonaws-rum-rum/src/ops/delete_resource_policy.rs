@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the one resource-based policy an app monitor carries, clearing the
+//! [`crate::state::ResourcePolicyRecord`] `PutResourcePolicy` wrote, optionally
+//! conditional on that policy's current revision id.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        // The policy to remove is named entirely by the request's own members.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(record) = store.app_monitors.get_mut(&input.name) else {
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::app_monitor_not_found(&input.name),
+            )
+            .into());
+        };
+        // Nothing to remove: the monitor exists but carries no policy. This is also what
+        // a repeated delete answers — the first one took the policy away, so the second
+        // finds none.
+        if record.resource_policy.is_none() {
+            return Err(DeleteResourcePolicyErrorModeled::PolicyNotFoundException(
+                crate::state::policy_not_found(&input.name),
+            )
+            .into());
+        }
+        // `PolicyRevisionId` makes the delete atomic against the revision the caller
+        // read: a stale id is refused with the policy left in place.
+        if let Some(mismatch) = record.policy_revision_refusal(input.policy_revision_id.as_deref())
+        {
+            return Err(
+                DeleteResourcePolicyErrorModeled::InvalidPolicyRevisionIdException(mismatch)
+                    .into(),
+            );
+        }
+
+        // `PolicyRevisionId` in the response is "The revision ID of the policy that was
+        // removed", so it is read off the policy this call took away.
+        let removed = record.resource_policy.take();
+        Ok(DeleteResourcePolicyOutput {
+            policy_revision_id: removed.map(|policy| policy.revision_id),
+        })
     }
 }

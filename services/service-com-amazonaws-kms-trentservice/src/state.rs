@@ -108,6 +108,19 @@ pub const ARN_SERVICE: &str = "kms";
 /// The prefix of an alias name: "alias/<name>".
 pub const ALIAS_PREFIX: &str = "alias/";
 
+/// The alias-name prefix a caller may not create under: "The alias name cannot
+/// begin with alias/aws/. The alias/aws/ prefix is reserved for Amazon Web Services
+/// managed keys"
+/// (`smithy_query(query="doc",shape="CreateAliasRequest",member="AliasName")`).
+pub const ALIAS_PREFIX_AWS_MANAGED: &str = "alias/aws/";
+
+/// The largest number of aliases one KMS key carries: KMS's published resource
+/// quota "Aliases per KMS key: 50" (Quotas in the Key Management Service Developer
+/// Guide, which the modelled `LimitExceededException` — "a length constraint or
+/// quota was exceeded" — points at). It is also what bounds how far one key can
+/// grow this store.
+pub const MAX_ALIASES_PER_KEY: usize = 50;
+
 /// Per-service state for com-amazonaws-kms-trentservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKmsTrentserviceState {
@@ -117,10 +130,17 @@ pub struct ComAmazonawsKmsTrentserviceState {
     /// boundary is stable across calls and a new key never reshuffles earlier
     /// pages.
     pub key_order: Vec<String>,
-    /// `alias/<name>` -> key id. `CreateAlias` (still a stub) is what fills this;
-    /// the resolver already consults it, so every operation taking a `KeyId`
-    /// accepts an alias the moment aliases exist.
-    pub aliases: HashMap<String, String>,
+    /// Every persisted alias, keyed by its ALIAS ARN
+    /// (`arn:aws:kms:<region>:<account>:alias/<name>`) rather than by its name:
+    /// "The alias must be unique in the account and Region, but you can have
+    /// aliases with the same name in different Regions"
+    /// (`smithy_query(query="doc",shape="CreateAlias")`), so the name alone does
+    /// not identify one. `CreateAlias` fills this, and the resolver consults it, so
+    /// every operation taking a `KeyId` accepts an alias that exists.
+    pub aliases: HashMap<String, Alias>,
+    /// The alias ARNs in creation order, so an alias reader reports them in a
+    /// stable order rather than the hash map's.
+    pub alias_order: Vec<String>,
 }
 
 impl ComAmazonawsKmsTrentserviceState {
@@ -137,6 +157,32 @@ impl ComAmazonawsKmsTrentserviceState {
     /// before it mints one.
     pub fn has_room_for_another_key(&self) -> bool {
         self.keys.len() < MAX_KEYS
+    }
+
+    /// Persist a freshly created alias, remembering its place in creation order.
+    ///
+    /// The caller refuses the request past [`MAX_ALIASES_PER_KEY`] BEFORE creating
+    /// it, so this never grows the store without a bound.
+    pub fn insert_alias(&mut self, alias: Alias) {
+        self.alias_order.push(alias.arn.clone());
+        self.aliases.insert(alias.arn.clone(), alias);
+    }
+
+    /// The alias `region`'s endpoint serves under the name `alias_name`
+    /// (`alias/<name>`), which is the uniqueness `CreateAlias` enforces: an alias
+    /// is unique per account and Region, so the same name in another Region is a
+    /// different (absent) alias.
+    pub fn alias(&self, region: &str, alias_name: &str) -> Option<&Alias> {
+        self.aliases.get(&alias_arn(region, alias_name))
+    }
+
+    /// How many aliases `region`'s endpoint already holds for the key `key_id` —
+    /// what bounds a key's aliases at [`MAX_ALIASES_PER_KEY`].
+    pub fn alias_count_for_key(&self, region: &str, key_id: &str) -> usize {
+        self.aliases
+            .values()
+            .filter(|alias| alias.region == region && alias.target_key_id == key_id)
+            .count()
     }
 
     /// The key a `KeyId` request member names, accepting every form KMS does:
@@ -193,9 +239,8 @@ impl ComAmazonawsKmsTrentserviceState {
         let key = match identifier {
             KeyIdentifier::KeyId { key_id, .. } => self.key_in(region, key_id.as_str()),
             KeyIdentifier::Alias { alias, .. } => self
-                .aliases
-                .get(alias.as_str())
-                .and_then(|key_id| self.key_in(region, key_id)),
+                .alias(region, alias.as_str())
+                .and_then(|alias| self.key_in(region, &alias.target_key_id)),
         }?;
         // A key ARN addresses one key in one Region of one account: an ARN whose
         // Region or account segment names another endpoint's key is not found
@@ -374,6 +419,94 @@ fn arn_of(
         requested.to_string()
     } else {
         ::engine::emulator_arn(ARN_SERVICE, region, resource)
+    }
+}
+
+/// The ARN of the alias `alias_name` (`alias/<name>`) in `region`, which is what
+/// identifies an alias: "you can have aliases with the same name in different
+/// Regions" (`smithy_query(query="doc",shape="CreateAlias")`).
+pub fn alias_arn(region: &str, alias_name: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, alias_name)
+}
+
+/// Whether a `KeyId`-shaped identifier names an ALIAS (`alias/<name>` or an alias
+/// ARN) rather than a key.
+///
+/// `CreateAlias` and `UpdateAlias` take a target that must be a key — "Specify the
+/// key ID or key ARN of the KMS key"
+/// (`smithy_query(query="doc",shape="CreateAliasRequest",member="TargetKeyId")`) —
+/// while every other `KeyId` member accepts either.
+pub fn names_an_alias(identifier: &str) -> bool {
+    matches!(
+        parse_key_identifier(identifier),
+        Ok(KeyIdentifier::Alias { .. })
+    )
+}
+
+/// Whether `alias_name` is a name a caller may create, and why not when it is not.
+///
+/// Two rules, both from the member's own documentation
+/// (`smithy_query(query="doc",shape="CreateAliasRequest",member="AliasName")`):
+/// the value "must begin with alias/ followed by a name", so the prefix is required
+/// and what follows it may not be empty; and "the alias name cannot begin with
+/// alias/aws/", which is reserved for AWS managed keys. The character set and the
+/// 1..256 length are modelled, so the boundary validator has already refused
+/// anything outside them before this is reached.
+///
+/// One function for the whole service, so no two alias operations judge the same
+/// name differently. The sentences are examples of KMS's; what this pins is WHICH
+/// names are refused, and the refusal names the value the request gave.
+pub fn validate_alias_name(alias_name: &str) -> Result<(), String> {
+    let Some(name) = alias_name.strip_prefix(ALIAS_PREFIX) else {
+        return Err(format!(
+            "Alias must start with the prefix \"{ALIAS_PREFIX}\". Found: {alias_name}"
+        ));
+    };
+    if name.is_empty() {
+        return Err(format!(
+            "Alias must have a name after the prefix \"{ALIAS_PREFIX}\". Found: {alias_name}"
+        ));
+    }
+    if alias_name.starts_with(ALIAS_PREFIX_AWS_MANAGED) {
+        return Err(format!(
+            "Aliases beginning with \"{ALIAS_PREFIX_AWS_MANAGED}\" are reserved for Amazon Web \
+             Services managed keys. Found: {alias_name}"
+        ));
+    }
+    Ok(())
+}
+
+/// One alias: a friendly name for a KMS key, in one Region of one account.
+///
+/// The record holds the TARGET KEY ID, never another alias: an alias "is associated
+/// with only one KMS key at a time"
+/// (`smithy_query(query="doc",shape="CreateAlias")`), so resolving one is a single
+/// step and can never chain.
+#[derive(Debug, Clone)]
+pub struct Alias {
+    /// `alias/<name>`, as the request gave it.
+    pub alias_name: String,
+    /// `arn:aws:kms:<region>:<account>:alias/<name>`, which is also this record's
+    /// map key.
+    pub arn: String,
+    /// The Region whose endpoint created it; an alias is a regional resource.
+    pub region: String,
+    /// The key id (never an alias) this alias resolves to.
+    pub target_key_id: String,
+    pub creation_date: SystemTime,
+}
+
+impl Alias {
+    /// A freshly created alias for `target_key_id`.
+    pub fn new(region: String, alias_name: String, target_key_id: String) -> Self {
+        let arn = alias_arn(&region, &alias_name);
+        Self {
+            alias_name,
+            arn,
+            region,
+            target_key_id,
+            creation_date: SystemTime::now(),
+        }
     }
 }
 

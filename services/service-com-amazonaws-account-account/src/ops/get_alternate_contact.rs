@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 alternate_contact: Some(record.to_alternate_contact()),
             }),
             None => Err(GetAlternateContactErrorModeled::ResourceNotFoundException(
-                crate::state::alternate_contact_not_found(&account_id, contact_type.as_wire()),
+                crate::state::alternate_contact_not_found(),
             )
             .into()),
         }

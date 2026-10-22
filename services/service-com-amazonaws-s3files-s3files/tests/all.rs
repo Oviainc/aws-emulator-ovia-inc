@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/file_system_lifecycle.rs"]
 mod file_system_lifecycle;
+#[path = "all/file_system_policy.rs"]
+mod file_system_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

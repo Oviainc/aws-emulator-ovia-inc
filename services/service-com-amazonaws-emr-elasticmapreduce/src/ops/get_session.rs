@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Resolves the session id against the sessions the named cluster carries in the
+//! shared engine and answers with the one it names. A cluster id no cluster carries,
+//! and a session id the cluster carries no session under, are both refused with
+//! `InvalidRequestException` — the one client error this operation models.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `StartSession` is what puts a session on a cluster, and it is still a scaffold stub
+//! (its own issue), so today every well-formed session id reaches the lookup and is
+//! refused there rather than at a guess.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +139,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSession"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // Reporting only: `cluster_mut` materialises the transitions the clock already
+        // made due, which were owed at this instant whether or not anybody asked for a
+        // session.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(GetSessionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster id '{}' is not valid or does not exist.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let Some(session) = cluster.session(&input.session_id) else {
+            return Err(GetSessionErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Session id '{}' is not valid or does not exist on cluster '{}'.",
+                        input.session_id, input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetSessionOutput {
+            session: session.clone(),
+        })
     }
 }

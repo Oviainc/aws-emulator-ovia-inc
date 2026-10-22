@@ -468,8 +468,8 @@ fn integration_of(
         // configuration is materialised by the service — `cacheNamespace` defaults to
         // the resource id ("By default, API Gateway uses the resource ID as the
         // cacheNamespace") — so its parameter list is reported as stored, empty included.
-        request_parameters: non_empty(input.request_parameters.clone()),
-        request_templates: non_empty(input.request_templates.clone()),
+        request_parameters: crate::state::non_empty_map(input.request_parameters.clone()),
+        request_templates: crate::state::non_empty_map(input.request_templates.clone()),
         passthrough_behavior: Some(passthrough_behavior),
         content_handling: input.content_handling.clone(),
         timeout_in_millis,
@@ -487,14 +487,6 @@ fn integration_of(
         response_transfer_mode: input.response_transfer_mode.clone(),
         integration_target: input.integration_target.clone(),
     })
-}
-
-/// A caller-supplied map as it is reported: absent when the caller set no entry, so an
-/// empty map in the request does not become an empty map in every later read.
-fn non_empty(
-    map: Option<::std::collections::HashMap<String, String>>,
-) -> Option<::std::collections::HashMap<String, String>> {
-    map.filter(|entries| !entries.is_empty())
 }
 
 /// The stored `Integration` as THIS operation's output shape. Both are the model's

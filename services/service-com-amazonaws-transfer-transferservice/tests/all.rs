@@ -61,6 +61,8 @@ mod state_roundtrip;
 mod user_properties_and_keys;
 #[path = "all/user_state_persistence.rs"]
 mod user_state_persistence;
+#[path = "all/web_app_customization.rs"]
+mod web_app_customization;
 #[path = "all/web_app_lifecycle.rs"]
 mod web_app_lifecycle;
 #[path = "all/web_app_listing.rs"]

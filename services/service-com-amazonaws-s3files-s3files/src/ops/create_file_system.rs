@@ -246,6 +246,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     client_token: Some(client_token.clone()),
                     name: crate::state::name_from_tags(&tags),
                     tags,
+                    // A new file system carries no resource policy until
+                    // `PutFileSystemPolicy` attaches one.
+                    policy: None,
                     sequence,
                 };
                 store.file_systems.insert(file_system_id.clone(), record);

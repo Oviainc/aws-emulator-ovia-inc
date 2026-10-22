@@ -29,7 +29,10 @@ use crate::rest_api_lifecycle::{
 /// A fresh resource under `root` carrying one `verb` method, answering its resource id.
 /// `request_parameters` is the method's `requestParameters` map, which is what a
 /// `cacheKeyParameters` entry has to name.
-async fn resource_with_a_method(
+///
+/// Shared with the sibling `method_response` suite, which puts method responses on the
+/// methods it builds, so both suites stand a method up the same way.
+pub(crate) async fn resource_with_a_method(
     gateway: &Gateway,
     api: &str,
     root: &str,
@@ -94,8 +97,9 @@ async fn get_integration(gateway: &Gateway, api: &str, resource: &str, verb: &st
 }
 
 /// `GetMethod` for `verb` on `resource` of `api`, which reports the same stored
-/// integration as its `methodIntegration`.
-async fn get_method(gateway: &Gateway, api: &str, resource: &str, verb: &str) -> Answer {
+/// integration as its `methodIntegration` and the stored method responses as its
+/// `methodResponses`. Shared with the sibling `method_response` suite.
+pub(crate) async fn get_method(gateway: &Gateway, api: &str, resource: &str, verb: &str) -> Answer {
     gateway
         .call(
             "GET",

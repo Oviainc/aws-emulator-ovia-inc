@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAutoshiftObserverNotificationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAutoshiftObserverNotificationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAutoshiftObserverNotificationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the account-wide autoshift observer notification status to the store and
+//! reports the value now in effect, so `GetAutoshiftObserverNotificationStatus`
+//! reads back what this call set.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +75,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::AutoshiftObserverNotificationStatus;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +148,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAutoshiftObserverNotificationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAutoshiftObserverNotificationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAutoshiftObserverNotificationStatus"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAutoshiftObserverNotificationStatusError::from(
+                UpdateAutoshiftObserverNotificationStatusErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the ARC zonal shift store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        // The modelled enum is refused at the boundary, so a value that is not one of
+        // the two the model declares does not reach here; refusing it as a modelled
+        // `ValidationException` (reason `InvalidStatus`) rather than unwrapping keeps
+        // the handler's answer a modelled one whatever reaches it.
+        let Some(status) = AutoshiftObserverNotificationStatus::parse(&input.status) else {
+            return Err(
+                UpdateAutoshiftObserverNotificationStatusErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "status {} is not one of {}",
+                            input.status,
+                            AUTOSHIFT_OBSERVER_NOTIFICATION_STATUS_VALUES.join(", ")
+                        ),
+                        reason: "InvalidStatus".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Idempotent: the setting is replaced by the one the caller asked for, so
+        // repeating the call leaves the same value in the store.
+        state.lock().autoshift_observer_notification_status = status;
+
+        Ok(UpdateAutoshiftObserverNotificationStatusOutput {
+            status: status.as_wire().to_string(),
+        })
     }
 }

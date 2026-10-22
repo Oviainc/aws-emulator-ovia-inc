@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFileSystemPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFileSystemPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFileSystemPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches the IAM resource policy a file system carries. `@idempotent`, with a
+//! modelled 204 and no response body: a file system that carries no policy is already
+//! in the state this call asks for, so the call succeeds rather than failing.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFileSystemPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFileSystemPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFileSystemPolicy"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteFileSystemPolicyErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        let file_system_id = crate::state::file_system_id_of(&input.file_system_id)
+            .ok_or_else(|| {
+                DeleteFileSystemPolicyErrorModeled::ValidationException(crate::state::invalid(
+                    format!(
+                        "fileSystemId must be a file system id (fs-<hex>) or its ARN, got {:?}",
+                        input.file_system_id
+                    ),
+                ))
+            })?
+            .to_string();
+
+        // The file system itself must exist; its policy need not. `@idempotent` means a
+        // repeat of this call is the same call, so detaching an already-absent policy is
+        // a success.
+        let stored = store.file_systems.get_mut(&file_system_id).ok_or_else(|| {
+            DeleteFileSystemPolicyErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(format!("no file system {file_system_id}")),
+            )
+        })?;
+        stored.policy = None;
+
+        Ok(DeleteFileSystemPolicyOutput)
     }
 }

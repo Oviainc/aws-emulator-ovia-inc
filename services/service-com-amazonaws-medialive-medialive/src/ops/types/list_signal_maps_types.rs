@@ -27,7 +27,16 @@ pub struct ListSignalMapsOutput {
     pub signal_maps: Option<Vec<SignalMapSummary>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.medialive#SignalMapSummary")]
+/// `SignalMapSummary`, with its schema written out instead of derived because `CreatedAt`
+/// and `ModifiedAt` target `__timestampIso8601`, which is `@timestampFormat("date-time")`;
+/// the note in `shared_types` says why that cannot be derived here. Member for member this
+/// is the model's shape: same ids, same order, same indices, and the `@required` members
+/// (`Arn`, `CreatedAt`, `Id`, `MonitorDeploymentStatus`, `Name`, `Status`) are bare fields
+/// refused by name when absent, exactly as the derive has them.
+///
+/// Unlike the flat response shapes beside it this one DOES carry a deserializer: it is the
+/// element of `ListSignalMapsResponse$SignalMaps`, and the derive on that shape reads each
+/// element through `DeserializableStruct`.
 #[derive(Debug, Clone)]
 pub struct SignalMapSummary {
     pub arn: String,
@@ -39,5 +48,144 @@ pub struct SignalMapSummary {
     pub name: String,
     pub status: String,
     pub tags: Option<std::collections::HashMap<String, String>>,
+}
+
+impl SignalMapSummary {
+    const M_ARN: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("SignalMapSummary", "Arn", "arn", String, 0);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("SignalMapSummary", "CreatedAt", "createdAt", 1);
+    const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("SignalMapSummary", "Description", "description", String, 2);
+    const M_ID: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("SignalMapSummary", "Id", "id", String, 3);
+    const M_MODIFIED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("SignalMapSummary", "ModifiedAt", "modifiedAt", 4);
+    // `SignalMapMonitorDeploymentStatus` and `SignalMapStatus` are enum shapes, which the
+    // generator writes as `ShapeType::String`.
+    const M_MONITOR_DEPLOYMENT_STATUS: ::aws_smithy_schema::Schema = shared_types::member_of!(
+        "SignalMapSummary",
+        "MonitorDeploymentStatus",
+        "monitorDeploymentStatus",
+        String,
+        5
+    );
+    const M_NAME: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("SignalMapSummary", "Name", "name", String, 6);
+    const M_STATUS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("SignalMapSummary", "Status", "status", String, 7);
+    const M_TAGS: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("SignalMapSummary", "Tags", "tags", Map, 8);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.medialive#SignalMapSummary",
+            shared_types::NAMESPACE,
+            "SignalMapSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_CREATED_AT,
+            &Self::M_DESCRIPTION,
+            &Self::M_ID,
+            &Self::M_MODIFIED_AT,
+            &Self::M_MONITOR_DEPLOYMENT_STATUS,
+            &Self::M_NAME,
+            &Self::M_STATUS,
+            &Self::M_TAGS,
+        ],
+    );
+}
+
+pub static SIGNAL_MAP_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &SignalMapSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for SignalMapSummary {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_string(&Self::M_ARN, self.arn.as_str())?;
+        serializer.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        if let Some(value) = self.description.as_ref() {
+            serializer.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+        }
+        serializer.write_string(&Self::M_ID, self.id.as_str())?;
+        if let Some(value) = self.modified_at.as_ref() {
+            serializer.write_timestamp(&Self::M_MODIFIED_AT, value)?;
+        }
+        serializer.write_string(
+            &Self::M_MONITOR_DEPLOYMENT_STATUS,
+            self.monitor_deployment_status.as_str(),
+        )?;
+        serializer.write_string(&Self::M_NAME, self.name.as_str())?;
+        serializer.write_string(&Self::M_STATUS, self.status.as_str())?;
+        if let Some(value) = self.tags.as_ref() {
+            serializer.write_map(&Self::M_TAGS, &|entries| {
+                for (key, tag) in value.iter() {
+                    entries.write_string(&Self::M_TAGS, key.as_str())?;
+                    entries.write_string(&Self::M_TAGS, tag.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for SignalMapSummary {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut arn = ::std::option::Option::None;
+        let mut created_at = ::std::option::Option::None;
+        let mut description = ::std::option::Option::None;
+        let mut id = ::std::option::Option::None;
+        let mut modified_at = ::std::option::Option::None;
+        let mut monitor_deployment_status = ::std::option::Option::None;
+        let mut name = ::std::option::Option::None;
+        let mut status = ::std::option::Option::None;
+        let mut tags = ::std::option::Option::None;
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, reader| {
+            match member.member_index() {
+                Some(0) => arn = Some(reader.read_string(&Self::M_ARN)?),
+                Some(1) => created_at = Some(reader.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(2) => description = Some(reader.read_string(&Self::M_DESCRIPTION)?),
+                Some(3) => id = Some(reader.read_string(&Self::M_ID)?),
+                Some(4) => modified_at = Some(reader.read_timestamp(&Self::M_MODIFIED_AT)?),
+                Some(5) => {
+                    monitor_deployment_status =
+                        Some(reader.read_string(&Self::M_MONITOR_DEPLOYMENT_STATUS)?);
+                }
+                Some(6) => name = Some(reader.read_string(&Self::M_NAME)?),
+                Some(7) => status = Some(reader.read_string(&Self::M_STATUS)?),
+                Some(8) => {
+                    let mut entries: ::std::collections::HashMap<String, String> =
+                        ::std::collections::HashMap::new();
+                    reader.read_map(&Self::M_TAGS, &mut |key, value| {
+                        entries.insert(key, value.read_string(&Self::M_TAGS)?);
+                        Ok(())
+                    })?;
+                    tags = Some(entries);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            arn: arn.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Arn"))?,
+            created_at: created_at
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("CreatedAt"))?,
+            description,
+            id: id.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Id"))?,
+            modified_at,
+            monitor_deployment_status: monitor_deployment_status.ok_or_else(|| {
+                ::aws_smithy_schema_server::missing_member("MonitorDeploymentStatus")
+            })?,
+            name: name.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Name"))?,
+            status: status.ok_or_else(|| ::aws_smithy_schema_server::missing_member("Status"))?,
+            tags,
+        })
+    }
 }
 

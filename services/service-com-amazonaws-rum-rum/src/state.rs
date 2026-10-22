@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AppMonitor, AppMonitorConfiguration, AppMonitorDetails, AppMonitorSummary,
     ConflictException, CustomEvents, CwLog, DataStorage, DeobfuscationConfiguration,
-    ResourceNotFoundException,
+    InvalidPolicyRevisionIdException, PolicyNotFoundException, ResourceNotFoundException,
 };
 
 /// This service's ARN namespace / sigv4 signing name (`OPERATIONS.md`,
@@ -91,6 +91,33 @@ pub const MAX_APP_MONITORS: usize = 1000;
 /// days and then deleted"). The count is this emulator's own bound, not AWS's.
 pub const MAX_EVENTS_PER_APP_MONITOR: usize = 10_000;
 
+/// The most bytes a resource-policy document may carry.
+///
+/// From the model: `PutResourcePolicy` documents "The maximum size of the policy is 4
+/// KB" and `PolicySizeLimitExceededException` documents "The policy document is too
+/// large. The limit is 4 KB." — 4 KB is AWS's own documented limit, not a bound this
+/// emulator chose, and a document past it is refused with that modelled error.
+pub const MAX_POLICY_DOCUMENT_BYTES: usize = 4 * 1024;
+
+/// The `Version` values an IAM JSON policy document may declare.
+///
+/// Source: the IAM JSON policy language reference — `Version` "specifies the language
+/// syntax rules" and admits the current `2012-10-17` and the legacy `2008-10-17`; any
+/// other value makes the document malformed.
+pub const POLICY_DOCUMENT_VERSIONS: &[&str] = &["2008-10-17", "2012-10-17"];
+
+/// The top-level elements an IAM JSON policy document may carry.
+///
+/// Source: the IAM JSON policy language reference — a policy document is a JSON object
+/// whose elements are `Version`, `Id` and `Statement`.
+pub const POLICY_DOCUMENT_ELEMENTS: &[&str] = &["Version", "Id", "Statement"];
+
+/// The `Effect` values an IAM policy statement may carry.
+///
+/// Source: the IAM JSON policy language reference — `Effect` is required and is either
+/// `Allow` or `Deny`, matched case-sensitively.
+pub const POLICY_STATEMENT_EFFECTS: &[&str] = &["Allow", "Deny"];
+
 /// The message for the one failure that is not about the request: this service was
 /// mounted on an engine that holds no store for it.
 pub const NO_STORE: &str = "the com-amazonaws-rum-rum store is not mounted on this engine";
@@ -119,6 +146,23 @@ pub struct StoredRumEvent {
     pub session_id: Option<String>,
     /// The event as a JSON object: `id`, `timestamp`, `type`, `metadata`, `details`.
     pub event_json: String,
+}
+
+/// The resource-based policy attached to one app monitor.
+///
+/// `PutResourcePolicy` documents "Each app monitor can have one resource-based policy",
+/// so a monitor holds at most one of these, and it lives ON the monitor's record: a
+/// policy cannot outlive the resource whose access it controls, so `DeleteAppMonitor`
+/// takes it away with the monitor.
+#[derive(Debug, Clone)]
+pub struct ResourcePolicyRecord {
+    /// `PolicyDocument` exactly as the `PutResourcePolicy` call delivered it — kept
+    /// verbatim, never re-serialized, so a read reports the bytes that were written.
+    pub document: String,
+    /// The `PolicyRevisionId` this revision was stored under: minted by the service on
+    /// every successful put, and what a later conditional put or delete is checked
+    /// against.
+    pub revision_id: String,
 }
 
 /// One persisted app monitor.
@@ -159,6 +203,10 @@ pub struct AppMonitorRecord {
     /// Events delivered by `PutRumEvents`, oldest first. Bounded by
     /// [`MAX_EVENTS_PER_APP_MONITOR`]; append through [`Self::record_events`].
     pub events: VecDeque<StoredRumEvent>,
+    /// This monitor's one resource-based policy, or `None` while it carries none — the
+    /// state `GetResourcePolicy` and `DeleteResourcePolicy` answer
+    /// `PolicyNotFoundException` for.
+    pub resource_policy: Option<ResourcePolicyRecord>,
 }
 
 impl AppMonitorRecord {
@@ -214,6 +262,35 @@ impl AppMonitorRecord {
         }
     }
 
+    /// The revision id of this monitor's stored resource policy, or `None` while it
+    /// carries no policy.
+    pub fn policy_revision_id(&self) -> Option<&str> {
+        self.resource_policy
+            .as_ref()
+            .map(|policy| policy.revision_id.as_str())
+    }
+
+    /// Why a request carrying `provided` as its `PolicyRevisionId` cannot act on this
+    /// monitor's policy, or `None` when it can.
+    ///
+    /// From the model (`PutResourcePolicyRequest$PolicyRevisionId`): "You can provide the
+    /// revision ID of your existing policy to make mutating requests against that policy
+    /// … later requests about that policy will be rejected with an
+    /// InvalidPolicyRevisionIdException error if they don't provide the correct current
+    /// revision ID." So a request that names a revision id is CONDITIONAL on it being
+    /// the current one — including when there is no policy at all, where no id can be the
+    /// current one — and a request that names none is unconditional. Shared by
+    /// `PutResourcePolicy` and `DeleteResourcePolicy`, which the model gives the same
+    /// member and the same error.
+    pub fn policy_revision_refusal(
+        &self,
+        provided: Option<&str>,
+    ) -> Option<InvalidPolicyRevisionIdException> {
+        let provided = provided?;
+        (self.policy_revision_id() != Some(provided))
+            .then(|| policy_revision_mismatch(provided))
+    }
+
     /// Append events to this monitor's buffer, dropping the oldest once the buffer is at
     /// [`MAX_EVENTS_PER_APP_MONITOR`].
     pub fn record_events(&mut self, events: impl IntoIterator<Item = StoredRumEvent>) {
@@ -265,11 +342,28 @@ impl ComAmazonawsRumRumState {
         }
         loop {
             self.next_id_seq = self.next_id_seq.wrapping_add(1);
-            let candidate = uuid_v4_shaped(self.id_seed, self.next_id_seq);
+            let candidate = uuid_v4_shaped(APP_MONITOR_ID_DOMAIN, self.id_seed, self.next_id_seq);
             if !self.monitor_ids.contains_key(&candidate) {
                 return candidate;
             }
         }
+    }
+
+    /// Mint a fresh `PolicyRevisionId` for a resource policy a call is about to store.
+    ///
+    /// `PolicyRevisionId` is modelled as a 1..255-character string with no pattern, and
+    /// the value is the SERVICE's: a caller only ever passes one back to make a
+    /// conditional request, so what matters is that no two puts produce the same id
+    /// (otherwise a stale id would pass a conditional check) and that it cannot be
+    /// guessed from the previous one. Both come from the same digest-of-(seed, counter)
+    /// construction [`Self::mint_app_monitor_id`] uses, under its own domain string so
+    /// the two id spaces cannot collide.
+    pub fn mint_policy_revision_id(&mut self) -> String {
+        if self.id_seed == 0 {
+            self.id_seed = nanos_since_epoch() as u64;
+        }
+        self.next_id_seq = self.next_id_seq.wrapping_add(1);
+        uuid_v4_shaped(POLICY_REVISION_DOMAIN, self.id_seed, self.next_id_seq)
     }
 
     /// Store `record`, keeping the `Id` -> `Name` index in step with the primary map.
@@ -306,16 +400,25 @@ fn nanos_since_epoch() -> u128 {
         .as_nanos()
 }
 
-/// One `(seed, sequence)` pair as a canonical, lowercase, version-4-shaped UUID string.
+/// The id space [`ComAmazonawsRumRumState::mint_app_monitor_id`] draws from.
+const APP_MONITOR_ID_DOMAIN: &str = "rum/appmonitor";
+
+/// The id space [`ComAmazonawsRumRumState::mint_policy_revision_id`] draws from.
+const POLICY_REVISION_DOMAIN: &str = "rum/policyrevision";
+
+/// One `(domain, seed, sequence)` triple as a canonical, lowercase, version-4-shaped
+/// UUID string.
 ///
-/// The 16 bytes come from a SHA-256 digest of the pair, then byte 6's high nibble is set
-/// to `4` (the version) and byte 8's two high bits to `10` (the RFC 4122 variant), which
-/// is exactly the layout a v4 generator writes. Distinct pairs give distinct ids: the
-/// digest is injective in practice and the sequence is strictly increasing.
-fn uuid_v4_shaped(seed: u64, sequence: u64) -> String {
+/// The 16 bytes come from a SHA-256 digest of the triple, then byte 6's high nibble is
+/// set to `4` (the version) and byte 8's two high bits to `10` (the RFC 4122 variant),
+/// which is exactly the layout a v4 generator writes. Distinct triples give distinct
+/// ids: the digest is injective in practice and the sequence is strictly increasing.
+/// `domain` keeps one kind of id from ever equalling another drawn from the same seed
+/// and counter.
+fn uuid_v4_shaped(domain: &str, seed: u64, sequence: u64) -> String {
     use sha2::{Digest as _, Sha256};
 
-    let digest = Sha256::digest(format!("rum/appmonitor/{seed}/{sequence}").as_bytes());
+    let digest = Sha256::digest(format!("{domain}/{seed}/{sequence}").as_bytes());
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -444,6 +547,211 @@ pub fn app_monitor_not_found(name_or_id: &str) -> ResourceNotFoundException {
         message: format!("App monitor {name_or_id} does not exist."),
         resource_name: name_or_id.to_string(),
         resource_type: Some(APP_MONITOR_RESOURCE_TYPE.to_string()),
+    }
+}
+
+/// Why this `PolicyDocument` is not a resource policy this service can store, or `None`
+/// when it is one.
+///
+/// `PolicyDocument` is modelled as a bare `String`, so NOTHING about its contents is
+/// refused before a handler runs; `MalformedPolicyDocumentException` — "The policy
+/// document that you specified is not formatted correctly" — is the modelled refusal for
+/// a document that is not a well-formed IAM JSON policy. The grammar checked here is the
+/// IAM JSON policy language's own: the document parses as JSON (by `serde_json`, this
+/// crate's JSON parser) into an object whose only elements are
+/// [`POLICY_DOCUMENT_ELEMENTS`], it carries at least one statement, and every statement
+/// element has the type and the value set that language gives it. Semantics beyond the
+/// grammar (whether an action exists, whether a principal resolves) are NOT checked:
+/// they are not what "formatted correctly" means.
+pub fn policy_document_refusal(document: &str) -> Option<String> {
+    let parsed = match ::serde_json::from_str::<::serde_json::Value>(document) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Some(format!(
+                "The policy document is not valid JSON: {error}."
+            ))
+        }
+    };
+    let Some(elements) = parsed.as_object() else {
+        return Some("The policy document must be a JSON object.".to_string());
+    };
+    if let Some(unknown) = elements
+        .keys()
+        .find(|key| !POLICY_DOCUMENT_ELEMENTS.contains(&key.as_str()))
+    {
+        return Some(format!(
+            "The policy document carries the unknown element {unknown}; a policy \
+             document's elements are {}.",
+            POLICY_DOCUMENT_ELEMENTS.join(", ")
+        ));
+    }
+    if let Some(version) = elements.get("Version") {
+        let declared = version.as_str();
+        if !declared.is_some_and(|value| POLICY_DOCUMENT_VERSIONS.contains(&value)) {
+            return Some(format!(
+                "The policy document's Version must be one of {}.",
+                POLICY_DOCUMENT_VERSIONS.join(", ")
+            ));
+        }
+    }
+    if elements.get("Id").is_some_and(|id| !id.is_string()) {
+        return Some("The policy document's Id must be a string.".to_string());
+    }
+    let statements = match elements.get("Statement") {
+        None => {
+            return Some("The policy document must carry a Statement element.".to_string())
+        }
+        // A single statement may be given as the object itself rather than as a
+        // one-element list.
+        Some(::serde_json::Value::Object(statement)) => {
+            vec![::serde_json::Value::Object(statement.clone())]
+        }
+        Some(::serde_json::Value::Array(statements)) if !statements.is_empty() => {
+            statements.clone()
+        }
+        Some(_) => {
+            return Some(
+                "The policy document's Statement must be a statement object or a \
+                 non-empty list of them."
+                    .to_string(),
+            )
+        }
+    };
+    statements.iter().find_map(policy_statement_refusal)
+}
+
+/// Why one element of a policy document's `Statement` is not a well-formed statement, or
+/// `None` when it is one.
+fn policy_statement_refusal(statement: &::serde_json::Value) -> Option<String> {
+    let Some(members) = statement.as_object() else {
+        return Some("Each policy statement must be a JSON object.".to_string());
+    };
+    match members.get("Effect").and_then(::serde_json::Value::as_str) {
+        Some(effect) if POLICY_STATEMENT_EFFECTS.contains(&effect) => {}
+        _ => {
+            return Some(format!(
+                "Each policy statement must carry an Effect of {}.",
+                POLICY_STATEMENT_EFFECTS.join(" or ")
+            ))
+        }
+    }
+    // The IAM policy language takes the action either way round, but never both and
+    // never neither: a statement with no action element applies to nothing.
+    if members.contains_key("Action") == members.contains_key("NotAction") {
+        return Some(
+            "Each policy statement must carry exactly one of Action and NotAction.".to_string(),
+        );
+    }
+    for element in ["Action", "NotAction", "Resource", "NotResource"] {
+        if let Some(value) = members.get(element) {
+            if !is_string_or_non_empty_string_list(value) {
+                return Some(format!(
+                    "A policy statement's {element} must be a string or a non-empty list \
+                     of strings."
+                ));
+            }
+        }
+    }
+    for element in ["Principal", "NotPrincipal"] {
+        if let Some(value) = members.get(element) {
+            if !is_policy_principal(value) {
+                return Some(format!(
+                    "A policy statement's {element} must be a string or a map of \
+                     principal type to one or more principals."
+                ));
+            }
+        }
+    }
+    if members.get("Sid").is_some_and(|sid| !sid.is_string()) {
+        return Some("A policy statement's Sid must be a string.".to_string());
+    }
+    if members
+        .get("Condition")
+        .is_some_and(|condition| !is_policy_condition(condition))
+    {
+        return Some(
+            "A policy statement's Condition must be a map of condition operator to a map \
+             of condition key to its values."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Whether `value` is how the IAM policy language writes one or more strings: the string
+/// itself, or a non-empty list of strings.
+fn is_string_or_non_empty_string_list(value: &::serde_json::Value) -> bool {
+    match value {
+        ::serde_json::Value::String(_) => true,
+        ::serde_json::Value::Array(entries) => {
+            !entries.is_empty() && entries.iter().all(::serde_json::Value::is_string)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `value` is a `Principal`/`NotPrincipal` element: the wildcard string, or a map
+/// of principal type (`AWS`, `Service`, `Federated`, `CanonicalUser`) to one or more
+/// principals.
+fn is_policy_principal(value: &::serde_json::Value) -> bool {
+    match value {
+        ::serde_json::Value::String(_) => true,
+        ::serde_json::Value::Object(by_type) => {
+            !by_type.is_empty()
+                && by_type
+                    .values()
+                    .all(is_string_or_non_empty_string_list)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `value` is a `Condition` element: a map of condition operator to a map of
+/// condition key to the value(s) it is compared against.
+fn is_policy_condition(value: &::serde_json::Value) -> bool {
+    value.as_object().is_some_and(|by_operator| {
+        by_operator.values().all(|by_key| {
+            by_key
+                .as_object()
+                .is_some_and(|keys| keys.values().all(is_policy_condition_value))
+        })
+    })
+}
+
+/// Whether `value` is a condition key's right-hand side: a string, a boolean, a number,
+/// or a non-empty list of those.
+fn is_policy_condition_value(value: &::serde_json::Value) -> bool {
+    match value {
+        ::serde_json::Value::String(_)
+        | ::serde_json::Value::Bool(_)
+        | ::serde_json::Value::Number(_) => true,
+        ::serde_json::Value::Array(entries) => {
+            !entries.is_empty() && entries.iter().all(is_policy_condition_value)
+        }
+        _ => false,
+    }
+}
+
+/// `PolicyNotFoundException` for an app monitor that exists but carries no resource
+/// policy. The message is built from the request, so it names the monitor asked about.
+pub fn policy_not_found(name: &str) -> PolicyNotFoundException {
+    PolicyNotFoundException {
+        message: format!("App monitor {name} does not have a resource policy."),
+    }
+}
+
+/// `InvalidPolicyRevisionIdException` for a conditional request whose `PolicyRevisionId`
+/// is not the stored policy's current one.
+///
+/// From the model: "The policy revision ID that you provided doeesn't match the latest
+/// policy revision ID." The message names the id the REQUEST carried; the current one is
+/// deliberately not disclosed, since a caller that holds a stale id has to re-read the
+/// policy to learn the new one.
+pub fn policy_revision_mismatch(provided: &str) -> InvalidPolicyRevisionIdException {
+    InvalidPolicyRevisionIdException {
+        message: format!(
+            "The policy revision ID {provided} does not match the latest policy revision ID."
+        ),
     }
 }
 

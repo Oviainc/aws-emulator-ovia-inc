@@ -35,7 +35,8 @@ use crate::ops::types::{
 
 /// How long a status transition a create owes takes to fall due.
 ///
-/// `CreateDirectory` answers while the directory is still being built — the modelled
+/// A create (`CreateDirectory`, `CreateMicrosoftAD`) answers while the directory is
+/// still being built — the modelled
 /// `DirectoryStage` enum's first value is `Requested` — and `CreateSnapshot` answers
 /// while the snapshot is still being taken — the modelled `SnapshotStatus` enum's first
 /// value is `Creating` — so the move to `Active`/`Completed` is owed by the clock rather
@@ -79,6 +80,36 @@ pub const STAGE_ACTIVE: &str = "Active";
 /// with the `SimpleAD` value of the modelled `DirectoryType` enum.
 pub const TYPE_SIMPLE_AD: &str = "SimpleAD";
 
+/// The `DirectoryType` of a directory created by `CreateMicrosoftAD`: AWS Managed
+/// Microsoft AD.
+///
+/// `CreateMicrosoftAD`'s own documentation ("Creates a Microsoft AD directory ... see
+/// Managed Microsoft AD"), rendered with the `MicrosoftAD` value of the modelled
+/// `DirectoryType` enum.
+pub const TYPE_MICROSOFT_AD: &str = "MicrosoftAD";
+
+/// The editions a Managed Microsoft AD directory may be created with.
+///
+/// From `CreateMicrosoftADRequest$Edition`'s own documentation: "Managed Microsoft AD is
+/// available in two editions: `Standard` and `Enterprise`." The third value of the
+/// modelled `DirectoryEdition` enum, `Hybrid`, belongs to a hybrid directory and is
+/// therefore refused by `CreateMicrosoftAD`.
+pub const MICROSOFT_AD_EDITIONS: [&str; 2] = ["Standard", "Enterprise"];
+
+/// The edition a Managed Microsoft AD directory is created with when the request names
+/// none, from the same sentence: "`Enterprise` is the default."
+pub const DEFAULT_MICROSOFT_AD_EDITION: &str = "Enterprise";
+
+/// The number of domain controllers a Managed Microsoft AD directory is created with.
+///
+/// The modelled `DesiredNumberOfDomainControllers` carries `range { min: 2 }`, and
+/// `DirectoryVpcSettings$SubnetIds`' own documentation says "Directory Service creates a
+/// directory server and a DNS server in each of these subnets" — two subnets in
+/// different Availability Zones — so a freshly created Managed Microsoft AD directory
+/// has exactly the modelled minimum of two. `UpdateNumberOfDomainControllers` is what
+/// changes it afterwards.
+pub const MICROSOFT_AD_DOMAIN_CONTROLLERS: i32 = 2;
+
 /// The DNS suffix a directory's access URL is built on, from the `AccessUrl` member's
 /// documentation: "The access URL for the directory, such as
 /// `http://<alias>.awsapps.com`".
@@ -91,8 +122,10 @@ const ACCESS_URL_SUFFIX: &str = ".awsapps.com";
 /// modelled `NetworkType` enum, `IPv6`, is therefore refused for this directory type.
 pub const SIMPLE_AD_NETWORK_TYPES: [&str; 2] = ["IPv4", "Dual-stack"];
 
-/// Directory Service's default quota "Simple AD directories: 10" per account per
-/// Region, the bound `DirectoryLimitExceededException` reports.
+/// Directory Service's default quota of 10 directories per account per Region, the
+/// bound `DirectoryLimitExceededException` reports. Every create in this slice
+/// (`CreateDirectory`, `CreateMicrosoftAD`) counts against it, so the Region holds at
+/// most this many directories whatever their type.
 pub const MAX_DIRECTORIES: usize = 10;
 
 /// AWS's tagging limit of 50 tags per resource, the bound
@@ -254,11 +287,16 @@ pub struct Directory {
     pub name: String,
     pub short_name: Option<String>,
     pub description: Option<String>,
+    /// Only a Simple AD directory has a size (`Small`/`Large`), so this stays `None`
+    /// for a Managed Microsoft AD directory, which carries an [`Self::edition`]
+    /// instead.
     pub size: Option<String>,
     /// Only AWS Managed Microsoft AD has an edition, so this stays `None` for a
-    /// Simple AD directory; `CreateMicrosoftAD` (still scaffolded) will set it.
+    /// Simple AD directory and `CreateMicrosoftAD` sets it.
     pub edition: Option<String>,
-    /// One of the modelled `DirectoryType` values; [`TYPE_SIMPLE_AD`] here.
+    /// One of the modelled `DirectoryType` values: [`TYPE_SIMPLE_AD`] for a directory
+    /// `CreateDirectory` persisted, [`TYPE_MICROSOFT_AD`] for one `CreateMicrosoftAD`
+    /// persisted.
     pub directory_type: String,
     /// One of the modelled `DirectoryStage` values.
     pub stage: String,
@@ -273,8 +311,9 @@ pub struct Directory {
     pub vpc_settings: Option<DirectoryVpcSettingsDescription>,
     pub network_type: Option<String>,
     pub sso_enabled: bool,
-    /// Set by `UpdateNumberOfDomainControllers` (still scaffolded) and reported only
-    /// for AWS Managed Microsoft AD, so it stays `None` for Simple AD.
+    /// Reported only for AWS Managed Microsoft AD, so it stays `None` for Simple AD:
+    /// `CreateMicrosoftAD` sets it to [`MICROSOFT_AD_DOMAIN_CONTROLLERS`] and
+    /// `UpdateNumberOfDomainControllers` (still scaffolded) is what changes it.
     pub desired_number_of_domain_controllers: Option<i32>,
     /// This directory's tags, keyed by tag key: a second `AddTagsToResource` with a key
     /// already present overwrites that key's value.

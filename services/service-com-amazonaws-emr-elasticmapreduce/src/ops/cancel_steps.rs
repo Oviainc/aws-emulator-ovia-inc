@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelSteps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelSteps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelSteps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Begins cancelling each named step of the named cluster and answers with one
+//! `CancelStepsInfo` per requested step id: `SUBMITTED` for a step the cancel could
+//! act on, `FAILED` with a reason for one it could not (an id the cluster does not
+//! carry, or a step already past cancelling). An id no cluster carries is refused with
+//! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +149,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelSteps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelStepsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelSteps"))
+        use crate::state::{cancel_steps_request_status, MAX_CANCEL_STEP_IDS};
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // "A maximum of 256 steps are allowed in each CancelSteps request."
+        // (`CancelSteps` doc.)
+        if input.step_ids.len() > MAX_CANCEL_STEP_IDS {
+            return Err(CancelStepsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "StepIds carries {} ids; a maximum of {MAX_CANCEL_STEP_IDS} steps are \
+                         allowed in each CancelSteps request",
+                        input.step_ids.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CancelStepsErrorModeled::InternalServerError(InternalServerError {}).into(),
+            );
+        };
+        let mut store = state.lock();
+
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(CancelStepsErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster id '{}' is not valid or does not exist.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // One entry per requested id, in request order: "A list of CancelStepsInfo,
+        // which shows the status of specified cancel requests for each StepID
+        // specified." (`CancelStepsOutput$CancelStepsInfoList` doc.)
+        let mut info = Vec::with_capacity(input.step_ids.len());
+        for step_id in &input.step_ids {
+            let (status, reason) = match cluster.step_mut(step_id) {
+                Some(step) => {
+                    if step.begin_cancellation(now) {
+                        (cancel_steps_request_status::SUBMITTED, None)
+                    } else {
+                        // The step is past cancelling: "you can cancel steps that are
+                        // in a PENDING or RUNNING state" (`CancelSteps` doc).
+                        (
+                            cancel_steps_request_status::FAILED,
+                            Some(format!(
+                                "Step {step_id} is in state {} and can no longer be cancelled",
+                                step.state
+                            )),
+                        )
+                    }
+                }
+                None => (
+                    cancel_steps_request_status::FAILED,
+                    Some(format!(
+                        "Step id '{step_id}' is not valid or does not exist on cluster '{}'",
+                        input.cluster_id
+                    )),
+                ),
+            };
+            info.push(CancelStepsInfo {
+                step_id: Some(step_id.clone()),
+                status: Some(status.to_string()),
+                reason,
+            });
+        }
+
+        Ok(CancelStepsOutput {
+            cancel_steps_info_list: Some(info),
+        })
     }
 }

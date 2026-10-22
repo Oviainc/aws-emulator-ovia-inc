@@ -17,5 +17,7 @@ mod canary_lifecycle;
 mod input_validation;
 #[path = "all/missing_resource_errors.rs"]
 mod missing_resource_errors;
+#[path = "all/server_side_validation.rs"]
+mod server_side_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

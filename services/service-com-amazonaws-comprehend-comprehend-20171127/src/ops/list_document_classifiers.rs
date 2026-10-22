@@ -7,8 +7,11 @@
 //! `MaxResults` and hands back an opaque `NextToken` that resumes exactly after the
 //! last classifier on the page.
 //!
-//! A pure report: it computes the page from [`crate::state`] and writes nothing, so
-//! two callers an instant apart see the same list.
+//! A pure report: it computes the page from [`crate::state`] and writes nothing a
+//! caller can tell apart from the clock's own work \u2014 the only thing it materialises
+//! is the status change each record was already owed at the instant of the call
+//! ([`crate::state::ComAmazonawsComprehendComprehend20171127State::settle_document_classifiers`]),
+//! so two callers an instant apart see the same list.
 //!
 //! ## Shape of an operation
 //!
@@ -270,7 +273,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(DEFAULT_MAX_RESULTS)
             .clamp(1, MAX_RESULTS_CEILING);
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // Materialise the status changes the clock already owed, so the status this
+        // page reports — and the one `Filter.Status` selects on — is the status each
+        // classifier already had at `now`, and a classifier whose deletion has come
+        // due is no longer listed. Reporting, not mutating: every transition applied
+        // here was due whether or not anybody called.
+        store.settle_document_classifiers(::std::time::SystemTime::now());
 
         // A cursor is a creation sequence number this service has actually minted,
         // so a well-formed string that names no page it ever issued — zero, or a

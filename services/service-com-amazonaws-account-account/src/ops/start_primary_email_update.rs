@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartPrimaryEmailUpdate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartPrimaryEmailUpdate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartPrimaryEmailUpdate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a primary email update against the MEMBER account the request names,
+//! which is what a later `GetPrimaryEmailUpdateStatus` reports. A request that
+//! names the caller's own account is refused with the modelled 403
+//! `AccessDeniedException` before the address is acted on: per the model's own
+//! `AccountId` documentation, the management account can't specify its own
+//! `AccountId`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +160,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartPrimaryEmailUpdate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartPrimaryEmailUpdateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartPrimaryEmailUpdate"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartPrimaryEmailUpdateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // The authorization rule comes FIRST, before the proposed address is
+        // looked at or stored: this operation updates a member account from the
+        // management or delegated administrator account, and the model's
+        // `AccountId` documentation states that the management account can't
+        // specify its own `AccountId`. `AccountId` is a required member here
+        // (unlike on the reporting operations), so there is no caller's-own
+        // default to resolve — naming one's own account is the refusal.
+        if input.account_id == crate::state::default_account_id() {
+            return Err(StartPrimaryEmailUpdateErrorModeled::AccessDeniedException(
+                crate::state::cannot_target_own_account(),
+            )
+            .into());
+        }
+
+        // `PrimaryEmail` carries `@length(min: 5, max: 64)` and no `@pattern`, and
+        // `AccountId` carries `^\d{12}$`, so the boundary already refused anything
+        // outside those with HTTP 400 `ValidationException` before this handler
+        // ran. The model constrains the address no further, so no address format
+        // is invented here.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(account) = store.account_mut(&input.account_id, now) else {
+            return Err(StartPrimaryEmailUpdateErrorModeled::AccessDeniedException(
+                crate::state::account_store_full(&input.account_id),
+            )
+            .into());
+        };
+        // The account carries its MOST RECENT update, so starting another one
+        // replaces the record rather than adding a second: a restarted update is
+        // the one a status read reports, with its own `UpdatedAt`.
+        let update = crate::state::PrimaryEmailUpdate::started(input.primary_email, now);
+        let status = update.status.clone();
+        account.primary_email_update = Some(update);
+
+        Ok(StartPrimaryEmailUpdateOutput {
+            status: Some(status),
+        })
     }
 }

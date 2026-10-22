@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the cluster's step concurrency level and extended-support setting in the
+//! shared engine and answers with the values the cluster now carries, so a later
+//! `DescribeCluster` reports the same ones. An id no cluster carries is refused with
+//! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +142,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCluster"))
+        use crate::state::{DEFAULT_STEP_CONCURRENCY_LEVEL, MAX_STEP_CONCURRENCY_LEVEL};
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // "The number of steps that can be executed concurrently. You can specify a
+        // minimum of 1 step and a maximum of 256 steps."
+        // (`ModifyCluster$StepConcurrencyLevel` doc.) The model types the member as a
+        // plain integer, so the range is refused here rather than at the boundary.
+        if let Some(level) = input.step_concurrency_level {
+            if !(DEFAULT_STEP_CONCURRENCY_LEVEL..=MAX_STEP_CONCURRENCY_LEVEL).contains(&level) {
+                return Err(ModifyClusterErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        error_code: None,
+                        message: Some(format!(
+                            "StepConcurrencyLevel {level} is outside \
+                             {DEFAULT_STEP_CONCURRENCY_LEVEL}..{MAX_STEP_CONCURRENCY_LEVEL}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ModifyClusterErrorModeled::InternalServerError(InternalServerError {}).into(),
+            );
+        };
+        let mut store = state.lock();
+
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(ModifyClusterErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster id '{}' is not valid or does not exist.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A member the request omits is not a change: the cluster keeps the value it
+        // holds, and the response reports what it now carries either way.
+        if let Some(level) = input.step_concurrency_level {
+            cluster.step_concurrency_level = level;
+        }
+        if input.extended_support.is_some() {
+            cluster.extended_support = input.extended_support;
+        }
+
+        Ok(ModifyClusterOutput {
+            step_concurrency_level: Some(cluster.step_concurrency_level),
+            extended_support: cluster.extended_support,
+        })
     }
 }

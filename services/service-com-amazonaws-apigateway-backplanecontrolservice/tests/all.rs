@@ -19,6 +19,8 @@ mod api_key_lifecycle;
 mod delete_lifecycle;
 #[path = "all/method_integration.rs"]
 mod method_integration;
+#[path = "all/method_response.rs"]
+mod method_response;
 #[path = "all/patch_updates.rs"]
 mod patch_updates;
 #[path = "all/rest_api_defaults.rs"]

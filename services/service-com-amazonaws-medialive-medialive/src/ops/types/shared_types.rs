@@ -11,6 +11,577 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-medialive-medialive.json");
 
+// ---------------------------------------------------------------------------
+// Member-schema builders for the shapes whose schemas this service writes out
+// by hand instead of deriving.
+// ---------------------------------------------------------------------------
+//
+// WHY any shape is hand-written here: `com.amazonaws.medialive#__timestampIso8601` — the
+// target of every timestamp member this service models — carries
+// `@timestampFormat("date-time")`
+// (`smithy_query(query="shape",shape="__timestampIso8601")` reports
+// `"timestampFormat": "date-time"`), and `#[smithy_macros::smithy(shape = ...)]` does not
+// carry that trait onto the member schemas it emits (grep the tree: every
+// `with_timestamp_format` call site is hand-written service code). The restJson1 JSON
+// codec reads the format off the MEMBER schema and otherwise falls back to the protocol
+// default, epoch seconds (`vendor/smithy-schema-server/src/json.rs::timestamp_format`) —
+// a JSON NUMBER where the model, and every AWS SDK's generated deserializer for a
+// `date-time` member, requires an RFC 3339 string.
+//
+// The generator gap is filed as
+// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`;
+// the fix belongs in `vendor/smithy-macros`, which a service crate may not change. Until
+// then a shape of this service that serializes a timestamp writes its schema out with the
+// two builders below, which differ from the macro's output in exactly one chain call —
+// [`date_time_member_schema`]'s `.with_timestamp_format(DateTime)`.
+//
+// OTHER COPIES OF THIS WORKAROUND, to delete together when that issue lands: the closest
+// is `services/service-com-amazonaws-vpclattice-mercurycontrolplane/src/ops/types/
+// shared_types.rs` (`member_schema` / `date_time_member_schema` / `member_of!` /
+// `date_time_member_of!`, the same two const fns without the `@jsonName` argument this
+// service needs), and `accessanalyzer`, `amplifyuibuilder`, `apigatewaymanagementapi`,
+// `artifact`, `chimesdkmediapipelines`, `chimesdkvoice`, `detective`, `dlm` and
+// `verifiedpermissions` each carry an equivalent. They are per-crate because a service
+// crate's `types/` modules are the only place a member schema can be written, and the
+// shapes, namespaces and member lists are each service's own.
+//
+// Every member of this service's response shapes carries `@jsonName` (the model spells
+// members `CreatedAt` and the wire key `createdAt`), so both names are passed: the shape
+// id and the member name keep the model's spelling, and `.with_json_name` carries the
+// wire key the JSON codec emits. Constraint traits are deliberately absent, as they are
+// from the macro's output for an output shape: the validating walk runs on operation
+// INPUTS only, so a captured constraint on a response member is inert.
+
+/// This service's Smithy namespace, the second argument of every `ShapeId::from_static`
+/// the generator emits.
+pub const NAMESPACE: &str = "com.amazonaws.medialive";
+
+/// One member schema, as `#[smithy_macros::smithy(shape = ...)]` emits it.
+///
+/// `absolute` is the member's shape id (`<namespace>#<Shape>$<Member>`), `member_name` the
+/// member as the model spells it, `json_name` the `@jsonName` wire key, and `index` the
+/// member's position in the model's member list.
+pub const fn member_schema(
+    absolute: &'static str,
+    member_name: &'static str,
+    json_name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(absolute, NAMESPACE, member_name),
+        shape_type,
+        member_name,
+        index,
+    )
+    .with_json_name(json_name)
+}
+
+/// One timestamp member's schema: [`member_schema`] plus the `@timestampFormat` that
+/// `__timestampIso8601` declares and the macro drops.
+pub const fn date_time_member_schema(
+    absolute: &'static str,
+    member_name: &'static str,
+    json_name: &'static str,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    member_schema(
+        absolute,
+        member_name,
+        json_name,
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        index,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime)
+}
+
+/// [`member_schema`] for one member of `$shape`, spelling the member's shape id out of
+/// the shape and member names the way the generator does.
+///
+/// `$shape_type` is the `aws_smithy_schema::ShapeType` variant the generator picks for the
+/// member's target; an `enum` shape is `String`, as `shape_type_ident` has it.
+macro_rules! member_of {
+    ($shape:literal, $member:literal, $json:literal, $shape_type:ident, $index:literal) => {
+        $crate::ops::types::shared_types::member_schema(
+            concat!("com.amazonaws.medialive#", $shape, "$", $member),
+            $member,
+            $json,
+            ::aws_smithy_schema::ShapeType::$shape_type,
+            $index,
+        )
+    };
+}
+
+/// [`date_time_member_schema`] for one timestamp member of `$shape`; see [`member_of`].
+macro_rules! date_time_member_of {
+    ($shape:literal, $member:literal, $json:literal, $index:literal) => {
+        $crate::ops::types::shared_types::date_time_member_schema(
+            concat!("com.amazonaws.medialive#", $shape, "$", $member),
+            $member,
+            $json,
+            $index,
+        )
+    };
+}
+
+/// The schema and the serializer for one monitor template-GROUP response shape.
+///
+/// `CreateCloudWatchAlarmTemplateGroupResponse`,
+/// `GetCloudWatchAlarmTemplateGroupResponse`,
+/// `CreateEventBridgeRuleTemplateGroupResponse` and
+/// `GetEventBridgeRuleTemplateGroupResponse` are member for member the same shape
+/// (`smithy_query(query="shape",shape="…")`): seven members, in the model's order, with
+/// `CreatedAt` and `ModifiedAt` targeting `__timestampIso8601`. One macro rather than four
+/// copies of the same 60 lines, so the four cannot drift from each other or from the
+/// model.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: these shapes
+/// are operation OUTPUTS, which the server only ever serializes (`Operation::Output`
+/// requires `SerializableStruct`; only `Input` is deserialized).
+macro_rules! template_group_response {
+    ($ty:ident, $schema_static:ident, $shape:literal) => {
+        impl $ty {
+            const M_ARN: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Arn", "arn", String, 0);
+            const M_CREATED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!($shape, "CreatedAt", "createdAt", 1);
+            const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Description", "description", String, 2);
+            const M_ID: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Id", "id", String, 3);
+            const M_MODIFIED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!($shape, "ModifiedAt", "modifiedAt", 4);
+            const M_NAME: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Name", "name", String, 5);
+            const M_TAGS: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Tags", "tags", Map, 6);
+
+            pub const SCHEMA: ::aws_smithy_schema::Schema =
+                ::aws_smithy_schema::Schema::new_struct(
+                    ::aws_smithy_schema::ShapeId::from_static(
+                        concat!("com.amazonaws.medialive#", $shape),
+                        shared_types::NAMESPACE,
+                        $shape,
+                    ),
+                    ::aws_smithy_schema::ShapeType::Structure,
+                    &[
+                        &Self::M_ARN,
+                        &Self::M_CREATED_AT,
+                        &Self::M_DESCRIPTION,
+                        &Self::M_ID,
+                        &Self::M_MODIFIED_AT,
+                        &Self::M_NAME,
+                        &Self::M_TAGS,
+                    ],
+                );
+        }
+
+        pub static $schema_static: &::aws_smithy_schema::Schema = &$ty::SCHEMA;
+
+        impl ::aws_smithy_schema::serde::SerializableStruct for $ty {
+            fn serialize_members(
+                &self,
+                serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+            ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+                if let Some(value) = self.arn.as_ref() {
+                    serializer.write_string(&Self::M_ARN, value.as_str())?;
+                }
+                if let Some(value) = self.created_at.as_ref() {
+                    serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+                }
+                if let Some(value) = self.description.as_ref() {
+                    serializer.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+                }
+                if let Some(value) = self.id.as_ref() {
+                    serializer.write_string(&Self::M_ID, value.as_str())?;
+                }
+                if let Some(value) = self.modified_at.as_ref() {
+                    serializer.write_timestamp(&Self::M_MODIFIED_AT, value)?;
+                }
+                if let Some(value) = self.name.as_ref() {
+                    serializer.write_string(&Self::M_NAME, value.as_str())?;
+                }
+                if let Some(value) = self.tags.as_ref() {
+                    serializer.write_map(&Self::M_TAGS, &|entries| {
+                        for (key, tag) in value.iter() {
+                            entries.write_string(&Self::M_TAGS, key.as_str())?;
+                            entries.write_string(&Self::M_TAGS, tag.as_str())?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+/// The schema and the serializer for one eventbridge rule TEMPLATE response shape.
+///
+/// `CreateEventBridgeRuleTemplateResponse` and `GetEventBridgeRuleTemplateResponse` are
+/// member for member the same shape (`smithy_query(query="shape",shape="…")`): ten
+/// members, in the model's order, with `CreatedAt` and `ModifiedAt` targeting
+/// `__timestampIso8601`. See [`template_group_response`] for why the schema is written out
+/// and why no deserializer is emitted.
+macro_rules! event_bridge_rule_template_response {
+    ($ty:ident, $schema_static:ident, $shape:literal) => {
+        impl $ty {
+            const M_ARN: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Arn", "arn", String, 0);
+            const M_CREATED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!($shape, "CreatedAt", "createdAt", 1);
+            const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Description", "description", String, 2);
+            const M_EVENT_TARGETS: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "EventTargets", "eventTargets", List, 3);
+            // `EventBridgeRuleTemplateEventType` is an enum shape, which the generator
+            // writes as `ShapeType::String`.
+            const M_EVENT_TYPE: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "EventType", "eventType", String, 4);
+            const M_GROUP_ID: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "GroupId", "groupId", String, 5);
+            const M_ID: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Id", "id", String, 6);
+            const M_MODIFIED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!($shape, "ModifiedAt", "modifiedAt", 7);
+            const M_NAME: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Name", "name", String, 8);
+            const M_TAGS: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Tags", "tags", Map, 9);
+
+            pub const SCHEMA: ::aws_smithy_schema::Schema =
+                ::aws_smithy_schema::Schema::new_struct(
+                    ::aws_smithy_schema::ShapeId::from_static(
+                        concat!("com.amazonaws.medialive#", $shape),
+                        shared_types::NAMESPACE,
+                        $shape,
+                    ),
+                    ::aws_smithy_schema::ShapeType::Structure,
+                    &[
+                        &Self::M_ARN,
+                        &Self::M_CREATED_AT,
+                        &Self::M_DESCRIPTION,
+                        &Self::M_EVENT_TARGETS,
+                        &Self::M_EVENT_TYPE,
+                        &Self::M_GROUP_ID,
+                        &Self::M_ID,
+                        &Self::M_MODIFIED_AT,
+                        &Self::M_NAME,
+                        &Self::M_TAGS,
+                    ],
+                );
+        }
+
+        pub static $schema_static: &::aws_smithy_schema::Schema = &$ty::SCHEMA;
+
+        impl ::aws_smithy_schema::serde::SerializableStruct for $ty {
+            fn serialize_members(
+                &self,
+                serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+            ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+                if let Some(value) = self.arn.as_ref() {
+                    serializer.write_string(&Self::M_ARN, value.as_str())?;
+                }
+                if let Some(value) = self.created_at.as_ref() {
+                    serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+                }
+                if let Some(value) = self.description.as_ref() {
+                    serializer.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+                }
+                if let Some(value) = self.event_targets.as_ref() {
+                    serializer.write_list(&Self::M_EVENT_TARGETS, &|elements| {
+                        for target in value.iter() {
+                            // A list of structures writes each element against the
+                            // ELEMENT shape's own schema, as the generator does.
+                            elements.write_struct(&EventBridgeRuleTemplateTarget::SCHEMA, target)?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                if let Some(value) = self.event_type.as_ref() {
+                    serializer.write_string(&Self::M_EVENT_TYPE, value.as_str())?;
+                }
+                if let Some(value) = self.group_id.as_ref() {
+                    serializer.write_string(&Self::M_GROUP_ID, value.as_str())?;
+                }
+                if let Some(value) = self.id.as_ref() {
+                    serializer.write_string(&Self::M_ID, value.as_str())?;
+                }
+                if let Some(value) = self.modified_at.as_ref() {
+                    serializer.write_timestamp(&Self::M_MODIFIED_AT, value)?;
+                }
+                if let Some(value) = self.name.as_ref() {
+                    serializer.write_string(&Self::M_NAME, value.as_str())?;
+                }
+                if let Some(value) = self.tags.as_ref() {
+                    serializer.write_map(&Self::M_TAGS, &|entries| {
+                        for (key, tag) in value.iter() {
+                            entries.write_string(&Self::M_TAGS, key.as_str())?;
+                            entries.write_string(&Self::M_TAGS, tag.as_str())?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+/// The schema and the serializer for one flat SIGNAL MAP response shape.
+///
+/// `CreateSignalMapResponse` and `GetSignalMapResponse` are member for member the same
+/// shape (`smithy_query(query="shape",shape="…")`): eighteen members, in the model's
+/// order, with `CreatedAt`, `LastDiscoveredAt` and `ModifiedAt` targeting
+/// `__timestampIso8601`. See [`template_group_response`] for why the schema is written out
+/// and why no deserializer is emitted.
+macro_rules! signal_map_response {
+    ($ty:ident, $schema_static:ident, $shape:literal) => {
+        impl $ty {
+            const M_ARN: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Arn", "arn", String, 0);
+            const M_CLOUD_WATCH_ALARM_TEMPLATE_GROUP_IDS: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "CloudWatchAlarmTemplateGroupIds",
+                    "cloudWatchAlarmTemplateGroupIds",
+                    List,
+                    1
+                );
+            const M_CREATED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!($shape, "CreatedAt", "createdAt", 2);
+            const M_DESCRIPTION: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Description", "description", String, 3);
+            const M_DISCOVERY_ENTRY_POINT_ARN: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "DiscoveryEntryPointArn",
+                    "discoveryEntryPointArn",
+                    String,
+                    4
+                );
+            const M_ERROR_MESSAGE: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "ErrorMessage", "errorMessage", String, 5);
+            const M_EVENT_BRIDGE_RULE_TEMPLATE_GROUP_IDS: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "EventBridgeRuleTemplateGroupIds",
+                    "eventBridgeRuleTemplateGroupIds",
+                    List,
+                    6
+                );
+            const M_FAILED_MEDIA_RESOURCE_MAP: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "FailedMediaResourceMap",
+                    "failedMediaResourceMap",
+                    Map,
+                    7
+                );
+            const M_ID: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Id", "id", String, 8);
+            const M_LAST_DISCOVERED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!(
+                    $shape,
+                    "LastDiscoveredAt",
+                    "lastDiscoveredAt",
+                    9
+                );
+            const M_LAST_SUCCESSFUL_MONITOR_DEPLOYMENT: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "LastSuccessfulMonitorDeployment",
+                    "lastSuccessfulMonitorDeployment",
+                    Structure,
+                    10
+                );
+            const M_MEDIA_RESOURCE_MAP: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "MediaResourceMap", "mediaResourceMap", Map, 11);
+            const M_MODIFIED_AT: ::aws_smithy_schema::Schema =
+                shared_types::date_time_member_of!($shape, "ModifiedAt", "modifiedAt", 12);
+            const M_MONITOR_CHANGES_PENDING_DEPLOYMENT: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "MonitorChangesPendingDeployment",
+                    "monitorChangesPendingDeployment",
+                    Boolean,
+                    13
+                );
+            const M_MONITOR_DEPLOYMENT: ::aws_smithy_schema::Schema =
+                shared_types::member_of!(
+                    $shape,
+                    "MonitorDeployment",
+                    "monitorDeployment",
+                    Structure,
+                    14
+                );
+            const M_NAME: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Name", "name", String, 15);
+            // `SignalMapStatus` is an enum shape, which the generator writes as
+            // `ShapeType::String`.
+            const M_STATUS: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Status", "status", String, 16);
+            const M_TAGS: ::aws_smithy_schema::Schema =
+                shared_types::member_of!($shape, "Tags", "tags", Map, 17);
+
+            pub const SCHEMA: ::aws_smithy_schema::Schema =
+                ::aws_smithy_schema::Schema::new_struct(
+                    ::aws_smithy_schema::ShapeId::from_static(
+                        concat!("com.amazonaws.medialive#", $shape),
+                        shared_types::NAMESPACE,
+                        $shape,
+                    ),
+                    ::aws_smithy_schema::ShapeType::Structure,
+                    &[
+                        &Self::M_ARN,
+                        &Self::M_CLOUD_WATCH_ALARM_TEMPLATE_GROUP_IDS,
+                        &Self::M_CREATED_AT,
+                        &Self::M_DESCRIPTION,
+                        &Self::M_DISCOVERY_ENTRY_POINT_ARN,
+                        &Self::M_ERROR_MESSAGE,
+                        &Self::M_EVENT_BRIDGE_RULE_TEMPLATE_GROUP_IDS,
+                        &Self::M_FAILED_MEDIA_RESOURCE_MAP,
+                        &Self::M_ID,
+                        &Self::M_LAST_DISCOVERED_AT,
+                        &Self::M_LAST_SUCCESSFUL_MONITOR_DEPLOYMENT,
+                        &Self::M_MEDIA_RESOURCE_MAP,
+                        &Self::M_MODIFIED_AT,
+                        &Self::M_MONITOR_CHANGES_PENDING_DEPLOYMENT,
+                        &Self::M_MONITOR_DEPLOYMENT,
+                        &Self::M_NAME,
+                        &Self::M_STATUS,
+                        &Self::M_TAGS,
+                    ],
+                );
+        }
+
+        pub static $schema_static: &::aws_smithy_schema::Schema = &$ty::SCHEMA;
+
+        impl ::aws_smithy_schema::serde::SerializableStruct for $ty {
+            fn serialize_members(
+                &self,
+                serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+            ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+                if let Some(value) = self.arn.as_ref() {
+                    serializer.write_string(&Self::M_ARN, value.as_str())?;
+                }
+                if let Some(value) = self.cloud_watch_alarm_template_group_ids.as_ref() {
+                    serializer.write_list(
+                        &Self::M_CLOUD_WATCH_ALARM_TEMPLATE_GROUP_IDS,
+                        &|elements| {
+                            for id in value.iter() {
+                                elements.write_string(
+                                    &Self::M_CLOUD_WATCH_ALARM_TEMPLATE_GROUP_IDS,
+                                    id.as_str(),
+                                )?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+                if let Some(value) = self.created_at.as_ref() {
+                    serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+                }
+                if let Some(value) = self.description.as_ref() {
+                    serializer.write_string(&Self::M_DESCRIPTION, value.as_str())?;
+                }
+                if let Some(value) = self.discovery_entry_point_arn.as_ref() {
+                    serializer.write_string(&Self::M_DISCOVERY_ENTRY_POINT_ARN, value.as_str())?;
+                }
+                if let Some(value) = self.error_message.as_ref() {
+                    serializer.write_string(&Self::M_ERROR_MESSAGE, value.as_str())?;
+                }
+                if let Some(value) = self.event_bridge_rule_template_group_ids.as_ref() {
+                    serializer.write_list(
+                        &Self::M_EVENT_BRIDGE_RULE_TEMPLATE_GROUP_IDS,
+                        &|elements| {
+                            for id in value.iter() {
+                                elements.write_string(
+                                    &Self::M_EVENT_BRIDGE_RULE_TEMPLATE_GROUP_IDS,
+                                    id.as_str(),
+                                )?;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+                if let Some(value) = self.failed_media_resource_map.as_ref() {
+                    // A map writes BOTH its key and its value against the MAP member's
+                    // schema, and a structure member writes against its own member
+                    // schema — which is what the generator emits for either
+                    // (`vendor/smithy-macros/src/codegen.rs::emit_write`, where only a
+                    // LIST of structures substitutes the element shape's `SCHEMA`, for
+                    // the XML element name). The JSON codec reads the wire key off the
+                    // member schema it is handed, so the map's own schema is the one
+                    // that carries `@jsonName` here.
+                    serializer.write_map(&Self::M_FAILED_MEDIA_RESOURCE_MAP, &|entries| {
+                        for (key, resource) in value.iter() {
+                            entries
+                                .write_string(&Self::M_FAILED_MEDIA_RESOURCE_MAP, key.as_str())?;
+                            entries.write_struct(&Self::M_FAILED_MEDIA_RESOURCE_MAP, resource)?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                if let Some(value) = self.id.as_ref() {
+                    serializer.write_string(&Self::M_ID, value.as_str())?;
+                }
+                if let Some(value) = self.last_discovered_at.as_ref() {
+                    serializer.write_timestamp(&Self::M_LAST_DISCOVERED_AT, value)?;
+                }
+                if let Some(value) = self.last_successful_monitor_deployment.as_ref() {
+                    serializer
+                        .write_struct(&Self::M_LAST_SUCCESSFUL_MONITOR_DEPLOYMENT, value)?;
+                }
+                if let Some(value) = self.media_resource_map.as_ref() {
+                    serializer.write_map(&Self::M_MEDIA_RESOURCE_MAP, &|entries| {
+                        for (key, resource) in value.iter() {
+                            entries.write_string(&Self::M_MEDIA_RESOURCE_MAP, key.as_str())?;
+                            entries.write_struct(&Self::M_MEDIA_RESOURCE_MAP, resource)?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                if let Some(value) = self.modified_at.as_ref() {
+                    serializer.write_timestamp(&Self::M_MODIFIED_AT, value)?;
+                }
+                if let Some(value) = self.monitor_changes_pending_deployment.as_ref() {
+                    serializer
+                        .write_boolean(&Self::M_MONITOR_CHANGES_PENDING_DEPLOYMENT, *value)?;
+                }
+                if let Some(value) = self.monitor_deployment.as_ref() {
+                    serializer.write_struct(&Self::M_MONITOR_DEPLOYMENT, value)?;
+                }
+                if let Some(value) = self.name.as_ref() {
+                    serializer.write_string(&Self::M_NAME, value.as_str())?;
+                }
+                if let Some(value) = self.status.as_ref() {
+                    serializer.write_string(&Self::M_STATUS, value.as_str())?;
+                }
+                if let Some(value) = self.tags.as_ref() {
+                    serializer.write_map(&Self::M_TAGS, &|entries| {
+                        for (key, tag) in value.iter() {
+                            entries.write_string(&Self::M_TAGS, key.as_str())?;
+                            entries.write_string(&Self::M_TAGS, tag.as_str())?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+// Re-exported as items so the hand-written shapes of this service can invoke them by path
+// (`shared_types::member_of!(..)`) from whichever `types/` module declares them, without a
+// copy of the macro per module.
+pub(crate) use date_time_member_of;
+pub(crate) use event_bridge_rule_template_response;
+pub(crate) use member_of;
+pub(crate) use signal_map_response;
+pub(crate) use template_group_response;
+
 #[smithy_macros::smithy(shape = "com.amazonaws.medialive#BadGatewayException")]
 #[derive(Debug, Clone, Default)]
 pub struct BadGatewayException {

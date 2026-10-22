@@ -698,6 +698,88 @@ fn is_s3_bucket_name(bucket: &str) -> bool {
 /// it carries nothing from the request, so a rejected value is never echoed back.
 pub const ARTIFACT_S3_LOCATION_MALFORMED: &str = "ArtifactS3Location: The location is malformed.";
 
+/// Every CloudWatch Synthetics canary runtime version this service publishes.
+///
+/// `RuntimeVersion` is modelled as a bare `String` with `@length 1..1024` and no enum, and
+/// the member documents its value set as something the service publishes rather than
+/// something the model carries — "Specifies the runtime version to use for the canary. For
+/// a list of valid runtime versions and more information about runtime versions, see
+/// Canary Runtime Versions"
+/// (`smithy_query(query="doc",shape="CreateCanaryRequest",member="RuntimeVersion")`). The
+/// allow-list is therefore a server-side catalogue, written out here from the CloudWatch
+/// Synthetics "Canary Runtime Versions" documentation (the `syn-nodejs-playwright-*`,
+/// `syn-nodejs-puppeteer-*` and `syn-python-selenium-*` families it lists, plus the
+/// retired `syn-nodejs-2.x` / `syn-1.0` ones it still names), newest first within each
+/// family.
+///
+/// This is the catalogue `DescribeRuntimeVersions` is to report; that operation is still a
+/// scaffold stub with an issue of its own
+/// (`issues/things-that-do-not-work/20261022T200712Z-synthetics-describeruntimeversions-stub.md`),
+/// so it is kept here, beside the state, rather than inside one handler.
+pub const RUNTIME_VERSIONS: &[&str] = &[
+    // Node.js with Playwright.
+    "syn-nodejs-playwright-3.0",
+    "syn-nodejs-playwright-2.0",
+    "syn-nodejs-playwright-1.0",
+    // Node.js with Puppeteer.
+    "syn-nodejs-puppeteer-11.0",
+    "syn-nodejs-puppeteer-10.0",
+    "syn-nodejs-puppeteer-9.1",
+    "syn-nodejs-puppeteer-9.0",
+    "syn-nodejs-puppeteer-8.0",
+    "syn-nodejs-puppeteer-7.0",
+    "syn-nodejs-puppeteer-6.2",
+    "syn-nodejs-puppeteer-6.1",
+    "syn-nodejs-puppeteer-6.0",
+    "syn-nodejs-puppeteer-5.2",
+    "syn-nodejs-puppeteer-5.1",
+    "syn-nodejs-puppeteer-5.0",
+    "syn-nodejs-puppeteer-4.0",
+    "syn-nodejs-puppeteer-3.9",
+    "syn-nodejs-puppeteer-3.8",
+    "syn-nodejs-puppeteer-3.7",
+    "syn-nodejs-puppeteer-3.6",
+    "syn-nodejs-puppeteer-3.5",
+    "syn-nodejs-puppeteer-3.4",
+    "syn-nodejs-puppeteer-3.3",
+    "syn-nodejs-puppeteer-3.2",
+    "syn-nodejs-puppeteer-3.1",
+    "syn-nodejs-puppeteer-3.0",
+    // Python with Selenium.
+    "syn-python-selenium-5.1",
+    "syn-python-selenium-5.0",
+    "syn-python-selenium-4.1",
+    "syn-python-selenium-4.0",
+    "syn-python-selenium-3.0",
+    "syn-python-selenium-2.1",
+    "syn-python-selenium-2.0",
+    "syn-python-selenium-1.3",
+    "syn-python-selenium-1.2",
+    "syn-python-selenium-1.1",
+    "syn-python-selenium-1.0",
+    // The retired families the service still names.
+    "syn-nodejs-2.2",
+    "syn-nodejs-2.1",
+    "syn-nodejs-2.0",
+    "syn-1.0",
+];
+
+/// Whether `requested` names a runtime version this service publishes
+/// ([`RUNTIME_VERSIONS`]). An exact match: a runtime version is an identifier the service
+/// mints, not a pattern, so nothing about the value is normalised first.
+pub fn is_published_runtime_version(requested: &str) -> bool {
+    RUNTIME_VERSIONS.contains(&requested)
+}
+
+/// How Synthetics words the refusal of a runtime version it does not publish.
+///
+/// Built from the request, because the message is the only place the service reports WHICH
+/// value it rejected — a caller fixing the request, or falling back to
+/// `DescribeRuntimeVersions`, has that value and nothing else to go on.
+pub fn unknown_runtime_version(requested: &str) -> String {
+    format!("Invalid runtime version specified: {requested}")
+}
+
 /// How often `expression` runs the canary, in seconds, when that is determinable.
 ///
 /// `CanaryScheduleInput$Expression` documents the rate form as `rate(<number> <unit>)`

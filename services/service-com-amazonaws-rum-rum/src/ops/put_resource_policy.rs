@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches (or replaces) the ONE resource-based policy an app monitor may carry, over
+//! the [`crate::state::ResourcePolicyRecord`] held on that monitor's stored record, so
+//! `GetResourcePolicy` and `DeleteResourcePolicy` read exactly what this call wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +165,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        // A policy is written into this service's own state and reported back from it;
+        // nothing here depends on the request's metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The policy belongs to one app monitor (the `@httpLabel` `Name`), so a name no
+        // stored monitor holds — never created, or already deleted — has nothing to
+        // attach a policy to.
+        if !store.app_monitors.contains_key(&input.name) {
+            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::app_monitor_not_found(&input.name),
+            )
+            .into());
+        }
+
+        // `PolicyDocument` is modelled as a bare `String`, so its size and its syntax are
+        // this handler's to refuse, each with the error the model declares for it: 4 KB
+        // is the documented ceiling, and anything that is not a well-formed IAM JSON
+        // policy is "not formatted correctly".
+        if input.policy_document.len() > crate::state::MAX_POLICY_DOCUMENT_BYTES {
+            return Err(
+                PutResourcePolicyErrorModeled::PolicySizeLimitExceededException(
+                    PolicySizeLimitExceededException {
+                        message: format!(
+                            "The policy document is {} bytes; the limit is {} bytes.",
+                            input.policy_document.len(),
+                            crate::state::MAX_POLICY_DOCUMENT_BYTES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(message) = crate::state::policy_document_refusal(&input.policy_document) {
+            return Err(
+                PutResourcePolicyErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException { message },
+                )
+                .into(),
+            );
+        }
+
+        // A request that names a `PolicyRevisionId` is conditional on it being the
+        // policy's current one. The check happens before anything is written, so a
+        // refused put leaves the stored policy exactly as it was.
+        if let Some(mismatch) = store
+            .app_monitors
+            .get(&input.name)
+            .and_then(|record| record.policy_revision_refusal(input.policy_revision_id.as_deref()))
+        {
+            return Err(
+                PutResourcePolicyErrorModeled::InvalidPolicyRevisionIdException(mismatch).into(),
+            );
+        }
+
+        // Every accepted put is a NEW revision of the policy, so the id it reports is
+        // freshly minted: the id the caller held is exactly what a later conditional
+        // request must no longer satisfy.
+        let revision_id = store.mint_policy_revision_id();
+        let Some(record) = store.app_monitors.get_mut(&input.name) else {
+            // Unreachable: the same lock has been held since the `contains_key` above.
+            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::app_monitor_not_found(&input.name),
+            )
+            .into());
+        };
+        // The document is stored as the request delivered it, byte for byte.
+        record.resource_policy = Some(crate::state::ResourcePolicyRecord {
+            document: input.policy_document,
+            revision_id: revision_id.clone(),
+        });
+
+        // Reported off the record this call just wrote, under the lock it still holds, so
+        // what a following `GetResourcePolicy` reads is what is answered here.
+        let stored = record
+            .resource_policy
+            .as_ref()
+            .map(|policy| policy.document.clone());
+        Ok(PutResourcePolicyOutput {
+            policy_document: stored,
+            policy_revision_id: Some(revision_id),
+        })
     }
 }

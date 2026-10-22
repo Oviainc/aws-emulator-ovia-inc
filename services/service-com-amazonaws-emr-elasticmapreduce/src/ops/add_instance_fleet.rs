@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddInstanceFleet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddInstanceFleet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddInstanceFleet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the configured instance fleet to the cluster in the shared engine under the
+//! fleet id EMR mints for it, and answers with that id, the cluster id and the
+//! cluster's ARN. A cluster id no cluster carries, and a cluster whose instances are
+//! instance GROUPS rather than fleets, are both refused with
+//! `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddInstanceFleet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddInstanceFleetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddInstanceFleet"))
+        use crate::state::{
+            instance_collection_type, InstanceFleetRecord, MAX_INSTANCE_FLEETS_PER_CLUSTER,
+        };
+
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddInstanceFleetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR cluster store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // Everything the refusals below turn on, read once off the resolved cluster;
+        // `cluster_mut` also materialises the transitions the clock already made due.
+        let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
+            return Err(AddInstanceFleetErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster id '{}' is not valid or does not exist.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        };
+        let collection_type = cluster.instances.instance_collection_type.clone();
+        let cluster_state = cluster.status.state.clone();
+        let running = !cluster.is_terminal()
+            && cluster_state != crate::state::cluster_state::TERMINATING;
+        let cluster_arn = cluster.arn.clone();
+        let held_fleets = cluster.fleets.len();
+
+        // A cluster is launched with instance fleets or with instance groups, never
+        // both ("The RunJobFlow request can contain InstanceFleets parameters or
+        // InstanceGroups parameters, but not both"), so a fleet cannot be added to a
+        // cluster whose instances are groups.
+        if collection_type != instance_collection_type::INSTANCE_FLEET {
+            return Err(AddInstanceFleetErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster '{}' uses instance groups, so an instance fleet cannot be \
+                         added to it.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Adds an instance fleet to a running cluster" (`AddInstanceFleet` doc): a
+        // cluster that is shutting down or gone runs nothing to add capacity to.
+        if !running {
+            return Err(AddInstanceFleetErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster '{}' is in state {cluster_state} and is not running.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // One cluster carries a bounded number of instance fleets, the way it carries a
+        // bounded number of steps, so a caller cannot grow one cluster's fleet list
+        // without limit.
+        if held_fleets >= MAX_INSTANCE_FLEETS_PER_CLUSTER {
+            return Err(AddInstanceFleetErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    error_code: None,
+                    message: Some(format!(
+                        "Cluster '{}' already carries {MAX_INSTANCE_FLEETS_PER_CLUSTER} \
+                         instance fleets, which is the maximum.",
+                        input.cluster_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let fleet_id = store.mint_instance_fleet_id();
+        store
+            .clusters
+            .get_mut(&input.cluster_id)
+            .expect("the cluster was just resolved under this id")
+            .fleets
+            .push(InstanceFleetRecord::from_config(
+                fleet_id.clone(),
+                input.instance_fleet,
+                now,
+            ));
+
+        Ok(AddInstanceFleetOutput {
+            cluster_id: Some(input.cluster_id),
+            instance_fleet_id: Some(fleet_id),
+            cluster_arn: Some(cluster_arn),
+        })
     }
 }

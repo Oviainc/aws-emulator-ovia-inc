@@ -26,6 +26,9 @@ mod component_wire_fidelity;
 #[path = "all/export_components.rs"]
 mod export_components;
 
+#[path = "all/form_delete.rs"]
+mod form_delete;
+
 #[path = "all/form_lifecycle.rs"]
 mod form_lifecycle;
 

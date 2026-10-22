@@ -8,26 +8,14 @@
 //!
 //! The suites are tables: the recorded case in the issue is ONE row of each.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
-use crate::support::{create_in, get_in, member, timestamp, GROUPS};
+use crate::support::{
+    create_in, epoch_seconds, get_in, member, reported_tags, timestamp, unix_seconds, GROUPS,
+};
 use crate::wire::{call, error_code, medialive, ACCOUNT, DEFAULT_REGION as REGION};
-
-/// A wire timestamp as seconds since the Unix epoch, so it can be compared with
-/// a [`SystemTime`] the test took around the call.
-fn epoch_seconds(stamp: aws_smithy_types::DateTime) -> f64 {
-    stamp.secs() as f64 + f64::from(stamp.subsec_nanos()) / 1e9
-}
-
-/// The same reading of a [`SystemTime`] the test took itself.
-fn unix_seconds(instant: SystemTime) -> f64 {
-    instant
-        .duration_since(UNIX_EPOCH)
-        .expect("the test clock is after the Unix epoch")
-        .as_secs_f64()
-}
 
 /// Rule: a create mints a server-side id for the new resource, builds its ARN
 /// from the region the request was signed for and that id, stores every value the
@@ -147,15 +135,11 @@ async fn created_groups_round_trip_through_their_reader() {
             "case {case:?}: expected the requested description, got {:?}",
             member(&created, "description")
         );
-        // `Tags` is reported only when the group carries tags, so an absent map
-        // and an empty one both read as no tags at all.
-        let expected_tags = tags
-            .clone()
-            .filter(|tags| tags.as_object().is_some_and(|map| !map.is_empty()))
-            .unwrap_or(Value::Null);
+        // `Tags` is always reported, as the map it is modelled as: a group created
+        // with no tags reports the empty map.
         assert_eq!(
             member(&created, "tags"),
-            expected_tags,
+            reported_tags(tags.as_ref()),
             "case {case:?}: expected the requested tags, got {:?}",
             member(&created, "tags")
         );

@@ -15,7 +15,7 @@
 //! bounds, the punctuation `RepositoryName`'s pattern allows, repositories with and
 //! without a description, with and without history, and renames chained and
 //! round-tripped — rather than one recorded request. The harness (`emulator`,
-//! `ok`, `error`, `string_at`, `is_uuid`) is the one in
+//! `ok`, `error`, `string_at`, `is_uuid`) is the shared one in
 //! [`crate::repository_lifecycle`].
 
 use std::time::Duration;

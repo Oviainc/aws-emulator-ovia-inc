@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDocumentClassifier
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDocumentClassifier`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDocumentClassifier::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Mints the classifier's ARN, persists the whole submitted record in
+//! [`crate::state`] as `SUBMITTED`, and lets the clock walk it on from there
+//! ([`crate::state::DocumentClassifier::settle`]). A repeated `ClientRequestToken`
+//! resolves to the classifier it already created instead of creating a second one.
+//!
+//! Training itself is NOT performed: see
+//! [`crate::state::DocumentClassifier::settle`] for why a started training ends in
+//! the modelled `IN_ERROR` status rather than reporting a `TRAINED` model that
+//! nothing trained.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +143,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::{document_classifier_arn, DocumentClassifier, DEFAULT_CLASSIFIER_DATA_FORMAT};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -217,18 +222,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDocumentClassifier` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDocumentClassifierErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDocumentClassifier"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateDocumentClassifierErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The service store is unavailable. Retry your request.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // The tag bound every Comprehend resource shares, stated once in
+        // `crate::state`; only the exception wrapper is this operation's own.
+        let tags = input.tags.unwrap_or_default();
+        if let Some(message) = crate::state::too_many_tags_message(&tags) {
+            return Err(CreateDocumentClassifierErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The training data the model documents as required for the data format the
+        // request asks for: `DataFormat` defaults to `COMPREHEND_CSV`, which "requires
+        // the S3Uri parameter in your request", while `AUGMENTED_MANIFEST` "requires
+        // the AugmentedManifests parameter in your request". A request naming neither
+        // points the training at nothing, which is the invalid request this operation
+        // models.
+        let data_format = input
+            .input_data_config
+            .data_format
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CLASSIFIER_DATA_FORMAT.to_string());
+        let missing_member = match data_format.as_str() {
+            "AUGMENTED_MANIFEST" => input
+                .input_data_config
+                .augmented_manifests
+                .as_ref()
+                .is_none_or(|manifests| manifests.is_empty())
+                .then_some("AugmentedManifests"),
+            // `COMPREHEND_CSV`, and anything the enum gains later, is satisfied by an
+            // S3 location — either `S3Uri` or the native-document `Documents` block.
+            _ => (input.input_data_config.s3_uri.is_none()
+                && input.input_data_config.documents.is_none())
+            .then_some("S3Uri"),
+        };
+        if let Some(member) = missing_member {
+            return Err(
+                CreateDocumentClassifierErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "InputDataConfig.{member} is required when DataFormat is \
+                             {data_format}."
+                        )),
+                        reason: None,
+                        detail: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        // Report from a store whose clock-owed changes are already materialised, so a
+        // name freed by a completed deletion is free here too.
+        store.settle_document_classifiers(now);
+
+        // `ClientRequestToken` is `@idempotencyToken`: the same token re-submitted
+        // names the classifier it already created. The TOKEN decides, not the rest of
+        // the request — the model declares no error for a token reused with different
+        // members, so a reuse resolves to the first classifier rather than being
+        // refused.
+        if let Some(token) = input.client_request_token.as_ref() {
+            if let Some(existing) = store.classifier_idempotency_tokens.get(token).cloned() {
+                if store.document_classifiers.contains_key(&existing) {
+                    return Ok(CreateDocumentClassifierOutput {
+                        document_classifier_arn: Some(existing),
+                    });
+                }
+            }
+        }
+
+        // The ARN form the output member's own pattern states, rendered by the one
+        // place that states it, `crate::state::document_classifier_arn`. It carries
+        // the name, the version and the REGION the request was signed for, so it is
+        // also the identity a second creation collides on — a classifier name is
+        // unique "among all models with the same classifier name in the account/
+        // Region", as `VersionName`'s documentation states, not across regions.
+        let arn = document_classifier_arn(
+            &region,
+            &input.document_classifier_name,
+            input.version_name.as_deref(),
+        );
+
+        // One name (and version) names one classifier: a second creation under a live
+        // ARN is the "specified resource name is already in use" this operation
+        // models.
+        if store.document_classifiers.contains_key(&arn) {
+            return Err(CreateDocumentClassifierErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "The document classifier {arn} is already in use. Use a different \
+                         name and try your request again."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let seq = store.mint_document_classifier_seq();
+        let mut classifier = DocumentClassifier::submitted(
+            seq,
+            arn.clone(),
+            input.document_classifier_name,
+            input.language_code,
+            now,
+        );
+        classifier.version_name = input.version_name;
+        classifier.input_data_config = Some(input.input_data_config);
+        classifier.output_data_config = input.output_data_config;
+        classifier.data_access_role_arn = Some(input.data_access_role_arn);
+        classifier.volume_kms_key_id = input.volume_kms_key_id;
+        classifier.model_kms_key_id = input.model_kms_key_id;
+        classifier.vpc_config = input.vpc_config;
+        if let Some(mode) = input.mode {
+            classifier.mode = mode;
+        }
+        classifier.model_policy = input.model_policy;
+        classifier.tags = tags;
+        classifier.client_request_token = input.client_request_token;
+        store.insert_document_classifier(classifier);
+
+        Ok(CreateDocumentClassifierOutput {
+            document_classifier_arn: Some(arn),
+        })
     }
 }
