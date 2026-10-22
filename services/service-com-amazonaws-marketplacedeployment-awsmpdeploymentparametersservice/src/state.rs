@@ -426,12 +426,19 @@ pub fn merge_tags(
     Ok(merged)
 }
 
-/// The modelled `ResourceNotFoundException` (HTTP 404) for an ARN that names no
-/// stored deployment parameter. Every member the model marks `@required` is filled.
-pub fn parameter_not_found(resource_arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("no deployment parameter resource is identified by '{resource_arn}'"),
-    }
+/// The not-found failure for an ARN that names no stored deployment parameter:
+/// HTTP 404 with the error code `NotFoundException`.
+///
+/// NOT the modelled `ResourceNotFoundException`, whose shape name would reach the
+/// wire as the error code: this service's recorded responses answer a resource ARN
+/// it holds no record for with the code `NotFoundException`
+/// ([`crate::scaffolded::NOT_FOUND_CODE`]) and the constant text
+/// [`crate::scaffolded::NOT_FOUND_TEXT`], at the same 404 the modelled shape
+/// carries, and a client branches on the code. It names no ARN because the service
+/// names none. Generic over the operation's modelled error enum, so every operation
+/// that resolves a caller-supplied resource ARN answers the one failure.
+pub fn parameter_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::not_found()
 }
 
 /// The modelled `ResourceNotFoundException` (HTTP 404) for a write aimed at a

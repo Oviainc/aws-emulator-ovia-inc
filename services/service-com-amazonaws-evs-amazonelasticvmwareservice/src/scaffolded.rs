@@ -177,6 +177,115 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The `message` member of the tagging surface's not-found error shape.
+static TAGGING_NOT_FOUND_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#TaggingResourceNotFound$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message")
+.with_json_name("message");
+
+/// The `resourceArn` member of the tagging surface's not-found error shape: the ARN
+/// the request named, echoed back so a client batching tagging calls can tell WHICH
+/// resource was missing. The modeled `ResourceNotFoundException` declares no such
+/// member, which is why this shape is synthetic.
+static TAGGING_NOT_FOUND_RESOURCE_ARN: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#TaggingResourceNotFound$resourceArn",
+        "smithy.framework",
+        "resourceArn",
+    ),
+    ShapeType::String,
+    "resourceArn",
+    1,
+)
+.with_xml_name("ResourceArn")
+.with_json_name("resourceArn");
+
+/// Schema for the not-found error the TAGGING surface (`TagResource`,
+/// `ListTagsForResource`, `UntagResource` — the operations addressing a resource by
+/// `resourceArn`) answers for an ARN that names no resource.
+///
+/// In the `smithy.framework` namespace for the same reason as [`NOT_IMPLEMENTED_SCHEMA`]:
+/// the body Amazon EVS returns there is NOT the modeled `com.amazonaws.evs#ResourceNotFoundException`
+/// (`message` + `resourceId` + `resourceType`) — it carries `message` plus a
+/// `resourceArn`, so the shape has to be declared here and must not collide with the
+/// modeled one. The wire error code (`ResourceNotFoundException`) and the status travel
+/// beside it, from [`TaggingResourceNotFound`].
+pub static TAGGING_RESOURCE_NOT_FOUND_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#TaggingResourceNotFound",
+        "smithy.framework",
+        "TaggingResourceNotFound",
+    ),
+    ShapeType::Structure,
+    &[&TAGGING_NOT_FOUND_MESSAGE, &TAGGING_NOT_FOUND_RESOURCE_ARN],
+);
+
+/// The wire error code of the tagging surface's not-found refusal — the same code the
+/// model binds to those operations, so a client matching on `__type` is unaffected.
+pub const TAGGING_RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
+
+/// The HTTP status the tagging surface answers a missing resource with.
+///
+/// 400, NOT the `@httpError(404)` the modeled `ResourceNotFoundException` carries: the
+/// recorded wire response for these operations is a 400, and a 400 is what a client's
+/// retry layer classifies as the modeled client error rather than as a routing or
+/// endpoint failure.
+pub const TAGGING_RESOURCE_NOT_FOUND_STATUS: u16 = 400;
+
+/// The tagging surface's text for a missing resource: one FIXED, resource-agnostic
+/// string for every such refusal, carrying nothing from the request. The ARN the
+/// caller asked about travels in the `resourceArn` member instead — that member is the
+/// only place it appears.
+pub const TAGGING_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource cannot be found.";
+
+/// The body of the tagging surface's not-found refusal: the fixed message plus the
+/// `resourceArn` the request named.
+#[derive(Debug, Clone)]
+pub struct TaggingResourceNotFound {
+    /// The `resourceArn` the request named, echoed verbatim.
+    pub resource_arn: String,
+}
+
+impl TaggingResourceNotFound {
+    /// The refusal for `resource_arn`, an ARN this service holds no resource for.
+    pub fn new(resource_arn: impl Into<String>) -> Self {
+        Self {
+            resource_arn: resource_arn.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for TaggingResourceNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{TAGGING_RESOURCE_NOT_FOUND_CODE}: {TAGGING_RESOURCE_NOT_FOUND_MESSAGE} ({})",
+            self.resource_arn
+        )
+    }
+}
+
+impl std::error::Error for TaggingResourceNotFound {}
+
+impl SerializableStruct for TaggingResourceNotFound {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(
+            &TAGGING_NOT_FOUND_MESSAGE,
+            TAGGING_RESOURCE_NOT_FOUND_MESSAGE,
+        )?;
+        s.write_string(&TAGGING_NOT_FOUND_RESOURCE_ARN, self.resource_arn.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +294,14 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A tagging operation named an ARN this service holds no resource for. Renders as
+    /// HTTP 400 with the error code `ResourceNotFoundException` and a body carrying the
+    /// request's `resourceArn`.
+    ///
+    /// It is a variant here rather than the modeled `ResourceNotFoundException` because
+    /// neither the status nor the body of that modeled shape is what the tagging surface
+    /// answers; see [`TAGGING_RESOURCE_NOT_FOUND_SCHEMA`].
+    TaggingResourceNotFound(TaggingResourceNotFound),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -221,6 +338,20 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse a TAGGING request whose `resourceArn` names no resource this service
+    /// holds: HTTP 400 `ResourceNotFoundException`, the fixed resource-agnostic
+    /// message, and the request's ARN in the `resourceArn` member.
+    ///
+    /// Use it from `TagResource` / `ListTagsForResource` / `UntagResource` — the
+    /// operations that address a resource by ARN. An operation that resolves an
+    /// environment by `environmentId` answers the MODELED
+    /// `ResourceNotFoundException` (`crate::state::environment_not_found`) instead:
+    /// that error reports `resourceId`/`resourceType`, which an ARN-addressed tagging
+    /// call does not.
+    pub fn tagging_resource_not_found(resource_arn: impl Into<String>) -> Self {
+        Self::TaggingResourceNotFound(TaggingResourceNotFound::new(resource_arn))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -228,6 +359,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::TaggingResourceNotFound(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +372,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::TaggingResourceNotFound(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +387,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::TaggingResourceNotFound(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +396,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            Self::TaggingResourceNotFound(_) => &TAGGING_RESOURCE_NOT_FOUND_SCHEMA,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +409,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::TaggingResourceNotFound(_) => TAGGING_RESOURCE_NOT_FOUND_CODE,
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +422,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::TaggingResourceNotFound(_) => TAGGING_RESOURCE_NOT_FOUND_STATUS,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +434,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // Same reason: the synthetic shape carries no `awsQueryError` trait.
+            Self::TaggingResourceNotFound(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

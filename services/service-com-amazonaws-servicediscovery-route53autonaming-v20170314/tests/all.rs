@@ -19,6 +19,8 @@ mod custom_health_status;
 mod delete_namespace;
 #[path = "all/delete_service.rs"]
 mod delete_service;
+#[path = "all/discover_instances_revision.rs"]
+mod discover_instances_revision;
 #[path = "all/instance_health_status.rs"]
 mod instance_health_status;
 #[path = "all/list_instances.rs"]
