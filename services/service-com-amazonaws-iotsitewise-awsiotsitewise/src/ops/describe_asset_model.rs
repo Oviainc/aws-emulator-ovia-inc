@@ -291,7 +291,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn not_found(label: &str) -> DescribeAssetModelError {
     DescribeAssetModelError::Modeled(DescribeAssetModelErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: format!("The asset model {label} could not be found."),
+            message: crate::state::not_found_message(
+                crate::state::RESOURCE_ASSET_MODEL,
+                label,
+            ),
         },
     ))
 }

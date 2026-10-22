@@ -397,6 +397,17 @@ impl AssetRecord {
         }
     }
 
+    /// The hierarchy of this asset a `CustomID` label names: a raw hierarchy id,
+    /// or `externalId:<externalId>` resolved against the hierarchy's external id.
+    ///
+    /// The same two label forms every other id member of this service accepts, so
+    /// a hierarchy is addressable the way the model says ids are.
+    pub fn hierarchy(&self, label: &str) -> Option<&AssetHierarchy> {
+        self.hierarchies.iter().find(|hierarchy| {
+            matches_id_label(hierarchy.id.as_deref(), hierarchy.external_id.as_deref(), label)
+        })
+    }
+
     /// The asset's `AssetState` as of `now`: its [`Self::settling_state`] until
     /// the owed transition falls due, `ACTIVE` from then on. Derived, so a read
     /// never has to write.
@@ -429,6 +440,59 @@ impl AssetRecord {
             status: self.status(now),
             hierarchies: self.hierarchies.clone(),
             description: self.description.clone(),
+        }
+    }
+}
+
+/// Whether a stored `(id, externalId)` pair is the one a `CustomID` label names:
+/// the raw id, or `externalId:` followed by the external id.
+///
+/// ONE definition of the two label forms, so every nested resource this service
+/// addresses by label — a hierarchy on an asset, a hierarchy on its model — is
+/// resolved the same way.
+pub fn matches_id_label(id: Option<&str>, external_id: Option<&str>, label: &str) -> bool {
+    match label.strip_prefix(EXTERNAL_ID_PREFIX) {
+        Some(external) => external_id == Some(external),
+        None => id == Some(label),
+    }
+}
+
+/// A `(parent asset, hierarchy, child asset)` triple resolved to stored ids —
+/// what the association operations address.
+#[derive(Debug, Clone)]
+pub struct HierarchyTriple {
+    /// The parent asset's stored `assetId`.
+    pub asset_id: String,
+    /// The hierarchy's stored id, taken from the parent asset's hierarchy list.
+    pub hierarchy_id: String,
+    /// The child asset's stored `assetId`.
+    pub child_asset_id: String,
+}
+
+/// Why an association triple does not name anything the store can act on.
+///
+/// Described structurally rather than as one error type, because the two
+/// association operations declare their own modelled error sets and each maps
+/// these onto its own variants; [`TripleRefusal::message`] is the shared wording.
+#[derive(Debug, Clone)]
+pub enum TripleRefusal {
+    /// No stored asset answers to this label (the parent or the child).
+    AssetNotFound(String),
+    /// The parent asset carries no hierarchy this label names.
+    HierarchyNotFound(String),
+}
+
+impl TripleRefusal {
+    /// What the caller is told. Every variant here is an absent resource, so the
+    /// wording is the service's not-found rule: the resource kind, then the
+    /// identifier the request supplied.
+    pub fn message(&self) -> String {
+        match self {
+            Self::AssetNotFound(label) => not_found_message(RESOURCE_ASSET, label),
+            // A hierarchy is not a top-level resource, and AWS words its absence
+            // as a hierarchy that "doesn't exist"; the identifier is still the
+            // one the request supplied.
+            Self::HierarchyNotFound(label) => format!("A hierarchy with ID {label} doesn't exist"),
         }
     }
 }
@@ -808,6 +872,122 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         }
         Some(record)
     }
+
+    /// The child assets associated with `(asset_id, hierarchy_id)`.
+    pub fn hierarchy_children(&self, asset_id: &str, hierarchy_id: &str) -> &[String] {
+        self.asset_hierarchy_children
+            .get(&(asset_id.to_string(), hierarchy_id.to_string()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Resolve a `(parent, hierarchyId, childAssetId)` triple of `CustomID` labels
+    /// to the stored ids it names.
+    ///
+    /// Every label takes either form the model admits (a raw id or
+    /// `externalId:<externalId>`). The hierarchy is resolved against the PARENT
+    /// ASSET'S MODEL — the same place `AssociateAssets` resolves it, since the
+    /// model is what defines which groupings exist — so the operation that records
+    /// an association and the one that removes it address exactly one set of
+    /// hierarchies, even once a model's definition has changed since the asset was
+    /// created. The asset's own copied hierarchy list is the fallback for a parent
+    /// whose model is no longer stored.
+    pub fn resolve_hierarchy_triple(
+        &self,
+        asset_label: &str,
+        hierarchy_label: &str,
+        child_label: &str,
+    ) -> Result<HierarchyTriple, TripleRefusal> {
+        let asset_id = self
+            .resolve_asset_id(asset_label)
+            .ok_or_else(|| TripleRefusal::AssetNotFound(asset_label.to_string()))?;
+        let asset = self
+            .assets
+            .get(&asset_id)
+            .ok_or_else(|| TripleRefusal::AssetNotFound(asset_label.to_string()))?;
+        let hierarchy_id = self
+            .asset_models
+            .get(&asset.asset_model_id)
+            .and_then(|model| {
+                model.hierarchies.iter().find(|hierarchy| {
+                    matches_id_label(
+                        hierarchy.id.as_deref(),
+                        hierarchy.external_id.as_deref(),
+                        hierarchy_label,
+                    )
+                })
+            })
+            .and_then(|hierarchy| hierarchy.id.clone())
+            .or_else(|| {
+                asset
+                    .hierarchy(hierarchy_label)
+                    .and_then(|hierarchy| hierarchy.id.clone())
+            })
+            .ok_or_else(|| TripleRefusal::HierarchyNotFound(hierarchy_label.to_string()))?;
+        let child_asset_id = self
+            .resolve_asset_id(child_label)
+            .ok_or_else(|| TripleRefusal::AssetNotFound(child_label.to_string()))?;
+        Ok(HierarchyTriple {
+            asset_id,
+            hierarchy_id,
+            child_asset_id,
+        })
+    }
+
+    /// Remove `child_id` from `(asset_id, hierarchy_id)`, answering whether an
+    /// association was there to remove. `false` means the triple was never
+    /// associated, which is the caller's cue to refuse rather than to report a
+    /// removal that did not happen.
+    ///
+    /// The write side of the association set lives in `AssociateAssets`, which
+    /// owns the hierarchy rules it has to enforce before recording one; this is
+    /// the removal `DisassociateAssets` performs.
+    pub fn disassociate_child(
+        &mut self,
+        asset_id: &str,
+        hierarchy_id: &str,
+        child_id: &str,
+    ) -> bool {
+        let key = (asset_id.to_string(), hierarchy_id.to_string());
+        let Some(children) = self.asset_hierarchy_children.get_mut(&key) else {
+            return false;
+        };
+        let Some(at) = children.iter().position(|child| child == child_id) else {
+            return false;
+        };
+        children.remove(at);
+        // An emptied hierarchy keeps no entry, so the map holds only live
+        // associations and cannot grow with keys nothing reads.
+        if children.is_empty() {
+            self.asset_hierarchy_children.remove(&key);
+        }
+        true
+    }
+}
+
+/// The resource kind a `ResourceNotFoundException` / `ResourceAlreadyExistsException`
+/// names for an asset, as AWS words it.
+pub const RESOURCE_ASSET: &str = "Asset";
+
+/// The resource kind those errors name for an asset model.
+pub const RESOURCE_ASSET_MODEL: &str = "Asset Model";
+
+/// The message a not-found refusal carries: the resource kind, then the
+/// identifier the REQUEST supplied (a raw id or an `externalId:` label, exactly
+/// as sent).
+///
+/// One rule for every not-found path in this service, so no handler invents its
+/// own template: AWS states the absence as `<Resource> with ID <id> not found`,
+/// which is why the identifier is echoed rather than replaced by whatever the
+/// handler resolved.
+pub fn not_found_message(resource: &str, requested: &str) -> String {
+    format!("{resource} with ID {requested} not found")
+}
+
+/// The message a uniqueness refusal carries: AWS names the DIMENSION of the
+/// request that collided (`externalId`, `ID`), not an identifier the rejected
+/// request would have minted.
+pub fn already_using_message(resource: &str, dimension: &str) -> String {
+    format!("Another {resource} is already using the same {dimension}")
 }
 
 /// Turn `AssetModelPropertyDefinition`s into the stored `AssetModelProperty`s,

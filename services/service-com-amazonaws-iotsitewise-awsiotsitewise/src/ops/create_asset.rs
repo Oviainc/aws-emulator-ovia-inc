@@ -223,9 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 CreateAssetError::Modeled(CreateAssetErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "The asset model {} could not be found.",
-                            input.asset_model_id
+                        message: crate::state::not_found_message(
+                            crate::state::RESOURCE_ASSET_MODEL,
+                            &input.asset_model_id,
                         ),
                     },
                 ))
@@ -283,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let asset_id = match input.asset_id.clone() {
             Some(id) => {
                 if store.assets.contains_key(&id) {
-                    return Err(already_exists(&region, &id));
+                    return Err(already_exists(&region, &id, "ID"));
                 }
                 id
             }
@@ -295,10 +295,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         };
 
-        // `assetExternalId` must be unique within the account.
+        // `assetExternalId` must be unique within the account. The refusal names
+        // the DIMENSION that collided — the external id — and points its
+        // resourceId/resourceArn at the asset that already holds it, which is the
+        // only asset in the exchange that exists.
         if let Some(external) = input.asset_external_id.as_deref() {
             if let Some(existing) = store.asset_external_ids.get(external).cloned() {
-                return Err(already_exists(&region, &existing));
+                return Err(already_exists(&region, &existing, "externalId"));
             }
         }
 
@@ -334,11 +337,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// HTTP 409 `ResourceAlreadyExistsException` naming the colliding asset.
-fn already_exists(region: &str, asset_id: &str) -> CreateAssetError {
+/// HTTP 409 `ResourceAlreadyExistsException` for a `dimension` of the request
+/// (`ID`, `externalId`) that an asset already holds; `asset_id` is THAT asset,
+/// the one the caller has to look at.
+fn already_exists(region: &str, asset_id: &str, dimension: &str) -> CreateAssetError {
     CreateAssetError::Modeled(CreateAssetErrorModeled::ResourceAlreadyExistsException(
         ResourceAlreadyExistsException {
-            message: format!("The asset {asset_id} already exists."),
+            message: crate::state::already_using_message("asset", dimension),
             resource_id: asset_id.to_string(),
             resource_arn: crate::state::asset_arn(region, asset_id),
         },

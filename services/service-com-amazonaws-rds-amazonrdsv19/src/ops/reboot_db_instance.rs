@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RebootDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RebootDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation restarts the stored DB instance's engine — the instance
+//! goes to `rebooting` and the clock owes it `available` again — and is the ONLY file to
+//! touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RebootDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +154,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RebootDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RebootDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RebootDBInstance"))
+        let region =
+            crate::state::request_region(ctx).map_err(RebootDBInstanceError::validation)?;
+        // `DBInstanceIdentifier`: "This parameter is stored as a lowercase string."
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all; 501 is the honest answer, never a reboot
+        // nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the state this reboot is judged against is the current one.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: an instance is addressable only in the region it was created
+        // in, so an identifier that names one elsewhere is not found here.
+        let key = (region.clone(), identifier.clone());
+        let Some(instance) = store.db_instances.get(&key) else {
+            return Err(RebootDBInstanceErrorModeled::DBInstanceNotFoundFault(
+                DBInstanceNotFoundFault {
+                    // RDS words this fault per operation, and this one answers
+                    // "<resource type> not found: <name>" where the describe answers
+                    // "<resource type> <name> not found." — the wording is the service's,
+                    // the name is the request's.
+                    message: Some(format!("DBInstance not found: {identifier}")),
+                },
+            )
+            .into());
+        };
+
+        // `ForceFailover`: "Constraint: You can't enable force failover if the instance
+        // isn't configured for Multi-AZ." The model cannot express a constraint between
+        // two members, so it is refused here.
+        if input.force_failover.unwrap_or(false) && !instance.multi_az {
+            return Err(RebootDBInstanceError::validation(format!(
+                "ForceFailover can't be enabled for DB instance {identifier}: it isn't \
+                 configured for Multi-AZ"
+            )));
+        }
+
+        // "Rebooting a DB instance restarts the database engine service", so there has to
+        // be a running engine to restart: an instance still coming up, or on its way out,
+        // cannot take one. The status the clock has yet to settle is real.
+        if instance.status != "available" {
+            let status = instance.status.clone();
+            return Err(RebootDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} is not available for a reboot (status \
+                         {status})"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = store
+            .db_instances
+            .get_mut(&key)
+            .expect("the instance was found above and the store is locked");
+        // "Rebooting a DB instance results in a momentary outage, during which the DB
+        // instance status is set to rebooting": the instance is reported as `rebooting`
+        // now and the clock owes it `available` once the outage is over.
+        record.status = "rebooting".to_string();
+        record.pending_status = Some(crate::state::PendingStatus::in_a_moment("available"));
+        Ok(RebootDBInstanceOutput {
+            db_instance: Some(record.to_wire()),
+        })
     }
 }

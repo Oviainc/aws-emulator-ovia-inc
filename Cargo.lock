@@ -8194,9 +8194,13 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "md-5",
+ "pem",
+ "rcgen",
  "regex",
  "serde_json",
  "sha2 0.10.9",
+ "spki",
  "tokio",
  "tracing",
 ]
