@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCreditAllocationHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCreditAllocationHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCreditAllocationHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation reports the credit allocations persisted in
+//! [`crate::state::ComAmazonawsBillingAwsbillingState::credit_allocations`].
+//!
+//! It is a REPORTING operation: it reads the store and writes nothing, so a
+//! caller cannot change another caller's answer by reading. Entries are
+//! selected by the requested account, the requested billing-month range and the
+//! optional `creditId`, reported newest billing month first, and paged by
+//! `maxResults`/`nextToken`.
+//!
+//! NOTE: nothing in this emulator writes that store yet — an allocation exists
+//! only once a credit has been APPLIED to a bill, and the emulator runs no
+//! billing pipeline (a credit `GetCredits` holds is not an application of one).
+//! So on a running emulator this reports an empty list until an operation that
+//! applies credits exists; the suite at
+//! `tests/all/credit_allocation_history.rs` persists records through
+//! `ComAmazonawsBillingAwsbillingState::record_credit_allocation` to exercise
+//! the selection, ordering and paging rules. Nothing here synthesises an entry.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +148,127 @@ pub struct GetCreditAllocationHistory<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The page size used when the request omits `maxResults`.
+///
+/// From the `maxResults` doc: "The maximum number of records to return per
+/// page. Range: 1 to 1000. Default: 100."
+const DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The smallest and largest page size the model's `maxResults` range allows
+/// (1..1000), used to clamp a size that reached this handler anyway.
+const MIN_MAX_RESULTS: usize = 1;
+const MAX_MAX_RESULTS: usize = 1000;
+
+/// The most billing months a request's date range may span.
+///
+/// From the `startDate` doc: "The range from `startDate` to `endDate` cannot
+/// exceed 24 billing months." A range's width in billing months is the
+/// DISTANCE between the months its two bounds fall in — a range inside one
+/// month is 0 months wide, and one from a month to the same month a year later
+/// is 12 — so a distance of 24 is a range of exactly 24 billing months and is
+/// accepted, and anything wider is refused. The looser of the two readings of
+/// that sentence is deliberate: refusing a range the service accepts would
+/// reject a caller AWS answers.
+const MAX_BILLING_MONTHS_SPANNED: i32 = 24;
+
+/// Refuse a request member as invalid, in the modeled `ValidationException`
+/// shape (HTTP 400) this operation declares.
+///
+/// `constraint` continues the sentence the member name starts, so the top-level
+/// `message` names the member and the documented constraint the request broke
+/// ("startDate must be on or before endDate") without echoing the offending
+/// value back, and the `fieldList` entry carries the same constraint against
+/// the member it is about.
+fn invalid_field(member: &str, constraint: &str) -> GetCreditAllocationHistoryError {
+    GetCreditAllocationHistoryErrorModeled::ValidationException(ValidationException {
+        message: format!("{member} {constraint}"),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!("Member {constraint}"),
+        }]),
+    })
+    .into()
+}
+
+/// The store key a `nextToken` resumes after, or a `ValidationException` when
+/// the token is not one this service issued. The token format and the
+/// refusal's wording live in `crate::state`, shared with this service's other
+/// paginated reads.
+fn resume_key(token: &str) -> Result<String, GetCreditAllocationHistoryError> {
+    crate::state::decode_page_token(token).ok_or_else(|| {
+        GetCreditAllocationHistoryErrorModeled::ValidationException(ValidationException {
+            message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
+            reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
+            field_list: Some(vec![ValidationExceptionField {
+                name: "nextToken".to_string(),
+                message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
+            }]),
+        })
+        .into()
+    })
+}
+
+/// The billing month a request `Timestamp` falls in, as the modeled
+/// `BillingMonth` `YYYY-MM` string paired with that month's index (the count of
+/// whole calendar months before it, so two timestamps' months can be
+/// subtracted).
+///
+/// AWS bills on UTC calendar months, so the instant is read off the UTC civil
+/// calendar — `Format::DateTime` renders RFC 3339 in UTC,
+/// `YYYY-MM-DDThh:mm:ss[.fff]Z`, the same rendering
+/// [`crate::state::billing_period`] reads a billing period from — never by
+/// dividing a span by a fixed month length.
+///
+/// `None` when the instant names no `YYYY-MM` month: one the clock cannot
+/// render, or one whose year is not four digits, which the fixed-width
+/// assumption behind [`crate::state::CreditAllocation::month_key_bounds`]
+/// requires. The caller refuses such a `Timestamp` rather than seeking a key
+/// range the store's ordering does not define.
+fn billing_month_of(at: &::aws_smithy_types::DateTime) -> Option<(String, i32)> {
+    let rendered = at
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()?;
+    // A four-digit year puts the separator at index 4; anything else (a five
+    // digit or negative year) is not the modeled `BillingMonth` shape.
+    if rendered.as_bytes().get(4) != Some(&b'-') {
+        return None;
+    }
+    let year: i32 = rendered.get(0..4)?.parse().ok()?;
+    let month: i32 = rendered.get(5..7)?.parse().ok()?;
+    Some((rendered.get(0..7)?.to_string(), year * 12 + month - 1))
+}
+
+/// Whether the stored `CreditId` names the same credit as the request's
+/// `creditId` filter.
+///
+/// The stored id is the modeled digit string and the filter is a `Long`, so
+/// they are compared as numbers: an id written with leading zeros names the
+/// same credit, and an id too large for the filter's range names none.
+fn is_filtered_credit(stored: &str, filter: i64) -> bool {
+    stored.parse::<i128>().ok() == Some(i128::from(filter))
+}
+
+/// Whether `allocation` is one the request selects: the account whose history
+/// was asked for and the credit the `creditId` filter names when it carries
+/// one.
+///
+/// The billing-month range is NOT checked here: the walk below seeks straight
+/// to the keys of the requested months, so every entry this sees is already in
+/// range.
+fn is_selected(
+    allocation: &crate::state::CreditAllocation,
+    input: &GetCreditAllocationHistoryInput,
+) -> bool {
+    // This emulator persists no consolidated billing family, so the family of
+    // the requested account is that account: the entries applied to its own
+    // bills. A family model would widen this filter, not replace it.
+    allocation.account_id == input.account_id
+        && input
+            .credit_id
+            .is_none_or(|credit| is_filtered_credit(&allocation.credit_id, credit))
+}
+
 impl<Eng> GetCreditAllocationHistory<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -165,18 +295,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCreditAllocationHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCreditAllocationHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCreditAllocationHistory"))
+        // Every modeled constraint (the `accountId` pattern, `maxResults`
+        // 1..1000, the `nextToken` pattern and length) is refused by the
+        // boundary validator before this runs; what is checked here is the
+        // documented relationship between the two dates.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCreditAllocationHistoryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the credit allocation store is unavailable".to_string(),
+                },
+            )
+        })?;
+        // A reporting operation: the guard is only read through, so two callers
+        // reading the same history see the same answer.
+        let state = state.lock();
+
+        let (start_month, start_index) = billing_month_of(&input.start_date)
+            .ok_or_else(|| invalid_field("startDate", "must name a representable calendar date"))?;
+        let (end_month, end_index) = billing_month_of(&input.end_date)
+            .ok_or_else(|| invalid_field("endDate", "must name a representable calendar date"))?;
+        // "Inclusive start date as Unix epoch seconds. Must be on or before
+        // `endDate`." The recorded corpus answers this request with a refusal
+        // whose own message wording is not derivable from the model, so this
+        // message states the rule: the member and the constraint it broke.
+        if crate::state::date_time_secs(&input.start_date)
+            > crate::state::date_time_secs(&input.end_date)
+        {
+            return Err(invalid_field("startDate", "must be on or before endDate"));
+        }
+        // "The range from `startDate` to `endDate` cannot exceed 24 billing
+        // months" — counted as the distance between the two months, see
+        // MAX_BILLING_MONTHS_SPANNED. `checked_sub` keeps the check exact for
+        // two indices far enough apart to overflow the subtraction.
+        if end_index
+            .checked_sub(start_index)
+            .is_none_or(|spanned| spanned > MAX_BILLING_MONTHS_SPANNED)
+        {
+            return Err(invalid_field(
+                "endDate",
+                "must be within 24 billing months of startDate",
+            ));
+        }
+
+        // The page resumes strictly after the entry the previous page ended on,
+        // so an allocation written or removed between pages cannot make the
+        // walk skip or repeat another one.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(resume_key(token)?),
+            None => None,
+        };
+        let limit = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+
+        // `credit_allocations` is keyed month-first, so the requested months are
+        // one contiguous key range: seek to it instead of scanning the store,
+        // and stop the range at the previous page's last key. Walking that range
+        // in REVERSE is the documented output order, `billingMonth` descending.
+        // One extra match is read to learn whether a further page exists.
+        let (lower, _) = crate::state::CreditAllocation::month_key_bounds(&start_month);
+        let (_, end_upper) = crate::state::CreditAllocation::month_key_bounds(&end_month);
+        // The range end is exclusive, so resuming AT the previous page's last
+        // key reports every entry strictly before it and nothing twice. A token
+        // naming a key below the requested range leaves an empty range, which
+        // the guard below answers as an empty page; one at or above the range
+        // leaves the whole range still to come, which is what the descending
+        // walk owes a caller that narrowed the range after that page.
+        let upper = match resume_after {
+            Some(after) if after < end_upper => after,
+            _ => end_upper,
+        };
+        let mut page: Vec<(&String, &crate::state::CreditAllocation)> = Vec::new();
+        if lower < upper {
+            for (key, allocation) in state.credit_allocations.range(lower..upper).rev() {
+                if is_selected(allocation, &input) {
+                    page.push((key, allocation));
+                    if page.len() > limit {
+                        break;
+                    }
+                }
+            }
+        }
+        let next_token = if page.len() > limit {
+            page.truncate(limit);
+            page.last()
+                .map(|(key, _)| crate::state::encode_page_token(key))
+        } else {
+            None
+        };
+
+        Ok(GetCreditAllocationHistoryOutput {
+            credit_allocation_history_list: Some(
+                page.into_iter()
+                    .map(|(_, allocation)| CreditAllocationHistoryEntry {
+                        credit_id: allocation.credit_id.clone(),
+                        credit_amount: Amount {
+                            currency_code: allocation.credit_amount.currency_code.clone(),
+                            currency_amount: allocation.credit_amount.currency_amount.clone(),
+                        },
+                        description: allocation.description.clone(),
+                        account_id: allocation.account_id.clone(),
+                        applied_service_name: allocation.applied_service_name.clone(),
+                        billing_month: allocation.billing_month.clone(),
+                        is_estimated_bill: allocation.is_estimated_bill,
+                    })
+                    .collect(),
+            ),
+            // Every requested month is answered from this emulator's own store,
+            // so no month can fail to return data: `partialResults` is false and
+            // `failedMonths` — "non-empty only when partialResults is true" — is
+            // empty.
+            partial_results: false,
+            failed_months: Some(Vec::new()),
+            next_token,
+        })
     }
 }

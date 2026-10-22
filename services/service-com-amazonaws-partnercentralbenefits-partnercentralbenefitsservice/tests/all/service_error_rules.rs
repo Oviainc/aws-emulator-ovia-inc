@@ -50,36 +50,42 @@ const REGION: &str = "us-west-2";
 
 /// `BenefitApplicationIdentifier`'s `@pattern`, with the anchors the model spells it
 /// with stripped — which is exactly what a clause reporting it must state.
-const APPLICATION_IDENTIFIER_PATTERN: &str = r"(arn:.+|benappl-[0-9a-z]{14})";
+pub(crate) const APPLICATION_IDENTIFIER_PATTERN: &str = r"(arn:.+|benappl-[0-9a-z]{14})";
 
 /// `BenefitAllocationIdentifier`'s `@pattern`, unanchored.
-const ALLOCATION_IDENTIFIER_PATTERN: &str = r"(arn:.+|benalloc-[0-9a-z]{14})";
+pub(crate) const ALLOCATION_IDENTIFIER_PATTERN: &str = r"(arn:.+|benalloc-[0-9a-z]{14})";
 
 /// The `@pattern` on `GetBenefitInput$Identifier` / `BenefitId`, unanchored.
-const BENEFIT_IDENTIFIER_PATTERN: &str = r"(arn:.+|ben-[0-9a-z]{14})";
+pub(crate) const BENEFIT_IDENTIFIER_PATTERN: &str = r"(arn:.+|ben-[0-9a-z]{14})";
 
 /// `Arn`'s `@pattern`, unanchored — the shape `ResourceArn` targets.
-const ARN_PATTERN: &str = r"arn:aws:([a-zA-Z0-9\-])+:([a-z]{2}(-gov)?-[a-z]+-\d{1})?:(\d{12})?:(.+)";
+pub(crate) const ARN_PATTERN: &str =
+    r"arn:aws:([a-zA-Z0-9\-])+:([a-z]{2}(-gov)?-[a-z]+-\d{1})?:(\d{12})?:(.+)";
+
+/// `TaggableResourceArn`'s `@pattern`, unanchored — the shape every tagging operation's
+/// `resourceArn` targets.
+pub(crate) const TAGGABLE_ARN_PATTERN: &str =
+    r"arn:[\w+=/,.@-]+:partnercentral:[\w+=/,.@-]*:[0-9]{12}:catalog/([a-zA-Z]+)/[\w+=,.@-]+(/[\w+=,.@-]+)*";
 
 /// `CatalogName`'s `@pattern`, unanchored.
-const CATALOG_NAME_PATTERN: &str = "[A-Za-z0-9_-]+";
+pub(crate) const CATALOG_NAME_PATTERN: &str = "[A-Za-z0-9_-]+";
 
 /// An application id the modelled `BenefitApplicationIdentifier` admits and no create
 /// ever minted, so every lookup of it finds nothing.
-const UNKNOWN_APPLICATION: &str = "benappl-00000000000001";
+pub(crate) const UNKNOWN_APPLICATION: &str = "benappl-00000000000001";
 
 /// A benefit id the modelled `BenefitId` admits and no catalog holds.
-const UNKNOWN_BENEFIT: &str = "ben-00000000000000";
+pub(crate) const UNKNOWN_BENEFIT: &str = "ben-00000000000000";
 
 /// An allocation id the modelled `BenefitAllocationIdentifier` admits.
-const UNKNOWN_ALLOCATION: &str = "benalloc-00000000000001";
+pub(crate) const UNKNOWN_ALLOCATION: &str = "benalloc-00000000000001";
 
 /// A `ClientToken` every `@pattern` on one admits (`^[!-~]{1,64}$` on create/update,
 /// `^[a-zA-Z0-9-]{1,64}$` on cancel/amend).
-const CLIENT_TOKEN: &str = "gate-probe-token";
+pub(crate) const CLIENT_TOKEN: &str = "gate-probe-token";
 
 /// A `TaggableResourceArn` the modelled pattern admits.
-fn taggable_arn() -> String {
+pub(crate) fn taggable_arn() -> String {
     format!(
         "arn:aws:partnercentral:{REGION}:{ACCOUNT}:catalog/{CATALOG}/benefit-application/{UNKNOWN_APPLICATION}"
     )
@@ -98,37 +104,40 @@ fn taggable_arn() -> String {
 const UNGATED_OPERATIONS: &[&str] = &["ListTagsForResource", "TagResource", "UntagResource"];
 
 /// The envelope a single violation renders into.
-fn one(clause: &str) -> String {
+pub(crate) fn one(clause: &str) -> String {
     format!("1 validation error detected: {clause}")
 }
 
 /// One clause of the envelope: the member path, then the constraint it failed.
-fn clause(path: &str, requirement: &str) -> String {
+pub(crate) fn clause(path: &str, requirement: &str) -> String {
     format!("Value at '{path}' failed to satisfy constraint: {requirement}")
 }
 
 /// The clause a `@pattern` violation states.
-fn pattern_clause(path: &str, pattern: &str) -> String {
+pub(crate) fn pattern_clause(path: &str, pattern: &str) -> String {
     clause(
         path,
         &format!("Member must satisfy regular expression pattern: {pattern}"),
     )
 }
 
-/// The message an error body carries. The framework's own refusal envelope spells the
-/// member `message`; this service's modelled errors, which a handler returns, spell it
-/// `Message` — both are read, so a refusal cannot hide from these tests by travelling
-/// through the other channel.
-fn message_of(response: &Value) -> Option<String> {
-    ["message", "Message"]
-        .into_iter()
-        .find_map(|member| response.get(member).and_then(Value::as_str))
+/// The message an error body carries, read ONLY under the member name the MODEL declares
+/// — `Message`, on this service's `ValidationException` as on every other error shape it
+/// declares. The framework's own generic refusal envelope spells it lowercase `message`
+/// and carries nothing else, so a refusal that travelled through that envelope rather
+/// than through the modelled shape has no message as far as these tests are concerned,
+/// which is exactly the defect they must see. The body itself is pinned in
+/// `tests/all/validation_error_body.rs`.
+pub(crate) fn message_of(response: &Value) -> Option<String> {
+    response
+        .get("Message")
+        .and_then(Value::as_str)
         .map(str::to_string)
 }
 
 /// The invariants of rule 1, checked on every refusal in every table: the AWS envelope,
 /// no rendering of the rejected value, and no pattern anchors.
-fn assert_validation_invariants(case: &str, message: &str) {
+pub(crate) fn assert_validation_invariants(case: &str, message: &str) {
     assert!(
         message.starts_with("1 validation error detected: ")
             || message
@@ -201,7 +210,7 @@ async fn refusal(
 /// violates a modelled constraint, so the only thing that can refuse them is the
 /// entitlement gate, except on the tagging path ([`UNGATED_OPERATIONS`]), which the gate
 /// does not front and which answers its own resource lookup instead.
-fn well_formed_requests() -> Vec<(&'static str, Value)> {
+pub(crate) fn well_formed_requests() -> Vec<(&'static str, Value)> {
     vec![
         ("ListBenefits", json!({ "Catalog": CATALOG })),
         ("ListBenefitApplications", json!({ "Catalog": CATALOG })),
@@ -713,10 +722,7 @@ fn the_renderer_states_each_constraint_class_and_strips_only_the_anchors() {
                         .to_string(),
                 ),
             ),
-            pattern_clause(
-                "resourceArn",
-                r"arn:[\w+=/,.@-]+:partnercentral:[\w+=/,.@-]*:[0-9]{12}:catalog/([a-zA-Z]+)/[\w+=,.@-]+(/[\w+=,.@-]+)*",
-            ),
+            pattern_clause("resourceArn", TAGGABLE_ARN_PATTERN),
         ),
         (
             // A pattern carrying no anchors at all is quoted as it stands.

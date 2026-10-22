@@ -177,9 +177,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DescribeWorkerConfigurationErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!(
-                        "No worker configuration exists with the ARN {}.",
-                        input.worker_configuration_arn
+                    message: Some(crate::state::invalid_parameter_because(
+                        "workerConfigurationArn",
+                        crate::state::RESOURCE_DOES_NOT_EXIST,
                     )),
                 },
             )

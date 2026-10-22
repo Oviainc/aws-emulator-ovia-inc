@@ -29,3 +29,5 @@ mod resource_tags;
 mod service_error_rules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_error_body.rs"]
+mod validation_error_body;
