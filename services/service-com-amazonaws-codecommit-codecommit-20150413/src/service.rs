@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -63,6 +63,108 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
         }
     }
+}
+
+/// The error CodeCommit names for one rejected member, or `None` to leave the
+/// framework's wording in place.
+///
+/// Each code is an error shape this service's model declares, and each message is
+/// that shape's own documented sentence (the `//! ## Errors` list in
+/// `src/ops/<operation>.rs`), followed by the member at fault so the caller can
+/// fix the request from the message alone.
+fn refusal_for(violation: &Violation) -> Option<Refused> {
+    // A nested path names its top-level member first (`tags.aws:x.member`).
+    let member = violation.path.split('.').next().unwrap_or_default();
+    let missing = matches!(violation.kind, ViolationKind::MissingRequiredMember);
+    let (code, requirement) = match (member, &violation.kind) {
+        ("repositoryName", _) if missing => (
+            "RepositoryNameRequiredException",
+            "A repository name is required, but was not specified.",
+        ),
+        ("repositoryName", _) => (
+            "InvalidRepositoryNameException",
+            "A specified repository name is not valid.",
+        ),
+        ("repositoryNames", _) if missing => (
+            "RepositoryNamesRequiredException",
+            "A repository names object is required, but was not specified.",
+        ),
+        ("repositoryDescription", _) => (
+            "InvalidRepositoryDescriptionException",
+            "The specified repository description is not valid.",
+        ),
+        ("branchName", _) if missing => (
+            "BranchNameRequiredException",
+            "A branch name is required, but was not specified.",
+        ),
+        ("branchName", _) => (
+            "InvalidBranchNameException",
+            "The specified reference name is not valid.",
+        ),
+        ("filePath" | "folderPath", _) if missing => (
+            "PathRequiredException",
+            "The folderPath for a location cannot be null.",
+        ),
+        ("filePath" | "folderPath", _) => {
+            ("InvalidPathException", "The specified path is not valid.")
+        }
+        ("fileContent", _) if missing => (
+            "FileContentRequiredException",
+            "The file cannot be added because it is empty.",
+        ),
+        ("fileContent", ViolationKind::MaxLength(_)) => (
+            "FileContentSizeLimitExceededException",
+            "The file cannot be added because it is too large.",
+        ),
+        ("fileMode", ViolationKind::EnumValue(_)) => (
+            "InvalidFileModeException",
+            "The specified file mode permission is not valid.",
+        ),
+        ("parentCommitId", _) if missing => (
+            "ParentCommitIdRequiredException",
+            "A parent commit ID is required.",
+        ),
+        ("parentCommitId", _) => (
+            "InvalidParentCommitIdException",
+            "The parent commit ID is not valid.",
+        ),
+        ("commitId", _) if missing => (
+            "CommitIdRequiredException",
+            "A commit ID was not specified.",
+        ),
+        ("commitId", _) => ("InvalidCommitIdException", "The specified commit ID is not valid."),
+        ("commitMessage", ViolationKind::MaxLength(_)) => (
+            "CommitMessageLengthExceededException",
+            "The commit message is too long.",
+        ),
+        ("name", ViolationKind::MaxLength(_)) => (
+            "NameLengthExceededException",
+            "The user name is not valid because it has exceeded the character limit for author names.",
+        ),
+        ("email", _) => (
+            "InvalidEmailException",
+            "The specified email address either contains one or more characters that are not allowed, or it exceeds the maximum number of characters allowed for an email address.",
+        ),
+        ("sortBy", ViolationKind::EnumValue(_)) => (
+            "InvalidSortByException",
+            "The specified sort by value is not valid.",
+        ),
+        ("order", ViolationKind::EnumValue(_)) => (
+            "InvalidOrderException",
+            "The specified sort order is not valid.",
+        ),
+        ("nextToken", _) => (
+            "InvalidContinuationTokenException",
+            "The specified continuation token is not valid.",
+        ),
+        ("tags", _) => ("InvalidTagsMapException", "The map of tags is not valid."),
+        // Everything else keeps the framework's own wording.
+        _ => return None,
+    };
+    Some(Refused {
+        code: code.to_string(),
+        message: format!("{requirement} (member: {})", violation.path),
+    })
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -96,17 +198,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // CodeCommit does not answer one generic `ValidationException`: it names a
+        // specific error per member — a missing repository name is
+        // `RepositoryNameRequiredException`, a `sortBy` outside its enum is
+        // `InvalidSortByException`, and so on. A client branches on that code, so the
+        // framework's refusal is reworded here (code AND message) into the error the
+        // model declares for the member at fault. The HTTP status stays with the
+        // protocol, and every error named below is a 400 in this model.
+        match refusal {
+            Refusal::Invalid(violations) => violations.iter().find_map(refusal_for),
+            // Authentication refusals, and any refusal kind added later, keep the
+            // framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
