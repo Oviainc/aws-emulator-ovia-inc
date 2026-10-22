@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomainEntry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomainEntry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Appends ONE recordset entry — the name, type, target and alias flag the request
+//! carries, under a server-assigned entry id — to the stored DNS zone the request
+//! names, and answers the operation-log entry the append wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomainEntry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +163,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomainEntry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainEntryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomainEntry"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: an entry lives in the zone it is added to, whose own
+        // location the store already holds.
+        let _ = ctx;
+
+        // `domainName` and `domainEntry` are modelled `@required` members, so the
+        // centralized walk refused an absent one before this body ran. Every
+        // member INSIDE `DomainEntry` is optional in the model, so the three that
+        // make a recordset — the name it answers for, the record type and the
+        // value it resolves to — are checked here, BEFORE the first write.
+        let domain_name = input.domain_name;
+        let requested = input.domain_entry;
+        let name = present("domainEntry.name", requested.name.as_deref())?;
+        let entry_type = present("domainEntry.type", requested.r#type.as_deref())?;
+        let target = present("domainEntry.target", requested.target.as_deref())?;
+
+        if !crate::state::DOMAIN_ENTRY_TYPES.contains(&entry_type.as_str()) {
+            return Err(invalid(format!(
+                "domainEntry.type '{entry_type}' is not a domain entry type: it is one of {}",
+                crate::state::domain_entry_types()
+            )));
+        }
+        // `isAlias` is what distinguishes an alias record pointing at another
+        // Amazon Web Services resource from a plain one; absent means not an
+        // alias, which is what the stored entry then reports.
+        let is_alias = requested.is_alias.unwrap_or(false);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Every check runs against the immutably borrowed zone first, so a
+            // refused request mints no id and appends nothing.
+            let location = {
+                let domain = store
+                    .domain(&domain_name)
+                    .ok_or_else(|| not_found(&domain_name))?;
+                crate::state::validate_domain_entry_name("domainEntry.name", &name, &domain.name)
+                    .map_err(invalid)?;
+                if domain
+                    .entries
+                    .iter()
+                    .any(|entry| crate::state::is_same_domain_entry(entry, &name, &entry_type, &target))
+                {
+                    return Err(invalid(format!(
+                        "domainEntry '{name}' of type '{entry_type}' with target '{target}' \
+                         is already an entry of domain '{domain_name}'"
+                    )));
+                }
+                if domain.entries.len() >= crate::state::MAX_DOMAIN_ENTRIES {
+                    return Err(invalid(format!(
+                        "adding an entry would take domain '{domain_name}' past the {} \
+                         entries this emulator holds in one domain",
+                        crate::state::MAX_DOMAIN_ENTRIES
+                    )));
+                }
+                domain.location.clone()
+            };
+
+            // The entry id is this service's to assign — it is what
+            // `UpdateDomainEntry` and `DeleteDomainEntry` address the entry by —
+            // so a value the request carried in it is not stored.
+            let entry = DomainEntry {
+                id: Some(store.mint_uuid()),
+                name: Some(name.clone()),
+                target: Some(target.clone()),
+                is_alias: Some(is_alias),
+                r#type: Some(entry_type.clone()),
+                // The modelled `DomainEntry$options` member is marked deprecated
+                // and documented "(Discontinued) The options for the domain
+                // entry", so a stored entry carries none.
+                options: None,
+            };
+            store
+                .domain_mut(&domain_name)
+                .ok_or_else(|| not_found(&domain_name))?
+                .entries
+                .push(entry);
+
+            // The entry is in the zone as this call returns — a `DomainEntry`
+            // carries no status member, so there is nothing for the clock to
+            // settle later — which is why the operation it logs is answered
+            // terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_UPDATE_DOMAIN_ENTRY,
+                crate::state::RESOURCE_TYPE_DOMAIN,
+                &domain_name,
+                &location,
+                None,
+            );
+            Ok(CreateDomainEntryOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// The value of `member`, or a 400 refusal: a recordset entry cannot be built
+/// without it, and a blank string is not a value DNS carries.
+fn present(member: &str, value: Option<&str>) -> Result<String, CreateDomainEntryError> {
+    match value.map(str::trim) {
+        Some(value) if !value.is_empty() => Ok(value.to_string()),
+        _ => Err(invalid(format!(
+            "{member} is required to create a domain entry"
+        ))),
+    }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateDomainEntryError {
+    CreateDomainEntryErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No domain recordset of that name is stored, so there is no zone to add an
+/// entry to: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name.
+fn not_found(name: &str) -> CreateDomainEntryError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(crate::state::RESOURCE_TYPE_DOMAIN, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateDomainEntryError {
+    CreateDomainEntryErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail domain store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

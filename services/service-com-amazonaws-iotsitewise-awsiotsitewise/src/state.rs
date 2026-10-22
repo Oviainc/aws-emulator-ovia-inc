@@ -18,7 +18,7 @@ use crate::ops::types::{
     AssetHierarchy, AssetModelCompositeModel, AssetModelCompositeModelPathSegment,
     AssetModelCompositeModelSummary, AssetModelHierarchy, AssetModelProperty,
     AssetModelPropertyDefinition, AssetModelStatus, AssetProperty, AssetPropertyValue, AssetStatus,
-    AssetSummary, GatewayCapabilitySummary, GatewayPlatform, TimeInNanos,
+    AssetSummary, GatewayCapabilitySummary, GatewayPlatform, PropertyType, TimeInNanos,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -85,6 +85,33 @@ pub const MAX_PROPERTIES_PER_COMPOSITE_MODEL: usize = 200;
 /// `CreateAssetModelCompositeModel` refuses past it with the modelled
 /// `LimitExceededException` (HTTP 410).
 pub const MAX_COMPOSITE_MODELS_PER_ASSET_MODEL: usize = 100;
+
+/// How many property definitions one asset model may carry.
+///
+/// A PUBLISHED AWS quota, stated by both `CreateAssetModel`'s and
+/// `UpdateAssetModel`'s `assetModelProperties` member: "You can specify up to 200
+/// properties per asset model." A write that would leave a model carrying more is
+/// refused with the modelled `LimitExceededException` (HTTP 410).
+pub const MAX_PROPERTIES_PER_ASSET_MODEL: usize = 200;
+
+/// How many hierarchy definitions one asset model may carry.
+///
+/// A PUBLISHED AWS quota, stated by both `CreateAssetModel`'s and
+/// `UpdateAssetModel`'s `assetModelHierarchies` member: "You can specify up to 10
+/// hierarchies per asset model." Refused the same way as
+/// [`MAX_PROPERTIES_PER_ASSET_MODEL`].
+pub const MAX_HIERARCHIES_PER_ASSET_MODEL: usize = 10;
+
+/// The `AssetModelVersionType` value naming a model's latest version, and the
+/// documented default of every `matchForVersionType` member.
+pub const VERSION_TYPE_LATEST: &str = "LATEST";
+
+/// The `AssetModelVersionType` value naming a model's active version.
+pub const VERSION_TYPE_ACTIVE: &str = "ACTIVE";
+
+/// The one value a `SelectAll` member (`ifNoneMatch`) admits: its modelled
+/// pattern is `^\*$`.
+pub const SELECT_ALL: &str = "*";
 
 /// The prefix a `CustomID` label uses to name a resource by its external id.
 pub const EXTERNAL_ID_PREFIX: &str = "externalId:";
@@ -873,6 +900,121 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
         Some(record)
     }
 
+    /// Re-materialise every asset created from asset model `asset_model_id`
+    /// against that model's CURRENT property and hierarchy definitions.
+    ///
+    /// This is the inheritance `UpdateAssetModel` documents: "Updates an asset
+    /// model and all of the assets that were created from the model. Each asset
+    /// created from the model inherits the updated asset model's property and
+    /// hierarchy definitions", and "If you remove a property from an asset model,
+    /// IoT SiteWise deletes all previous data for that property".
+    ///
+    /// So, per asset of that model: a property the model still defines keeps the
+    /// asset-level bindings the model does not define (its alias and its
+    /// notification state) and takes the definition's name, data type and unit; a
+    /// property the model no longer defines goes, and with it its stored time
+    /// series and its alias binding; a hierarchy the model no longer defines goes,
+    /// and with it the child associations recorded under it. Each affected asset
+    /// reports `UPDATING` until the transition this call owes falls due, exactly as
+    /// [`AssetRecord::begin_update`] records it for a direct `UpdateAsset`.
+    ///
+    /// `asset_model_id` is a stored id, not a label: resolve it with
+    /// [`Self::resolve_asset_model_id`] first. Does nothing when no stored model
+    /// has that id, or when no asset was created from it.
+    pub fn propagate_asset_model_definitions(&mut self, asset_model_id: &str, now: SystemTime) {
+        let Some(model) = self.asset_models.get(asset_model_id) else {
+            return;
+        };
+        // Cloned so the per-asset writes below are not borrowing the model.
+        let definitions = model.properties.clone();
+        let hierarchy_definitions = model.hierarchies.clone();
+        let asset_ids: Vec<String> = self
+            .assets
+            .values()
+            .filter(|asset| asset.asset_model_id == asset_model_id)
+            .map(|asset| asset.id.clone())
+            .collect();
+
+        for asset_id in asset_ids {
+            let Some(asset) = self.assets.get_mut(&asset_id) else {
+                continue;
+            };
+            let carried = ::std::mem::take(&mut asset.properties);
+            // A stored model property without an id would make an unaddressable
+            // asset property, so it is skipped rather than materialised with an
+            // empty id — the same filter `CreateAsset` applies.
+            let properties: Vec<AssetProperty> = definitions
+                .iter()
+                .filter_map(|definition| {
+                    let id = definition.id.clone().filter(|id| !id.is_empty())?;
+                    let held = carried.iter().find(|property| property.id == id);
+                    Some(AssetProperty {
+                        id,
+                        external_id: definition.external_id.clone(),
+                        name: definition.name.clone(),
+                        alias: held.and_then(|property| property.alias.clone()),
+                        notification: held.and_then(|property| property.notification.clone()),
+                        data_type: definition.data_type.clone(),
+                        data_type_spec: definition.data_type_spec.clone(),
+                        unit: definition.unit.clone(),
+                        path: None,
+                    })
+                })
+                .collect();
+            let hierarchies: Vec<AssetHierarchy> = hierarchy_definitions
+                .iter()
+                .map(|hierarchy| AssetHierarchy {
+                    id: hierarchy.id.clone(),
+                    external_id: hierarchy.external_id.clone(),
+                    name: hierarchy.name.clone(),
+                })
+                .collect();
+            let dropped_hierarchies: Vec<String> = asset
+                .hierarchies
+                .iter()
+                .filter_map(|hierarchy| hierarchy.id.clone())
+                .filter(|id| {
+                    !hierarchies
+                        .iter()
+                        .any(|kept| kept.id.as_deref() == Some(id.as_str()))
+                })
+                .collect();
+            let dropped_properties: Vec<AssetProperty> = carried
+                .into_iter()
+                .filter(|property| {
+                    !properties.iter().any(|kept| kept.id == property.id)
+                })
+                .collect();
+            asset.properties = properties;
+            asset.hierarchies = hierarchies;
+            asset.begin_update(now);
+
+            for property in dropped_properties {
+                if let Some(series) = self.property_values.get_mut(&asset_id) {
+                    series.remove(&property.id);
+                    if series.is_empty() {
+                        self.property_values.remove(&asset_id);
+                    }
+                }
+                if let Some(alias) = property.alias {
+                    let ours = self
+                        .property_alias_index
+                        .get(&alias)
+                        .is_some_and(|(bound_asset, bound_property)| {
+                            *bound_asset == asset_id && *bound_property == property.id
+                        });
+                    if ours {
+                        self.property_alias_index.remove(&alias);
+                    }
+                }
+            }
+            for hierarchy_id in dropped_hierarchies {
+                self.asset_hierarchy_children
+                    .remove(&(asset_id.clone(), hierarchy_id));
+            }
+        }
+    }
+
     /// The child assets associated with `(asset_id, hierarchy_id)`.
     pub fn hierarchy_children(&self, asset_id: &str, hierarchy_id: &str) -> &[String] {
         self.asset_hierarchy_children
@@ -1005,28 +1147,12 @@ pub fn property_definitions_to_properties(
 ) -> Result<Vec<AssetModelProperty>, String> {
     let mut properties = Vec::with_capacity(definitions.len());
     for definition in definitions {
-        let kinds = [
-            definition.r#type.attribute.is_some(),
-            definition.r#type.measurement.is_some(),
-            definition.r#type.transform.is_some(),
-            definition.r#type.metric.is_some(),
-        ]
-        .into_iter()
-        .filter(|set| *set)
-        .count();
-        if kinds != 1 {
-            return Err(format!(
-                "The property definition {} must specify exactly one property type \
-                 (attribute, measurement, transform or metric), but specifies {kinds}.",
-                definition.name
-            ));
-        }
-        if definition.data_type == "STRUCT" && definition.data_type_spec.is_none() {
-            return Err(format!(
-                "The property definition {} has the STRUCT data type, so dataTypeSpec is required.",
-                definition.name
-            ));
-        }
+        check_property_shape(
+            &definition.name,
+            &definition.data_type,
+            definition.data_type_spec.as_deref(),
+            &definition.r#type,
+        )?;
         properties.push(AssetModelProperty {
             id: Some(definition.id.clone().unwrap_or_else(new_id)),
             external_id: definition.external_id.clone(),
@@ -1039,6 +1165,99 @@ pub fn property_definitions_to_properties(
         });
     }
     Ok(properties)
+}
+
+/// Which of the four property types a `PropertyType` sets, named as the shape's
+/// own member; `None` when it sets none of them or more than one.
+///
+/// The ONE place this service decides what "the type of a property" is, so the
+/// rule that a definition carries exactly one type and the rule that an existing
+/// property's type cannot change ask the same question of the same shape.
+pub fn property_type_kind(property_type: &PropertyType) -> Option<&'static str> {
+    let kinds = [
+        ("attribute", property_type.attribute.is_some()),
+        ("measurement", property_type.measurement.is_some()),
+        ("transform", property_type.transform.is_some()),
+        ("metric", property_type.metric.is_some()),
+    ];
+    let mut found = None;
+    for (name, set) in kinds {
+        if set {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(name);
+        }
+    }
+    found
+}
+
+/// The two rules the property shapes' own documentation states, checked wherever
+/// a model property arrives — as a definition on a create, or as a full
+/// `AssetModelProperty` on `UpdateAssetModel`:
+///
+/// * exactly ONE property type ("You can only specify one type in a property
+///   definition"), and
+/// * `dataTypeSpec` on a `STRUCT` ("This parameter is required on properties that
+///   have the STRUCT data type").
+///
+/// The `Err` carries the refusal message, which the calling operation lifts into
+/// its own modelled `InvalidRequestException`.
+pub fn check_property_shape(
+    name: &str,
+    data_type: &str,
+    data_type_spec: Option<&str>,
+    property_type: &PropertyType,
+) -> Result<(), String> {
+    if property_type_kind(property_type).is_none() {
+        let set = [
+            property_type.attribute.is_some(),
+            property_type.measurement.is_some(),
+            property_type.transform.is_some(),
+            property_type.metric.is_some(),
+        ]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+        return Err(format!(
+            "The property definition {name} must specify exactly one property type \
+             (attribute, measurement, transform or metric), but specifies {set}."
+        ));
+    }
+    if data_type == DATA_TYPE_STRUCT && data_type_spec.is_none() {
+        return Err(format!(
+            "The property definition {name} has the STRUCT data type, so dataTypeSpec is required."
+        ));
+    }
+    Ok(())
+}
+
+/// The one `PropertyDataType` value that also requires `dataTypeSpec`; see
+/// [`check_property_shape`].
+pub const DATA_TYPE_STRUCT: &str = "STRUCT";
+
+/// The `ETag` the `If-Match` / `If-None-Match` preconditions of an asset-model
+/// write are evaluated against, as of `now`, or `None` when the version
+/// `version_type` names does not exist.
+///
+/// `matchForVersionType` targets the modelled `AssetModelVersionType` enum
+/// (`LATEST | ACTIVE`) and [`VERSION_TYPE_LATEST`] is its documented default.
+/// This emulator keeps ONE version of an asset model, so that version is always
+/// its latest one and is also its ACTIVE one once the transition the clock owes
+/// has fallen due; while one is still pending the model has no active version at
+/// all, which is the `None` here. Shared by every operation that carries those
+/// headers, so `CreateAssetModelCompositeModel`, `UpdateAssetModel` and
+/// `DeleteAssetModel` cannot disagree about which tag a precondition targets.
+pub fn asset_model_target_etag(
+    record: &AssetModelRecord,
+    version_type: Option<&str>,
+    now: SystemTime,
+) -> Option<String> {
+    let version_type = version_type.unwrap_or(VERSION_TYPE_LATEST);
+    if version_type == VERSION_TYPE_ACTIVE && record.state(now) != STATE_ACTIVE {
+        return None;
+    }
+    Some(asset_model_etag(record))
 }
 
 /// The entity tag of an asset model's stored definition.

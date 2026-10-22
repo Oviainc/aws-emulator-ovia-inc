@@ -152,7 +152,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A reporting operation: the page is cut from stored state, and the one write it
         // makes is materialising the status transitions the clock already owed.
-        let region = crate::state::request_region(ctx);
+        //
+        // Nothing on this path needs the request metadata: every value it reports is read
+        // off the STORED record (whose ARNs were minted in the region of the call that
+        // created it), and the one failure it raises names the resource it could not find
+        // by id rather than by ARN — so this handler mints no ARN and needs no region.
+        // Discarded rather than renamed, the same way `list_members.rs` does.
+        let _ = ctx;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListProposalsErrorModeled::InternalServiceErrorException(
@@ -184,13 +190,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would claim the network exists and carries no proposals.
         let Some(network) = guard.networks.get(&input.network_id) else {
             return Err(ListProposalsErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Network {} not found.", input.network_id)),
-                    // `ResourceNotFoundException$ResourceName` is an `ArnString`
-                    // (`^arn:.+:.+:.+:.+:.+$`), so it names the requested resource in ARN
-                    // form rather than by bare id.
-                    resource_name: Some(crate::state::network_arn(&region, &input.network_id)),
-                },
+                // Named by id, so `ResourceName` is omitted — see `crate::state::not_found`.
+                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
             .into());
         };

@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/lf_tags.rs"]
 mod lf_tags;
+#[path = "all/registered_resources.rs"]
+mod registered_resources;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

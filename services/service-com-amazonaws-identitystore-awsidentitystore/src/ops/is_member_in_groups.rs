@@ -179,12 +179,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modelled `MemberId` union declares exactly one variant, `UserId`, so the
         // member is always a user of this store — and a user the store does not hold is
         // the one resource the whole call is about, hence refused rather than reported
-        // as a row of `false`s.
+        // as a row of `false`s. The member end of a membership has its own constant, as
+        // `CreateGroupMembership` answers: the request named this user through
+        // `MemberId`, not through a user id of its own.
         let MemberId::UserId(member) = &input.member_id;
         let member_key = crate::state::resource_key(member);
         if !store.users.contains_key(&member_key) {
             return Err(IsMemberInGroupsErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(crate::state::ResourceKind::User, member),
+                crate::state::member_not_found(member),
             )
             .into());
         }

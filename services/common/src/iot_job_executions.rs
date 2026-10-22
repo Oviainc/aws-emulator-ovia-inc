@@ -1,0 +1,900 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The IoT JOB-EXECUTION store, shared by the two services that write and read it.
+//!
+//! A job execution belongs to one (thing, job) pair and is reached by TWO emulated
+//! services: the IoT control plane CREATES one per targeted thing when a job is
+//! created (`iot`: `CreateJob` targets things), and the IoT Jobs data plane is where
+//! the device then polls, starts and updates it (`iot-jobs-data`:
+//! `GetPendingJobExecutions`, `StartNextPendingJobExecution`, `DescribeJobExecution`,
+//! `UpdateJobExecution`, `StartCommandExecution`). An execution one service writes is
+//! the execution the other must see, so both reach ONE store — this type, registered
+//! once in the shared engine — instead of each keeping its own copy keyed by its own
+//! state struct.
+//!
+//! Nothing here names a wire shape or a Smithy type: a service crate projects a
+//! [`JobExecutionRecord`] onto the shapes ITS model declares (`JobExecution`,
+//! `JobExecutionSummary`, `JobExecutionState`, …). What lives here is the record, the
+//! lookups every reader needs and the quotas that bound the store.
+//!
+//! Every caller-driven store is BOUNDED: see the quota constants below,
+//! [`JobExecutionStore::try_insert_execution`] (which refuses past a quota and evicts
+//! a thing's oldest FINISHED executions) and
+//! [`JobExecutionStore::remember_client_token`] (oldest token evicted first).
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// A newly enqueued execution's status.
+pub const STATUS_QUEUED: &str = "QUEUED";
+/// The status a device moves an execution to when it starts working on it.
+pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// The two statuses an execution is PENDING in — the ones
+/// `GetPendingJobExecutions` documents as "not in a terminal status" and
+/// `StartNextPendingJobExecution` as the executions it may start.
+pub const PENDING_STATUSES: [&str; 2] = [STATUS_QUEUED, STATUS_IN_PROGRESS];
+
+/// The `versionNumber` a freshly created execution carries: "Job execution versions
+/// are incremented each time they are updated by a device"
+/// (`JobExecution$versionNumber`), and a created execution has had no device update.
+pub const FIRST_VERSION_NUMBER: i64 = 1;
+/// The `executionNumber` of a job's FIRST execution on a device
+/// ("a number that identifies a particular job execution on a particular device").
+pub const FIRST_EXECUTION_NUMBER: i64 = 1;
+
+/// True while `status` leaves the execution pending.
+pub fn is_pending_status(status: &str) -> bool {
+    PENDING_STATUSES.contains(&status)
+}
+
+/// True for a status that ENDS an execution: every status that is not one of the two
+/// [`PENDING_STATUSES`]. The writing service validates a status against its model's
+/// `JobExecutionStatus` enum before it reaches this store, so "not pending" and "one
+/// of the modelled terminal values" are the same set here — and a status the model
+/// adds is classified without editing a second list.
+pub fn is_terminal_status(status: &str) -> bool {
+    !is_pending_status(status)
+}
+
+/// Quota on how many job executions one thing may have pending at once; a request
+/// past it is refused with the caller's modelled quota error rather than growing the
+/// store without bound.
+pub const MAX_PENDING_EXECUTIONS_PER_THING: usize = 1_000;
+/// How many FINISHED executions one thing keeps: the newest ones stay resolvable
+/// (so a reader can still tell "finished" from "never existed"), older ones are
+/// evicted as new executions are enqueued, so completed work does not accumulate for
+/// the process's lifetime.
+pub const MAX_TERMINAL_EXECUTIONS_PER_THING: usize = 100;
+/// Quota on how many things may hold job executions at once.
+pub const MAX_THINGS_WITH_EXECUTIONS: usize = 10_000;
+/// How many client tokens the idempotency index remembers; the oldest is evicted
+/// first, so a replay of a recent token is still answered from the index.
+pub const MAX_REMEMBERED_CLIENT_TOKENS: usize = 10_000;
+/// Ceiling on the executions the whole store holds, so the per-thing quotas cannot
+/// multiply out without a bound on the total.
+pub const MAX_STORED_EXECUTIONS: usize = 50_000;
+/// Ceiling on the job-document bytes the whole store holds, so a store full of
+/// maximum-size documents is bounded in BYTES and not only in record count.
+pub const MAX_STORED_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many name/value pairs a job execution's `statusDetails` may hold: the IoT
+/// Jobs quota for a job execution's status details.
+pub const MAX_STATUS_DETAIL_PAIRS: usize = 10;
+/// "The maximum length of the value in the name/value pair is 1,024 characters"
+/// — every member that carries `DetailsMap`.
+pub const MAX_STATUS_DETAIL_VALUE_LEN: usize = 1_024;
+/// The model documents a maximum for the VALUE only; the same ceiling is applied to
+/// the NAME so a record cannot be grown through long keys either.
+pub const MAX_STATUS_DETAIL_NAME_LEN: usize = 1_024;
+
+/// `stepTimeoutInMinutes`'s documented lower bound: "Valid values for this parameter
+/// range from 1 to 10080 (1 minute to 7 days)."
+pub const MIN_STEP_TIMEOUT_MINUTES: i64 = 1;
+/// `stepTimeoutInMinutes`'s documented upper bound (7 days).
+pub const MAX_STEP_TIMEOUT_MINUTES: i64 = 10_080;
+/// `UpdateJobExecution$stepTimeoutInMinutes`: "A value of -1 is also valid and will
+/// cancel the current step timer".
+pub const CANCEL_STEP_TIMER_MINUTES: i64 = -1;
+
+/// `$next` as it appears in `DescribeJobExecution`'s `jobId` label — the model's own
+/// pattern for that member is `^[a-zA-Z0-9_-]+|^\$next$`.
+pub const NEXT_JOB_ID: &str = "$next";
+
+/// `ThingName`'s modelled maximum length (len 1..128) — the member every operation
+/// of both planes names a device by.
+pub const MAX_THING_NAME_LEN: usize = 128;
+
+/// Whether `name` satisfies the model's `ThingName`: 1..128 characters matching
+/// `^[a-zA-Z0-9:_-]+$`.
+///
+/// ONE rule for the whole IoT family: a name that fails it can never be addressed by
+/// a `/things/{thingName}/...` request, so an execution stored under it would exist
+/// and be unreachable. Smithy `length` counts CHARACTERS, so this does too.
+pub fn is_modeled_thing_name(name: &str) -> bool {
+    let length = name.chars().count();
+    (1..=MAX_THING_NAME_LEN).contains(&length)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
+}
+
+/// Seconds in one minute, for the timer members documented in MINUTES.
+const SECONDS_PER_MINUTE: i64 = 60;
+
+/// Wall-clock seconds since the epoch: the unit every timestamp member of
+/// `JobExecution` / `JobExecutionSummary` is documented in ("The time, in seconds
+/// since the epoch, …").
+pub fn now_epoch_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// One job execution of one job on one thing, as the services persist it.
+#[derive(Debug, Clone)]
+pub struct JobExecutionRecord {
+    /// The job id: the `jobId` the job was created with, or, for a command
+    /// execution, the minted `executionId`.
+    pub job_id: String,
+    /// The thing the execution runs on.
+    pub thing_name: String,
+    /// One of the model's `JobExecutionStatus` values.
+    pub status: String,
+    /// Device-reported name/value pairs. Ordered, so a response is deterministic.
+    pub status_details: BTreeMap<String, String>,
+    pub queued_at: i64,
+    pub started_at: Option<i64>,
+    pub last_updated_at: i64,
+    /// Starts at [`FIRST_VERSION_NUMBER`] and is incremented on every device update,
+    /// as `JobExecution$versionNumber` documents.
+    pub version_number: i64,
+    pub execution_number: i64,
+    /// The step timer's deadline, in epoch seconds, when one is armed.
+    pub step_timeout_expires_at: Option<i64>,
+    /// The in-progress / command-execution timer's deadline, in epoch seconds, when
+    /// one is armed.
+    pub execution_timeout_expires_at: Option<i64>,
+    /// The job's `timeoutConfig.inProgressTimeoutInMinutes`, when the job that
+    /// created this execution set one. It is kept rather than applied at once
+    /// because the member documents "The timer is started when the job execution
+    /// status is set to IN_PROGRESS", which is a later call.
+    pub in_progress_timeout_minutes: Option<i64>,
+    /// The job document the device runs, when this emulator holds it. `None` for a
+    /// job whose document lives outside the emulator (`CreateJob$documentSource`
+    /// names an S3 object), which this emulator does not fetch and therefore does
+    /// not report.
+    pub job_document: Option<String>,
+}
+
+impl JobExecutionRecord {
+    /// A newly created execution of `job_id` on `thing_name`: `QUEUED`, never
+    /// started, at [`FIRST_VERSION_NUMBER`] and [`FIRST_EXECUTION_NUMBER`]. A caller
+    /// that knows better overwrites the public fields (`execution_number` for a
+    /// re-targeted job, the timers for a job that configures one).
+    pub fn queued(
+        job_id: String,
+        thing_name: String,
+        job_document: Option<String>,
+        now: i64,
+    ) -> Self {
+        Self {
+            job_id,
+            thing_name,
+            status: STATUS_QUEUED.to_string(),
+            status_details: BTreeMap::new(),
+            queued_at: now,
+            started_at: None,
+            last_updated_at: now,
+            version_number: FIRST_VERSION_NUMBER,
+            execution_number: FIRST_EXECUTION_NUMBER,
+            step_timeout_expires_at: None,
+            execution_timeout_expires_at: None,
+            in_progress_timeout_minutes: None,
+            job_document,
+        }
+    }
+
+    /// True when the execution has reached a status it never leaves.
+    pub fn is_terminal(&self) -> bool {
+        is_terminal_status(&self.status)
+    }
+
+    /// True while the execution is pending: `QUEUED` or `IN_PROGRESS`, the two
+    /// statuses `StartNextPendingJobExecution` documents as pending.
+    pub fn is_pending(&self) -> bool {
+        !self.is_terminal()
+    }
+
+    /// Seconds left before the soonest armed timer would move this execution to
+    /// `TIMED_OUT`, floored at zero; `None` when no timer is armed or the execution
+    /// is already terminal.
+    pub fn approximate_seconds_before_timed_out(&self, now: i64) -> Option<i64> {
+        if self.is_terminal() {
+            return None;
+        }
+        let deadline = match (self.step_timeout_expires_at, self.execution_timeout_expires_at) {
+            (Some(step), Some(exec)) => Some(step.min(exec)),
+            (Some(step), None) => Some(step),
+            (None, Some(exec)) => Some(exec),
+            (None, None) => None,
+        }?;
+        Some(deadline.saturating_sub(now).max(0))
+    }
+
+    /// The `statusDetails` in the `HashMap` form every modelled `DetailsMap` member
+    /// carries.
+    pub fn status_details_map(&self) -> HashMap<String, String> {
+        self.status_details
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Apply a request's `statusDetails` WITHIN the bounds a job execution's details
+    /// carry: every supplied pair is set and an absent map leaves the details
+    /// unchanged ("If not specified, the statusDetails are unchanged"), but a map
+    /// that would push the record past [`MAX_STATUS_DETAIL_PAIRS`],
+    /// [`MAX_STATUS_DETAIL_NAME_LEN`] or [`MAX_STATUS_DETAIL_VALUE_LEN`] is refused
+    /// with the reason, for the caller to report as the modelled client error.
+    /// Nothing is written on a refusal: the whole map is checked before the first
+    /// insert, so repeated updates cannot accumulate details without bound.
+    pub fn try_merge_status_details(
+        &mut self,
+        details: Option<&HashMap<String, String>>,
+    ) -> Result<(), String> {
+        let Some(details) = details else {
+            return Ok(());
+        };
+        for (name, value) in details {
+            let name_len = name.chars().count();
+            if name_len > MAX_STATUS_DETAIL_NAME_LEN {
+                return Err(format!(
+                    "a statusDetails name of {name_len} characters is over the {MAX_STATUS_DETAIL_NAME_LEN} character maximum"
+                ));
+            }
+            let value_len = value.chars().count();
+            if value_len > MAX_STATUS_DETAIL_VALUE_LEN {
+                return Err(format!(
+                    "the statusDetails value for {name} is {value_len} characters, over the {MAX_STATUS_DETAIL_VALUE_LEN} character maximum"
+                ));
+            }
+        }
+        let resulting_pairs = self
+            .status_details
+            .keys()
+            .chain(details.keys())
+            .collect::<BTreeSet<&String>>()
+            .len();
+        if resulting_pairs > MAX_STATUS_DETAIL_PAIRS {
+            return Err(format!(
+                "the job execution would hold {resulting_pairs} statusDetails name/value pairs, over the maximum of {MAX_STATUS_DETAIL_PAIRS}"
+            ));
+        }
+        for (name, value) in details {
+            self.status_details.insert(name.clone(), value.clone());
+        }
+        Ok(())
+    }
+
+    /// Apply a request's `stepTimeoutInMinutes`: absent leaves the current step timer
+    /// alone, [`CANCEL_STEP_TIMER_MINUTES`] cancels it, and any other value arms it
+    /// from `now`.
+    pub fn arm_step_timer(&mut self, minutes: Option<i64>, now: i64) {
+        match minutes {
+            None => {}
+            Some(CANCEL_STEP_TIMER_MINUTES) => self.step_timeout_expires_at = None,
+            Some(minutes) => {
+                self.step_timeout_expires_at =
+                    Some(now.saturating_add(minutes.saturating_mul(SECONDS_PER_MINUTE)));
+            }
+        }
+    }
+
+    /// Move the execution to `IN_PROGRESS` at `now`, recording the start and arming
+    /// the job's in-progress timer on the FIRST start.
+    ///
+    /// `TimeoutConfig$inProgressTimeoutInMinutes`: "The timer is started when the job
+    /// execution status is set to IN_PROGRESS" — so an execution resumed while
+    /// already in progress keeps both its original `startedAt` and the deadline that
+    /// first start armed.
+    pub fn start(&mut self, now: i64) {
+        self.status = STATUS_IN_PROGRESS.to_string();
+        if self.started_at.is_none() {
+            self.started_at = Some(now);
+            if let Some(minutes) = self.in_progress_timeout_minutes {
+                self.execution_timeout_expires_at =
+                    Some(now.saturating_add(minutes.saturating_mul(SECONDS_PER_MINUTE)));
+            }
+        }
+    }
+}
+
+/// What one `clientToken` of `StartCommandExecution` committed, so a replay of the
+/// same token answers with the same execution and a replay with different parameters
+/// can be refused as a conflict.
+#[derive(Debug, Clone)]
+pub struct StartedCommand {
+    pub execution_id: String,
+    /// Digest of the request members the token covers.
+    pub request_fingerprint: String,
+}
+
+/// The job executions of every thing, with the client-token index the command-
+/// execution surface needs for idempotency.
+///
+/// Every caller-driven store is BOUNDED: `things` holds at most
+/// [`MAX_THINGS_WITH_EXECUTIONS`] things, each with at most
+/// [`MAX_PENDING_EXECUTIONS_PER_THING`] pending and
+/// [`MAX_TERMINAL_EXECUTIONS_PER_THING`] finished executions (oldest finished evicted
+/// first), with store-wide ceilings of [`MAX_STORED_EXECUTIONS`] records and
+/// [`MAX_STORED_DOCUMENT_BYTES`] job-document bytes so the per-thing quotas cannot
+/// multiply out; each record's `statusDetails` is bounded by
+/// [`MAX_STATUS_DETAIL_PAIRS`] / [`MAX_STATUS_DETAIL_NAME_LEN`] /
+/// [`MAX_STATUS_DETAIL_VALUE_LEN`]; and the client-token index holds at most
+/// [`MAX_REMEMBERED_CLIENT_TOKENS`] entries (oldest evicted first).
+#[derive(Debug, Default)]
+pub struct JobExecutionStore {
+    /// thing name -> that thing's job executions, in the order they were enqueued.
+    pub things: BTreeMap<String, Vec<JobExecutionRecord>>,
+    /// `StartCommandExecution` client token -> what that token committed.
+    pub idempotency: BTreeMap<String, StartedCommand>,
+    /// The remembered client tokens in insertion order, so the index evicts the
+    /// oldest token first once it is full.
+    pub idempotency_order: VecDeque<String>,
+    /// How many executions `things` holds in total, for the store-wide ceiling.
+    pub stored_executions: usize,
+    /// How many job-document bytes `things` holds in total, for the store-wide byte
+    /// ceiling.
+    pub stored_document_bytes: usize,
+    /// Monotonic counter feeding minted execution ids.
+    next_execution_seq: u64,
+}
+
+impl JobExecutionStore {
+    /// The thing's executions, oldest-enqueued first; empty for a thing that has none
+    /// (every operation reports an unknown thing as having no executions rather than
+    /// inventing one).
+    pub fn executions_for(&self, thing_name: &str) -> &[JobExecutionRecord] {
+        self.things.get(thing_name).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// The thing's executions with `status`, oldest-queued first.
+    pub fn with_status(&self, thing_name: &str, status: &str) -> Vec<&JobExecutionRecord> {
+        let mut found: Vec<&JobExecutionRecord> = self
+            .executions_for(thing_name)
+            .iter()
+            .filter(|record| record.status == status)
+            .collect();
+        // Stable, so two executions enqueued in the same second keep enqueue order.
+        found.sort_by_key(|record| record.queued_at);
+        found
+    }
+
+    /// Index of the thing's next pending execution: an already-started
+    /// (`IN_PROGRESS`) execution before any `QUEUED` one, oldest-queued first within
+    /// each group, enqueue order breaking a tie.
+    pub fn next_pending_index(&self, thing_name: &str) -> Option<usize> {
+        self.executions_for(thing_name)
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.is_pending())
+            .min_by_key(|(position, record)| {
+                let group = u8::from(record.status != STATUS_IN_PROGRESS);
+                (group, record.queued_at, *position)
+            })
+            .map(|(position, _)| position)
+    }
+
+    /// Index of the execution `job_id` names on `thing_name`. With `execution_number`
+    /// it is that exact execution; without one it is the latest (highest
+    /// `executionNumber`), which is what `DescribeJobExecution$executionNumber`
+    /// documents as the default.
+    pub fn execution_index(
+        &self,
+        thing_name: &str,
+        job_id: &str,
+        execution_number: Option<i64>,
+    ) -> Option<usize> {
+        self.executions_for(thing_name)
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.job_id == job_id)
+            .filter(|(_, record)| execution_number.is_none_or(|n| record.execution_number == n))
+            .max_by_key(|(position, record)| (record.execution_number, *position))
+            .map(|(position, _)| position)
+    }
+
+    /// Index of the execution a `jobId` label resolves to, resolving `$next` to the
+    /// thing's next pending execution.
+    pub fn resolve_index(
+        &self,
+        thing_name: &str,
+        job_id: &str,
+        execution_number: Option<i64>,
+    ) -> Option<usize> {
+        if job_id == NEXT_JOB_ID {
+            self.next_pending_index(thing_name)
+        } else {
+            self.execution_index(thing_name, job_id, execution_number)
+        }
+    }
+
+    /// The record a `jobId` label resolves to, with `$next` resolving to the thing's
+    /// next pending execution. ONE fallible lookup, so a caller has a single
+    /// not-found path.
+    pub fn resolve_record(
+        &self,
+        thing_name: &str,
+        job_id: &str,
+        execution_number: Option<i64>,
+    ) -> Option<&JobExecutionRecord> {
+        let index = self.resolve_index(thing_name, job_id, execution_number)?;
+        self.record(thing_name, index)
+    }
+
+    /// The record at `index` of `thing_name`'s executions.
+    pub fn record(&self, thing_name: &str, index: usize) -> Option<&JobExecutionRecord> {
+        self.things.get(thing_name)?.get(index)
+    }
+
+    /// The record at `index` of `thing_name`'s executions, for update.
+    pub fn record_mut(
+        &mut self,
+        thing_name: &str,
+        index: usize,
+    ) -> Option<&mut JobExecutionRecord> {
+        self.things.get_mut(thing_name)?.get_mut(index)
+    }
+
+    /// The `executionNumber` the next execution of `job_id` on `thing_name` gets: one
+    /// past the highest the thing already holds for that job, so re-targeting a thing
+    /// with the same job numbers the executions in order, and a job's first execution
+    /// on a device is [`FIRST_EXECUTION_NUMBER`].
+    pub fn next_execution_number(&self, thing_name: &str, job_id: &str) -> i64 {
+        self.executions_for(thing_name)
+            .iter()
+            .filter(|record| record.job_id == job_id)
+            .map(|record| record.execution_number)
+            .max()
+            .map_or(FIRST_EXECUTION_NUMBER, |highest| {
+                highest.saturating_add(1)
+            })
+    }
+
+    /// The next value of the store's monotonic sequence, for a service that mints
+    /// opaque execution ids from it.
+    pub fn next_sequence(&mut self) -> u64 {
+        self.next_execution_seq = self.next_execution_seq.saturating_add(1);
+        self.next_execution_seq
+    }
+
+    /// Enqueue `record` for its thing, within the store's quotas: `Err` names the
+    /// quota the request would exceed, for the caller to report as ITS modelled quota
+    /// error. Enqueueing also evicts the thing's oldest FINISHED executions beyond
+    /// [`MAX_TERMINAL_EXECUTIONS_PER_THING`], so a long-lived store does not keep
+    /// every completed execution forever.
+    pub fn try_insert_execution(&mut self, record: JobExecutionRecord) -> Result<(), String> {
+        let thing_name = record.thing_name.clone();
+        // Every quota is checked WITHOUT touching the map, so a refused request
+        // leaves no entry behind and consumes no thing slot.
+        let held = self.things.get(&thing_name);
+        if held.is_none() && self.things.len() >= MAX_THINGS_WITH_EXECUTIONS {
+            return Err(format!(
+                "the maximum of {MAX_THINGS_WITH_EXECUTIONS} things with job executions is already reached"
+            ));
+        }
+        if held.is_some_and(|executions| {
+            executions.iter().filter(|h| h.is_pending()).count()
+                >= MAX_PENDING_EXECUTIONS_PER_THING
+        }) {
+            return Err(format!(
+                "the thing already has the maximum of {MAX_PENDING_EXECUTIONS_PER_THING} pending job executions"
+            ));
+        }
+
+        // Evict this thing's oldest finished executions first, so the bytes and
+        // records they held are released before the store-wide ceilings below.
+        let (evicted_records, evicted_bytes) = match self.things.get_mut(&thing_name) {
+            Some(executions) => {
+                let mut excess = executions
+                    .iter()
+                    .filter(|held| held.is_terminal())
+                    .count()
+                    .saturating_sub(MAX_TERMINAL_EXECUTIONS_PER_THING);
+                let mut evicted_records = 0usize;
+                let mut evicted_bytes = 0usize;
+                if excess > 0 {
+                    // `retain` visits in enqueue order, so the OLDEST finished
+                    // executions are the ones dropped.
+                    executions.retain(|held| {
+                        if held.is_terminal() && excess > 0 {
+                            excess -= 1;
+                            evicted_records += 1;
+                            evicted_bytes += document_bytes(held);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                (evicted_records, evicted_bytes)
+            }
+            None => (0, 0),
+        };
+        self.stored_executions = self.stored_executions.saturating_sub(evicted_records);
+        self.stored_document_bytes = self.stored_document_bytes.saturating_sub(evicted_bytes);
+
+        if self.stored_executions >= MAX_STORED_EXECUTIONS {
+            return Err(format!(
+                "the store already holds the maximum of {MAX_STORED_EXECUTIONS} job executions"
+            ));
+        }
+        let bytes = document_bytes(&record);
+        if self.stored_document_bytes.saturating_add(bytes) > MAX_STORED_DOCUMENT_BYTES {
+            return Err(format!(
+                "storing this job document would exceed the maximum of {MAX_STORED_DOCUMENT_BYTES} stored job-document bytes"
+            ));
+        }
+
+        self.things.entry(thing_name).or_default().push(record);
+        self.stored_executions = self.stored_executions.saturating_add(1);
+        self.stored_document_bytes = self.stored_document_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Enqueue every record of ONE job, all-or-nothing: the first refusal rolls the
+    /// records already inserted back out, so a job that does not fit inside the
+    /// quotas leaves no half-targeted job behind. The eviction of a thing's oldest
+    /// FINISHED executions is a bound and is not rolled back — an evicted execution
+    /// is gone whether or not the request that displaced it completed.
+    ///
+    /// `records` is consumed LAZILY, one at a time: a caller's iterator may build a
+    /// record per target (each carrying a copy of the job document), and only the
+    /// record being inserted is materialised, so the store's own ceilings
+    /// ([`MAX_STORED_EXECUTIONS`], [`MAX_STORED_DOCUMENT_BYTES`]) bound the memory
+    /// one request can claim instead of being checked after it was already claimed.
+    pub fn try_insert_executions<I>(&mut self, records: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = JobExecutionRecord>,
+    {
+        let mut inserted: Vec<(String, String, i64)> = Vec::new();
+        for record in records {
+            let rollback_key = (
+                record.thing_name.clone(),
+                record.job_id.clone(),
+                record.execution_number,
+            );
+            match self.try_insert_execution(record) {
+                Ok(()) => inserted.push(rollback_key),
+                Err(reason) => {
+                    for (thing_name, job_id, execution_number) in inserted {
+                        self.remove_execution(&thing_name, &job_id, execution_number);
+                    }
+                    return Err(reason);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop one execution, keeping the store's record and byte counts in step with
+    /// what it holds. `true` when a record was removed.
+    pub fn remove_execution(
+        &mut self,
+        thing_name: &str,
+        job_id: &str,
+        execution_number: i64,
+    ) -> bool {
+        let Some(executions) = self.things.get_mut(thing_name) else {
+            return false;
+        };
+        let Some(position) = executions.iter().position(|held| {
+            held.job_id == job_id && held.execution_number == execution_number
+        }) else {
+            return false;
+        };
+        let removed = executions.remove(position);
+        if executions.is_empty() {
+            self.things.remove(thing_name);
+        }
+        self.stored_executions = self.stored_executions.saturating_sub(1);
+        self.stored_document_bytes = self
+            .stored_document_bytes
+            .saturating_sub(document_bytes(&removed));
+        true
+    }
+
+    /// Drop every execution of `job_id`, on every thing, keeping the store's record
+    /// and byte counts in step with what it holds. Answers how many were dropped.
+    ///
+    /// Deleting a job deletes "its related job executions", so the control plane
+    /// needs exactly this: the executions of one job wherever they are queued.
+    pub fn remove_job_executions(&mut self, job_id: &str) -> usize {
+        let mut removed = 0usize;
+        let mut released = 0usize;
+        for executions in self.things.values_mut() {
+            executions.retain(|held| {
+                if held.job_id == job_id {
+                    removed += 1;
+                    released += document_bytes(held);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.things
+            .retain(|_, executions| !executions.is_empty());
+        self.stored_executions = self.stored_executions.saturating_sub(removed);
+        self.stored_document_bytes = self.stored_document_bytes.saturating_sub(released);
+        removed
+    }
+
+    /// How many executions of `job_id` are still pending, on any thing — a job with
+    /// one of these is a job still running on some device.
+    pub fn pending_executions_of_job(&self, job_id: &str) -> usize {
+        self.things
+            .values()
+            .flatten()
+            .filter(|held| held.job_id == job_id && held.is_pending())
+            .count()
+    }
+
+    /// Remember what a `clientToken` committed, evicting the oldest remembered token
+    /// once the index is full.
+    pub fn remember_client_token(
+        &mut self,
+        token: String,
+        execution_id: String,
+        request_fingerprint: String,
+    ) {
+        while self.idempotency_order.len() >= MAX_REMEMBERED_CLIENT_TOKENS {
+            match self.idempotency_order.pop_front() {
+                Some(oldest) => {
+                    self.idempotency.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        if self
+            .idempotency
+            .insert(
+                token.clone(),
+                StartedCommand {
+                    execution_id,
+                    request_fingerprint,
+                },
+            )
+            .is_none()
+        {
+            self.idempotency_order.push_back(token);
+        }
+    }
+}
+
+/// The job-document bytes one record holds; a record whose document is not in this
+/// emulator holds none.
+fn document_bytes(record: &JobExecutionRecord) -> usize {
+    record.job_document.as_ref().map_or(0, String::len)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The store's own rules: classification, ordering, numbering and the bounds.
+
+    use super::*;
+
+    fn enqueue(store: &mut JobExecutionStore, thing: &str, job: &str, now: i64) {
+        let mut record = JobExecutionRecord::queued(
+            job.to_string(),
+            thing.to_string(),
+            Some("{}".to_string()),
+            now,
+        );
+        record.execution_number = store.next_execution_number(thing, job);
+        store
+            .try_insert_execution(record)
+            .expect("the store accepts an execution below every quota");
+    }
+
+    /// A created execution is pending at version 1, execution number 1, and the two
+    /// pending statuses are the only ones that are not terminal.
+    #[test]
+    fn a_created_execution_is_queued_and_only_pending_statuses_are_non_terminal() {
+        let record = JobExecutionRecord::queued(
+            "job".to_string(),
+            "thing".to_string(),
+            None,
+            1_700_000_000,
+        );
+        assert!(
+            record.is_pending() && !record.is_terminal(),
+            "case created: expected a pending execution, got status {:?}",
+            record.status
+        );
+        assert_eq!(
+            (record.version_number, record.execution_number),
+            (FIRST_VERSION_NUMBER, FIRST_EXECUTION_NUMBER),
+            "case created: expected the first version and execution number, got {record:?}"
+        );
+
+        // (case, status, pending)
+        let rows: [(&str, &str, bool); 6] = [
+            ("queued", STATUS_QUEUED, true),
+            ("in progress", STATUS_IN_PROGRESS, true),
+            ("succeeded", "SUCCEEDED", false),
+            ("failed", "FAILED", false),
+            ("timed out", "TIMED_OUT", false),
+            ("rejected", "REJECTED", false),
+        ];
+        for (case, status, pending) in rows {
+            assert_eq!(
+                is_pending_status(status),
+                pending,
+                "case {case:?}: expected is_pending_status == {pending}, got {}",
+                is_pending_status(status)
+            );
+            assert_eq!(
+                is_terminal_status(status),
+                !pending,
+                "case {case:?}: expected is_terminal_status == {}, got {}",
+                !pending,
+                is_terminal_status(status)
+            );
+        }
+    }
+
+    /// A thing name is accepted exactly on the model's `ThingName` constraint
+    /// (len 1..128, `^[a-zA-Z0-9:_-]+$`) — the one rule both planes parse a target
+    /// ARN with, since a name outside it can never be addressed.
+    #[test]
+    fn only_a_modeled_thing_name_is_accepted() {
+        let at_maximum = "a".repeat(MAX_THING_NAME_LEN);
+        let past_maximum = "a".repeat(MAX_THING_NAME_LEN + 1);
+        // (case, name, accepted) — each published bound and one past it, plus the
+        // punctuation the pattern allows and some it does not.
+        let rows: [(&str, &str, bool); 10] = [
+            ("one character, the lower bound", "a", true),
+            ("empty, one under the lower bound", "", false),
+            ("at the upper bound", at_maximum.as_str(), true),
+            ("one past the upper bound", past_maximum.as_str(), false),
+            ("digits and the allowed punctuation", "Laser:probe_1-2", true),
+            ("a slash", "laser/probe", false),
+            ("a space", "laser probe", false),
+            ("a dot", "laser.probe", false),
+            ("a non-ascii letter", "läser", false),
+            ("a plus", "laser+probe", false),
+        ];
+        for (case, name, accepted) in rows {
+            assert_eq!(
+                is_modeled_thing_name(name),
+                accepted,
+                "case {case:?}: expected is_modeled_thing_name == {accepted}, got {}",
+                is_modeled_thing_name(name)
+            );
+        }
+    }
+
+    /// `executionNumber` counts a job's executions ON ONE DEVICE: the first is 1, a
+    /// re-target of the same job is 2, and another job on the same thing starts at 1
+    /// again.
+    #[test]
+    fn execution_numbers_count_per_thing_and_job() {
+        let mut store = JobExecutionStore::default();
+        // (case, thing, job, expected execution number)
+        let rows: [(&str, &str, &str, i64); 5] = [
+            ("first job on thing a", "thing-a", "job-1", 1),
+            ("same job again on thing a", "thing-a", "job-1", 2),
+            ("another job on thing a", "thing-a", "job-2", 1),
+            ("same job on thing b", "thing-b", "job-1", 1),
+            ("third time on thing a", "thing-a", "job-1", 3),
+        ];
+        for (case, thing, job, expected) in rows {
+            let actual = store.next_execution_number(thing, job);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected executionNumber {expected}, got {actual}"
+            );
+            enqueue(&mut store, thing, job, 1_700_000_000);
+        }
+    }
+
+    /// `$next` serves an already-started execution before any queued one, and queued
+    /// ones oldest-first.
+    #[test]
+    fn the_next_pending_execution_is_in_progress_first_then_oldest_queued() {
+        let mut store = JobExecutionStore::default();
+        enqueue(&mut store, "thing", "job-old", 100);
+        enqueue(&mut store, "thing", "job-new", 200);
+        let first = store
+            .resolve_record("thing", NEXT_JOB_ID, None)
+            .expect("a thing with two queued executions has a next one");
+        assert_eq!(
+            first.job_id, "job-old",
+            "case all queued: expected the oldest queued execution, got {:?}",
+            first.job_id
+        );
+
+        let index = store
+            .execution_index("thing", "job-new", None)
+            .expect("the newer execution is in the store");
+        store
+            .record_mut("thing", index)
+            .expect("the index came from this store")
+            .start(300);
+        let started = store
+            .resolve_record("thing", NEXT_JOB_ID, None)
+            .expect("a started execution is still pending");
+        assert_eq!(
+            started.job_id, "job-new",
+            "case one started: expected the in-progress execution first, got {:?}",
+            started.job_id
+        );
+    }
+
+    /// The in-progress timer is armed by the FIRST start and survives a resume.
+    #[test]
+    fn the_in_progress_timer_is_armed_once_at_the_first_start() {
+        let mut record =
+            JobExecutionRecord::queued("job".to_string(), "thing".to_string(), None, 1_000);
+        record.in_progress_timeout_minutes = Some(2);
+        record.start(1_000);
+        assert_eq!(
+            record.execution_timeout_expires_at,
+            Some(1_000 + 2 * SECONDS_PER_MINUTE),
+            "case first start: expected the timer armed from the start, got {record:?}"
+        );
+        record.start(5_000);
+        assert_eq!(
+            (record.started_at, record.execution_timeout_expires_at),
+            (Some(1_000), Some(1_000 + 2 * SECONDS_PER_MINUTE)),
+            "case resumed: expected the first start's instant and deadline, got {record:?}"
+        );
+    }
+
+    /// A thing keeps at most [`MAX_TERMINAL_EXECUTIONS_PER_THING`] finished
+    /// executions, oldest evicted first, and the byte count follows the records.
+    #[test]
+    fn finished_executions_are_evicted_oldest_first() {
+        let mut store = JobExecutionStore::default();
+        for index in 0..=MAX_TERMINAL_EXECUTIONS_PER_THING {
+            let job = format!("job-{index}");
+            enqueue(&mut store, "thing", &job, 100 + index as i64);
+            let at = store
+                .execution_index("thing", &job, None)
+                .expect("the execution just enqueued");
+            store
+                .record_mut("thing", at)
+                .expect("the index came from this store")
+                .status = "SUCCEEDED".to_string();
+        }
+        assert!(
+            store.execution_index("thing", "job-0", None).is_some(),
+            "case at the bound: the oldest finished execution is still held, got {} records",
+            store.executions_for("thing").len()
+        );
+
+        enqueue(&mut store, "thing", "one-more", 9_999);
+        assert!(
+            store.execution_index("thing", "job-0", None).is_none(),
+            "case past the bound: expected the oldest finished execution evicted, got it still held"
+        );
+        assert_eq!(
+            store.stored_executions,
+            store.executions_for("thing").len(),
+            "case past the bound: the record count must follow the store, got {}",
+            store.stored_executions
+        );
+        assert_eq!(
+            store.stored_document_bytes,
+            store
+                .executions_for("thing")
+                .iter()
+                .map(document_bytes)
+                .sum::<usize>(),
+            "case past the bound: the byte count must follow the store, got {}",
+            store.stored_document_bytes
+        );
+    }
+}

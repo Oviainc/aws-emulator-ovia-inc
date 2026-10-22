@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateStateMachine
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateStateMachine`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the members the request carries to the PERSISTED state
+//! machine in [`crate::state`] — its definition, `roleArn` and configuration
+//! structures — moves it to a fresh `revisionId`, and publishes a new version when
+//! `publish` is set, so every later `DescribeStateMachine`, `StartExecution` and
+//! `CreateStateMachine` idempotency check reads the configuration this call wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateStateMachine::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -218,18 +217,198 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateStateMachine` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateStateMachineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateStateMachine"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        let Some(parsed) = crate::state::parse_state_machine_arn(&input.state_machine_arn) else {
+            return Err(
+                UpdateStateMachineErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(format!(
+                        "Invalid Arn: '{}'",
+                        input.state_machine_arn
+                    )),
+                })
+                .into(),
+            );
+        };
+
+        // "A qualified state machine ARN can either refer to a Distributed Map state
+        // defined within a state machine, a version ARN, or an alias ARN." None of
+        // those is a state machine this call can modify — a version is an immutable
+        // snapshot and an alias only routes to them — so a qualified ARN is refused
+        // rather than silently updating the state machine behind it.
+        if parsed.qualifier.is_some() {
+            return Err(UpdateStateMachineErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "a qualified state machine ARN cannot be updated: '{}'",
+                        input.state_machine_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // "You must include at least one of definition or roleArn or you will
+        // receive a MissingRequiredParameter error."
+        if input.definition.is_none() && input.role_arn.is_none() {
+            return Err(UpdateStateMachineErrorModeled::MissingRequiredParameter(
+                MissingRequiredParameter {
+                    message: Some(
+                        "either definition or roleArn must be given to update a state machine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The same input rules `CreateStateMachine` applies, from the same place:
+        // the structural rules of the Amazon States Language, an ARN that names an
+        // IAM role, and the two configuration structures whose members must agree
+        // with each other.
+        if let Some(definition) = input.definition.as_deref() {
+            if let Err(why) = crate::state::asl::validate(definition) {
+                return Err(UpdateStateMachineErrorModeled::InvalidDefinition(
+                    InvalidDefinition { message: Some(why) },
+                )
+                .into());
+            }
+        }
+        if let Some(role_arn) = input.role_arn.as_deref() {
+            if let Some(why) = crate::state::invalid_role_arn_reason(role_arn) {
+                return Err(
+                    UpdateStateMachineErrorModeled::InvalidArn(InvalidArn { message: Some(why) })
+                        .into(),
+                );
+            }
+        }
+        if let Some(configuration) = input.encryption_configuration.as_ref() {
+            if let Some(why) = crate::state::invalid_encryption_reason(configuration) {
+                return Err(
+                    UpdateStateMachineErrorModeled::InvalidEncryptionConfiguration(
+                        InvalidEncryptionConfiguration { message: Some(why) },
+                    )
+                    .into(),
+                );
+            }
+        }
+        if let Some(configuration) = input.logging_configuration.as_ref() {
+            if let Some(why) = crate::state::invalid_logging_reason(configuration) {
+                return Err(UpdateStateMachineErrorModeled::InvalidLoggingConfiguration(
+                    InvalidLoggingConfiguration { message: Some(why) },
+                )
+                .into());
+            }
+        }
+
+        // `versionDescription`'s own documentation: "You can only specify the
+        // versionDescription parameter if you've set publish to true."
+        if input.version_description.is_some() && !input.publish {
+            return Err(UpdateStateMachineErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "versionDescription can only be set when publish is true".to_string(),
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let revision_id = store.fresh_revision_id();
+        let update = crate::state::StateMachineUpdate {
+            definition: input.definition,
+            role_arn: input.role_arn,
+            logging_configuration: input.logging_configuration,
+            tracing_configuration: input.tracing_configuration,
+            encryption_configuration: input.encryption_configuration,
+            revision_id: revision_id.clone(),
+            now,
+        };
+        if let Err(rejection) = store.apply_state_machine_update(&input.state_machine_arn, update) {
+            return Err(match rejection {
+                crate::state::StateMachineUpdateRejection::NotFound => {
+                    UpdateStateMachineErrorModeled::StateMachineDoesNotExist(
+                        StateMachineDoesNotExist {
+                            message: Some(format!(
+                                "State Machine Does Not Exist: '{}'",
+                                input.state_machine_arn
+                            )),
+                        },
+                    )
+                }
+                crate::state::StateMachineUpdateRejection::Deleting => {
+                    UpdateStateMachineErrorModeled::StateMachineDeleting(StateMachineDeleting {
+                        message: Some(format!(
+                            "State Machine Deleting: '{}'",
+                            input.state_machine_arn
+                        )),
+                    })
+                }
+                // The store's bound is on the WHOLE store in bytes, and a longer
+                // definition is what an update can grow it by, so an update that
+                // does not fit is refused with the operation's own quota error and
+                // the state machine is left exactly as it was.
+                crate::state::StateMachineUpdateRejection::NoRoom => {
+                    UpdateStateMachineErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "this update would take the store past the {} bytes this emulator \
+                                 retains",
+                                crate::state::MAX_STORE_BYTES
+                            )),
+                        },
+                    )
+                }
+            }
+            .into());
+        }
+
+        // "After you update your state machine, you can set the publish parameter to
+        // true in the same action to publish a new version." The version is a
+        // snapshot of the configuration the update just wrote, so it is published
+        // from the record after the write — and its bytes are admitted against the
+        // store's bound first, the way every other growth site does it.
+        let state_machine_version_arn = if input.publish {
+            if !store.has_room_for(store.version_reserve(&input.state_machine_arn)) {
+                return Err(
+                    UpdateStateMachineErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "publishing a version would take the store past the {} bytes this \
+                                 emulator retains",
+                                crate::state::MAX_STORE_BYTES
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            store
+                .publish_state_machine_version(
+                    &input.state_machine_arn,
+                    input.version_description,
+                    now,
+                )
+                .map(|version| version.arn)
+        } else {
+            None
+        };
+
+        Ok(UpdateStateMachineOutput {
+            update_date: crate::state::to_date_time(now),
+            revision_id: Some(revision_id),
+            state_machine_version_arn,
+        })
     }
 }

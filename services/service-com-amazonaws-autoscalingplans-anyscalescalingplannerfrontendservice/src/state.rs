@@ -7,10 +7,16 @@
 //! status, and the two value helpers (timestamps and pagination cursors) that more
 //! than one handler in `src/ops/` reaches.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{ApplicationSource, ScalingInstruction};
+use crate::ops::types::{
+    ApplicationSource, PredefinedScalingMetricSpecification, ScalingInstruction,
+    TargetTrackingConfiguration, LOAD_METRIC_TYPE_VALUES, METRIC_STATISTIC_VALUES,
+    PREDICTIVE_SCALING_MAX_CAPACITY_BEHAVIOR_VALUES, PREDICTIVE_SCALING_MODE_VALUES,
+    SCALABLE_DIMENSION_VALUES, SCALING_METRIC_TYPE_VALUES,
+    SCALING_POLICY_UPDATE_BEHAVIOR_VALUES, SERVICE_NAMESPACE_VALUES,
+};
 
 /// The only scaling-plan version this service models.
 ///
@@ -273,23 +279,590 @@ fn names_stack(source: &ApplicationSource) -> bool {
         .is_some_and(|arn| !arn.is_empty())
 }
 
+/// Whether `arn` is the Amazon Resource Name of a CloudFormation stack.
+///
+/// `ApplicationSource$CloudFormationStackARN` is documented as "The Amazon Resource
+/// Name (ARN) of a AWS CloudFormation stack", and an ARN is
+/// `arn:<partition>:<service>:<region>:<account>:<resource>` — so a stack ARN names the
+/// `cloudformation` service and a `stack/…` resource.
+fn is_cloud_formation_stack_arn(arn: &str) -> bool {
+    let mut fields = arn.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some("cloudformation"),
+        Some(region),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return false;
+    };
+    !partition.is_empty()
+        && !region.is_empty()
+        && !account.is_empty()
+        && resource
+            .strip_prefix("stack/")
+            .is_some_and(|name| !name.is_empty())
+}
+
 /// Validate an `ApplicationSource` a caller wrote, returning its identity key.
 ///
 /// `ApplicationSource` is documented as "A CloudFormation stack or a set of tags" —
 /// the two are ALTERNATIVES, so naming neither identifies no application and naming
-/// both is contradictory. `Err` carries the refusal message naming the members.
-pub fn validate_application_source(source: &ApplicationSource) -> Result<String, &'static str> {
+/// both is contradictory, and a stack is named by its ARN. `Err` carries the refusal
+/// message naming the member at fault.
+pub fn validate_application_source(source: &ApplicationSource) -> Result<String, String> {
+    if let Some(arn) = source
+        .cloud_formation_stack_arn
+        .as_deref()
+        .filter(|arn| !arn.is_empty())
+    {
+        if !is_cloud_formation_stack_arn(arn) {
+            return Err(format!("Invalid CloudFormation stack ARN: {arn}"));
+        }
+    }
     match (names_stack(source), names_tag_filters(source)) {
         (true, true) => Err(
-            "ApplicationSource must specify either CloudFormationStackARN or TagFilters, not both",
+            "ApplicationSource must specify either CloudFormationStackARN or TagFilters, not both"
+                .to_string(),
         ),
         (false, false) => Err(
-            "ApplicationSource must specify either CloudFormationStackARN or TagFilters",
+            "ApplicationSource must specify either CloudFormationStackARN or TagFilters"
+                .to_string(),
         ),
-        _ => application_source_key(source).ok_or(
-            "ApplicationSource must specify either CloudFormationStackARN or TagFilters",
-        ),
+        _ => application_source_key(source).ok_or_else(|| {
+            "ApplicationSource must specify either CloudFormationStackARN or TagFilters".to_string()
+        }),
     }
+}
+
+// ---------------------------------------------------------------------------
+// ScalingInstruction semantics
+//
+// The model constrains each member's TYPE, but a scaling instruction also has to hold
+// together across its members, and `CreateScalingPlan` / `UpdateScalingPlan` both
+// model `ValidationException` ("An exception was thrown for a validation issue. Review
+// the parameters provided.") for input that does not. Every constant and relation
+// below comes from the model, from its documentation, or from the refusal the service
+// itself answers with — never from the values of one particular request.
+// ---------------------------------------------------------------------------
+
+/// Documented bound on `ScalingInstruction$TargetTrackingConfigurations`: "The target
+/// tracking configurations (up to 10)."
+pub const MAX_TARGET_TRACKING_CONFIGURATIONS: usize = 10;
+
+/// The smallest `MinCapacity` a scaling instruction may ask for.
+///
+/// `ResourceCapacity` carries no `@range` in the model, but the service refuses a
+/// minimum capacity below one unit ("Minimum capacity cannot be less than 1"): a
+/// scaling instruction has to leave the resource at least one unit of capacity.
+pub const MIN_RESOURCE_CAPACITY: i32 = 1;
+
+/// Lower bound of `ScalingInstruction$PredictiveScalingMaxCapacityBuffer`: "The range
+/// is 1-100."
+pub const MAX_CAPACITY_BUFFER_MIN: i32 = 1;
+/// Upper bound of the same documented range.
+pub const MAX_CAPACITY_BUFFER_MAX: i32 = 100;
+
+/// The `PredictiveScalingMaxCapacityBehavior` value that makes
+/// `PredictiveScalingMaxCapacityBuffer` required: "Required if the
+/// PredictiveScalingMaxCapacityBehavior is set to SetMaxCapacityAboveForecastCapacity,
+/// and cannot be used otherwise."
+pub const BEHAVIOR_ABOVE_FORECAST_CAPACITY: &str = "SetMaxCapacityAboveForecastCapacity";
+
+/// The only `ScalingMetricType` a `PredefinedScalingMetricSpecification$ResourceLabel`
+/// may accompany: "You can't specify a resource label unless the metric type is
+/// ALBRequestCountPerTarget".
+pub const ALB_SCALING_METRIC_TYPE: &str = "ALBRequestCountPerTarget";
+
+/// The same rule for `PredefinedLoadMetricSpecification$ResourceLabel`: "You can't
+/// specify a resource label unless the metric type is ALBTargetGroupRequestCount".
+pub const ALB_LOAD_METRIC_TYPE: &str = "ALBTargetGroupRequestCount";
+
+/// `CustomizedLoadMetricSpecification$Statistic`: "The only valid value is Sum."
+pub const LOAD_METRIC_STATISTIC: &str = "Sum";
+
+/// The documented bound on `TargetTrackingConfiguration$TargetValue`: "Although this
+/// property accepts numbers of type Double, it won't accept values that are either too
+/// small or too large." The service states the two bounds itself, in the refusal it
+/// answers with: "For target tracking scaling, target value must be between
+/// '8.51592E-109' and '1.174271E108'".
+pub const TARGET_VALUE_MIN: f64 = 8.515_92e-109;
+/// Upper bound of that same range.
+pub const TARGET_VALUE_MAX: f64 = 1.174_271e108;
+
+/// The two bounds as the service renders them in its refusal text.
+const TARGET_VALUE_MIN_TEXT: &str = "8.51592E-109";
+const TARGET_VALUE_MAX_TEXT: &str = "1.174271E108";
+
+/// What each `ScalableDimension` scales, and what can be tracked for it.
+///
+/// Columns: the scalable dimension; where the resource id of a resource it applies to
+/// starts, taken from the worked examples in `ScalingInstruction$ResourceId`'s own
+/// documentation (`smithy_query(query="doc",shape="ScalingInstruction",member="ResourceId")`)
+/// — `autoScalingGroup/my-asg`, `service/default/sample-webapp`,
+/// `spot-fleet-request/sfr-73fbd2ce-…`, `table/my-table`,
+/// `table/my-table/index/my-table-index`, `cluster:my-db-cluster`; and the
+/// `ScalingMetricType`s that measure that resource, each named for what it measures
+/// (`ASG…` an Auto Scaling group, `ECSService…` an ECS service, `DynamoDBRead…` /
+/// `DynamoDBWrite…` the matching capacity of a table or index, `RDSReader…` an Aurora
+/// replica, `EC2SpotFleetRequest…` a Spot Fleet request), with
+/// `ALBRequestCountPerTarget` documented as applying "only to Auto Scaling groups, Spot
+/// Fleet requests, and ECS services"
+/// (`smithy_query(query="doc",shape="PredefinedScalingMetricSpecification",member="PredefinedScalingMetricType")`).
+const SCALABLE_DIMENSIONS: &[(&str, &str, &[&str])] = &[
+    (
+        "autoscaling:autoScalingGroup:DesiredCapacity",
+        "autoScalingGroup/",
+        &[
+            "ASGAverageCPUUtilization",
+            "ASGAverageNetworkIn",
+            "ASGAverageNetworkOut",
+            ALB_SCALING_METRIC_TYPE,
+        ],
+    ),
+    (
+        "ecs:service:DesiredCount",
+        "service/",
+        &[
+            "ECSServiceAverageCPUUtilization",
+            "ECSServiceAverageMemoryUtilization",
+            ALB_SCALING_METRIC_TYPE,
+        ],
+    ),
+    (
+        "ec2:spot-fleet-request:TargetCapacity",
+        "spot-fleet-request/",
+        &[
+            "EC2SpotFleetRequestAverageCPUUtilization",
+            "EC2SpotFleetRequestAverageNetworkIn",
+            "EC2SpotFleetRequestAverageNetworkOut",
+            ALB_SCALING_METRIC_TYPE,
+        ],
+    ),
+    (
+        "rds:cluster:ReadReplicaCount",
+        "cluster:",
+        &[
+            "RDSReaderAverageCPUUtilization",
+            "RDSReaderAverageDatabaseConnections",
+        ],
+    ),
+    (
+        "dynamodb:table:ReadCapacityUnits",
+        "table/",
+        &["DynamoDBReadCapacityUtilization"],
+    ),
+    (
+        "dynamodb:table:WriteCapacityUnits",
+        "table/",
+        &["DynamoDBWriteCapacityUtilization"],
+    ),
+    (
+        "dynamodb:index:ReadCapacityUnits",
+        "table/",
+        &["DynamoDBReadCapacityUtilization"],
+    ),
+    (
+        "dynamodb:index:WriteCapacityUnits",
+        "table/",
+        &["DynamoDBWriteCapacityUtilization"],
+    ),
+];
+
+/// The row of [`SCALABLE_DIMENSIONS`] for `dimension`, if the model lists it.
+fn scalable_dimension(dimension: &str) -> Option<(&'static str, &'static [&'static str])> {
+    SCALABLE_DIMENSIONS
+        .iter()
+        .find(|(name, _, _)| *name == dimension)
+        .map(|(_, prefix, metrics)| (*prefix, *metrics))
+}
+
+/// How the service refuses a `(ServiceNamespace, ResourceId, ScalableDimension)` triple
+/// that does not describe one scalable resource: "Unsupported service namespace,
+/// resource type or scalable dimension".
+const UNSUPPORTED_RESOURCE: &str =
+    "Unsupported service namespace, resource type or scalable dimension";
+
+/// The segment a DynamoDB global secondary index's resource id carries, from the same
+/// doc: "the resource type is `index` and the unique identifier is the resource ID.
+/// Example: `table/my-table/index/my-table-index`".
+const INDEX_SEGMENT: &str = "/index/";
+
+/// Validate the `ScalingInstructions` a caller wrote.
+///
+/// `CreateScalingPlan` and `UpdateScalingPlan` both take this list and both model
+/// `ValidationException`, so both refuse the same input the same way, before touching
+/// state. `Err` carries the message naming the offending member and the constraint it
+/// broke.
+pub fn validate_scaling_instructions(instructions: &[ScalingInstruction]) -> Result<(), String> {
+    if instructions.is_empty() {
+        return Err(
+            "ScalingInstructions must specify at least one scaling instruction".to_string(),
+        );
+    }
+    // "Each scaling instruction applies to one resource" (`ScalingInstruction` doc), so
+    // two instructions for one scalable resource contradict each other.
+    let mut covered: BTreeSet<(&str, &str, &str)> = BTreeSet::new();
+    for (index, instruction) in instructions.iter().enumerate() {
+        validate_scaling_instruction(index, instruction)?;
+        let resource = (
+            instruction.service_namespace.as_str(),
+            instruction.resource_id.as_str(),
+            instruction.scalable_dimension.as_str(),
+        );
+        if !covered.insert(resource) {
+            return Err(format!(
+                "ScalingInstructions[{index}]: a scaling plan can specify only one scaling \
+                 instruction per scalable resource, and '{}' ({}) is already covered",
+                instruction.resource_id, instruction.scalable_dimension
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every relation one `ScalingInstruction` has to satisfy on its own.
+fn validate_scaling_instruction(
+    index: usize,
+    instruction: &ScalingInstruction,
+) -> Result<(), String> {
+    let at = |member: &str| format!("ScalingInstructions[{index}].{member}");
+
+    one_of(
+        &at("ServiceNamespace"),
+        &instruction.service_namespace,
+        SERVICE_NAMESPACE_VALUES,
+    )?;
+    one_of(
+        &at("ScalableDimension"),
+        &instruction.scalable_dimension,
+        SCALABLE_DIMENSION_VALUES,
+    )?;
+    // Every `ScalableDimension` value is prefixed with the namespace of the service
+    // that owns it, so a dimension from another service names no scalable resource.
+    let dimension_namespace = instruction
+        .scalable_dimension
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    if dimension_namespace != instruction.service_namespace {
+        return Err(UNSUPPORTED_RESOURCE.to_string());
+    }
+    validate_resource_id(&instruction.resource_id, &instruction.scalable_dimension)?;
+
+    // "The minimum capacity of the resource" / "The maximum capacity of the resource":
+    // a capacity is a count of units, and the maximum bounds the minimum. The refusals
+    // name the members in prose, the way the service words them.
+    if instruction.min_capacity < MIN_RESOURCE_CAPACITY {
+        return Err(format!(
+            "Minimum capacity cannot be less than {MIN_RESOURCE_CAPACITY}"
+        ));
+    }
+    if instruction.max_capacity < instruction.min_capacity {
+        return Err("Maximum capacity cannot be less than minimum capacity".to_string());
+    }
+
+    // "The amount of time, in seconds, to buffer the run time of scheduled scaling
+    // actions": the model already bounds this at 0, which is checked again here so the
+    // same refusal holds however the value reaches the handler.
+    if instruction
+        .scheduled_action_buffer_time
+        .is_some_and(|seconds| seconds < 0)
+    {
+        return Err(format!(
+            "{}: a time in seconds cannot be negative",
+            at("ScheduledActionBufferTime")
+        ));
+    }
+    if let Some(behavior) = instruction.scaling_policy_update_behavior.as_deref() {
+        one_of(
+            &at("ScalingPolicyUpdateBehavior"),
+            behavior,
+            SCALING_POLICY_UPDATE_BEHAVIOR_VALUES,
+        )?;
+    }
+
+    validate_target_tracking_configurations(index, instruction)?;
+    validate_predictive_scaling(index, instruction)
+}
+
+/// A resource id has to identify a resource of the kind its scalable dimension scales.
+fn validate_resource_id(resource_id: &str, dimension: &str) -> Result<(), String> {
+    // A dimension the model does not list is refused by its own enum check, not here.
+    let Some((prefix, _)) = scalable_dimension(dimension) else {
+        return Ok(());
+    };
+    let resource_type = dimension.split(':').nth(1).unwrap_or_default();
+    let identifies = resource_id.starts_with(prefix)
+        && match resource_type {
+            // A global secondary index is addressed through its table, a table is not.
+            "index" => resource_id.contains(INDEX_SEGMENT),
+            "table" => !resource_id.contains(INDEX_SEGMENT),
+            _ => true,
+        };
+    if !identifies {
+        return Err(UNSUPPORTED_RESOURCE.to_string());
+    }
+    Ok(())
+}
+
+/// The target tracking configurations of one instruction: "(up to 10). Each of these
+/// structures must specify a unique scaling metric and a target value for the metric."
+fn validate_target_tracking_configurations(
+    index: usize,
+    instruction: &ScalingInstruction,
+) -> Result<(), String> {
+    let member = format!("ScalingInstructions[{index}].TargetTrackingConfigurations");
+    let configurations = &instruction.target_tracking_configurations;
+    if configurations.is_empty() {
+        return Err(format!(
+            "{member}: at least one target tracking configuration is required"
+        ));
+    }
+    if configurations.len() > MAX_TARGET_TRACKING_CONFIGURATIONS {
+        return Err(format!(
+            "{member}: Value of length {} failed to satisfy constraint: Member must have \
+             length less than or equal to {MAX_TARGET_TRACKING_CONFIGURATIONS}",
+            configurations.len()
+        ));
+    }
+    let mut metrics: BTreeSet<String> = BTreeSet::new();
+    for (position, configuration) in configurations.iter().enumerate() {
+        let at = format!("{member}[{position}]");
+        let metric = validate_target_tracking_configuration(
+            &at,
+            &instruction.scalable_dimension,
+            configuration,
+        )?;
+        if !metrics.insert(metric.clone()) {
+            return Err(format!(
+                "{at}: each target tracking configuration must specify a unique scaling \
+                 metric, and '{metric}' is already specified"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One target tracking configuration, answering the identity of the metric it tracks so
+/// the caller can enforce uniqueness across the instruction.
+fn validate_target_tracking_configuration(
+    at: &str,
+    dimension: &str,
+    configuration: &TargetTrackingConfiguration,
+) -> Result<String, String> {
+    let target_value = configuration.target_value;
+    if !(TARGET_VALUE_MIN..=TARGET_VALUE_MAX).contains(&target_value) {
+        return Err(format!(
+            "For target tracking scaling, target value must be between \
+             '{TARGET_VALUE_MIN_TEXT}' and '{TARGET_VALUE_MAX_TEXT}', but was \
+             '{target_value:?}'."
+        ));
+    }
+    // "The amount of time, in seconds, …" — none of the three is a negative span.
+    for (name, seconds) in [
+        ("ScaleOutCooldown", configuration.scale_out_cooldown),
+        ("ScaleInCooldown", configuration.scale_in_cooldown),
+        (
+            "EstimatedInstanceWarmup",
+            configuration.estimated_instance_warmup,
+        ),
+    ] {
+        if seconds.is_some_and(|value| value < 0) {
+            return Err(format!("{at}.{name}: a time in seconds cannot be negative"));
+        }
+    }
+
+    // "You can specify either a predefined metric or a customized metric": one of the
+    // two, never neither and never both.
+    match (
+        &configuration.predefined_scaling_metric_specification,
+        &configuration.customized_scaling_metric_specification,
+    ) {
+        (Some(_), Some(_)) => Err(format!(
+            "{at}: specify either PredefinedScalingMetricSpecification or \
+             CustomizedScalingMetricSpecification, not both"
+        )),
+        (None, None) => Err(format!(
+            "{at}: specify either PredefinedScalingMetricSpecification or \
+             CustomizedScalingMetricSpecification"
+        )),
+        (Some(predefined), None) => validate_predefined_scaling_metric(at, dimension, predefined),
+        (None, Some(customized)) => {
+            one_of(
+                &format!("{at}.CustomizedScalingMetricSpecification.Statistic"),
+                &customized.statistic,
+                METRIC_STATISTIC_VALUES,
+            )?;
+            let mut dimensions: Vec<String> = customized
+                .dimensions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|dimension| format!("{}={}", dimension.name, dimension.value))
+                .collect();
+            dimensions.sort();
+            Ok(format!(
+                "{}/{}/{}[{}]",
+                customized.namespace,
+                customized.metric_name,
+                customized.statistic,
+                dimensions.join(",")
+            ))
+        }
+    }
+}
+
+/// A predefined scaling metric: a modelled metric type that measures the resource the
+/// instruction scales, and a resource label only where one is allowed.
+fn validate_predefined_scaling_metric(
+    at: &str,
+    dimension: &str,
+    specification: &PredefinedScalingMetricSpecification,
+) -> Result<String, String> {
+    let member = format!("{at}.PredefinedScalingMetricSpecification");
+    let metric = specification.predefined_scaling_metric_type.as_str();
+    one_of(
+        &format!("{member}.PredefinedScalingMetricType"),
+        metric,
+        SCALING_METRIC_TYPE_VALUES,
+    )?;
+    // A predefined metric measures one kind of resource, so only the metrics of the
+    // resource this instruction scales can be tracked for it.
+    if let Some((_, supported)) = scalable_dimension(dimension) {
+        if !supported.contains(&metric) {
+            return Err(format!(
+                "Scalable dimension {dimension} only supports the following predefined \
+                 metric types: {}",
+                supported.join(", ")
+            ));
+        }
+    }
+    if specification.resource_label.is_some() && metric != ALB_SCALING_METRIC_TYPE {
+        return Err(format!(
+            "{member}.ResourceLabel: a resource label can only be specified when the metric \
+             type is {ALB_SCALING_METRIC_TYPE}"
+        ));
+    }
+    Ok(metric.to_string())
+}
+
+/// The predictive-scaling members of one instruction, each of which is documented as
+/// valid only when a load metric specification configures predictive scaling.
+fn validate_predictive_scaling(
+    index: usize,
+    instruction: &ScalingInstruction,
+) -> Result<(), String> {
+    let at = |member: &str| format!("ScalingInstructions[{index}].{member}");
+    let predefined = instruction.predefined_load_metric_specification.as_ref();
+    let customized = instruction.customized_load_metric_specification.as_ref();
+
+    // "This parameter or a CustomizedLoadMetricSpecification is required when
+    // configuring predictive scaling, and cannot be used otherwise."
+    if predefined.is_some() && customized.is_some() {
+        return Err(format!(
+            "{}: specify either PredefinedLoadMetricSpecification or \
+             CustomizedLoadMetricSpecification, not both",
+            at("PredefinedLoadMetricSpecification")
+        ));
+    }
+    if let Some(specification) = predefined {
+        let member = at("PredefinedLoadMetricSpecification");
+        one_of(
+            &format!("{member}.PredefinedLoadMetricType"),
+            &specification.predefined_load_metric_type,
+            LOAD_METRIC_TYPE_VALUES,
+        )?;
+        if specification.resource_label.is_some()
+            && specification.predefined_load_metric_type != ALB_LOAD_METRIC_TYPE
+        {
+            return Err(format!(
+                "{member}.ResourceLabel: a resource label can only be specified when the \
+                 metric type is {ALB_LOAD_METRIC_TYPE}"
+            ));
+        }
+    }
+    if let Some(specification) = customized {
+        // "The statistic of the metric. The only valid value is Sum."
+        if specification.statistic != LOAD_METRIC_STATISTIC {
+            return Err(format!(
+                "{}.Statistic: the only valid value is {LOAD_METRIC_STATISTIC}",
+                at("CustomizedLoadMetricSpecification")
+            ));
+        }
+    }
+
+    let predictive = predefined.is_some() || customized.is_some();
+    if let Some(mode) = instruction.predictive_scaling_mode.as_deref() {
+        one_of(&at("PredictiveScalingMode"), mode, PREDICTIVE_SCALING_MODE_VALUES)?;
+    }
+    let behavior = instruction
+        .predictive_scaling_max_capacity_behavior
+        .as_deref();
+    if let Some(behavior) = behavior {
+        one_of(
+            &at("PredictiveScalingMaxCapacityBehavior"),
+            behavior,
+            PREDICTIVE_SCALING_MAX_CAPACITY_BEHAVIOR_VALUES,
+        )?;
+        // "Only valid when configuring predictive scaling."
+        if !predictive {
+            return Err(format!(
+                "{}: only valid when configuring predictive scaling, which requires a load \
+                 metric specification",
+                at("PredictiveScalingMaxCapacityBehavior")
+            ));
+        }
+    }
+
+    // "Required if the PredictiveScalingMaxCapacityBehavior is set to
+    // SetMaxCapacityAboveForecastCapacity, and cannot be used otherwise. The range is
+    // 1-100."
+    let above_forecast = behavior == Some(BEHAVIOR_ABOVE_FORECAST_CAPACITY);
+    match instruction.predictive_scaling_max_capacity_buffer {
+        Some(_) if !above_forecast => Err(format!(
+            "{}: can only be specified when PredictiveScalingMaxCapacityBehavior is \
+             {BEHAVIOR_ABOVE_FORECAST_CAPACITY}",
+            at("PredictiveScalingMaxCapacityBuffer")
+        )),
+        Some(buffer)
+            if !(MAX_CAPACITY_BUFFER_MIN..=MAX_CAPACITY_BUFFER_MAX).contains(&buffer) =>
+        {
+            Err(format!(
+                "{}: Value '{buffer}' failed to satisfy constraint: Member must be between \
+                 {MAX_CAPACITY_BUFFER_MIN} and {MAX_CAPACITY_BUFFER_MAX}",
+                at("PredictiveScalingMaxCapacityBuffer")
+            ))
+        }
+        None if above_forecast => Err(format!(
+            "{}: required when PredictiveScalingMaxCapacityBehavior is \
+             {BEHAVIOR_ABOVE_FORECAST_CAPACITY}",
+            at("PredictiveScalingMaxCapacityBuffer")
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a value the model's own enum does not list, naming the member and the values
+/// it accepts.
+fn one_of(member: &str, value: &str, allowed: &[&str]) -> Result<(), String> {
+    if allowed.contains(&value) {
+        return Ok(());
+    }
+    Err(format!(
+        "{member}: Value '{value}' failed to satisfy constraint: Member must satisfy enum \
+         value set: [{}]",
+        allowed.join(", ")
+    ))
 }
 
 /// AWS's wording for "the name and version in this request name no stored plan",

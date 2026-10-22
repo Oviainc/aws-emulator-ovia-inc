@@ -164,10 +164,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A pure read of the registry: the record is cloned out and reported, and a
         // name the registry does not hold is a 404, never a hollow 200.
+        //
+        // The refusal's message follows the service's request-derived form, which
+        // names the ACCOUNT and the thing the request asked for:
+        // `Thing <account-id>:<thingName> not found.`
         let store = state.lock();
         let thing = store.things.get(&input.thing_name).ok_or_else(|| {
             DescribeThingErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("Thing {} does not exist", input.thing_name)),
+                message: Some(format!(
+                    "Thing {}:{} not found.",
+                    ::engine::emulator_account_id(),
+                    input.thing_name
+                )),
             })
         })?;
 

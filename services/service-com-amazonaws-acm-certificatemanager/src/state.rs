@@ -491,6 +491,35 @@ pub fn validation_target(domain_name: &str) -> &str {
     domain_name.strip_prefix("*.").unwrap_or(domain_name)
 }
 
+/// Whether two domain names name the same domain. DNS labels are case-insensitive,
+/// so `Example.COM` and `example.com` are one name.
+pub fn same_domain(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+/// Whether `validation_domain` may validate `domain_name`: the superdomain rule ACM
+/// states for every `ValidationDomain` member it models
+/// (`DomainValidationOption$ValidationDomain`: "This must be the same as the
+/// `DomainName` value or a superdomain of the `DomainName` value";
+/// `ResendValidationEmailRequest$ValidationDomain` says the same of `Domain`).
+///
+/// A superdomain is a DOT-BOUNDARY suffix: `example.com` validates
+/// `testing.example.com`, while `ample.com` and `other.example.com` do not. The
+/// comparison is case-insensitive (see [`same_domain`]), and a wildcard name is
+/// validated through the domain it covers, which is the name ACM proves control of
+/// ([`validation_target`]).
+pub fn is_validation_domain_for(validation_domain: &str, domain_name: &str) -> bool {
+    if same_domain(validation_domain, domain_name) {
+        return true;
+    }
+    let candidate = validation_domain.to_ascii_lowercase();
+    let target = validation_target(domain_name).to_ascii_lowercase();
+    candidate == target
+        || target
+            .strip_suffix(&candidate)
+            .is_some_and(|higher_labels| higher_labels.ends_with('.'))
+}
+
 /// The request's tags as the key -> value map the certificate record stores, or the
 /// message explaining why a tag was refused.
 ///

@@ -8,8 +8,9 @@
 //! * a lookup by `ScalingPlanName` + `ScalingPlanVersion` that finds no stored plan is
 //!   refused with the request-derived sentence
 //!   `No scaling plan found for scaling plan name: <name>, version: <version>`, on every
-//!   operation that performs such a lookup, whatever error shape that operation models
-//!   the refusal in;
+//!   operation that MODELS such a refusal — `DescribeScalingPlanResources` models none
+//!   and answers a miss with an empty page instead, which the same rows check here and
+//!   `crate::scaling_instruction_validation` covers in full;
 //! * a `DescribeScalingPlans` request that combines `ApplicationSources` with the
 //!   name-based selector (`ScalingPlanNames` and/or `ScalingPlanVersion`) is refused
 //!   with the fixed sentence
@@ -24,18 +25,18 @@ use crate::scaling_plan_lifecycle::{
     error_code, error_message, simple_instructions, stack_source, Emulator,
 };
 
-/// The operations that look a plan up by `ScalingPlanName` + `ScalingPlanVersion`, with
-/// the error shape each models that refusal in.
+/// The operations that REFUSE a lookup by `ScalingPlanName` + `ScalingPlanVersion` that
+/// finds no plan, with the error shape each models that refusal in.
 ///
 /// Source: `smithy_query(query="operation",
 /// operation="DeleteScalingPlan,UpdateScalingPlan,DescribeScalingPlanResources")` — the
-/// two write paths bind `ObjectNotFoundException` (client, httpError 400);
-/// `DescribeScalingPlanResources` binds no not-found error, so it refuses through its
-/// `ValidationException` (client, httpError 400) with the same sentence.
-const LOOKUP_OPERATIONS: [(&str, &str); 3] = [
+/// two write paths bind `ObjectNotFoundException` (client, httpError 400).
+/// `DescribeScalingPlanResources` binds no not-found error at all and its
+/// `ScalingPlanResources` output member is not required, so a miss there is a 200
+/// carrying an empty list, not a refusal: it is checked that way below.
+const LOOKUP_OPERATIONS: [(&str, &str); 2] = [
     ("DeleteScalingPlan", "ObjectNotFoundException"),
     ("UpdateScalingPlan", "ObjectNotFoundException"),
-    ("DescribeScalingPlanResources", "ValidationException"),
 ];
 
 /// AWS's fixed text for the application-source / name-selector conflict.
@@ -101,8 +102,8 @@ async fn a_lookup_that_finds_no_plan_names_the_requested_name_and_version() {
     ];
 
     for (label, name, version) in cases {
+        let request = json!({ "ScalingPlanName": name, "ScalingPlanVersion": version });
         for (operation, expected_shape) in LOOKUP_OPERATIONS {
-            let request = json!({ "ScalingPlanName": name, "ScalingPlanVersion": version });
             let (status, body) = emulator.call(operation, &request).await;
             assert_eq!(
                 status, 400,
@@ -121,6 +122,18 @@ async fn a_lookup_that_finds_no_plan_names_the_requested_name_and_version() {
                 expected_not_found(&name, version)
             );
         }
+
+        // The same miss on the operation that models no not-found error: an empty page,
+        // which is what AWS answers there.
+        let (status, body) = emulator
+            .call("DescribeScalingPlanResources", &request)
+            .await;
+        assert_eq!(
+            (status, body.get("ScalingPlanResources")),
+            (200, Some(&json!([]))),
+            "case DescribeScalingPlanResources/{label}: expected HTTP 200 with an empty \
+             ScalingPlanResources list, got {status} with {body}"
+        );
     }
 
     // The control: the plan that IS stored, at the version it has, is not refused — the

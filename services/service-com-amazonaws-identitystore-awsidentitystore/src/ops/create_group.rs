@@ -212,17 +212,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `DisplayName` is a uniqueness claim within the identity store, so a second
         // create naming one that is taken conflicts rather than storing a duplicate.
         // The member is optional in the model, so a request without one claims nothing.
-        // The name itself is `@sensitive` and so stays out of the message.
-        if let Some(taken_by) = input
+        // The conflict names the CLAIM that was violated and nothing else: neither the
+        // `@sensitive` name nor the id of the group that already holds it.
+        if input
             .display_name
             .as_deref()
-            .and_then(|display_name| store.group_display_name_index.get(display_name))
+            .is_some_and(|display_name| store.group_display_name_index.contains_key(display_name))
         {
             return Err(CreateGroupErrorModeled::ConflictException(
-                crate::state::uniqueness_conflict(format!(
-                    "a group with this DisplayName already exists in identity store {} (GroupId {taken_by})",
-                    store.identity_store_id
-                )),
+                crate::state::uniqueness_conflict(
+                    crate::state::UniquenessClaim::GroupDisplayName,
+                ),
             )
             .into());
         }

@@ -2,8 +2,9 @@
 
 //! @op DescribeStateMachine
 //! IMPLEMENTED: a REPORTING operation. It answers from the state machine record
-//! `CreateStateMachine` stored — never from this request and never from a canned
-//! value — and the only write it makes is materialising a deletion the clock has
+//! `CreateStateMachine` stored — or, for a version-qualified ARN, from the version
+//! record a publish stored — never from this request and never from a canned
+//! value, and the only write it makes is materialising a deletion the clock has
 //! already made due.
 //!
 //! A request this operation cannot serve is refused with one of the operation's own
@@ -216,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        if crate::state::parse_state_machine_arn(&input.state_machine_arn).is_none() {
+        let Some(parsed) = crate::state::parse_state_machine_arn(&input.state_machine_arn) else {
             return Err(DescribeStateMachineErrorModeled::InvalidArn(InvalidArn {
                 message: Some(format!(
                     "'{}' is not a state machine ARN of this service",
@@ -224,23 +225,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
             .into());
-        }
+        };
 
         let mut store = state.lock();
         // Materialising a deletion the clock already owes is the one write a report
         // may make: it was due at the same instant whether or not anybody called.
         store.settle(crate::state::now());
 
+        let not_found = || {
+            DescribeStateMachineErrorModeled::StateMachineDoesNotExist(StateMachineDoesNotExist {
+                message: Some(format!(
+                    "state machine {} does not exist",
+                    input.state_machine_arn
+                )),
+            })
+        };
+
+        // "This API action returns the details for a state machine version" when the
+        // ARN is qualified with a version: a version is its own stored record, so it
+        // is reported from that record and not from the state machine, whose
+        // configuration may have moved on since the version was published. A
+        // qualifier that is not a version names an ALIAS, which this emulator does
+        // not store yet, so no record answers for it.
+        if let Some(qualifier) = parsed.qualifier.as_deref() {
+            if crate::state::qualifier_version(qualifier).is_none() {
+                return Err(not_found().into());
+            }
+            let Some(version) = store.state_machine_versions.get(&input.state_machine_arn) else {
+                return Err(not_found().into());
+            };
+            return Ok(DescribeStateMachineOutput {
+                state_machine_arn: version.arn.clone(),
+                name: version.name.clone(),
+                // A published version is usable from the moment it exists, and
+                // `StateMachineStatus` is ACTIVE | DELETING.
+                status: Some(crate::state::STATE_MACHINE_STATUS_ACTIVE.to_string()),
+                definition: version.definition.clone(),
+                role_arn: version.role_arn.clone(),
+                r#type: version.sm_type.clone(),
+                creation_date: crate::state::to_date_time(version.creation_date),
+                logging_configuration: version.logging_configuration.clone(),
+                tracing_configuration: version.tracing_configuration.clone(),
+                label: None,
+                revision_id: version.revision_id.clone(),
+                description: version.description.clone(),
+                encryption_configuration: version.encryption_configuration.clone(),
+                variable_references: None,
+            });
+        }
+
         let Some(machine) = store.state_machines.get(&input.state_machine_arn) else {
-            return Err(DescribeStateMachineErrorModeled::StateMachineDoesNotExist(
-                StateMachineDoesNotExist {
-                    message: Some(format!(
-                        "state machine {} does not exist",
-                        input.state_machine_arn
-                    )),
-                },
-            )
-            .into());
+            return Err(not_found().into());
         };
 
         // `includedData` only changes what a KMS-ENCRYPTED definition reports ("you

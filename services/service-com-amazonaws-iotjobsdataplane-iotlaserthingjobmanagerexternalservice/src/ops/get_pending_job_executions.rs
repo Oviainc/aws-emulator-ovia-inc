@@ -160,9 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation reports the thing's pending jobs, and "none" is an answer.
         let summaries = |status: &str| -> Vec<JobExecutionSummary> {
             state
-                .pending_with_status(&input.thing_name, status)
+                .with_status(&input.thing_name, status)
                 .into_iter()
-                .map(crate::state::JobExecutionRecord::to_summary)
+                .map(crate::state::to_summary)
                 .collect()
         };
 

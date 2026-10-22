@@ -250,8 +250,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .status
                 .unwrap_or_else(|| crate::state::QUEUE_STATUS_ACTIVE.to_string()),
             queue_type: crate::state::QUEUE_TYPE_CUSTOM.to_string(),
-            concurrent_jobs: input.concurrent_jobs,
-            maximum_concurrent_feeds: input.maximum_concurrent_feeds,
+            // Both concurrency members are service-applied when the request omits them,
+            // so the stored queue carries a value for each and every reader of the queue
+            // reports it. "For reserved queues, specify the number of jobs you can
+            // process concurrently in your reservation plan instead" — so a reserved
+            // queue's concurrency is the slot count it reserved, and an on-demand one's
+            // is the account default.
+            concurrent_jobs: input.concurrent_jobs.unwrap_or_else(|| {
+                input
+                    .reservation_plan_settings
+                    .as_ref()
+                    .map_or(crate::state::DEFAULT_CONCURRENT_JOBS, |settings| {
+                        settings.reserved_slots
+                    })
+            }),
+            maximum_concurrent_feeds: input
+                .maximum_concurrent_feeds
+                .unwrap_or(crate::state::DEFAULT_MAXIMUM_CONCURRENT_FEEDS),
             reservation_plan: input
                 .reservation_plan_settings
                 .as_ref()

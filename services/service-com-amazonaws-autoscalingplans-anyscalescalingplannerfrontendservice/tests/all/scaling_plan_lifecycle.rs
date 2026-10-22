@@ -168,7 +168,7 @@ impl Emulator {
 /// (`smithy_query(query="shape",shape="ServiceNamespace,ScalableDimension,ScalingMetricType")`,
 /// mirrored in `src/ops/types/shared_types.rs` as `SERVICE_NAMESPACE_VALUES`,
 /// `SCALABLE_DIMENSION_VALUES` and `SCALING_METRIC_TYPE_VALUES`).
-fn instruction(
+pub(crate) fn instruction(
     namespace: &str,
     resource_id: &str,
     dimension: &str,
@@ -739,7 +739,7 @@ async fn an_update_replaces_only_what_the_request_carries() {
 }
 
 #[tokio::test]
-async fn an_unknown_plan_or_version_is_never_an_empty_success() {
+async fn an_unknown_plan_or_version_answers_each_operations_own_envelope() {
     let emulator = Emulator::new();
     emulator
         .ok(
@@ -753,22 +753,24 @@ async fn an_unknown_plan_or_version_is_never_an_empty_success() {
         .await;
     emulator.make_all_due();
 
-    // `DescribeScalingPlanResources` models no not-found error, so an unknown plan —
-    // or a version this service does not have — is a validation failure, never a 200.
+    // `DescribeScalingPlanResources` models no not-found error and its
+    // `ScalingPlanResources` output member is not required, so a miss on
+    // (name, version) is an empty page — see
+    // `tests/all/scaling_instruction_validation.rs` for the full table.
     for (label, name, version) in [
         ("unknown name", "missing", 1),
         ("known name, unmodelled version", "known", 2),
     ] {
-        let (status, code) = emulator
-            .err(
+        let described = emulator
+            .ok(
                 "DescribeScalingPlanResources",
                 json!({ "ScalingPlanName": name, "ScalingPlanVersion": version }),
             )
             .await;
         assert_eq!(
-            (status, code.as_str()),
-            (400, "ValidationException"),
-            "case {label}: expected a 400 ValidationException"
+            described.get("ScalingPlanResources"),
+            Some(&json!([])),
+            "case {label}: expected an empty ScalingPlanResources page, got {described}"
         );
     }
 
@@ -1114,6 +1116,10 @@ async fn describe_scaling_plans_honours_its_documented_filter_rules() {
             json!({ "ScalingPlanNames": ["by-stack"], "ApplicationSources": [stack] }),
         ),
         ("version without a name", json!({ "ScalingPlanVersion": 1 })),
+        (
+            "sources together with a version",
+            json!({ "ApplicationSources": [tagged.clone()], "ScalingPlanVersion": 1 }),
+        ),
         ("more than ten names", json!({ "ScalingPlanNames": eleven })),
         // An ApplicationSources entry that identifies no application must be refused,
         // never dropped: dropping it would widen the filter to "every plan" and

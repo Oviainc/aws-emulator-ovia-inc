@@ -23,7 +23,9 @@
 
 use serde_json::{json, Value};
 
-use super::network_and_node_lifecycle::{available_network, call, create_node, new_router, Answer};
+use super::network_and_node_lifecycle::{
+    available_network, call, create_node, member_configuration, new_router, Answer,
+};
 
 /// A resource id of the shape this service mints, for a resource nothing holds: the
 /// prefix, a hyphen and 26 base-32 characters, within `ResourceIdString`'s
@@ -255,6 +257,29 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
             resource_type: "Accessor",
             id: gone_accessor.clone(),
         },
+        // A LISTING that models the exception answers it the same way: the scope it
+        // could not resolve is named in `Message`, with no `ResourceName`.
+        NotFoundCase {
+            case: "ListProposals/unknown-network",
+            method: "GET",
+            path: format!("/networks/{gone_network}/proposals"),
+            resource_type: "Network",
+            id: gone_network.clone(),
+        },
+        NotFoundCase {
+            case: "ListProposals/another-unknown-network",
+            method: "GET",
+            path: format!("/networks/{other_gone_network}/proposals?maxResults=5"),
+            resource_type: "Network",
+            id: other_gone_network.clone(),
+        },
+        NotFoundCase {
+            case: "ListMembers/unknown-network",
+            method: "GET",
+            path: format!("/networks/{gone_network}/members"),
+            resource_type: "Network",
+            id: gone_network.clone(),
+        },
     ];
 
     for row in cases {
@@ -314,6 +339,48 @@ async fn a_lookup_that_finds_nothing_names_the_resource_it_was_asked_for() {
     )
     .await;
     assert_not_found("CreateNode/unknown-member", &answer, "Member", &gone_member);
+
+    // `CreateMember` resolves TWO things the request names by id — the network it joins
+    // and the invitation that authorises the join — and each one it cannot find names
+    // itself, never the other. The invitation rows matter most: the network in the
+    // request path exists, so a `ResourceName` defaulted to the path resource would tell
+    // a client a healthy network is the missing resource.
+    for (case, network, invitation, resource_type, id) in [
+        (
+            "CreateMember/unknown-invitation",
+            network_id.clone(),
+            gone_invitation.clone(),
+            "Invitation",
+            gone_invitation.clone(),
+        ),
+        (
+            "CreateMember/another-unknown-invitation",
+            network_id.clone(),
+            unknown_id("i", 'H'),
+            "Invitation",
+            unknown_id("i", 'H'),
+        ),
+        (
+            "CreateMember/unknown-network",
+            gone_network.clone(),
+            gone_invitation.clone(),
+            "Network",
+            gone_network.clone(),
+        ),
+    ] {
+        let answer = call(
+            &router,
+            "POST",
+            &format!("/networks/{network}/members"),
+            Some(json!({
+                "ClientRequestToken": format!("errors-{case}"),
+                "InvitationId": invitation,
+                "MemberConfiguration": member_configuration("errors-org"),
+            })),
+        )
+        .await;
+        assert_not_found(case, &answer, resource_type, &id);
+    }
 }
 
 /// A request outside a constraint the model declares is refused with the modelled

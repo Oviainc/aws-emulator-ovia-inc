@@ -15,6 +15,8 @@
 mod delete_group;
 #[path = "all/delete_user.rs"]
 mod delete_user;
+#[path = "all/error_message_rules.rs"]
+mod error_message_rules;
 #[path = "all/get_group_id.rs"]
 mod get_group_id;
 #[path = "all/get_user_id.rs"]

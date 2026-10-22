@@ -224,6 +224,19 @@ async fn describe_standards_reports_the_published_catalog_for_the_request_region
             "region {region:?}: one page holds the whole catalog, so NextToken must be absent, got {body}"
         );
 
+        // The catalog is reported in `Name` order, so a page boundary falls in the
+        // same place on every call.
+        let names: Vec<String> = standards
+            .iter()
+            .map(|standard| standard["Name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "region {region:?}: expected the catalog in Name order, got {names:?}"
+        );
+
         for (definition, returned) in STANDARDS_CATALOG.iter().zip(standards.iter()) {
             let case = definition.name;
             let expected_arn = standard_arn(region, definition);
@@ -454,6 +467,27 @@ async fn out_of_range_and_unissued_inputs_are_refused() {
         .expect("a catalog larger than one page must carry a NextToken")
         .to_string();
 
+    // A token issued against the whole catalog whose offset is past the end of the
+    // narrowest provider selection, so replaying it there points past that selection.
+    let narrowest = STANDARDS_PROVIDER_VALUES
+        .iter()
+        .map(|provider| catalog_arns_for_providers(region, &[provider]).len())
+        .min()
+        .expect("StandardsProvider defines at least one value");
+    let beyond_page = STANDARDS_CATALOG.len() - 1;
+    assert!(
+        beyond_page > narrowest,
+        "the test needs a catalog offset past the narrowest provider selection ({narrowest})"
+    );
+    let (status, body) = harness
+        .describe_standards(&format!("MaxResults={beyond_page}"))
+        .await;
+    assert_eq!(status, 200, "wide first page: got {status} with {body}");
+    let issued_beyond = body["NextToken"]
+        .as_str()
+        .expect("a page shorter than the catalog must carry a NextToken")
+        .to_string();
+
     // (case, query, expected status, expected error code)
     let cases: Vec<(&str, String, u16, &str)> = vec![
         ("MaxResults at the lower bound", "MaxResults=1".into(), 200, ""),
@@ -485,9 +519,9 @@ async fn out_of_range_and_unissued_inputs_are_refused() {
         ),
         (
             "NextToken past the end of the selection",
-            // Issued against the whole catalog, replayed against a selection that
-            // holds nothing, so its offset is past the end.
-            format!("Providers=Azure&NextToken={issued}"),
+            // Issued against the whole catalog, replayed against the narrowest
+            // provider selection, so its offset is past that selection's end.
+            format!("Providers=Azure&NextToken={issued_beyond}"),
             400,
             "InvalidInputException",
         ),
@@ -521,41 +555,126 @@ async fn out_of_range_and_unissued_inputs_are_refused() {
     }
 }
 
-/// RULE: an account with no Security Hub CSPM subscription is not permitted to call
-/// the service, which is `InvalidAccessException` (401) — before it ever enabled,
-/// and again once the subscription is removed. A subscription is per Region, so a
-/// Region that was never enabled is refused while the enabled one still answers.
+/// RULE: the standards catalog is the service's own published metadata, not this
+/// account's data, so `DescribeStandards` answers 200 with the same catalog whatever
+/// the caller has enabled — including a first-contact call with no hub anywhere in
+/// state, which is how a client discovers the `StandardsArn` values it would pass to
+/// `BatchEnableStandards`.
+///
+/// The table spans every subscription state a hub can be in at the moment of the
+/// read — never enabled, enabled, enabled in another Region only, re-read after the
+/// subscription was removed — and asserts the response is byte-for-byte the same in
+/// all of them, including the filtered and paged forms (so no projection below the
+/// gate was reached only by a subscribed caller).
 #[tokio::test]
-async fn an_unsubscribed_account_cannot_describe_standards() {
-    let harness = Harness::new("us-east-1");
-    let (status, body) = harness.describe_standards("").await;
-    assert_eq!(
-        status, 401,
-        "before enable: expected 401, got {status} with {body}"
-    );
+async fn the_catalog_is_served_whatever_the_account_has_enabled() {
+    let region = "us-west-2";
+    let queries = ["", "Providers=AWS", "MaxResults=2", "MaxResults=100"];
+    let harness = Harness::new(region);
 
-    let (status, body) = harness.enable().await;
-    assert_eq!(status, 200, "enable: got {status} with {body}");
+    // The first read happens before anything was ever enabled: the reference the
+    // other subscription states are compared against.
+    let mut reference: Vec<(&str, Value)> = Vec::new();
+    for query in queries {
+        let (status, body) = harness.describe_standards(query).await;
+        assert_eq!(
+            status, 200,
+            "case \"never enabled\" query {query:?}: expected 200, got {status} with {body}"
+        );
+        assert!(
+            !returned_standards(&body).is_empty(),
+            "case \"never enabled\" query {query:?}: the catalog must be populated, got {body}"
+        );
+        assert!(
+            returned_standards(&body).len() <= STANDARDS_CATALOG.len(),
+            "case \"never enabled\" query {query:?}: got more entries than the catalog holds: {body}"
+        );
+        reference.push((query, body));
+    }
+
+    // (case, the mutation that puts the hub into this subscription state)
+    let states: Vec<(&str, bool)> = vec![
+        ("subscribed", true),
+        ("subscription removed again", false),
+        ("subscribed once more", true),
+    ];
+    for (case, subscribe) in states {
+        let (status, body) = if subscribe {
+            harness.enable().await
+        } else {
+            harness.disable().await
+        };
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reaching that state must succeed, got {status} with {body}"
+        );
+        for (query, expected) in &reference {
+            let (status, body) = harness.describe_standards(query).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} query {query:?}: expected 200, got {status} with {body}"
+            );
+            assert_eq!(
+                &body, expected,
+                "case {case:?} query {query:?}: expected the same catalog as an unsubscribed caller ({expected}), got {body}"
+            );
+        }
+    }
+
+    // A Region that was never enabled, on the same emulator: the catalog is still
+    // served, with its own Region's ARNs.
+    let other_region = "eu-west-3";
+    let (status, body) = harness.describe_standards_in(other_region, "").await;
+    assert_eq!(
+        status, 200,
+        "case \"unsubscribed Region\": expected 200, got {status} with {body}"
+    );
+    assert_eq!(
+        returned_arns(&body),
+        catalog_arns(other_region),
+        "case \"unsubscribed Region\": expected that Region's catalog ARNs, got {body}"
+    );
+}
+
+/// RULE: the subscription precondition belongs to the HUB-SCOPED operations — the
+/// ones that read or write this account's hub and the resources under it — so an
+/// unsubscribed caller is still refused there with `InvalidAccessException` (401)
+/// while the catalog read answers 200.
+///
+/// The table spans one hub-scoped read of the hub itself and one of a resource under
+/// it, in a Region with no hub, so dropping the precondition everywhere rather than
+/// narrowing it to account data fails here.
+#[tokio::test]
+async fn hub_scoped_operations_still_refuse_an_unsubscribed_account() {
+    let region = "ap-south-1";
+    let harness = Harness::new(region);
+
+    // (case, method, path, body)
+    let cases: Vec<(&str, &str, &str, Option<Value>)> = vec![
+        ("DescribeHub", "GET", "/accounts", None),
+        (
+            "GetEnabledStandards",
+            "POST",
+            "/standards/get",
+            Some(json!({})),
+        ),
+    ];
+    for (case, method, path, body) in cases {
+        let (status, response) = harness.call(method, path, body).await;
+        assert_eq!(
+            status, 401,
+            "case {case:?}: a hub-scoped call by an unsubscribed account must be refused, got {status} with {response}"
+        );
+        assert!(
+            response.to_string().contains("InvalidAccessException"),
+            "case {case:?}: expected InvalidAccessException, got {response}"
+        );
+    }
+
     let (status, body) = harness.describe_standards("").await;
     assert_eq!(
         status, 200,
-        "after enable: expected 200, got {status} with {body}"
-    );
-
-    // The same emulator, a Region that was never subscribed: a subscription is per
-    // account AND Region, so the unsubscribed Region is still refused.
-    let (status, body) = harness.describe_standards_in("eu-west-3", "").await;
-    assert_eq!(
-        status, 401,
-        "an unsubscribed Region: expected 401, got {status} with {body}"
-    );
-
-    let (status, body) = harness.disable().await;
-    assert_eq!(status, 200, "disable: got {status} with {body}");
-    let (status, body) = harness.describe_standards("").await;
-    assert_eq!(
-        status, 401,
-        "after disable: expected 401, got {status} with {body}"
+        "the catalog read in the same Region must still answer 200, got {status} with {body}"
     );
 }
 

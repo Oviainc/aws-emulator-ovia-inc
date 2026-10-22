@@ -323,18 +323,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| model_not_found(&input.asset_model_id))?;
 
         // The target version the `If-Match` / `If-None-Match` preconditions are
-        // evaluated against. `matchForVersionType` targets the modelled
-        // `AssetModelVersionType` enum (`LATEST | ACTIVE`), so only those two
-        // values reach here and LATEST is the documented default. This emulator
-        // keeps ONE version of an asset model, so its latest version is always
-        // there and its ACTIVE version exists only once the transition the clock
-        // owes has fallen due.
-        let version_type = input.match_for_version_type.as_deref().unwrap_or("LATEST");
-        let target_exists =
-            version_type != "ACTIVE" || record.state(now) == crate::state::STATE_ACTIVE;
-        let target_etag = crate::state::asset_model_etag(record);
+        // evaluated against; [`crate::state::asset_model_target_etag`] is the one
+        // place this service decides which ETag that is.
+        let version_type = input
+            .match_for_version_type
+            .as_deref()
+            .unwrap_or(crate::state::VERSION_TYPE_LATEST);
+        let target = crate::state::asset_model_target_etag(
+            record,
+            input.match_for_version_type.as_deref(),
+            now,
+        );
+        let target_exists = target.is_some();
         if let Some(expected) = input.if_match.as_deref() {
-            if !target_exists || expected != target_etag {
+            if target.as_deref() != Some(expected) {
                 return Err(precondition_failed(
                     &region,
                     &asset_model_id,
@@ -348,7 +350,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ifNoneMatch` is modelled as `SelectAll` with the pattern `^\*$`, so `*`
         // is the only value that reaches here; it asks that the target version NOT
         // exist.
-        if input.if_none_match.as_deref() == Some("*") && target_exists {
+        if input.if_none_match.as_deref() == Some(crate::state::SELECT_ALL) && target_exists {
             return Err(precondition_failed(
                 &region,
                 &asset_model_id,

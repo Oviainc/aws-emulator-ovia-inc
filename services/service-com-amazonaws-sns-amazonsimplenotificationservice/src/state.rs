@@ -1098,6 +1098,74 @@ pub fn arn_refusal(member: &str, value: &str) -> Option<String> {
     arn_shape_reason(value).map(|reason| format!("Invalid parameter: {member} Reason: {reason}"))
 }
 
+/// The most tags one topic holds: "Can't add more than 50 tags to a topic"
+/// ([`TagLimitExceededException`](crate::ops::types::TagLimitExceededException) doc).
+///
+/// Shared by every operation that writes a topic's tags, so a topic cannot hold a
+/// different number depending on which call put them there.
+pub const MAX_TAGS_PER_TOPIC: usize = 50;
+
+/// The message a `ResourceArn` of one of SNS's TAG operations is refused with, or
+/// `None` when the value is a topic ARN.
+///
+/// Two rules, in order, and both are ARGUMENT validation rather than a lookup — a
+/// value that could not name a topic in ANY account is bad input, so it is judged
+/// before the store is consulted:
+///
+/// 1. it has to be an ARN at all ([`arn_refusal`]);
+/// 2. it has to be an ARN of an Amazon SNS TOPIC. Every tag operation documents its
+///    `ResourceArn` as "The ARN of the topic …", and SNS holds tags on topics alone,
+///    so an ARN of another service, or an SNS ARN whose resource part is not a topic
+///    name (a platform endpoint's `endpoint/GCM/app/…`, a subscription's
+///    `<topic>:<uuid>`), names nothing a tag operation could ever act on.
+///
+/// Neither clause reproduces the value the caller sent: both name the member and the
+/// constraint it failed, as every other refusal of this service does.
+pub fn tagged_topic_arn_refusal(member: &str, value: &str) -> Option<String> {
+    if let Some(message) = arn_refusal(member, value) {
+        return Some(message);
+    }
+    topic_name_from_arn(value).is_none().then(|| {
+        format!(
+            "Invalid parameter: {member} Reason: An SNS tag is held by a topic, so the \
+             ARN must name an Amazon SNS topic"
+        )
+    })
+}
+
+/// The refusal a topic's tag map is held to: `None` when `tags` is a map the topic may
+/// hold, a message when it is not.
+///
+/// Both ceilings are checked, in the order a caller fixes them: the documented
+/// [`MAX_TAGS_PER_TOPIC`] entry COUNT, then this emulator's own
+/// [`MAX_TAG_BYTES_PER_TOPIC`] byte ceiling on the one caller-sized map a topic record
+/// carries. The first is the modelled `TagLimitExceededException`'s sentence; the
+/// second is an `InvalidParameterException`'s — so the caller is told which it crossed.
+pub enum TagRefusal {
+    /// Too many entries: the documented per-topic tag limit.
+    TooMany(String),
+    /// Too many bytes: this emulator's per-record ceiling.
+    TooLarge(String),
+}
+
+/// The refusal for the tag map a write WOULD leave a topic holding, or `None` when
+/// the topic may hold it. Measured on the resulting map, so a caller cannot grow one
+/// record past either ceiling by repeating a call with ever larger values.
+pub fn tag_map_refusal(tags: &HashMap<String, String>) -> Option<TagRefusal> {
+    if tags.len() > MAX_TAGS_PER_TOPIC {
+        return Some(TagRefusal::TooMany(format!(
+            "Can't add more than {MAX_TAGS_PER_TOPIC} tags to a topic"
+        )));
+    }
+    let held = attribute_bytes(tags);
+    (held > MAX_TAG_BYTES_PER_TOPIC).then(|| {
+        TagRefusal::TooLarge(format!(
+            "Invalid parameter: Tags - a topic holds at most {MAX_TAG_BYTES_PER_TOPIC} \
+             bytes of Tags: {held}"
+        ))
+    })
+}
+
 /// The sentence SNS states for a topic no account of this emulator holds.
 ///
 /// Fixed, and the SAME for every operation that looks a topic up: SNS names the

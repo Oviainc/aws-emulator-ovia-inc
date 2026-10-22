@@ -41,7 +41,7 @@ const REGION: &str = "us-west-2";
 
 /// Comfortably past `state::ACTIVATION_DELAY`, so the owed CREATING -> ACTIVE
 /// transition has fallen due and the model has an ACTIVE version.
-const PAST_ACTIVATION: Duration = Duration::from_millis(900);
+pub(crate) const PAST_ACTIVATION: Duration = Duration::from_millis(900);
 
 /// A router with just this service mounted on a fresh shared engine.
 fn router() -> MultiServiceRouter {
@@ -61,7 +61,7 @@ fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 
 /// One request, with the extra request headers `headers` carries, answered as
 /// `(status, response headers, parsed body)`.
-async fn call_with_headers(
+pub(crate) async fn call_with_headers(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -144,7 +144,7 @@ async fn create_asset(router: &MultiServiceRouter, body: Value) -> String {
 }
 
 /// The `ETag` response header of `DescribeAssetModel` on `model_id`.
-async fn describe_e_tag(router: &MultiServiceRouter, model_id: &str) -> String {
+pub(crate) async fn describe_e_tag(router: &MultiServiceRouter, model_id: &str) -> String {
     let (status, headers, body) =
         call_with_headers(router, "GET", &format!("/asset-models/{model_id}"), None, &[]).await;
     assert_eq!(status, 200, "DescribeAssetModel {model_id}: got {body}");
@@ -163,7 +163,7 @@ async fn describe_e_tag(router: &MultiServiceRouter, model_id: &str) -> String {
 /// reports, as an INDEPENDENT oracle: it admits every character class the pattern
 /// does rather than the ones `crate::state::asset_model_etag`'s encoder happens to
 /// emit, so a change of encoding cannot make one bug agree with itself.
-fn is_modelled_e_tag(tag: &str) -> bool {
+pub(crate) fn is_modelled_e_tag(tag: &str) -> bool {
     tag.chars().count() == 43
         && tag
             .chars()
@@ -172,7 +172,7 @@ fn is_modelled_e_tag(tag: &str) -> bool {
 
 /// A valid-but-unknown `ETag`: 43 characters the pattern admits, which no stored
 /// model can hash to.
-const FOREIGN_E_TAG: &str = "0123456789_0123456789-0123456789_012345678-";
+pub(crate) const FOREIGN_E_TAG: &str = "0123456789_0123456789-0123456789_012345678-";
 
 /// One row of the conditional-delete table: the case name, the conditional
 /// request headers it sends, and the status `DeleteAssetModel` must answer.

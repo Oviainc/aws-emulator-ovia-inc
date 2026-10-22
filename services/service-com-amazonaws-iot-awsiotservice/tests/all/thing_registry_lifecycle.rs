@@ -141,6 +141,16 @@ impl Emulator {
         self.call("GET", &format!("/things/{thing_name}"), None, REGION)
             .await
     }
+
+    async fn delete_thing(&self, thing_name: &str, query: &str) -> Reply {
+        self.call(
+            "DELETE",
+            &format!("/things/{thing_name}{query}"),
+            None,
+            REGION,
+        )
+        .await
+    }
 }
 
 /// The ARN a thing registered in `region` must carry.
@@ -532,6 +542,121 @@ async fn describing_a_thing_the_registry_does_not_hold_is_refused() {
             described.error_code.as_deref(),
             Some("ResourceNotFoundException"),
             "case {label:?}: expected ResourceNotFoundException, got {described:?}"
+        );
+        // The refusal's message is built from the request: it names the ACCOUNT and
+        // the thing name that was asked for, so it is never one fixed string.
+        let expected = format!("Thing {ACCOUNT_ID}:{label} not found.");
+        assert_eq!(
+            described.text("message").as_deref(),
+            Some(expected.as_str()),
+            "case {label:?}: expected the message {expected:?}, got {described:?}"
+        );
+    }
+}
+
+/// RULE: `DeleteThing` removes the thing from the registry — a later read of that
+/// name is a 404 — and is IDEMPOTENT: "Returns successfully with no error if the
+/// deletion is successful or you specify a thing that doesn't exist". An
+/// `expectedVersion` that does not match the stored record is refused 409
+/// `VersionConflictException` and removes nothing.
+#[tokio::test]
+async fn deleting_a_thing_removes_it_and_is_idempotent() {
+    let emulator = Emulator::new();
+
+    // (case, the name to delete, whether it is registered first, the query string the
+    // delete carries, the expected status)
+    //
+    // The rows differ in whether the thing exists, in the form of its name, and in
+    // whether the delete states an expected version — the matching one, and one that
+    // does not match.
+    let rows: [(&str, &str, bool, &str, u16); 6] = [
+        ("a registered thing", "delete-plain", true, "", 200),
+        (
+            "a registered thing, at its stored version",
+            "delete-versioned",
+            true,
+            "?expectedVersion=1",
+            200,
+        ),
+        (
+            "a registered thing, at a version it is not at",
+            "delete-stale",
+            true,
+            "?expectedVersion=7",
+            409,
+        ),
+        (
+            "a name nothing registered",
+            "delete-absent",
+            false,
+            "",
+            200,
+        ),
+        (
+            "a name nothing registered, with an expected version",
+            "delete-absent-versioned",
+            false,
+            "?expectedVersion=1",
+            200,
+        ),
+        (
+            "a name carrying the colon its pattern allows",
+            "Delete:Thing_9-x",
+            true,
+            "",
+            200,
+        ),
+    ];
+
+    for (case, thing_name, registered, query, expected) in rows {
+        if registered {
+            let created = emulator
+                .create_thing(thing_name, &payload_of(&[("color", "red")]))
+                .await;
+            assert_eq!(
+                created.status, 200,
+                "case {case:?}: the fixture thing must register, got {created:?}"
+            );
+        }
+
+        let deleted = emulator.delete_thing(thing_name, query).await;
+        assert_eq!(
+            deleted.status, expected,
+            "case {case:?}: expected {expected}, got {deleted:?}"
+        );
+
+        if expected == 409 {
+            assert_eq!(
+                deleted.error_code.as_deref(),
+                Some("VersionConflictException"),
+                "case {case:?}: expected VersionConflictException, got {deleted:?}"
+            );
+            // The refused delete removed nothing: the thing is still readable.
+            let described = emulator.describe_thing(thing_name).await;
+            assert_eq!(
+                described.status, 200,
+                "case {case:?}: a refused delete must leave the thing registered, got {described:?}"
+            );
+            continue;
+        }
+
+        // A successful delete is observable: the name is gone, and deleting it again
+        // still succeeds.
+        let described = emulator.describe_thing(thing_name).await;
+        assert_eq!(
+            described.status, 404,
+            "case {case:?}: the deleted name must be a 404, got {described:?}"
+        );
+        let again = emulator.delete_thing(thing_name, "").await;
+        assert_eq!(
+            again.status, 200,
+            "case {case:?}: a repeated delete is still a success, got {again:?}"
+        );
+        // And the name is free again: a create re-registers it.
+        let recreated = emulator.create_thing(thing_name, &json!({})).await;
+        assert_eq!(
+            recreated.status, 200,
+            "case {case:?}: the deleted name must be reusable, got {recreated:?}"
         );
     }
 }

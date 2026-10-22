@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers one data-lake location as managed by the Data Catalog: it inserts a
+//! [`crate::state::RegisteredResource`] into
+//! [`crate::state::ComAmazonawsLakeformationAwslakeformationState`]'s
+//! `registered_resources`, keyed by the resource ARN, which `DescribeResource` reads back.
+//!
+//! Three refusals, each the modelled error for its case:
+//!
+//! * a `ResourceArn` that is not an ARN at all — `InvalidInputException`
+//!   (`ResourceArnString` carries no pattern, so the boundary validator admits it);
+//! * a request naming neither `RoleArn` nor `UseServiceLinkedRole` —
+//!   `InvalidInputException`, per this operation's own documentation ("If
+//!   UseServiceLinkedRole is not set to true, you must provide or set the RoleArn");
+//! * an ARN that is already registered — `AlreadyExistsException` ("A resource to be
+//!   created or added already exists"), never an overwrite of the stored role.
+//!
+//! This is the only site that inserts into `registered_resources`, so it is where that
+//! map's ceiling ([`crate::state::MAX_REGISTERED_RESOURCES`]) is enforced, with the
+//! modelled `ResourceNumberLimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +180,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterResource"))
+        // The caller the audit record below attributes this state change to.
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterResourceErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("LakeFormation state is unavailable".to_string()),
+            })
+        })?;
+
+        // `ResourceArnString` has no modelled pattern, so a value that is not an ARN
+        // reaches the handler and is refused here, naming the member and the form it
+        // must take.
+        if let Err(why) = crate::state::validate_resource_arn(&input.resource_arn) {
+            return Err(
+                RegisterResourceErrorModeled::InvalidInputException(InvalidInputException {
+                    message: Some(why),
+                })
+                .into(),
+            );
+        }
+
+        // The registration's data access role: the `RoleArn` the request names, else the
+        // Lake Formation service-linked role when `UseServiceLinkedRole` selects it. A
+        // request that names neither has no role to register with — "If
+        // UseServiceLinkedRole is not set to true, you must provide or set the RoleArn".
+        let role_arn = match (input.role_arn.as_deref(), input.use_service_linked_role) {
+            (Some(role), _) => role.to_string(),
+            (None, Some(true)) => crate::state::service_linked_role_arn(),
+            (None, _) => {
+                return Err(RegisterResourceErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(
+                            "RoleArn is required unless UseServiceLinkedRole is true".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let mut store = state.lock();
+        // A location is registered once: re-registering it must not silently replace the
+        // role or the flags of the live registration.
+        if store.registered_resources.contains_key(&input.resource_arn) {
+            return Err(
+                RegisterResourceErrorModeled::AlreadyExistsException(AlreadyExistsException {
+                    message: Some(format!(
+                        "Resource {} is already registered",
+                        input.resource_arn
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The store holds a bounded number of registrations: the model declares
+        // `ResourceNumberLimitExceededException` for exactly this, so the single
+        // inserting site never grows it past the ceiling.
+        let held = store.registered_resources.len();
+        if held >= crate::state::MAX_REGISTERED_RESOURCES {
+            return Err(
+                RegisterResourceErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "{held} resources are already registered, the maximum is {}",
+                            crate::state::MAX_REGISTERED_RESOURCES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.registered_resources.insert(
+            input.resource_arn.clone(),
+            crate::state::RegisteredResource {
+                resource_arn: input.resource_arn.clone(),
+                role_arn: role_arn.clone(),
+                with_federation: input.with_federation,
+                hybrid_access_enabled: input.hybrid_access_enabled,
+                // Modelled `Boolean` with `default false`, so the registration always
+                // carries a value even when the request omitted the member.
+                with_privileged_access: Some(input.with_privileged_access),
+                expected_resource_owner_account: input.expected_resource_owner_account.clone(),
+                last_modified: ::std::time::SystemTime::now(),
+            },
+        );
+
+        // The audit record for a state change: who, what, where, outcome. No secret and
+        // no credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        tracing::info!(
+            operation = "RegisterResource",
+            akid = %akid,
+            resource_arn = %input.resource_arn,
+            role_arn = %role_arn,
+            outcome = "registered",
+            "data lake location registered"
+        );
+
+        // `RegisterResourceResponse` models no members: the proof of the insert is what
+        // `DescribeResource` reads back out of state.
+        Ok(RegisterResourceOutput {})
     }
 }

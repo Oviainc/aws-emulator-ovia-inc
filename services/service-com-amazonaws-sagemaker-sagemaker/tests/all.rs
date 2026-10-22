@@ -19,3 +19,5 @@ mod inference_deployment_lifecycle;
 mod model_package_group_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/studio_app_lifecycle.rs"]
+mod studio_app_lifecycle;

@@ -156,6 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(source) = input.application_source.as_ref() {
             crate::state::validate_application_source(source).map_err(validation)?;
         }
+        // Instructions the request carries are held to the same semantics
+        // `CreateScalingPlan` holds them to: an update cannot leave a plan in a shape
+        // a create could never have produced.
+        if let Some(instructions) = input.scaling_instructions.as_deref() {
+            crate::state::validate_scaling_instructions(instructions).map_err(validation)?;
+        }
 
         let plan = state
             .plan_mut(&input.scaling_plan_name, input.scaling_plan_version)

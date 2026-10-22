@@ -651,6 +651,32 @@ async fn an_arn_typed_member_is_refused_before_the_lookup() {
             code: "InvalidParameter",
             message: elements("TargetArn", 1),
         },
+        ArnCase {
+            case: "ListTagsForResource with a value that is not an ARN at all",
+            action: "ListTagsForResource",
+            params: vec![("ResourceArn", "arn-shape-topic")],
+            status: 400,
+            code: "InvalidParameter",
+            message: elements("ResourceArn", 1),
+        },
+        ArnCase {
+            case: "ListTagsForResource with six elements that do not open with arn:",
+            action: "ListTagsForResource",
+            params: vec![("ResourceArn", "urn:aws:sns:us-east-1:000000000000:t")],
+            status: 400,
+            code: "InvalidParameter",
+            message: prefix("ResourceArn"),
+        },
+        ArnCase {
+            // The one operation here whose lookup miss is `ResourceNotFound` rather
+            // than `NotFound`: the tag operations model their own not-found shape.
+            case: "ListTagsForResource with an ARN-shaped topic that does not exist",
+            action: "ListTagsForResource",
+            params: vec![("ResourceArn", absent)],
+            status: 404,
+            code: "ResourceNotFound",
+            message: String::new(),
+        },
     ];
 
     for ArnCase {

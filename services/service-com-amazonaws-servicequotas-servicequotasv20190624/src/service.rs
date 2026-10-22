@@ -59,10 +59,23 @@
 //! into the operation's input shape, then run the model's constraint traits over what
 //! was read (`aws_smithy_schema_server::constraints::validate`, the same call the
 //! centralized sequence makes) — what the request violates, and renders the first
-//! violation as the modelled `IllegalArgumentException`. The rules enforced are
-//! therefore exactly the model's; only the WORDS and the envelope are this service's.
-//! A request the model accepts is delegated, untouched, to the generated operation in
-//! the routing table, so each handler, its state and its 501 are exactly as before.
+//! violation as the refusal the recordings show for the member it names. The rules
+//! enforced are therefore exactly the model's; only the WORDS and the envelope are
+//! this service's. A request the model accepts is delegated, untouched, to the
+//! generated operation in the routing table, so each handler, its state and its 501
+//! are exactly as before.
+//!
+//! ## Two validators, two error codes
+//!
+//! Service Quotas does not answer every constraint violation with one code, and which
+//! code a member gets is RECORDED behaviour rather than anything the model states —
+//! `ValidationException` is not in this service's model at all. The refusal a member
+//! gets is chosen in [`FRONT_END_VALIDATED_MEMBERS`], where the two recordings behind
+//! the split are cited; the message form of each recording is what tells the
+//! request-validation front end apart from the service's own application layer.
+//! A refusal a HANDLER makes after reading a request the model accepts — a quota that
+//! is not adjustable, a desired value that is not an increase — is a semantic refusal
+//! and stays the modelled `IllegalArgumentException` wherever it is raised.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -80,10 +93,43 @@ use smithy_server_runtime::{
 /// same name a handler-returned `IllegalArgumentException` carries.
 const ILLEGAL_ARGUMENT_CODE: &str = "IllegalArgumentException";
 
+/// The wire error code (`__type`) of a refusal this service's request-validation FRONT
+/// END makes, for the members it owns (see [`FRONT_END_VALIDATED_MEMBERS`]). The shape
+/// is NOT in this service's model, which is why it is rendered through the synthetic
+/// [`crate::scaffolded::ValidationException`] rather than through an operation's error
+/// enum.
+const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
+
 /// The status an input-validation refusal is served on: `IllegalArgumentException`'s
 /// own `@httpError(400)`, which is also the status this awsJson front end puts on any
-/// client fault (see [`crate::scaffolded::wire_http_status`]).
-const ILLEGAL_ARGUMENT_STATUS: u16 = 400;
+/// client fault (see [`crate::scaffolded::wire_http_status`]) and the status the
+/// request validator answers a malformed member with.
+const REFUSAL_STATUS: u16 = 400;
+
+/// The input members Service Quotas' request-validation FRONT END owns, rather than its
+/// own application layer.
+///
+/// Which error code a constraint violation carries is recorded behaviour, and two
+/// recordings fix the split for this service. The FORM of each recorded message is what
+/// tells the two validators apart:
+///
+/// * a `RequestId` outside its `@pattern` is refused with [`VALIDATION_EXCEPTION_CODE`]
+///   and a message in the request validator's form — `Value at '<member path>' failed
+///   to satisfy constraint: …`, naming the member as the WIRE spells it (recorded for
+///   `GetRequestedServiceQuotaChange`);
+/// * a `QuotaCode` or `ServiceCode` outside theirs is refused with the MODELLED
+///   [`ILLEGAL_ARGUMENT_CODE`] and a message in the service's own form — `QuotaCode
+///   failed to satisfy constraint: …`, with no `Value at` clause and no
+///   `N validation error(s) detected` envelope (recorded for `GetServiceQuota`, and
+///   pinned by the resolved issue
+///   `20261022T115709Z-servicequotas-service-quotas-error-paths-answer-404-instead-of`,
+///   cause 5).
+///
+/// Listed by the member name the MODEL spells, so the split follows that member
+/// wherever this service declares it — `GetRequestedServiceQuotaChange` and
+/// `CreateSupportCase` both take a `RequestId` — instead of being keyed to one
+/// operation or to one recorded request.
+const FRONT_END_VALIDATED_MEMBERS: &[&str] = &["RequestId"];
 
 /// The clause joining the member a caller got wrong to the rule it broke, as AWS
 /// words it: `QuotaCode failed to satisfy constraint: Member must satisfy regular
@@ -223,7 +269,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // shape. What still arrives here is a refusal with no modelled operation to
         // read the request against — an unparseable body, or a caller the emulator
         // would not authenticate.
+        //
+        // A violation naming a member the request validator owns
+        // ([`FRONT_END_VALIDATED_MEMBERS`]) keeps that validator's code and clause
+        // here too, so one member is not refused under two codes depending on which
+        // path answered it. The member is placed WITHOUT a schema on this path, by
+        // lowerCamel-ing each listed name onto the violation's own path, which is the
+        // spelling the framework's walk reports.
         match refusal {
+            Refusal::Invalid(violations) if violations.first().is_some_and(front_end_owned) => {
+                let first = violations.first()?;
+                Some(Refused {
+                    code: VALIDATION_EXCEPTION_CODE.to_string(),
+                    message: front_end_message(first),
+                })
+            }
             Refusal::Invalid(violations) => Some(Refused {
                 code: ILLEGAL_ARGUMENT_CODE.to_string(),
                 message: violations
@@ -303,30 +363,25 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
         Box::pin(async move {
             let started = std::time::Instant::now();
             let protocol = svc.definition().protocol();
-            if let Some(exception) = modelled_refusal::<Op>(protocol, req) {
+            if let Some(refusal) = modelled_refusal::<Op>(protocol, req) {
                 // Serialized through the service's own protocol, exactly as a
-                // handler-returned `IllegalArgumentException` is: the same body member
-                // name (`Message`), the same `__type`, and the status the model
-                // declares for it.
-                match protocol.serialize_error(
-                    &exception,
-                    &crate::ops::types::SCHEMA_ILLEGAL_ARGUMENT_EXCEPTION,
-                    ILLEGAL_ARGUMENT_CODE,
-                    ILLEGAL_ARGUMENT_STATUS,
-                ) {
+                // handler-returned error is: the same body member name, the same
+                // `__type`, and the status this front end serves a client fault on.
+                match refusal.serialize(protocol) {
                     Ok(response) => {
-                        record_refusal::<Op>(ctx, started.elapsed());
+                        record_refusal::<Op>(ctx, refusal.code(), started.elapsed());
                         return response;
                     }
-                    // A modelled error that will not serialize leaves the request to
-                    // the framework, which refuses it in the generic envelope — the
-                    // very divergence this wrapper removes, so it is logged rather
-                    // than passed over silently.
+                    // An error that will not serialize leaves the request to the
+                    // framework, which refuses it in the generic envelope — the very
+                    // divergence this wrapper removes, so it is logged rather than
+                    // passed over silently.
                     Err(error) => tracing::warn!(
                         operation = Op::NAME,
+                        code = refusal.code(),
                         %error,
-                        "the modelled IllegalArgumentException would not serialize; this \
-                         refusal falls back to the framework's generic envelope"
+                        "this service's constraint refusal would not serialize; it falls \
+                         back to the framework's generic envelope"
                     ),
                 }
             }
@@ -350,7 +405,11 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
 /// (this service's signing name and the operation's own name), and the same already
 /// sanitized request metadata. Everything is gated on a client collecting, exactly as
 /// the framework gates it.
-fn record_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time::Duration) {
+fn record_refusal<Op: Operation>(
+    ctx: &OperationContext<'_>,
+    code: &str,
+    latency: std::time::Duration,
+) {
     if !emulator_telemetry::recording_active() {
         return;
     }
@@ -360,11 +419,74 @@ fn record_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time:
         &handle,
         latency,
         Some(emulator_telemetry::OperationFailure::classify(
-            ILLEGAL_ARGUMENT_STATUS,
-            ILLEGAL_ARGUMENT_CODE,
+            REFUSAL_STATUS,
+            code,
         )),
         smithy_server_runtime::RequestTelemetry::from_headers(&ctx.parts().headers).into_metadata(),
     );
+}
+
+/// One refusal of a request that broke a rule this service's model declares, in the
+/// error shape the recordings show for the MEMBER it names.
+///
+/// Both arms carry the same status and the same two halves of a sentence (the member and
+/// the requirement); they differ in the error code a client branches on, in how the
+/// member is spelled, and in whether the shape is one the model declares — see
+/// [`FRONT_END_VALIDATED_MEMBERS`].
+enum ConstraintRefusal {
+    /// The request-validation front end's answer, in the synthetic
+    /// [`crate::scaffolded::ValidationException`]: a shape this service's model does not
+    /// declare, so it cannot be an arm of any operation's error enum.
+    FrontEnd(crate::scaffolded::ValidationException),
+    /// The service's own answer, in the MODELLED `IllegalArgumentException` — whose
+    /// `Message` member is what puts `$.Message` in the body.
+    Modelled(crate::ops::types::IllegalArgumentException),
+}
+
+impl ConstraintRefusal {
+    /// The refusal `violation` gets: the front end's for a member it owns, this
+    /// service's own for every other.
+    fn of(violation: &Violation, input_schema: &Schema) -> Self {
+        match modelled_member_name(&violation.path, input_schema) {
+            Some(member) if FRONT_END_VALIDATED_MEMBERS.contains(&member.as_str()) => {
+                Self::FrontEnd(crate::scaffolded::ValidationException::new(
+                    front_end_message(violation),
+                ))
+            }
+            _ => Self::Modelled(illegal_argument(refusal_message(violation, input_schema))),
+        }
+    }
+
+    /// The wire error code (`__type`) this refusal carries.
+    fn code(&self) -> &'static str {
+        match self {
+            Self::FrontEnd(_) => VALIDATION_EXCEPTION_CODE,
+            Self::Modelled(_) => ILLEGAL_ARGUMENT_CODE,
+        }
+    }
+
+    /// Render this refusal through the service's own protocol, so its body carries the
+    /// member name, the `__type` and the status the recordings show.
+    fn serialize(
+        &self,
+        protocol: &dyn ServerHttpProtocol,
+    ) -> Result<aws_smithy_runtime_api::http::Response, aws_smithy_schema_server::ProtocolError>
+    {
+        match self {
+            Self::FrontEnd(exception) => protocol.serialize_error(
+                exception,
+                &crate::scaffolded::VALIDATION_EXCEPTION_SCHEMA,
+                VALIDATION_EXCEPTION_CODE,
+                REFUSAL_STATUS,
+            ),
+            Self::Modelled(exception) => protocol.serialize_error(
+                exception,
+                &crate::ops::types::SCHEMA_ILLEGAL_ARGUMENT_EXCEPTION,
+                ILLEGAL_ARGUMENT_CODE,
+                REFUSAL_STATUS,
+            ),
+        }
+    }
 }
 
 /// How this service states the request `Op` cannot be read from, or `None` when it has
@@ -378,7 +500,7 @@ fn record_refusal<Op: Operation>(ctx: &OperationContext<'_>, latency: std::time:
 fn modelled_refusal<Op: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &aws_smithy_runtime_api::http::Request,
-) -> Option<crate::ops::types::IllegalArgumentException> {
+) -> Option<ConstraintRefusal> {
     let input = {
         let mut deserializer = protocol.deserialize_input(req, Op::INPUT_SCHEMA).ok()?;
         match <Op::Input as DeserializableStruct>::deserialize(&mut *deserializer) {
@@ -396,7 +518,7 @@ fn modelled_refusal<Op: Operation>(
                     kind: ViolationKind::MissingRequiredMember,
                     value: None,
                 };
-                return Some(illegal_argument(refusal_message(&absent, Op::INPUT_SCHEMA)));
+                return Some(ConstraintRefusal::of(&absent, Op::INPUT_SCHEMA));
             }
             // Any other codec failure is not a refusal this service rewords.
             Err(_) => return None,
@@ -406,7 +528,44 @@ fn modelled_refusal<Op: Operation>(
     // AWS names ONE member per refusal, and the walk visits members in schema order,
     // so "the first" is a property of the input shape rather than of the request.
     let first = violations.first()?;
-    Some(illegal_argument(refusal_message(first, Op::INPUT_SCHEMA)))
+    Some(ConstraintRefusal::of(first, Op::INPUT_SCHEMA))
+}
+
+/// Whether `violation` names a member the request-validation front end owns, placed
+/// without an input schema: each listed member name is lowerCamel-ed onto the path the
+/// framework's walk reports, so the model is still the source of the spelling.
+fn front_end_owned(violation: &Violation) -> bool {
+    FRONT_END_VALIDATED_MEMBERS
+        .iter()
+        .any(|member| constraints::path::member(member) == violation.path)
+}
+
+/// How the request-validation front end words a value that broke a rule the model
+/// declares: the member path as the WIRE spells it (the validating walk's lowerCamel,
+/// which is the spelling the recorded message carries) and the rule it broke —
+/// `Value at 'requestId' failed to satisfy constraint: Member must satisfy regular
+/// expression pattern: …`.
+///
+/// The rejected value is NOT quoted back: a refusal states the rule, and echoing input
+/// into a 400 body puts caller-supplied bytes in every client log. The one value a
+/// clause does report is the `null` of a member the request omits, which is a fact of
+/// the request's SHAPE rather than something the caller sent.
+///
+/// A violation this cannot render a requirement for keeps the framework's own sentence,
+/// which already names both the path and the rule.
+fn front_end_message(violation: &Violation) -> String {
+    let Some(requirement) = requirement(violation) else {
+        return violation.message();
+    };
+    let subject = if matches!(violation.kind, ViolationKind::MissingRequiredMember) {
+        "Value null"
+    } else {
+        "Value"
+    };
+    format!(
+        "{subject} at '{}'{CONSTRAINT_CLAUSE}{requirement}",
+        violation.path
+    )
 }
 
 /// This service's modelled refusal carrying `message` — the one place its
