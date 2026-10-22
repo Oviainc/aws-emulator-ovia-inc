@@ -257,14 +257,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         let Some(record) = store.vocabularies.get_mut(&input.vocabulary_name) else {
-            return Err(UpdateVocabularyErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "The requested vocabulary {} couldn't be found. Check the vocabulary \
-                     name and try your request again.",
-                    input.vocabulary_name
-                )),
-            })
-            .into());
+            // A resource that does not exist is a `BadRequestException` on this
+            // service's wire, not the modelled `NotFoundException`: the shape's own
+            // documentation covers "the entity you're trying to delete doesn't exist",
+            // and that is the shape its recorded not-found responses carry.
+            return Err(bad_request(&crate::state::not_found_message(
+                crate::state::KIND_VOCABULARY,
+            )));
         };
 
         // "This operation overwrites all existing information with your new values; you

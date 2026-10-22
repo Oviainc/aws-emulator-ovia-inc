@@ -19,5 +19,7 @@ mod external_connection;
 mod package_group_hierarchy;
 #[path = "all/repository_endpoint.rs"]
 mod repository_endpoint;
+#[path = "all/repository_permissions_policy.rs"]
+mod repository_permissions_policy;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

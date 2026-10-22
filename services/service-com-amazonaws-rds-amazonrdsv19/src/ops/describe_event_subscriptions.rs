@@ -166,7 +166,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
-        let store = state.lock();
+        let mut store = state.lock();
+        // Only the DB instance and snapshot transitions the clock has ALREADY made due
+        // are materialised here — this writes nothing that was not owed at this instant
+        // even if nobody had called. An event subscription is active from its create
+        // onwards and owes no transition of its own.
+        store.settle_due_transitions(&region);
 
         // A subscription belongs to the region it was created in, so a request sees only
         // that region's subscriptions. A `SubscriptionName` that names none of them is the

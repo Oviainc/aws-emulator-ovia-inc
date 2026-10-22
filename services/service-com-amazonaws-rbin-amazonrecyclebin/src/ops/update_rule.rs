@@ -217,6 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Whatever the clock already owes this rule is materialised before the guards
+        // below read its state: they must decide on the state the clock has actually
+        // reached, not one it has already left.
+        rule.settle(now);
         // A locked rule "can't be modified or deleted", and an unlocked one still
         // inside its unlock delay can be modified "only after the unlock delay period
         // has expired".
@@ -261,6 +265,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         rule.resource_tags = merged_resource_tags;
         rule.exclude_resource_tags = merged_exclude_resource_tags;
+        // A rule that has just been modified is not retaining resources under the new
+        // configuration yet: it goes back to `pending` and reaches `available` once the
+        // clock makes the transition due.
+        rule.begin_pending(now);
 
         Ok(UpdateRuleOutput {
             identifier: Some(rule.identifier.clone()),

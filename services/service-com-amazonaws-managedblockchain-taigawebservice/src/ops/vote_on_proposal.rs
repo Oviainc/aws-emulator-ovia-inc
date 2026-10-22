@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VoteOnProposal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VoteOnProposal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: records the voting member's `VoteValue` on the stored proposal in
+//! [`crate::state`], then decides the proposal against the network's own
+//! `ApprovalThresholdPolicy` — approving it once the `YES` votes reach the threshold
+//! (carrying out its `ProposalActions`), rejecting it once the `NO` votes put that
+//! threshold out of reach, and leaving it open otherwise. `GetProposal`,
+//! `ListProposals` and `ListInvitations` answer from what this writes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VoteOnProposal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation "Applies only to Hyperledger Fabric", which holds by construction here
+//! rather than by a check: a proposal exists only where `CreateProposal` put one, and the
+//! only networks this service creates are `HYPERLEDGER_FABRIC` ones (`CreateNetwork`'s
+//! `@required` `MemberConfiguration` "Applies only to Hyperledger Fabric" — see
+//! [`crate::state::FRAMEWORK_HYPERLEDGER_FABRIC`]), while AWS's standing public Ethereum
+//! networks hold no proposals to vote on, so a vote naming one is already the proposal's
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +160,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VoteOnProposal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VoteOnProposalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VoteOnProposal"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(VoteOnProposalErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        // The region the invitations an approved proposal mints are named in, read off
+        // this request's own credential scope, exactly as every other create does.
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        guard.settle(now);
+
+        // The PROPOSAL is the resource this call votes on; the network id only scopes the
+        // lookup, so the failure names the proposal whenever that proposal cannot be read
+        // — including when the network id names nothing stored.
+        let found = guard.networks.get(&input.network_id).and_then(|network| {
+            network
+                .proposals
+                .get(&input.proposal_id)
+                .map(|proposal| (network, proposal))
+        });
+        let Some((network, proposal)) = found else {
+            return Err(VoteOnProposalErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_PROPOSAL, &input.proposal_id),
+            )
+            .into());
+        };
+
+        // The facts the rules below read, copied out here so the write path can take the
+        // single mutable borrow it needs. `OutstandingVoteCount` is "the number of members
+        // minus the sum of YES votes and NO votes", so the membership at THIS instant is
+        // what the threshold is measured against.
+        let members = network.members.len();
+        let voting_policy = network.voting_policy.clone();
+        let proposal_status = proposal.status.clone();
+        let proposal_open = proposal.is_open();
+        let already_voted = proposal.votes.contains_key(&input.voter_member_id);
+        let voter = network.members.get(&input.voter_member_id).cloned();
+
+        // "Casts a vote for a specified ProposalId on behalf of a member": the member to
+        // vote as must be one of the voting network's own members.
+        let Some(voter) = voter else {
+            return Err(VoteOnProposalErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_MEMBER, &input.voter_member_id),
+            )
+            .into());
+        };
+
+        // "The member to vote as, specified by VoterMemberId, must be in the same Amazon
+        // Web Services account as the principal that calls the action": a member held by
+        // another account is not this caller's to vote as.
+        if !voter.is_owned() {
+            return Err(VoteOnProposalErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(format!(
+                        "member {} is not held by account {} and cannot be voted as",
+                        voter.id,
+                        ::engine::emulator_account_id()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Only a proposal that is "active and open for member voting" can be voted on
+        // (`Proposal$Status`'s `IN_PROGRESS`); once it is approved, rejected or expired,
+        // voting on it is an illegal action on the resource rather than a missing one.
+        if !proposal_open {
+            return Err(VoteOnProposalErrorModeled::IllegalActionException(
+                IllegalActionException {
+                    message: Some(format!(
+                        "proposal {} is {proposal_status} and is no longer open for member voting",
+                        input.proposal_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A member casts ONE vote: the threshold is a share of the membership, so a
+        // member voting twice would count twice. Changing a cast vote is the same illegal
+        // action.
+        if already_voted {
+            return Err(VoteOnProposalErrorModeled::IllegalActionException(
+                IllegalActionException {
+                    message: Some(format!(
+                        "member {} has already voted on proposal {}",
+                        input.voter_member_id, input.proposal_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Record the vote, then decide the proposal against the network's own voting
+        // policy. The counts come from the stored votes themselves, so no total can drift
+        // from the votes actually cast.
+        let outcome = {
+            let proposal = guard
+                .networks
+                .get_mut(&input.network_id)
+                .and_then(|network| network.proposals.get_mut(&input.proposal_id));
+            let Some(proposal) = proposal else {
+                return Err(VoteOnProposalErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {},
+                )
+                .into());
+            };
+            proposal
+                .votes
+                .insert(input.voter_member_id.clone(), input.vote.clone());
+            let outcome = crate::state::proposal_outcome(
+                voting_policy.as_ref(),
+                members,
+                proposal.vote_count(crate::state::VOTE_YES),
+                proposal.vote_count(crate::state::VOTE_NO),
+            );
+            if let Some(outcome) = outcome {
+                proposal.status = outcome.to_string();
+            }
+            // The actions are carried out only for an APPROVED proposal; for every other
+            // outcome "the specified ProposalActions aren't carried out".
+            outcome.and_then(|outcome| {
+                (outcome == crate::state::PROPOSAL_APPROVED).then(|| proposal.actions.clone())
+            })
+        };
+
+        // "The specified proposal actions are carried out" (`Proposal$Status`'s
+        // `APPROVED`): each `InviteAction` records the invitation it owes its principal,
+        // and each `RemoveAction` deletes the member it names and that member's
+        // resources.
+        if let Some(actions) = outcome {
+            let carried_out =
+                guard.carry_out_proposal_actions(&input.network_id, &actions, &region, now);
+            if !carried_out {
+                // "ACTION_FAILED - One or more of the specified ProposalActions in a
+                // proposal that was approved couldn't be completed because of an error."
+                let proposal = guard
+                    .networks
+                    .get_mut(&input.network_id)
+                    .and_then(|network| network.proposals.get_mut(&input.proposal_id));
+                let Some(proposal) = proposal else {
+                    return Err(VoteOnProposalErrorModeled::InternalServiceErrorException(
+                        InternalServiceErrorException {},
+                    )
+                    .into());
+                };
+                proposal.status = crate::state::PROPOSAL_ACTION_FAILED.to_string();
+            }
+        }
+
+        Ok(VoteOnProposalOutput {})
     }
 }

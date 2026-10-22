@@ -5,7 +5,8 @@
 //! `StartTranscriptionJob` stored, with the status transitions the clock has made
 //! due materialised first, so a job reads back `COMPLETED` with its
 //! `Transcript.TranscriptFileUri` and `CompletionTime` once its processing span has
-//! elapsed. An unknown job name is a `NotFoundException`.
+//! elapsed. An unknown job name is a `BadRequestException`, the error this service
+//! reports a resource it does not hold with.
 //!
 //! ## Shape of an operation
 //!
@@ -171,13 +172,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .transcription_jobs
             .get_mut(&input.transcription_job_name)
         else {
-            return Err(GetTranscriptionJobErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "The requested job {} couldn't be found. Check the job name and \
-                     try your request again.",
-                    input.transcription_job_name
-                )),
-            })
+            return Err(GetTranscriptionJobErrorModeled::BadRequestException(
+                BadRequestException {
+                    // A job this account never started is this service's
+                    // `BadRequestException` — the shape its recorded not-found
+                    // responses carry, and the one whose documentation covers an
+                    // entity that "doesn't exist" — not the modelled
+                    // `NotFoundException`. A poll-until-done loop classifies an
+                    // unknown job by this error, so it must be the one the service
+                    // emits.
+                    message: Some(crate::state::not_found_message(crate::state::KIND_JOB)),
+                },
+            )
             .into());
         };
 

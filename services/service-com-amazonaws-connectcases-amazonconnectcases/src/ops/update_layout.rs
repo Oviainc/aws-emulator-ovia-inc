@@ -190,23 +190,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(UpdateLayoutErrorModeled::ResourceNotFoundException)?;
 
         // The layout has to exist before anything is written, and a DELETED one
-        // cannot be updated: per `DeleteLayout`'s documentation, "You cannot
-        // update a deleted layout by calling UpdateLayout; it throws a
-        // ValidationException".
+        // cannot be updated. `DeleteLayout`'s documentation says the refusal is
+        // a `ValidationException`, but the service's RECORDED answer for an
+        // update of a deleted layout is `ResourceNotFoundException` (404) — a
+        // deleted layout is no longer a layout an update can resolve, even
+        // though `GetLayout` still reports the record — so that is what this
+        // handler returns, with the recording outranking the prose. The
+        // recording is the behavioural unit
+        // `connectcases.layout-create-update-content-round-trip` (corpus
+        // `simparity-behavioral-aws-v1`), which asserts
+        // `UpdateLayout` of a deleted layout answers code
+        // `ResourceNotFoundException`; `tests/all/layout_deletion.rs` pins it.
         let deleted = domain
             .layout(&input.layout_id)
             .map_err(UpdateLayoutErrorModeled::ResourceNotFoundException)?
             .deleted;
         if deleted {
-            return Err(
-                UpdateLayoutErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "layout {} in domain {} has been deleted and cannot be updated",
-                        input.layout_id, input.domain_id
-                    ),
-                })
-                .into(),
-            );
+            return Err(UpdateLayoutErrorModeled::ResourceNotFoundException(
+                crate::state::not_found("Layout", &input.layout_id),
+            )
+            .into());
         }
 
         // A layout name identifies the layout within its domain, so a rename

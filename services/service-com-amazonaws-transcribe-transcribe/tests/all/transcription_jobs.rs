@@ -125,19 +125,17 @@ impl Reply {
         &self.body
     }
 
-    /// Assert a successful call that answers one of the modelled success statuses
-    /// other than 200 (`201` for `CreateVocabularyFilter`, `204` for the deletes).
+    /// Assert a successful call that answers an explicit status.
+    ///
+    /// Every operation of this awsJson1_1 service answers 200 on success (the model's
+    /// `@http` `code` is inert on an RPC protocol), so this is 200 everywhere; it
+    /// stays as its own assertion so a row that means to pin a status says so.
     pub(crate) fn ok_status(&self, case: &str, expected: u16) {
         assert_eq!(
             self.status, expected,
             "case {case:?}: expected HTTP {expected}, got {} with body {:?}",
             self.status, self.body
         );
-    }
-
-    /// Assert a successful call that answers the modelled `204 No Content`.
-    pub(crate) fn ok_no_content(&self, case: &str) {
-        self.ok_status(case, 204);
     }
 
     /// Assert this answer is the modelled refusal `code` with HTTP `status`.
@@ -189,6 +187,23 @@ impl Reply {
             .get("__type")
             .and_then(Value::as_str)
             .map_or("", |code| code.rsplit(['#', ':']).next().unwrap_or(""))
+    }
+
+    /// The error body's message, whichever casing this envelope spells the member in
+    /// (`Message` on the modelled shapes, `message` on the framework's synthetic
+    /// ones).
+    pub(crate) fn error_message(&self, case: &str) -> String {
+        self.body
+            .get("Message")
+            .or_else(|| self.body.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected a message in the error body, got {:?}",
+                    self.body
+                )
+            })
+            .to_string()
     }
 }
 
@@ -612,8 +627,8 @@ async fn re_using_a_job_name_is_a_conflict() {
     for (case, retry) in [("identical request", request), ("different body", different)] {
         let conflict = transcribe.call("StartTranscriptionJob", retry).await;
         assert_eq!(
-            conflict.status, 409,
-            "case {case:?}: expected HTTP 409, got {} with body {:?}",
+            conflict.status, 400,
+            "case {case:?}: expected HTTP 400, got {} with body {:?}",
             conflict.status, conflict.body
         );
         assert_eq!(
@@ -827,8 +842,8 @@ async fn the_store_is_bounded_by_the_account_job_quota() {
     // and nothing is stored for it.
     let over = start("quota-100".to_string()).await;
     assert_eq!(
-        over.status, 429,
-        "a start beyond the quota must be HTTP 429, got {} with body {:?}",
+        over.status, 400,
+        "a start beyond the quota must be HTTP 400, got {} with body {:?}",
         over.status, over.body
     );
     assert_eq!(
@@ -844,7 +859,7 @@ async fn the_store_is_bounded_by_the_account_job_quota() {
         )
         .await;
     assert_eq!(
-        missing.status, 404,
+        missing.status, 400,
         "the refused job must not have been stored, got {} with body {:?}",
         missing.status, missing.body
     );
@@ -860,7 +875,7 @@ async fn the_store_is_bounded_by_the_account_job_quota() {
             json!({"TranscriptionJobName": "quota-0"}),
         )
         .await
-        .ok_no_content("delete a completed job to free quota");
+        .ok_status("delete a completed job to free quota", 200);
     let after_delete = start("quota-100".to_string()).await;
     assert_eq!(
         after_delete.status, 200,
@@ -880,14 +895,14 @@ async fn an_unknown_job_is_not_found_and_delete_removes_a_known_one() {
         )
         .await;
     assert_eq!(
-        missing.status, 404,
-        "an unknown job must be HTTP 404, got {} with body {:?}",
+        missing.status, 400,
+        "an unknown job must be HTTP 400, got {} with body {:?}",
         missing.status, missing.body
     );
     assert_eq!(
         missing.error_code(),
-        "NotFoundException",
-        "an unknown job must be a NotFoundException, got {:?}",
+        "BadRequestException",
+        "an unknown job must be a BadRequestException, got {:?}",
         missing.body
     );
 
@@ -938,8 +953,9 @@ async fn an_unknown_job_is_not_found_and_delete_removes_a_known_one() {
         )
         .await;
     assert_eq!(
-        deleted.status, 204,
-        "DeleteTranscriptionJob answers the modelled 204, got {} with body {:?}",
+        deleted.status, 200,
+        "DeleteTranscriptionJob answers this awsJson1_1 service's success status 200, \
+         got {} with body {:?}",
         deleted.status, deleted.body
     );
     assert_eq!(
@@ -956,8 +972,8 @@ async fn an_unknown_job_is_not_found_and_delete_removes_a_known_one() {
         )
         .await;
     assert_eq!(
-        after_delete.status, 404,
-        "a deleted job must be HTTP 404, got {} with body {:?}",
+        after_delete.status, 400,
+        "a deleted job must be HTTP 400, got {} with body {:?}",
         after_delete.status, after_delete.body
     );
 

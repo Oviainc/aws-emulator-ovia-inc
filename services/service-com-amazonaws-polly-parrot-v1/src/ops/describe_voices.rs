@@ -237,20 +237,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.include_additional_language_codes,
             )
             .ok_or_else(|| {
-                DescribeVoicesErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-                    message: Some(format!(
-                        "the NextToken is invalid, or was not issued for this request's \
-                         Engine, LanguageCode and IncludeAdditionalLanguageCodes: {token}"
-                    )),
-                })
+                DescribeVoicesErrorModeled::InvalidNextTokenException(
+                    crate::service::errors::invalid_next_token(),
+                )
             })?,
             None => 0,
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            DescribeVoicesErrorModeled::ServiceFailureException(ServiceFailureException {
-                message: Some("the Amazon Polly voice catalog is unavailable".to_string()),
-            })
+            DescribeVoicesErrorModeled::ServiceFailureException(
+                crate::service::errors::service_failure(),
+            )
         })?;
 
         let guard = state.lock();

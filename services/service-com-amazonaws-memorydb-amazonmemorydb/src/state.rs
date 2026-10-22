@@ -72,6 +72,14 @@ pub const MAX_RESOURCES_PER_KIND: usize = 500;
 /// of passwords belonging to the user. The maximum is two."
 pub const MAX_PASSWORDS_PER_USER: usize = 2;
 
+/// The most tags one resource may carry.
+///
+/// `TagList` is `@length(min: 0, max: 200)` and is the shape `ListTags` reports a
+/// resource's whole tag set in, so a resource can never hold more than that many tags;
+/// `TagResource` answers a merge that would exceed it with the modelled
+/// `TagQuotaPerResourceExceeded`.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
 /// The shortest password MemoryDB accepts for a user, from the password requirements
 /// AWS documents for RBAC users ("Authenticating users with Access Control Lists"):
 /// "must be at least 16 characters and no more than 128 characters in length".
@@ -792,9 +800,17 @@ pub struct ComAmazonawsMemorydbAmazonmemorydbState {
     /// Parameter groups by `ParameterGroupName`, in name order like the maps above,
     /// so a listing over them pages stably.
     pub parameter_groups: BTreeMap<String, StoredParameterGroup>,
-    /// Tags by resource ARN, written by the `Tags` member of a create. The
-    /// `ListTags`/`TagResource` slice (still scaffolded) reads the same map.
-    pub tags: BTreeMap<String, Vec<(String, String)>>,
+    /// Tags by resource ARN: the tags of each tagged resource, under the ARN that
+    /// resource's create minted. Written by the `Tags` member of a create and by
+    /// `TagResource`/`UntagResource`, read by `ListTags` — one map, so no two of them
+    /// can report a different tag set for one resource.
+    ///
+    /// A tag KEY identifies a tag within a resource (a second tag with the same key
+    /// replaces the first), so each resource's tags are a `BTreeMap` keyed by it —
+    /// which also puts every `TagList` this service answers with in key order. "A tag
+    /// with a null Value is permitted" (`Tag`), and such a tag carries the EMPTY value
+    /// from then on, so a stored tag always has one.
+    pub tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl ComAmazonawsMemorydbAmazonmemorydbState {
@@ -898,6 +914,84 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
             }
         }
         membership
+    }
+
+    /// The modelled `TagList` of the resource at `resource_arn`, in key order, or an
+    /// empty list for a resource carrying no tags.
+    ///
+    /// Every `TagList` this service answers with is built here, from the store, so
+    /// `ListTags` and the two tag mutations cannot report different tags for one
+    /// resource.
+    pub fn tag_list(&self, resource_arn: &str) -> Vec<Tag> {
+        self.tags
+            .get(resource_arn)
+            .map(|tags| {
+                tags.iter()
+                    .map(|(key, value)| Tag {
+                        key: Some(key.clone()),
+                        value: Some(value.clone()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Replace the tags of the resource at `resource_arn`.
+    ///
+    /// An EMPTY set removes the entry rather than storing an empty one, so a resource
+    /// created without tags — including one re-created under a name whose ARN once
+    /// carried tags — starts with none of them.
+    pub fn set_tags(&mut self, resource_arn: &str, tags: BTreeMap<String, String>) {
+        if tags.is_empty() {
+            self.tags.remove(resource_arn);
+        } else {
+            self.tags.insert(resource_arn.to_string(), tags);
+        }
+    }
+
+    /// Resolve a tagging call's `ResourceArn` to the resource it names.
+    ///
+    /// Tags belong to a resource, so each of `ListTags`, `TagResource` and
+    /// `UntagResource` resolves the ARN against this store before reading or writing a
+    /// tag, rather than serving a tag set for an ARN nothing answers for:
+    ///
+    /// * an ARN that is not a MemoryDB resource ARN at all —
+    ///   [`TagTargetRejection::InvalidArn`], the 400 `InvalidARNFault`;
+    /// * a well-formed one naming no resource in this store —
+    ///   [`TagTargetRejection::NotFound`] carrying the kind whose 404 the operation
+    ///   models. A resource's ARN is STORED rather than rebuilt per call, so an ARN
+    ///   naming an existing resource in another region or account resolves to nothing
+    ///   too.
+    pub fn tag_target(&self, resource_arn: &str) -> Result<String, TagTargetRejection> {
+        let Some((kind, name)) = parse_resource_arn(resource_arn) else {
+            return Err(TagTargetRejection::InvalidArn(format!(
+                "{resource_arn} is not a valid MemoryDB resource ARN."
+            )));
+        };
+        let stored = match kind {
+            ResourceKind::Cluster => self.clusters.get(name).map(|cluster| cluster.arn.as_str()),
+            ResourceKind::Acl => self.acls.get(name).map(|acl| acl.arn.as_str()),
+            ResourceKind::User => self.users.get(name).map(|user| user.arn.as_str()),
+            ResourceKind::ParameterGroup => self
+                .parameter_groups
+                .get(name)
+                .map(|group| group.arn.as_str()),
+            // Snapshots, subnet groups and the multi-Region resources have no store in
+            // this service yet (their creates are still scaffolded), so no ARN of those
+            // kinds can name a resource that exists — which is exactly what their
+            // not-found faults say.
+            ResourceKind::Snapshot
+            | ResourceKind::SubnetGroup
+            | ResourceKind::MultiRegionCluster
+            | ResourceKind::MultiRegionParameterGroup => None,
+        };
+        if stored == Some(resource_arn) {
+            return Ok(resource_arn.to_string());
+        }
+        Err(TagTargetRejection::NotFound(
+            kind,
+            format!("{} {name} not found.", kind.label()),
+        ))
     }
 
     /// Take `user_name` out of the `UserNames` of every ACL that lists it, answering
@@ -1496,8 +1590,81 @@ pub fn page_limit(max_results: Option<i32>) -> Option<usize> {
     max_results.and_then(|max| usize::try_from(max).ok())
 }
 
-/// The `(key, value)` pairs of a request's `Tags` member, for the by-ARN tag store.
-pub fn tag_pairs(tags: Option<&Vec<Tag>>) -> Vec<(String, String)> {
+/// The name prefix of the parameter groups MemoryDB itself creates in every account
+/// (`default.memorydb-redis7`, `default.memorydb-valkey7`, …).
+///
+/// A caller neither created those groups nor owns them, so they are not a caller's to
+/// tag — see [`default_resource_rejection`].
+pub const DEFAULT_PARAMETER_GROUP_PREFIX: &str = "default.";
+
+/// The refusal for a tag mutation aimed at a resource MemoryDB itself provides, or
+/// `None` when the ARN names a resource a caller owns.
+///
+/// Tags are a caller's own metadata on a caller's own resource; the service's DEFAULT
+/// resources — the `default.<family>` parameter groups every account starts with —
+/// belong to MemoryDB, and a tag mutation on one is refused instead of written. An ARN
+/// this service cannot parse at all is not refused here: it is the ARN itself that is
+/// wrong, which the caller is told instead.
+pub fn default_resource_rejection(resource_arn: &str) -> Option<String> {
+    let (kind, name) = parse_resource_arn(resource_arn)?;
+    let is_default = match kind {
+        ResourceKind::ParameterGroup | ResourceKind::MultiRegionParameterGroup => {
+            name.starts_with(DEFAULT_PARAMETER_GROUP_PREFIX)
+        }
+        _ => false,
+    };
+    is_default.then(|| "Tagging on default resources is not supported".to_string())
+}
+
+/// The tag-key prefix AWS reserves for itself.
+///
+/// From AWS's tagging rules (and "Tagging your MemoryDB resources"): "Do not use the
+/// `aws:` prefix in your tag names or values because it is reserved for AWS use. You
+/// can't edit or delete tag names or values with this prefix." So a CALLER's tag key
+/// may not carry it, in any letter case, and neither a create nor a tag mutation
+/// accepts one.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// What is wrong with a caller-supplied tag key, or `None` when the caller may use it.
+///
+/// Two rules, both holding wherever a request carries tag keys — a create's `Tags`,
+/// `TagResource`'s `Tags` and `UntagResource`'s `TagKeys`:
+///
+/// * `Tag$Key` "may not be null", so a tag with no usable key names no tag at all;
+/// * the `aws:` prefix is reserved ([`RESERVED_TAG_KEY_PREFIX`]), so a caller can
+///   neither write nor remove a key that carries it.
+pub fn tag_key_rejection(key: &str) -> Option<String> {
+    if key.is_empty() {
+        return Some("A tag key may not be null or empty.".to_string());
+    }
+    if key
+        .to_ascii_lowercase()
+        .starts_with(RESERVED_TAG_KEY_PREFIX)
+    {
+        return Some(format!(
+            "Tag keys cannot start with the reserved prefix {RESERVED_TAG_KEY_PREFIX:?}."
+        ));
+    }
+    None
+}
+
+/// The first thing wrong with a request's `Tags` member, or `None` when every tag in it
+/// is one a caller may write. A request carrying no `Tags` at all breaks no rule.
+pub fn tags_rejection(tags: Option<&Vec<Tag>>) -> Option<String> {
+    tags?
+        .iter()
+        .find_map(|tag| tag_key_rejection(tag.key.as_deref().unwrap_or_default()))
+}
+
+/// The tags of a request's `Tags` member, for the by-ARN tag store.
+///
+/// Keyed by tag key, so a request repeating a key leaves ONE tag on the resource (the
+/// last value it gave) instead of two a later read would have to choose between. "A tag
+/// with a null Value is permitted" (`Tag`) and carries the EMPTY value once stored, so
+/// every tag this service reports has a `Value`. A tag whose `Key` the request omitted
+/// lands under the empty key, which the tag mutations refuse up front (`Tag$Key` "may
+/// not be null").
+pub fn tag_map(tags: Option<&Vec<Tag>>) -> BTreeMap<String, String> {
     tags.map(|tags| {
         tags.iter()
             .map(|tag| {
@@ -1509,6 +1676,104 @@ pub fn tag_pairs(tags: Option<&Vec<Tag>>) -> Vec<(String, String)> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// The kind of resource a MemoryDB ARN names, which is what decides WHICH not-found
+/// fault a tagging call answers with for an ARN this store does not hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Cluster,
+    Acl,
+    User,
+    ParameterGroup,
+    Snapshot,
+    SubnetGroup,
+    MultiRegionCluster,
+    MultiRegionParameterGroup,
+}
+
+impl ResourceKind {
+    /// How a message names this kind of resource.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cluster => "Cluster",
+            Self::Acl => "ACL",
+            Self::User => "User",
+            Self::ParameterGroup => "Parameter group",
+            Self::Snapshot => "Snapshot",
+            Self::SubnetGroup => "Subnet group",
+            Self::MultiRegionCluster => "Multi-Region cluster",
+            Self::MultiRegionParameterGroup => "Multi-Region parameter group",
+        }
+    }
+}
+
+/// The resource-type segment of each kind of MemoryDB ARN.
+///
+/// The first four are the segments this service's own ARN builders mint
+/// ([`cluster_arn`], [`acl_arn`], [`user_arn`], [`parameter_group_arn`]); the rest are
+/// the remaining resource types whose absence `ListTags`/`TagResource`/`UntagResource`
+/// each model a not-found fault for. A segment that is in neither list names no
+/// taggable MemoryDB resource, so an ARN carrying it is refused as invalid.
+const RESOURCE_TYPE_SEGMENTS: &[(&str, ResourceKind)] = &[
+    ("cluster", ResourceKind::Cluster),
+    ("acl", ResourceKind::Acl),
+    ("user", ResourceKind::User),
+    ("parametergroup", ResourceKind::ParameterGroup),
+    ("snapshot", ResourceKind::Snapshot),
+    ("subnetgroup", ResourceKind::SubnetGroup),
+    ("multiregioncluster", ResourceKind::MultiRegionCluster),
+    (
+        "multiregionparametergroup",
+        ResourceKind::MultiRegionParameterGroup,
+    ),
+];
+
+/// The kind and name a MemoryDB resource ARN carries, or `None` when it is not one.
+///
+/// The shape is the one every ARN this service mints has (see [`cluster_arn`]):
+/// `arn:<partition>:memorydb:<region>:<account>:<type>/<name>`, with a non-empty
+/// partition, region and account, a resource type from [`RESOURCE_TYPE_SEGMENTS`] and a
+/// non-empty resource name. The service segment must be this service's
+/// ([`ARN_NAMESPACE`]): another service's ARN names no MemoryDB resource.
+pub fn parse_resource_arn(resource_arn: &str) -> Option<(ResourceKind, &str)> {
+    let mut fields = resource_arn.splitn(6, ':');
+    let prefix = fields.next()?;
+    let partition = fields.next()?;
+    let service = fields.next()?;
+    let region = fields.next()?;
+    let account = fields.next()?;
+    let resource = fields.next()?;
+    if prefix != "arn"
+        || partition.is_empty()
+        || service != ARN_NAMESPACE
+        || region.is_empty()
+        || account.is_empty()
+    {
+        return None;
+    }
+    let (resource_type, name) = resource.split_once('/')?;
+    if name.is_empty() {
+        return None;
+    }
+    let (_, kind) = RESOURCE_TYPE_SEGMENTS
+        .iter()
+        .find(|(segment, _)| *segment == resource_type)?;
+    Some((*kind, name))
+}
+
+/// Why a tagging call's `ResourceArn` names no resource of this service
+/// (see [`ComAmazonawsMemorydbAmazonmemorydbState::tag_target`]).
+///
+/// Carries the MESSAGE and, for a resolved kind, the kind — not a modelled error: each
+/// of the three tagging operations declares its own error enum, so each lifts this into
+/// its own `InvalidARNFault` / per-kind not-found variant.
+#[derive(Debug, Clone)]
+pub enum TagTargetRejection {
+    /// The ARN is not a MemoryDB resource ARN at all: the 400 `InvalidARNFault`.
+    InvalidArn(String),
+    /// The ARN is well formed but names no resource in this store: that kind's 404.
+    NotFound(ResourceKind, String),
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

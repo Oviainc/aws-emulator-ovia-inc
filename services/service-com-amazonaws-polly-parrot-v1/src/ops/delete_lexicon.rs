@@ -138,19 +138,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            DeleteLexiconErrorModeled::ServiceFailureException(ServiceFailureException {
-                message: Some("the Amazon Polly lexicon store is unavailable".to_string()),
-            })
+            DeleteLexiconErrorModeled::ServiceFailureException(
+                crate::service::errors::service_failure(),
+            )
         })?;
 
         // `remove` returning `None` is the 404: the name named nothing to delete.
         state.lock().lexicons.remove(&input.name).ok_or_else(|| {
-            DeleteLexiconErrorModeled::LexiconNotFoundException(LexiconNotFoundException {
-                message: Some(format!(
-                    "Amazon Polly can't find the specified lexicon: {}",
-                    input.name
-                )),
-            })
+            DeleteLexiconErrorModeled::LexiconNotFoundException(
+                crate::service::errors::lexicon_not_found(),
+            )
         })?;
 
         Ok(DeleteLexiconOutput {})

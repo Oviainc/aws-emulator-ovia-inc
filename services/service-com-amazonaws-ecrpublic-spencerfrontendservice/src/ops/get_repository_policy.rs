@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRepositoryPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRepositoryPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRepositoryPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the repository policy document stored on a repository in [`crate::state`],
+//! byte for byte as `SetRepositoryPolicy` supplied it. A read only: a repository that
+//! carries no policy is answered with the modelled
+//! `RepositoryPolicyNotFoundException`, never with an empty document.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRepositoryPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRepositoryPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRepositoryPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRepositoryPolicyErrorModeled::ServerException(ServerException {
+                message: Some(
+                    "The ECR Public emulator could not reach its state store.".to_string(),
+                ),
+            })
+            .into());
+        };
+
+        let store = state.lock();
+        if let Some(registry_id) = input.registry_id.as_deref() {
+            if !store.is_this_registry(registry_id) {
+                return Err(GetRepositoryPolicyErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "Invalid parameter at 'registryId' failed to satisfy constraint: \
+                             'Member must name the public registry of this account ({})'",
+                            store.registry_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+        let registry_id = store.registry_id.clone();
+        let Some(repository) = store.repositories.get(&input.repository_name) else {
+            return Err(GetRepositoryPolicyErrorModeled::RepositoryNotFoundException(
+                RepositoryNotFoundException {
+                    message: Some(format!(
+                        "The repository with name '{}' does not exist in the registry with id \
+                         '{registry_id}'",
+                        input.repository_name
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some(policy_text) = repository.policy_text.clone() else {
+            return Err(
+                GetRepositoryPolicyErrorModeled::RepositoryPolicyNotFoundException(
+                    RepositoryPolicyNotFoundException {
+                        message: Some(format!(
+                            "Repository policy does not exist for the repository with name \
+                             '{}' in the registry with id '{registry_id}'",
+                            input.repository_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let repository_name = repository.name.clone();
+        drop(store);
+
+        Ok(GetRepositoryPolicyOutput {
+            registry_id: Some(registry_id),
+            repository_name: Some(repository_name),
+            policy_text: Some(policy_text),
+        })
     }
 }

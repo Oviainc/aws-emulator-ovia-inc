@@ -280,18 +280,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The model has to be one this emulator recognises, and one the Converse
         // API serves: "Supported models and model features" lists base models
-        // that only `InvokeModel` serves.
+        // that only `InvokeModel` serves. An identifier the service cannot
+        // interpret is a 400; one naming a model or resource that is not
+        // available here is a 404 (see
+        // `crate::state::resolve_model_for_inference`).
         let model = {
             let guard = state.lock();
-            match guard.resolve_model(&input.model_id) {
-                Some(entry) => entry.clone(),
-                None => {
+            match guard.resolve_model_for_inference(&input.model_id) {
+                Ok(entry) => entry.clone(),
+                Err(crate::state::ModelRejection::Invalid(message)) => {
+                    return Err(validation(message))
+                }
+                Err(crate::state::ModelRejection::NotFound(message)) => {
                     return Err(ConverseErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(format!(
-                                "The provided model identifier is invalid: {}",
-                                input.model_id
-                            )),
+                            message: Some(message),
                         },
                     )
                     .into())

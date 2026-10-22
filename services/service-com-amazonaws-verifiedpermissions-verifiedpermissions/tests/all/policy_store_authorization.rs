@@ -1827,19 +1827,21 @@ async fn the_policy_store_quota_bounds_how_many_stores_exist() {
     );
 }
 
-/// `ListPolicies` is `@paginated`, so an absent `maxResults` takes the service's
-/// own default page size and an over-large one is clamped: one small request can
-/// never materialise an unbounded response.
+/// `ListPolicies` is `@paginated`, so an absent `maxResults` takes the default
+/// page size its own documentation states ("the operation defaults to 10
+/// policies per response") and an over-large one is clamped to the documented
+/// cap ("a maximum of 50 policies per response"): one small request can never
+/// materialise an unbounded response.
 #[tokio::test]
 async fn list_policies_bounds_the_page_it_builds() {
-    /// `DEFAULT_PAGE_SIZE` in `src/state.rs`.
-    const DEFAULT_PAGE_SIZE: usize = 50;
-    /// `MAX_PAGE_SIZE` in `src/state.rs`.
-    const MAX_PAGE_SIZE: usize = 200;
+    /// `DEFAULT_PAGE_SIZE` in `src/state.rs`, the documented default of 10.
+    const DEFAULT_PAGE_SIZE: usize = 10;
+    /// `MAX_PAGE_SIZE` in `src/state.rs`, the documented maximum of 50.
+    const MAX_PAGE_SIZE: usize = 50;
 
     let router = router();
     let store_id = store_with_validation_off(&router).await;
-    let total = DEFAULT_PAGE_SIZE + 10;
+    let total = MAX_PAGE_SIZE + 5;
     for n in 0..total {
         ok(
             &router,
@@ -1854,21 +1856,28 @@ async fn list_policies_bounds_the_page_it_builds() {
         .await;
     }
 
-    // Rows differ along what the caller asked for.
+    // Rows differ along what the caller asked for: nothing, below the default,
+    // between the default and the cap, exactly the cap, and past it.
     let cases: &[(&str, Value, usize, bool)] = &[
         ("no maxResults", Value::Null, DEFAULT_PAGE_SIZE, true),
-        ("maxResults below the total", json!(7), 7, true),
+        ("maxResults below the default", json!(7), 7, true),
         (
-            "maxResults above the total but below the cap",
-            json!(100),
-            total,
-            false,
+            "maxResults between the default and the cap",
+            json!(23),
+            23,
+            true,
+        ),
+        (
+            "maxResults at the cap",
+            json!(MAX_PAGE_SIZE),
+            MAX_PAGE_SIZE,
+            true,
         ),
         (
             "maxResults above the cap",
             json!(2_000),
-            total.min(MAX_PAGE_SIZE),
-            false,
+            MAX_PAGE_SIZE,
+            true,
         ),
     ];
     for (case, max_results, expected_len, expect_token) in cases {

@@ -4,6 +4,13 @@
 //! Reports one managed resource from the store: its zonal shifts in progress and the
 //! `appliedWeights` they move, both derived from the shifts the store holds.
 //!
+//! The caller's authorization on the named target is decided BEFORE the target is
+//! resolved: a `resourceIdentifier` that is not shaped like a resource ARN
+//! (`crate::state::names_a_resource_arn`) matches no resource ARN an IAM policy could
+//! have granted this action on, so it is denied `AccessDeniedException` (403) rather
+//! than looked up; only an ARN-shaped identifier reaches the store, where a resource
+//! ARC holds no record of is `ResourceNotFoundException` (404).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -164,6 +171,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // Authorization on the named target is decided BEFORE the target is resolved:
+        // an identifier that is not shaped like a resource ARN matches no resource ARN
+        // an IAM policy could have granted this action on, so it is denied rather than
+        // looked up. Only an attributable identifier reaches the store below, where a
+        // resource ARC holds no record of is reported as not found.
+        if !crate::state::names_a_resource_arn(&input.resource_identifier) {
+            return Err(GetManagedResourceErrorModeled::AccessDeniedException(
+                crate::state::identifier_not_attributable(),
+            )
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetManagedResourceError::from(GetManagedResourceErrorModeled::InternalServerException(
                 InternalServerException {

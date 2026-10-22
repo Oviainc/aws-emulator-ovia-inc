@@ -62,6 +62,20 @@
 //! [`ComAmazonawsEc2Amazonec2State::launch_template_id_for_name`] because the API lets a
 //! caller name either.
 //!
+//! ## AMIs: the published catalog, plus whatever a writer stores
+//!
+//! [`ComAmazonawsEc2Amazonec2State::images`] holds the AMIs the account can see as the
+//! modelled [`Image`] shape itself, keyed by `ImageId`, for the same reason the VPC store
+//! holds [`Vpc`]s: every member a writer sets round-trips through `DescribeImages` without
+//! a field-by-field copy that can silently drop one. Nothing in the EC2 API creates
+//! Amazon's own AMIs — "the images available to you include public images"
+//! (`DescribeImages`) — so the store starts with the public images Amazon publishes
+//! ([`published_image_specs`]), the same way it starts with the default VPC AWS creates
+//! for a fresh account, and an image a later operation registers goes beside them through
+//! [`ComAmazonawsEc2Amazonec2State::insert_image`]. Each one's `CreationDate` is the build
+//! date its published name carries, so it is the same across reads and across runs and the
+//! newest image of a name pattern is always the same image.
+//!
 //! ## The default VPC's default subnets
 //!
 //! "When we create a default VPC, we create a default subnet in each Availability Zone
@@ -89,11 +103,12 @@ use std::net::Ipv6Addr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    AvailabilityZone, AvailabilityZoneMessage, BlockPublicAccessStates, GroupIdentifier,
-    INSTANCE_TYPE_VALUES, Instance, InstanceState, InstanceTypeOffering, IpPermission, IpRange,
-    LOCATION_TYPE_VALUES, LaunchTemplate, Monitoring, OperatorResponse, Placement,
-    PrivateDnsNameOptionsOnLaunch, RequestLaunchTemplateData, RunInstancesOutput, SecurityGroup,
-    StateReason, Subnet, Tag, UserIdGroupPair, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState,
+    AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
+    EbsBlockDevice, GroupIdentifier, INSTANCE_TYPE_VALUES, Image, Instance, InstanceState,
+    InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES, LaunchTemplate, Monitoring,
+    OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch, RequestLaunchTemplateData,
+    RunInstancesOutput, SecurityGroup, StateReason, Subnet, Tag, UserIdGroupPair, Vpc,
+    VpcCidrBlockAssociation, VpcCidrBlockState,
 };
 use crate::scaffolded::Scaffolded;
 
@@ -685,6 +700,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// field-by-field copy. Ordered by id, which is the order the describe reports and
     /// pages over.
     pub subnets: BTreeMap<String, Subnet>,
+    /// Every AMI the account can see, by `ImageId`, as the modelled [`Image`] shape itself
+    /// — the Amazon-published catalog a fresh account already has (see the module docs)
+    /// plus any image a writer stores later. Ordered by id, which is the order the
+    /// describe reports and pages over.
+    pub images: BTreeMap<String, Image>,
     /// Every security group the account holds, by `GroupId`, as the modelled
     /// [`SecurityGroup`] shape itself — so a member a writer sets round-trips through
     /// `DescribeSecurityGroups` without a field-by-field copy. Ordered by id, which is the
@@ -704,7 +724,8 @@ pub struct ComAmazonawsEc2Amazonec2State {
 }
 
 /// A fresh account's EC2 state: the ambient network AWS gives it — the default VPC, that
-/// VPC's per-zone default subnets and its default security group — and nothing else.
+/// VPC's per-zone default subnets and its default security group — plus the public images
+/// Amazon publishes, and nothing else.
 impl Default for ComAmazonawsEc2Amazonec2State {
     fn default() -> Self {
         let mut state = Self {
@@ -720,6 +741,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpcs: BTreeMap::new(),
             vpc_available_at: BTreeMap::new(),
             subnets: BTreeMap::new(),
+            images: BTreeMap::new(),
             security_groups: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
             launch_template_client_tokens: HashMap::new(),
@@ -734,6 +756,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
         );
         state.insert_default_subnets(&default_vpc, DEFAULT_VPC_CIDR_BLOCK, DEFAULT_REGION);
         state.insert_default_security_group(&default_vpc, DEFAULT_REGION);
+        // After the resources of the default VPC, so the ids those are minted with do not
+        // depend on how many images the published catalog holds.
+        state.insert_published_images();
         state
     }
 }
@@ -2630,6 +2655,606 @@ pub fn require_service_state<Eng: Send + Sync + 'static, E>(
         )
     })
 }
+
+// ---------------------------------------------------------------------------
+// AMIs
+// ---------------------------------------------------------------------------
+
+/// An AMI that "is successfully registered and can be used to launch an instance"
+/// (`Image$State`): the `ImageState` enum's `available` member.
+pub const IMAGE_STATE_AVAILABLE: &str = "available";
+
+/// An AMI its owner has disabled: the `ImageState` enum's `disabled` member. Such an
+/// image is left out of a report unless the request asks for it (`IncludeDisabled`).
+pub const IMAGE_STATE_DISABLED: &str = "disabled";
+
+/// "The type of image" (`Image$ImageType`) for an AMI, as opposed to a kernel or a RAM
+/// disk image: the `ImageTypeValues` enum's `machine` member.
+pub const IMAGE_TYPE_MACHINE: &str = "machine";
+
+/// "The hypervisor type of the image. Only `xen` is supported" (`Image$Hypervisor`).
+pub const IMAGE_HYPERVISOR_XEN: &str = "xen";
+
+/// The virtualization type of every image published today: the `VirtualizationType`
+/// enum's `hvm` member (`paravirtual` is the retired alternative).
+pub const IMAGE_VIRTUALIZATION_TYPE_HVM: &str = "hvm";
+
+/// An AMI whose root volume is an Amazon EBS volume: the `DeviceType` enum's `ebs`
+/// member (`Image$RootDeviceType`).
+pub const IMAGE_ROOT_DEVICE_TYPE_EBS: &str = "ebs";
+
+/// "A value of `simple` indicates that enhanced networking with the Intel 82599 VF
+/// interface is enabled" (the `sriov-net-support` filter of `DescribeImages`).
+pub const IMAGE_SRIOV_NET_SUPPORT_SIMPLE: &str = "simple";
+
+/// The EBS volume type an image's root snapshot is restored into unless its spec names
+/// another: the `VolumeType` enum's `gp3` member.
+pub const IMAGE_ROOT_VOLUME_TYPE: &str = "gp3";
+
+/// The EBS volume type of the older published images whose own names carry it (`…-gp2`):
+/// the `VolumeType` enum's `gp2` member.
+pub const IMAGE_ROOT_VOLUME_TYPE_GP2: &str = "gp2";
+
+/// "Indicates whether deregistration protection is enabled for the AMI"
+/// (`Image$DeregistrationProtection`) — off, nothing having enabled it.
+pub const IMAGE_DEREGISTRATION_PROTECTION_DISABLED: &str = "disabled";
+
+/// `Image$BootMode`'s `uefi-preferred`: the image boots UEFI where the instance type
+/// supports it and legacy BIOS otherwise.
+pub const BOOT_MODE_UEFI_PREFERRED: &str = "uefi-preferred";
+
+/// `Image$BootMode`'s `uefi`.
+pub const BOOT_MODE_UEFI: &str = "uefi";
+
+/// `Image$BootMode`'s `legacy-bios`.
+pub const BOOT_MODE_LEGACY_BIOS: &str = "legacy-bios";
+
+/// "If `v2.0`, it indicates that IMDSv2 is specified in the AMI"
+/// (`Image$ImdsSupport`).
+pub const IMDS_SUPPORT_V2: &str = "v2.0";
+
+/// "This value is set to `windows` for Windows AMIs; otherwise, it is blank"
+/// (`Image$Platform`), whose modelled `PlatformValues` enum publishes the single value
+/// `Windows` — so that is the value a stored image carries.
+pub const IMAGE_PLATFORM_WINDOWS: &str = "Windows";
+
+/// The `PlatformDetails` of a Linux image: "the platform details associated with the
+/// billing code of the AMI" (`Image$PlatformDetails`).
+pub const PLATFORM_DETAILS_LINUX: &str = "Linux/UNIX";
+
+/// The `PlatformDetails` of a Windows image.
+pub const PLATFORM_DETAILS_WINDOWS: &str = "Windows";
+
+/// The `UsageOperation` billing code of a Linux image (`Image$UsageOperation`).
+pub const USAGE_OPERATION_LINUX: &str = "RunInstances";
+
+/// The `UsageOperation` billing code of a Windows image — Amazon's billing-code table
+/// pairs `RunInstances:0002` with Windows ("Understand AMI billing information").
+pub const USAGE_OPERATION_WINDOWS: &str = "RunInstances:0002";
+
+/// The root device name of the published Linux images (`Image$RootDeviceName`).
+pub const LINUX_ROOT_DEVICE_NAME: &str = "/dev/xvda";
+
+/// The root device name of the published Windows images.
+pub const WINDOWS_ROOT_DEVICE_NAME: &str = "/dev/sda1";
+
+/// The root volume size, in GiB, of a published Linux image.
+pub const LINUX_ROOT_VOLUME_SIZE: i32 = 8;
+
+/// The root volume size, in GiB, of a published Windows image.
+pub const WINDOWS_ROOT_VOLUME_SIZE: i32 = 30;
+
+/// The owner alias Amazon's own published AMIs carry: "the owner alias (`amazon` |
+/// `aws-backup-vault` | `aws-marketplace`)" (`Image$ImageOwnerAlias`).
+pub const IMAGE_OWNER_ALIAS_AMAZON: &str = "amazon";
+
+/// Every owner alias `DescribeImagesRequest$Owners` accepts beside an account id and
+/// `self`: "you can specify a combination of Amazon Web Services account IDs, self,
+/// amazon, aws-backup-vault, and aws-marketplace".
+pub const IMAGE_OWNER_ALIASES: [&str; 3] = ["amazon", "aws-backup-vault", "aws-marketplace"];
+
+/// The account id Amazon publishes its Amazon Linux AMIs from, which the published
+/// catalog's images are owned by; `amazon` is the alias for it
+/// (`IMAGE_OWNER_ALIAS_AMAZON`).
+pub const AMAZON_IMAGE_OWNER_ID: &str = "137112412989";
+
+/// "self (the sender of the request)" — the `Owners` and `ExecutableUsers` term that
+/// names the calling account.
+pub const OWNER_SELF: &str = "self";
+
+/// "all (public AMIs)" — the `ExecutableUsers` term that names every account.
+pub const EXECUTABLE_BY_ALL: &str = "all";
+
+/// How many digits an Amazon Web Services account id has.
+pub const AWS_ACCOUNT_ID_DIGITS: usize = 12;
+
+/// How many characters of an ISO 8601 UTC timestamp carry the instant down to the
+/// second: `YYYY-MM-DDThh:mm:ss`.
+const ISO8601_SECONDS_WIDTH: usize = 19;
+
+/// How many images this store holds, so a writer cannot grow it without bound. A create
+/// asks [`ComAmazonawsEc2Amazonec2State::has_image_capacity`] first, the way a VPC create
+/// asks [`ComAmazonawsEc2Amazonec2State::has_vpc_capacity`].
+pub const MAX_IMAGES: usize = 4_096;
+
+/// The code EC2 answers for an AMI id the account can see no image for.
+pub const INVALID_AMI_ID_NOT_FOUND: &str = "InvalidAMIID.NotFound";
+
+/// The code EC2 answers for something that is not an AMI id at all.
+pub const INVALID_AMI_ID_MALFORMED: &str = "InvalidAMIID.Malformed";
+
+/// The code EC2 answers for an owner or executable-by term that is neither an account id
+/// nor one of the aliases — "you must specify a valid value for the owner or executableBy
+/// parameters, such as an Amazon Web Services account ID" (EC2 error codes,
+/// `InvalidUserID.Malformed`).
+pub const INVALID_USER_ID_MALFORMED: &str = "InvalidUserID.Malformed";
+
+/// Is `id` shaped like an AMI id?
+///
+/// An image id is `ami-` followed by 8 or 17 lowercase hexadecimal digits — the short and
+/// the long id form, the same two forms [`instance_id_is_well_formed`] accepts. EC2
+/// answers `InvalidAMIID.Malformed` for anything else, BEFORE it looks the id up, which is
+/// a different answer from `InvalidAMIID.NotFound` for a well-formed id no image has.
+pub fn image_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("ami-") else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Is `id` shaped like an Amazon Web Services account id — [`AWS_ACCOUNT_ID_DIGITS`]
+/// decimal digits?
+pub fn aws_account_id_is_well_formed(id: &str) -> bool {
+    id.len() == AWS_ACCOUNT_ID_DIGITS && id.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Does the ISO 8601 UTC timestamp `timestamp` name an instant before `reference`?
+///
+/// Both are `YYYY-MM-DDThh:mm:ss` with an optional fraction and the `Z` zone — a
+/// fixed-width UTC rendering whose lexicographic order IS its chronological order — so the
+/// comparison is made over the first [`ISO8601_SECONDS_WIDTH`] characters, which every
+/// such rendering carries whether or not it also carries a fraction.
+fn iso8601_is_before(timestamp: &str, reference: &str) -> bool {
+    fn to_the_second(value: &str) -> &str {
+        value
+            .char_indices()
+            .nth(ISO8601_SECONDS_WIDTH)
+            .map_or(value, |(index, _)| &value[..index])
+    }
+    to_the_second(timestamp) < to_the_second(reference)
+}
+
+/// Is `image` deprecated as of `now` — does it carry a `DeprecationTime` that has passed?
+///
+/// "The date and time to deprecate the AMI" (`Image$DeprecationTime`): an AMI with no such
+/// time is never deprecated, and one whose time is still in the future is not deprecated
+/// yet, so both are reported without `IncludeDeprecated`.
+pub fn image_is_deprecated(image: &Image, now: SystemTime) -> bool {
+    let reference = iso8601_utc(now);
+    image
+        .deprecation_time
+        .as_deref()
+        .is_some_and(|at| iso8601_is_before(at, &reference))
+}
+
+/// Refuse a request that named an AMI id the account can see no image for, the way EC2
+/// does: HTTP 400 `InvalidAMIID.NotFound`.
+pub fn invalid_ami_id_not_found<E>(image_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_AMI_ID_NOT_FOUND,
+        400,
+        format!("The image id '{image_id}' does not exist"),
+    )
+}
+
+/// Refuse a request that named something that is not an AMI id at all: HTTP 400
+/// `InvalidAMIID.Malformed`.
+pub fn invalid_ami_id_malformed<E>(image_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_AMI_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{image_id}'"),
+    )
+}
+
+/// Refuse an owner or executable-by term that names no account and no alias: HTTP 400
+/// `InvalidUserID.Malformed`.
+pub fn invalid_user_id_malformed<E>(user_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_USER_ID_MALFORMED,
+        400,
+        format!("Invalid user id: '{user_id}'"),
+    )
+}
+
+/// What one AMI is stored with: the facts about the image itself, everything the service
+/// derives being left to [`ComAmazonawsEc2Amazonec2State::insert_image`].
+#[derive(Debug, Clone)]
+pub struct ImageSpec {
+    /// "The name of the AMI that was provided during image creation" (`Image$Name`).
+    pub name: String,
+    /// "The description of the AMI that was provided during image creation".
+    pub description: String,
+    /// One of `ARCHITECTURE_VALUES_VALUES`.
+    pub architecture: String,
+    /// `Some(`[`IMAGE_PLATFORM_WINDOWS`]`)` for a Windows image, `None` otherwise.
+    pub platform: Option<String>,
+    /// The billing platform details ([`PLATFORM_DETAILS_LINUX`]).
+    pub platform_details: String,
+    /// The billing usage operation ([`USAGE_OPERATION_LINUX`]).
+    pub usage_operation: String,
+    /// One of `BOOT_MODE_VALUES_VALUES`, for an image that declares one.
+    pub boot_mode: Option<String>,
+    /// [`IMDS_SUPPORT_V2`] for an image that requires IMDSv2.
+    pub imds_support: Option<String>,
+    /// The root device name of the image's block device mapping.
+    pub root_device_name: String,
+    /// The size, in GiB, of the root volume the image's snapshot restores into.
+    pub root_volume_size: i32,
+    /// The EBS volume type that volume is created as.
+    pub root_volume_type: String,
+    /// One of `IMAGE_STATE_VALUES`.
+    pub state: String,
+    /// "Indicates whether the image has public launch permissions" (`Image$Public`).
+    pub public: bool,
+    /// The account that owns the image.
+    pub owner_id: String,
+    /// The owner's alias, for an image published under one.
+    pub owner_alias: Option<String>,
+    /// "The date and time the image was created" (`Image$CreationDate`), an ISO 8601 UTC
+    /// timestamp.
+    pub creation_date: String,
+    /// "The date and time to deprecate the AMI" (`Image$DeprecationTime`), for an image
+    /// that carries one.
+    pub deprecation_time: Option<String>,
+    /// "Indicates whether the image is eligible for Amazon Web Services Free Tier".
+    pub free_tier_eligible: bool,
+    /// "The name of the public Systems Manager parameter that resolves to this AMI",
+    /// for an image one resolves to.
+    pub public_ssm_parameter_name: Option<String>,
+    /// "Any tags assigned to the image" (`Image$Tags`).
+    pub tags: Vec<Tag>,
+}
+
+/// An EBS-backed Linux machine image of the calling account, created now and available:
+/// the shape of an image a register or create operation stores. Every published catalog
+/// row below starts from [`published_amazon_image`], which starts from this.
+impl Default for ImageSpec {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            architecture: "x86_64".to_string(),
+            platform: None,
+            platform_details: PLATFORM_DETAILS_LINUX.to_string(),
+            usage_operation: USAGE_OPERATION_LINUX.to_string(),
+            boot_mode: None,
+            imds_support: None,
+            root_device_name: LINUX_ROOT_DEVICE_NAME.to_string(),
+            root_volume_size: LINUX_ROOT_VOLUME_SIZE,
+            root_volume_type: IMAGE_ROOT_VOLUME_TYPE.to_string(),
+            state: IMAGE_STATE_AVAILABLE.to_string(),
+            public: false,
+            owner_id: ::engine::emulator_account_id().to_string(),
+            owner_alias: None,
+            creation_date: iso8601_utc(SystemTime::now()),
+            deprecation_time: None,
+            free_tier_eligible: false,
+            public_ssm_parameter_name: None,
+            tags: Vec::new(),
+        }
+    }
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another image fits inside the store's ceiling ([`MAX_IMAGES`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// instead of growing the store past its ceiling.
+    pub fn has_image_capacity(&self) -> bool {
+        self.images.len() < MAX_IMAGES
+    }
+
+    /// Store an AMI, and answer the `ImageId` it was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller — the image's own id, the snapshot id of its root block device mapping, the
+    /// manifest location `<owner>/<name>` the `manifest-location` filter selects on, and
+    /// the fixed facts of an EBS-backed HVM machine image — so two writers cannot report
+    /// the same image differently. Like [`Self::insert_vpc`], the caller-chosen bytes of
+    /// `spec.tags` are charged against the store's byte budget here.
+    pub fn insert_image(&mut self, spec: ImageSpec) -> String {
+        let image_id = self.next_id("ami");
+        let snapshot_id = self.next_id("snap");
+        let owner = spec
+            .owner_alias
+            .clone()
+            .unwrap_or_else(|| spec.owner_id.clone());
+        let image = Image {
+            platform_details: Some(spec.platform_details),
+            usage_operation: Some(spec.usage_operation),
+            // "Any block device mapping entries" (`Image$BlockDeviceMappings`): the root
+            // volume's, restored from the snapshot minted above.
+            block_device_mappings: Some(vec![BlockDeviceMapping {
+                ebs: Some(EbsBlockDevice {
+                    delete_on_termination: Some(true),
+                    snapshot_id: Some(snapshot_id),
+                    volume_size: Some(spec.root_volume_size),
+                    volume_type: Some(spec.root_volume_type),
+                    encrypted: Some(false),
+                    iops: None,
+                    kms_key_id: None,
+                    throughput: None,
+                    outpost_arn: None,
+                    availability_zone: None,
+                    volume_initialization_rate: None,
+                    availability_zone_id: None,
+                    ebs_card_index: None,
+                }),
+                no_device: None,
+                device_name: Some(spec.root_device_name.clone()),
+                virtual_name: None,
+            }]),
+            description: Some(spec.description),
+            ena_support: Some(true),
+            hypervisor: Some(IMAGE_HYPERVISOR_XEN.to_string()),
+            image_owner_alias: spec.owner_alias,
+            name: Some(spec.name.clone()),
+            root_device_name: Some(spec.root_device_name),
+            root_device_type: Some(IMAGE_ROOT_DEVICE_TYPE_EBS.to_string()),
+            sriov_net_support: Some(IMAGE_SRIOV_NET_SUPPORT_SIMPLE.to_string()),
+            // "The reason for the state change" (`Image$StateReason`): an image that
+            // never left `available` has had no state change to report.
+            state_reason: None,
+            tags: Some(spec.tags),
+            virtualization_type: Some(IMAGE_VIRTUALIZATION_TYPE_HVM.to_string()),
+            boot_mode: spec.boot_mode,
+            // NitroTPM is not configured for any image this store holds.
+            tpm_support: None,
+            deprecation_time: spec.deprecation_time,
+            imds_support: spec.imds_support,
+            // Set only "if the AMI was created using CreateImage" (`Image$SourceInstanceId`).
+            source_instance_id: None,
+            deregistration_protection: Some(
+                IMAGE_DEREGISTRATION_PROTECTION_DISABLED.to_string(),
+            ),
+            // "when the AMI was last used to launch an EC2 instance … there is a 24-hour
+            // delay before that usage is reported" (`Image$LastLaunchedTime`), so an
+            // image this store has only just published reports none.
+            last_launched_time: None,
+            // "If `true`, the AMI satisfies the criteria for Allowed AMIs"
+            // (`Image$ImageAllowed`). This account declares no Allowed AMIs criteria, so
+            // every image it can see satisfies them.
+            image_allowed: Some(true),
+            // Set only for an image copied from another (`CopyImage`).
+            source_image_id: None,
+            source_image_region: None,
+            free_tier_eligible: Some(spec.free_tier_eligible),
+            public_ssm_parameter_name: spec.public_ssm_parameter_name,
+            // No watermark is attached until something attaches one.
+            image_watermarks: Some(Vec::new()),
+            // An image whose owner published no instance-type specification is
+            // compatible with every instance type its architecture offers.
+            instance_type_specification: None,
+            image_id: Some(image_id.clone()),
+            // "The location of the AMI" (`Image$ImageLocation`): `<owner>/<name>`, the
+            // manifest location the `manifest-location` filter selects on.
+            image_location: Some(format!("{owner}/{}", spec.name)),
+            state: Some(spec.state),
+            owner_id: Some(spec.owner_id),
+            creation_date: Some(spec.creation_date),
+            public: Some(spec.public),
+            // No product code: nothing here is a Marketplace or paid image.
+            product_codes: Some(Vec::new()),
+            architecture: Some(spec.architecture),
+            image_type: Some(IMAGE_TYPE_MACHINE.to_string()),
+            // An HVM image carries neither a kernel nor a RAM disk image.
+            kernel_id: None,
+            ramdisk_id: None,
+            platform: spec.platform,
+        };
+        self.add_stored_bytes(tag_list_bytes(image.tags.as_deref().unwrap_or_default()));
+        self.images.insert(image_id.clone(), image);
+        image_id
+    }
+
+    /// Give the store the public images Amazon publishes ([`published_image_specs`]), and
+    /// answer their ids.
+    ///
+    /// "The images available to you include public images" (`DescribeImages`) and no EC2
+    /// operation creates them, so they are part of a fresh account's state the same way
+    /// its default VPC is.
+    pub fn insert_published_images(&mut self) -> Vec<String> {
+        let mut inserted = Vec::new();
+        for spec in published_image_specs() {
+            if !self.has_image_capacity() {
+                break;
+            }
+            inserted.push(self.insert_image(spec));
+        }
+        inserted
+    }
+}
+
+/// A public AMI Amazon publishes: owned by Amazon's publishing account
+/// ([`AMAZON_IMAGE_OWNER_ID`]) under the `amazon` alias, with public launch permissions,
+/// and eligible for the Free Tier as the Amazon Linux and Windows base images are.
+fn published_amazon_image(name: &str, architecture: &str, creation_date: &str) -> ImageSpec {
+    ImageSpec {
+        name: name.to_string(),
+        architecture: architecture.to_string(),
+        creation_date: creation_date.to_string(),
+        public: true,
+        owner_id: AMAZON_IMAGE_OWNER_ID.to_string(),
+        owner_alias: Some(IMAGE_OWNER_ALIAS_AMAZON.to_string()),
+        free_tier_eligible: true,
+        ..ImageSpec::default()
+    }
+}
+
+/// The public AMIs a fresh account can already see.
+///
+/// Each row is one Amazon-published image, named the way Amazon documents its published
+/// names: an Amazon Linux 2023 image is
+/// `al2023-ami[-minimal]-<version>-kernel-<kernel version>-<architecture>` and an Amazon
+/// Linux 2 image `amzn2-ami[-kernel-<kernel version>][-minimal]-hvm-<version>-<architecture>-<root volume>`
+/// (Amazon Linux 2023 User Guide, "Find an AMI"), with the build date of that version as
+/// its `CreationDate` — which is what makes "the newest `CreationDate` of the images
+/// matching a name pattern" pick the same image on every run. Two builds of the same
+/// variant are published, because that is the choice a caller resolving an AMI by name
+/// pattern has to make, and the oldest Amazon Linux 2 build carries the
+/// `DeprecationTime` its end of standard support fell on, so a deprecated image is part
+/// of the catalog rather than only of a test.
+pub fn published_image_specs() -> Vec<ImageSpec> {
+    vec![
+        ImageSpec {
+            description: "Amazon Linux 2023 AMI 2023.6.20241121.0 x86_64 HVM kernel-6.1"
+                .to_string(),
+            boot_mode: Some(BOOT_MODE_UEFI_PREFERRED.to_string()),
+            imds_support: Some(IMDS_SUPPORT_V2.to_string()),
+            public_ssm_parameter_name: Some(
+                "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64".to_string(),
+            ),
+            ..published_amazon_image(
+                "al2023-ami-2023.6.20241121.0-kernel-6.1-x86_64",
+                "x86_64",
+                "2024-11-21T04:40:03.000Z",
+            )
+        },
+        ImageSpec {
+            description: "Amazon Linux 2023 AMI 2023.6.20241121.0 arm64 HVM kernel-6.1"
+                .to_string(),
+            boot_mode: Some(BOOT_MODE_UEFI.to_string()),
+            imds_support: Some(IMDS_SUPPORT_V2.to_string()),
+            public_ssm_parameter_name: Some(
+                "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64".to_string(),
+            ),
+            ..published_amazon_image(
+                "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
+                "arm64",
+                "2024-11-21T04:40:03.000Z",
+            )
+        },
+        ImageSpec {
+            description: "Amazon Linux 2023 AMI 2023.6.20241121.0 x86_64 HVM kernel-6.1 Minimal"
+                .to_string(),
+            boot_mode: Some(BOOT_MODE_UEFI_PREFERRED.to_string()),
+            imds_support: Some(IMDS_SUPPORT_V2.to_string()),
+            public_ssm_parameter_name: Some(
+                "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-x86_64"
+                    .to_string(),
+            ),
+            ..published_amazon_image(
+                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-x86_64",
+                "x86_64",
+                "2024-11-21T04:40:03.000Z",
+            )
+        },
+        ImageSpec {
+            description: "Amazon Linux 2023 AMI 2023.6.20241121.0 arm64 HVM kernel-6.1 Minimal"
+                .to_string(),
+            boot_mode: Some(BOOT_MODE_UEFI.to_string()),
+            imds_support: Some(IMDS_SUPPORT_V2.to_string()),
+            public_ssm_parameter_name: Some(
+                "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-arm64"
+                    .to_string(),
+            ),
+            ..published_amazon_image(
+                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
+                "arm64",
+                "2024-11-21T04:40:03.000Z",
+            )
+        },
+        // The previous build of the same two variants: an older `CreationDate`, and no
+        // public Systems Manager parameter, which resolves to the latest build only.
+        ImageSpec {
+            description: "Amazon Linux 2023 AMI 2023.5.20240903.0 x86_64 HVM kernel-6.1"
+                .to_string(),
+            boot_mode: Some(BOOT_MODE_UEFI_PREFERRED.to_string()),
+            imds_support: Some(IMDS_SUPPORT_V2.to_string()),
+            ..published_amazon_image(
+                "al2023-ami-2023.5.20240903.0-kernel-6.1-x86_64",
+                "x86_64",
+                "2024-09-03T22:17:11.000Z",
+            )
+        },
+        ImageSpec {
+            description: "Amazon Linux 2023 AMI 2023.5.20240903.0 x86_64 HVM kernel-6.1 Minimal"
+                .to_string(),
+            boot_mode: Some(BOOT_MODE_UEFI_PREFERRED.to_string()),
+            imds_support: Some(IMDS_SUPPORT_V2.to_string()),
+            ..published_amazon_image(
+                "al2023-ami-minimal-2023.5.20240903.0-kernel-6.1-x86_64",
+                "x86_64",
+                "2024-09-03T22:17:11.000Z",
+            )
+        },
+        ImageSpec {
+            description: "Amazon Linux 2 Kernel 5.10 AMI 2.0.20241113.1 x86_64 HVM gp2"
+                .to_string(),
+            boot_mode: Some(BOOT_MODE_LEGACY_BIOS.to_string()),
+            root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
+            public_ssm_parameter_name: Some(
+                "/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-x86_64-gp2"
+                    .to_string(),
+            ),
+            ..published_amazon_image(
+                "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
+                "x86_64",
+                "2024-11-13T18:21:48.000Z",
+            )
+        },
+        ImageSpec {
+            description: "Amazon Linux 2 AMI 2.0.20241113.1 x86_64 HVM ebs Minimal".to_string(),
+            boot_mode: Some(BOOT_MODE_LEGACY_BIOS.to_string()),
+            root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
+            ..published_amazon_image(
+                "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
+                "x86_64",
+                "2024-11-13T18:21:48.000Z",
+            )
+        },
+        // Amazon Linux 2 reached the end of its standard support on 2025-06-30 (Amazon
+        // Linux FAQs), which is the `DeprecationTime` the builds from before it carry.
+        ImageSpec {
+            description: "Amazon Linux 2 AMI 2.0.20230119.1 x86_64 HVM gp2".to_string(),
+            boot_mode: Some(BOOT_MODE_LEGACY_BIOS.to_string()),
+            root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
+            deprecation_time: Some("2025-06-30T00:00:00.000Z".to_string()),
+            ..published_amazon_image(
+                "amzn2-ami-hvm-2.0.20230119.1-x86_64-gp2",
+                "x86_64",
+                "2023-01-19T18:33:27.000Z",
+            )
+        },
+        ImageSpec {
+            description: "Microsoft Windows Server 2022 Full Locale English AMI provided by Amazon"
+                .to_string(),
+            platform: Some(IMAGE_PLATFORM_WINDOWS.to_string()),
+            platform_details: PLATFORM_DETAILS_WINDOWS.to_string(),
+            usage_operation: USAGE_OPERATION_WINDOWS.to_string(),
+            boot_mode: Some(BOOT_MODE_UEFI_PREFERRED.to_string()),
+            root_device_name: WINDOWS_ROOT_DEVICE_NAME.to_string(),
+            root_volume_size: WINDOWS_ROOT_VOLUME_SIZE,
+            public_ssm_parameter_name: Some(
+                "/aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base"
+                    .to_string(),
+            ),
+            ..published_amazon_image(
+                "Windows_Server-2022-English-Full-Base-2024.11.13",
+                "x86_64",
+                "2024-11-13T07:36:19.000Z",
+            )
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Pagination tokens
+// ---------------------------------------------------------------------------
 
 /// The marker every token this service mints carries, ahead of the checksum and the
 /// cursor itself: a token a caller assembled carries neither, so it is detectable rather

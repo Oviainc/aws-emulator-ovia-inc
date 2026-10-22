@@ -70,6 +70,39 @@ pub fn target_unavailable() -> AccessDeniedException {
     }
 }
 
+/// The prefix every Amazon Resource Name carries, which is the whole of what
+/// `ResourceArn`'s `@pattern` requires of one: `^arn:.*$`
+/// (`smithy_query(query="shape", shape="ResourceArn")`). `ResourceIdentifier` — the
+/// member a caller names a resource by — declares no pattern of its own, and its
+/// documentation says "The identifier is the Amazon Resource Name (ARN) for the
+/// resource", so this is the shape an identifier has to take to name one at all.
+pub const RESOURCE_ARN_PREFIX: &str = "arn:";
+
+/// Whether `identifier` is shaped like the resource ARN a `resourceIdentifier` names.
+#[must_use]
+pub fn names_a_resource_arn(identifier: &str) -> bool {
+    identifier.starts_with(RESOURCE_ARN_PREFIX)
+}
+
+/// The refusal a resource-scoped operation answers for a `resourceIdentifier`
+/// authorization cannot evaluate at all: one that is not shaped like a resource ARN
+/// ([`names_a_resource_arn`]).
+///
+/// An IAM policy grants an ARC action on RESOURCE ARNS, and the caller's authorization
+/// on the named target is decided before the service resolves it, so an identifier that
+/// cannot be an ARN matches no granted pattern and the call is denied — 403
+/// `AccessDeniedException` — rather than looked up and reported missing. It carries NO
+/// message: `AccessDeniedException$message` is optional in the model, and a denial taken
+/// before the target was resolved has nothing to report about it (a refusal recorded
+/// from ARC for a non-ARN identifier carries an empty message). An identifier that IS
+/// ARN-shaped is attributable, so it is resolved: one ARC holds no record of is that
+/// operation's own `ResourceNotFoundException` (404) or, for a mutation,
+/// [`target_unavailable`].
+#[must_use]
+pub fn identifier_not_attributable() -> AccessDeniedException {
+    AccessDeniedException { message: None }
+}
+
 /// A zonal shift's lifecycle status.
 ///
 /// The model's `ZonalShiftStatus` enum (`ACTIVE`, `EXPIRED`, `CANCELED`):

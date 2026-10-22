@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMarketplaceRevenueShares
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMarketplaceRevenueShares`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMarketplaceRevenueShares::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the revenue shares stored in one catalog, honouring
+//! the product-id, product-code and creation-date filters.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +156,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMarketplaceRevenueShares` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMarketplaceRevenueSharesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMarketplaceRevenueShares"))
+        // A reporting operation: it reads the store and writes nothing.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListMarketplaceRevenueSharesErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let catalog = crate::state::parse_catalog(&input.catalog).map_err(validation)?;
+        // `SortBy` declares exactly one field; absent, the list is in the store's
+        // own stable order, which is `ProductId` ascending.
+        let sort_by_last_modified = match input.sort_by.as_deref() {
+            None | Some("") => false,
+            Some("LastModifiedDate") => true,
+            Some(_) => {
+                return Err(validation(crate::state::invalid_enum(
+                    "SortBy",
+                    MARKETPLACE_REVENUE_SHARE_SORT_BY_VALUES,
+                )))
+            }
+        };
+        // The model states no default for this list's `SortOrder`, so an absent
+        // one leaves the store's ascending order in place.
+        let sort_order = match input.sort_order.as_deref() {
+            None | Some("") => crate::state::SortOrder::Ascending,
+            Some(value) => match crate::state::SortOrder::from_wire(value) {
+                Some(order) => order,
+                None => {
+                    return Err(validation(crate::state::invalid_enum(
+                        "SortOrder",
+                        SORT_ORDER_VALUES,
+                    )))
+                }
+            },
+        };
+
+        if let Some(requested) = input.max_results.filter(|value| *value < 1) {
+            return Err(validation(crate::state::invalid_max_results(requested)));
+        }
+
+        let state = state.lock();
+        let mut rows: Vec<((i64, u32, String), String, MarketplaceRevenueShareSummary)> =
+            Vec::new();
+        for ((share_catalog, product_id), share) in &state.marketplace_revenue_shares {
+            if *share_catalog != catalog {
+                continue;
+            }
+            if input
+                .product_ids
+                .as_ref()
+                .is_some_and(|wanted| !wanted.contains(product_id))
+            {
+                continue;
+            }
+            if input
+                .product_codes
+                .as_ref()
+                .is_some_and(|wanted| !wanted.contains(&share.product_code))
+            {
+                continue;
+            }
+            let created = crate::state::epoch_whole_seconds(share.created_date);
+            // Neither `CreatedAfter` nor `CreatedBefore` carries inclusivity
+            // wording in this operation's contract — unlike
+            // `ListMarketplaceRevenueShareAllocations`, whose `AfterEffectiveFrom`
+            // is documented "Inclusive lower bound" and whose
+            // `BeforeEffectiveFrom` is documented "Exclusive upper bound
+            // (half-open range)" — so applying BOTH strictly here is the
+            // EMULATOR's own rule, not a modelled one: a share created within the
+            // bound's own second is outside the window. The comparison is at
+            // whole-second granularity, which is the precision a bound survives
+            // this protocol's timestamp encoding at (see
+            // `state::epoch_whole_seconds`), so a bound a caller echoes back from
+            // a `CreatedDate` means exactly that instant. The tests pin both
+            // boundaries.
+            if input
+                .created_after
+                .as_ref()
+                .is_some_and(|after| created <= crate::state::wire_whole_seconds(*after))
+            {
+                continue;
+            }
+            if input
+                .created_before
+                .as_ref()
+                .is_some_and(|before| created >= crate::state::wire_whole_seconds(*before))
+            {
+                continue;
+            }
+            // Both counts are derived from the stored allocations at the share's
+            // latest revision, never held as a field.
+            let (total, active) = share.allocation_counts_at(share.revision);
+            let sort_key = if sort_by_last_modified {
+                let (secs, nanos) = crate::state::epoch_parts(share.last_modified_date());
+                (secs, nanos, product_id.clone())
+            } else {
+                (0, 0, product_id.clone())
+            };
+            rows.push((
+                sort_key,
+                product_id.clone(),
+                MarketplaceRevenueShareSummary {
+                    product_id: share.product_id.clone(),
+                    arn: share.arn.clone(),
+                    catalog: Some(share.catalog.as_wire().to_string()),
+                    product_code: Some(share.product_code.clone()),
+                    // Absent: see the note on `ProductName` in `crate::state`.
+                    product_name: None,
+                    created_date: Some(crate::state::wire_timestamp(share.created_date)),
+                    last_modified_date: Some(crate::state::wire_timestamp(
+                        share.last_modified_date(),
+                    )),
+                    latest_revision: Some(share.revision),
+                    total_marketplace_revenue_share_allocation_count: Some(total),
+                    total_active_marketplace_revenue_share_allocation_count: Some(active),
+                },
+            ));
+        }
+        // `ProductId` breaks every tie, so the order is total and a page resumes
+        // at exactly the item the previous one stopped before. With `SortBy`
+        // absent the rows are already in `ProductId` order (the store iterates a
+        // `BTreeMap` keyed on it), so only a `LastModifiedDate` sort has work to
+        // do here.
+        if sort_by_last_modified {
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+        }
+        if sort_order == crate::state::SortOrder::Descending {
+            rows.reverse();
+        }
+
+        let cursors: Vec<String> = rows.iter().map(|row| row.1.clone()).collect();
+        let page = crate::state::page(&cursors, input.next_token.as_deref(), input.max_results)
+            .ok_or_else(|| validation(crate::state::invalid_next_token()))?;
+        let summaries = rows[page.start..page.end]
+            .iter()
+            .map(|row| row.2.clone())
+            .collect();
+        Ok(ListMarketplaceRevenueSharesOutput {
+            marketplace_revenue_share_summaries: summaries,
+            next_token: page.next_token,
+        })
     }
+}
+
+/// Lift a modelled `ValidationException` into this operation's error channel.
+fn validation(error: ValidationException) -> ListMarketplaceRevenueSharesError {
+    ListMarketplaceRevenueSharesErrorModeled::ValidationException(error).into()
 }

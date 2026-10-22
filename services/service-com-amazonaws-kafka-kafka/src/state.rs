@@ -9,6 +9,11 @@
 //! predicates beside it. Keeping them next to the record is what makes the two
 //! readers agree: they render the same stored cluster the same way.
 //!
+//! A cluster's configuration also changes after creation: an update operation
+//! (`UpdateConnectivity`) records a [`PendingUpdate`] on the cluster, and
+//! [`Cluster::settle`] folds it into the record once the clock owes its
+//! completion — so one place decides what every reader then reports.
+//!
 //! The channel registry lives beside it, keyed by channel ARN and indexed by
 //! (cluster ARN, channel name) — a channel is a sub-resource of the cluster it
 //! streams from, so it is only ever resolved through that cluster and disappears
@@ -24,12 +29,13 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BrokerNodeGroupInfo, BrokerSoftwareInfo, ChannelLoggingInfo, ClientAuthentication, ClusterInfo,
-    ConfigurationInfo, CreateChannelInput, CreateClusterInput, DescribeChannelOutput,
-    EncryptionAtRest, EncryptionConfiguration, EncryptionInTransit, EncryptionInfo,
-    IcebergDestinationConfiguration, JmxExporter, JmxExporterInfo, KafkaCluster,
+    ConfigurationInfo, ConnectivityInfo, CreateChannelInput, CreateClusterInput,
+    DescribeChannelOutput, EncryptionAtRest, EncryptionConfiguration, EncryptionInTransit,
+    EncryptionInfo, IcebergDestinationConfiguration, JmxExporter, JmxExporterInfo, KafkaCluster,
     KafkaClusterSummary, LoggingInfo, NodeExporter, NodeExporterInfo, OpenMonitoring,
     OpenMonitoringInfo, Prometheus, PrometheusInfo, Provisioned, Rebalancing, ReplicationInfo,
     ReplicationInfoSummary, ReplicatorSummary, S3DestinationConfiguration, TopicConfiguration,
+    ZookeeperAccess,
 };
 
 /// How long after `CreateCluster` a new cluster becomes `ACTIVE`.
@@ -39,6 +45,16 @@ use crate::ops::types::{
 /// a caller that describes the cluster immediately still observes `CREATING` (and
 /// the state errors that go with it) while a caller that waits sees `ACTIVE`.
 pub const CLUSTER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long a cluster update (`UpdateConnectivity` and the sibling update
+/// operations) stays in flight before the cluster leaves `UPDATING`.
+///
+/// CHOSEN, not documented: the real service reconfigures brokers over minutes.
+/// The project fixes an emulated clock-owed transition at 250–750 ms, so a caller
+/// that describes the cluster immediately still observes `UPDATING`, its active
+/// operation ARN and the pre-update configuration, while a caller that waits sees
+/// the new configuration and the new cluster version.
+pub const CLUSTER_UPDATE_DELAY: Duration = Duration::from_millis(500);
 
 /// The largest number of broker nodes one provisioned cluster may hold, from the
 /// `range` on `CreateClusterRequest$NumberOfBrokerNodes` (`__integerMin1Max15`,
@@ -126,6 +142,16 @@ pub const DEFAULT_STORAGE_MODE: &str = "LOCAL";
 /// documentation ("By default, a cluster uses the IPv4 network type").
 pub const DEFAULT_NETWORK_TYPE: &str = "IPV4";
 
+/// The message Amazon MSK answers a request naming a resource it does not hold.
+///
+/// A CONSTANT of the service, not built from the request: every operation that
+/// models `NotFoundException` reports this one wording, which is what the
+/// behavioural corpus records the real service answering (the apostrophe is
+/// U+2019, as the service writes it). The parameter at fault is named by
+/// `NotFoundException$InvalidParameter`, not by the message, so a reader that
+/// knows which member it was still says the same thing about the resource.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource doesn\u{2019}t exist.";
+
 /// The `ClusterType` of a cluster whose brokers this emulator provisions — one of
 /// the two values the model's `ClusterType` enum names. It is STORED on the record
 /// (see [`Cluster::cluster_type`]) rather than assumed by a reader, so a listing's
@@ -193,6 +219,49 @@ pub struct Cluster {
     pub zookeeper_connect_string: String,
     pub zookeeper_connect_string_tls: String,
     pub brokers: Vec<BrokerNode>,
+    /// Whether Apache ZooKeeper access is turned on, as
+    /// `UpdateConnectivity`'s `ZookeeperAccess` leaves it. A cluster is
+    /// provisioned with access on. The model reports this setting through
+    /// `MutableClusterInfo$ZookeeperAccess`, i.e. through the cluster-operation
+    /// readers, so it is stored here rather than rendered by `ClusterInfo`,
+    /// which models no member for it.
+    pub zookeeper_access_enabled: bool,
+    /// Which revision of its configuration the cluster is at.
+    /// [`Cluster::current_version`] is this number's token, so the version
+    /// changes exactly when a completed update changes the cluster.
+    pub revision: u64,
+    /// The update this cluster has in flight, if any: the one cluster operation
+    /// acting on it, and the change the clock owes it. `Some` is exactly what
+    /// makes the cluster `UPDATING` with an active operation ARN.
+    pub pending_update: Option<PendingUpdate>,
+}
+
+/// A cluster operation in flight: the change a caller asked for, the ARN of the
+/// operation that will apply it, and the instant the clock owes its completion.
+/// Stored, never slept on — [`Cluster::settle`] materialises it.
+#[derive(Debug, Clone)]
+pub struct PendingUpdate {
+    /// `ClusterInfo$ActiveOperationArn` while the operation runs, and the
+    /// `ClusterOperationArn` the update call answered with.
+    pub operation_arn: String,
+    /// When the operation is due to finish.
+    pub due: SystemTime,
+    /// What it changes.
+    pub change: ClusterChange,
+}
+
+/// The change one cluster operation applies. Each update operation this service
+/// implements contributes the variant describing what it changes, so a cluster
+/// holds at most one in-flight change whatever produced it.
+#[derive(Debug, Clone)]
+pub enum ClusterChange {
+    /// `UpdateConnectivity`: the broker access configuration, the ZooKeeper
+    /// access setting, or both. `None` means the request left that part of the
+    /// cluster alone.
+    Connectivity {
+        connectivity_info: Option<ConnectivityInfo>,
+        zookeeper_access: Option<ZookeeperAccess>,
+    },
 }
 
 /// A channel streaming one cluster topic to Amazon S3 or Apache Iceberg, holding
@@ -616,8 +685,9 @@ impl ComAmazonawsKafkaKafkaState {
         Some(replicator)
     }
 
-    /// The same lookup, with the `CREATING` -> `ACTIVE` transition the clock
-    /// already owed THIS cluster materialised.
+    /// The same lookup, with the transitions the clock already owed THIS cluster
+    /// materialised (`CREATING` -> `ACTIVE`, and an in-flight update whose
+    /// completion is due).
     ///
     /// Scoped to the one cluster being reported: a read must not do work
     /// proportional to the whole registry, and no other cluster's status is this
@@ -628,6 +698,20 @@ impl ComAmazonawsKafkaKafkaState {
         arn: &str,
         now: SystemTime,
     ) -> Option<&Cluster> {
+        self.settled_cluster_in_mut(region, arn, now)
+            .map(|cluster| &*cluster)
+    }
+
+    /// The same settled lookup, handed back for update — what an operation that
+    /// changes the cluster resolves it through, so a mutating call and a
+    /// reporting one agree about which clusters this endpoint holds and about
+    /// what the clock already owed them.
+    pub fn settled_cluster_in_mut(
+        &mut self,
+        region: &str,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&mut Cluster> {
         let cluster = self.clusters.get_mut(arn)?;
         if cluster.region != region {
             return None;
@@ -996,23 +1080,130 @@ impl Cluster {
                 PORT_ZOOKEEPER_TLS,
             ),
             brokers,
+            // A provisioned cluster comes up with ZooKeeper access on; only
+            // `UpdateConnectivity` turns it off.
+            zookeeper_access_enabled: true,
+            // Revision 1 is the configuration the create submitted, and
+            // `current_version` above is that revision's token.
+            revision: 1,
+            pending_update: None,
         }
     }
 
-    /// Apply the `CREATING` -> `ACTIVE` transition once `now` has reached
-    /// [`Self::active_due`]. Idempotent, and a no-op for every other state: only a
-    /// transition the clock already owed is materialised here.
+    /// Apply the transitions the clock already owes this cluster: `CREATING` ->
+    /// `ACTIVE` once `now` has reached [`Self::active_due`], and the completion
+    /// of an in-flight update once `now` has reached its
+    /// [`PendingUpdate::due`]. Idempotent, and a no-op for every other state:
+    /// nothing here depends on who called or when they called it, only on the
+    /// instants already stored.
     pub fn settle(&mut self, now: SystemTime) {
         if self.state == "CREATING" && now >= self.active_due {
             self.state = "ACTIVE".to_string();
         }
+        match self.pending_update.take() {
+            // An update completes only for a cluster that is still `UPDATING`
+            // because of it. Any other state means something else now owns the
+            // record, so the change is dropped rather than folded into a
+            // cluster that has moved on.
+            Some(update) if now >= update.due && self.state == "UPDATING" => {
+                self.apply_change(update.change);
+                // "When this update operation is successful, it generates a new
+                // cluster version" (`CurrentVersion` on every update request),
+                // so the version token follows the new revision.
+                self.revision += 1;
+                self.current_version = current_version_token(&self.arn, self.revision);
+                self.state = "ACTIVE".to_string();
+            }
+            // Due but no longer this cluster's business: dropped, changing
+            // nothing.
+            Some(dropped) if now >= dropped.due => {}
+            // Still in flight: put it back exactly as it was.
+            pending => self.pending_update = pending,
+        }
+    }
+
+    /// Start a connectivity update: the cluster enters `UPDATING` with the
+    /// returned operation as its active one, and the submitted settings become
+    /// its own when [`Self::settle`] finds the operation due.
+    ///
+    /// Nothing the readers report changes yet — the real service accepts the
+    /// call, hands back a cluster operation, and reports the new configuration
+    /// and the new cluster version only once that operation finishes.
+    ///
+    /// A submitted `ConnectivityInfo` REPLACES the cluster's broker access
+    /// configuration (the request carries the whole shape, so a member it omits
+    /// falls back to that member's default), while an omitted one leaves the
+    /// configuration alone; `ZookeeperAccess` is independent of it.
+    pub fn begin_connectivity_update(
+        &mut self,
+        now: SystemTime,
+        connectivity_info: Option<ConnectivityInfo>,
+        zookeeper_access: Option<ZookeeperAccess>,
+    ) -> String {
+        let operation_arn = self.operation_arn(self.revision + 1);
+        self.pending_update = Some(PendingUpdate {
+            operation_arn: operation_arn.clone(),
+            due: now + CLUSTER_UPDATE_DELAY,
+            change: ClusterChange::Connectivity {
+                connectivity_info,
+                zookeeper_access,
+            },
+        });
+        self.state = "UPDATING".to_string();
+        operation_arn
+    }
+
+    /// Fold a completed operation's change into the stored record, so every
+    /// reader derives the cluster's new behaviour from one place.
+    fn apply_change(&mut self, change: ClusterChange) {
+        match change {
+            ClusterChange::Connectivity {
+                connectivity_info,
+                zookeeper_access,
+            } => {
+                if let Some(info) = connectivity_info {
+                    self.broker_node_group_info.connectivity_info = Some(info);
+                }
+                if let Some(access) = zookeeper_access {
+                    // `ZookeeperAccess$Enabled` is optional; a request that
+                    // names the shape without it leaves access on, the setting a
+                    // cluster is provisioned with.
+                    self.zookeeper_access_enabled = access.enabled.unwrap_or(true);
+                }
+            }
+        }
+    }
+
+    /// The ARN of the cluster operation that takes this cluster to `revision`:
+    /// `arn:<partition>:kafka:<region>:<account>:cluster-operation/<name>/<cluster
+    /// id>/<operation id>` — the cluster's own identity followed by the
+    /// operation's id, the form an MSK cluster-operation ARN takes. A pure
+    /// function of the cluster and the revision it produces, so one operation
+    /// keeps one ARN however often it is reported.
+    fn operation_arn(&self, revision: u64) -> String {
+        let cluster_id = self.arn.rsplit_once('/').map_or("", |(_, id)| id);
+        let digest = stable_digest(&format!("{}#operation#{revision}", self.arn));
+        ::engine::emulator_arn(
+            "kafka",
+            &self.region,
+            &format!(
+                "cluster-operation/{}/{cluster_id}/{}",
+                self.name,
+                uuid_v4_shaped_from_digest(&digest)
+            ),
+        )
     }
 
     /// The cluster as `ClusterInfo`, the shape both `DescribeCluster` and
     /// `ListClusters` report.
     pub fn to_cluster_info(&self) -> ClusterInfo {
         ClusterInfo {
-            active_operation_arn: None,
+            // The operation in flight on the cluster, while one is: this is the
+            // ARN the update call that started it answered with.
+            active_operation_arn: self
+                .pending_update
+                .as_ref()
+                .map(|update| update.operation_arn.clone()),
             broker_node_group_info: Some(self.broker_node_group_info.clone()),
             rebalancing: self.rebalancing.clone(),
             client_authentication: self.client_authentication.clone(),

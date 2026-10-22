@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the tags [`crate::state`] holds for the resource `ResourceArn`
+//! names, after resolving that ARN against the store — so a tag set is only ever
+//! answered for a resource that exists.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +123,60 @@ impl From<ListTagsErrorModeled> for ListTagsError {
     }
 }
 
+/// This operation's answer to a `ResourceArn` that names no resource of this service.
+///
+/// The classification is [`crate::state::ComAmazonawsMemorydbAmazonmemorydbState::tag_target`]'s,
+/// shared with the two tag mutations; only the lift into THIS operation's error enum
+/// lives here, because each tagging operation declares its own.
+fn reject(rejection: crate::state::TagTargetRejection) -> ListTagsError {
+    use crate::state::{ResourceKind, TagTargetRejection};
+    match rejection {
+        TagTargetRejection::InvalidArn(message) => {
+            ListTagsErrorModeled::InvalidARNFault(InvalidARNFault {
+                message: Some(message),
+            })
+        }
+        TagTargetRejection::NotFound(kind, text) => {
+            let message = Some(text);
+            match kind {
+                ResourceKind::Cluster => {
+                    ListTagsErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault { message })
+                }
+                ResourceKind::Acl => {
+                    ListTagsErrorModeled::ACLNotFoundFault(ACLNotFoundFault { message })
+                }
+                ResourceKind::User => {
+                    ListTagsErrorModeled::UserNotFoundFault(UserNotFoundFault { message })
+                }
+                ResourceKind::ParameterGroup => {
+                    ListTagsErrorModeled::ParameterGroupNotFoundFault(ParameterGroupNotFoundFault {
+                        message,
+                    })
+                }
+                ResourceKind::Snapshot => {
+                    ListTagsErrorModeled::SnapshotNotFoundFault(SnapshotNotFoundFault { message })
+                }
+                ResourceKind::SubnetGroup => {
+                    ListTagsErrorModeled::SubnetGroupNotFoundFault(SubnetGroupNotFoundFault {
+                        message,
+                    })
+                }
+                ResourceKind::MultiRegionCluster => {
+                    ListTagsErrorModeled::MultiRegionClusterNotFoundFault(
+                        MultiRegionClusterNotFoundFault { message },
+                    )
+                }
+                ResourceKind::MultiRegionParameterGroup => {
+                    ListTagsErrorModeled::MultiRegionParameterGroupNotFoundFault(
+                        MultiRegionParameterGroupNotFoundFault { message },
+                    )
+                }
+            }
+        }
+    }
+    .into()
+}
+
 /// The `ListTags` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,18 +213,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTags"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in a mounted emulator (the router hands every service the
+            // one shared `InMemoryEngine`); this operation models no server fault, so
+            // the request is refused rather than answered with a canned tag list.
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "the MemoryDB store is unreachable on this engine",
+            ));
+        };
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        // The two writes a REPORT may make, neither asked for by this caller: the
+        // status transitions the clock already owed at this instant, and the users the
+        // account already had before any call — so the ARN of a built-in user resolves
+        // here exactly as it does for `DescribeUsers`.
+        state.settle(std::time::Instant::now());
+        state.ensure_builtin_users(&region);
+
+        // Tags belong to a resource: an ARN that resolves to nothing is the modelled
+        // refusal, never an empty tag list.
+        let resource_arn = state.tag_target(&input.resource_arn).map_err(reject)?;
+        Ok(ListTagsOutput {
+            tag_list: Some(state.tag_list(&resource_arn)),
+        })
     }
 }

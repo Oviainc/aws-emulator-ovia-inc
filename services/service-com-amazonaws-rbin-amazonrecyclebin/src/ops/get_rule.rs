@@ -176,8 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        let store = state.lock();
-        let Some(rule) = store.rules.get(&input.identifier) else {
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(rule) = store.rules.get_mut(&input.identifier) else {
             return Err(GetRuleErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -189,6 +190,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // A transition the clock has already made due — `pending` -> `available`, and an
+        // unlock delay that has run out — was owed at this instant whether or not
+        // anybody called, so report the state the clock reached rather than the one the
+        // last writer left behind.
+        rule.settle(now);
         Ok(GetRuleOutput {
             identifier: Some(rule.identifier.clone()),
             description: rule.description.clone(),

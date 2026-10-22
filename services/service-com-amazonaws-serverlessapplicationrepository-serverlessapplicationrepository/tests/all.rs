@@ -15,6 +15,8 @@
 mod application_metadata;
 #[path = "all/application_mutations.rs"]
 mod application_mutations;
+#[path = "all/application_policies.rs"]
+mod application_policies;
 #[path = "all/applications.rs"]
 mod applications;
 #[path = "all/error_bodies.rs"]

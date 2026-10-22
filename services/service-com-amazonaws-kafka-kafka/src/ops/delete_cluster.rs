@@ -171,14 +171,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let mut state = state.lock();
 
-        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
+        // Resolved through the settling lookup: the version checked below is
+        // the cluster's own, and a completed update changes it, so the delete
+        // must see the transitions the clock already owed this cluster.
+        let Some(cluster) = state.settled_cluster_in(
+            &region,
+            &input.cluster_arn,
+            std::time::SystemTime::now(),
+        ) else {
             return Err(
                 DeleteClusterErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("ClusterArn".to_string()),
-                    message: Some(format!(
-                        "No cluster exists in {region} with the ARN {}",
-                        input.cluster_arn
-                    )),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 })
                 .into(),
             );

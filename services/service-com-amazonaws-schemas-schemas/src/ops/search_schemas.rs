@@ -156,9 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reports the ARNs the
-        // creates stored rather than deriving any, so it needs nothing from it.
-        let _ = ctx;
+        // A schema a caller created reports the ARN that create stored; one in a
+        // service-owned registry was created by no request, so its ARN names the
+        // region THIS request is signed for.
+        let region = crate::state::request_region(ctx.parts());
         // The model gives `Limit` no range: fewer than one item is not a page, and
         // more than `MAX_PAGE_SIZE` would materialise the whole selected store into
         // one response, so the handler owns both bounds — the same bounds every
@@ -227,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into_iter()
                     .map(|schema| SearchSchemaSummary {
                         registry_name: Some(input.registry_name.clone()),
-                        schema_arn: Some(schema.arn.clone()),
+                        schema_arn: Some(registry.schema_arn_in(&region, schema)),
                         schema_name: Some(schema.name.clone()),
                         // "An array of schema version summaries": one entry per
                         // version this service holds for the schema, in version

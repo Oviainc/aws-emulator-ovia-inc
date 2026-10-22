@@ -163,14 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Returns all the tags on the specified Application Auto Scaling scalable
         // target" — so an ARN no registered target carries is a 404 rather than an empty
-        // tag set: the two are different answers and a client tells them apart.
+        // tag set: the two are different answers and a client tells them apart. Either
+        // the target is registered or it is not, which is what the message states; the
+        // ARN asked about is reported in `ResourceName`.
         let Some(record) = record else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "No scalable target found for resource {}",
-                        input.resource_arn
-                    )),
+                    message: Some(crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE.to_string()),
                     // The member's own documentation: "The name of the Application Auto
                     // Scaling resource. This value is an Amazon Resource Name (ARN)."
                     resource_name: Some(input.resource_arn.clone()),

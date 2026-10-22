@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteLayout
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteLayout`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteLayout::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A DELETE of one layout of a domain. The service's delete is a SOFT delete: the
+//! record stays readable through `GetLayout`, is refused by `UpdateLayout` and drops
+//! out of `ListLayouts` — exactly what this operation's own documentation says happens
+//! "after a layout is deleted". So this handler marks the stored layout deleted rather
+//! than dropping it, and the operation is `@idempotent`: deleting a layout that is
+//! already deleted succeeds and changes nothing.
+//!
+//! The documentation calls the refusal of an update of a deleted layout a
+//! `ValidationException`; the service's RECORDED answer is `ResourceNotFoundException`
+//! (404) — the behavioural unit `connectcases.layout-create-update-content-round-trip`
+//! of corpus `simparity-behavioral-aws-v1` asserts that code — so that is what
+//! `UpdateLayout` returns for this flag.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +157,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteLayout` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteLayoutErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteLayout"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteLayoutErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // Both ids are resolved against the store before anything is written: a
+        // layout is scoped to its domain, so an unknown domain and a layout the
+        // named domain does not hold are both the modelled 404.
+        let domain = store
+            .domain_mut(&input.domain_id)
+            .map_err(DeleteLayoutErrorModeled::ResourceNotFoundException)?;
+        let Some(layout) = domain.layouts.get_mut(&input.layout_id) else {
+            return Err(DeleteLayoutErrorModeled::ResourceNotFoundException(
+                crate::state::not_found("Layout", &input.layout_id),
+            )
+            .into());
+        };
+
+        // A soft delete: the record is kept and flagged, because after a delete
+        // "You can still retrieve the layout by calling GetLayout" while
+        // `UpdateLayout` must refuse it and `ListLayouts` must leave it out:
+        // all three read this flag. The operation is `@idempotent`, so a repeat
+        // delete succeeds; `lastModifiedTime` is "Timestamp at which the
+        // resource was created or last modified", so it moves only on the call
+        // that actually changed the record.
+        if !layout.deleted {
+            layout.deleted = true;
+            layout.last_modified_time = now;
+        }
+
+        // The documented success: HTTP 200 with an empty body.
+        Ok(DeleteLayoutOutput {})
     }
 }

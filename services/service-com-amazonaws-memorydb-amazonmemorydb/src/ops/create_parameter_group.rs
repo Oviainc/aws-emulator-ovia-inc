@@ -163,6 +163,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let region = crate::state::request_region(ctx);
+        // The request's tag keys are refused before the group is created: `Tag$Key` may
+        // not be null, and the `aws:` prefix is reserved for AWS.
+        if let Some(message) = crate::state::tags_rejection(input.tags.as_ref()) {
+            return Err(
+                CreateParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         let mut state = state.lock();
         // Besides this create's own insert, the only write: the status transitions the
         // clock already owed the stored clusters and ACLs at this instant.
@@ -209,10 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             parameter_values: std::collections::BTreeMap::new(),
         };
 
-        let tags = crate::state::tag_pairs(input.tags.as_ref());
-        if !tags.is_empty() {
-            state.tags.insert(arn, tags);
-        }
+        // The request's tags, under the ARN the tagging operations resolve this
+        // resource by. An empty set leaves NO entry, so the parameter group starts with
+        // exactly the tags this request gave it.
+        state.set_tags(&arn, crate::state::tag_map(input.tags.as_ref()));
         let response = group.to_api();
         state
             .parameter_groups

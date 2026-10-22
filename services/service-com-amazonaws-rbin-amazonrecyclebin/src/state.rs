@@ -70,6 +70,33 @@ pub fn upsert_tags(held: &mut Vec<Tag>, tags: Vec<Tag>) {
     }
 }
 
+/// The two states `RuleStatus` models, kept here so every status-aware operation
+/// names one spelling. "The state of the retention rule. Only retention rules that
+/// are in the `available` state retain resources."
+///
+/// These are the same two spellings the generated validation list
+/// [`crate::ops::types::RULE_STATUS_VALUES`] enumerates; `tests/all/rule_status_transitions.rs`
+/// pins each of them to a member of that list, so the two cannot drift apart.
+pub const RULE_STATUS_PENDING: &str = "pending";
+pub const RULE_STATUS_AVAILABLE: &str = "available";
+
+/// How long a rule stays `pending` before the clock makes `available` due.
+///
+/// A rule that has just been created or modified is reported `pending` and reaches
+/// `available` on its own. Recycle Bin publishes no figure for how long that takes, so
+/// this span is CHOSEN rather than cited: long enough that a caller acting straight
+/// after a create or an update still observes the `pending` the real service reports,
+/// short enough that a wait loop finishes promptly.
+pub const STATUS_TRANSITION: Duration = Duration::from_millis(300);
+
+/// The instant a rule that entered `pending` at `now` becomes `available`.
+///
+/// `checked_add` rather than `+`: a clock far enough in the future to overflow must
+/// leave the rule immediately settled, not panic in a handler.
+pub fn status_transition_end(now: SystemTime) -> SystemTime {
+    now.checked_add(STATUS_TRANSITION).unwrap_or(now)
+}
+
 /// Seconds in one day. `UnlockDelayUnit` models exactly one unit — "The unit of
 /// time in which to measure the unlock delay. Currently, the unlock delay can be
 /// measured only in days" — so an unlock delay is this many seconds per unit.
@@ -102,6 +129,9 @@ pub struct Rule {
     pub tags: Vec<Tag>,
     /// `available` | `pending`.
     pub status: String,
+    /// When a `pending` rule's transition to `available` falls due. See
+    /// [`STATUS_TRANSITION`].
+    pub available_at: SystemTime,
     pub lock_configuration: Option<LockConfiguration>,
     /// `locked` | `pending_unlock` | `unlocked`; `None` means never locked, a state
     /// a rule can never return to once locked.
@@ -172,6 +202,34 @@ impl Rule {
             self.lock_state = Some(LOCK_STATE_UNLOCKED.to_string());
             self.lock_end_time = None;
         }
+    }
+
+    /// Enter `pending` now and owe `available` one [`STATUS_TRANSITION`] later.
+    ///
+    /// Every call that mints or modifies a rule goes through this: "Only retention
+    /// rules that are in the `available` state retain resources", and a rule that has
+    /// just been created or changed is not retaining yet.
+    pub fn begin_pending(&mut self, now: SystemTime) {
+        self.status = RULE_STATUS_PENDING.to_string();
+        self.available_at = status_transition_end(now);
+    }
+
+    /// Materialise the status transition the CLOCK has already made due: a `pending`
+    /// rule whose transition span has elapsed is `available`, whether or not anybody
+    /// called. Nothing else moves a rule's status, so a rule already `available` is
+    /// left exactly as it is — the status never runs backwards.
+    pub fn settle_status(&mut self, now: SystemTime) {
+        if self.status == RULE_STATUS_PENDING && now >= self.available_at {
+            self.status = RULE_STATUS_AVAILABLE.to_string();
+        }
+    }
+
+    /// Materialise every transition the clock owes this rule — [`Self::settle_status`]
+    /// and [`Self::settle_lock_state`] — so a caller is answered with the state the
+    /// clock has actually reached rather than one it has already left.
+    pub fn settle(&mut self, now: SystemTime) {
+        self.settle_status(now);
+        self.settle_lock_state(now);
     }
 
     /// Whether every tag in `filter` appears among the rule's resource tags. An

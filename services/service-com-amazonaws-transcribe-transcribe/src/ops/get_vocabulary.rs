@@ -188,11 +188,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owed this vocabulary, which was due at its stored instant whether or not
         // anybody called.
         let Some(record) = store.vocabulary_mut(&input.vocabulary_name, now) else {
-            return Err(GetVocabularyErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "The requested vocabulary {} couldn't be found. Check the vocabulary \
-                     name and try your request again.",
-                    input.vocabulary_name
+            // A vocabulary this account does not hold is this service's
+            // `BadRequestException` — the shape whose own documentation covers an
+            // entity that "doesn't exist", and the one its recorded not-found
+            // responses carry — not the modelled `NotFoundException`.
+            return Err(GetVocabularyErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::KIND_VOCABULARY,
                 )),
             })
             .into());

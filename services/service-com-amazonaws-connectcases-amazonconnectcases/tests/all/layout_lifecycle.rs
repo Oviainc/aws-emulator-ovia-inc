@@ -27,7 +27,7 @@ use crate::harness::{domain, is_minted_id, string_at, Emulator};
 
 /// Create a `Text` field in `domain_id` and return its id. One field is enough
 /// for a layout: a layout references a field, it does not carry its type.
-async fn text_field(emulator: &Emulator, domain_id: &str, name: &str) -> String {
+pub(crate) async fn text_field(emulator: &Emulator, domain_id: &str, name: &str) -> String {
     let case = format!("CreateField {name}");
     let response = emulator
         .ok(
@@ -41,7 +41,7 @@ async fn text_field(emulator: &Emulator, domain_id: &str, name: &str) -> String 
 }
 
 /// `n` fields of `domain_id`, named apart so each is its own record.
-async fn text_fields(emulator: &Emulator, domain_id: &str, n: usize) -> Vec<String> {
+pub(crate) async fn text_fields(emulator: &Emulator, domain_id: &str, n: usize) -> Vec<String> {
     let mut ids = Vec::with_capacity(n);
     for index in 0..n {
         ids.push(text_field(emulator, domain_id, &format!("field-{index}")).await);
@@ -50,7 +50,7 @@ async fn text_fields(emulator: &Emulator, domain_id: &str, n: usize) -> Vec<Stri
 }
 
 /// `CreateLayout`, returning `(layoutId, layoutArn)`.
-async fn create_layout(
+pub(crate) async fn create_layout(
     emulator: &Emulator,
     case: &str,
     domain_id: &str,
@@ -72,7 +72,12 @@ async fn create_layout(
 }
 
 /// `GetLayout`'s whole body.
-async fn get_layout(emulator: &Emulator, case: &str, domain_id: &str, layout_id: &str) -> Value {
+pub(crate) async fn get_layout(
+    emulator: &Emulator,
+    case: &str,
+    domain_id: &str,
+    layout_id: &str,
+) -> Value {
     emulator
         .ok(
             case,
@@ -100,7 +105,7 @@ type RefusalRow = (
 
 /// A `topPanel`-only content listing `fields` in the order given, as a request
 /// spells it: `moreInfo` is left out entirely.
-fn top_panel(fields: &[String]) -> Value {
+pub(crate) fn top_panel(fields: &[String]) -> Value {
     let items: Vec<Value> = fields.iter().map(|id| json!({ "id": id })).collect();
     json!({ "basic": { "topPanel": { "sections": [{ "fieldGroup": { "fields": items } }] } } })
 }
@@ -108,7 +113,7 @@ fn top_panel(fields: &[String]) -> Value {
 /// The content a read answers for a layout written with [`top_panel`] over
 /// `fields`: the one unnamed group in `topPanel`, and the `moreInfo` panel the
 /// request never mentioned present and empty.
-fn top_panel_reported(fields: &[String]) -> Value {
+pub(crate) fn top_panel_reported(fields: &[String]) -> Value {
     let items: Vec<&String> = fields.iter().collect();
     reported(vec![field_group(None, &items)], vec![])
 }
@@ -143,7 +148,7 @@ fn field_group(name: Option<&str>, fields: &[&String]) -> Value {
 /// section list and an absent one. Whatever a row spells, the sections, the
 /// group name and the field order come back exactly as given, and only the
 /// panels a request omitted are filled in.
-fn content_forms(fields: &[String]) -> Vec<(&'static str, Value, Value)> {
+pub(crate) fn content_forms(fields: &[String]) -> Vec<(&'static str, Value, Value)> {
     let (first, second, third) = (&fields[0], &fields[1], &fields[2]);
     vec![
         (

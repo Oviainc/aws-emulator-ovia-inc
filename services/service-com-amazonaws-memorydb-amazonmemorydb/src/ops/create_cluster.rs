@@ -295,6 +295,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
+        // The request's tag keys are refused before the cluster is created: `Tag$Key`
+        // may not be null, and the `aws:` prefix is reserved for AWS.
+        if let Some(message) = crate::state::tags_rejection(input.tags.as_ref()) {
+            return Err(CreateClusterErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         let port = input.port.unwrap_or(crate::state::DEFAULT_PORT);
         let created_at = std::time::SystemTime::now();
         let arn = crate::state::cluster_arn(&region, &input.cluster_name);
@@ -392,10 +402,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at,
         };
 
-        let tags = crate::state::tag_pairs(input.tags.as_ref());
-        if !tags.is_empty() {
-            state.tags.insert(arn, tags);
-        }
+        // The request's tags, under the ARN the tagging operations resolve this
+        // resource by. An empty set leaves NO entry, so the cluster starts with exactly
+        // the tags this request gave it.
+        state.set_tags(&arn, crate::state::tag_map(input.tags.as_ref()));
         // `CreateCluster` has no `ShowShardDetails` member, so the shards it just laid
         // out are reported here; `DescribeClusters` gates them on that flag.
         let response = cluster.to_api(true);

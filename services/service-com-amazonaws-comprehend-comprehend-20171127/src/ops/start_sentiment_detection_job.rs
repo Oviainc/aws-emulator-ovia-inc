@@ -4,7 +4,8 @@
 //!
 //! IMPLEMENTED. Mints the job's id and ARN, persists the whole submitted record in
 //! [`crate::state`], and answers `SUBMITTED`. A repeated `ClientRequestToken`
-//! resolves to the job it already created instead of creating a second one.
+//! carrying the same parameters resolves to the job it already created instead of
+//! creating a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -118,17 +119,10 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::{AnalysisJob, JobFamily, PROCESSING_SPAN, QUEUE_SPAN};
+use crate::state::{AnalysisJob, JobFamily, Submission, PROCESSING_SPAN, QUEUE_SPAN};
 
 /// The family every job this operation creates belongs to.
 const FAMILY: JobFamily = JobFamily::SentimentDetection;
-
-/// The most tags a Comprehend resource can carry.
-///
-/// From the modelled documentation of the `TooManyTagsException` this operation
-/// declares: "The request contains more tags than can be associated with a resource
-/// (50 tags per resource)."
-const MAX_TAGS: usize = 50;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -213,15 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // The tag bound every Comprehend resource shares, stated once in
+        // `crate::state`; only the exception wrapper is this operation's own.
         let tags = input.tags.unwrap_or_default();
-        if tags.len() > MAX_TAGS {
+        if let Some(message) = crate::state::too_many_tags_message(&tags) {
             return Err(StartSentimentDetectionJobErrorModeled::TooManyTagsException(
                 TooManyTagsException {
-                    message: Some(format!(
-                        "The request contains {} tags, more than the {MAX_TAGS} tags that can \
-                         be associated with a resource.",
-                        tags.len()
-                    )),
+                    message: Some(message),
                 },
             )
             .into());
@@ -229,20 +221,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = SystemTime::now();
+        // The submission's identity, beside its token: what makes a second call a
+        // RETRY of this one rather than a new job (see `state::Submission`).
+        let fingerprint = Submission {
+            job_name: input.job_name.as_deref(),
+            language_code: &input.language_code,
+            input_data_config: &input.input_data_config,
+            output_data_config: &input.output_data_config,
+            data_access_role_arn: &input.data_access_role_arn,
+            volume_kms_key_id: input.volume_kms_key_id.as_deref(),
+            vpc_config: input.vpc_config.as_ref(),
+            tags: &tags,
+        }
+        .fingerprint();
         let mut store = state.lock();
 
         // `ClientRequestToken` is `@idempotencyToken`: the same token re-submitted
-        // names the job it already created. A request that carries none is a fresh
-        // submission, as the member's documentation says.
+        // with the same parameters names the job it already created. A request that
+        // carries none is a fresh submission, as the member's documentation says.
         //
-        // The TOKEN decides, not the rest of the request: an idempotency token is
-        // what a retrying SDK sends to make "did my first attempt land?" answerable,
-        // and the model declares no error for a token reused with different members,
-        // so a reuse resolves to the first job rather than being refused.
+        // A retry is the SAME request again, so the token alone does not decide:
+        // the model declares no error for a token reused with different members,
+        // and the same token carrying different parameters is a different
+        // submission, which gets a job of its own.
         if let Some(token) = input.client_request_token.as_ref() {
             if let Some(existing) = store
                 .idempotency_tokens
-                .get(&(FAMILY, token.clone()))
+                .get(&(FAMILY, token.clone(), fingerprint.clone()))
                 .cloned()
             {
                 if let Some(job) = store.analysis_jobs.get_mut(&(FAMILY, existing)) {
@@ -284,6 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_config: input.vpc_config,
             tags,
             client_request_token: input.client_request_token,
+            submission_fingerprint: fingerprint,
         };
         let job_status = job.job_status.clone();
         store.insert_analysis_job(FAMILY, job);

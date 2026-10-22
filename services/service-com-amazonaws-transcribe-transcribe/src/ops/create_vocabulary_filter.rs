@@ -193,7 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreateVocabularyFilter";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_VOCABULARY_FILTER_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_VOCABULARY_FILTER_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 201u16;
+    // 200, not the model's `@http` `code: 201`: this service speaks awsJson1_1, an RPC
+    // protocol, so its `@http` traits are inert on the wire (`smithy_query` reports
+    // `httpBindingsInert: true` for every operation) and a success answers that
+    // protocol's own status, 200. The error side of the same rule is
+    // [`crate::scaffolded::wire_status`].
+    const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(
         &self,
@@ -274,10 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateVocabularyFilterErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "The requested vocabulary filter name {} already exists. Use a \
-                         different name and try your request again.",
-                        input.vocabulary_filter_name
+                    // The service's own text names the resource KIND and does not echo
+                    // the name asked for — see [`crate::state::name_already_exists_message`].
+                    message: Some(crate::state::name_already_exists_message(
+                        crate::state::KIND_VOCABULARY_FILTER,
                     )),
                 },
             )

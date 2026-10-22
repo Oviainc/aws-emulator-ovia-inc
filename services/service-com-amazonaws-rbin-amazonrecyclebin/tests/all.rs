@@ -17,6 +17,8 @@ mod resource_tags;
 mod retention_rule_lifecycle;
 #[path = "all/rule_lock_transitions.rs"]
 mod rule_lock_transitions;
+#[path = "all/rule_status_transitions.rs"]
+mod rule_status_transitions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_arn_label_encoding.rs"]

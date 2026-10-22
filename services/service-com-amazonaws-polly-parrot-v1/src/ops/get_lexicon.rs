@@ -144,19 +144,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            GetLexiconErrorModeled::ServiceFailureException(ServiceFailureException {
-                message: Some("the Amazon Polly lexicon store is unavailable".to_string()),
-            })
+            GetLexiconErrorModeled::ServiceFailureException(
+                crate::service::errors::service_failure(),
+            )
         })?;
 
         let guard = state.lock();
         let stored = guard.lexicons.get(&input.name).ok_or_else(|| {
-            GetLexiconErrorModeled::LexiconNotFoundException(LexiconNotFoundException {
-                message: Some(format!(
-                    "Amazon Polly can't find the specified lexicon: {}",
-                    input.name
-                )),
-            })
+            GetLexiconErrorModeled::LexiconNotFoundException(
+                crate::service::errors::lexicon_not_found(),
+            )
         })?;
 
         Ok(GetLexiconOutput {

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMarketplaceRevenueShareAllocation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMarketplaceRevenueShareAllocation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMarketplaceRevenueShareAllocation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads one stored allocation out of [`crate::state`], at the
+//! parent share revision the request names or at the latest.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +166,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMarketplaceRevenueShareAllocation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMarketplaceRevenueShareAllocationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMarketplaceRevenueShareAllocation"))
+        // A reporting operation: it reads the store and writes nothing.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetMarketplaceRevenueShareAllocationErrorModeled::InternalServerException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let catalog = crate::state::parse_catalog(&input.catalog).map_err(validation)?;
+        let state = state.lock();
+        let Some(share) = state.share(catalog, &input.product_id) else {
+            return Err(
+                GetMarketplaceRevenueShareAllocationErrorModeled::ResourceNotFoundException(
+                    crate::state::share_not_found(catalog, &input.product_id),
+                )
+                .into(),
+            );
+        };
+
+        // `MarketplaceRevenueShareRevision` reads the allocation as it existed at
+        // that parent revision; omitting it reads the latest.
+        let revision = match input.marketplace_revenue_share_revision.as_deref() {
+            None => share.revision,
+            Some(token) => match crate::state::parse_revision_token(token)
+                .filter(|revision| *revision <= share.revision)
+            {
+                Some(revision) => revision,
+                None => {
+                    return Err(
+                        GetMarketplaceRevenueShareAllocationErrorModeled::ResourceNotFoundException(
+                            crate::state::revision_not_found(
+                                "MarketplaceRevenueShareRevision",
+                                &input.product_id,
+                                token,
+                                share.revision,
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let Some(allocation) = share
+            .allocations
+            .get(&input.marketplace_revenue_share_allocation_id)
+        else {
+            return Err(
+                GetMarketplaceRevenueShareAllocationErrorModeled::ResourceNotFoundException(
+                    crate::state::allocation_not_found(
+                        &input.product_id,
+                        &input.marketplace_revenue_share_allocation_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+        // An allocation created after `revision` did not exist then, so at that
+        // revision it names nothing.
+        let Some(version) = allocation.version_at(revision) else {
+            return Err(
+                GetMarketplaceRevenueShareAllocationErrorModeled::ResourceNotFoundException(
+                    crate::state::not_found(format!(
+                        "marketplace revenue share allocation {} did not exist at \
+                         MarketplaceRevenueShareRevision {revision}; it was created at revision {}",
+                        allocation.allocation_id,
+                        allocation.created_revision()
+                    )),
+                )
+                .into(),
+            );
+        };
+
+        let view = crate::state::allocation_view(share, allocation, version);
+        Ok(GetMarketplaceRevenueShareAllocationOutput {
+            marketplace_revenue_share_allocation_id: view.allocation_id,
+            product_id: view.product_id,
+            // Absent: see the note on `ProductName` in `crate::state`.
+            product_name: None,
+            arn: view.arn,
+            effective_from: view.effective_from,
+            effective_until: view.effective_until,
+            revenue_share_percent: view.revenue_share_percent,
+            status: view.status,
+            created_date: Some(crate::state::wire_timestamp(view.created_date)),
+            last_modified_date: Some(crate::state::wire_timestamp(view.last_modified_date)),
+            latest_marketplace_revenue_share_revision: Some(
+                view.latest_marketplace_revenue_share_revision,
+            ),
+        })
     }
+}
+
+/// Lift a modelled `ValidationException` into this operation's error channel.
+fn validation(error: ValidationException) -> GetMarketplaceRevenueShareAllocationError {
+    GetMarketplaceRevenueShareAllocationErrorModeled::ValidationException(error).into()
 }

@@ -190,15 +190,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let mut guard = state.lock();
 
-        let model = match guard.resolve_model(&input.model_id) {
-            Some(entry) => entry.clone(),
-            None => {
+        let model = match guard.resolve_model_for_inference(&input.model_id) {
+            Ok(entry) => entry.clone(),
+            // An identifier the service cannot interpret is a 400; one naming a
+            // model or resource that is not available here is a 404 (see
+            // `crate::state::resolve_model_for_inference`).
+            Err(crate::state::ModelRejection::Invalid(message)) => {
+                return Err(StartAsyncInvokeErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+            Err(crate::state::ModelRejection::NotFound(message)) => {
                 return Err(StartAsyncInvokeErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "The provided model identifier is invalid: {}",
-                            input.model_id
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into())

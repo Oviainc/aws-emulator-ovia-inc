@@ -530,12 +530,12 @@ impl Drop for UpdateInFlight {
 /// Refuse a capacity window whose minimum is above its maximum: scaling "will not scale
 /// capacity to values that are outside of the minimum and maximum range", which is not a
 /// range at all when the bounds are inverted.
+///
+/// The refusal carries [`crate::state::CAPACITY_RANGE_INVERTED_MESSAGE`], the one sentence
+/// every operation that takes a capacity window answers this rule with.
 fn check_capacity_range(min_capacity: i32, max_capacity: i32) -> Result<(), RegisterScalableTargetError> {
     if min_capacity > max_capacity {
-        return Err(validation(format!(
-            "MinCapacity ({min_capacity}) must be less than or equal to MaxCapacity \
-             ({max_capacity})"
-        )));
+        return Err(validation(crate::state::CAPACITY_RANGE_INVERTED_MESSAGE));
     }
     Ok(())
 }

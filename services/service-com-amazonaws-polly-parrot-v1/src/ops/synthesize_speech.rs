@@ -21,8 +21,9 @@
 //!   is not stored is `LexiconNotFoundException` (404);
 //! * `Engine` and `LanguageCode` are checked against the voice the request names, as
 //!   the voice catalog `DescribeVoices` serves records it, so the two operations
-//!   cannot disagree: an engine the voice does not support is
-//!   `EngineNotSupportedException` and a language it does not speak is
+//!   cannot disagree: an engine the voice does not support is the request-shape
+//!   refusal `ValidationException` (which is what Amazon Polly answers for it, not
+//!   the modelled `EngineNotSupportedException`) and a language it does not speak is
 //!   `LanguageNotSupportedException`. A voice the seeded catalog does not carry is not
 //!   narrowed, because that catalog is a stated subset;
 //! * `ContentType` is the `OutputFormat`'s documented media type;
@@ -771,24 +772,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // format is the failure `MarksNotSupportedForFormatException` names.
         if !marks.is_empty() && output_format != "json" {
             return Err(SynthesizeSpeechErrorModeled::MarksNotSupportedForFormatException(
-                MarksNotSupportedForFormatException {
-                    message: Some(format!(
-                        "speech marks are not supported for the OutputFormat selected \
-                         ({output_format}); they are only available for content in json format"
-                    )),
-                },
+                crate::service::errors::marks_not_supported_for_format(),
             )
             .into());
         }
         if marks.iter().any(|mark| mark == "ssml") && text_type != "ssml" {
             return Err(
                 SynthesizeSpeechErrorModeled::SsmlMarksNotSupportedForTextTypeException(
-                    SsmlMarksNotSupportedForTextTypeException {
-                        message: Some(
-                            "SSML speech marks are not supported for plain text-type input"
-                                .to_string(),
-                        ),
-                    },
+                    crate::service::errors::ssml_marks_not_supported_for_text_type(),
                 )
                 .into(),
             );
@@ -799,30 +790,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let total_characters = input.text.chars().count();
         if total_characters > MAX_TOTAL_CHARACTERS {
             return Err(SynthesizeSpeechErrorModeled::TextLengthExceededException(
-                TextLengthExceededException {
-                    message: Some(format!(
-                        "the value of the Text parameter is longer than the accepted limits: \
-                         {total_characters} characters, maximum {MAX_TOTAL_CHARACTERS}"
-                    )),
-                },
+                crate::service::errors::text_length_exceeded(),
             )
             .into());
         }
-        let billed = billed_characters(&input.text, text_type).map_err(|detail| {
-            SynthesizeSpeechErrorModeled::InvalidSsmlException(InvalidSsmlException {
-                message: Some(format!(
-                    "the SSML you provided is invalid; verify the SSML syntax: {detail}"
-                )),
-            })
+        let billed = billed_characters(&input.text, text_type).map_err(|_| {
+            SynthesizeSpeechErrorModeled::InvalidSsmlException(
+                crate::service::errors::invalid_ssml(),
+            )
         })?;
         if billed > MAX_BILLED_CHARACTERS {
             return Err(SynthesizeSpeechErrorModeled::TextLengthExceededException(
-                TextLengthExceededException {
-                    message: Some(format!(
-                        "the value of the Text parameter is longer than the accepted limits: \
-                         {billed} billed characters, maximum {MAX_BILLED_CHARACTERS}"
-                    )),
-                },
+                crate::service::errors::text_length_exceeded(),
             )
             .into());
         }
@@ -841,17 +820,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let parsed = requested.parse::<u32>().ok().filter(|r| valid.contains(r));
                     parsed.ok_or_else(|| {
                         SynthesizeSpeechErrorModeled::InvalidSampleRateException(
-                            InvalidSampleRateException {
-                                message: Some(format!(
-                                    "the specified sample rate is not valid for {output_format}: \
-                                     {requested}; valid values are {}",
-                                    valid
-                                        .iter()
-                                        .map(u32::to_string)
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                )),
-                            },
+                            crate::service::errors::invalid_sample_rate(),
                         )
                     })?
                 }
@@ -863,19 +832,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // synthesis reads state, and it is why an unknown name is a 404 rather than a
         // silently ignored input.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            SynthesizeSpeechErrorModeled::ServiceFailureException(ServiceFailureException {
-                message: Some("the Amazon Polly lexicon store is unavailable".to_string()),
-            })
+            SynthesizeSpeechErrorModeled::ServiceFailureException(
+                crate::service::errors::service_failure(),
+            )
         })?;
         if let Some(names) = input.lexicon_names.as_ref() {
             let guard = state.lock();
-            if let Some(missing) = names.iter().find(|name| !guard.lexicons.contains_key(*name)) {
+            if names.iter().any(|name| !guard.lexicons.contains_key(name)) {
                 return Err(SynthesizeSpeechErrorModeled::LexiconNotFoundException(
-                    LexiconNotFoundException {
-                        message: Some(format!(
-                            "Amazon Polly can't find the specified lexicon: {missing}"
-                        )),
-                    },
+                    crate::service::errors::lexicon_not_found(),
                 )
                 .into());
             }
@@ -898,17 +863,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // chosen voice isn't supported by the standard engine, this will result
             // in an error" (`SynthesizeSpeechInput$Engine`).
             if !voice.supports_engine(engine) {
-                return Err(SynthesizeSpeechErrorModeled::EngineNotSupportedException(
-                    EngineNotSupportedException {
-                        message: Some(format!(
-                            "the {engine} engine is not compatible with the voice {}; it supports \
-                             {}",
-                            voice.id,
-                            voice.supported_engines.join(", ")
-                        )),
-                    },
-                )
-                .into());
+                // Amazon Polly refuses this combination as a REQUEST-SHAPE failure —
+                // HTTP 400 `ValidationException` naming the engine — rather than with
+                // the `EngineNotSupportedException` the model also declares, so a
+                // client that branches on the code takes the request-validation
+                // branch for it.
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "This voice does not support the selected engine: {engine}"
+                )));
             }
             // "Optional language code … This is only necessary if using a bilingual
             // voice, such as Aditi, which can be used for either Indian English
@@ -919,17 +881,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(language) = input.language_code.as_deref() {
                 if !voice.speaks(language, true) {
                     return Err(SynthesizeSpeechErrorModeled::LanguageNotSupportedException(
-                        LanguageNotSupportedException {
-                            message: Some(format!(
-                                "the language {language} is not supported by the voice {}; it \
-                                 speaks {}",
-                                voice.id,
-                                std::iter::once(voice.language_code)
-                                    .chain(voice.additional_language_codes.iter().copied())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )),
-                        },
+                        crate::service::errors::language_not_supported(),
                     )
                     .into());
                 }
@@ -981,19 +933,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("alaw", Some(rate)) => audio::alaw_silence(rate, duration_ms),
             ("mp3", Some(rate)) => audio::mp3_silence(rate, duration_ms).ok_or_else(|| {
                 SynthesizeSpeechErrorModeled::InvalidSampleRateException(
-                    InvalidSampleRateException {
-                        message: Some(format!(
-                            "the specified sample rate is not valid for mp3: {rate}"
-                        )),
-                    },
+                    crate::service::errors::invalid_sample_rate(),
                 )
             })?,
             ("ogg_opus", Some(rate)) => {
                 audio::ogg_opus_silence(rate, duration_ms).ok_or_else(|| {
                     SynthesizeSpeechErrorModeled::ServiceFailureException(
-                        ServiceFailureException {
-                            message: Some("the Ogg Opus stream could not be written".to_string()),
-                        },
+                        crate::service::errors::service_failure(),
                     )
                 })?
             }
