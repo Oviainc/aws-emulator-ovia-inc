@@ -5,10 +5,10 @@
 //! DB resource and PERSISTS it in [`crate::state`], so the id it returns is the one
 //! the Get/List/Delete report operations resolve.
 //!
-//! Authorization is NOT emulated: the emulator holds no IAM principals or
-//! policies, so the modelled `NotAuthorizedException` is never the answer and a
-//! well-formed request is served. That is a deliberate, documented divergence,
-//! not a permission decision.
+//! A request that addresses no data source this account may see is refused with
+//! the modelled `NotAuthorizedException` (HTTP 400) before anything is written,
+//! so no report is ever minted against a resource the caller may not touch (see
+//! [`crate::state::is_data_source_identifier`]).
 //!
 //! ## Shape of an operation
 //!
@@ -188,6 +188,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A report is a WRITE against the addressed data source, so the
+        // authorization gate comes before the store is touched: an unauthorized
+        // Create mints nothing. The cross-member window check above runs first,
+        // so a request whose values do not hold together is still answered as
+        // the argument error it is.
+        if !crate::state::is_data_source_identifier(&input.identifier) {
+            return Err(not_authorized());
+        }
+
         let create_time = crate::state::now();
         let region = crate::state::request_region(ctx.parts());
         let tags = input.tags.unwrap_or_default();
@@ -243,4 +252,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             analysis_report_id: Some(analysis_report_id),
         })
     }
+}
+
+/// `NotAuthorizedException` (HTTP 400), the uniform refusal for a request that
+/// addresses a data source this account may not create a report for.
+fn not_authorized() -> CreatePerformanceAnalysisReportError {
+    CreatePerformanceAnalysisReportErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(crate::state::NOT_AUTHORIZED_MESSAGE.to_string()),
+    })
+    .into()
 }
