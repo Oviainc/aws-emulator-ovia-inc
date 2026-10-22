@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRuleGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRuleGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRuleGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -210,18 +201,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRuleGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRuleGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRuleGroup"))
+        // "You provide your rule group specification in your request using either
+        // RuleGroup or Rules" — `Rules` is "a string containing STATEFUL rule group
+        // rules specifications in Suricata flat format", and the response "returns a
+        // RuleGroup object that Network Firewall has populated from your string", so a
+        // `Rules` request is stored as the rule group document that string defines.
+        let rule_group = match (input.rule_group, input.rules) {
+            (Some(_), Some(_)) => {
+                return Err(invalid_request(
+                    "You must provide either the RuleGroup or the Rules setting, but not both.",
+                ))
+            }
+            (None, None) => {
+                return Err(invalid_request(
+                    "You must provide either the RuleGroup or the Rules setting.",
+                ))
+            }
+            (Some(rule_group), None) => rule_group,
+            (None, Some(rules)) => {
+                if input.r#type == crate::state::RULE_GROUP_STATELESS {
+                    return Err(invalid_request(
+                        "The Rules setting carries stateful rule group rules in Suricata flat \
+                         format, so it cannot define a STATELESS rule group.",
+                    ));
+                }
+                RuleGroup {
+                    rules_source: RulesSource {
+                        rules_string: Some(rules),
+                        ..RulesSource::default()
+                    },
+                    ..RuleGroup::default()
+                }
+            }
+        };
+
+        if let Some(breach) = crate::state::rule_group_document_breach(&input.r#type, &rule_group) {
+            return Err(invalid_request(&breach));
+        }
+
+        // "Rule group capacity is fixed at creation ... When you reference a rule group
+        // from a firewall policy, Network Firewall reserves this capacity": a rule
+        // group whose rules already need more than the capacity reserved for it could
+        // never be used, so the request is refused rather than stored.
+        if input.capacity < 1 {
+            return Err(invalid_request(&format!(
+                "Capacity must be at least 1 capacity unit; this request asked for {}.",
+                input.capacity
+            )));
+        }
+        if input.capacity > crate::state::MAX_RULE_GROUP_CAPACITY {
+            return Err(CreateRuleGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator allows at most {} capacity units per rule group; this \
+                         request asked for {}.",
+                        crate::state::MAX_RULE_GROUP_CAPACITY,
+                        input.capacity
+                    )),
+                },
+            )
+            .into());
+        }
+        let consumed = crate::state::required_capacity(&input.r#type, &rule_group);
+        if consumed > input.capacity {
+            return Err(invalid_request(&format!(
+                "The rules in RulesSource.{} require {consumed} capacity units, which exceeds \
+                 the rule group's capacity of {}.",
+                crate::state::rules_source_member(&rule_group),
+                input.capacity
+            )));
+        }
+
+        // "If set to TRUE, Network Firewall runs the analysis and then creates the rule
+        // group for you", and the analyzer reports on stateless rule groups only, so a
+        // stateful rule group has no findings to report rather than an empty list. It
+        // runs here, BEFORE the store is locked, so one caller's analysis never holds
+        // the lock every other request to this service needs.
+        let analysis_results = (input.analyze_rule_group
+            && input.r#type == crate::state::RULE_GROUP_STATELESS)
+            .then(|| crate::state::analyze_stateless_rule_group(&rule_group));
+
+        let region = crate::state::request_region(ctx);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateRuleGroupErrorModeled::InternalServerError(InternalServerError {
+                    message: Some("the rule group store is unavailable".to_string()),
+                })
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // A rule group is identified by its name AND its type, so a name is only taken
+        // within the half of the service the type names.
+        let key = crate::state::rule_group_resource_path(&input.r#type, &input.rule_group_name);
+        if state.rule_groups.contains_key(&key) {
+            return Err(invalid_request(&format!(
+                "A {} rule group named {} already exists.",
+                input.r#type, input.rule_group_name
+            )));
+        }
+        // Bound what one caller can make this emulator retain: nothing else caps the
+        // number of stored rule groups, so a request past the ceiling is refused with
+        // the modelled `LimitExceededException` before the record is built.
+        if state.rule_groups.len() >= crate::state::MAX_STORED_RULE_GROUPS {
+            return Err(CreateRuleGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This emulator holds the maximum of {} rule groups; delete one before \
+                         creating another.",
+                        crate::state::MAX_STORED_RULE_GROUPS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::RuleGroupRecord {
+            rule_group_arn: crate::state::rule_group_arn(
+                &region,
+                &input.r#type,
+                &input.rule_group_name,
+            ),
+            rule_group_name: input.rule_group_name,
+            rule_group_id: crate::state::new_uuid(),
+            rule_group_type: input.r#type,
+            capacity: input.capacity,
+            rule_group,
+            description: input.description,
+            tags: input.tags,
+            encryption_configuration: Some(crate::state::effective_encryption_configuration(
+                input.encryption_configuration,
+            )),
+            source_metadata: input.source_metadata,
+            summary_configuration: input.summary_configuration,
+            status: crate::state::RESOURCE_ACTIVE.to_string(),
+            number_of_associations: 0,
+            update_token: crate::state::new_uuid(),
+            last_modified_time: ::std::time::SystemTime::now(),
+        };
+
+        let mut rule_group_response = record.to_response();
+        rule_group_response.analysis_results = analysis_results;
+        let output = CreateRuleGroupOutput {
+            update_token: record.update_token.clone(),
+            rule_group_response,
+        };
+
+        // `DryRun` asks the service to check the request rather than run it, so nothing
+        // is stored. The response still reports the ARN and id the rule group WOULD
+        // have had, which is why `RuleGroupResponse$RuleGroupArn` calls a dry run's ARN
+        // "a placeholder that isn't attached to a valid resource" — and why a dry run
+        // is how a caller "retrieve[s] the capacity that would be required for a rule
+        // group before you create" it.
+        if !input.dry_run {
+            state
+                .rule_group_arn_index
+                .insert(record.rule_group_arn.clone(), key.clone());
+            state.rule_groups.insert(key, record);
+        }
+
+        Ok(output)
     }
+}
+
+/// Refuse a request this operation models `InvalidRequestException` for: "The
+/// operation failed because of a problem with your request."
+fn invalid_request(message: &str) -> CreateRuleGroupError {
+    CreateRuleGroupErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
