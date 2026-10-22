@@ -41,9 +41,42 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers a resource ARN that is not an ARN with.
+///
+/// NOT a shape this service's model declares — which is why it is a string here and
+/// not a modelled error variant: the recorded service answers a malformed
+/// `resourceArn` label on the tagging operations with HTTP 400 and
+/// `x-amzn-errortype: BadRequestException`, the front-end ARN parser's own answer,
+/// rather than the modelled `ValidationException` the member-constraint validator
+/// would report. Restated here because `override_refusal` replaces the code and the
+/// message TOGETHER.
+pub(crate) const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// What this service says when a resource ARN does not parse.
+///
+/// A CONSTANT that interpolates no part of the request: an ARN parser reports that the
+/// label was not an ARN, and nothing about which member or which rule it failed — so
+/// there is nothing of the request to state.
+pub(crate) const MALFORMED_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
+
+/// Whether `violation` is a value that failed the `@pattern` of this service's
+/// `ScanNameArn` shape — i.e. a resource ARN that is not an ARN at all.
+///
+/// Keyed on the pattern the value failed ([`crate::state::SCAN_NAME_ARN_PATTERN`], the
+/// `ScanNameArn` shape's own), not on a member name or an operation: every INPUT
+/// member of this service that targets `ScanNameArn` is a tagging operation's
+/// `resourceArn` label, and every other constrained member of this service carries a
+/// different pattern, so none of them is caught here.
+fn is_malformed_resource_arn(violation: &Violation) -> bool {
+    matches!(
+        &violation.kind,
+        ViolationKind::Pattern(pattern) if pattern == crate::state::SCAN_NAME_ARN_PATTERN
+    )
+}
 
 /// The `com-amazonaws-codegurusecurity-awscodegurusecurity` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -96,17 +129,33 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // CodeGuru Security PARSES the `resourceArn` @httpLabel of a tagging call
+        // before it validates anything else, so a label that is not an ARN is a
+        // malformed REQUEST — answered with HTTP 400 `BadRequestException`, the
+        // parser's own code — and not a member that failed a modelled constraint,
+        // which is what `ValidationException` reports. The status is 400 either way;
+        // the code is what a client branches on, so both it and the message are
+        // replaced together, and the ValidationException-style "N validation error(s)
+        // detected" prose goes with the code.
+        //
+        // `any`, not "every violation": the ARN parse runs first, so it decides the
+        // answer even when the same request also breaks another rule.
+        //
+        // Every OTHER refusal keeps the framework's default wording and the modelled
+        // `ValidationException` code: an absent required member, a value outside a
+        // declared bound (including a `resourceArn` that parses as an ARN but is
+        // longer than the shape's `@length` allows — a size limit, not a syntax
+        // failure) and an authentication refusal are all reported as this service's
+        // model declares them.
+        match refusal {
+            Refusal::Invalid(violations) if violations.iter().any(is_malformed_resource_arn) => {
+                Some(Refused {
+                    code: BAD_REQUEST_EXCEPTION.to_string(),
+                    message: MALFORMED_ARN_MESSAGE.to_string(),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

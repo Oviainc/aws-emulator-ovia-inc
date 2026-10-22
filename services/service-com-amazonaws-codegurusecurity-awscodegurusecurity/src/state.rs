@@ -16,6 +16,8 @@
 //!   [`UPLOAD_ARTIFACT_TTL_MILLIS`] after it was minted ([`Store::expire_due_artifacts`]).
 //! * [`SCAN_QUOTA`] caps `scans`, and [`RUNS_PER_SCAN_QUOTA`] caps the runs of one scan,
 //!   so the (scans x runs) product is bounded.
+//! * [`TAGS_PER_SCAN_QUOTA`] caps the tags of one scan, enforced in `TagResource`, so
+//!   repeatedly tagging one scan cannot grow its tag store without end.
 //! * `idempotency` gains one entry only where a run was created, so it is bounded by the
 //!   same (scans x runs) product.
 //! * `findings` is written only by a scan run's analysis, which this emulator does not
@@ -80,6 +82,15 @@ pub const UPLOAD_ARTIFACT_TTL_MILLIS: i64 = 15 * 60 * 1_000;
 
 /// The most scans this emulator keeps at once; see [`UPLOAD_ARTIFACT_QUOTA`].
 pub const SCAN_QUOTA: usize = 1_000;
+
+/// The most tags one scan holds, so repeated `TagResource` calls cannot grow a scan's
+/// tag store without end. A STORE BOUND chosen by this emulator, not a published AWS
+/// quota: it is the modelled maximum of `TagMap` itself
+/// (`smithy_query(query="shape",shape="TagMap")`: length 0..200), which is what ONE
+/// request may carry, applied to the scan's accumulated tags as well — AWS publishes no
+/// tags-per-scan limit for CodeGuru Security, so nothing here should be read as its
+/// recorded behaviour.
+pub const TAGS_PER_SCAN_QUOTA: usize = 200;
 
 /// The most runs (revisions) one scan keeps; see [`UPLOAD_ARTIFACT_QUOTA`]. Together
 /// with [`SCAN_QUOTA`] this bounds the total number of runs, and with it the size of the
@@ -338,6 +349,26 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         self.findings
             .get(&(scan_name.to_string(), finding_id.to_string()))
     }
+
+    /// The scan the resource ARN `arn` names, for the tagging operations.
+    ///
+    /// An ARN names a resource of one region and one account, so the stored scan
+    /// answers only when the ARN it was created with is the ARN the request named: an
+    /// otherwise well-formed ARN naming another region or another account names no
+    /// scan of this account, and is reported as absent.
+    pub fn scan_by_arn(&self, arn: &str) -> Option<&Scan> {
+        let parsed = parse_scan_arn(arn)?;
+        self.scans
+            .get(parsed.scan_name)
+            .filter(|scan| scan.scan_name_arn == arn)
+    }
+
+    /// [`Self::scan_by_arn`] for the tagging operations that write the scan's tags.
+    pub fn scan_by_arn_mut(&mut self, arn: &str) -> Option<&mut Scan> {
+        let parsed = parse_scan_arn(arn)?;
+        let scan = self.scans.get_mut(parsed.scan_name)?;
+        (scan.scan_name_arn == arn).then_some(scan)
+    }
 }
 
 /// Epoch milliseconds now. The one clock this service reads, so every timestamp it
@@ -366,6 +397,94 @@ pub fn request_region(headers: &::http::HeaderMap) -> String {
 /// shared ARN helper so the account segment is the emulator's canonical one.
 pub fn scan_name_arn(region: &str, scan_name: &str) -> String {
     ::engine::emulator_arn(SERVICE_CODE, region, &format!("scans/{scan_name}"))
+}
+
+/// The `@pattern` of the modelled `ScanNameArn` shape, verbatim
+/// (`smithy_query(query="shape",shape="ScanNameArn")`).
+///
+/// Every INPUT member of this service constrained by it is a tagging operation's
+/// `resourceArn` @httpLabel — `ListTagsForResource`, `TagResource` and
+/// `UntagResource` are the only operations that take a `ScanNameArn` — so a value
+/// that failed THIS pattern is a resource ARN that is not an ARN. `crate::service`
+/// keys the refusal it answers for such a label on this constant.
+pub const SCAN_NAME_ARN_PATTERN: &str =
+    r"^arn:aws:codeguru-security:[\S]+:[\d]{12}:scans\/[a-zA-Z0-9-_$:.]*$";
+
+/// The fixed head of every `ScanNameArn`: the `aws` partition and this service's
+/// namespace, as [`SCAN_NAME_ARN_PATTERN`] spells them.
+pub const SCAN_ARN_PREFIX: &str = "arn:aws:codeguru-security:";
+
+/// What separates an ARN's account-id segment from the scan name it names, from the
+/// same pattern (`:scans\/`).
+const SCAN_ARN_RESOURCE_SEGMENT: &str = ":scans/";
+
+/// Digits in an ARN's account-id segment, from the same pattern (`[\d]{12}`).
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// A `ScanNameArn` taken apart: which region and account it names, and the scan name
+/// it identifies there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanArn<'a> {
+    /// The ARN's region segment.
+    pub region: &'a str,
+    /// The ARN's account-id segment, always 12 digits.
+    pub account_id: &'a str,
+    /// The scan name after `scans/`; the pattern allows it to be empty.
+    pub scan_name: &'a str,
+}
+
+/// Parse `arn` as a `ScanNameArn`, or `None` when it is not one.
+///
+/// Accepts exactly the strings [`SCAN_NAME_ARN_PATTERN`] accepts, except for the
+/// shape's separate `@length` bound, which is a size limit rather than a question of
+/// syntax: the prefix is fixed, the region is one or more non-whitespace characters,
+/// the account id is 12 digits and the scan name holds only the characters the
+/// pattern's last class allows.
+///
+/// The region class (`[\S]+`) can itself hold `:` and the scan-name class can hold
+/// `:scans/`-shaped text, so one string may be splittable in several ways. The LAST
+/// split that holds is the answer, which is where the pattern's greedy region leaves
+/// the boundary.
+pub fn parse_scan_arn(arn: &str) -> Option<ScanArn<'_>> {
+    let rest = arn.strip_prefix(SCAN_ARN_PREFIX)?;
+    let mut parsed = None;
+    let mut from = 0usize;
+    while let Some(offset) = rest[from..].find(SCAN_ARN_RESOURCE_SEGMENT) {
+        let at = from + offset;
+        let head = &rest[..at];
+        let scan_name = &rest[at + SCAN_ARN_RESOURCE_SEGMENT.len()..];
+        // The account id holds no `:`, so the last `:` of the head is always the one
+        // between the region and the account.
+        if let Some((region, account_id)) = head.rsplit_once(':') {
+            if is_arn_region(region) && is_account_id(account_id) && is_scan_name(scan_name) {
+                parsed = Some(ScanArn {
+                    region,
+                    account_id,
+                    scan_name,
+                });
+            }
+        }
+        // `:scans/` cannot overlap itself, so the next candidate starts after this one.
+        from = at + SCAN_ARN_RESOURCE_SEGMENT.len();
+    }
+    parsed
+}
+
+/// `[\S]+`: one or more non-whitespace characters.
+fn is_arn_region(region: &str) -> bool {
+    !region.is_empty() && !region.chars().any(char::is_whitespace)
+}
+
+/// `[\d]{12}`.
+fn is_account_id(account_id: &str) -> bool {
+    account_id.len() == ACCOUNT_ID_DIGITS && account_id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `[a-zA-Z0-9-_$:.]*`.
+fn is_scan_name(scan_name: &str) -> bool {
+    scan_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '$' | ':' | '.'))
 }
 
 /// Mint a server-generated identifier in the textual form the `Uuid` shape requires

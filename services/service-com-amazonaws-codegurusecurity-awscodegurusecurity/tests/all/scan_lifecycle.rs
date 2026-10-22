@@ -34,7 +34,9 @@ pub(crate) const REGION: &str = "us-west-2";
 const LIST_SCANS_MAX_PAGE: usize = 100;
 
 /// One dispatched request's answer. Shared with the sibling suites of this test target
-/// (`crate::account_configuration`), so every suite reads a response the same way.
+/// (`crate::account_configuration`, `crate::resource_tagging`), so every suite reads a
+/// response the same way.
+#[derive(Debug)]
 pub(crate) struct Answer {
     pub(crate) status: u16,
     /// The wire error code, from `x-amzn-errortype` or the body's `__type`; empty on a
@@ -127,7 +129,7 @@ pub(crate) async fn create_upload_url(router: &MultiServiceRouter, scan_name: &s
 }
 
 /// Mint an artifact for `scan_name` and return its `codeArtifactId`.
-async fn artifact_for(router: &MultiServiceRouter, scan_name: &str) -> String {
+pub(crate) async fn artifact_for(router: &MultiServiceRouter, scan_name: &str) -> String {
     let answer = create_upload_url(router, scan_name).await;
     assert_eq!(
         answer.status, 200,
@@ -137,7 +139,11 @@ async fn artifact_for(router: &MultiServiceRouter, scan_name: &str) -> String {
     answer.str_of("codeArtifactId")
 }
 
-async fn create_scan(router: &MultiServiceRouter, mut body: Value, artifact: &str) -> Answer {
+pub(crate) async fn create_scan(
+    router: &MultiServiceRouter,
+    mut body: Value,
+    artifact: &str,
+) -> Answer {
     body["resourceId"] = json!({ "codeArtifactId": artifact });
     call(router, "POST", "/scans", Some(body)).await
 }
@@ -210,7 +216,7 @@ fn is_modelled_uuid(value: &str) -> bool {
 
 /// The `ScanNameArn` shape's pattern:
 /// `^arn:aws:codeguru-security:[\S]+:[\d]{12}:scans\/[a-zA-Z0-9-_$:.]*$`.
-fn expected_scan_arn(scan_name: &str) -> String {
+pub(crate) fn expected_scan_arn(scan_name: &str) -> String {
     format!("arn:aws:codeguru-security:{REGION}:000000000000:scans/{scan_name}")
 }
 

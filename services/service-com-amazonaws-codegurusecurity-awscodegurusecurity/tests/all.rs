@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_configuration.rs"]
 mod account_configuration;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/scan_lifecycle.rs"]
 mod scan_lifecycle;
 #[path = "all/state_roundtrip.rs"]

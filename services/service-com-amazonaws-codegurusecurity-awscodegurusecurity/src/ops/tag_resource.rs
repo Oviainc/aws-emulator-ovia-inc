@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the request's tags to the scan a resource ARN names, in the single tag store
+//! `CreateScan` writes and `ListTagsForResource` reads (`state::Scan::tags`): a key the
+//! scan already carries takes the new value, every other key is added.
+//!
+//! A `resourceArn` label that is not a scan ARN never reaches here — the boundary
+//! validator refuses it against the `ScanNameArn` `@pattern`, and `crate::service`
+//! answers that refusal with HTTP 400 `BadRequestException`, the ARN parser's own code
+//! (see `crate::service::MALFORMED_ARN_MESSAGE`).
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +153,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("state unavailable".to_string()),
+                    message: Some(
+                        "the CodeGuru Security store is not reachable from this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(scan) = store.scan_by_arn_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: "ResourceNotFoundException".to_string(),
+                    message: format!(
+                        "no scan of this account is identified by {}",
+                        input.resource_arn
+                    ),
+                    resource_id: input.resource_arn.clone(),
+                    resource_type: "scan".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // The tags this call would leave on the scan: the keys it adds, plus the keys
+        // the scan already carries that this call does not replace. Bounded, so no
+        // sequence of TagResource calls can grow one scan's tag store without end.
+        let added = input
+            .tags
+            .keys()
+            .filter(|key| !scan.tags.contains_key(key.as_str()))
+            .count();
+        if scan.tags.len() + added > crate::state::TAGS_PER_SCAN_QUOTA {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                error_code: "ValidationException".to_string(),
+                message: format!(
+                    "a scan holds at most {quota} tags; this request would leave {would} on \
+                     {resource_arn}",
+                    quota = crate::state::TAGS_PER_SCAN_QUOTA,
+                    would = scan.tags.len() + added,
+                    resource_arn = input.resource_arn,
+                ),
+                reason: "fieldValidationFailed".to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "tags".to_string(),
+                    message: format!(
+                        "remove tags from the scan, or send at most {remaining} new keys",
+                        remaining = crate::state::TAGS_PER_SCAN_QUOTA
+                            .saturating_sub(scan.tags.len()),
+                    ),
+                }]),
+            })
+            .into());
+        }
+
+        for (key, value) in &input.tags {
+            scan.tags.insert(key.clone(), value.clone());
+        }
+
+        Ok(TagResourceOutput {})
     }
 }
