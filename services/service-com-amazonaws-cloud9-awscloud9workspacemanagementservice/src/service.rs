@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation,
 };
 use std::sync::Arc;
 
@@ -96,17 +96,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        match refusal {
+            // Cloud9's own answer to a request that breaks one of the model's
+            // rules — an absent required member, a name longer than
+            // `@length(max: 60)`, an `instanceType` outside its `@pattern`, a
+            // `maxResults` above its `@range` — is `BadRequestException` ("The
+            // target request is invalid."), which is the client-input error
+            // EVERY operation in this service declares. The framework's default
+            // code, `ValidationException`, names a shape this model does not
+            // contain, so a Cloud9 client branching on the error code would
+            // never match it.
+            //
+            // Only the CODE is restated; the message keeps the framework's
+            // wording, which names the offending member and the constraint it
+            // failed — the rule the caller has to fix.
+            Refusal::Invalid(violations) if !violations.is_empty() => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: violations
+                    .iter()
+                    .map(Violation::message)
+                    .collect::<Vec<String>>()
+                    .join("; "),
+            }),
+            // An authentication refusal is the emulator's, not Cloud9's: keep
+            // the framework's 403 wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
