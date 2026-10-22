@@ -314,6 +314,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 properties,
             });
         }
+        // Every composite model an `AssetModelCompositeModelDefinition` defines is
+        // top-level and inline: the definition shape has neither a parent nor a
+        // composed-model member, so it links to nothing.
+        let composite_model_links = ::std::collections::HashMap::new();
 
         let record = crate::state::AssetModelRecord {
             id: asset_model_id.clone(),
@@ -325,10 +329,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             properties,
             hierarchies,
             composite_models,
+            composite_model_links,
             creation_date: now,
             last_update_date: now,
             // The CREATING -> ACTIVE transition the clock owes. Stored, never slept on.
             active_at: now + crate::state::ACTIVATION_DELAY,
+            settling_state: crate::state::STATE_CREATING.to_string(),
             version: 1,
             tags: input.tags.clone().unwrap_or_default(),
         };
@@ -368,50 +374,13 @@ fn invalid_request(message: String) -> CreateAssetModelError {
     ))
 }
 
-/// Turn `AssetModelPropertyDefinition`s into the stored `AssetModelProperty`s,
-/// minting an id for every definition that did not supply one.
+/// Turn `AssetModelPropertyDefinition`s into the stored `AssetModelProperty`s.
 ///
-/// Two rules the shapes' own documentation states are enforced here: a property
-/// definition carries exactly ONE property type ("You can only specify one type in
-/// a property definition"), and a `STRUCT` property also carries `dataTypeSpec`
-/// ("This parameter is required on properties that have the STRUCT data type").
+/// The rule itself lives in [`crate::state::property_definitions_to_properties`],
+/// shared with every other operation that takes property definitions; this lifts
+/// its refusal into THIS operation's modelled `InvalidRequestException`.
 fn convert_property_definitions(
     definitions: &[AssetModelPropertyDefinition],
 ) -> Result<Vec<AssetModelProperty>, CreateAssetModelError> {
-    let mut properties = Vec::with_capacity(definitions.len());
-    for definition in definitions {
-        let kinds = [
-            definition.r#type.attribute.is_some(),
-            definition.r#type.measurement.is_some(),
-            definition.r#type.transform.is_some(),
-            definition.r#type.metric.is_some(),
-        ]
-        .into_iter()
-        .filter(|set| *set)
-        .count();
-        if kinds != 1 {
-            return Err(invalid_request(format!(
-                "The property definition {} must specify exactly one property type \
-                 (attribute, measurement, transform or metric), but specifies {kinds}.",
-                definition.name
-            )));
-        }
-        if definition.data_type == "STRUCT" && definition.data_type_spec.is_none() {
-            return Err(invalid_request(format!(
-                "The property definition {} has the STRUCT data type, so dataTypeSpec is required.",
-                definition.name
-            )));
-        }
-        properties.push(AssetModelProperty {
-            id: Some(definition.id.clone().unwrap_or_else(crate::state::new_id)),
-            external_id: definition.external_id.clone(),
-            name: definition.name.clone(),
-            data_type: definition.data_type.clone(),
-            data_type_spec: definition.data_type_spec.clone(),
-            unit: definition.unit.clone(),
-            r#type: definition.r#type.clone(),
-            path: None,
-        });
-    }
-    Ok(properties)
+    crate::state::property_definitions_to_properties(definitions).map_err(invalid_request)
 }
