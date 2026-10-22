@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelGremlinQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelGremlinQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelGremlinQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels the Gremlin query the `queryId` label names, by marking that record in the
+//! registry in [`crate::state`] cancelled. The record is kept, so
+//! `GetGremlinQueryStatus` goes on reporting the id with `cancelled` set and
+//! `ListGremlinQueries` stops counting it as running. `@idempotent`: a query that has
+//! already finished is left as it is, so a repeated cancel of one id answers exactly
+//! like the first. An id the registry does not hold is refused with the modelled
+//! `InvalidParameterException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +172,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelGremlinQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelGremlinQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelGremlinQuery"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            record_access(ctx, &input.query_id, "store-unavailable");
+            return Err(CancelGremlinQueryErrorModeled::FailureByQueryException(
+                crate::state::store_unavailable_failure(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(query) = store.gremlin_queries.get_mut(&input.query_id) else {
+            drop(store);
+            record_access(ctx, &input.query_id, "unknown-query-id");
+            return Err(CancelGremlinQueryErrorModeled::InvalidParameterException(
+                crate::state::invalid_query_id(&input.query_id),
+            )
+            .into());
+        };
+        // The return says whether THIS call is what cancelled the query; a query that
+        // had already finished is left alone. Either way the registry still holds the
+        // record and the answer is the same, which is what `@idempotent` asks for.
+        let cancelled_now = query.cancel(now);
+        drop(store);
+
+        record_access(
+            ctx,
+            &input.query_id,
+            if cancelled_now {
+                "cancelled"
+            } else {
+                "already-finished"
+            },
+        );
+
+        Ok(CancelGremlinQueryOutput {
+            // `status` reports "the status of the cancelation" — the status of this
+            // cancellation request, not of the query it names.
+            status: Some(crate::state::CANCELLATION_ACCEPTED.to_string()),
+        })
     }
+}
+
+/// Record one access to this operation — the only state-changing operation implemented
+/// in this service so far.
+///
+/// Every exit records: what was asked (the method, the URI and the query id), who asked
+/// (the access key the request presented), and how it ended — including the two refusals,
+/// so a refused attempt to cancel someone's query leaves a record too. The request-supplied
+/// id is rendered with `Debug`, which escapes control characters, so a value carrying CRLF
+/// cannot forge a second line; no secret is recorded (the access key id is an identifier,
+/// never the signing key).
+fn record_access(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    query_id: &str,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        operation = "CancelGremlinQuery",
+        method = %parts.method,
+        uri = %parts.uri,
+        query_id = ?query_id,
+        akid = ?::emulator_server::extract_akid(&parts.headers),
+        outcome,
+        "neptunedata cancel gremlin query"
+    );
 }

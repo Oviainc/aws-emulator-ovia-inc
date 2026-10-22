@@ -41,9 +41,42 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The input member every resource-ARN-addressed operation of this service
+/// carries, as a violation path spells it (lowerCamel).
+const RESOURCE_ARN_MEMBER: &str = "resourceArn";
+
+/// The first `/`-separated segment of `path`, or `None` for a path with no non-empty
+/// first segment (`"/"`, `""`).
+fn first_path_segment(path: &str) -> Option<&str> {
+    let segment = path.trim_start_matches('/').split('/').next()?;
+    (!segment.is_empty()).then_some(segment)
+}
+
+/// Whether `parts` addresses a path inside `path_segments` — the model-derived first
+/// URI path segments this service declares (`crate::ROUTE_PATH_SEGMENTS`).
+///
+/// This mirrors the framework's own discriminator,
+/// `emulator_server::can_handle_based_on_route_key_and_path`, which the generated
+/// `can_handle` entry point uses. The framework helper takes a whole buffered
+/// `http::Request`, which the `Service::can_handle` seam below does not receive, so the
+/// rule is applied here over `Parts` instead of called. It is kept identical, including
+/// both edge cases: an EMPTY list means the model published no usable discriminator and
+/// is "no constraint", and the framework's own `ROOT_PATH_SEGMENT` sentinel is how a
+/// service that must answer `POST /` claims the root path without claiming every path.
+/// Matching is EXACT segment equality, deliberately never a prefix test.
+fn claims_modeled_path(parts: &http::request::Parts, path_segments: &[&str]) -> bool {
+    if path_segments.is_empty() {
+        return true;
+    }
+    match first_path_segment(parts.uri.path()) {
+        Some(segment) => path_segments.contains(&segment),
+        None => path_segments.contains(&emulator_server::ROOT_PATH_SEGMENT),
+    }
+}
 
 /// The `com-amazonaws-marketplacecatalog-awsmpseymour` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -74,12 +107,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // This service signs as `aws-marketplace` — a signing name it SHARES with
+        // every other AWS Marketplace-family service (Agreement, Deployment,
+        // Discovery, Entitlement, Metering, Reporting), each of which serves its own
+        // endpoint (`catalog.marketplace` here, `reporting-marketplace`,
+        // `entitlement.marketplace`, …). The router's routing key comes from the SigV4
+        // credential scope first, so all of them resolve to `aws-marketplace` and
+        // matching on the signing name ALONE makes every one of them claim every
+        // request — which the router answers `500 AmbiguousService`, leaving this
+        // service unreachable.
+        //
+        // So the claim is narrowed the way the framework narrows it for the other
+        // signing-name collisions: the signing name must match AND the request must
+        // address this service's own modeled URI path space (see `claims_modeled_path`),
+        // which for a restJson1 service is the first segment of each operation's
+        // `@http` URI (`/GetResourcePolicy`, `/TagResource`, …).
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => {
+                claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
+            }
+            _ => false,
         }
     }
 
@@ -96,17 +143,39 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // A resource ARN this service will not accept is stated the way this
+        // service states it: naming the value it rejected and the syntax it
+        // required. The boundary validator refuses a `ResourceARN` that fails the
+        // modelled `@pattern` before any handler runs, so this seam is the only
+        // place that wording can be chosen — and the one place it is chosen for
+        // EVERY operation that takes a `ResourceArn` (the tagging and
+        // resource-policy surface), rather than per operation.
+        //
+        // The code stays `ValidationException`, which is both the framework's own
+        // code for a constraint failure and the modelled client error a handler
+        // answers for one, so a client branches on one code however the value was
+        // refused. The HTTP status of a boundary refusal stays with the protocol
+        // (400); only a handler-returned `ValidationException` carries the
+        // modelled 422.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        // The first refused member, which is the one the service names. The path
+        // is rooted at the top-level input member and descends from there.
+        let violation = violations.first()?;
+        if violation.path.split('.').next()? != RESOURCE_ARN_MEMBER {
+            return None;
+        }
+        let ViolationKind::Pattern(pattern) = &violation.kind else {
+            return None;
+        };
+        Some(Refused {
+            code: "ValidationException".to_string(),
+            message: crate::state::invalid_resource_arn_message(
+                violation.value.as_deref().unwrap_or_default(),
+                pattern,
+            ),
+        })
     }
 
     fn override_routing_error(

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the stored project record in place: a member absent from the request keeps
+//! its stored value, and the ARN and creation instant are never rewritten.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProject"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateProjectErrorModeled::ServiceAccountException(
+                ServiceAccountException {
+                    message: Some("the Device Farm state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        if !crate::state::is_project_arn(&input.arn) {
+            return Err(UpdateProjectErrorModeled::ArgumentException(ArgumentException {
+                message: Some(format!("{} is not a project ARN", input.arn)),
+            })
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(record) = store.projects.get_mut(&input.arn) else {
+            return Err(UpdateProjectErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("No project found for arn {}", input.arn)),
+            })
+            .into());
+        };
+
+        // Absent members leave the stored value alone; `arn` and `created` are identity,
+        // not configuration, so nothing here touches them.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        if let Some(minutes) = input.default_job_timeout_minutes {
+            record.default_job_timeout_minutes = minutes;
+        }
+        if let Some(vpc_config) = input.vpc_config {
+            record.vpc_config = Some(vpc_config);
+        }
+        if let Some(environment_variables) = input.environment_variables {
+            record.environment_variables = environment_variables;
+        }
+        if let Some(execution_role_arn) = input.execution_role_arn {
+            record.execution_role_arn = Some(execution_role_arn);
+        }
+
+        Ok(UpdateProjectOutput {
+            project: Some(record.to_project()),
+        })
     }
 }

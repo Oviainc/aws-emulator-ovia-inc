@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDeviceRegistration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDeviceRegistration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDeviceRegistration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports whether the named device of the named fleet is registered with this
+//! emulator's Edge Manager: it looks the device up in [`crate::state`] and answers with
+//! the registration document and cache TTL recorded for THAT device. A device this
+//! service does not hold is reported as not registered, with no `CacheTTL` (there is no
+//! recorded one) — this operation only reports, so it registers nothing and writes
+//! nothing; `SendHeartbeat` (the agent reporting in) and the control-plane seam
+//! `register_device` are what create a device record.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +141,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDeviceRegistration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeviceRegistrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDeviceRegistration"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDeviceRegistrationErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "the sagemakeredge emulator could not reach its service state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A pure report: the document and TTL come from the device record, which this
+        // operation never creates and never rewrites, so a second read answers the same
+        // bytes as the first.
+        let state = state.lock();
+        let held = state.device(&input.device_fleet_name, &input.device_name);
+        // The access record of this read: who was asked about, and whether a record for
+        // that device was held.
+        ::tracing::debug!(
+            operation = Self::NAME,
+            device_fleet_name = %input.device_fleet_name,
+            device_name = %input.device_name,
+            registered = held.is_some(),
+            outcome = "reported",
+            "device registration reported"
+        );
+        let (device_registration, cache_ttl) = match held {
+            Some(device) => (
+                device.registration.clone(),
+                // The TTL recorded for THAT device.
+                Some(device.cache_ttl.clone()),
+            ),
+            // No record is held, so there is no recorded TTL to report: `CacheTTL` is
+            // optional in the model, and reporting a TTL here would suggest a stored
+            // value where none exists.
+            None => (
+                crate::state::unregistered_document(&input.device_fleet_name, &input.device_name),
+                None,
+            ),
+        };
+
+        Ok(GetDeviceRegistrationOutput {
+            device_registration: Some(device_registration),
+            cache_ttl,
+        })
     }
 }

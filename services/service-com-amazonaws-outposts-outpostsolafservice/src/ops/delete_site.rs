@@ -146,17 +146,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored record.
         let site_id = crate::state::resolve_site_id(&input.site_id).ok_or_else(|| {
             DeleteSiteErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "SiteId must be a site id or site ARN, got {}",
-                    input.site_id
-                )),
+                message: Some(crate::state::site_id_pattern_report()),
             })
         })?;
 
         let mut store = state.lock();
         if !store.sites.contains_key(&site_id) {
             return Err(DeleteSiteErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("the site {site_id} does not exist")),
+                // The identifier echo, of the value AS SUPPLIED — not of
+                // `site_id`, which is the bare id an ARN resolved to.
+                message: Some(crate::state::identifier_not_found(
+                    crate::state::SITE_ID_MEMBER,
+                    &input.site_id,
+                )),
             })
             .into());
         }

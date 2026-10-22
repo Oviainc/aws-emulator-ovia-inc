@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFixture
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFixture`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the one fixture a `fixtureId` names, as the data-source
+//! catalog holds it. Reporting only (`@readonly`): it writes nothing at all.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFixture::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The catalog lives in [`crate::state`] and is the same one `SearchFixtures`
+//! projects, so a fixture this operation returns agrees member for member with the
+//! `FixtureSummary` that search reported for it. An id no catalog entry has is
+//! `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +170,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFixture` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFixtureErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFixture"))
+        // `ctx` carries request metadata only, and this operation needs none of it.
+        let _ = ctx;
+        // The fixture comes from the data-source catalog in `crate::state`, not from
+        // the engine's store: no operation of this service creates a fixture, and
+        // this one is `@readonly`, so there is nothing here to write and nothing
+        // per-account to read. The engine stays on `self` all the same, as every
+        // handler's constructor seam.
+        let _ = &self.engine;
+
+        let Some(fixture) = crate::state::fixture_by_id(&input.fixture_id) else {
+            return Err(GetFixtureErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("No fixture with id {} exists.", input.fixture_id),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetFixtureOutput {
+            // "The ID that you specified in the request"
+            // (`GetFixtureResponse$fixtureId`) — which is this fixture's own id.
+            fixture_id: fixture.id.clone(),
+            name: fixture.name.clone(),
+            fixture_group: fixture.group.clone(),
+            scheduled_start: Some(fixture.scheduled_start()),
+            status: fixture.status_at(crate::state::now_secs()).to_string(),
+            competitors: fixture.competitors.clone(),
+        })
     }
 }

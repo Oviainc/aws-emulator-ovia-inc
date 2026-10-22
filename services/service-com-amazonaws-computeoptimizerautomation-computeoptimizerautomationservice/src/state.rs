@@ -14,6 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     AutomationEvent, AutomationEventFilter, AutomationRule, Criteria, EstimatedMonthlySavings,
@@ -109,6 +110,160 @@ pub fn now() -> ::aws_smithy_types::DateTime {
 pub fn fingerprint<T: std::fmt::Debug>(value: &T) -> String {
     let digest = Sha256::digest(format!("{value:?}").as_bytes());
     hex::encode(digest)
+}
+
+// ---------------------------------------------------------------------------
+// Error wording
+//
+// Every client error this service raises is worded HERE, so the body a caller
+// parses is built in one place and two handlers raising the same error cannot
+// word it differently. Two shapes of rule live here:
+//
+// * a FIXED message, which the error carries whatever the request named — it
+//   must not echo a resource identifier or any other request value;
+// * a message BUILT from the request or from the stored resource, which states
+//   the fact the caller needs to recover (the member and the constraint it
+//   failed, the current revision, the values that are settable).
+// ---------------------------------------------------------------------------
+
+/// The message every `ResourceNotFoundException` of this service carries.
+///
+/// FIXED and resource-independent: the error reports that the resource the
+/// request named is not there, and names neither the ARN nor the id, so a
+/// not-found body never echoes a resource identifier back to its caller.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The specified resource could not be found";
+
+/// The message every `IdempotentParameterMismatchException` of this service
+/// carries — the service's own wire wording for "this client token was first
+/// used with a different request", FIXED and derived from nothing in the
+/// request.
+pub const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
+    "The request tied to this token is different!";
+
+/// The `InvalidParameterValueException` message for a request whose
+/// `ruleRevision` is not the rule's current one.
+///
+/// `ruleRevision` is the rule's optimistic-concurrency token, so the rejection
+/// states the rule's CURRENT revision — the one fact a caller that lost the race
+/// needs to read-modify-write again — and not the rejected input or the rule's
+/// ARN.
+pub fn revision_mismatch_message(current_revision: i64) -> String {
+    format!("Rule revision does not match the current revision number {current_revision}")
+}
+
+/// The `EnrollmentStatus` values `UpdateEnrollmentConfiguration` accepts from a
+/// caller.
+///
+/// `EnrollmentStatus` is `Active | Inactive | Pending | Failed`
+/// (`smithy_query(query="shape",shape="EnrollmentStatus")`) and the request
+/// member documents that "The Pending and Failed options cannot be used to
+/// update the enrollment status of an account. They are returned in the
+/// response", so those two are server-only and the rest are settable.
+pub const SETTABLE_ENROLLMENT_STATUSES: &[&str] = &["Active", "Inactive"];
+
+/// The `InvalidParameterValueException` message for an enrollment status a
+/// caller may not set: it names the rejected value AND enumerates the settable
+/// set, so the caller is told what to send instead.
+pub fn invalid_enrollment_status_message(status: &str) -> String {
+    format!(
+        "Invalid status: {status}. Only {} are allowed.",
+        settable_enrollment_statuses_phrase()
+    )
+}
+
+/// The settable statuses as the rejection lists them: the model's value set,
+/// upper-cased, joined so the last one reads "… and X".
+fn settable_enrollment_statuses_phrase() -> String {
+    let values: Vec<String> = SETTABLE_ENROLLMENT_STATUSES
+        .iter()
+        .map(|status| status.to_uppercase())
+        .collect();
+    match values.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, leading)) => format!("{} and {last}", leading.join(", ")),
+    }
+}
+
+/// The marker that separates the member clause of a validation clause from the
+/// requirement it failed, in the framework's own wording.
+const CONSTRAINT_MARKER: &str = "failed to satisfy constraint: ";
+
+/// AWS's standard validation report for the modelled constraints a request
+/// failed at the protocol boundary, as `src/service.rs` words a refusal with.
+///
+/// The report opens with HOW MANY members failed, then states one clause per
+/// failing member: the member's dotted path and the requirement it failed. It
+/// does NOT echo the rejected value — a request value (a name, or a secret on
+/// some other member) must not be replayed into an error body — and reports a
+/// `@pattern` as the regular expression itself, without the anchors the model
+/// spells it with.
+pub fn validation_report(violations: &[Violation]) -> String {
+    let count = violations.len();
+    let noun = if count == 1 { "error" } else { "errors" };
+    let clauses: Vec<String> = violations.iter().map(validation_clause).collect();
+    format!("{count} validation {noun} detected: {}", clauses.join("; "))
+}
+
+/// One clause of [`validation_report`]: the member and what it failed, with no
+/// value echoed.
+fn validation_clause(violation: &Violation) -> String {
+    format!(
+        "Value at '{}' {CONSTRAINT_MARKER}{}",
+        violation.path,
+        violation_requirement(violation)
+    )
+}
+
+/// The validation report for ONE member a HANDLER refused — a rule the model's
+/// constraints cannot carry, so the protocol boundary admitted the value and
+/// the check lives in the handler.
+///
+/// Same format as [`validation_report`], because a client counts and attributes
+/// a constraint failure the same way wherever the service found it, and the
+/// rejected value is echoed in neither.
+pub fn constraint_report(member: &str, requirement: &str) -> String {
+    format!("1 validation error detected: Value at '{member}' {CONSTRAINT_MARKER}{requirement}")
+}
+
+/// The requirement a violation states.
+///
+/// A `@pattern` is reported unanchored, because the requirement is the
+/// expression a value must match and the `^`/`$` are how the model spells
+/// "whole value". Every other constraint keeps the framework's own requirement
+/// wording, read off the clause it builds, so a constraint kind added to the
+/// framework later is reported rather than dropped.
+fn violation_requirement(violation: &Violation) -> String {
+    match &violation.kind {
+        ViolationKind::Pattern(pattern) => {
+            format!(
+                "Member must satisfy regular expression pattern: {}",
+                unanchored(pattern)
+            )
+        }
+        _ => {
+            // Read the requirement off a clause the framework builds for this
+            // SAME violation with no value attached. A clause that carried the
+            // value would put caller-controlled text before the marker, so a
+            // value containing the marker itself would split inside the value
+            // and copy the rest of it into the report.
+            let valueless = Violation {
+                value: None,
+                ..violation.clone()
+            };
+            let clause = valueless.message();
+            match clause.split_once(CONSTRAINT_MARKER) {
+                Some((_, requirement)) => requirement.to_string(),
+                None => clause,
+            }
+        }
+    }
+}
+
+/// `pattern` without its `^` prefix and `$` suffix.
+fn unanchored(pattern: &str) -> &str {
+    let without_caret = pattern.strip_prefix('^').unwrap_or(pattern);
+    without_caret.strip_suffix('$').unwrap_or(without_caret)
 }
 
 /// The enrollment configuration of one account.
@@ -602,6 +757,19 @@ pub fn unknown_filter_name(filters: &[Filter]) -> Option<&str> {
         .iter()
         .map(|f| f.name.as_str())
         .find(|name| !AUTOMATION_RULE_FILTER_NAMES.contains(name))
+}
+
+/// The refusal for a filter name outside the model's value set. The set is
+/// enumerated from [`AUTOMATION_RULE_FILTER_NAMES`], so the message cannot
+/// drift from the names the service actually accepts.
+pub fn unknown_filter_name_message() -> String {
+    constraint_report(
+        "filters.member.name",
+        &format!(
+            "Member must satisfy enum value set: [{}]",
+            AUTOMATION_RULE_FILTER_NAMES.join(", ")
+        ),
+    )
 }
 
 /// The `AutomationRuleFilterName` value set, from the Smithy model

@@ -91,3 +91,27 @@ OPERATIONS.md for this crate lists exactly 3 operations with their routes, requi
 7. POST /SendHeartbeat again with DeploymentResult {DeploymentName:"deploy-1", DeploymentStatus:"SUCCESS", DeploymentStartTime, DeploymentEndTime, DeploymentModels:[{ModelName:"mnist",ModelVersion:"1.0"}]} — expect 200.
 8. POST /GetDeployments again for the same device — expect 200 with an EMPTY `Deployments` list, because the deployment was acknowledged by the heartbeat.
 9. POST /GetDeployments for an unknown device ("edge-device-9" / "fleet-a") — expect 200 with an empty Deployments list, never a fabricated deployment.
+
+## Resolution
+
+All three operations are implemented and answer from `src/state.rs` (fleets -> devices /
+seeded deployments); the `SCAFFOLDED, NOT IMPLEMENTED` marker is gone from each handler.
+Covered end-to-end by `tests/all/edge_agent_loop.rs`.
+
+One deliberate departure from the plan above, with the consequence for the script in
+"Steps to Reproduce": **GetDeviceRegistration does not register a device.** The model
+documents that operation as "Use to check if a device is registered with SageMaker Edge
+Manager" — it reports — and a reporting operation must not change what a later caller
+sees. A device record is therefore created only where a write is sanctioned: by
+`SendHeartbeat` (the agent reporting the device in) or by the `register_device` seam that
+stands in for the `sagemaker` control plane's device-fleet APIs. Steps 2 and 3 answer 200
+with a document reporting `Status: NOT_REGISTERED` for a device nothing has registered yet
+(identical on every read, since nothing is generated per call), and **step 5 reports
+"deploy-1" only once `edge-device-1` has been registered** — by the step-6 heartbeat, or by
+seeding it through `register_device` next to the step-4 `seed_deployment`. Steps 6 to 9 hold
+as written. Both registration paths are exercised in the test suite, which asserts that how
+a device record was created does not change what GetDeployments reports.
+
+Request-keyed state is bounded (`MAX_FLEETS`, `MAX_DEVICES_PER_FLEET`,
+`MAX_DEPLOYMENTS_PER_FLEET`, `MAX_DEPLOYMENT_RESULTS_PER_DEVICE`): a heartbeat that would
+grow the store past a bound is refused with 400 rather than growing it.

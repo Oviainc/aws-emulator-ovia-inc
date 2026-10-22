@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAutoScalingGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAutoScalingGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAutoScalingGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored Auto Scaling groups exactly as they were created and
+//! updated — sizes, zones, tags, health check, launch source, instances and
+//! creation time — name-ordered, filtered by the requested names and tag filters,
+//! and paged by `MaxRecords`/`NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,204 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAutoScalingGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAutoScalingGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAutoScalingGroups"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeAutoScalingGroupsErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_next_token(token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(DescribeAutoScalingGroupsErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some("The NextToken value is not valid.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `MaxRecords` has a documented range; a page size outside it is refused,
+        // not quietly reshaped.
+        if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The MaxRecords value {max_records} is not valid: it must be between 1 and {}",
+                crate::state::MAX_MAX_RECORDS
+            )));
+        }
+
+        let filters = input.filters.unwrap_or_default();
+        for filter in &filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !(name == FILTER_TAG_KEY
+                || name == FILTER_TAG_VALUE
+                || name.starts_with(FILTER_TAG_PREFIX))
+            {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "The filter '{name}' is not valid: valid filter names are {FILTER_TAG_KEY}, \
+                     {FILTER_TAG_VALUE} and {FILTER_TAG_PREFIX}<key>"
+                )));
+            }
+        }
+
+        let wanted = input.auto_scaling_group_names.unwrap_or_default();
+        if wanted.len() > crate::state::max_filter_names(input.max_records) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The AutoScalingGroupNames value names {} groups, more than the {} this request \
+                 allows: raise MaxRecords to describe more of them in one call",
+                wanted.len(),
+                crate::state::max_filter_names(input.max_records)
+            )));
+        }
+        // The model documents `IncludeInstances` as defaulting to true.
+        let include_instances = input.include_instances.unwrap_or(true);
+
+        let mut state = state.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        let matching: Vec<AutoScalingGroup> = state
+            .groups
+            .values()
+            .filter(|group| wanted.is_empty() || wanted.contains(&group.name))
+            .filter(|group| filters.iter().all(|filter| matches_filter(group, filter)))
+            .map(|group| group_view(group, include_instances))
+            .collect();
+        // A token the service issued always points inside the list it was issued
+        // for; one that points past the end was not issued for this list.
+        if offset > 0 && offset >= matching.len() {
+            return Err(DescribeAutoScalingGroupsErrorModeled::InvalidNextToken(
+                InvalidNextToken {
+                    message: Some("The NextToken value is not valid.".to_string()),
+                },
+            )
+            .into());
+        }
+        let (auto_scaling_groups, next_token) =
+            crate::state::page(&matching, offset, input.max_records);
+
+        Ok(DescribeAutoScalingGroupsOutput {
+            auto_scaling_groups,
+            next_token,
+        })
+    }
+}
+
+// The filter names the model documents for this operation
+// (smithy_query(query="doc",shape="Filter",member="Name")): a tag key, a tag
+// value, or `tag:<key>` for a key/value pair.
+const FILTER_TAG_KEY: &str = "tag-key";
+const FILTER_TAG_VALUE: &str = "tag-value";
+const FILTER_TAG_PREFIX: &str = "tag:";
+
+/// Whether a group matches one tag filter. A filter's values are joined with OR;
+/// the caller joins the filters themselves with AND, as the model documents.
+fn matches_filter(group: &crate::state::StoredGroup, filter: &Filter) -> bool {
+    let name = filter.name.as_deref().unwrap_or_default();
+    let values = filter.values.clone().unwrap_or_default();
+    if values.is_empty() {
+        // A filter carrying no values selects nothing and excludes nothing: the
+        // model gives no rule for the empty list, and refusing it or matching
+        // nothing would both be guesses, so such a filter is ignored.
+        return true;
+    }
+    group.tags.iter().any(|tag| {
+        let value = tag.value.clone().unwrap_or_default();
+        if name == FILTER_TAG_KEY {
+            values.contains(&tag.key)
+        } else if name == FILTER_TAG_VALUE {
+            values.contains(&value)
+        } else {
+            name.strip_prefix(FILTER_TAG_PREFIX)
+                .is_some_and(|key| key == tag.key && values.contains(&value))
+        }
+    })
+}
+
+/// The `AutoScalingGroup` the service reports for a stored group.
+fn group_view(group: &crate::state::StoredGroup, include_instances: bool) -> AutoScalingGroup {
+    let instances = include_instances.then(|| {
+        group
+            .instances
+            .iter()
+            .map(|instance| Instance {
+                instance_id: instance.instance_id.clone(),
+                instance_type: instance.instance_type.clone(),
+                availability_zone: instance.availability_zone.clone(),
+                availability_zone_id: None,
+                lifecycle_state: instance.lifecycle_state.clone(),
+                health_status: instance.health_status.clone(),
+                launch_configuration_name: instance.launch_configuration_name.clone(),
+                launch_template: instance.launch_template.clone(),
+                image_id: instance.image_id.clone(),
+                protected_from_scale_in: instance.protected_from_scale_in,
+                weighted_capacity: None,
+            })
+            .collect()
+    });
+    AutoScalingGroup {
+        auto_scaling_group_name: group.name.clone(),
+        auto_scaling_group_arn: Some(group.arn.clone()),
+        launch_configuration_name: group.launch_configuration_name.clone(),
+        launch_template: group.launch_template.clone(),
+        mixed_instances_policy: group.mixed_instances_policy.clone(),
+        min_size: group.min_size,
+        max_size: group.max_size,
+        desired_capacity: group.desired_capacity,
+        predicted_capacity: None,
+        default_cooldown: group.default_cooldown,
+        availability_zones: group.availability_zones.clone(),
+        availability_zone_ids: group.availability_zone_ids.clone(),
+        load_balancer_names: group.load_balancer_names.clone(),
+        target_group_ar_ns: group.target_group_arns.clone(),
+        health_check_type: group.health_check_type.clone(),
+        health_check_grace_period: group.health_check_grace_period,
+        instances,
+        created_time: crate::state::to_date_time(group.created_time),
+        suspended_processes: None,
+        placement_group: group.placement_group.clone(),
+        vpc_zone_identifier: group.vpc_zone_identifier.clone(),
+        enabled_metrics: None,
+        status: group.status.clone(),
+        tags: Some(
+            group
+                .tags
+                .iter()
+                .map(|tag| TagDescription {
+                    resource_id: tag.resource_id.clone(),
+                    resource_type: tag.resource_type.clone(),
+                    key: Some(tag.key.clone()),
+                    value: tag.value.clone(),
+                    propagate_at_launch: tag.propagate_at_launch,
+                })
+                .collect(),
+        ),
+        termination_policies: Some(group.termination_policies.clone()),
+        new_instances_protected_from_scale_in: Some(group.new_instances_protected_from_scale_in),
+        service_linked_role_arn: group.service_linked_role_arn.clone(),
+        max_instance_lifetime: group.max_instance_lifetime,
+        capacity_rebalance: group.capacity_rebalance,
+        warm_pool_configuration: None,
+        warm_pool_size: None,
+        context: group.context.clone(),
+        desired_capacity_type: group.desired_capacity_type.clone(),
+        default_instance_warmup: group.default_instance_warmup,
+        traffic_sources: group.traffic_sources.clone(),
+        instance_maintenance_policy: group.instance_maintenance_policy.clone(),
+        deletion_protection: group.deletion_protection.clone(),
+        availability_zone_distribution: group.availability_zone_distribution.clone(),
+        availability_zone_impairment_policy: group.availability_zone_impairment_policy.clone(),
+        capacity_reservation_specification: group.capacity_reservation_specification.clone(),
+        instance_lifecycle_policy: group.instance_lifecycle_policy.clone(),
+        operator: group.operator.clone(),
     }
 }

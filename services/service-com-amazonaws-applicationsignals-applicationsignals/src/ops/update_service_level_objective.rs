@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServiceLevelObjective
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServiceLevelObjective`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServiceLevelObjective::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the persisted service level objective an `Id` names.
 //!
 //! ## Shape of an operation
 //!
@@ -154,23 +146,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_SERVICE_LEVEL_OBJECTIVE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Apply the supplied members to the stored SLO and answer the updated record.
+    ///
+    /// Every member the request omits is left exactly as stored — including `Arn`, `Name`
+    /// and `CreatedTime`, which no request can change — and `LastUpdatedTime` is advanced
+    /// to now. Supplying `SliConfig` switches the record to `PeriodBased` and supplying
+    /// `RequestBasedSliConfig` switches it to `RequestBased`, since the two indicators are
+    /// mutually exclusive, and `MetricSourceType` is re-derived from the new indicator.
+    ///
+    /// A supplied `Goal` REPLACES the stored goal wholesale: each of its own members the
+    /// request omits takes the default the model documents for it, not the value the stored
+    /// goal happened to carry. The same holds for the SLI configs and the burn-rate list —
+    /// each is one structure the request either replaces or leaves alone, so "only the
+    /// supplied members change" is at the granularity of these top-level members.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServiceLevelObjective` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceLevelObjectiveErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServiceLevelObjective"))
+        let _ = ctx;
+        // Same documented exclusion as on create: "You can't specify both
+        // RequestBasedSliConfig and SliConfig in the same operation."
+        if input.sli_config.is_some() && input.request_based_sli_config.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "You can't specify both RequestBasedSliConfig and SliConfig in the same operation.",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateServiceLevelObjectiveErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let mut store = state.lock();
+        let Some(slo) = store.resolve_mut(&input.id) else {
+            return Err(
+                UpdateServiceLevelObjectiveErrorModeled::ResourceNotFoundException(
+                    crate::state::slo_not_found(&input.id),
+                )
+                .into(),
+            );
+        };
+
+        if let Some(description) = input.description.as_ref() {
+            slo.description = Some(description.clone());
+        }
+        if let Some(config) = input.sli_config.as_ref() {
+            slo.sli = Some(crate::state::sli_from_config(config));
+            slo.request_based_sli = None;
+            slo.evaluation_type =
+                Some(crate::state::EVALUATION_TYPE_PERIOD_BASED.to_string());
+        }
+        if let Some(config) = input.request_based_sli_config.as_ref() {
+            slo.request_based_sli = Some(crate::state::request_based_sli_from_config(config));
+            slo.sli = None;
+            slo.evaluation_type =
+                Some(crate::state::EVALUATION_TYPE_REQUEST_BASED.to_string());
+        }
+        if input.sli_config.is_some() || input.request_based_sli_config.is_some() {
+            let derived = crate::state::derive_metric_source_type(
+                slo.sli.as_ref(),
+                slo.request_based_sli.as_ref(),
+            );
+            slo.metric_source_type = derived;
+        }
+        if let Some(goal) = input.goal.as_ref() {
+            slo.goal = crate::state::goal_with_defaults(Some(goal));
+        }
+        if let Some(configurations) = input.burn_rate_configurations.as_ref() {
+            slo.burn_rate_configurations = Some(configurations.clone());
+        }
+        if let Some(enabled) = input.auto_investigation_enabled {
+            slo.auto_investigation_enabled = Some(enabled);
+        }
+        slo.last_updated_time = now;
+
+        Ok(UpdateServiceLevelObjectiveOutput { slo: slo.clone() })
     }
 }

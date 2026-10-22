@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSupportDataExport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSupportDataExport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSupportDataExport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +168,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSupportDataExport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSupportDataExportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSupportDataExport"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                StartSupportDataExportErrorModeled::MarketplaceCommerceAnalyticsException(
+                    MarketplaceCommerceAnalyticsException {
+                        message: Some(
+                            "the marketplace commerce analytics request store is unavailable"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // This operation names its object down to the second
+        // (`{data_set_type}_YYYY-MM-DD'T'HH-mm-ss'Z'.csv`), unlike `GenerateDataSet`'s
+        // day-granular name; a `fromDate` that names no calendar instant names no
+        // export either, and the model bounds the member only as a timestamp.
+        let Some(object_name) = crate::state::support_data_export_object_name(
+            &input.data_set_type,
+            &input.from_date,
+        ) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "fromDate {} is not a date a support data export can be published for",
+                input.from_date.secs()
+            )));
+        };
+
+        // `destinationS3BucketName` is the friendly bucket name, and S3's bucket
+        // naming rules say which names exist: lowercase letters, numbers, dots
+        // and hyphens, beginning and ending alphanumeric, no adjacent periods,
+        // not an IP address. The model bounds the member only by length, so this
+        // is the unmodelled refusal channel.
+        if let Some(message) =
+            crate::state::malformed_bucket_name_message(&input.destination_s3_bucket_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // S3 stores an object key of at most 1,024 bytes, and
+        // `destinationS3Prefix` carries no modelled length bound, so a prefix
+        // that pushes the published key past it names an object the publication
+        // could never write. Unmodelled refusal channel again.
+        if let Some(message) = crate::state::oversized_key_message(
+            input.destination_s3_prefix.as_deref(),
+            &object_name,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        // One write, under one lock: the id this call is correlated by, the
+        // request record, and the artifact its publication writes — which
+        // replaces whatever the same data set, instant and destination held
+        // before. The id the caller gets back is the stored record's own. A
+        // store at its ceiling accepts nothing, and says so with the modelled
+        // fault.
+        let accepted = {
+            let mut store = state.lock();
+            let request = crate::state::DataSetRequest {
+                data_set_request_id: store.mint_request_id(),
+                kind: crate::state::RequestKind::StartSupportDataExport,
+                data_set_type: input.data_set_type,
+                // `dataSetPublicationDate` belongs to `GenerateDataSet` alone;
+                // this operation dates its export from `fromDate`.
+                publication_date: None,
+                from_date: Some(input.from_date),
+                role_name_arn: input.role_name_arn,
+                destination_s3_bucket_name: input.destination_s3_bucket_name,
+                destination_s3_prefix: input.destination_s3_prefix,
+                sns_topic_arn: input.sns_topic_arn,
+                customer_defined_values: input
+                    .customer_defined_values
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                created_at: ::std::time::SystemTime::now(),
+            };
+            store.accept(request, object_name)
+        };
+        let data_set_request_id = match accepted {
+            Ok(id) => id,
+            Err(message) => {
+                return Err(
+                    StartSupportDataExportErrorModeled::MarketplaceCommerceAnalyticsException(
+                        MarketplaceCommerceAnalyticsException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // Audit record for a state-changing operation: who asked, what changed,
+        // how it ended. Wire metadata and the server-minted id only — never the
+        // caller's own `customerDefinedValues`.
+        ::tracing::info!(
+            audit = true,
+            operation = "StartSupportDataExport",
+            outcome = "accepted",
+            caller_akid = %::engine::extract_akid(&ctx.parts().headers),
+            data_set_request_id = %data_set_request_id,
+            "support data export request accepted"
+        );
+
+        Ok(StartSupportDataExportOutput {
+            data_set_request_id: Some(data_set_request_id),
+        })
     }
 }

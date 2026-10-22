@@ -21,13 +21,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination tokens: `ListServiceLevelObjectives`'s `NextToken` is the hex
+# encoding of the cursor, so a caller cannot read or forge a store key out of it.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

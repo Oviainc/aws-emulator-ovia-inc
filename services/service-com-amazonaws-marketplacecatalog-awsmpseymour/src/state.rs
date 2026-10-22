@@ -18,10 +18,10 @@ use ::aws_smithy_types::Document;
 use serde_json::{Map, Value};
 
 use crate::ops::types::{
-    AmiProductSummary, ChangeSetSummaryListItem, ChangeSummary, ContainerProductSummary,
-    DataProductSummary, Entity, EntitySummary, MachineLearningProductSummary,
-    ResourceInUseException, ResourceNotFoundException, SaaSProductSummary, Tag,
-    ValidationException, ValidationExceptionField,
+    AccessDeniedException, AmiProductSummary, ChangeSetSummaryListItem, ChangeSummary,
+    ContainerProductSummary, DataProductSummary, Entity, EntitySummary,
+    MachineLearningProductSummary, ResourceInUseException, ResourceNotFoundException,
+    SaaSProductSummary, Tag, ValidationException, ValidationExceptionField,
 };
 
 /// The only catalog this service serves.
@@ -161,6 +161,27 @@ pub const PRODUCT_ENTITY_TYPES: &[&str] = &[
     "MachineLearningProduct",
     "SaaSProduct",
 ];
+
+/// The resource type segment a CHANGE SET's ARN carries, as
+/// [`change_set_arn`] writes it. An entity's ARN carries its `EntityType`
+/// there instead, which is how one resource ARN form names both.
+pub const CHANGE_SET_RESOURCE_TYPE: &str = "ChangeSet";
+
+/// The resource-based policy a resource that has none carries.
+///
+/// `GetResourcePolicy` reports "a resource-based policy of an entity", and
+/// `ResourcePolicyJson` is `@length 1..10240`, so the absence of a policy is
+/// reported as the EMPTY JSON policy document rather than as an absent member
+/// or an empty string, neither of which that bound admits.
+pub const EMPTY_RESOURCE_POLICY: &str = "{}";
+
+/// How many tags one resource holds.
+///
+/// `TagList` is `@length(min: 1, max: 200)`, which is the bound on the tags a
+/// resource carries as much as on the tags one request names, so a
+/// `TagResource` whose merge would pass it is refused rather than storing a set
+/// no `ListTagsForResource` could report.
+pub const MAX_RESOURCE_TAGS: usize = 200;
 
 /// The `NextToken` prefix `ListChangeSets` pages with.
 pub const CHANGE_SET_PAGE_PREFIX: &str = "CS";
@@ -506,6 +527,11 @@ pub struct ComAmazonawsMarketplacecatalogAwsmpseymourState {
     pub change_set_seq: u64,
     /// The counter entity ids are minted from.
     pub entity_seq: u64,
+    /// The resource-based policy attached to each resource that has one, keyed
+    /// by [`CatalogResource::policy_key`] — the resource's type and id, which
+    /// is what identifies it whatever region or partition the ARN naming it was
+    /// written with. A resource absent from the map has no policy attached.
+    pub resource_policies: BTreeMap<String, String>,
 }
 
 impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
@@ -558,6 +584,66 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
     pub fn resolve_identifier(&self, identifier: &str) -> Option<&EntityRecord> {
         let id = identifier.split('@').next().unwrap_or(identifier);
         self.entities.get(id)
+    }
+
+    /// Whether this store holds the resource a resource ARN named.
+    ///
+    /// An entity's ARN names its `EntityType` as well as its id, so a record
+    /// whose type is not the one the ARN carries is NOT the resource that ARN
+    /// names.
+    pub fn holds_resource(&self, resource: &CatalogResource) -> bool {
+        match resource {
+            CatalogResource::Entity { entity_type, id } => self
+                .entities
+                .get(id)
+                .is_some_and(|held| &held.entity_type == entity_type),
+            CatalogResource::ChangeSet { id } => self.change_sets.contains_key(id),
+        }
+    }
+
+    /// The ARN the stored record carries for the resource a resource ARN named,
+    /// which is what an operation reporting the resource reports — never the
+    /// ARN the request was written with.
+    pub fn stored_resource_arn(&self, resource: &CatalogResource) -> Option<&str> {
+        match resource {
+            CatalogResource::Entity { entity_type, id } => self
+                .entities
+                .get(id)
+                .filter(|held| &held.entity_type == entity_type)
+                .map(|held| held.arn.as_str()),
+            CatalogResource::ChangeSet { id } => {
+                self.change_sets.get(id).map(|held| held.arn.as_str())
+            }
+        }
+    }
+
+    /// The tags the stored record carries for the resource a resource ARN
+    /// named: the one copy `StartChangeSet` wrote and `TagResource` updates.
+    pub fn resource_tags(&self, resource: &CatalogResource) -> Option<&[Tag]> {
+        match resource {
+            CatalogResource::Entity { entity_type, id } => self
+                .entities
+                .get(id)
+                .filter(|held| &held.entity_type == entity_type)
+                .map(|held| held.tags.as_slice()),
+            CatalogResource::ChangeSet { id } => {
+                self.change_sets.get(id).map(|held| held.tags.as_slice())
+            }
+        }
+    }
+
+    /// Those same tags, for writing.
+    pub fn resource_tags_mut(&mut self, resource: &CatalogResource) -> Option<&mut Vec<Tag>> {
+        match resource {
+            CatalogResource::Entity { entity_type, id } => self
+                .entities
+                .get_mut(id)
+                .filter(|held| &held.entity_type == entity_type)
+                .map(|held| &mut held.tags),
+            CatalogResource::ChangeSet { id } => {
+                self.change_sets.get_mut(id).map(|held| &mut held.tags)
+            }
+        }
     }
 
     /// Materialise every change the clock owes: a change set past its due
@@ -740,6 +826,113 @@ pub fn entity_arn(region: &str, entity_type: &str, entity_id: &str) -> String {
         region,
         &format!("{AWS_MARKETPLACE_CATALOG}/{entity_type}/{entity_id}"),
     )
+}
+
+/// A resource of this catalog, as one of its resource ARNs names it.
+///
+/// `ListTagsForResource` is documented for "a resource (either an entity or
+/// change set)", and [`entity_arn`] / [`change_set_arn`] write both in the one
+/// form `<catalog>/<type>/<id>`, so one parse covers both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogResource {
+    /// A catalog entity: its `EntityType` and its `ResourceId`.
+    Entity { entity_type: String, id: String },
+    /// A change set, by its `ResourceId`.
+    ChangeSet { id: String },
+}
+
+impl CatalogResource {
+    /// The id the ARN named — what a `ResourceNotFoundException` for it names.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Entity { id, .. } | Self::ChangeSet { id } => id.as_str(),
+        }
+    }
+
+    /// The key [`ComAmazonawsMarketplacecatalogAwsmpseymourState::resource_policies`]
+    /// holds this resource's policy under: its type and id, so a policy
+    /// attached through an ARN written for one region is the policy read back
+    /// through an ARN written for another — the resource is the same resource.
+    pub fn policy_key(&self) -> String {
+        match self {
+            Self::Entity { entity_type, id } => format!("{entity_type}/{id}"),
+            Self::ChangeSet { id } => format!("{CHANGE_SET_RESOURCE_TYPE}/{id}"),
+        }
+    }
+}
+
+/// The resource portion of `arn` — everything after the account field — or the
+/// whole value when it has no such field.
+pub fn arn_resource(arn: &str) -> &str {
+    let mut fields = arn.splitn(6, ':');
+    match (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) {
+        (Some("arn"), Some(_), Some(_), Some(_), Some(_), Some(resource)) => resource,
+        _ => arn,
+    }
+}
+
+/// The resource of THIS service `arn` names, or `None` when `arn` names none.
+///
+/// A resource ARN this service can act on is one it mints: this account, this
+/// `arnNamespace`, and a resource portion of the `<catalog>/<type>/<id>` form
+/// [`entity_arn`] and [`change_set_arn`] write. Every other well-formed ARN
+/// names a resource outside this catalog, which no identity or resource policy
+/// of this catalog can grant an action on — so the caller is not authorized to
+/// act on it rather than it being absent.
+///
+/// The partition and region fields are not constrained: they name where the
+/// resource lives, not what it is, and the modelled `ResourceARN` pattern
+/// already bounds their characters.
+pub fn parse_resource_arn(arn: &str) -> Option<CatalogResource> {
+    let mut fields = arn.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(_partition),
+        Some(ARN_NAMESPACE),
+        Some(_region),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return None;
+    };
+    if account != ::engine::emulator_account_id() {
+        return None;
+    }
+    let mut segments = resource.split('/');
+    let (Some(AWS_MARKETPLACE_CATALOG), Some(resource_type), Some(id), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    if id.is_empty() {
+        return None;
+    }
+    Some(if resource_type == CHANGE_SET_RESOURCE_TYPE {
+        CatalogResource::ChangeSet { id: id.to_string() }
+    } else {
+        CatalogResource::Entity {
+            entity_type: resource_type.to_string(),
+            id: id.to_string(),
+        }
+    })
 }
 
 /// The region this request was signed for — what the ARNs it mints name.
@@ -926,10 +1119,44 @@ pub fn change_set_not_found(change_set_id: &str) -> ResourceNotFoundException {
 
 /// The modelled `ResourceNotFoundException` payload for an entity id that names
 /// no entity.
+///
+/// The wording is this service's own for an absent resource, as its recorded
+/// answers show it ("Requested entity '<id>' does not exist."): it names the id
+/// the request asked for, so the caller can see which one was missing.
 pub fn entity_not_found(entity_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("Entity {entity_id} was not found")),
+        message: Some(format!("Requested entity '{entity_id}' does not exist.")),
     }
+}
+
+/// The modelled `ResourceNotFoundException` payload for a resource ARN that
+/// names a resource of this catalog the store does not hold.
+pub fn resource_not_found(resource: &CatalogResource) -> ResourceNotFoundException {
+    match resource {
+        CatalogResource::Entity { id, .. } => entity_not_found(id),
+        CatalogResource::ChangeSet { id } => change_set_not_found(id),
+    }
+}
+
+/// The modelled `AccessDeniedException` payload for an action on a resource ARN
+/// this catalog cannot authorize: it names the IAM action (this service's
+/// `arnNamespace` is its IAM service prefix) and the resource the request named.
+pub fn access_denied(operation: &str, resource_arn: &str) -> AccessDeniedException {
+    let resource = arn_resource(resource_arn);
+    AccessDeniedException {
+        message: Some(format!(
+            "Access is denied. The caller is not authorized to perform: \
+             {ARN_NAMESPACE}:{operation} on resource: {resource} because no \
+             resource-based policy allows the {ARN_NAMESPACE}:{operation} action"
+        )),
+    }
+}
+
+/// How this service states a resource ARN it will not accept: the value it
+/// rejected and the syntax it required, which is the modelled `ResourceARN`
+/// `@pattern` the request failed.
+pub fn invalid_resource_arn_message(resource_arn: &str, pattern: &str) -> String {
+    format!("[Requested resource arn '{resource_arn}' is invalid. It should match with {pattern}.]")
 }
 
 /// The modelled `ResourceInUseException` payload for a resource another call

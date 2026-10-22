@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the resource-based policy attached to the resource a resource ARN names.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +136,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteResourcePolicyErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the marketplace catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Authorization is evaluated on the ARN BEFORE anything is looked up: an
+        // ARN that names no resource of this catalog in this account is one no
+        // identity or resource policy of this catalog can grant an action on, so
+        // the caller is not authorized to act on it rather than it being absent.
+        let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
+            return Err(DeleteResourcePolicyErrorModeled::AccessDeniedException(
+                crate::state::access_denied(Self::NAME, &input.resource_arn),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A resource exists once the change set that creates it has succeeded,
+        // which is a change the clock owes rather than one this call makes.
+        store.settle(now);
+
+        // Deleting leaves the resource with no policy attached, which is the
+        // state a resource that never had one is already in: this is a write to
+        // the resource-POLICY store, keyed by the resource the ARN names, and it
+        // creates no binding to the catalog's own record — so deleting an absent
+        // policy, or one for a resource the catalog holds no record for, is the
+        // same success, and the answer carries no members either way. Attaching
+        // is the operation that binds, and it is the one that requires the
+        // entity to exist.
+        store.resource_policies.remove(&resource.policy_key());
+
+        Ok(DeleteResourcePolicyOutput {})
     }
 }

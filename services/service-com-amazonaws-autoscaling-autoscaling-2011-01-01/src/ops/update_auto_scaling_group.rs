@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAutoScalingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAutoScalingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAutoScalingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies ONLY the members the request supplies to a stored group — an absent
+//! member leaves that part of the group unchanged — then brings the group's
+//! capacity within the bounds the update leaves it with, as the model documents.
 //!
 //! ## Shape of an operation
 //!
@@ -313,18 +308,268 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAutoScalingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAutoScalingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAutoScalingGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAutoScalingGroupErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.auto_scaling_group_name.clone();
+        if input.availability_zones.is_some() && input.availability_zone_ids.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "You cannot specify both AvailabilityZones and AvailabilityZoneIds in the same \
+                 request",
+            ));
+        }
+        if let Some(lifetime) = input.max_instance_lifetime {
+            if !crate::state::is_valid_max_instance_lifetime(lifetime) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "The MaxInstanceLifetime value {lifetime} is not valid: it must be either 0 \
+                     or at least {} seconds",
+                    crate::state::MIN_MAX_INSTANCE_LIFETIME
+                )));
+            }
+        }
+        if let Some(health_check_type) = input.health_check_type.as_deref() {
+            if !crate::state::is_valid_health_check_type(health_check_type) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "The HealthCheckType value {health_check_type} is not valid: it must be a \
+                     comma-separated list of {:?}",
+                    crate::state::HEALTH_CHECK_TYPES
+                )));
+            }
+        }
+        if let Some(policy) = input
+            .termination_policies
+            .iter()
+            .flatten()
+            .find(|policy| !crate::state::is_valid_termination_policy(policy))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The TerminationPolicies value {policy} is not valid: it must be one of {:?} or a \
+                 Lambda function ARN",
+                crate::state::TERMINATION_POLICIES
+            )));
+        }
+        if let Some(capacity_type) = input.desired_capacity_type.as_deref() {
+            if !crate::state::DESIRED_CAPACITY_TYPES.contains(&capacity_type) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "The DesiredCapacityType value {capacity_type} is not valid: it must be one \
+                     of {:?}",
+                    crate::state::DESIRED_CAPACITY_TYPES
+                )));
+            }
+        }
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let Some(group) = state.groups.get(&name) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "AutoScalingGroup name not found - AutoScalingGroup: {name} not found"
+            )));
+        };
+
+        // The bounds this update leaves the group with: a member the request omits
+        // keeps the value the group already has.
+        let min_size = input.min_size.unwrap_or(group.min_size);
+        let max_size = input.max_size.unwrap_or(group.max_size);
+        let current_capacity = group.desired_capacity;
+        if min_size < 0 {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The MinSize must not be negative, but it is {min_size}"
+            )));
+        }
+        if max_size < min_size {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The MinSize must be less than or equal to the MaxSize, but MinSize is \
+                 {min_size} and MaxSize is {max_size}"
+            )));
+        }
+        if let Some(desired_capacity) = input.desired_capacity {
+            if desired_capacity < min_size || desired_capacity > max_size {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "The DesiredCapacity must be between the MinSize and the MaxSize, but \
+                     DesiredCapacity is {desired_capacity} and the range is [{min_size}, \
+                     {max_size}]"
+                )));
+            }
+        }
+        // Those checks are all RELATIVE, so none of them bounds the absolute size:
+        // every unit of capacity is a stored instance. Refuse past the ceiling
+        // before any member is applied or any instance allocated.
+        if let Some(size) = crate::state::size_past_ceiling(&[
+            min_size,
+            max_size,
+            input.desired_capacity.unwrap_or(0),
+        ]) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The group size {size} exceeds the limit of {} instances per Auto Scaling group",
+                crate::state::MAX_GROUP_CAPACITY
+            )));
+        }
+        if let Some(configuration) = input.launch_configuration_name.as_deref() {
+            if !state.launch_configurations.contains_key(configuration) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                    "Launch configuration name not found - No launch configuration found with the \
+                     name {configuration}"
+                )));
+            }
+        }
+
+        // The capacity the group holds after the update: what the request asked
+        // for, else the capacity it had brought within the new bounds — "If you
+        // specify a new value for MinSize without specifying a value for
+        // DesiredCapacity, and the new MinSize is larger than the current size of
+        // the group, this sets the group's DesiredCapacity to the new MinSize
+        // value", and the mirror of that for MaxSize.
+        let desired_capacity = input
+            .desired_capacity
+            .unwrap_or(current_capacity)
+            .clamp(min_size, max_size);
+        let launches_needed = group.launches_needed(desired_capacity);
+        // An instance is reported in the Availability Zone it runs in, and
+        // resolving that zone from a subnet id needs EC2's own state (see
+        // `CreateAutoScalingGroup`), so a group left with capacity to launch and no
+        // zone to launch into is refused rather than reported short.
+        let zones_after_update = input
+            .availability_zones
+            .clone()
+            .unwrap_or_else(|| group.availability_zones.clone());
+        if zones_after_update.is_empty() && desired_capacity > 0 {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "launching instances for a group that names only VPCZoneIdentifier \
+                              needs each subnet's Availability Zone, which this emulator does not \
+                              hold: pass AvailabilityZones as well"
+                        .to_string(),
+                },
+            ));
+        }
+        // Instances from an earlier change are stored until they finish
+        // terminating, and they occupy the group's ceiling while they do. A change
+        // whose launches would not fit beside them cannot be started yet.
+        if group.launches_needed(desired_capacity) > group.launch_headroom() {
+            return Err(
+                UpdateAutoScalingGroupErrorModeled::ScalingActivityInProgressFault(
+                    ScalingActivityInProgressFault {
+                        message: Some(format!(
+                            "The AutoScalingGroup {name} still holds instances from an earlier \
+                             scaling activity: retry once they have finished terminating"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let group = state
+            .groups
+            .get_mut(&name)
+            .expect("the group was present a moment ago");
+        group.min_size = min_size;
+        group.max_size = max_size;
+        if let Some(value) = input.launch_configuration_name {
+            group.launch_configuration_name = Some(value);
+            // A group launches from a launch configuration or from a launch
+            // template, never from both.
+            group.launch_template = None;
+            group.mixed_instances_policy = None;
+        }
+        if let Some(value) = input.launch_template {
+            group.launch_template = Some(value);
+            group.launch_configuration_name = None;
+            group.mixed_instances_policy = None;
+        }
+        if let Some(value) = input.mixed_instances_policy {
+            group.mixed_instances_policy = Some(value);
+            group.launch_configuration_name = None;
+            group.launch_template = None;
+        }
+        if let Some(value) = input.default_cooldown {
+            group.default_cooldown = value;
+        }
+        if let Some(value) = input.availability_zones {
+            group.availability_zones = value;
+        }
+        if let Some(value) = input.availability_zone_ids {
+            group.availability_zone_ids = Some(value);
+        }
+        if let Some(value) = input.health_check_type {
+            group.health_check_type = value;
+        }
+        if let Some(value) = input.health_check_grace_period {
+            group.health_check_grace_period = Some(value);
+        }
+        if let Some(value) = input.placement_group {
+            group.placement_group = Some(value);
+        }
+        if let Some(value) = input.vpc_zone_identifier {
+            group.vpc_zone_identifier = Some(value);
+        }
+        if let Some(value) = input.termination_policies {
+            group.termination_policies = value;
+        }
+        if let Some(value) = input.new_instances_protected_from_scale_in {
+            group.new_instances_protected_from_scale_in = value;
+        }
+        if let Some(value) = input.service_linked_role_arn {
+            group.service_linked_role_arn = Some(value);
+        }
+        if let Some(value) = input.max_instance_lifetime {
+            group.max_instance_lifetime = Some(value);
+        }
+        if let Some(value) = input.capacity_rebalance {
+            group.capacity_rebalance = Some(value);
+        }
+        if let Some(value) = input.context {
+            group.context = Some(value);
+        }
+        if let Some(value) = input.desired_capacity_type {
+            group.desired_capacity_type = Some(value);
+        }
+        if let Some(value) = input.default_instance_warmup {
+            group.default_instance_warmup = Some(value);
+        }
+        if let Some(value) = input.instance_maintenance_policy {
+            group.instance_maintenance_policy = Some(value);
+        }
+        if let Some(value) = input.availability_zone_distribution {
+            group.availability_zone_distribution = Some(value);
+        }
+        if let Some(value) = input.availability_zone_impairment_policy {
+            group.availability_zone_impairment_policy = Some(value);
+        }
+        if let Some(value) = input.capacity_reservation_specification {
+            group.capacity_reservation_specification = Some(value);
+        }
+        if let Some(value) = input.instance_lifecycle_policy {
+            group.instance_lifecycle_policy = Some(value);
+        }
+        if let Some(value) = input.deletion_protection {
+            group.deletion_protection = Some(value);
+        }
+
+        // The capacity the group holds after the update, computed above from the
+        // bounds this update leaves it with. The capacity is re-applied only when
+        // there is something to do — a change of capacity, or instances still to
+        // launch for it. An update that changes neither must not restart the
+        // group's cooldown.
+        if desired_capacity != current_capacity || launches_needed > 0 {
+            let cause = crate::state::AutoScalingState::capacity_change_cause(
+                "a user request update of AutoScalingGroup constraints",
+                current_capacity,
+                desired_capacity,
+            );
+            state.apply_capacity(&name, desired_capacity, &cause, now);
+        }
+
+        crate::state::audit(ctx.parts(), "UpdateAutoScalingGroup", &name, "updated");
+        Ok(UpdateAutoScalingGroupOutput)
     }
 }

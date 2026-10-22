@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApplications`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `ApplicationSummary` per registered application, computed from state,
+//! in `ApplicationId` order: `MaxResults` bounds the page, `NextToken` resumes after
+//! the last item of the previous one, and `Filters` narrow the set.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApplications"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListApplicationsErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let mut state = state.lock();
+        // Materialise what the clock already owed, so a listing agrees with a
+        // `GetApplication` made at the same instant.
+        state.settle(::std::time::SystemTime::now());
+
+        let filters = input.filters.unwrap_or_default();
+        // The bounds the model declares on `FilterList`, `FilterName` and `FilterValue`,
+        // re-stated before any filtering runs so the work this request does over the
+        // store is bounded by a check in this crate rather than by request size.
+        crate::state::filters_within_bounds(&filters)
+            .map_err(ListApplicationsErrorModeled::ValidationException)?;
+        for filter in &filters {
+            if !FILTER_OPERATOR_VALUES.contains(&filter.operator.as_str()) {
+                return Err(ListApplicationsErrorModeled::ValidationException(
+                    crate::state::validation(format!(
+                        "Filter Operator must be one of {}, but was {}",
+                        FILTER_OPERATOR_VALUES.join(", "),
+                        filter.operator
+                    )),
+                )
+                .into());
+            }
+            if !crate::state::FILTER_NAMES.contains(&filter.name.as_str()) {
+                return Err(ListApplicationsErrorModeled::ValidationException(
+                    crate::state::validation(format!(
+                        "Filter Name must be one of {}, but was {}",
+                        crate::state::FILTER_NAMES.join(", "),
+                        filter.name
+                    )),
+                )
+                .into());
+            }
+        }
+
+        // The ids that match, in id order: the page is taken over ids so only the
+        // applications actually returned are projected onto `ApplicationSummary`.
+        let matching: Vec<(String, String)> = state
+            .applications
+            .values()
+            .filter(|application| {
+                filters
+                    .iter()
+                    .all(|filter| crate::state::filter_matches(application, filter))
+            })
+            .map(|application| (application.id.clone(), application.id.clone()))
+            .collect();
+
+        let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListApplicationsErrorModeled::ValidationException(
+                    crate::state::page_validation_exception(&error),
+                )
+            })?;
+
+        let applications: Vec<ApplicationSummary> = page
+            .items
+            .iter()
+            .filter_map(|id| state.applications.get(id))
+            .map(|application| application.summary(state.tags_for(&application.arn)))
+            .collect();
+
+        Ok(ListApplicationsOutput {
+            applications: Some(applications),
+            next_token: page.next_token,
+        })
     }
 }
