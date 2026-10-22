@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCostCategoryDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCostCategoryDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCostCategoryDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +112,28 @@ impl From<ListCostCategoryDefinitionsErrorModeled> for ListCostCategoryDefinitio
     }
 }
 
+/// The resource types `SupportedResourceTypes` accepts.
+///
+/// From `ListCostCategoryDefinitionsRequest$SupportedResourceTypes`: "The valid values are
+/// billing:rispgroupsharing, billing:billingview, and billing:creditsharing." The modelled
+/// `ResourceType` pattern (`^[-a-zA-Z0-9/_]+:[-a-zA-Z0-9/_]+$`) admits far more than these,
+/// so the catalog is checked here.
+pub const SUPPORTED_RESOURCE_TYPE_VALUES: &[&str] = &[
+    "billing:billingview",
+    "billing:creditsharing",
+    "billing:rispgroupsharing",
+];
+
+/// The largest page `MaxResults` admits.
+///
+/// From the operation's own documentation ("The request can have a MaxResults range up to
+/// 100") and the model's `CostCategoryMaxResults` range 1..100.
+pub const MAX_PAGE_SIZE: usize = 100;
+
+/// The page size a request that names no `MaxResults` gets: the largest the operation
+/// admits.
+pub const DEFAULT_MAX_RESULTS: usize = MAX_PAGE_SIZE;
+
 /// The `ListCostCategoryDefinitions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +170,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCostCategoryDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCostCategoryDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCostCategoryDefinitions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so there is nothing to list and the operation genuinely
+            // cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // "If there is no EffectiveOn specified, you'll see cost categories that are
+        // effective on the current date."
+        let at = crate::state::effective_on_or_now(input.effective_on.as_deref()).map_err(
+            |why| crate::scaffolded::Scaffolded::validation(format!("EffectiveOn {why}")),
+        )?;
+
+        let resource_types = input.supported_resource_types.unwrap_or_default();
+        for resource_type in &resource_types {
+            if !SUPPORTED_RESOURCE_TYPE_VALUES.contains(&resource_type.as_str()) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "SupportedResourceTypes value '{resource_type}' is not a supported \
+                     resource type; the valid values are {}",
+                    SUPPORTED_RESOURCE_TYPE_VALUES.join(", ")
+                )));
+            }
+        }
+        if !resource_types.is_empty() {
+            // "If the filter is present, the result only includes Cost Categories that
+            // supports input resource type." What makes a cost category support a resource
+            // type is the cost category RESOURCE ASSOCIATION surface
+            // (`ListCostCategoryResourceAssociations`), which is not implemented yet, so
+            // nothing in this emulator can decide that predicate. Answering an empty page
+            // would dress that absence up as a successful filter, so the unimplemented
+            // filter is answered honestly with 501 instead; an unfiltered List is served
+            // from state as normal.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListCostCategoryDefinitions with SupportedResourceTypes",
+            ));
+        }
+
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_next_token(token).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(format!(
+                    "NextToken '{token}' is not a token this service issued"
+                ))
+            })?),
+        };
+
+        // The modelled `CostCategoryMaxResults` range (1..100) is already enforced before
+        // this handler runs; it is re-checked here rather than clamped, so a page size of
+        // zero can never reach the walk below and emit a `NextToken` for an empty page.
+        let page_size = match input.max_results {
+            None => DEFAULT_MAX_RESULTS,
+            Some(requested) => usize::try_from(requested)
+                .ok()
+                .filter(|size| (1..=MAX_PAGE_SIZE).contains(size))
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation(format!(
+                        "MaxResults {requested} is outside the supported range 1..{MAX_PAGE_SIZE}"
+                    ))
+                })?,
+        };
+
+        let store = state.lock();
+        // One stable total order (the ARN ordering the registry is keyed on) is what
+        // makes the cursor resolvable: the next page is "everything at or after this
+        // ARN", so a definition created or deleted between pages neither duplicates nor
+        // skips the rest.
+        let mut visible = store
+            .cost_categories
+            .range::<String, _>(resume_at.as_ref().map_or(
+                (::std::ops::Bound::Unbounded, ::std::ops::Bound::Unbounded),
+                |from| (::std::ops::Bound::Included(from), ::std::ops::Bound::Unbounded),
+            ))
+            .map(|(_, def)| def)
+            .filter(|def| def.effective_on(at));
+
+        let mut references = Vec::new();
+        let mut next_token = None;
+        for def in visible.by_ref().take(page_size) {
+            references.push(def.to_reference());
+        }
+        if let Some(first_of_next_page) = visible.next() {
+            next_token = Some(crate::state::encode_next_token(&first_of_next_page.arn));
+        }
+        drop(store);
+
+        Ok(ListCostCategoryDefinitionsOutput {
+            cost_category_references: Some(references),
+            next_token,
+        })
     }
 }

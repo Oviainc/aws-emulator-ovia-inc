@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteCostCategoryDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteCostCategoryDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteCostCategoryDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +137,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteCostCategoryDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteCostCategoryDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteCostCategoryDefinition"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so there is nothing to delete and the operation genuinely
+            // cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        let now = crate::state::Timestamp::now();
+        let effective_end = crate::state::now_zoned_date_time();
+
+        let mut store = state.lock();
+        let Some(definition) = store
+            .cost_categories
+            .get_mut(&input.cost_category_arn)
+            .filter(|def| def.effective_on(now))
+        else {
+            drop(store);
+            // Never created, or already ended: either way the request names no cost
+            // category this service can end.
+            return Err(DeleteCostCategoryDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No cost category found for {}",
+                        input.cost_category_arn
+                    )),
+                    resource_name: Some(input.cost_category_arn),
+                },
+            )
+            .into());
+        };
+
+        // TOMBSTONE rather than remove: the definition stops being effective from now
+        // on, so Describe/List as of now no longer see it, while a Describe with an
+        // `EffectiveOn` inside its lifetime still reports it — with the `EffectiveEnd`
+        // set here.
+        definition.effective_end = Some(effective_end.clone());
+        // The write is also where the registry's retention runs: ended definitions the
+        // policy no longer keeps are released now, bounding the tombstones this very
+        // operation creates.
+        store.release_ended_definitions(now);
+        drop(store);
+
+        Ok(DeleteCostCategoryDefinitionOutput {
+            cost_category_arn: Some(input.cost_category_arn),
+            effective_end: Some(effective_end),
+        })
     }
 }

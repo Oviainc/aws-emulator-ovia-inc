@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCostCategoryDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCostCategoryDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCostCategoryDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +153,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCostCategoryDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCostCategoryDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Only reachable when this service was mounted on an engine that holds no
+            // store for it, so the update cannot be persisted and the operation
+            // genuinely cannot be served here.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // Same `EffectiveStart` contract as Create: a billing start date inside the
+        // documented twelve-month window, defaulting to the first day of the current
+        // month, which is also the month the new rules start categorising.
+        let effective_start = match input.effective_start.as_deref() {
+            None => crate::state::current_month_start(),
+            Some(requested) => {
+                crate::state::validate_effective_start(requested)
+                    .map_err(crate::scaffolded::Scaffolded::validation)?;
+                requested.to_string()
+            }
+        };
+
+        let mut store = state.lock();
+        let now = crate::state::Timestamp::now();
+        let Some(definition) = store
+            .cost_categories
+            .get_mut(&input.cost_category_arn)
+            .filter(|def| def.effective_on(now))
+        else {
+            drop(store);
+            return Err(UpdateCostCategoryDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No cost category found for {}",
+                        input.cost_category_arn
+                    )),
+                    resource_name: Some(input.cost_category_arn),
+                },
+            )
+            .into());
+        };
+
+        definition.rule_version = input.rule_version;
+        definition.rules = input.rules;
+        definition.split_charge_rules = input.split_charge_rules;
+        definition.default_value = input.default_value;
+        definition.effective_start = effective_start.clone();
+        // ONE VERSION PER DEFINITION: this overwrites the stored content rather than
+        // adding a version keyed by `EffectiveStart`, so a later read's `EffectiveOn`
+        // decides whether the definition was in effect at that instant, not which
+        // revision of its rules applied then. See the note on
+        // [`crate::state::CostCategoryDefinition`].
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCostCategoryDefinition"))
+        // The write restarts the Cost Explorer component's processing, exactly as the
+        // create did, so a reader right after an update sees `PROCESSING` again.
+        definition.applied_at = ::std::time::Instant::now() + crate::state::PROCESSING_SPAN;
+        drop(store);
+
+        Ok(UpdateCostCategoryDefinitionOutput {
+            cost_category_arn: Some(input.cost_category_arn),
+            effective_start: Some(effective_start),
+        })
     }
 }

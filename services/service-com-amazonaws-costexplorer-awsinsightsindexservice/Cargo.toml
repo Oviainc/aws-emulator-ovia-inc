@@ -16,18 +16,21 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# The `time` feature is on so the processing-status test can wait with
+# `tokio::time::sleep` instead of blocking the runtime worker.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Derives the UUID-shaped id in a generated cost category ARN (RFC 9562 version 8) from
+# the registry's own sequence number and the creation instant.
+sha2 = { workspace = true }
+# Renders that id, and encodes the opaque ListCostCategoryDefinitions pagination cursor.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
