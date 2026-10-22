@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: moves the index to `DELETING` and schedules its removal, so a later
+//! `DescribeIndex` or `Query` on that `Id` answers `ResourceNotFoundException` (HTTP
+//! 404) and `ListIndices` stops listing it. The index's documents go with it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletion is asynchronous in the real service too: the index is reported as
+//! `DELETING` until the removal instant stored in `crate::state` passes.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +167,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIndex"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteIndexError::Modeled(DeleteIndexErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the kendra emulator could not reach its state store".to_string(),
+                    ),
+                },
+            ))
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due_transitions(now);
+
+        let Some(index) = state.index_mut(&input.id) else {
+            return Err(DeleteIndexErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("no index with id {}", input.id)),
+                },
+            )
+            .into());
+        };
+
+        if index.status == crate::state::STATUS_DELETING {
+            return Err(DeleteIndexErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "index {} is already in status {}",
+                    index.id,
+                    crate::state::STATUS_DELETING
+                )),
+            })
+            .into());
+        }
+
+        index.status = crate::state::STATUS_DELETING.to_string();
+        index.updated_at = now;
+        // An index being deleted never reaches ACTIVE.
+        index.active_at = None;
+        index.removed_at = Some(now + crate::state::INDEX_DELETION_DELAY);
+
+        Ok(DeleteIndexOutput)
     }
 }

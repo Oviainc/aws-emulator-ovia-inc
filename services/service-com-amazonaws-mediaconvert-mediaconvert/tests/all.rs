@@ -17,5 +17,7 @@ mod account_endpoints;
 mod job_lifecycle;
 #[path = "all/job_templates.rs"]
 mod job_templates;
+#[path = "all/policy_lifecycle.rs"]
+mod policy_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

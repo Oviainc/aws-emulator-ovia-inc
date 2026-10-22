@@ -17,7 +17,7 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
-    ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, Rule, RuleGroup,
+    ActivatedRule, IPSet, IPSetDescriptor, IPSetSummary, Predicate, Rule, RuleGroup, RuleSummary,
     SqlInjectionMatchSet, SqlInjectionMatchTuple, WafAction, WebACL, XssMatchSet,
     XssMatchSetSummary, XssMatchTuple,
 };
@@ -158,8 +158,8 @@ pub fn web_acl_arn(region: &str, web_acl_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("webacl/{web_acl_id}"))
 }
 
-/// The largest page `ListIPSets` returns, and the page size a `Limit` of 0 (the
-/// model's declared default) asks for.
+/// The largest page a paginated `List*` returns (`ListIPSets`, `ListRules`, …), and
+/// the page size a `Limit` of 0 (the model's declared default) asks for.
 ///
 /// Source: `PaginationLimit`'s modelled `@range` of 0..100.
 pub const MAX_PAGE_SIZE: usize = 100;
@@ -627,6 +627,15 @@ impl RuleEntry {
                 .iter()
                 .map(PredicateEntry::to_modelled)
                 .collect(),
+        }
+    }
+
+    /// This record projected onto the `RuleSummary` shape `ListRules` returns: the
+    /// identifier and the friendly name, taken from the stored record.
+    pub fn summary(&self) -> RuleSummary {
+        RuleSummary {
+            rule_id: self.rule_id.clone(),
+            name: self.name.clone(),
         }
     }
 }

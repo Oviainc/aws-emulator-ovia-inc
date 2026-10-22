@@ -8,89 +8,12 @@
 //! write made by one request is only visible to the next if it really reached
 //! state.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
-/// A router serving only this service, over a fresh shared engine.
-///
-/// `pub(crate)` so a sibling suite in this test target (see `tests/all.rs`)
-/// reaches the same harness rather than declaring a second one.
-pub(crate) fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(
-        service_com_amazonaws_verifiedpermissions_verifiedpermissions::EmulatedService::new(engine),
-    );
-    router
-}
-
-/// Call one operation and return `(http status, parsed body)`.
-pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("VerifiedPermissions.{operation}"))
-        .header(
-            "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20260101/us-east-1/verifiedpermissions/aws4_request, \
-             SignedHeaders=host;x-amz-target, Signature=0",
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("a test request body always serializes"),
-        ))
-        .expect("a valid test request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, parsed)
-}
-
-/// Call one operation, requiring success, and return the parsed body.
-pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
-    let (status, parsed) = call(router, operation, body).await;
-    assert_eq!(status, 200, "{operation} failed: {parsed}");
-    parsed
-}
-
-/// Create a store with the given validation `mode` and return its
-/// `policyStoreId`. The ONE store-creation helper this test crate has; every
-/// suite reaches a store through it.
-pub(crate) async fn store_with_mode(router: &MultiServiceRouter, mode: &str) -> String {
-    let created = ok(
-        router,
-        "CreatePolicyStore",
-        &json!({ "validationSettings": { "mode": mode } }),
-    )
-    .await;
-    created["policyStoreId"]
-        .as_str()
-        .expect("policyStoreId is required on the CreatePolicyStore response")
-        .to_string()
-}
-
-/// Create a store with validation mode `OFF` and return its `policyStoreId`.
-async fn store_with_validation_off(router: &MultiServiceRouter) -> String {
-    store_with_mode(router, "OFF").await
-}
-
-/// The error code an awsJson1_0 fault carries in `__type`, without its namespace.
-pub(crate) fn error_code(body: &Value) -> String {
-    body["__type"]
-        .as_str()
-        .unwrap_or_default()
-        .rsplit(['#', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
+// The wire harness (`router`, `call`, `ok`, `store_with_mode`,
+// `store_with_validation_off`, `error_code`) lives once in `tests/all/harness.rs`
+// and is shared with every other suite in this crate.
+use super::harness::{call, error_code, ok, router, store_with_validation_off};
 
 /// `{entityType, entityId}` pairs, sorted, for order-insensitive comparison.
 fn pairs(value: &Value, type_key: &str, id_key: &str) -> Vec<(String, String)> {

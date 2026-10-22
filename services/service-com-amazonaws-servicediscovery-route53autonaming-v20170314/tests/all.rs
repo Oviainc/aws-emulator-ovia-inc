@@ -19,6 +19,8 @@ mod delete_namespace;
 mod delete_service;
 #[path = "all/instance_health_status.rs"]
 mod instance_health_status;
+#[path = "all/list_instances.rs"]
+mod list_instances;
 #[path = "all/list_operations.rs"]
 mod list_operations;
 #[path = "all/namespace_listing.rs"]

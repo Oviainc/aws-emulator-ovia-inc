@@ -3,7 +3,9 @@
 //! @op GetBillingView
 //! Reads one persisted billing view out of this service's state and renders it as
 //! a `BillingViewElement`, with `sourceViewCount` and `derivedViewCount` derived
-//! from the stored records. An ARN no view is stored under is a
+//! from the stored records. An ARN outside the caller's own account is an
+//! `AccessDeniedException` (403), refused before any lookup; an ARN in the
+//! caller's account that no view is stored under is a
 //! `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
@@ -145,8 +147,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The modeled `arn` pattern is refused by the boundary validator before
-        // this runs; what is left to decide is whether a view is stored under it.
+        // this runs; what is left to decide is whether the ARN is scoped to the
+        // caller's own account and, if so, whether a view is stored under it.
         let _ = ctx;
+        // The account boundary is enforced BEFORE any existence lookup, so this
+        // service never reveals whether a view exists in another account: a
+        // well-formed ARN whose embedded account id is not the caller's own is
+        // refused with the modeled `AccessDeniedException` (403) whatever is
+        // stored.
+        if !crate::state::is_caller_account_arn(&input.arn) {
+            return Err(GetBillingViewErrorModeled::AccessDeniedException(
+                crate::state::cross_account_access_denied(Self::NAME, &input.arn),
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetBillingViewErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),

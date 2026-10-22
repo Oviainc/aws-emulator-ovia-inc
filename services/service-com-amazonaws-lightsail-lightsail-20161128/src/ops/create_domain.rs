@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts one domain recordset — a DNS zone — into this service's store under the
+//! domain name the request names, and answers the operation-log entry the insert
+//! appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDomain"))
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: a domain recordset is not a zonal resource, so its
+        // location is this service's domain region rather than anything the
+        // request signed for.
+        let _ = ctx;
+
+        // `domainName` is a modelled `@required` member, so the centralized walk
+        // refused an absent one before this body ran. The modelled `DomainName`
+        // shape carries no pattern, so the DNS form of the name is checked here,
+        // BEFORE the first write — a refused request creates nothing.
+        let name = input.domain_name;
+        crate::state::validate_domain_name(&name).map_err(invalid)?;
+        let tags = input.tags.unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        let location = crate::state::StoredLocation::domain();
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A domain name addresses one recordset, so creating one this account
+            // already holds is refused rather than silently replacing the zone and
+            // every entry in it.
+            if store.domain(&name).is_some() {
+                return Err(invalid(format!(
+                    "domainName '{name}' already names a domain recordset of this account"
+                )));
+            }
+            if store.domains.len() >= crate::state::MAX_DOMAINS {
+                return Err(invalid(format!(
+                    "creating a domain would take this account past the {} this emulator \
+                     holds",
+                    crate::state::MAX_DOMAINS
+                )));
+            }
+
+            let id = store.mint_uuid();
+            store.insert_domain(crate::state::StoredDomain {
+                name: name.clone(),
+                arn: crate::state::domain_arn(&id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags: tags.clone(),
+                // A new zone holds no recordsets: `CreateDomainEntry` is what
+                // adds one.
+                entries: Vec::new(),
+            });
+            // The zone exists as this call returns — a `Domain` carries no status
+            // member, so there is nothing for the clock to settle later — which is
+            // why the operation it logs is answered terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_CREATE_DOMAIN,
+                crate::state::RESOURCE_TYPE_DOMAIN,
+                &name,
+                &location,
+                None,
+            );
+            Ok(CreateDomainOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateDomainError {
+    CreateDomainErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateDomainError {
+    CreateDomainErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail domain store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

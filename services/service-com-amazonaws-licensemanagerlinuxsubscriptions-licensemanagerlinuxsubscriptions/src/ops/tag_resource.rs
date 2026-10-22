@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Adds metadata tags to one of this service's resources: the pairs are MERGED into the
+//! tag set the addressed resource already carries in this service's state (a key the
+//! request names takes the request's value; a key it does not name keeps the value it
+//! had), so `ListTagsForResource` afterwards reports the union of every write.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `resourceArn` is a `SubscriptionProviderArn`, so the resource it addresses is a
+//! registered subscription provider; an ARN naming none is refused with the
+//! `NotFoundException` the tag APIs answer ([`crate::scaffolded::NOT_FOUND_CODE`]), and a
+//! write whose resultant set would pass [`crate::state::MAX_TAGS_PER_RESOURCE`] is
+//! refused with `BadRequestException` before anything is stored.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +118,16 @@ pub struct TagResource<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The server-side failure for a store this handler cannot reach: state is a
+/// construction-time dependency, so an unreachable store is a server fault, never the
+/// caller's.
+fn store_unavailable() -> TagResourceError {
+    TagResourceErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the service state is unavailable".to_string()),
+    })
+    .into()
+}
+
 impl<Eng> TagResource<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -139,20 +152,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // `resourceArn`'s modelled pattern and the 0..50 bound on the `tags` map the
+        // REQUEST carries are refused by the framework before this handler runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        let mut store = state.lock();
+        // The tag APIs address a resource by ARN and nothing else, so an ARN this
+        // account holds no resource for is a not-found refusal — stated before any tag
+        // is written, so a refused call leaves the store untouched.
+        let tags = store
+            .resource_tags_mut(&input.resource_arn)
+            .ok_or_else(TagResourceError::not_found)?;
+
+        // The resultant set is what the resource would carry, so it is the set the tag
+        // bound applies to: count the keys the write would ADD to what is stored.
+        let resultant = tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !tags.contains_key(*key))
+                .count();
+        if resultant > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceError::tag_limit_exceeded());
+        }
+
+        // Add or overwrite exactly the keys the request names: a key it does not name
+        // keeps the value it had, which is what makes two writes of different keys
+        // converge on the union of both, and what makes a repeat of the same write (the
+        // operation is `@idempotent`) leave the same set behind.
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput::default())
     }
 }
+

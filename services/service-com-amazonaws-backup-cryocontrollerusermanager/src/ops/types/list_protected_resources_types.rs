@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-backup-cryocontrollerusermanager.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.backup#ListProtectedResourcesInput")]
+// `MaxResults`'s `@range` is checked by the HANDLER, not by the framework's
+// boundary validator: AWS refuses an out-of-range page size with this
+// operation's own modelled `InvalidParameterValueException`, and only an
+// exception the handler returns is serialized as the shape the model declares
+// (the body carrying `Code` and `Message`). See
+// `crate::state::rejected_max_results`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.backup#ListProtectedResourcesInput",
+    skip_validation = ["MaxResults"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListProtectedResourcesInput {
     pub next_token: Option<String>,

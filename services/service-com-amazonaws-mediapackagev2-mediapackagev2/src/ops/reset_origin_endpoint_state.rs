@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetOriginEndpointState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetOriginEndpointState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetOriginEndpointState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resets one origin endpoint: the endpoint's stored content is discarded and the moment
+//! of the reset is recorded on the endpoint as `ResetAt`, so a later `GetOriginEndpoint`
+//! reports the same instant this call answered with. The endpoint's identity and
+//! configuration (ARN, container type, segment, manifests, tags, `CreatedAt`,
+//! `ModifiedAt`, `ETag`) are untouched: a reset clears content, it does not reconfigure
+//! the resource.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +171,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetOriginEndpointState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetOriginEndpointStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetOriginEndpointState"))
+        // Every addressed resource is named in the URI, so the reset needs nothing else
+        // from the request: the ARN it reports is the one persisted at create time rather
+        // than one recomputed from this request's credential scope. Authorization is the
+        // emulator's, not this handler's — the framework verifies the request signature
+        // before a handler runs, so the modelled `AccessDeniedException` is deliberately
+        // unused here, as it is in every other handler of this service.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ResetOriginEndpointStateErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // The containment chain is resolved one level at a time, so the refusal names the
+        // level that is actually missing, as the sibling handlers on this hierarchy do.
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(
+                ResetOriginEndpointStateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Channel group {} not found",
+                            input.channel_group_name
+                        )),
+                        resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(
+                ResetOriginEndpointStateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Channel {} not found in channel group {}",
+                            input.channel_name, input.channel_group_name
+                        )),
+                        resource_type_not_found: Some("CHANNEL".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(endpoint) = channel.origin_endpoints.get_mut(&input.origin_endpoint_name) else {
+            return Err(
+                ResetOriginEndpointStateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Origin endpoint {} not found on channel {} in channel group {}",
+                            input.origin_endpoint_name,
+                            input.channel_name,
+                            input.channel_group_name
+                        )),
+                        resource_type_not_found: Some("ORIGIN_ENDPOINT".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The reset itself. The endpoint holds no media in this emulator, so what a reset
+        // persists is the instant its content was discarded; `ModifiedAt` and the ETag
+        // cover the endpoint's CONFIGURATION, which a reset does not change, so both stay
+        // as they were.
+        let reset_at = crate::state::now();
+        endpoint.reset_at = Some(reset_at);
+
+        Ok(ResetOriginEndpointStateOutput {
+            arn: endpoint.arn.clone(),
+            channel_group_name: endpoint.group_name.clone(),
+            channel_name: endpoint.channel_name.clone(),
+            origin_endpoint_name: endpoint.name.clone(),
+            // The instant that was just persisted, so the value this response reports is
+            // exactly the one a later `GetOriginEndpoint` reads back.
+            reset_at,
+        })
     }
 }

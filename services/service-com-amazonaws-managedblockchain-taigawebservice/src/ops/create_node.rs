@@ -236,7 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MemberId` is "The unique identifier of the member that owns this node.
         // Applies only to Hyperledger Fabric": on a Fabric network a node belongs to a
         // member, so the request must name one and it must be a member of this network.
-        let member_id = if network.framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC {
+        let framework = network.framework.clone();
+        let member_id = if framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC {
             let Some(member_id) = input.member_id.clone() else {
                 return Err(CreateNodeErrorModeled::InvalidRequestException(
                     InvalidRequestException {
@@ -280,7 +281,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|member| member.kms_key_arn.clone());
 
         let node_id = guard.mint_id("nd");
-        let (peer_endpoint, peer_event_endpoint) = crate::state::peer_endpoints(
+        // `NodeConfiguration$StateDB` "Applies only to Hyperledger Fabric": a node on a
+        // framework that has no state database cannot take one, so a request that names
+        // one is refused rather than silently ignored.
+        if framework != crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
+            && input.node_configuration.state_db.is_some()
+        {
+            return Err(CreateNodeErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "StateDB applies only to {} networks; network {} is {framework}",
+                        crate::state::FRAMEWORK_HYPERLEDGER_FABRIC,
+                        input.network_id
+                    )),
+                },
+            )
+            .into());
+        }
+        // The endpoints a node reports are the ones its network's framework publishes:
+        // peer endpoints on Hyperledger Fabric, JSON-RPC endpoints on Ethereum.
+        let endpoints = crate::state::node_endpoints(
+            &framework,
             &region,
             &input.network_id,
             member_id.as_deref(),
@@ -295,16 +316,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Stored exactly as the request named it: which zone the service would pick
             // for a request that names none is EC2 state this emulator does not hold.
             availability_zone: configuration.availability_zone,
-            peer_endpoint,
-            peer_event_endpoint,
+            endpoints,
             log_publishing_configuration: configuration.log_publishing_configuration,
             // `NodeConfiguration$StateDB` documents the default: "When using an Amazon
             // Managed Blockchain network with Hyperledger Fabric version 1.4 or later,
             // the default is CouchDB." The model states no other default, so CouchDB is
-            // what an omitted member takes.
-            state_db: configuration
-                .state_db
-                .unwrap_or_else(crate::state::default_state_db),
+            // what an omitted member takes — and the member "Applies only to Hyperledger
+            // Fabric", so a node on any other framework reports no state database at all.
+            state_db: (framework == crate::state::FRAMEWORK_HYPERLEDGER_FABRIC).then(|| {
+                configuration
+                    .state_db
+                    .unwrap_or_else(crate::state::default_state_db)
+            }),
             status: crate::state::STATUS_CREATING.to_string(),
             available_at: now + crate::state::TRANSITION_SPAN,
             creation_date: now,

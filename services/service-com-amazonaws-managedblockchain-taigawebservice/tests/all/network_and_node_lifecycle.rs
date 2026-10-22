@@ -171,7 +171,8 @@ pub(crate) async fn create_network(router: &MultiServiceRouter, body: Value) -> 
     (answer.text(&["NetworkId"]), answer.text(&["MemberId"]))
 }
 
-/// Create one network that has already settled to `AVAILABLE`, so it can take nodes.
+/// Create one network that has already settled to `AVAILABLE`, so it can take nodes and
+/// members.
 pub(crate) async fn available_network(
     router: &MultiServiceRouter,
     token: &str,

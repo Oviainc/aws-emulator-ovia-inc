@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResiliencyPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResiliencyPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResiliencyPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `policyArn` and persists the policy in
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::policies`], so
+//! `DescribeResiliencyPolicy` and `CreateApp`'s `policyArn` reference both resolve.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResiliencyPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResiliencyPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResiliencyPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // The boundary constraint validator already refused every modeled
+        // constraint on this input, INCLUDING each enum member's value set and
+        // `FailurePolicy`'s `@range(min: 0)` on rtoInSecs/rpoInSecs. What it does
+        // NOT walk is a map's KEY, so `DisruptionPolicy`'s `DisruptionType` keys are
+        // checked here.
+        // NOT the model's: `DisruptionPolicy` carries no `@length(min: 1)`, so this
+        // is the service's own rule — a resiliency policy that names no disruption
+        // type states no objective at all.
+        if input.policy.is_empty() {
+            return Err(invalid(
+                "policy: a resiliency policy must carry a failure policy for at least one \
+                 disruption type",
+            ));
+        }
+        // Sorted, so the refusal a request earns does not depend on hash order.
+        let mut disruption_types: Vec<&String> = input.policy.keys().collect();
+        disruption_types.sort();
+        for disruption_type in disruption_types {
+            if let Some(message) = crate::state::enum_violation(
+                &format!("policy.{disruption_type}"),
+                disruption_type,
+                DISRUPTION_TYPE_VALUES,
+            ) {
+                return Err(invalid(message));
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // A replayed `@idempotencyToken` returns the policy its first call created.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(first_arn) = store.created_by_token(Self::NAME, token).cloned() {
+                if let Some(first) = store.policies.get(&first_arn) {
+                    if describes_same_policy(first, &input) {
+                        return Ok(CreateResiliencyPolicyOutput {
+                            policy: first.clone(),
+                        });
+                    }
+                    return Err(conflict(
+                        format!(
+                            "clientToken {token} was already used to create resiliency policy \
+                             {first_arn} with different parameters"
+                        ),
+                        first_arn,
+                    ));
+                }
+            }
+        }
+
+        // The store is bounded: past the ceiling no further policy is created.
+        if store.policies.len() >= crate::state::MAX_RESILIENCY_POLICIES {
+            return Err(quota_exceeded());
+        }
+
+        let policy_arn = crate::state::mint_policy_arn(&region);
+        let policy = ResiliencyPolicy {
+            policy_arn: Some(policy_arn.clone()),
+            policy_name: Some(input.policy_name),
+            policy_description: input.policy_description,
+            data_location_constraint: input.data_location_constraint,
+            tier: Some(input.tier),
+            // AWS derives `estimatedCostTier` from a cost model it does not publish;
+            // the member is optional, so it is left absent rather than invented.
+            estimated_cost_tier: None,
+            policy: Some(input.policy),
+            creation_time: Some(crate::state::now()),
+            tags: input.tags,
+        };
+
+        store.policies.insert(policy_arn.clone(), policy.clone());
+        if let Some(token) = input.client_token.as_deref() {
+            store.record_idempotency_token(Self::NAME, token, &policy_arn);
+        }
+
+        Ok(CreateResiliencyPolicyOutput { policy })
     }
+}
+
+/// The 402 for a request that would take the store past
+/// [`crate::state::MAX_RESILIENCY_POLICIES`].
+fn quota_exceeded() -> CreateResiliencyPolicyError {
+    CreateResiliencyPolicyErrorModeled::ServiceQuotaExceededException(
+        ServiceQuotaExceededException {
+            message: Some(format!(
+                "this emulator stores at most {} resiliency policies",
+                crate::state::MAX_RESILIENCY_POLICIES
+            )),
+        },
+    )
+    .into()
+}
+
+/// A 400 `ValidationException` carrying `message`.
+///
+/// The MODELED error, not `crate::scaffolded::Scaffolded::validation`: this
+/// operation declares `ValidationException`, so the modeled shape is what a client
+/// deserializes (see the note in `crate::scaffolded`).
+fn invalid(message: impl Into<String>) -> CreateResiliencyPolicyError {
+    CreateResiliencyPolicyErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> CreateResiliencyPolicyError {
+    CreateResiliencyPolicyErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 409 `ConflictException` naming the resiliency policy that already holds the
+/// replayed `clientToken`.
+fn conflict(message: impl Into<String>, policy_arn: String) -> CreateResiliencyPolicyError {
+    CreateResiliencyPolicyErrorModeled::ConflictException(ConflictException {
+        message: Some(message.into()),
+        resource_id: Some(policy_arn),
+        resource_type: Some("ResiliencyPolicy".to_string()),
+    })
+    .into()
+}
+
+/// Whether `stored` is the policy `request` asks for — the idempotency check: a
+/// replayed token with the same parameters replays the first result, a replayed
+/// token with different parameters is a conflict.
+fn describes_same_policy(stored: &ResiliencyPolicy, request: &CreateResiliencyPolicyInput) -> bool {
+    stored.policy_name.as_deref() == Some(request.policy_name.as_str())
+        && stored.policy_description == request.policy_description
+        && stored.data_location_constraint == request.data_location_constraint
+        && stored.tier.as_deref() == Some(request.tier.as_str())
+        && stored.tags == request.tags
+        && stored.policy.as_ref().is_some_and(|stored_policy| {
+            stored_policy.len() == request.policy.len()
+                && request.policy.iter().all(|(disruption, failure)| {
+                    stored_policy.get(disruption).is_some_and(|other| {
+                        other.rto_in_secs == failure.rto_in_secs
+                            && other.rpo_in_secs == failure.rpo_in_secs
+                    })
+                })
+        })
 }

@@ -3,7 +3,10 @@
 //! @op UpdateBillingView
 //! Mutates the persisted billing view in place — only the members the request
 //! carries — stamps `updatedAt`, and answers with the ARN and that instant. An ARN
-//! no view is stored under is a `ResourceNotFoundException` (404).
+//! outside the caller's own account is an `AccessDeniedException` (403); an ARN
+//! that names no existing `CUSTOM` view of this account — absent, or the
+//! account's `PRIMARY` view — is a `ValidationException` (400), because only a
+//! `CUSTOM` view may be edited and eligibility is decided before existence.
 //!
 //! ## Shape of an operation
 //!
@@ -166,6 +169,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modeled `arn`, `name` and `description` constraints are refused by
         // the boundary validator before this runs.
         let _ = ctx;
+        // The account boundary comes first: a well-formed ARN outside the
+        // caller's own account is refused without consulting the store, so no
+        // answer of this operation depends on what another account holds.
+        if !crate::state::is_caller_account_arn(&input.arn) {
+            return Err(UpdateBillingViewErrorModeled::AccessDeniedException(
+                crate::state::cross_account_access_denied(Self::NAME, &input.arn),
+            )
+            .into());
+        }
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateBillingViewErrorModeled::InternalServerException(InternalServerException {
                 message: "the billing view store is unavailable".to_string(),
@@ -173,12 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
 
-        let view = state.billing_views.get_mut(&input.arn).ok_or_else(|| {
-            UpdateBillingViewErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Billing view {} does not exist", input.arn),
-                resource_id: input.arn.clone(),
-                resource_type: crate::state::BILLING_VIEW_RESOURCE_TYPE.to_string(),
-            })
+        // Eligibility is decided BEFORE existence: only a `CUSTOM` view may be
+        // edited, so an ARN that names no `CUSTOM` view of this account — absent
+        // or the account's `PRIMARY` view — is one refusal, and the modeled
+        // `ResourceNotFoundException` would tell a caller which of the two it
+        // was.
+        let view = state.custom_view_mut(&input.arn).ok_or_else(|| {
+            UpdateBillingViewErrorModeled::ValidationException(crate::state::not_a_custom_view(
+                &input.arn, "edited",
+            ))
         })?;
 
         let updated_at = std::time::SystemTime::now();

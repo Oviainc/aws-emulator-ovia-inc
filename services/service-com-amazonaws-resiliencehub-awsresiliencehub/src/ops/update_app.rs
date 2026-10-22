@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a PARTIAL update of the stored application in
+//! [`crate::state::ComAmazonawsResiliencehubAwsresiliencehubState::apps`] — only the
+//! members the request supplies change, and a later `DescribeApp` observes them.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +170,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApp"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_failure());
+        };
+
+        // Setting the policy and clearing it in one call is self-contradictory.
+        // Every modeled constraint (each enum member's value set included) has
+        // already been refused by the boundary validator, so this combination rule
+        // is the only one left for the handler.
+        if input.clear_resiliency_policy_arn == Some(true) && input.policy_arn.is_some() {
+            return Err(invalid(
+                "clearResiliencyPolicyArn: cannot clear policyArn and set it in the same request",
+            ));
+        }
+
+        let mut store = state.lock();
+
+        if !store.apps.contains_key(&input.app_arn) {
+            return Err(app_not_found(&input.app_arn));
+        }
+        // A policy reference must resolve, exactly as it must on CreateApp.
+        if let Some(policy_arn) = input.policy_arn.as_deref() {
+            if !store.policies.contains_key(policy_arn) {
+                return Err(policy_not_found(policy_arn));
+            }
+        }
+
+        let Some(app) = store.apps.get_mut(&input.app_arn) else {
+            return Err(app_not_found(&input.app_arn));
+        };
+
+        // PARTIAL update: an absent member leaves the stored value alone.
+        if let Some(description) = input.description {
+            app.description = Some(description);
+        }
+        if input.clear_resiliency_policy_arn == Some(true) {
+            app.policy_arn = None;
+        } else if let Some(policy_arn) = input.policy_arn {
+            app.policy_arn = Some(policy_arn);
+        }
+        if let Some(schedule) = input.assessment_schedule {
+            app.assessment_schedule = Some(schedule);
+        }
+        if let Some(permission_model) = input.permission_model {
+            app.permission_model = Some(permission_model);
+        }
+        if let Some(event_subscriptions) = input.event_subscriptions {
+            app.event_subscriptions = Some(event_subscriptions);
+        }
+
+        Ok(UpdateAppOutput { app: app.clone() })
     }
+}
+
+/// A 400 `ValidationException` carrying `message`.
+///
+/// The MODELED error, not `crate::scaffolded::Scaffolded::validation`: this
+/// operation declares `ValidationException`, so the modeled shape is what a client
+/// deserializes (see the note in `crate::scaffolded`).
+fn invalid(message: impl Into<String>) -> UpdateAppError {
+    UpdateAppErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The 500 for a service mounted on an engine that holds no state for it.
+fn internal_failure() -> UpdateAppError {
+    UpdateAppErrorModeled::InternalServerException(InternalServerException {
+        message: Some("resiliencehub state is unavailable on this engine".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for an `appArn` that was never created, or was
+/// deleted.
+fn app_not_found(app_arn: &str) -> UpdateAppError {
+    UpdateAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("application {app_arn} does not exist")),
+        resource_id: Some(app_arn.to_string()),
+        resource_type: Some("App".to_string()),
+    })
+    .into()
+}
+
+/// A 404 `ResourceNotFoundException` for a `policyArn` no `CreateResiliencyPolicy`
+/// ever minted.
+fn policy_not_found(policy_arn: &str) -> UpdateAppError {
+    UpdateAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("resiliency policy {policy_arn} does not exist")),
+        resource_id: Some(policy_arn.to_string()),
+        resource_type: Some("ResiliencyPolicy".to_string()),
+    })
+    .into()
 }

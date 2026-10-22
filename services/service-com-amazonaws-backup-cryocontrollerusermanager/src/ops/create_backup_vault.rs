@@ -224,16 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && named_key == input.encryption_key_arn
                 && existing.tags == tags;
             if !is_retry {
+                // The collision is reported with the condition's own `Code` and
+                // sentence, and discloses nothing about the vault that is
+                // already there: `AlreadyExistsException`'s `Arn` and
+                // `CreatorRequestId` members stay unset.
                 return Err(CreateBackupVaultErrorModeled::AlreadyExistsException(
-                    AlreadyExistsException {
-                        message: Some(format!(
-                            "Backup vault {} already exists",
-                            input.backup_vault_name
-                        )),
-                        creator_request_id: existing.creator_request_id.clone(),
-                        arn: Some(existing.arn.clone()),
-                        ..Default::default()
-                    },
+                    crate::state::vault_already_exists(),
                 )
                 .into());
             }

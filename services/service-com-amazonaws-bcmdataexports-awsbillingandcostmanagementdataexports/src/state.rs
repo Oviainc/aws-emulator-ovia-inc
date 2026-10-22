@@ -183,16 +183,19 @@ const PAGE_TOKEN_TAG_LEN: usize = 8;
 const PAGE_TOKEN_DOMAIN: &[u8] = b"bcm-data-exports/page-token/v1\0";
 
 /// Which listing a page token belongs to. A token is bound to its listing as well as to
-/// its position, because the two paginated listings page over different key spaces
-/// (`ListExports` over export ARNs, `ListTagsForResource` over an export's tag keys): a
-/// token handed to the wrong listing names a position in a sequence it was never cut
-/// from, and must be refused rather than resumed at some unrelated offset.
+/// its position, because the paginated listings page over different key spaces
+/// (`ListExports` over export ARNs, `ListTagsForResource` over an export's tag keys,
+/// `ListTables` over the table catalog's names): a token handed to the wrong listing
+/// names a position in a sequence it was never cut from, and must be refused rather than
+/// resumed at some unrelated offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageTokenKind {
     /// `ListExports`, paging over the export ARNs in [`ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::exports`].
     Exports,
     /// `ListTagsForResource`, paging over one export's tag keys.
     ResourceTags,
+    /// `ListTables`, paging over the table names of [`TABLE_CATALOG`].
+    Tables,
 }
 
 impl PageTokenKind {
@@ -201,6 +204,7 @@ impl PageTokenKind {
         match self {
             Self::Exports => b"Exports\0",
             Self::ResourceTags => b"ResourceTags\0",
+            Self::Tables => b"Tables\0",
         }
     }
 }
