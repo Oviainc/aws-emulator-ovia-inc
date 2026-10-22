@@ -514,6 +514,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
             client_token: input.client_token,
             fingerprint,
+            // An endpoint is created with no resource policy attached; one arrives only
+            // through `PutOriginEndpointPolicy`.
+            policy: None,
         };
         endpoint.etag = crate::state::origin_endpoint_etag(&endpoint);
         channel.origin_endpoints.insert(name.clone(), endpoint);
