@@ -45,6 +45,20 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether `parts` addresses the ROOT path, which is where every request to an
+/// `awsJson1_1` service arrives: the protocol posts every operation to `/` and
+/// carries the operation name in `X-Amz-Target` rather than in the URI.
+///
+/// This is the same rule the framework's own discriminator
+/// (`emulator_server::can_handle_based_on_route_key_and_path`) applies through the
+/// `ROOT_PATH_SEGMENT` sentinel. It is spelled out here because this model carries no
+/// `smithy.api#http` binding at all, so `crate::ROUTE_PATH_SEGMENTS` is EMPTY — "no
+/// constraint" — and an unconstrained claim would swallow every peer that shares this
+/// service's signing name.
+fn claims_root_path(parts: &http::request::Parts) -> bool {
+    parts.uri.path().trim_start_matches('/').is_empty()
+}
+
 /// The `com-amazonaws-marketplacemetering-awsmpmeteringservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,12 +88,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // This service signs as `aws-marketplace` — a signing name every AWS
+        // Marketplace-family service SHARES while each serves its own endpoint
+        // (`metering.marketplace` here, `catalog.marketplace` for Marketplace
+        // Catalog, `entitlement.marketplace` for the Entitlement Service, …). The
+        // router's routing key comes from the SigV4 credential scope first, so all of
+        // them resolve to `aws-marketplace` and matching on the signing name ALONE
+        // makes every one of them claim every request — which the router answers
+        // `500 AmbiguousService`, leaving all of them unreachable.
+        //
+        // So the claim is narrowed to this service's own wire path space: it speaks
+        // `awsJson1_1`, so every one of its requests is a `POST /` (see
+        // `claims_root_path`), and the REST peers that share its signing name each own
+        // a real path space of their own.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => claims_root_path(parts),
+            _ => false,
         }
     }
 

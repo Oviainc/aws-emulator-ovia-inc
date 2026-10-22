@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes tags from the resource a resource ARN names.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +138,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the marketplace catalog store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Authorization is evaluated on the ARN BEFORE anything is looked up: an
+        // ARN that names no resource of this catalog in this account is one no
+        // identity or resource policy of this catalog can grant an action on, so
+        // the caller is not authorized to act on it rather than it being absent.
+        let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::AccessDeniedException(
+                crate::state::access_denied(Self::NAME, &input.resource_arn),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A resource exists once the change set that creates it has succeeded,
+        // which is a change the clock owes rather than one this call makes.
+        store.settle(now);
+
+        let Some(held) = store.resource_tags_mut(&resource) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&resource),
+            )
+            .into());
+        };
+
+        // Untagging leaves the resource without the keys named. A key the
+        // resource does not carry is already removed, so naming one is not an
+        // error: the request asks for an end state, not for a deletion of a
+        // specific entry.
+        held.retain(|tag| !input.tag_keys.contains(&tag.key));
+
+        Ok(UntagResourceOutput {})
     }
 }
