@@ -29,6 +29,8 @@ mod batch_put_timestamp_and_quality;
 mod gateway_lifecycle;
 #[path = "all/property_value_history.rs"]
 mod property_value_history;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/support.rs"]

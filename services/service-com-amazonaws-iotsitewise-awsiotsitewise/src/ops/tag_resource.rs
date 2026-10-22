@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation upserts the request's tags onto the resource its
+//! `resourceArn` names in the shared engine store (`crate::state`), where
+//! `ListTagsForResource` reads them back; this is the ONLY file to touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +154,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Every key is checked before anything is stored, so a batch holding one
+        // over-long key lands no key at all. The boundary validator reaches a map's
+        // VALUES but not its KEYS, so `TagKey`'s own bound is enforced here.
+        for key in input.tags.keys() {
+            if let Err(message) = crate::state::check_tag_key(key) {
+                return Err(invalid_request(message));
+            }
+        }
+
+        // A string that is not an ARN of this service names no resource this service
+        // could ever tag: a malformed request, not a resource that is missing.
+        if crate::state::parse_resource_arn(&input.resource_arn).is_none() {
+            return Err(invalid_request(format!(
+                "The value '{}' at 'resourceArn' is not the ARN of an IoT SiteWise resource.",
+                input.resource_arn
+            )));
+        }
+
+        let mut store = state.lock();
+        let Some(tags) = store.tags_for_resource_mut(&input.resource_arn) else {
+            return Err(not_found(&input.resource_arn));
+        };
+
+        // "Adds tags to an IoT SiteWise resource. If a tag already exists for the
+        // resource, this operation updates the tag's value" — an upsert, so only a key
+        // the resource does not already hold grows its tag set and re-tagging a held
+        // key can never reach the ceiling. The resulting count is checked BEFORE any
+        // tag is stored, so a refused call leaves the tag set exactly as it was.
+        let resulting = tags.len()
+            + input
+                .tags
+                .keys()
+                .filter(|key| !tags.contains_key(*key))
+                .count();
+        if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(too_many_tags(&input.resource_arn, resulting));
+        }
+
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> TagResourceError {
+    TagResourceErrorModeled::InvalidRequestException(InvalidRequestException { message }).into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the ARN that resolved to no
+/// stored resource.
+fn not_found(resource_arn: &str) -> TagResourceError {
+    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("Resource with ARN {resource_arn} not found"),
+    })
+    .into()
+}
+
+/// HTTP 400 `TooManyTagsException`: the call would carry the resource past the
+/// per-resource ceiling, so none of its tags is stored.
+fn too_many_tags(resource_arn: &str, resulting: usize) -> TagResourceError {
+    TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
+        message: Some(format!(
+            "The request would leave {resulting} tags on the resource; a resource holds at \
+             most {} tags.",
+            crate::state::MAX_TAGS_PER_RESOURCE
+        )),
+        // The member's own documentation: "The name of the resource with too many tags."
+        resource_name: Some(resource_arn.to_string()),
+    })
+    .into()
 }

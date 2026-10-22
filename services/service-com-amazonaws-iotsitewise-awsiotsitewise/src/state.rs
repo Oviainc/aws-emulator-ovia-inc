@@ -4,9 +4,12 @@
 //!
 //! The asset-model / asset / property-value and gateway slices of IoT SiteWise
 //! live here: one map per resource plus the indexes the modelled lookup forms need
-//! (`externalId:<id>` labels, property aliases, a gateway's platform device). Every handler reads and writes
-//! THIS struct through [`service_state`]; nothing in `src/ops/` keeps state of its
-//! own.
+//! (`externalId:<id>` labels, property aliases, a gateway's platform device). A
+//! resource's tags live on that resource's own record, reached by ARN through
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource`], so the
+//! tagging operations and the creates share one tag set per resource. Every handler
+//! reads and writes THIS struct through [`service_state`]; nothing in `src/ops/`
+//! keeps state of its own.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -103,6 +106,31 @@ pub const MAX_ASSET_MODELS: usize = 1_000;
 
 /// See [`MAX_ASSET_MODELS`].
 pub const MAX_ASSETS: usize = 10_000;
+
+/// The greatest number of tags one IoT SiteWise resource holds.
+///
+/// The model's own ceiling: `TagMap` carries `@length(min: 1, max: 50)` wherever
+/// it is used — `TagResource.tags`, `CreateAsset.tags`, `CreateAssetModel.tags`
+/// and `ListTagsForResource.tags` — so no single call may carry more than this
+/// many tags and no listing may report more. A `TagResource` call that would
+/// leave a resource above it is refused with the modelled `TooManyTagsException`
+/// (HTTP 400), whose own documentation is "You've reached the quota for the
+/// number of tags allowed for a resource".
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The `TagKey` bounds: `TagMap`'s key targets `TagKey`, which the model
+/// declares as `@length(min: 1, max: 128)`.
+pub const TAG_KEY_MIN_LENGTH: usize = 1;
+/// See [`TAG_KEY_MIN_LENGTH`].
+pub const TAG_KEY_MAX_LENGTH: usize = 128;
+
+/// The ARN resource-type segment of an asset ARN, as [`asset_arn`] builds it.
+pub const ASSET_RESOURCE_TYPE: &str = "asset";
+/// The ARN resource-type segment of an asset-model ARN, as [`asset_model_arn`]
+/// builds it.
+pub const ASSET_MODEL_RESOURCE_TYPE: &str = "asset-model";
+/// The ARN resource-type segment of a gateway ARN, as [`gateway_arn`] builds it.
+pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
 
 /// See [`MAX_ASSET_MODELS`]: the same bound, for the gateway map. `CreateGateway`
 /// is the only thing that adds a gateway and it declares the modelled
@@ -468,6 +496,67 @@ pub fn gateway_platform_count(platform: &GatewayPlatform) -> usize {
     .count()
 }
 
+/// A stored record the tagging operations reach by ARN: it knows the ARN it was
+/// minted with and owns the one tag set every operation that touches its tags
+/// reads and writes.
+///
+/// Implemented once per taggable record, so
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource`] and its
+/// `_mut` twin hold only the list of kinds and cannot drift in how a kind is
+/// resolved.
+pub trait TaggedRecord {
+    /// The ARN this record was minted with.
+    fn arn(&self) -> &str;
+    /// The record's tag set.
+    fn tags(&self) -> &HashMap<String, String>;
+    /// The same tag set, for writing.
+    fn tags_mut(&mut self) -> &mut HashMap<String, String>;
+}
+
+/// Implement [`TaggedRecord`] for a record carrying an `arn` and a `tags` field.
+macro_rules! tagged_record {
+    ($record:ty) => {
+        impl TaggedRecord for $record {
+            fn arn(&self) -> &str {
+                &self.arn
+            }
+
+            fn tags(&self) -> &HashMap<String, String> {
+                &self.tags
+            }
+
+            fn tags_mut(&mut self) -> &mut HashMap<String, String> {
+                &mut self.tags
+            }
+        }
+    };
+}
+
+tagged_record!(AssetRecord);
+tagged_record!(AssetModelRecord);
+tagged_record!(GatewayRecord);
+
+/// `record`'s tag set, but only when `record` is the one `arn` names exactly —
+/// same partition, account and region, not merely the same id.
+fn tags_of<'a, R: TaggedRecord>(
+    record: Option<&'a R>,
+    arn: &str,
+) -> Option<&'a HashMap<String, String>> {
+    record
+        .filter(|record| record.arn() == arn)
+        .map(TaggedRecord::tags)
+}
+
+/// The same, for writing. See [`tags_of`].
+fn tags_of_mut<'a, R: TaggedRecord>(
+    record: Option<&'a mut R>,
+    arn: &str,
+) -> Option<&'a mut HashMap<String, String>> {
+    record
+        .filter(|record| record.arn() == arn)
+        .map(TaggedRecord::tags_mut)
+}
+
 /// Per-service state for com-amazonaws-iotsitewise-awsiotsitewise. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
@@ -664,6 +753,35 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             .last()
     }
 
+    /// The tag set of the resource `arn` names, for reading.
+    ///
+    /// Resolved through [`parse_resource_arn`] and then by exact ARN equality, so
+    /// an ARN that names a stored id in another partition, account or region
+    /// resolves to nothing — the resource it names is not one this store holds.
+    /// Every record this store holds that carries tags is reachable: the arms
+    /// below are the whole list of taggable kinds, and each is one line because
+    /// the per-record work lives in [`TaggedRecord`].
+    pub fn tags_for_resource(&self, arn: &str) -> Option<&HashMap<String, String>> {
+        let (resource_type, id) = parse_resource_arn(arn)?;
+        match resource_type {
+            ASSET_RESOURCE_TYPE => tags_of(self.assets.get(id), arn),
+            ASSET_MODEL_RESOURCE_TYPE => tags_of(self.asset_models.get(id), arn),
+            GATEWAY_RESOURCE_TYPE => tags_of(self.gateways.get(id), arn),
+            _ => None,
+        }
+    }
+
+    /// The same tag set, for writing. See [`Self::tags_for_resource`].
+    pub fn tags_for_resource_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
+        let (resource_type, id) = parse_resource_arn(arn)?;
+        match resource_type {
+            ASSET_RESOURCE_TYPE => tags_of_mut(self.assets.get_mut(id), arn),
+            ASSET_MODEL_RESOURCE_TYPE => tags_of_mut(self.asset_models.get_mut(id), arn),
+            GATEWAY_RESOURCE_TYPE => tags_of_mut(self.gateways.get_mut(id), arn),
+            _ => None,
+        }
+    }
+
     /// Forget an asset and everything keyed off it: its external-id entry, its
     /// property series and its property aliases.
     pub fn forget_asset(&mut self, asset_id: &str) -> Option<AssetRecord> {
@@ -835,6 +953,54 @@ pub fn asset_model_arn(region: &str, asset_model_id: &str) -> String {
 /// The canonical ARN of an asset in `region`.
 pub fn asset_arn(region: &str, asset_id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("asset/{asset_id}"))
+}
+
+/// The resource type and resource id an `AmazonResourceName` names, when the
+/// string is an ARN of THIS service in the `<type>/<id>` resource form every
+/// IoT SiteWise ARN takes (`asset/<assetId>`, `asset-model/<assetModelId>`,
+/// `portal/<portalId>`, …).
+///
+/// `None` for anything that is not such an ARN — a string that is not an ARN at
+/// all, or one whose service segment is another service's. The resource type is
+/// returned as it was written rather than matched here, so a caller decides
+/// which types it holds.
+pub fn parse_resource_arn(arn: &str) -> Option<(&str, &str)> {
+    // `arn:<partition>:<service>:<region>:<account>:<resource>` — the resource
+    // section is the only one that may itself contain a `:`, so it takes the
+    // remainder.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let _partition = fields.next()?;
+    if fields.next()? != ARN_SERVICE {
+        return None;
+    }
+    let _region = fields.next()?;
+    let _account = fields.next()?;
+    let (resource_type, id) = fields.next()?.split_once('/')?;
+    if resource_type.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some((resource_type, id))
+}
+
+/// Refuse a tag key outside the modelled `TagKey` bounds, in the wording the
+/// boundary validator uses for a map's keys.
+///
+/// The framework's constraint walk reaches a map's VALUES but not its KEYS, so
+/// `TagMap`'s `@length(min: 1, max: 128)` on `TagKey` is the handler's to
+/// enforce; the length is in characters, as `@length` counts them.
+pub fn check_tag_key(key: &str) -> Result<(), String> {
+    let length = key.chars().count();
+    if (TAG_KEY_MIN_LENGTH..=TAG_KEY_MAX_LENGTH).contains(&length) {
+        return Ok(());
+    }
+    Err(format!(
+        "1 validation error detected: Value at 'tags' failed to satisfy constraint: \
+         Map keys must satisfy constraint: [Member must have length greater than or equal to \
+         {TAG_KEY_MIN_LENGTH}, Member must have length less than or equal to {TAG_KEY_MAX_LENGTH}]"
+    ))
 }
 
 /// The canonical ARN of a gateway in `region`, in the form `CreateGateway`
