@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation removes the keys its `tagKeys` names from the tag set of
+//! the resource its `resourceArn` names in the shared engine store (`crate::state`),
+//! where `ListTagsForResource` reads the remainder back; this is the ONLY file to touch
+//! for it.
 //!
 //! ## Shape of an operation
 //!
@@ -154,20 +149,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A string that is not an ARN of this service names no resource this service
+        // could ever hold tags for: a malformed request, not a resource that is
+        // missing — the same reading `TagResource` and `ListTagsForResource` take.
+        if crate::state::parse_resource_arn(&input.resource_arn).is_none() {
+            return Err(invalid_request(format!(
+                "The value '{}' at 'resourceArn' is not the ARN of an IoT SiteWise resource.",
+                input.resource_arn
+            )));
+        }
+
+        let mut store = state.lock();
+        let Some(tags) = store.tags_for_resource_mut(&input.resource_arn) else {
+            return Err(not_found(&input.resource_arn));
+        };
+
+        // "Removes a tag from an IoT SiteWise resource": afterwards the resource holds
+        // none of the named keys and every key the request did not name is untouched,
+        // with its value unchanged. Removal is idempotent — a key the resource does not
+        // hold removes nothing and is not an error, because the state the caller asked
+        // for already holds.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
 }
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> UntagResourceError {
+    UntagResourceErrorModeled::InvalidRequestException(InvalidRequestException { message }).into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the ARN that resolved to no stored
+/// resource.
+fn not_found(resource_arn: &str) -> UntagResourceError {
+    UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("Resource with ARN {resource_arn} not found"),
+    })
+    .into()
+}
+

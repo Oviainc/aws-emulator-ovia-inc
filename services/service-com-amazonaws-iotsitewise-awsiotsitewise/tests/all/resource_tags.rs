@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for the IoT SiteWise resource-tagging slice — `TagResource`
-//! and the `ListTagsForResource` read it is proved through — driven over HTTP
-//! through the same `MultiServiceRouter` the emulator boots with, so every
-//! assertion is about the wire behaviour a real client sees.
+//! End-to-end cover for the IoT SiteWise resource-tagging slice — `TagResource`,
+//! `UntagResource` and the `ListTagsForResource` read they are proved through —
+//! driven over HTTP through the same `MultiServiceRouter` the emulator boots
+//! with, so every assertion is about the wire behaviour a real client sees.
 //!
 //! The rule these suites pin: `TagResource` upserts the request's key-value
 //! pairs onto the resource its `resourceArn` names and persists them in the one
 //! shared store, so `ListTagsForResource` reports exactly the accumulated set
-//! for every kind of resource the store holds; a call that would leave a
-//! resource above the modelled per-resource tag ceiling is refused with
-//! `TooManyTagsException` and stores nothing; and an ARN that names no stored
-//! resource is a modelled refusal rather than a tag set invented for it.
+//! for every kind of resource the store holds; `UntagResource` removes exactly
+//! the keys its `tagKeys` names from that same set, leaving every other key and
+//! value untouched, and is idempotent for a key the resource does not hold; a
+//! call that would leave a resource above the modelled per-resource tag ceiling
+//! is refused with `TooManyTagsException` and stores nothing; and an ARN that
+//! names no stored resource is a modelled refusal rather than a tag set
+//! invented for it.
 
 use std::collections::BTreeMap;
 
@@ -161,6 +164,63 @@ async fn tag_resource(
 /// `ListTagsForResource` on `arn`.
 async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     call(router, "GET", &format!("/tags?resourceArn={arn}"), None).await
+}
+
+/// Percent-encode one query value the way an SDK does: everything outside RFC
+/// 3986's unreserved set is encoded, so a key carrying a space or a multi-byte
+/// character survives the server's decode.
+fn encode_query(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '.' | '_' | '~' => ch.to_string(),
+            other => other
+                .to_string()
+                .bytes()
+                .map(|byte| format!("%{byte:02X}"))
+                .collect(),
+        })
+        .collect()
+}
+
+/// `UntagResource` on `arn`, naming `keys`.
+///
+/// `DELETE /tags?resourceArn=…&tagKeys=…`: both members are `@httpQuery`, and
+/// `tagKeys` is a list, so each key is its own repeated `tagKeys=` parameter.
+async fn untag_resource(
+    router: &MultiServiceRouter,
+    arn: &str,
+    keys: &[String],
+) -> (u16, Value) {
+    let mut query = format!("resourceArn={}", encode_query(arn));
+    for key in keys {
+        query.push_str("&tagKeys=");
+        query.push_str(&encode_query(key));
+    }
+    call(router, "DELETE", &format!("/tags?{query}"), None).await
+}
+
+/// The keys of `pairs`, as `untag_resource` takes them.
+fn keys_of(pairs: &[(String, String)]) -> Vec<String> {
+    pairs.iter().map(|(key, _)| key.clone()).collect()
+}
+
+/// Owned keys from `&str` literals.
+fn keys(rows: &[&str]) -> Vec<String> {
+    rows.iter().map(|key| (*key).to_string()).collect()
+}
+
+/// Seed `arn` with `rows` through `TagResource`, asserting the write landed.
+async fn seed_tags(router: &MultiServiceRouter, arn: &str, rows: &[(String, String)], case: &str) {
+    if rows.is_empty() {
+        return;
+    }
+    let (status, body) = tag_resource(router, arn, tags_json(rows)).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: seeding {} tags must answer 200, got {status} {body}",
+        rows.len()
+    );
 }
 
 /// The tag set `ListTagsForResource` reports for `arn`, asserting a 200.
@@ -601,6 +661,322 @@ async fn a_tag_key_outside_the_modelled_bound_is_refused_and_stores_nothing() {
         assert_eq!(
             after, held,
             "case {case:?}: a refused call must store no part of its batch, got {after:?}"
+        );
+    }
+}
+
+// =============================================================================
+// 6. UntagResource removes exactly the named keys and nothing else
+// =============================================================================
+
+/// One row of the untag table: a case label, the kind of resource, the tags it
+/// is seeded with, the keys the `UntagResource` call names, and the pairs that
+/// must remain afterwards.
+type UntagCase = (&'static str, &'static str, TagRows, Vec<String>, TagRows);
+
+/// How many keys one `UntagResource` call may name.
+///
+/// The model's own bound, from this service's Smithy model: `tagKeys` targets
+/// `TagKeyList`, declared `@length(min: 0, max: 200)`.
+const MAX_TAG_KEYS_PER_CALL: usize = 200;
+
+#[tokio::test]
+async fn untag_resource_removes_exactly_the_named_keys_and_is_idempotent() {
+    let router = router();
+
+    let long_key = "k".repeat(TAG_KEY_MAX_LENGTH);
+    let short_key = "k".repeat(TAG_KEY_MIN_LENGTH);
+    let ceiling = generated_pairs(MAX_TAGS_PER_RESOURCE);
+
+    // Rows differ along what the rule generalises over: the KIND of resource the
+    // ARN names, HOW MANY of its keys the call names (none of them, one, some,
+    // all), whether a named key is one the resource holds, the FORM of the key
+    // (multi-byte, at `TagKey`'s minimum and maximum length), repeated entries
+    // in the list, and the size of the list itself.
+    let cases: Vec<UntagCase> = vec![
+        (
+            "asset-model, one of three keys",
+            "asset-model",
+            pairs(&[("Stage", "production"), ("Owner", "plant-1"), ("Line", "a")]),
+            keys(&["Owner"]),
+            pairs(&[("Stage", "production"), ("Line", "a")]),
+        ),
+        (
+            "asset, two of three keys",
+            "asset",
+            pairs(&[("Stage", "production"), ("Owner", "plant-1"), ("Line", "a")]),
+            keys(&["Stage", "Line"]),
+            pairs(&[("Owner", "plant-1")]),
+        ),
+        (
+            "gateway, every key it holds",
+            "gateway",
+            pairs(&[("Stage", "production"), ("Site", "north")]),
+            keys(&["Stage", "Site"]),
+            Vec::new(),
+        ),
+        (
+            "asset-model, a key the resource does not hold",
+            "asset-model",
+            pairs(&[("Stage", "production"), ("Owner", "plant-1")]),
+            keys(&["Absent"]),
+            pairs(&[("Stage", "production"), ("Owner", "plant-1")]),
+        ),
+        (
+            "asset, one held key beside one it does not hold",
+            "asset",
+            pairs(&[("Stage", "production"), ("Owner", "plant-1")]),
+            keys(&["Stage", "Absent"]),
+            pairs(&[("Owner", "plant-1")]),
+        ),
+        (
+            "asset, a multi-byte key",
+            "asset",
+            pairs(&[("温度", "25 °C — 施設"), ("Stage", "test")]),
+            keys(&["温度"]),
+            pairs(&[("Stage", "test")]),
+        ),
+        (
+            "asset-model, the key at TagKey's maximum length",
+            "asset-model",
+            vec![
+                (long_key.clone(), "long".to_string()),
+                (short_key.clone(), "short".to_string()),
+            ],
+            vec![long_key.clone()],
+            vec![(short_key.clone(), "short".to_string())],
+        ),
+        (
+            "gateway, the key at TagKey's minimum length",
+            "gateway",
+            vec![
+                (long_key.clone(), "long".to_string()),
+                (short_key.clone(), "short".to_string()),
+            ],
+            vec![short_key.clone()],
+            vec![(long_key.clone(), "long".to_string())],
+        ),
+        (
+            "asset, a key named twice in one call",
+            "asset",
+            pairs(&[("Stage", "production"), ("Owner", "plant-1")]),
+            keys(&["Stage", "Stage"]),
+            pairs(&[("Owner", "plant-1")]),
+        ),
+        (
+            "asset-model, all but one of the whole per-resource ceiling",
+            "asset-model",
+            ceiling.clone(),
+            keys_of(&ceiling[1..]),
+            ceiling[..1].to_vec(),
+        ),
+        (
+            "asset, the whole list bound, two of whose keys are held",
+            "asset",
+            pairs(&[("Stage", "production"), ("Owner", "plant-1")]),
+            {
+                let mut named = keys(&["Stage"]);
+                named.extend(
+                    (1..MAX_TAG_KEYS_PER_CALL).map(|at| format!("absent{at:03}")),
+                );
+                named
+            },
+            pairs(&[("Owner", "plant-1")]),
+        ),
+    ];
+
+    for (at, (case, kind, seeded, named, remaining)) in cases.iter().enumerate() {
+        assert!(
+            named.len() <= MAX_TAG_KEYS_PER_CALL,
+            "case {case:?}: the row itself must stay within the modelled list bound, got {}",
+            named.len()
+        );
+        let arn = create_resource(&router, kind, &format!("untag-{at}")).await;
+        seed_tags(&router, &arn, seeded, case).await;
+
+        let (status, body) = untag_resource(&router, &arn, named).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: UntagResource must answer 200, got {status} {body}"
+        );
+
+        let got = stored_tags(&router, &arn, case).await;
+        assert_eq!(
+            got,
+            expected(remaining),
+            "case {case:?}: exactly the named keys must be gone and every other pair \
+             kept, got {got:?}"
+        );
+
+        // Removal is idempotent: the same call again is accepted and leaves the
+        // same tag set, so a key the resource no longer holds is not an error.
+        let (status, body) = untag_resource(&router, &arn, named).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: repeating the call must answer 200, got {status} {body}"
+        );
+        let again = stored_tags(&router, &arn, case).await;
+        assert_eq!(
+            again, got,
+            "case {case:?}: repeating the call must leave the same tag set, got {again:?}"
+        );
+
+        // A removed key is removable again by a later `TagResource`: the removal
+        // took the key out of the set rather than marking it unusable.
+        if let Some((key, value)) = seeded.iter().find(|(key, _)| named.contains(key)) {
+            let (status, body) =
+                tag_resource(&router, &arn, tags_json(&[(key.clone(), value.clone())])).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: re-tagging a removed key must answer 200, got {status} {body}"
+            );
+            let retagged = stored_tags(&router, &arn, case).await;
+            assert_eq!(
+                retagged.get(key).map(String::as_str),
+                Some(value.as_str()),
+                "case {case:?}: the re-tagged key must read back, got {:?}",
+                retagged.get(key)
+            );
+        }
+    }
+}
+
+// =============================================================================
+// 7. UntagResource refuses an ARN that names no stored resource
+// =============================================================================
+
+#[tokio::test]
+async fn untag_resource_refuses_an_arn_that_names_no_stored_resource() {
+    let router = router();
+    let account = engine::EMULATOR_ACCOUNT_ID;
+    let held = pairs(&[("Stage", "production"), ("Owner", "plant-1")]);
+    let model_arn = tagged_model(&router, "untag-present", Some(tags_json(&held))).await;
+    let model_id = model_arn.rsplit('/').next().expect("an id tail").to_string();
+    let unknown_id = "11111111-2222-3333-4444-555555555555";
+
+    // Rows differ in WHICH part of the ARN names nothing — each is a well-formed
+    // IoT SiteWise ARN, so each is "the requested resource can't be found" (404).
+    let not_found = [
+        (
+            "an asset-model id the store does not hold",
+            format!("arn:aws:iotsitewise:{REGION}:{account}:asset-model/{unknown_id}"),
+        ),
+        (
+            "an asset id the store does not hold",
+            format!("arn:aws:iotsitewise:{REGION}:{account}:asset/{unknown_id}"),
+        ),
+        (
+            "a gateway id the store does not hold",
+            format!("arn:aws:iotsitewise:{REGION}:{account}:gateway/{unknown_id}"),
+        ),
+        (
+            "a resource type this emulator holds none of",
+            format!("arn:aws:iotsitewise:{REGION}:{account}:portal/{unknown_id}"),
+        ),
+        (
+            "the right id in another region",
+            format!("arn:aws:iotsitewise:eu-west-1:{account}:asset-model/{model_id}"),
+        ),
+        (
+            "the right id in another account",
+            format!("arn:aws:iotsitewise:{REGION}:111111111111:asset-model/{model_id}"),
+        ),
+        (
+            "the right id in another partition",
+            format!("arn:aws-cn:iotsitewise:{REGION}:{account}:asset-model/{model_id}"),
+        ),
+    ];
+    for (case, arn) in &not_found {
+        let (status, body) = untag_resource(&router, arn, &keys(&["Stage"])).await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: UntagResource must refuse {arn:?} as not found, got {status} {body}"
+        );
+    }
+
+    // Rows that are not an ARN of THIS service at all: no IoT SiteWise resource
+    // could ever answer for them, so they are a malformed request (400).
+    let invalid = [
+        ("not an ARN at all", "my-asset-model".to_string()),
+        (
+            "another service's ARN",
+            format!("arn:aws:s3:::bucket/{unknown_id}"),
+        ),
+        (
+            "an IoT SiteWise ARN with no resource id",
+            format!("arn:aws:iotsitewise:{REGION}:{account}:asset-model"),
+        ),
+        (
+            "an ARN missing its trailing resource section",
+            format!("arn:aws:iotsitewise:{REGION}:{account}"),
+        ),
+    ];
+    for (case, arn) in &invalid {
+        let (status, body) = untag_resource(&router, arn, &keys(&["Stage"])).await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "InvalidRequestException"),
+            "case {case:?}: UntagResource must refuse {arn:?} as invalid, got {status} {body}"
+        );
+    }
+
+    // Every refusal above left the real resource's tags exactly as they were.
+    let got = stored_tags(&router, &model_arn, "the present resource").await;
+    assert_eq!(
+        got,
+        expected(&held),
+        "the refusals above must have removed nothing from the real resource, got {got:?}"
+    );
+}
+
+// =============================================================================
+// 8. A tagKeys list outside the modelled bounds removes nothing
+// =============================================================================
+
+#[tokio::test]
+async fn a_tag_keys_list_outside_the_modelled_bounds_removes_nothing() {
+    let router = router();
+    let held = pairs(&[("Stage", "production"), ("Owner", "plant-1")]);
+    let arn = tagged_model(&router, "untag-bounds", Some(tags_json(&held))).await;
+
+    // The published bounds are `TagKeyList`'s own `@length(min: 0, max: 200)` and
+    // its member target `TagKey`'s `@length(min: 1, max: 128)`, both read from
+    // this service's Smithy model. Each is tested one past its edge; the edges
+    // themselves are rows of the table above.
+    let over_the_list_bound: Vec<String> = (0..=MAX_TAG_KEYS_PER_CALL)
+        .map(|at| format!("absent{at:03}"))
+        .collect();
+    let refused = [
+        (
+            "one key past the list's maximum length",
+            over_the_list_bound,
+        ),
+        (
+            "a key one character past TagKey's maximum length",
+            vec!["k".repeat(TAG_KEY_MAX_LENGTH + 1)],
+        ),
+        (
+            "a key one character short of TagKey's minimum length",
+            vec![String::new()],
+        ),
+    ];
+    for (case, named) in &refused {
+        // Each list also names a key the resource DOES hold, so a refusal that
+        // removed the legal part of it would be visible below.
+        let mut with_held = named.clone();
+        with_held.push("Stage".to_string());
+        let (status, body) = untag_resource(&router, &arn, &with_held).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a list of {} keys must be refused, got {status} {body}",
+            with_held.len()
+        );
+        let after = stored_tags(&router, &arn, case).await;
+        assert_eq!(
+            after,
+            expected(&held),
+            "case {case:?}: a refused call must remove no part of its list, got {after:?}"
         );
     }
 }
