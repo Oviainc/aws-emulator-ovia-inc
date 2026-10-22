@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPolicy
+//!
 //! Reads back the resource-based policy a write PERSISTED in
 //! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::policies`] for
 //! the resource the `arn` @httpLabel names, with the revision `token` of the standing

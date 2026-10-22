@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddPolicyStatement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddPolicyStatement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddPolicyStatement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds ONE statement to the resource-based policy of the resource the `arn`
+//! @httpLabel names, and answers the policy document the add produced together with
+//! the `token` of its revision.
+//!
+//! The policy is persisted in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::policies`], the
+//! same record `PutPolicy` writes and `GetPolicy` reads, so this response and a later
+//! read cannot disagree. The statement is APPENDED to the stored document's
+//! `Statement` list and every other member of that document is carried through
+//! untouched, which is what lets a document a `PutPolicy` caller wrote keep its own
+//! shape. `statementId` is the statement's `Sid` within the document, and it is what
+//! "differentiates the statement from others in the same policy", so an add naming one
+//! the document already holds is refused and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +179,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddPolicyStatement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddPolicyStatementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddPolicyStatement"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AddPolicyStatementErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // `condition` is modelled only by its length, so a value that is not a policy
+        // condition block reaches here. It cannot be written into a statement's
+        // `Condition`, so it is refused with the modelled `ValidationException` (HTTP
+        // 400) rather than stored and served back as something that is not a
+        // condition. Parsed BEFORE the lock is taken, as `PutPolicy` parses its
+        // document, but only REPORTED after the resource lookup below, so an ARN that
+        // names no resource answers 404 whatever the body carries.
+        let condition = match input.condition.as_deref() {
+            None => Ok(None),
+            Some(condition) => match ::serde_json::from_str::<::serde_json::Value>(condition) {
+                Ok(parsed) if parsed.is_object() => Ok(Some(parsed)),
+                Ok(_) => Err("the value is valid JSON but not a JSON object"),
+                Err(_) => Err("the value is not valid JSON"),
+            },
+        };
+
+        let mut store = state.lock();
+
+        // A policy belongs TO a resource, so there is nothing to attach a statement to
+        // until that resource exists. The `createdAt` the lookup answers is the
+        // incarnation stamp the stored entry carries, so a resource deleted and created
+        // again under the same name starts policy-less.
+        let resource_created_at = store
+            .policy_resource_created_at(&input.arn, &region)
+            .ok_or_else(|| {
+                AddPolicyStatementErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::messages::policy_resource_not_found(
+                            &input.arn,
+                        )),
+                    },
+                )
+            })?;
+
+        let condition = condition.map_err(|reason| {
+            AddPolicyStatementErrorModeled::ValidationException(ValidationException {
+                message: Some(crate::state::messages::invalid_statement_condition(reason)),
+            })
+        })?;
+
+        // The statement is added to the document STANDING on the resource, so a
+        // document `PutPolicy` wrote keeps every member of its own; a resource that
+        // carries no policy yet starts from an empty one.
+        let standing = store.resource_policy(&input.arn, &region);
+        let (object, mut statements) = match standing {
+            None => (crate::state::new_policy_document(), Vec::new()),
+            Some(policy) => crate::state::policy_document_parts(&policy.policy).ok_or_else(
+                || {
+                    AddPolicyStatementErrorModeled::ValidationException(ValidationException {
+                        message: Some(crate::state::messages::POLICY_NOT_JSON.to_string()),
+                    })
+                },
+            )?,
+        };
+
+        // `statementId` is what differentiates a statement from the others in the same
+        // policy, so a `Sid` the document already holds is refused — as the modelled
+        // `ValidationException` (HTTP 400), which is the code AWS answers for it — and
+        // refused BEFORE anything is minted or stored, so a rejected add leaves both
+        // the document and the revision token exactly as they were.
+        if statements
+            .iter()
+            .any(|statement| crate::state::statement_sid(statement) == Some(input.statement_id.as_str()))
+        {
+            return Err(AddPolicyStatementErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::messages::DUPLICATE_STATEMENT_ID.to_string()),
+                },
+            )
+            .into());
+        }
+
+        statements.push(crate::state::policy_statement(
+            &input.statement_id,
+            &input.effect,
+            &input.action,
+            &input.principal,
+            condition.as_ref(),
+            &input.arn,
+        ));
+
+        // A statement's own values have no modelled maximum and the statements of one
+        // policy accumulate across calls, so the document the add WOULD produce is
+        // rendered and measured BEFORE anything is stored: one that could not be
+        // served as a `PolicyDocument` is refused with the modelled
+        // `ValidationException`. That is what bounds this collection together with the
+        // pruning below — at most one document's worth per live resource.
+        let rendered = crate::state::render_policy_document(object, statements);
+        let length = rendered.as_deref().map_or(0, |document| document.chars().count());
+        let Some(document) =
+            rendered.filter(|_| length <= crate::state::MAX_POLICY_DOCUMENT_LENGTH)
+        else {
+            return Err(AddPolicyStatementErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::messages::policy_document_too_large(length)),
+                },
+            )
+            .into());
+        };
+
+        // A policy is not a resource of its own: it dies with the resource it is
+        // attached to, so the write that grows this collection first drops every entry
+        // whose resource is gone, exactly as `PutPolicy` does.
+        store.prune_orphaned_policies();
+
+        // Adding a statement produces a NEW revision, so it mints a new token: the one
+        // every later read serves until the next change.
+        let record = crate::state::ResourcePolicy {
+            policy: document,
+            token: crate::state::new_policy_token(),
+            resource_created_at,
+        };
+        // Answered from the STORED record, read back through the slot it was written
+        // into, so this response and a later `GetPolicy` cannot disagree about the
+        // policy this add produced.
+        let stored = match store.policies.entry(input.arn.clone()) {
+            ::std::collections::btree_map::Entry::Occupied(slot) => {
+                let slot = slot.into_mut();
+                *slot = record;
+                &*slot
+            }
+            ::std::collections::btree_map::Entry::Vacant(slot) => slot.insert(record),
+        };
+        Ok(AddPolicyStatementOutput {
+            arn: input.arn.clone(),
+            token: stored.token.clone(),
+            policy: Some(stored.policy.clone()),
+        })
     }
 }
