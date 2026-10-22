@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDomainPermissionsPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDomainPermissionsPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Attaches a resource policy to a domain, replacing any policy already attached, and
+//! answers with the policy as it was stored. The stored document is the caller's own
+//! `policyDocument`, byte for byte; the `revision` is minted by the service.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDomainPermissionsPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `policyRevision` is optimistic locking: when the caller supplies one it must be the
+//! revision currently attached, otherwise the write is refused with `ConflictException`
+//! (409) and nothing is stored. Omitting it writes unconditionally.
 //!
 //! ## Shape of an operation
 //!
@@ -93,6 +91,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::DOMAIN_RESOURCE_TYPE;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -166,20 +165,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDomainPermissionsPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDomainPermissionsPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDomainPermissionsPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutDomainPermissionsPolicyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A resource policy is "a valid displayable JSON Aspen policy string", and the
+        // modelled pattern only forbids control characters — so JSON well-formedness is
+        // the service's own rule, applied through the one check the whole policy family
+        // shares, before anything is written.
+        if let Some(refusal) = crate::state::policy_document_refusal(&input.policy_document) {
+            return Err(
+                PutDomainPermissionsPolicyErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
+        let mut store = state.lock();
+
+        // `domainOwner` pins the account the domain must belong to; `store.domain_mut` is
+        // the single place that rule lives, so a domain held by another account is not
+        // found here exactly as it is not found on every other domain-scoped operation.
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(
+                PutDomainPermissionsPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Domain {} not found.", input.domain),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some(DOMAIN_RESOURCE_TYPE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The optimistic lock, decided by the rule the whole policy family shares: a
+        // caller that named a revision is writing over the policy it read, so the write is
+        // refused unless that is still the revision held — including when nothing is held,
+        // which carries no revision to match. A refused write stores nothing.
+        if !crate::state::policy_revision_matches(
+            domain.policy.as_ref(),
+            input.policy_revision.as_deref(),
+        ) {
+            return Err(PutDomainPermissionsPolicyErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::policy_revision_conflict_message(
+                        DOMAIN_RESOURCE_TYPE,
+                        &input.domain,
+                    ),
+                    resource_id: Some(input.domain.clone()),
+                    resource_type: Some(DOMAIN_RESOURCE_TYPE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The response is the record that was just STORED, so a later
+        // `GetDomainPermissionsPolicy` cannot disagree with it.
+        let policy = domain.attach_policy(input.policy_document);
+
+        Ok(PutDomainPermissionsPolicyOutput {
+            policy: Some(policy),
+        })
     }
 }
