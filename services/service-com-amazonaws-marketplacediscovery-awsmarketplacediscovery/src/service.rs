@@ -114,7 +114,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // So the claim is narrowed the way the framework narrows it for the other
         // signing-name collisions: the signing name must match AND the request must
-        // address this service's own modeled URI path space (see `claims_modeled_path`).
+        // address this service's own modeled URI path space (see `claims_modeled_path`)
+        // — every operation here is bound to `POST /2026-02-05/<operation>`
+        // (`OPERATIONS.md`).
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) if key == self.entry.identity().signing_name() => {
                 claims_modeled_path(parts, crate::ROUTE_PATH_SEGMENTS)
