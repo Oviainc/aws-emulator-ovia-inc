@@ -15,13 +15,53 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Workload, WorkloadDiscoveryConfig, WorkloadJiraConfigurationInput,
-    WorkloadJiraConfigurationOutput, WorkloadSummary,
+    WorkloadJiraConfigurationOutput, WorkloadSummary, RISK_VALUES,
 };
 
 /// `Workload$ImprovementStatus` before any lens review has been answered. The
 /// `WorkloadImprovementStatus` enum's `NOT_APPLICABLE` member — see
 /// `smithy_query(query="shape", shape="WorkloadImprovementStatus")`.
 pub const DEFAULT_IMPROVEMENT_STATUS: &str = "NOT_APPLICABLE";
+
+/// The `Risk` member every unanswered question of an attached lens counts under —
+/// `smithy_query(query="shape", shape="Risk")` lists `UNANSWERED` beside the four
+/// answered risks. Named here because the roll-up below fills it from the lens
+/// question set rather than from an answer.
+pub const RISK_UNANSWERED: &str = "UNANSWERED";
+
+/// `TrustedAdvisorIntegrationStatus$DISABLED`: what a workload's discovery
+/// configuration reports while no Trusted Advisor integration has been configured for
+/// it. The enum publishes exactly `ENABLED` and `DISABLED`
+/// (`smithy_query(query="shape", shape="TrustedAdvisorIntegrationStatus")`), and a
+/// workload nobody enabled the integration for is not integrated.
+pub const DEFAULT_TRUSTED_ADVISOR_INTEGRATION_STATUS: &str = "DISABLED";
+
+/// The lens alias of the AWS-official Well-Architected Framework lens — the one lens
+/// definition this emulator carries. A lens is named on the wire either by this alias
+/// or by its ARN, whose resource part ends in `lens/<alias>`
+/// (`smithy_query(query="shape", shape="LensAlias")`).
+pub const FRAMEWORK_LENS_ALIAS: &str = "wellarchitected";
+
+/// The AWS Well-Architected Framework lens, as content: its pillars in the order the
+/// framework presents them, each with the number of questions that pillar asks.
+///
+/// `PillarId` is how a pillar is named on the wire (`smithy_query(query="shape",
+/// shape="PillarId")`: "The ID used to identify a pillar, for example, `security`").
+/// The question counts are the framework's published question numbering —
+/// operational excellence OPS 1-11, security SEC 1-11, reliability REL 1-13,
+/// performance efficiency PERF 1-5, cost optimization COST 1-11 and sustainability
+/// SUS 1-6 — 57 questions in all. Lens content is service-owned data; this emulator
+/// ships only this lens's shape, so the questions themselves (which the still-stubbed
+/// `GetLens` / `ListAnswers` would return) are not modelled here, only how many each
+/// pillar asks.
+pub const FRAMEWORK_LENS_PILLARS: &[(&str, usize)] = &[
+    ("operationalExcellence", 11),
+    ("security", 11),
+    ("reliability", 13),
+    ("performance", 5),
+    ("costOptimization", 11),
+    ("sustainability", 6),
+];
 
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
 /// workload.
@@ -47,9 +87,10 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// so a caller never meets it by accident.
 pub const MAX_WORKLOADS_PER_ACCOUNT_REGION: usize = 10_000;
 
-/// One stored workload. Every member of the modelled `Workload` output that this
-/// service can know about is persisted here; the two `to_*` projections below are the
-/// only places a response is built from it.
+/// One stored workload. Every member of the modelled `Workload` output that a request
+/// can set is persisted here, and the members the SERVICE computes — the risk roll-up
+/// and the defaulted discovery configuration — are derived from this record by the two
+/// `to_*` projections below, the only places a response is built from it.
 #[derive(Debug, Clone)]
 pub struct WorkloadRecord {
     pub workload_id: String,
@@ -73,15 +114,54 @@ pub struct WorkloadRecord {
     pub owner: String,
     pub tags: BTreeMap<String, String>,
     pub applications: Vec<String>,
-    /// Risk counts per `Risk` value, derived from this workload's lens-review answers.
-    /// Lens reviews and answers are not implemented yet (each is tracked by its own
-    /// stub issue), so no answer can exist and the map is empty — not canned.
-    pub risk_counts: BTreeMap<String, i32>,
     pub discovery_config: Option<WorkloadDiscoveryConfig>,
     pub jira_configuration: Option<WorkloadJiraConfigurationInput>,
 }
 
 impl WorkloadRecord {
+    /// This workload's risk roll-up: one entry for every `Risk` the enum publishes, so
+    /// a caller that reads a bucket to report review progress always finds it.
+    ///
+    /// `UNANSWERED` counts the questions of every lens attached to the workload that
+    /// carries no answer yet; each other bucket counts the stored answers that carry
+    /// that risk. No operation in this emulator can answer a question — `UpdateAnswer`,
+    /// `GetAnswer` and `ListAnswers` are still stubs, each with its own issue — so
+    /// every question an attached lens asks is unanswered and the answered buckets are
+    /// 0. The map is DERIVED from the attached lenses on every read and never stored,
+    /// so it moves when the lenses do.
+    pub fn risk_counts(&self) -> BTreeMap<String, i32> {
+        let mut counts: BTreeMap<String, i32> = RISK_VALUES
+            .iter()
+            .map(|risk| ((*risk).to_string(), 0))
+            .collect();
+        // A lens is attached once however many ways the request named it, so resolve
+        // each name to its lens and count that lens's questions once.
+        let attached: std::collections::BTreeSet<&str> =
+            self.lenses.iter().map(|lens| lens_alias(lens)).collect();
+        let unanswered: usize = attached.iter().map(|lens| lens_question_count(lens)).sum();
+        counts.insert(
+            RISK_UNANSWERED.to_string(),
+            i32::try_from(unanswered).unwrap_or(i32::MAX),
+        );
+        counts
+    }
+
+    /// This workload's discovery configuration, with the members the service defaults
+    /// filled in: a workload always has one, and its Trusted Advisor integration is
+    /// [`DEFAULT_TRUSTED_ADVISOR_INTEGRATION_STATUS`] until a caller enables it.
+    fn effective_discovery_config(&self) -> WorkloadDiscoveryConfig {
+        let stored = self.discovery_config.as_ref();
+        WorkloadDiscoveryConfig {
+            trusted_advisor_integration_status: stored
+                .and_then(|config| config.trusted_advisor_integration_status.clone())
+                .or_else(|| Some(DEFAULT_TRUSTED_ADVISOR_INTEGRATION_STATUS.to_string())),
+            // The resource definition is what the caller chose to discover resources
+            // by; the service defaults nothing for it.
+            workload_resource_definition: stored
+                .and_then(|config| config.workload_resource_definition.clone()),
+        }
+    }
+
     /// The `Workload` shape `GetWorkload`/`UpdateWorkload` return.
     pub fn to_workload(&self) -> Workload {
         Workload {
@@ -105,14 +185,15 @@ impl WorkloadRecord {
             industry: self.industry.clone(),
             notes: self.notes.clone(),
             improvement_status: Some(self.improvement_status.clone()),
-            risk_counts: Some(risk_counts_to_map(&self.risk_counts)),
+            risk_counts: Some(risk_counts_to_map(&self.risk_counts())),
             pillar_priorities: Some(self.pillar_priorities.clone()),
             lenses: Some(self.lenses.clone()),
             owner: Some(self.owner.clone()),
-            // `TagMap` is modelled `@length(min: 1)`, so an untagged workload omits
-            // the member rather than sending an empty map.
-            tags: (!self.tags.is_empty()).then(|| self.tags.clone().into_iter().collect()),
-            discovery_config: self.discovery_config.clone(),
+            // The tag map the workload carries, empty when it carries no tags: the
+            // `@length(min: 1)` on `TagMap` constrains the tags a REQUEST supplies,
+            // not what a projection of the stored workload reports.
+            tags: Some(self.tags.clone().into_iter().collect()),
+            discovery_config: Some(self.effective_discovery_config()),
             applications: Some(self.applications.clone()),
             // A workload's profiles, and the risk counts restricted to the questions a
             // profile prioritises, exist only once a profile is associated; profiles
@@ -139,7 +220,7 @@ impl WorkloadRecord {
             owner: Some(self.owner.clone()),
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
             lenses: Some(self.lenses.clone()),
-            risk_counts: Some(risk_counts_to_map(&self.risk_counts)),
+            risk_counts: Some(risk_counts_to_map(&self.risk_counts())),
             improvement_status: Some(self.improvement_status.clone()),
             profiles: None,
             prioritized_risk_counts: None,
@@ -149,6 +230,44 @@ impl WorkloadRecord {
 
 fn risk_counts_to_map(counts: &BTreeMap<String, i32>) -> HashMap<String, i32> {
     counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
+}
+
+/// The lens a `LensAlias` names, as its bare alias.
+///
+/// "For Amazon Web Services official lenses, this is either the lens alias, such as
+/// `serverless`, or the lens ARN, such as
+/// `arn:aws:wellarchitected:us-east-1::lens/serverless`" (`LensAlias` doc), so an ARN's
+/// trailing `lens/<alias>` resolves to the same lens as the bare alias. A lens ARN may
+/// also pin a version after the alias, which names the same lens.
+pub fn lens_alias(lens: &str) -> &str {
+    let alias = lens.rsplit_once("lens/").map_or(lens, |(_, alias)| alias);
+    alias.split('/').next().unwrap_or(alias)
+}
+
+/// How many questions the named lens asks, as this emulator knows it.
+///
+/// Only the AWS-official Well-Architected Framework lens has a definition here
+/// ([`FRAMEWORK_LENS_PILLARS`]); another lens — an AWS-published specialised lens or an
+/// imported custom one — carries no question set in this emulator yet, so it adds no
+/// questions to a roll-up. `ImportLens`, `GetLens` and `ListLenses` are still stubs,
+/// each with its own issue.
+pub fn lens_question_count(lens: &str) -> usize {
+    if lens_alias(lens) == FRAMEWORK_LENS_ALIAS {
+        FRAMEWORK_LENS_PILLARS.iter().map(|(_, count)| count).sum()
+    } else {
+        0
+    }
+}
+
+/// The pillar priority order a workload is created with when the request names none:
+/// the framework's own pillar order, which is what orders the items in a review's
+/// improvement plan (`WorkloadPillarPriorities` doc: "The priorities of the pillars,
+/// which are used to order items in the improvement plan").
+pub fn default_pillar_priorities() -> Vec<String> {
+    FRAMEWORK_LENS_PILLARS
+        .iter()
+        .map(|(pillar_id, _)| (*pillar_id).to_string())
+        .collect()
 }
 
 /// What a `CreateWorkload` idempotency token resolves to: the workload the original

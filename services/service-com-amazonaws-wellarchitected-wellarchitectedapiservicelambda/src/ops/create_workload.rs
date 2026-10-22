@@ -279,7 +279,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.tags.unwrap_or_default().into_iter().collect();
         let account_ids = input.account_ids.unwrap_or_default();
         let applications = input.applications.unwrap_or_default();
-        let pillar_priorities = input.pillar_priorities.unwrap_or_default();
+        // "The priorities of the pillars, which are used to order items in the
+        // improvement plan" (`PillarPriorities` doc): a workload is always reviewed in
+        // some pillar order, so a request that names none is created with the
+        // framework's own pillar order rather than with no priorities at all.
+        let pillar_priorities = match input.pillar_priorities {
+            Some(priorities) if !priorities.is_empty() => priorities,
+            _ => crate::state::default_pillar_priorities(),
+        };
         let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
             "AccountIds": &account_ids,
             "Applications": &applications,
@@ -381,7 +388,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pillar_priorities,
             architectural_design: input.architectural_design,
             review_owner: Some(review_owner),
-            is_review_owner_update_acknowledged: false,
+            // `IsReviewOwnerUpdateAcknowledged` records that the workload owner has
+            // acknowledged that the review-owner field is required — the flag whose
+            // 60-day clock restricts access to a workload that still has none
+            // (`Workload$IsReviewOwnerUpdateAcknowledged` doc). This operation
+            // documents `ReviewOwner` as required and refuses a request without one
+            // above, so a created workload always has a review owner and there is
+            // nothing left for its owner to acknowledge.
+            is_review_owner_update_acknowledged: true,
             industry_type: input.industry_type,
             industry: input.industry,
             notes: input.notes,
@@ -390,7 +404,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             owner: ::engine::emulator_account_id().to_string(),
             tags,
             applications,
-            risk_counts: std::collections::BTreeMap::new(),
             discovery_config: input.discovery_config,
             jira_configuration: input.jira_configuration,
         };
