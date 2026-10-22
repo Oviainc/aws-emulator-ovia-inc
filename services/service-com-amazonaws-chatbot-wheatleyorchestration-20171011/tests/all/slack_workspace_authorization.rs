@@ -16,17 +16,10 @@
 //! accepted table spans the same shape, so the refusal follows from the registry alone
 //! and never from the spelling, length or charset of an id.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use service_com_amazonaws_chatbot_wheatleyorchestration_20171011 as chatbot;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region the tests sign for.
-const REGION: &str = "us-east-1";
-
-/// Another region, so the account-wide reach of an authorization can be checked.
-const OTHER_REGION: &str = "us-west-2";
+use crate::wire::{Answer, Emulator, OTHER_REGION, REGION};
 
 /// The canonical emulator account id (`emulator_server::EMULATOR_ACCOUNT_ID`), spelled
 /// out here so the test pins what a client actually reads in the refusal.
@@ -39,93 +32,15 @@ const IAM_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/chatbot-role";
 /// and `InvalidParameterException`, both `httpError 400` with a lowercase `message`).
 const MODELLED_400_ERRORS: [&str; 2] = ["InvalidRequestException", "InvalidParameterException"];
 
-/// A SigV4 credential scope naming this service and `region`.
-fn authorization(region: &str) -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/chatbot/aws4_request, \
-         SignedHeaders=host;x-amz-date, Signature=deadbeef"
-    )
-}
-
-/// One answer from the emulator: the status, the `x-amzn-errortype` header a modelled
-/// failure carries, and the parsed body.
-struct Answer {
-    status: u16,
-    error_type: Option<String>,
-    body: Value,
-}
-
-impl Answer {
-    /// The lowercase `message` member of an error body.
-    fn message(&self) -> String {
-        self.body
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("<no message member>")
-            .to_string()
-    }
-}
-
-/// This service mounted alone over one shared engine, with the engine kept so a test can
-/// reach the authorization seam.
-struct Emulator {
-    router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
-}
-
+/// The workspace-authorization half of the shared [`Emulator`] harness: the state seam
+/// and the Slack-channel calls this suite drives it through.
 impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        router.set_request_authentication(false);
-        router.register_service(chatbot::EmulatedService::new(Arc::clone(&engine)));
-        Self { router, engine }
-    }
-
     /// Authorize `slack_team_id` with the account under the display name
     /// `slack_team_name`. This is the out-of-band seam standing in for the one-time
     /// Slack client (OAuth) handshake: no operation in this model performs it.
     fn authorize(&self, slack_team_id: &str, slack_team_name: &str) {
         chatbot::state::authorize_slack_workspace(&*self.engine, slack_team_id, slack_team_name)
             .unwrap_or_else(|| panic!("the shared engine must hold the chatbot store"));
-    }
-
-    async fn call_in_region(&self, region: &str, path: &str, body: &Value) -> Answer {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri(format!("https://chatbot.{region}.amazonaws.com{path}"))
-            .header("host", format!("chatbot.{region}.amazonaws.com"))
-            .header("content-type", "application/json")
-            .header("authorization", authorization(region))
-            .body(bytes::Bytes::from(body.to_string()))
-            .expect("build the request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error_type = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let bytes = response.into_body();
-        let body = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                panic!(
-                    "{path}: response body is not JSON ({e}): {}",
-                    String::from_utf8_lossy(&bytes)
-                )
-            })
-        };
-        Answer {
-            status,
-            error_type,
-            body,
-        }
-    }
-
-    async fn call(&self, path: &str, body: &Value) -> Answer {
-        self.call_in_region(REGION, path, body).await
     }
 
     async fn create(&self, configuration_name: &str, slack_team_id: &str) -> Answer {
@@ -154,7 +69,9 @@ impl Emulator {
 
     /// Every Slack channel configuration [`REGION`] holds, as the listing reports them.
     async fn configurations(&self) -> Vec<Value> {
-        let answer = self.call("/describe-slack-channel-configurations", &json!({})).await;
+        let answer = self
+            .call("/describe-slack-channel-configurations", &json!({}))
+            .await;
         assert_eq!(
             answer.status, 200,
             "describe configurations: expected 200, got {} with {}",

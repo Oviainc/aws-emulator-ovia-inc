@@ -12,10 +12,15 @@
 //! teams, which `ListMicrosoftTeamsConfiguredTeams` reports. See
 //! [`seed_slack_workspaces`] and [`seed_microsoft_teams_configured_teams`] for how an
 //! authorization gets into them, given that no operation in this model creates one.
+//!
+//! It owns the calling account's AWS Chatbot preferences too
+//! ([`AccountPreferencesRecord`]), which are account-scoped rather than per-resource.
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{ConfiguredTeam, SlackChannelConfiguration, SlackWorkspace, Tag};
+use crate::ops::types::{
+    AccountPreferences, ConfiguredTeam, SlackChannelConfiguration, SlackWorkspace, Tag,
+};
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. `us-east-1` is the emulator-wide default region.
@@ -73,6 +78,10 @@ pub struct ComAmazonawsChatbotWheatleyorchestration20171011State {
     ///
     /// Populated out of band; see [`seed_slack_workspaces`].
     slack_workspace_authorizations: BTreeMap<String, SlackWorkspaceRecord>,
+    /// The AWS Chatbot preferences of the calling account — ONE record, not a map:
+    /// see [`AccountPreferencesRecord`] for why the account, and not a region or any
+    /// resource, is what scopes them.
+    account_preferences: AccountPreferencesRecord,
     /// The Microsoft Teams teams AUTHORIZED with this account, keyed by `TeamId`.
     ///
     /// The Microsoft Teams counterpart of `slack_workspace_authorizations`: a team is
@@ -96,6 +105,7 @@ impl Default for ComAmazonawsChatbotWheatleyorchestration20171011State {
                 .into_iter()
                 .map(|workspace| (workspace.slack_team_id.clone(), workspace))
                 .collect(),
+            account_preferences: AccountPreferencesRecord::default(),
             microsoft_teams_authorizations: seed_microsoft_teams_configured_teams()
                 .into_iter()
                 .map(|team| (team.team_id.clone(), team))
@@ -147,6 +157,31 @@ impl ComAmazonawsChatbotWheatleyorchestration20171011State {
         record
     }
 
+    /// The account's current AWS Chatbot preferences.
+    pub fn account_preferences(&self) -> AccountPreferencesRecord {
+        self.account_preferences
+    }
+
+    /// Turn the named preferences on or off and hand back what the account now holds.
+    ///
+    /// A PARTIAL write: every member of `UpdateAccountPreferences` is optional
+    /// (`smithy_query` operation=UpdateAccountPreferences), so a member the request
+    /// omits names no new value for that preference and leaves the stored one exactly
+    /// as it was — only a member the request carries moves.
+    pub fn update_account_preferences(
+        &mut self,
+        user_authorization_required: Option<bool>,
+        training_data_collection_enabled: Option<bool>,
+    ) -> AccountPreferencesRecord {
+        if let Some(required) = user_authorization_required {
+            self.account_preferences.user_authorization_required = required;
+        }
+        if let Some(enabled) = training_data_collection_enabled {
+            self.account_preferences.training_data_collection_enabled = enabled;
+        }
+        self.account_preferences
+    }
+
     /// The authorized Microsoft Teams team `team_id` names, or `None` when no team with
     /// that id is configured with this account.
     ///
@@ -192,6 +227,39 @@ impl ComAmazonawsChatbotWheatleyorchestration20171011State {
         self.microsoft_teams_authorizations
             .insert(team_id.to_string(), record.clone());
         record
+    }
+}
+
+/// The AWS Chatbot preferences of the calling AWS account: what
+/// `GetAccountPreferences` reports and what `UpdateAccountPreferences` writes.
+///
+/// ACCOUNT-scoped, so the store holds exactly one of these and no region or resource
+/// narrows it: the model gives `GetAccountPreferences` an empty input (`smithy_query`
+/// operation=GetAccountPreferences: `input {}`) and documents the modelled
+/// `AccountPreferences` as "Preferences related to AWS Chatbot usage in the calling AWS
+/// account", so there is nothing else a read could key on.
+///
+/// Both preferences are OPT-INS — the model documents `TrainingDataCollectionEnabled`
+/// as "Turns on training data collection" and `UserAuthorizationRequired` as "Enables
+/// use of a user role requirement in your chat configuration" — so an account that has
+/// never called `UpdateAccountPreferences` has opted into neither and holds `false` for
+/// each. Stored as plain `bool`, never `Option`: a preference is on or off, and a read
+/// reports which, rather than "unset".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountPreferencesRecord {
+    pub user_authorization_required: bool,
+    pub training_data_collection_enabled: bool,
+}
+
+impl AccountPreferencesRecord {
+    /// Project the stored preferences onto the modelled `AccountPreferences` both
+    /// account-preference operations return, so a read and a write cannot answer two
+    /// different shapes for one record.
+    pub fn view(&self) -> AccountPreferences {
+        AccountPreferences {
+            user_authorization_required: Some(self.user_authorization_required),
+            training_data_collection_enabled: Some(self.training_data_collection_enabled),
+        }
     }
 }
 

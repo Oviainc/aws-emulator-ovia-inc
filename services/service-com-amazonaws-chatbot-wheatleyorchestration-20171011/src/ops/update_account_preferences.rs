@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccountPreferences
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccountPreferences`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccountPreferences::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the calling account's AWS Chatbot preferences into the store and reports what
+//! the account now holds. A PARTIAL write: a member the request omits leaves that
+//! preference exactly as it was. The preferences are account-scoped, so a write reaches
+//! every region's `GetAccountPreferences`; see
+//! [`crate::state::AccountPreferencesRecord`].
 //!
 //! ## Shape of an operation
 //!
@@ -150,20 +147,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccountPreferences` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountPreferencesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccountPreferences"))
+        // Both members are plain optional booleans with no modelled constraint, so any
+        // request that reaches here is already well formed; the preferences are
+        // account-scoped, so the region the request is signed for does not narrow the
+        // record this writes.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAccountPreferencesErrorModeled::UpdateAccountPreferencesException(
+                UpdateAccountPreferencesException {
+                    message: Some("the chatbot configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let updated = state.lock().update_account_preferences(
+            input.user_authorization_required,
+            input.training_data_collection_enabled,
+        );
+        Ok(UpdateAccountPreferencesOutput {
+            account_preferences: Some(updated.view()),
+        })
     }
 }
