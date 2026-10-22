@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketAccessKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketAccessKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the access keys a stored bucket holds, from that bucket's own record —
+//! their ids, status and creation time, never a secret access key, which only the
+//! create that minted it answered.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketAccessKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketAccessKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketAccessKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketAccessKeys"))
+        // A bucket is a REGIONAL resource, so the region the request is signed
+        // for selects which bucket record answers — the same resolution
+        // `GetBuckets` performs.
+        let region = crate::state::request_region(ctx.parts());
+
+        // A pure read: this operation "returns the existing access key IDs for
+        // the specified bucket", so it reports what the store holds and changes
+        // nothing a later caller sees.
+        crate::state::with_state(&*self.engine, |store| {
+            let bucket = store.bucket(&region, &input.bucket_name).ok_or_else(|| {
+                not_found(format!(
+                    "bucketName '{}' does not name a bucket of this account in {region}",
+                    input.bucket_name
+                ))
+            })?;
+            Ok(GetBucketAccessKeysOutput {
+                // A bucket with no access keys reports an empty list, not an
+                // absent one: the caller asked which keys the bucket has, and
+                // the answer is "none". The order is the order the keys were
+                // created in, which is the order the record holds them in.
+                access_keys: Some(
+                    bucket
+                        .access_keys
+                        .iter()
+                        .map(crate::state::StoredBucketAccessKey::view)
+                        .collect(),
+                ),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 404 for a bucket name this account holds no bucket under: the
+/// modelled `NotFoundException`, which the model documents as what "Lightsail
+/// throws when it cannot find a resource".
+fn not_found(message: String) -> GetBucketAccessKeysError {
+    GetBucketAccessKeysErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetBucketAccessKeysError {
+    GetBucketAccessKeysErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail bucket store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

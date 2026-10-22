@@ -1035,19 +1035,37 @@ async fn an_id_the_catalog_does_not_hold_is_not_found() {
 }
 
 #[tokio::test]
-async fn the_operations_outside_this_slice_still_answer_not_implemented() {
+async fn every_modelled_operation_answers_from_the_catalog_rather_than_the_scaffold() {
     let router = router();
-    // GetOfferSet is out of scope for this slice and must answer 501 rather than an empty
-    // 200. `SearchFacets` and `ListFulfillmentOptions` are implemented — their own suites
-    // are `tests/all/search_facets.rs` and `tests/all/fulfillment_options.rs`.
-    let cases: [(&str, Value); 1] = [
+    // One well-formed request per operation the service models (`OPERATIONS.md`). The ids
+    // are well formed but need not exist: what no operation may answer is the scaffold's
+    // 501 "not written yet", whether the catalog holds the record (200) or not (404).
+    let cases: [(&str, Value); 9] = [
+        ("searchListings", json!({ "maxResults": 1 })),
+        ("searchFacets", json!({})),
+        ("getListing", json!({ "listingId": "l-0001-analytics" })),
+        ("getProduct", json!({ "productId": "p-0001-analytics-core" })),
+        (
+            "listFulfillmentOptions",
+            json!({ "productId": "p-0001-analytics-core" }),
+        ),
+        ("listPurchaseOptions", json!({})),
+        ("getOffer", json!({ "offerId": "o-0001-analytics-annual" })),
+        (
+            "getOfferTerms",
+            json!({ "offerId": "o-0001-analytics-annual" }),
+        ),
         ("getOfferSet", json!({ "offerSetId": "os-0001-analytics" })),
     ];
     for (operation, input) in cases {
         let (status, body) = call(&router, operation, &input).await;
-        assert_eq!(
+        assert_ne!(
             status, 501,
-            "case {operation}: an unimplemented operation must answer 501, got {status} with {body}"
+            "case {operation}: every operation is implemented, got {status} with {body}"
+        );
+        assert_eq!(
+            status, 200,
+            "case {operation}: the request names seeded records, got {status} with {body}"
         );
     }
 }

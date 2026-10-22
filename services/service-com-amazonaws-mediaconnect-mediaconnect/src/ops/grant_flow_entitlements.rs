@@ -194,7 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "GrantFlowEntitlements";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GRANT_FLOW_ENTITLEMENTS_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::GRANT_FLOW_ENTITLEMENTS_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful grant CREATES entitlements, and the wire response AWS returns for it
+    // is HTTP 201. The on-disk model's `http.code` for this operation is 200, which is
+    // stale: what a client observes is the recorded 201, so that is the status served
+    // here — and it is the status the model itself declares for every sibling operation
+    // that adds sub-resources to an existing flow (AddFlowOutputs, AddFlowSources,
+    // AddFlowMediaStreams, AddFlowVpcInterfaces are all 201).
+    const SUCCESS_STATUS: u16 = 201u16;
 
     async fn handle(
         &self,

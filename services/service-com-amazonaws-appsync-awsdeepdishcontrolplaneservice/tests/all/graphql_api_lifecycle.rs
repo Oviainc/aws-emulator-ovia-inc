@@ -31,6 +31,27 @@ const HOUR: i64 = 3_600;
 /// One day in seconds — the unit the API-key validity window is stated in.
 const DAY: i64 = 86_400;
 
+/// How far inside or outside a validity bound a row sits.
+///
+/// `CreateApiKey` checks the submitted `expires` against the clock IT reads when the
+/// request arrives, which is necessarily LATER than the clock this test reads to build
+/// `expires`; the elapsed time shrinks the validity the handler computes. A row placed
+/// exactly on a bound, or one second past it, therefore flips to the other side of the
+/// bound whenever a second elapses first. Each row sits this far inside or outside the
+/// bound it exercises: a few seconds, which is far wider than the one in-process
+/// dispatch between this test's clock read (taken per row) and the handler's, and still
+/// close enough to pin the bound. The bounds themselves come from
+/// `ApiKeyValidityOutOfBoundsException` — "between 1 and 365 days from creation".
+const BOUND_SLACK: i64 = 5;
+
+/// Now, as whole seconds since the Unix epoch — the form `ApiKey$expires` takes.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs() as i64
+}
+
 /// A router with only this service mounted, over a fresh engine.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -406,24 +427,23 @@ async fn api_keys_are_stored_under_their_api_and_listed_back() {
     .await;
     let api_id = created["apiId"].as_str().unwrap_or_default().to_string();
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("the clock is after the epoch")
-        .as_secs() as i64;
-
-    // Rows span the validity window: both published bounds (1 and 365 days from
-    // creation), a value inside it, and one second past each bound. Source:
+    // Rows span the validity window: just inside each published bound (1 and 365 days
+    // from creation), a value well inside it, and just outside each bound — see
+    // `BOUND_SLACK` for why a row cannot sit exactly on a bound. Source:
     // `ApiKeyValidityOutOfBoundsException` — "between 1 and 365 days from creation".
     let cases: &[(&str, i64, bool)] = &[
-        ("one day", DAY, true),
+        ("just inside a day", DAY + BOUND_SLACK, true),
         ("thirty days", 30 * DAY, true),
-        ("one year", 365 * DAY, true),
-        ("a second short of a day", DAY - 1, false),
-        ("a second past a year", 365 * DAY + 1, false),
+        ("just inside a year", 365 * DAY - BOUND_SLACK, true),
+        ("just short of a day", DAY - BOUND_SLACK, false),
+        ("just past a year", 365 * DAY + BOUND_SLACK, false),
     ];
 
     let mut stored: Vec<(String, i64)> = Vec::new();
     for (case, validity, accepted) in cases {
+        // Read the clock per row, so the window between this read and the handler's own
+        // is one dispatch rather than the whole table.
+        let now = unix_now();
         let expires = now + validity;
         let (status, body) = call(
             &router,
@@ -478,6 +498,7 @@ async fn api_keys_are_stored_under_their_api_and_listed_back() {
     }
 
     // An omitted `expires` takes the documented default of 7 days from creation.
+    let now = unix_now();
     let (status, body) = call(
         &router,
         "POST",

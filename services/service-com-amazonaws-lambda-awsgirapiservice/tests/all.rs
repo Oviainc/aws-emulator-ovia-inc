@@ -15,6 +15,8 @@
 mod account_settings;
 #[path = "all/function_lifecycle.rs"]
 mod function_lifecycle;
+#[path = "all/resource_policy.rs"]
+mod resource_policy;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/state_roundtrip.rs"]

@@ -146,6 +146,7 @@ pub mod channel_state {
     pub const IDLE: &str = "IDLE";
     pub const STARTING: &str = "STARTING";
     pub const RUNNING: &str = "RUNNING";
+    pub const RECOVERING: &str = "RECOVERING";
     pub const STOPPING: &str = "STOPPING";
     pub const DELETING: &str = "DELETING";
     pub const UPDATE_FAILED: &str = "UPDATE_FAILED";
@@ -250,8 +251,8 @@ const DYNAMIC_CAPABLE_INPUT_TYPES: [&str; 2] = ["MP4_FILE", "TS_FILE"];
 const DYNAMIC_URL_VARIABLE: &str = "$urlPath$";
 
 /// How long a resource stays in a transient state before the clock makes the next
-/// one due: a channel's `CREATING`, `STARTING`, `STOPPING` and `DELETING`, and a
-/// signal map's `CREATE_IN_PROGRESS` discovery.
+/// one due: a channel's `CREATING`, `STARTING`, `STOPPING`, `RECOVERING` and
+/// `DELETING`, and a signal map's `CREATE_IN_PROGRESS` discovery.
 ///
 /// CHOSEN, not documented by AWS: the real service takes minutes, and no doc
 /// sentence pins a number, so this is the emulator's own span. It is deliberately
@@ -418,7 +419,7 @@ pub const MAX_LIST_PAGE_SIZE: usize = 50;
 enum Settled {
     /// `CREATING` and `STOPPING` settle into `IDLE`.
     Idle,
-    /// `STARTING` settles into `RUNNING`.
+    /// `STARTING` and `RECOVERING` settle into `RUNNING`.
     Running,
     /// `DELETING` settles into the channel no longer existing.
     Gone,
@@ -460,6 +461,13 @@ pub struct ChannelRecord {
     pub inference_settings: Option<InferenceSettings>,
     pub vpc: Option<VpcOutputSettings>,
     pub channel_engine_version: Option<String>,
+    /// The pipelines that are restarting right now, as
+    /// [`PipelineDetail`]`$PipelineId` numbers them (0 for `PIPELINE_0`), while
+    /// the channel is `RECOVERING`. Empty in every other state: a pipeline is
+    /// restarting only between the `RestartChannelPipelines` call that asked for
+    /// it and the transition that brings it back up, which is what
+    /// [`ChannelRecord::settle`] clears.
+    restarting_pipelines: Vec<i32>,
     /// This channel's schedule: the actions `BatchUpdateSchedule` has created in
     /// it and not yet deleted. It lives on the channel because that is what owns
     /// it — `DeleteChannel` takes the schedule with it, and no operation reaches
@@ -482,23 +490,46 @@ impl ChannelRecord {
         }
     }
 
-    /// How many of this channel's pipelines are running: all of them exactly
-    /// while the channel is `RUNNING`, none in any other state.
-    pub fn pipelines_running_count(&self) -> i32 {
-        if self.state == channel_state::RUNNING {
-            self.pipeline_count()
-        } else {
-            0
+    /// The pipelines of this channel that are up right now, numbered as
+    /// `PipelineDetail$PipelineId` numbers them.
+    ///
+    /// All of the class's pipelines exactly while the channel is `RUNNING`; while
+    /// it is `RECOVERING`, the ones that are not restarting, because a pipeline
+    /// `RestartChannelPipelines` took down is not up until the restart completes;
+    /// none at all in any other state, where the channel is not serving.
+    pub fn healthy_pipelines(&self) -> Vec<i32> {
+        let running = self.state == channel_state::RUNNING;
+        let recovering = self.state == channel_state::RECOVERING;
+        if !running && !recovering {
+            return Vec::new();
         }
+        (0..self.pipeline_count())
+            .filter(|pipeline| !self.restarting_pipelines.contains(pipeline))
+            .collect()
+    }
+
+    /// Whether `pipeline` is one of the pipelines this channel's class gives it
+    /// (the `ChannelClass` doc: a `STANDARD` channel has two, a
+    /// `SINGLE_PIPELINE` channel one), so a request may name it.
+    pub fn has_pipeline(&self, pipeline: i32) -> bool {
+        (0..self.pipeline_count()).contains(&pipeline)
+    }
+
+    /// How many of this channel's pipelines are healthy — the
+    /// `PipelinesRunningCount` member's own definition ("The number of currently
+    /// healthy pipelines"), i.e. how many [`Self::healthy_pipelines`] names.
+    pub fn pipelines_running_count(&self) -> i32 {
+        i32::try_from(self.healthy_pipelines().len()).unwrap_or(i32::MAX)
     }
 
     /// `PipelineDetail` is documented as "Runtime details of a pipeline when a
-    /// channel is running", so there is one entry per running pipeline and none
+    /// channel is running", so there is one entry per healthy pipeline and none
     /// at all when the channel is not running. Only `PipelineId` is reported: the
     /// other members describe media actually being ingested, which this emulator
     /// does not run and therefore does not claim.
     pub fn pipeline_details(&self) -> Vec<PipelineDetail> {
-        (0..self.pipelines_running_count())
+        self.healthy_pipelines()
+            .into_iter()
             .map(|pipeline| PipelineDetail {
                 pipeline_id: Some(pipeline.to_string()),
                 ..PipelineDetail::default()
@@ -549,11 +580,14 @@ impl ChannelRecord {
             Some(transition) if now >= transition.due => match transition.to {
                 Settled::Idle => {
                     self.state = channel_state::IDLE.to_string();
+                    self.restarting_pipelines.clear();
                     self.transition = None;
                     true
                 }
                 Settled::Running => {
                     self.state = channel_state::RUNNING.to_string();
+                    // A restart that is over leaves no pipeline down.
+                    self.restarting_pipelines.clear();
                     self.transition = None;
                     true
                 }
@@ -1047,6 +1081,16 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// The full `SdiSource` description of one stored source, or `None` when no
     /// source has that id.
+    ///
+    /// The ONE projection every operation that reports an SdiSource
+    /// (`CreateSdiSource`, `DescribeSdiSource`, `UpdateSdiSource`,
+    /// `DeleteSdiSource`) answers from, so none of them can drift from the
+    /// others. `Tags` is always a map — the source's stored tag set, empty when
+    /// it carries none — exactly as every other taggable MediaLive resource
+    /// projection reports it ([`Self::input_description`],
+    /// [`Self::channel_description`]): an absent member would make a caller that
+    /// iterates the returned source's tags dereference null instead of reading
+    /// an empty map.
     pub fn sdi_source_description(&self, id: &str) -> Option<SdiSource> {
         let source = self.sdi_sources.get(id)?;
         let inputs = self.inputs_using_sdi_source(id);
@@ -1057,6 +1101,7 @@ impl ComAmazonawsMedialiveMedialiveState {
             inputs: Some(inputs),
             mode: source.mode.clone(),
             name: source.name.clone(),
+            tags: Some(source.tags.clone()),
             r#type: source.r#type.clone(),
         })
     }
@@ -2534,6 +2579,7 @@ pub fn new_channel(
         inference_settings: None,
         vpc: None,
         channel_engine_version: None,
+        restarting_pipelines: Vec::new(),
         schedule: ChannelSchedule::default(),
         transition: None,
     };
@@ -2554,6 +2600,23 @@ pub fn begin_stop(channel: &mut ChannelRecord, now: SystemTime) {
 /// Move a channel into `DELETING`, owing its removal from state.
 pub fn begin_delete(channel: &mut ChannelRecord, now: SystemTime) {
     channel.begin_transition(channel_state::DELETING, Settled::Gone, now);
+}
+
+/// Take `pipelines` down for a restart on a running channel: it moves into
+/// `RECOVERING` — the `ChannelState` value for a channel whose pipelines are
+/// coming back up — and owes `RUNNING` with every pipeline healthy again once
+/// the restart completes.
+///
+/// `pipelines` are `PipelineDetail$PipelineId` numbers, each one the caller's
+/// `RestartChannelPipelines` request asked for; the channel reports them as not
+/// healthy for as long as it is `RECOVERING`.
+pub fn begin_pipeline_restart(
+    channel: &mut ChannelRecord,
+    pipelines: Vec<i32>,
+    now: SystemTime,
+) {
+    channel.restarting_pipelines = pipelines;
+    channel.begin_transition(channel_state::RECOVERING, Settled::Running, now);
 }
 
 /// The `State` of `source`, whose attached inputs are `inputs`.
@@ -2645,12 +2708,17 @@ pub const NO_STORE: &str = "medialive service state is unavailable";
 
 /// Project a `Channel` onto one of the structurally identical per-operation
 /// channel-description output shapes (`DescribeChannelOutput`,
-/// `StartChannelOutput`, `StopChannelOutput`, `DeleteChannelOutput`).
+/// `StartChannelOutput`, `StopChannelOutput`, `DeleteChannelOutput`,
+/// `RestartChannelPipelinesOutput`).
 ///
-/// One macro rather than four hand-written copies of the same 23-member move, so
-/// the four operations cannot drift from each other.
+/// One macro rather than five hand-written copies of the same 23-member move, so
+/// the operations cannot drift from each other. A shape that carries a member
+/// beyond the 23 (`RestartChannelPipelinesOutput$MaintenanceStatus`) passes it as
+/// a trailing `member: value` pair, so every member of every one of these shapes
+/// is still named exactly once and adding one to the model cannot be defaulted in
+/// silently.
 macro_rules! channel_description_output {
-    ($out:ident, $channel:expr) => {{
+    ($out:ident, $channel:expr $(, $extra:ident : $value:expr)* $(,)?) => {{
         let channel: $crate::ops::types::Channel = $channel;
         $out {
             arn: channel.arn,
@@ -2676,6 +2744,7 @@ macro_rules! channel_description_output {
             linked_channel_settings: channel.linked_channel_settings,
             channel_security_groups: channel.channel_security_groups,
             inference_settings: channel.inference_settings,
+            $($extra: $value,)*
         }
     }};
 }

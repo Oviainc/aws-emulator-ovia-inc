@@ -14,6 +14,9 @@
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 
+#[path = "all/channel_pipeline_restart.rs"]
+mod channel_pipeline_restart;
+
 #[path = "all/channel_schedule.rs"]
 mod channel_schedule;
 
@@ -46,6 +49,9 @@ mod resource_tags;
 
 #[path = "all/sdi_source_lifecycle.rs"]
 mod sdi_source_lifecycle;
+
+#[path = "all/sdi_source_tags_and_statuses.rs"]
+mod sdi_source_tags_and_statuses;
 
 #[path = "all/signal_map_listing.rs"]
 mod signal_map_listing;

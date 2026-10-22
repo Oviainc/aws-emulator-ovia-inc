@@ -27,6 +27,8 @@ mod endpoint_config_deletion;
 mod inference_deployment_lifecycle;
 #[path = "all/lineage_action_lifecycle.rs"]
 mod lineage_action_lifecycle;
+#[path = "all/list_endpoints.rs"]
+mod list_endpoints;
 #[path = "all/mlflow_app_lifecycle.rs"]
 mod mlflow_app_lifecycle;
 #[path = "all/model_card_governance.rs"]

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the members the request carries onto the template stored under
+//! its domain in [`crate::state`], leaving every absent member as it was.
+//! It is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +167,210 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTemplate"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateTemplateErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // "At least one of these attributes must not be null": a request that
+        // carries no modifiable member asks for no change at all, so it is a bad
+        // request rather than a silent no-op.
+        let modifiable_members_present = input.name.is_some()
+            || input.description.is_some()
+            || input.layout_configuration.is_some()
+            || input.required_fields.is_some()
+            || input.status.is_some()
+            || input.rules.is_some()
+            || input.tag_propagation_configurations.is_some();
+        if !modifiable_members_present {
+            return Err(
+                UpdateTemplateErrorModeled::ValidationException(ValidationException {
+                    message: "at least one of name, description, layoutConfiguration, \
+                              requiredFields, status, rules or tagPropagationConfigurations \
+                              must be provided"
+                        .to_string(),
+                })
+                .into(),
+            );
+        }
+
+        // Pure input validation, done BEFORE the store lock is taken, as on the
+        // create path: the model's `requiredFields` cap is re-checked here so the
+        // scans below are bounded by this code, and a list that names the same
+        // field twice is refused because two entries for one id is ambiguous.
+        if let Some(required_fields) = input.required_fields.as_ref() {
+            if let Some(message) = crate::state::list_too_long(
+                "requiredFields",
+                required_fields.len(),
+                crate::state::MAX_REQUIRED_FIELDS,
+            ) {
+                return Err(
+                    UpdateTemplateErrorModeled::ValidationException(ValidationException { message })
+                        .into(),
+                );
+            }
+            let duplicates =
+                crate::state::duplicate_ids(required_fields.iter().map(|f| f.field_id.as_str()));
+            if !duplicates.is_empty() {
+                return Err(
+                    UpdateTemplateErrorModeled::ValidationException(ValidationException {
+                        message: format!(
+                            "requiredFields names these field ids more than once: {}",
+                            crate::state::name_ids(&duplicates)
+                        ),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        let mut store = state.lock();
+
+        let domain = store
+            .domain_mut(&input.domain_id)
+            .map_err(UpdateTemplateErrorModeled::ResourceNotFoundException)?;
+
+        // The template has to exist before anything is written, and a deleted one
+        // is gone as far as a caller is concerned — exactly as `GetTemplate` reads
+        // it, through `Domain::template`.
+        domain
+            .template(&input.template_id)
+            .map_err(UpdateTemplateErrorModeled::ResourceNotFoundException)?;
+
+        // A template name identifies the template within its domain ("It must be
+        // unique per domain"), so a rename onto a name another live template
+        // already holds is refused — the same rule the create path applies.
+        // Renaming a template to the name it already has is not a conflict with
+        // itself.
+        if let Some(name) = input.name.as_deref() {
+            if let Some(existing) = domain.templates.values().find(|template| {
+                !template.deleted && template.name == name && template.template_id != input.template_id
+            }) {
+                return Err(
+                    UpdateTemplateErrorModeled::ConflictException(ConflictException {
+                        message: format!(
+                            "a template named {} already exists in domain {} (templateId {})",
+                            name, input.domain_id, existing.template_id
+                        ),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        // Every id the body references is resolved against the domain BEFORE
+        // anything is stored, as on the create path, so a template never records a
+        // reference that cannot be followed.
+        if let Some(required_fields) = input.required_fields.as_ref() {
+            let unknown =
+                domain.unknown_field_ids(required_fields.iter().map(|f| f.field_id.as_str()));
+            if !unknown.is_empty() {
+                return Err(
+                    UpdateTemplateErrorModeled::ValidationException(ValidationException {
+                        message: format!(
+                            "requiredFields names field ids that do not exist in domain {}: {}",
+                            input.domain_id,
+                            crate::state::name_ids(&unknown)
+                        ),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        // `rules` names case rules, which this emulator has no resource for yet —
+        // `CreateCaseRule` is still a scaffolded 501 — so a template cannot record
+        // a reference to one. The refusal says exactly that rather than claiming a
+        // lookup it did not perform, as `CreateTemplate` does.
+        let rule_ids: Vec<String> = input
+            .rules
+            .as_ref()
+            .map(|rules| rules.iter().map(|rule| rule.case_rule_id.clone()).collect())
+            .unwrap_or_default();
+        if !rule_ids.is_empty() {
+            return Err(
+                UpdateTemplateErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "rules names case rule ids, and this emulator supports no case rules \
+                         yet, so none can be referenced: {}",
+                        crate::state::name_ids(&rule_ids)
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        // `layoutConfiguration.defaultLayout` names a layout of this domain, so it
+        // is resolved against the domain's stored layouts before anything is
+        // written.
+        if let Some(layout_id) = input
+            .layout_configuration
+            .as_ref()
+            .and_then(|configuration| configuration.default_layout.as_deref())
+        {
+            if domain.layout(layout_id).is_err() {
+                return Err(
+                    UpdateTemplateErrorModeled::ValidationException(ValidationException {
+                        message: format!(
+                            "layoutConfiguration.defaultLayout names layout {layout_id}, which \
+                             does not exist in domain {}",
+                            input.domain_id
+                        ),
+                    })
+                    .into(),
+                );
+            }
+        }
+
+        // Only the members the request carries are written: "If a null value is
+        // provided for a given attribute, that attribute is ignored and its
+        // current value is preserved."
+        let Some(template) = domain
+            .templates
+            .get_mut(&input.template_id)
+            .filter(|template| !template.deleted)
+        else {
+            return Err(UpdateTemplateErrorModeled::ResourceNotFoundException(
+                crate::state::not_found("Template", &input.template_id),
+            )
+            .into());
+        };
+        let mut changed = false;
+        if let Some(name) = input.name {
+            changed |= template.name != name;
+            template.name = name;
+        }
+        if let Some(description) = input.description {
+            changed |= template.description.as_deref() != Some(description.as_str());
+            template.description = Some(description);
+        }
+        if let Some(status) = input.status {
+            changed |= template.status != status;
+            template.status = status;
+        }
+        if let Some(layout_configuration) = input.layout_configuration {
+            changed = true;
+            template.layout_configuration = Some(layout_configuration);
+        }
+        if let Some(required_fields) = input.required_fields {
+            changed = true;
+            template.required_fields = required_fields;
+        }
+        if let Some(configurations) = input.tag_propagation_configurations {
+            changed = true;
+            template.tag_propagation_configurations = configurations;
+        }
+        // `lastModifiedTime` is "Timestamp at which the resource was created or
+        // last modified", so it moves only when this call modified something.
+        if changed {
+            template.last_modified_time = now;
+        }
+
+        // The documented success: HTTP 200 with an empty body.
+        Ok(UpdateTemplateOutput {})
     }
 }

@@ -115,10 +115,10 @@ impl Answer {
 
     /// A member that must be present and non-null, whatever its JSON type.
     ///
-    /// Timestamps are read through this rather than [`Self::str_at`]: the wire form
-    /// of a timestamp is the framework's (the generated member schema carries no
-    /// `@timestampFormat`, so the JSON codec writes epoch seconds), and what this
-    /// service owns is the VALUE — fixed at write time and stable across reads.
+    /// Timestamps are read through this rather than [`Self::str_at`] because what these
+    /// cases own is the VALUE — fixed at write time and stable across reads — not its
+    /// rendering. The WIRE FORM of a `date-time` member is pinned on its own, over every
+    /// operation that answers one, in `tests/all/iso8601_timestamps.rs`.
     pub(crate) fn value_at(&self, member: &str) -> &Value {
         let value = self
             .body

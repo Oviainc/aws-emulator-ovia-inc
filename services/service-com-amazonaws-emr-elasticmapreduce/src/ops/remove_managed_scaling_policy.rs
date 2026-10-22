@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveManagedScalingPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveManagedScalingPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveManagedScalingPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the managed scaling policy off a cluster: the cluster's record stops carrying
+//! one, so `GetManagedScalingPolicy` then reports none. Removing where nothing is
+//! attached is a success that changes nothing (the call is idempotent); a cluster the
+//! service holds no record for is REFUSED (400 `ValidationException`).
 //!
 //! ## Shape of an operation
 //!
@@ -70,9 +66,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-emr-elasticmapreduce.js
 // here — hence the `RemoveManagedScalingPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.emr#RemoveManagedScalingPolicy")]
+// `InternalServerException` is widened in through `extra_errors`: this SERVICE models it
+// ("This exception occurs when there is an internal failure in the Amazon EMR service.")
+// and `DescribeCluster` declares it, but this operation's own `errors` list is empty —
+// so without the widening an unreachable shared store would have no modelled failure to
+// answer with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.emr#RemoveManagedScalingPolicy",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum RemoveManagedScalingPolicyErrorModeled {
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -126,18 +131,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveManagedScalingPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveManagedScalingPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveManagedScalingPolicy"))
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RemoveManagedScalingPolicyErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the EMR cluster store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // This operation models no client error, so an unknown cluster is refused with
+        // the 400 `ValidationException` channel rather than a 501 or an empty 200.
+        let Some(cluster) = store.clusters.get_mut(&input.cluster_id) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::unknown_cluster_message(&input.cluster_id),
+            ));
+        };
+
+        // Taking off a policy that is not there leaves the cluster as it was: the
+        // removal is idempotent.
+        cluster.managed_scaling_policy = None;
+        drop(store);
+
+        Ok(RemoveManagedScalingPolicyOutput {})
     }
 }

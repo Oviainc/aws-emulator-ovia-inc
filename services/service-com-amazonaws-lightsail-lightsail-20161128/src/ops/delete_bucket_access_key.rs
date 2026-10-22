@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBucketAccessKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBucketAccessKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes one access key from a stored bucket's record and withdraws it from the
+//! emulator's credential store, so nothing can sign with it again, answering the
+//! operation-log entry the delete wrote.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBucketAccessKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +157,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBucketAccessKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBucketAccessKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBucketAccessKey"))
+        // A bucket is a REGIONAL resource, so the region the request is signed
+        // for selects which bucket record holds the key — the same resolution
+        // `GetBuckets` performs.
+        let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_ms();
+
+        // Both members are modelled `@required` and carry the modelled pattern
+        // and length, so the centralized walk refused anything outside them
+        // before this body ran. What is left is what the model cannot express:
+        // the bucket has to exist in this region, and the key has to be one of
+        // the keys THAT bucket holds — a key of another bucket is not deleted
+        // through this one's name.
+        let deleted = crate::state::with_state(&*self.engine, |store| {
+            let bucket = store
+                .bucket_mut(&region, &input.bucket_name)
+                .ok_or_else(|| {
+                    not_found(format!(
+                        "bucketName '{}' does not name a bucket of this account in {region}",
+                        input.bucket_name
+                    ))
+                })?;
+            let held = bucket
+                .access_keys
+                .iter()
+                .position(|key| key.access_key_id == input.access_key_id)
+                .ok_or_else(|| {
+                    not_found(format!(
+                        "accessKeyId '{}' does not name an access key of bucket '{}'",
+                        input.access_key_id, input.bucket_name
+                    ))
+                })?;
+            bucket.access_keys.remove(held);
+            let location = bucket.location.clone();
+
+            // The key is gone as this call returns, which is why the operation it
+            // logs is answered terminal. The resource that entry names is the
+            // BUCKET: `Operation$resourceType` targets the modelled
+            // `ResourceType` enum, which has a `Bucket` member and none for an
+            // access key.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_BUCKET_ACCESS_KEY,
+                crate::state::RESOURCE_TYPE_BUCKET,
+                &input.bucket_name,
+                &location,
+                None,
+            );
+            Ok::<_, DeleteBucketAccessKeyError>(DeleteBucketAccessKeyOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)??;
+
+        // The key is no longer attributed to any bucket, so the credential it was
+        // minted from is withdrawn: "we recommend that you delete an access key if
+        // the secret access key is compromised", which only means anything if a
+        // request presenting it is refused afterwards. A credential the store no
+        // longer knows is already withdrawn, so a `NotFound` here is not a
+        // failure of this call.
+        if let Err(error) = ctx.credential_store().delete(&input.access_key_id) {
+            ::tracing::warn!(
+                operation = "DeleteBucketAccessKey",
+                reason = ?error,
+                "the deleted bucket access key was not held by the credential store"
+            );
+        }
+        // Audit record for a credential-revoking call: the bucket and the key id,
+        // never any secret material.
+        ::tracing::info!(
+            audit = true,
+            operation = "DeleteBucketAccessKey",
+            outcome = "deleted",
+            bucket_name = %input.bucket_name,
+            access_key_id = %input.access_key_id,
+            "bucket access key deleted"
+        );
+
+        Ok(deleted)
     }
+}
+
+/// This operation's 404 for a bucket or an access key this account holds none of:
+/// the modelled `NotFoundException`, which the model documents as what "Lightsail
+/// throws when it cannot find a resource".
+fn not_found(message: String) -> DeleteBucketAccessKeyError {
+    DeleteBucketAccessKeyErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteBucketAccessKeyError {
+    DeleteBucketAccessKeyErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail bucket store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

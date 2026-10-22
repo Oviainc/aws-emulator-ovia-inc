@@ -325,6 +325,15 @@ pub struct DomainValidationRecord {
     pub validation_method: String,
     /// The domain ACM mails, for email validation.
     pub validation_domain: Option<String>,
+    /// The validation domain the certificate was REQUESTED with for this name
+    /// (`DomainValidationOption$ValidationDomain`), kept whatever method is in force.
+    ///
+    /// [`Self::validation_domain`] is reported only for email validation, because it
+    /// is "the domain name that ACM used to send domain validation emails"; this is
+    /// the configuration that choice came from, so a certificate migrated away from
+    /// `EMAIL` and back mails the domain the request named rather than the covered
+    /// name itself.
+    pub requested_validation_domain: Option<String>,
     /// The mailboxes ACM mailed, for email validation.
     pub validation_emails: Vec<String>,
     /// The CNAME to publish, for DNS validation.
@@ -821,6 +830,16 @@ pub fn certificate_not_found_message(certificate_arn: &str) -> String {
     format!("Could not find certificate {certificate_arn}.")
 }
 
+/// The `InvalidStateException` message for a request that needs an issued, valid
+/// certificate and names one that is neither.
+///
+/// `InvalidStateException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence comes from ACM's recorded
+/// behaviour: ONE constant sentence for the whole refusal class, naming neither the
+/// certificate nor the status it is in. Rendered here so every operation that requires
+/// an issued certificate reports the same sentence.
+pub const NOT_ISSUED_MESSAGE: &str = "The selected certificate is not Issued and/or Valid.";
+
 /// The `ValidationException` message for an operation asked of a certificate export
 /// was never allowed for, built from the ARN the request asked for.
 ///
@@ -940,6 +959,69 @@ pub fn is_validation_domain_for(validation_domain: &str, domain_name: &str) -> b
         || target
             .strip_suffix(&candidate)
             .is_some_and(|higher_labels| higher_labels.ends_with('.'))
+}
+
+/// The validation ACM is waiting on for one domain name of one certificate.
+///
+/// DNS validation publishes a CNAME, email validation names the mailboxes ACM wrote
+/// to, and HTTP validation names the URL the CA fetches; `validation_method` decides
+/// which. Every value is derived from the certificate's own id, so the same
+/// `(certificate, domain, method)` always yields the same record — a later
+/// `DescribeCertificate` reports exactly what was stored, and a certificate migrated
+/// back to a method it already used reports the record it had.
+///
+/// Shared, because the method a certificate validates its domains by is set when the
+/// certificate is requested and can be changed afterwards
+/// (`CertificateOptions$ValidationMethod`), so both paths must mint the same record.
+pub fn domain_validation_record(
+    certificate_id: &str,
+    domain_name: &str,
+    validation_method: &str,
+    validation_domain: Option<&str>,
+) -> DomainValidationRecord {
+    let target = validation_target(domain_name);
+    let mut record = DomainValidationRecord {
+        domain_name: domain_name.to_string(),
+        validation_status: DOMAIN_STATUS_PENDING_VALIDATION.to_string(),
+        validation_method: validation_method.to_string(),
+        validation_domain: None,
+        requested_validation_domain: validation_domain.map(str::to_string),
+        validation_emails: Vec::new(),
+        resource_record: None,
+        http_redirect: None,
+    };
+    match validation_method {
+        "DNS" => {
+            let name = validation_label(certificate_id, domain_name, "dns-name");
+            let value = validation_label(certificate_id, domain_name, "dns-value");
+            record.resource_record = Some(ResourceRecord {
+                name: format!("_{name}.{target}."),
+                r#type: RECORD_TYPE_CNAME.to_string(),
+                value: format!("_{value}.{ACM_VALIDATIONS_ZONE}."),
+            });
+        }
+        "HTTP" => {
+            let token = validation_label(certificate_id, domain_name, "http-token");
+            let path = HTTP_VALIDATION_PATH;
+            record.http_redirect = Some(HttpRedirect {
+                redirect_from: Some(format!("http://{target}{path}{token}.txt")),
+                redirect_to: Some(format!(
+                    "http://{token}.{ACM_VALIDATIONS_ZONE}{path}{token}.txt"
+                )),
+            });
+        }
+        // EMAIL, and the default when no method was named.
+        _ => {
+            // The validation domain is the SUFFIX of the mailboxes ACM writes to, and
+            // a mail suffix carries no wildcard label: a request that validates
+            // `*.example.com` through itself is mailed at `example.com`, the domain
+            // ACM proves control of.
+            let mailed = validation_domain.map(validation_target).unwrap_or(target);
+            record.validation_domain = Some(mailed.to_string());
+            record.validation_emails = validation_mailboxes(mailed);
+        }
+    }
+    record
 }
 
 /// The request's tags as the key -> value map the certificate record stores, or the

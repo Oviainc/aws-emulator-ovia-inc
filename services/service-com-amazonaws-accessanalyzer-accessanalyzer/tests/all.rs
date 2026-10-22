@@ -35,6 +35,8 @@ mod policy_access_check;
 mod policy_check_reason_text;
 #[path = "all/policy_checks.rs"]
 mod policy_checks;
+#[path = "all/policy_validation.rs"]
+mod policy_validation;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/response_vocabulary.rs"]

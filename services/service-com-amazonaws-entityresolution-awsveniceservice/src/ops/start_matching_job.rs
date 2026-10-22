@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMatchingJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMatchingJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMatchingJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts one run of a matching workflow: mints the modelled `jobId`, PERSISTS the job
+//! against the workflow it runs, and answers that id. The job's lifecycle is then
+//! clock-driven — `QUEUED` -> `RUNNING` -> a terminal status — and every reader
+//! materialises what the clock already made due ([`crate::state::MatchingJob`]).
+//!
+//! ## What is refused, and why
+//!
+//! * The workflow must exist: this operation's doc says so ("The workflow must have
+//!   previously been created using the CreateMatchingWorkflow endpoint"), so a name the
+//!   store does not hold is the modelled `ResourceNotFoundException` (404).
+//! * One run at a time: a workflow that still has a job in progress answers the
+//!   modelled `ConflictException` (400), the condition `ConflictException`'s own doc
+//!   names ("Workflow is currently running"). Both refusals are decided BEFORE anything
+//!   is minted or stored, so a refused start leaves the store exactly as it was.
+//!
+//! ## The matching itself cannot execute here
+//!
+//! A matching job resolves entities across the workflow's input sources and writes
+//! matched records to its output source; this emulator has no matching engine and no
+//! access to those locations. The control plane is real — the job is minted, tracked and
+//! readable — and the execution it cannot perform ends in the service's own modelled
+//! failure status (`FAILED`, carrying [`crate::state::JOB_NOT_EXECUTED_MESSAGE`] on the
+//! modelled `ErrorDetails`) rather than in a `SUCCEEDED` with record counts nothing
+//! computed.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +169,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMatchingJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMatchingJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMatchingJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartMatchingJobErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        let started = crate::state::now_millis();
+        let mut store = state.lock();
+
+        // The workflow this job would run has to exist, and its stored output
+        // configuration is what the job reports as its own `outputSourceConfig`.
+        let output_source_config = {
+            let workflow = store
+                .matching_workflows
+                .get(&input.workflow_name)
+                .ok_or_else(|| {
+                    StartMatchingJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::messages::START_MATCHING_JOB_WORKFLOW_NOT_FOUND
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                })?;
+            crate::state::job_output_source_config(workflow)
+        };
+
+        // Decided on the CURRENT status of that workflow's jobs, so the clock-owed
+        // transitions are materialised first: a job whose run is already over by now
+        // does not block the next start.
+        if store
+            .matching_jobs_of_mut(&input.workflow_name, started)
+            .any(|job| job.is_in_progress())
+        {
+            return Err(StartMatchingJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        crate::state::messages::START_MATCHING_JOB_ALREADY_RUNNING.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Age out this workflow's oldest finished jobs so the store stays bounded
+        // however many starts a caller issues, leaving room for the one being minted.
+        store.retain_newest_jobs(
+            &input.workflow_name,
+            crate::state::MAX_JOBS_PER_WORKFLOW.saturating_sub(1),
+        );
+
+        // A fresh random id, and never one the store already holds: `jobId` is the key
+        // every later read addresses the job by.
+        let mut job_id = crate::state::new_job_id();
+        while store.matching_jobs.contains_key(&job_id) {
+            job_id = crate::state::new_job_id();
+        }
+
+        let span =
+            i64::try_from(crate::state::JOB_STATUS_TRANSITION.as_millis()).unwrap_or(i64::MAX);
+        let record = crate::state::MatchingJob {
+            job_id: job_id.clone(),
+            workflow_name: input.workflow_name,
+            // A started job is QUEUED; the clock owes it every later status, and
+            // nothing here sleeps for them.
+            status: crate::state::job_status::QUEUED.to_string(),
+            start_time: started,
+            end_time: None,
+            error_message: None,
+            output_source_config,
+            next_transition_at: Some(started.saturating_add(span)),
+        };
+        store.matching_jobs.insert(job_id.clone(), record);
+
+        // Answered from the STORED record, so this response and a later
+        // `GetMatchingJob` cannot disagree about which job was started.
+        Ok(StartMatchingJobOutput {
+            job_id: store.matching_jobs[&job_id].job_id.clone(),
+        })
     }
 }

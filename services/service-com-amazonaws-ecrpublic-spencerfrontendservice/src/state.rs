@@ -48,6 +48,15 @@ pub const GALLERY_HOST: &str = "public.ecr.aws";
 /// a `repositoryUri` be compared across calls.
 pub const DEFAULT_REGISTRY_ALIAS: &str = "emulator";
 
+/// The status every alias of this registry carries.
+///
+/// `RegistryAliasStatus` is modelled as an enum of `ACTIVE` / `PENDING` / `REJECTED`
+/// (`REGISTRY_ALIAS_STATUS_VALUES` in `ops/types/shared_types.rs`), and `PENDING` /
+/// `REJECTED` describe a *requested* custom alias: this service exposes no operation that
+/// requests one, so the alias the registry was assigned is the only one it has and it is
+/// usable — `ACTIVE`.
+pub const REGISTRY_ALIAS_STATUS_ACTIVE: &str = "ACTIVE";
+
 /// The largest page either `Describe*` operation will serve, and the page size a request
 /// that named none resolves to: `MaxResults` is modelled `range 1..1000`, so 1000 is the
 /// most a caller can ask for.
@@ -331,10 +340,27 @@ impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
         )
     }
 
+    /// The ARN of the registry itself.
+    ///
+    /// `Registry$registryArn` is "the Amazon Resource Name (ARN) of the public registry",
+    /// and ECR Public is a partition-wide service, so — exactly as for a repository ARN —
+    /// the region segment is empty and the account segment is the registry id, which is
+    /// also the registry resource's own name.
+    pub fn registry_arn(&self) -> String {
+        ::engine::emulator_arn(ARN_NAMESPACE, "", &format!("registry/{}", self.registry_id))
+    }
+
+    /// The URI of the registry: `Registry$registryUri` documents it as "a universal
+    /// prefix and the registry alias", which is the `repositoryUri` form without the
+    /// trailing repository segment.
+    pub fn registry_uri(&self) -> String {
+        format!("{GALLERY_HOST}/{}", self.registry_alias)
+    }
+
     /// The `docker pull`-able URI of a repository: the universal gallery prefix, the
     /// registry alias, then the repository name.
     pub fn repository_uri(&self, repository_name: &str) -> String {
-        format!("{GALLERY_HOST}/{}/{repository_name}", self.registry_alias)
+        format!("{}/{repository_name}", self.registry_uri())
     }
 
     /// This registry's catalog metadata as the modelled `RegistryCatalogData` shape: what
@@ -497,7 +523,7 @@ pub fn decode_page_token(token: Option<&str>) -> Result<Option<String>, String> 
 }
 
 /// What to tell a caller that presented a token this service did not mint.
-fn invalid_token_message() -> String {
+pub fn invalid_token_message() -> String {
     "Invalid parameter at 'nextToken' failed to satisfy constraint: 'Member must be a \
      token returned by a previous call'"
         .to_string()

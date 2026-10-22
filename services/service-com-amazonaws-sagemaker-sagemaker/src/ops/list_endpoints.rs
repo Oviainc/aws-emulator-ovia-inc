@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEndpoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEndpoints`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: filters, sorts and pages the endpoints stored in `crate::state`, after
+//! materialising the `Creating` -> `InService` transition the clock already owes. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEndpoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -137,6 +131,16 @@ impl<Eng> ListEndpoints<Eng> {
     }
 }
 
+/// `MaxResults`' documented default for this operation ("The maximum number of endpoints
+/// to return in the response. This value defaults to 10."), applied when the caller sends
+/// none. An explicit `MaxResults` is still capped by [`crate::state::MAX_PAGE_SIZE`].
+///
+/// `SortBy`'s and `SortOrder`'s documented defaults are [`crate::state::DEFAULT_SORT_BY`]
+/// and [`crate::state::DEFAULT_SORT_ORDER`], shared with the service's other listings;
+/// the accepted value sets are the generated `*_VALUES` slices in `super::types`, so a
+/// refusal stays in step with the model rather than with a transcription of it.
+const DEFAULT_MAX_RESULTS: i32 = 10;
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListEndpoints<Eng>
 {
@@ -154,18 +158,169 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEndpoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEndpointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEndpoints"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !ENDPOINT_SORT_KEY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                ENDPOINT_SORT_KEY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input
+            .sort_order
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_ORDER);
+        if !ORDER_KEY_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                ORDER_KEY_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+        if let Some(status) = input.status_equals.as_deref() {
+            // `StatusEquals` selects on exactly one member of the modelled enum; anything
+            // else is refused rather than quietly matching nothing.
+            if !ENDPOINT_STATUS_VALUES.contains(&status) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "StatusEquals must be one of {}; got \"{status}\".",
+                    ENDPOINT_STATUS_VALUES.join(", ")
+                )));
+            }
+        }
+
+        let created_after = input.creation_time_after.map(crate::state::timestamp_key);
+        let created_before = input.creation_time_before.map(crate::state::timestamp_key);
+        let modified_after = input
+            .last_modified_time_after
+            .map(crate::state::timestamp_key);
+        let modified_before = input
+            .last_modified_time_before
+            .map(crate::state::timestamp_key);
+
+        let mut store = state.lock();
+
+        // The one write a reporting call makes: every deployment the clock already owed.
+        // Each was due at its stored instant whether or not anybody listed the endpoints,
+        // so this listing reports the status a `DescribeEndpoint` at this same instant
+        // reports — which is what makes `StatusEquals` and a `Status` sort agree with the
+        // reader instead of selecting on a status the endpoint has already left.
+        let now = ::std::time::SystemTime::now();
+        let mut settled: Vec<String> = Vec::new();
+        for endpoint in store.endpoints.values_mut() {
+            if endpoint.settle_status(now) {
+                settled.push(endpoint.arn.clone());
+            }
+        }
+
+        let mut matching: Vec<&crate::state::Endpoint> = store
+            .endpoints
+            .values()
+            .filter(|endpoint| {
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| endpoint.name.contains(needle))
+            })
+            .filter(|endpoint| {
+                input
+                    .status_equals
+                    .as_deref()
+                    .is_none_or(|status| endpoint.status == status)
+            })
+            .filter(|endpoint| {
+                // Every bound of both ranges is inclusive, as `CreationTimeAfter`'s doc
+                // ("greater than or equal to the specified time") states and as
+                // `ListModels` applies them, so a bound landing exactly on a stored
+                // instant still selects the endpoint carrying it.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(endpoint.creation_time));
+                let modified = crate::state::timestamp_key(crate::state::timestamp(
+                    endpoint.last_modified_time,
+                ));
+                created_after.is_none_or(|bound| created >= bound)
+                    && created_before.is_none_or(|bound| created <= bound)
+                    && modified_after.is_none_or(|bound| modified >= bound)
+                    && modified_before.is_none_or(|bound| modified <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `EndpointName`
+        // ascending in both directions, so two endpoints sharing a sort key keep one order
+        // whichever way the page is sorted — and a `NextToken` resolved against a freshly
+        // computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = match sort_by {
+                "Name" => left.name.cmp(&right.name),
+                "Status" => left.status.cmp(&right.status),
+                _ => crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                ),
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| matching.iter().position(|endpoint| endpoint.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "NextToken does not name a page boundary of this result set; \
+                             restart the listing without it.",
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // An absent `MaxResults` takes this operation's documented default of 10; an
+        // explicit one is capped by the service's own ceiling, so no single call can
+        // serialise the whole store. The token below is emitted whenever anything is
+        // left, so a paginating client walks the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(DEFAULT_MAX_RESULTS, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => {
+                Some(crate::state::encode_page_token(&last.name))
+            }
+            _ => None,
+        };
+
+        let output = ListEndpointsOutput {
+            endpoints: page
+                .iter()
+                .map(|endpoint| EndpointSummary {
+                    endpoint_name: endpoint.name.clone(),
+                    endpoint_arn: endpoint.arn.clone(),
+                    creation_time: crate::state::timestamp(endpoint.creation_time),
+                    last_modified_time: crate::state::timestamp(endpoint.last_modified_time),
+                    endpoint_status: endpoint.status.clone(),
+                })
+                .collect(),
+            next_token,
+        };
+        drop(store);
+
+        for arn in &settled {
+            // A transition is a state change, so it leaves the same record a create does
+            // rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+        Ok(output)
     }
 }

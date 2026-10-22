@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -210,18 +201,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccess"))
+        use crate::state as st;
+
+        // `DescribedAccess` models no ARN, so this operation reads no request
+        // metadata; the engine comes from `self`.
+        let _ = ctx;
+
+        // A home-directory configuration the service would never create is refused
+        // BEFORE the state write, with the modelled `InvalidRequestException`
+        // (HTTP 400) the model documents as "thrown when the client submits a
+        // malformed request" — the same documented pairing `CreateUser` enforces,
+        // which `HomeDirectoryMappings` and `HomeDirectoryType` state identically on
+        // this operation's input.
+        if let Some(message) = st::home_directory_violation(
+            input.home_directory_type.as_deref(),
+            input.home_directory_mappings.as_deref(),
+        ) {
+            return Err(CreateAccessErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            CreateAccessErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        // The access belongs to a server, so an id the store does not hold is refused
+        // rather than creating one.
+        let identity_provider_type = guard
+            .servers
+            .get(&input.server_id)
+            .map(|server| server.identity_provider_type.clone())
+            .ok_or_else(|| {
+                st::not_found(CreateAccessErrorModeled::ResourceNotFoundException(
+                    st::unknown_server(&input.server_id),
+                ))
+            })?;
+
+        // An access grant names a group in the server's DIRECTORY, so a server whose
+        // identity provider is not a directory has no group to associate: the call is
+        // refused through the ONE rule every access operation shares with the
+        // implemented `DeleteAccess`, so the same invalid condition cannot answer two
+        // different messages depending on which operation the caller used.
+        if identity_provider_type != st::IDENTITY_PROVIDER_AWS_DIRECTORY_SERVICE {
+            return Err(CreateAccessErrorModeled::InvalidRequestException(
+                st::accesses_require_directory_provider(&input.server_id, &identity_provider_type),
+            )
+            .into());
+        }
+
+        let key = (input.server_id.clone(), input.external_id.clone());
+        if guard.accesses.contains_key(&key) {
+            return Err(CreateAccessErrorModeled::ResourceExistsException(
+                st::access_already_exists(&input.external_id),
+            )
+            .into());
+        }
+
+        // Each server's access set is BOUNDED, like its user set: past the bound a
+        // create is refused with the modelled `ServiceUnavailableException` rather
+        // than growing the store. `DeleteServer` releases a server's whole set.
+        if !guard.server_has_access_capacity(&input.server_id) {
+            return Err(CreateAccessErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "server {} already holds the maximum of {} accesses; \
+                         delete one before creating another",
+                        input.server_id,
+                        st::MAX_ACCESSES_PER_SERVER
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let access = st::Access {
+            server_id: input.server_id.clone(),
+            external_id: input.external_id.clone(),
+            role: Some(input.role),
+            home_directory: input.home_directory,
+            // The service resolves `HomeDirectoryType` at create time, so every
+            // stored access carries one and `DescribeAccess` projects it without
+            // defaulting a second time.
+            home_directory_type: Some(st::resolved_home_directory_type(
+                input.home_directory_type,
+            )),
+            home_directory_mappings: input.home_directory_mappings.unwrap_or_default(),
+            policy: input.policy,
+            posix_profile: input.posix_profile,
+        };
+        guard.accesses.insert(key, access);
+        drop(guard);
+
+        Ok(CreateAccessOutput {
+            server_id: input.server_id,
+            external_id: input.external_id,
+        })
     }
 }

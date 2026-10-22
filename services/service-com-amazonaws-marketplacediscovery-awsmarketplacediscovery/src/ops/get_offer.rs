@@ -203,7 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             agreement_proposal_id: offer.agreement_proposal_id.clone(),
             replacement_agreement_id: offer.replacement_agreement_id.clone(),
             pricing_model: offer.pricing_model.clone(),
-            badges: offer.badges.clone(),
+            // Each badge restates an attribute the stored offer already has, so the detail
+            // read and `ListPurchaseOptions` report the same badges for the same offer.
+            badges: state.offer_badges(offer, crate::state::now_secs()),
         })
     }
 }

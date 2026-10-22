@@ -17,6 +17,8 @@ mod arn_validation;
 mod error_messages;
 #[path = "all/execution_redrive.rs"]
 mod execution_redrive;
+#[path = "all/nested_type_discriminator.rs"]
+mod nested_type_discriminator;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_machine_create_options.rs"]

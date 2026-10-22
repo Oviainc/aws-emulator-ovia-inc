@@ -344,13 +344,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
-        // The flow name is part of the flow's ARN, so two flows cannot share one name.
-        if let Some(existing) = store.flow_arns_by_name.get(&input.name) {
-            return Err(bad_request(format!(
-                "A flow named {:?} already exists in this account and Region: {existing}.",
-                input.name
-            )));
-        }
+        // A flow's identity is the ARN this operation mints, and that ARN carries a
+        // per-flow generated id as well as the name (`flow:1-<id>:<name>`), so two flows
+        // may share a name and still be distinct resources. The model declares no
+        // uniqueness rule on `Name`, so nothing is refused here.
 
         // The flow store is bounded: nothing evicts a flow and DescribeFlow must still
         // answer what CreateFlow created, so the create refuses once the store is full
@@ -460,8 +457,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = StoredFlow {
             flow_arn: flow_arn.clone(),
             name: input.name.clone(),
-            // CreateFlow models no `Description` member, so a new flow has none.
-            description: None,
+            // CreateFlow models no `Description` member, so the flow's description is
+            // SERVICE-DERIVED from the source the request sets on it (the first one,
+            // which is `Flow.Source`). See `crate::state::derived_flow_description`.
+            description: crate::state::derived_flow_description(
+                &input.name,
+                sources
+                    .first()
+                    .map(|source| source.name.as_str())
+                    .unwrap_or_default(),
+                sources
+                    .first()
+                    .and_then(|source| source.description.as_deref()),
+            ),
             // "The Availability Zone that you want to create the flow in. These options
             // are limited to the Availability Zones within the current Region": when the
             // request names none, the service picks one in the request's Region.
@@ -501,9 +509,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
         };
 
-        store
-            .flow_arns_by_name
-            .insert(input.name.clone(), flow_arn.clone());
         store.flows.insert(flow_arn.clone(), stored);
 
         // The response is the STORED record, read back out of the store, not the request.

@@ -532,7 +532,10 @@ async fn create_upload_url_records_a_distinct_artifact_for_every_allowed_scan_na
         plain.json
     );
     let key_arn = "arn:aws:kms:us-west-2:000000000000:key/22222222-3333-4444-5555-666666666666";
-    store_of(&engine).lock().encryption_kms_key_arn = Some(key_arn.to_string());
+    store_of(&engine).lock().account_configuration = Some(cgs_state::AccountConfiguration {
+        encryption_kms_key_arn: Some(key_arn.to_string()),
+        created_at_millis: cgs_state::now_millis(),
+    });
     let encrypted = create_upload_url(&router, "encrypted").await;
     assert_eq!(
         encrypted.get("requestHeaders"),

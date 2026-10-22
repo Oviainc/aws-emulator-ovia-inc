@@ -17,7 +17,7 @@ mod availability_zones;
 mod describe_subnets;
 #[path = "all/describe_vpcs.rs"]
 mod describe_vpcs;
-// The shared ec2Query plumbing every describe drives the service through.
+// The shared ec2Query plumbing every suite drives the service through.
 #[path = "all/ec2_query.rs"]
 mod ec2_query;
 #[path = "all/instance_lifecycle.rs"]
@@ -28,3 +28,8 @@ mod instance_type_offerings;
 mod launch_templates;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/vpc_lifecycle.rs"]
+mod vpc_lifecycle;
+// Reading one VPC back out of an ec2Query response, on top of `ec2_query`'s plumbing.
+#[path = "all/wire.rs"]
+mod wire;

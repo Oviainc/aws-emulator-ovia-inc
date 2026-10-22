@@ -59,9 +59,18 @@ impl Dsql {
         // The one shared engine the router builds in production, handed to the
         // service through its constructor.
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        Self::sharing(&engine, region)
+    }
+
+    /// Another view of an EXISTING store, signed for `region`: the service is built
+    /// from the same engine `Arc`, which is exactly what the production router does —
+    /// so two views signed for different regions read one set of clusters.
+    pub fn sharing(engine: &Arc<engine::InMemoryEngine>, region: &str) -> Self {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(service_com_amazonaws_dsql_dsql::EmulatedService::new(engine));
+        router.register_service(service_com_amazonaws_dsql_dsql::EmulatedService::new(
+            Arc::clone(engine),
+        ));
         Self {
             router,
             region: region.to_string(),

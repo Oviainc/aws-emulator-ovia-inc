@@ -63,6 +63,8 @@ mod rds_shared_query_front_door_routing;
 mod rds_shared_signing_name_routing;
 #[path = "all/rds_signing_name_routing.rs"]
 mod rds_signing_name_routing;
+#[path = "all/resiliencehub_signing_name_routing.rs"]
+mod resiliencehub_signing_name_routing;
 #[path = "all/scheduler_execution_role.rs"]
 mod scheduler_execution_role;
 #[path = "all/servicecatalog_signing_name_routing.rs"]
@@ -84,3 +86,5 @@ mod sagemaker_signing_name_routing;
 mod bedrock_signing_name_routing;
 #[path = "all/billing_access_denied_principal_agrees_with_sts.rs"]
 mod billing_access_denied_principal_agrees_with_sts;
+#[path = "all/connectcampaigns_signing_name_routing.rs"]
+mod connectcampaigns_signing_name_routing;

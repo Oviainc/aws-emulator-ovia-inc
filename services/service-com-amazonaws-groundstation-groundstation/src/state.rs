@@ -26,7 +26,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::DateTime;
 
-use crate::ops::types::{ConfigTypeData, ContactVersion, KmsKey, TrackingOverrides};
+use crate::ops::types::{
+    ConfigTypeData, ContactVersion, Eirp, Frequency, FrequencyBandwidth, InvalidParameterException,
+    KmsKey, SpectrumConfig, TrackingOverrides,
+};
 
 /// Region used in minted ARNs when the request carries no usable SigV4 credential
 /// scope (an unsigned request still routes by endpoint host, so this is reachable).
@@ -59,6 +62,351 @@ pub fn config_type_of(config_data: &ConfigTypeData) -> &'static str {
         ConfigTypeData::trackingConfig(_) => "tracking",
         ConfigTypeData::uplinkEchoConfig(_) => "uplink-echo",
     }
+}
+
+/// The error code this service names when its request validator refuses a request that
+/// failed the model's own rules: a missing required member, or a value outside a
+/// declared bound. Recorded against AWS, which answers HTTP 400 with
+/// `x-amzn-errortype: BadRequestException` — NOT the `ValidationException` the framework
+/// defaults to, which this service's model does not declare for any operation
+/// (`smithy_query(query="service_info")` lists its common errors).
+pub const BAD_REQUEST_ERROR_CODE: &str = "BadRequestException";
+
+/// The message that goes with [`BAD_REQUEST_ERROR_CODE`]: one fixed sentence for the
+/// whole class, not a rendering of the constraint that failed.
+pub const INVALID_REQUEST_BODY: &str = "Invalid request body";
+
+/// The frequency bands an uplink `Config` may be tuned to, in MHz, as closed ranges.
+///
+/// Source: the model's own documentation of `UplinkSpectrumConfig$centerFrequency` —
+/// "Center frequency of an uplink spectral Config. Valid values are between 2025 to
+/// 2120 MHz" (`smithy_query(query="doc", shape="UplinkSpectrumConfig",
+/// member="centerFrequency")`). A frequency outside them is not one the service will
+/// radiate on, so a `Config` naming it is refused rather than stored. It is the band
+/// the SERVICE operates; which part of it a given account may transmit on is
+/// [`ComAmazonawsGroundstationGroundstationState::approved_uplink_bands_mhz`].
+pub const UPLINK_CENTER_FREQUENCY_BANDS_MHZ: &[(f64, f64)] = &[(2025.0, 2120.0)];
+
+/// The frequency bands a downlink `Config` may be tuned to, in MHz.
+///
+/// Source: `SpectrumConfig$centerFrequency`'s documentation — "Valid values are between
+/// 2200 to 2300 MHz and 7750 to 8400 MHz for downlink and 2025 to 2120 MHz for uplink"
+/// (`smithy_query(query="doc", shape="SpectrumConfig", member="centerFrequency")`).
+/// `SpectrumConfig` is the DOWNLINK spectrum shape — the uplink one is
+/// `UplinkSpectrumConfig` above — so the two downlink bands are the ones that apply.
+pub const DOWNLINK_CENTER_FREQUENCY_BANDS_MHZ: &[(f64, f64)] = &[(2200.0, 2300.0), (7750.0, 8400.0)];
+
+/// The bandwidth an `antennaDownlinkConfig` may ask for, in MHz.
+///
+/// Source: `FrequencyBandwidth$value`'s documentation — "For AntennaDownlinkconfig,
+/// valid values are between 10 kHz to 54 MHz" (`smithy_query(query="doc",
+/// shape="FrequencyBandwidth", member="value")`), with the lower bound converted to the
+/// MHz every bound here is expressed in.
+pub const ANTENNA_DOWNLINK_BANDWIDTH_MHZ: (f64, f64) = (0.01, 54.0);
+
+/// The bandwidth an `antennaDownlinkDemodDecodeConfig` may ask for, in MHz.
+///
+/// Source: the same `FrequencyBandwidth$value` documentation — "For
+/// AntennaDownlinkDemodDecodeconfig, valid values are between 125 kHz to 650 MHz".
+pub const DEMOD_DECODE_BANDWIDTH_MHZ: (f64, f64) = (0.125, 650.0);
+
+/// The target EIRP an `antennaUplinkConfig` may ask for, in dBW.
+///
+/// Source: `Eirp$value`'s documentation — "Value of an EIRP. Valid values are between
+/// 20.0 to 50.0 dBW" (`smithy_query(query="doc", shape="Eirp", member="value")`).
+pub const TARGET_EIRP_DBW: (f64, f64) = (20.0, 50.0);
+
+/// What the service answers for an uplink center frequency this account may not
+/// transmit on: its fixed refusal text for this one condition, as recorded against AWS.
+/// The model documents the error (`InvalidParameterException`, HTTP 431) but not the
+/// sentence, so the status and the error code are the contract and this text is the
+/// wording that goes with them.
+pub const UNAPPROVED_UPLINK_FREQUENCY: &str =
+    "The specified Uplink Frequency has not been approved.";
+
+/// The values `FrequencyUnits` and `BandwidthUnits` accept (`smithy_query(query="shape",
+/// shape="FrequencyUnits")` — `GHz`, `MHz`, `kHz`).
+///
+/// A token outside them never reaches a handler: it fails the model's own value set, so
+/// the boundary validator refuses the request with this service's 400
+/// `BadRequestException` (pinned by
+/// `tests/all/request_validation.rs::a_unit_outside_the_modelled_enum_is_refused_before_the_handler`).
+/// That is why [`in_megahertz`] needs no refusal of its own — a unit it cannot name is a
+/// value in no band, which is how the checks below treat it.
+pub const FREQUENCY_UNITS: &[&str] = &["GHz", "MHz", "kHz"];
+
+/// The one value `EirpUnits` accepts (`smithy_query(query="shape", shape="EirpUnits")`),
+/// refused outside it the same way as [`FREQUENCY_UNITS`].
+pub const EIRP_UNITS: &[&str] = &["dBW"];
+
+/// How far outside a documented bound a value may land and still be inside it: one
+/// millihertz, expressed in MHz.
+///
+/// A bound is a quantity, not a bit pattern, and the same quantity written in another
+/// unit converts through a binary multiply — `0.054 GHz` is the 54 MHz ceiling but
+/// lands an ulp past it. The tolerance is far below `kHz`, the finest unit the model
+/// offers, so it cannot widen a bound into a value a caller could use.
+const BOUND_TOLERANCE_MHZ: f64 = 1e-9;
+
+/// `value` expressed in MHz, from one of the [`FREQUENCY_UNITS`]; `None` for any other
+/// unit, which the boundary validator has already refused (see [`FREQUENCY_UNITS`]).
+fn in_megahertz(value: f64, units: &str) -> Option<f64> {
+    match units {
+        "GHz" => Some(value * 1_000.0),
+        "MHz" => Some(value),
+        "kHz" => Some(value / 1_000.0),
+        _ => None,
+    }
+}
+
+/// `value` as the request wrote it, unit and all: `2024.9 MHz`.
+///
+/// The refusal quotes the request rather than the converted number, so a caller reading
+/// it sees the value it sent beside the bound it missed.
+fn as_written(value: f64, units: &str) -> String {
+    format!("{value} {units}")
+}
+
+/// The modelled `InvalidParameterException` (HTTP 431) naming the member at fault.
+fn invalid_parameter(parameter_name: &str, message: String) -> InvalidParameterException {
+    InvalidParameterException {
+        message: Some(message),
+        parameter_name: Some(parameter_name.to_string()),
+    }
+}
+
+/// `bands` as a sentence fragment: `2200 to 2300 MHz or 7750 to 8400 MHz`.
+fn render_bands(bands: &[(f64, f64)]) -> String {
+    bands
+        .iter()
+        .map(|(low, high)| format!("{low} to {high} MHz"))
+        .collect::<Vec<_>>()
+        .join(" or ")
+}
+
+/// Whether `megahertz` falls inside one of `bands`, each a closed range.
+fn in_any_band(megahertz: f64, bands: &[(f64, f64)]) -> bool {
+    bands.iter().any(|(low, high)| {
+        megahertz >= low - BOUND_TOLERANCE_MHZ && megahertz <= high + BOUND_TOLERANCE_MHZ
+    })
+}
+
+/// Check a center frequency against the bands its link direction allows, wording the
+/// refusal from the request and the documented bound: the member, the value as written,
+/// and the range it fell outside.
+fn check_center_frequency(
+    path: &str,
+    frequency: &Frequency,
+    bands: &[(f64, f64)],
+) -> Result<(), InvalidParameterException> {
+    if in_megahertz(frequency.value, &frequency.units)
+        .is_some_and(|megahertz| in_any_band(megahertz, bands))
+    {
+        return Ok(());
+    }
+    Err(invalid_parameter(
+        path,
+        format!(
+            "Value '{}' at '{path}' is outside the valid range of {}.",
+            as_written(frequency.value, &frequency.units),
+            render_bands(bands)
+        ),
+    ))
+}
+
+/// Check a bandwidth against the closed range its config type allows.
+fn check_bandwidth(
+    path: &str,
+    bandwidth: &FrequencyBandwidth,
+    bound: (f64, f64),
+) -> Result<(), InvalidParameterException> {
+    if in_megahertz(bandwidth.value, &bandwidth.units)
+        .is_some_and(|megahertz| in_any_band(megahertz, &[bound]))
+    {
+        return Ok(());
+    }
+    let (low, high) = bound;
+    Err(invalid_parameter(
+        path,
+        format!(
+            "Value '{}' at '{path}' is outside the valid range of {low} to {high} MHz.",
+            as_written(bandwidth.value, &bandwidth.units)
+        ),
+    ))
+}
+
+/// Check a downlink spectrum: its center frequency against the downlink bands, its
+/// bandwidth against the range the owning config type allows.
+fn check_downlink_spectrum(
+    path: &str,
+    spectrum: &SpectrumConfig,
+    bandwidth: (f64, f64),
+) -> Result<(), InvalidParameterException> {
+    check_center_frequency(
+        &format!("{path}.centerFrequency"),
+        &spectrum.center_frequency,
+        DOWNLINK_CENTER_FREQUENCY_BANDS_MHZ,
+    )?;
+    check_bandwidth(&format!("{path}.bandwidth"), &spectrum.bandwidth, bandwidth)
+}
+
+/// Check an uplink center frequency against what this account may transmit on: inside
+/// the band the service operates, AND inside one of the bands the account is approved
+/// for. Both are the same refusal to a caller — the frequency is not one this account
+/// may uplink on — so both answer the service's one fixed sentence for it.
+fn check_uplink_center_frequency(
+    path: &str,
+    frequency: &Frequency,
+    approved_bands: &[(f64, f64)],
+) -> Result<(), InvalidParameterException> {
+    let megahertz = in_megahertz(frequency.value, &frequency.units);
+    if megahertz.is_some_and(|megahertz| {
+        in_any_band(megahertz, UPLINK_CENTER_FREQUENCY_BANDS_MHZ)
+            && in_any_band(megahertz, approved_bands)
+    }) {
+        return Ok(());
+    }
+    Err(invalid_parameter(
+        path,
+        UNAPPROVED_UPLINK_FREQUENCY.to_string(),
+    ))
+}
+
+/// Check a target EIRP against [`TARGET_EIRP_DBW`]. A unit outside [`EIRP_UNITS`] is a
+/// value in no range, for the reason given on that constant.
+fn check_target_eirp(path: &str, eirp: &Eirp) -> Result<(), InvalidParameterException> {
+    let (low, high) = TARGET_EIRP_DBW;
+    if EIRP_UNITS.contains(&eirp.units.as_str()) && eirp.value >= low && eirp.value <= high {
+        return Ok(());
+    }
+    Err(invalid_parameter(
+        &format!("{path}.value"),
+        format!(
+            "Value '{}' at '{path}.value' is outside the valid range of \
+             {low} to {high} dBW.",
+            as_written(eirp.value, &eirp.units)
+        ),
+    ))
+}
+
+/// Refuse a `ConfigTypeData` the service would not accept: a numeric member outside the
+/// range the model documents for it, or an uplink frequency `approved_uplink_bands` does
+/// not cover. The refusal is the service's modelled `InvalidParameterException` (HTTP
+/// 431), naming the member at fault.
+///
+/// Every bound is the model's own, cited on its constant above, and the value is
+/// compared after conversion from whichever `FrequencyUnits` the caller wrote it in —
+/// `2.05 GHz`, `2050 MHz` and `2050000 kHz` are the same frequency and are judged alike.
+/// The union members with no documented numeric range (`trackingConfig`,
+/// `dataflowEndpointConfig`, `uplinkEchoConfig`, `s3RecordingConfig`,
+/// `telemetrySinkConfig`) carry no bound for this to check: what they carry are
+/// references, resolved elsewhere — `uplinkEchoConfig`'s against this service's own
+/// store, `s3RecordingConfig`'s bucket by [`check_recording_bucket`].
+fn validate_config_data(
+    config_data: &ConfigTypeData,
+    approved_uplink_bands: &[(f64, f64)],
+) -> Result<(), InvalidParameterException> {
+    match config_data {
+        ConfigTypeData::antennaUplinkConfig(uplink) => {
+            check_uplink_center_frequency(
+                "configData.antennaUplinkConfig.spectrumConfig.centerFrequency",
+                &uplink.spectrum_config.center_frequency,
+                approved_uplink_bands,
+            )?;
+            check_target_eirp(
+                "configData.antennaUplinkConfig.targetEirp",
+                &uplink.target_eirp,
+            )
+        }
+        ConfigTypeData::antennaDownlinkConfig(downlink) => check_downlink_spectrum(
+            "configData.antennaDownlinkConfig.spectrumConfig",
+            &downlink.spectrum_config,
+            ANTENNA_DOWNLINK_BANDWIDTH_MHZ,
+        ),
+        ConfigTypeData::antennaDownlinkDemodDecodeConfig(downlink) => check_downlink_spectrum(
+            "configData.antennaDownlinkDemodDecodeConfig.spectrumConfig",
+            &downlink.spectrum_config,
+            DEMOD_DECODE_BANDWIDTH_MHZ,
+        ),
+        ConfigTypeData::trackingConfig(_)
+        | ConfigTypeData::dataflowEndpointConfig(_)
+        | ConfigTypeData::uplinkEchoConfig(_)
+        | ConfigTypeData::s3RecordingConfig(_)
+        | ConfigTypeData::telemetrySinkConfig(_) => Ok(()),
+    }
+}
+
+/// The bucket name an S3 BUCKET ARN names, or `None` when the string is not one.
+///
+/// An S3 bucket ARN is `arn:<partition>:s3:::<bucket>`: the service segment is `s3` and
+/// the region and account segments are empty, because a bucket name is global rather
+/// than regional or per account (the model's `BucketArn` carries an `arnReference` to
+/// `AWS::S3::Bucket` and no pattern, so the shape of the ARN is checked here). The
+/// bucket is the first path segment of the resource part, so an ARN that carries a key
+/// or a prefix after it still names its bucket — and an ARN of any OTHER service names
+/// no bucket at all, however its resource part is spelled.
+pub fn bucket_name_of(bucket_arn: &str) -> Option<&str> {
+    let mut segments = bucket_arn.splitn(6, ':');
+    if segments.next()? != "arn" {
+        return None;
+    }
+    let _partition = segments.next()?;
+    if segments.next()? != "s3" {
+        return None;
+    }
+    // Region and account: empty on a bucket ARN. An `arn:aws:s3:us-east-1:123…:…` is
+    // some other S3 resource (an access point, say), not a bucket.
+    if !segments.next()?.is_empty() || !segments.next()?.is_empty() {
+        return None;
+    }
+    let resource = segments.next()?;
+    let name = resource.split('/').next().unwrap_or(resource);
+    (!name.is_empty()).then_some(name)
+}
+
+/// What `s3RecordingConfig`'s bucket resolution answers when it cannot read the
+/// bucket's location: the service's fixed refusal text for this condition, as recorded
+/// against AWS. As with every other refusal here the status (431) and the error code
+/// (`InvalidParameterException`) are the contract, and this is the wording that goes
+/// with them.
+pub const UNRESOLVABLE_RECORDING_BUCKET: &str =
+    "Unable to create new S3 endpoint config - unable to get location of bucket. Ensure \
+     that Ground Station has s3:GetBucketLocation permissions on the bucket.";
+
+/// Whether Ground Station can read the location of the bucket `bucket_arn` names —
+/// `s3:GetBucketLocation` on an `s3RecordingConfig`'s bucket — given the buckets whose
+/// location it has read, `readable_buckets`.
+///
+/// The ARN has to name a bucket at all, and that bucket has to be one of those: the
+/// service refuses a config whose recording bucket it cannot locate, and an ARN of any
+/// other service names no bucket however its resource part is spelled.
+fn bucket_location_is_readable(bucket_arn: &str, readable_buckets: &[String]) -> bool {
+    bucket_name_of(bucket_arn)
+        .is_some_and(|name| readable_buckets.iter().any(|readable| readable == name))
+}
+
+/// Refuse a `configData` whose recording bucket this service cannot locate.
+///
+/// An `s3RecordingConfig` names the bucket to record to by ARN, and Ground Station reads
+/// that bucket's location before it will store the config: a bucket it cannot read the
+/// location of — one it has no record of, or one the ARN does not even name — is refused
+/// with the modelled `InvalidParameterException` (HTTP 431) instead of being stored, so a
+/// caller never holds a recording config that cannot record. Every other
+/// `ConfigTypeData` member names no bucket and is nothing for this to check.
+fn check_recording_bucket(
+    config_data: &ConfigTypeData,
+    readable_buckets: &[String],
+) -> Result<(), InvalidParameterException> {
+    let ConfigTypeData::s3RecordingConfig(recording) = config_data else {
+        return Ok(());
+    };
+    if bucket_location_is_readable(&recording.bucket_arn, readable_buckets) {
+        return Ok(());
+    }
+    Err(invalid_parameter(
+        "configData.s3RecordingConfig.bucketArn",
+        UNRESOLVABLE_RECORDING_BUCKET.to_string(),
+    ))
 }
 
 /// The capability's name as this service spells it in user-facing text: the
@@ -447,7 +795,7 @@ pub fn config_reference_not_found_message(arn: &str, required_type: Option<&str>
 }
 
 /// Per-service state for com-amazonaws-groundstation-groundstation. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsGroundstationGroundstationState {
     /// Configs, keyed by the `(configType, configId)` pair `GetConfig` addresses.
     pub configs: HashMap<(String, String), Config>,
@@ -457,9 +805,117 @@ pub struct ComAmazonawsGroundstationGroundstationState {
     pub contacts: HashMap<String, Contact>,
     /// Every ARN this service minted, and what it points at.
     pub arn_index: HashMap<String, ResourceRef>,
+    /// The uplink frequency bands, in MHz, this account has been approved to transmit
+    /// on — the account-level authorisation `CreateConfig` checks an
+    /// `antennaUplinkConfig`'s center frequency against.
+    ///
+    /// EMPTY unless [`APPROVED_UPLINK_BANDS_ENV`] grants a band, and that is this
+    /// account's real authorisation rather than a gap in the emulator: AWS Ground
+    /// Station radiates only on frequencies an account has been approved for, that
+    /// approval is granted outside the API (by AWS, after spectrum coordination), and
+    /// this service's model carries no operation that grants one and no response member
+    /// that reports one (`smithy_query(query="digest")`). So an account starts with no
+    /// uplink approval, exactly as a new AWS account does, and every
+    /// `antennaUplinkConfig` is refused with [`UNAPPROVED_UPLINK_FREQUENCY`] until a
+    /// band lands here — from the environment variable at start-up, or from the grant
+    /// the day the API models one. It is a field rather than a constant because the
+    /// authorisation is per account.
+    pub approved_uplink_bands_mhz: Vec<(f64, f64)>,
+    /// The S3 buckets whose location Ground Station has read — what `CreateConfig` and
+    /// `UpdateConfig` check an `s3RecordingConfig`'s `bucketArn` against.
+    ///
+    /// EMPTY unless [`RECORDING_BUCKETS_ENV`] names one. Ground Station reads the
+    /// recording bucket's location (`s3:GetBucketLocation`) before it will store the
+    /// config, and nothing in THIS API tells the service about a bucket: the bucket and
+    /// the permission on it are made in S3 and IAM, outside the operations this model
+    /// declares (`smithy_query(query="digest")` lists no bucket operation). So an
+    /// account starts with no bucket it can locate, and an `s3RecordingConfig` is
+    /// refused with [`UNRESOLVABLE_RECORDING_BUCKET`] — the sentence AWS answers when
+    /// the location cannot be read — until a bucket lands here.
+    pub readable_recording_buckets: Vec<String>,
+}
+
+/// The environment variable an operator uses to grant THIS emulated account its uplink
+/// approval, since the API models no operation that grants one: a comma-separated list
+/// of `<low>-<high>` bands in MHz, read once when this service's store is created
+/// (`GROUNDSTATION_APPROVED_UPLINK_BANDS_MHZ="2025-2120"` approves the whole band the
+/// service operates). Unset means no approval, which is what a new AWS account has and
+/// what AWS answers for.
+pub const APPROVED_UPLINK_BANDS_ENV: &str = "GROUNDSTATION_APPROVED_UPLINK_BANDS_MHZ";
+
+/// The bands `setting` grants: `<low>-<high>` pairs in MHz, comma-separated. An entry
+/// that is not a pair of numbers low-to-high is skipped rather than guessed at, so a
+/// typo grants nothing instead of granting something unintended.
+pub fn parse_approved_uplink_bands(setting: &str) -> Vec<(f64, f64)> {
+    setting
+        .split(',')
+        .filter_map(|entry| {
+            let (low, high) = entry.trim().split_once('-')?;
+            let low: f64 = low.trim().parse().ok()?;
+            let high: f64 = high.trim().parse().ok()?;
+            (low <= high).then_some((low, high))
+        })
+        .collect()
+}
+
+/// The environment variable an operator uses to tell this emulated Ground Station which
+/// S3 buckets it can read the location of, since the API models no operation that says
+/// so: a comma-separated list of bucket NAMES, read once when this service's store is
+/// created (`GROUNDSTATION_RECORDING_BUCKETS="aws-groundstation-downlink"`). Unset means
+/// none, and an `s3RecordingConfig` is then refused exactly as AWS refuses one whose
+/// bucket location it cannot read.
+pub const RECORDING_BUCKETS_ENV: &str = "GROUNDSTATION_RECORDING_BUCKETS";
+
+/// The bucket names `setting` names: comma-separated, surrounding space trimmed, empty
+/// entries dropped.
+pub fn parse_recording_buckets(setting: &str) -> Vec<String> {
+    setting
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The value `variable` holds, parsed by `parse`, or nothing when it is not set.
+fn from_env<T: Default>(variable: &str, parse: impl Fn(&str) -> T) -> T {
+    ::std::env::var(variable)
+        .map(|setting| parse(&setting))
+        .unwrap_or_default()
+}
+
+impl Default for ComAmazonawsGroundstationGroundstationState {
+    /// An account with no resources, the uplink approval [`APPROVED_UPLINK_BANDS_ENV`]
+    /// grants it and the recording buckets [`RECORDING_BUCKETS_ENV`] names (none of
+    /// either, unless they are set).
+    fn default() -> Self {
+        Self {
+            configs: HashMap::new(),
+            mission_profiles: HashMap::new(),
+            contacts: HashMap::new(),
+            arn_index: HashMap::new(),
+            approved_uplink_bands_mhz: from_env(
+                APPROVED_UPLINK_BANDS_ENV,
+                parse_approved_uplink_bands,
+            ),
+            readable_recording_buckets: from_env(RECORDING_BUCKETS_ENV, parse_recording_buckets),
+        }
+    }
 }
 
 impl ComAmazonawsGroundstationGroundstationState {
+    /// Refuse a `ConfigTypeData` this account's authorisation, the model's own documented
+    /// ranges or the buckets this service can locate do not allow, with the modelled
+    /// `InvalidParameterException` (HTTP 431). See [`validate_config_data`] for the
+    /// bounds and [`check_recording_bucket`] for the bucket.
+    pub fn validate_config_data(
+        &self,
+        config_data: &ConfigTypeData,
+    ) -> Result<(), InvalidParameterException> {
+        validate_config_data(config_data, &self.approved_uplink_bands_mhz)?;
+        check_recording_bucket(config_data, &self.readable_recording_buckets)
+    }
+
     /// The config `arn` names, if it names one.
     pub fn config_by_arn(&self, arn: &str) -> Option<&Config> {
         match self.arn_index.get(arn)? {

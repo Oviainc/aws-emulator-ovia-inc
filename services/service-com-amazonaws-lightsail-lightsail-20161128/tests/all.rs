@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/blueprint_catalog.rs"]
 mod blueprint_catalog;
+#[path = "all/bucket_access_keys.rs"]
+mod bucket_access_keys;
 #[path = "all/bucket_bundles.rs"]
 mod bucket_bundles;
 #[path = "all/bucket_lifecycle.rs"]

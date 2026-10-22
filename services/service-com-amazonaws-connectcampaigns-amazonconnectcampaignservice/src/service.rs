@@ -45,6 +45,39 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether this service serves the request these `parts` came from.
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
+/// owner of this rule, and it is CALLED here rather than re-implemented: the request's
+/// route key must match this service's signing name AND its first URI path segment
+/// must be one the generated, model-derived `ROUTE_PATH_SEGMENTS` declares, by exact
+/// segment equality. That path conjunct is what separates two services sharing one
+/// SigV4 signing name — ConnectCampaigns v1 and ConnectCampaignsV2 both sign as
+/// `connect-campaigns`, so the key alone matches both and the router rejects every
+/// such request as `500 AmbiguousService` instead of serving either one — and their
+/// modelled path spaces are disjoint: v1 publishes `campaigns`, `campaigns-state`,
+/// `campaigns-summary`, `connect-instance` and `tags` here, while every V2 route
+/// lives under `v2` there.
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed
+/// only the request's parts, so the two things it reads — the URI and the headers —
+/// are re-presented to it as a bodiless request. It reads neither the body nor the
+/// method, so nothing it decides on is missing.
+fn can_handle_parts(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-connectcampaigns-amazonconnectcampaignservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +107,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // Delegated to the framework's own predicate — see [`can_handle_parts`]:
+        // this service's signing name (`connect-campaigns`) is shared with the
+        // ConnectCampaignsV2 API, so the claim is the route key AND the
+        // model-derived first URI path segment (v1's unprefixed route space).
+        // Matching on the signing name alone would have both services claim every
+        // `connect-campaigns`-signed request, which the router answers with 500
+        // `AmbiguousService` instead of serving either one.
+        can_handle_parts(parts)
     }
 
     fn override_operation(

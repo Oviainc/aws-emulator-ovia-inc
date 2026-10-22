@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! "Returns the resource-based IAM policy for a function, version, or alias" — the
+//! policy document made up of the statements `AddPermission` added to that resource,
+//! and the revision it is at.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT: it answers from `crate::state::PolicyRecord` and writes nothing of its own.
+//! Resolving the function materialises whatever the clock already made due (the
+//! documented `Pending` -> `Active` move), which was owed at the same instant even if
+//! nobody had called.
+//!
+//! A function, version or alias that has no policy at all is a
+//! `ResourceNotFoundException`: there is no document to report, and an empty one would
+//! claim a policy exists.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +157,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPolicyErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+        let (record, version) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            input.qualifier.as_deref(),
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                GetPolicyErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                GetPolicyErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(message),
+                })
+            }
+        })?;
+
+        let resource = record.versioned_arn(&version);
+        let Some(policy) = record.policies.get(&version) else {
+            return Err(GetPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    r#type: None,
+                    message: Some(format!("The resource you requested does not exist. Resource: {resource}")),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetPolicyOutput {
+            policy: Some(policy.to_json()),
+            revision_id: Some(policy.revision_id.clone()),
+        })
     }
 }

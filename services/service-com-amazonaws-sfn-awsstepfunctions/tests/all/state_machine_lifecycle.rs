@@ -31,6 +31,7 @@ use service_com_amazonaws_sfn_awsstepfunctions::state::{
     asl::{MAX_CAUSE_BYTES, MAX_ERROR_BYTES, MAX_PAYLOAD_BYTES, MAX_STATE_NAME_CHARS, MAX_WAIT_SECONDS},
     DELETE_SETTLE_DELAY, EXECUTION_SETTLE_DELAY, MAX_TAGS,
 };
+use service_com_amazonaws_sfn_awsstepfunctions::service::wire;
 use service_com_amazonaws_sfn_awsstepfunctions::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -168,6 +169,24 @@ pub(crate) fn error_code(body: &Value) -> String {
         .next()
         .unwrap_or("<no __type>")
         .to_string()
+}
+
+/// One nested structure as this service puts it on the wire: the members given
+/// plus the SWF type discriminator, which every awsJson recording of this API
+/// shows on a shared base-model structure.
+///
+/// The suites here assert what a structure's members HOLD, so they name the
+/// discriminator through this one helper; the rule itself — which shapes carry
+/// one and what it says — is `tests/all/nested_type_discriminator.rs`.
+pub(crate) fn discriminated(shape_name: &str, members: Value) -> Value {
+    let Value::Object(mut members) = members else {
+        panic!("expected an object of members, got {members:?}")
+    };
+    members.insert(
+        "__type".to_string(),
+        Value::String(wire::discriminator(shape_name)),
+    );
+    Value::Object(members)
 }
 
 /// The string member `name` of `body`, which must be present.
@@ -335,18 +354,24 @@ async fn describe_state_machine_reports_the_created_record() {
         // A configuration the create SUPPLIED is reported as supplied; one it did
         // not is reported at its own modelled default, which
         // `tests/all/state_machine_projection.rs` pins over the whole class.
-        let expected_logging = request.get("loggingConfiguration").cloned().unwrap_or(
-            json!({ "level": "OFF", "includeExecutionData": false }),
+        let expected_logging = discriminated(
+            "LoggingConfiguration",
+            request.get("loggingConfiguration").cloned().unwrap_or(
+                json!({ "level": "OFF", "includeExecutionData": false }),
+            ),
         );
         assert_eq!(
             described.get("loggingConfiguration"),
             Some(&expected_logging),
             "case {case:?}: expected loggingConfiguration {expected_logging}, got {described:?}"
         );
-        let expected_tracing = request
-            .get("tracingConfiguration")
-            .cloned()
-            .unwrap_or(json!({ "enabled": false }));
+        let expected_tracing = discriminated(
+            "TracingConfiguration",
+            request
+                .get("tracingConfiguration")
+                .cloned()
+                .unwrap_or(json!({ "enabled": false })),
+        );
         assert_eq!(
             described.get("tracingConfiguration"),
             Some(&expected_tracing),
