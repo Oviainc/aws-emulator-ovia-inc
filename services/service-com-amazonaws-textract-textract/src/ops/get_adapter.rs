@@ -180,10 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(adapter) = store.adapters.get(&input.adapter_id) else {
             return Err(GetAdapterErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "adapter {} does not exist in this account",
-                        input.adapter_id
-                    )),
+                    message: Some(crate::state::ADAPTER_NOT_FOUND_MESSAGE.to_string()),
                     code: None,
                 },
             )
