@@ -6,18 +6,22 @@
 //! the monotonic id counter that mints its `Id`, and the idempotency-token map
 //! that makes a retried `CreateChannel` return the channel it already created.
 //! The input lifecycle lives beside it: one [`InputRecord`] per created input,
-//! its own id counter and its own token map.
+//! its own id counter and its own token map. The SDI-source resource lives here
+//! too: one [`SdiSourceRecord`] per created source, its own id counter and its
+//! own token map.
 //!
 //! The input security group lifecycle lives here too: one
 //! [`InputSecurityGroupRecord`] per created group and the counter that mints its
 //! `Id`. A group's `State`, `Inputs` and `Channels` are derived from the rest of
 //! the state on every read, never recorded at create time.
 //!
-//! Every value a channel- or input-shaped response carries is either stored
-//! verbatim from the request that created the resource or derived from the stored
-//! state ([`ComAmazonawsMedialiveMedialiveState::channel_description`],
-//! [`ComAmazonawsMedialiveMedialiveState::input_description`]) — no operation
-//! builds a response out of its own request.
+//! Every value a channel-, input-, input-security-group- or SdiSource-shaped
+//! response carries is either stored verbatim from the request that created the
+//! resource or derived from the stored state
+//! ([`ComAmazonawsMedialiveMedialiveState::channel_description`],
+//! [`ComAmazonawsMedialiveMedialiveState::input_description`],
+//! [`ComAmazonawsMedialiveMedialiveState::sdi_source_description`]) - no
+//! operation builds a response out of its own request.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -31,7 +35,8 @@ use crate::ops::types::{
     InputSourceRequest, InputSpecification, InputVpcRequest, InputWhitelistRule,
     LinkedChannelSettings, MaintenanceStatus, MediaConnectFlow, MediaConnectFlowRequest,
     MulticastSettings, MulticastSettingsCreateRequest, MulticastSource, OutputDestination,
-    PipelineDetail, RouterDestination, RouterInputSettings, RouterSettings,
+    PipelineDetail, RouterDestination, RouterInputSettings, RouterSettings, SdiSource,
+    SdiSourceSummary,
     Smpte2110ReceiverGroupSettings, SrtCallerDecryption, SrtCallerSource,
     SrtListenerDecryption, SrtListenerSettings, SrtSettings, SrtSettingsRequest,
     VpcOutputSettings, VpcOutputSettingsDescription,
@@ -50,6 +55,15 @@ pub mod channel_state {
     pub const STOPPING: &str = "STOPPING";
     pub const DELETING: &str = "DELETING";
     pub const UPDATE_FAILED: &str = "UPDATE_FAILED";
+}
+
+/// The `SdiSourceState` enum values, spelled exactly as the model declares them
+/// (`smithy_query(query="shape", shape="SdiSourceState")`: IDLE | IN_USE |
+/// DELETED).
+pub mod sdi_source_state {
+    pub const IDLE: &str = "IDLE";
+    pub const IN_USE: &str = "IN_USE";
+    pub const DELETED: &str = "DELETED";
 }
 
 /// The `ChannelClass` enum values (`smithy_query(query="shape",
@@ -145,6 +159,21 @@ pub const MAX_CHANNELS: usize = 100;
 /// caller-chosen strings independently of the channels they name.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_CHANNELS;
 
+/// The id the first SdiSource of a process gets, and the most SDI sources this
+/// emulator stores for one account.
+///
+/// The id is a numeric string, as MediaLive resource ids are, minted from a
+/// counter at a fixed seven-digit width so the `BTreeMap` key order equals the
+/// mint order and `ListSdiSources` pagination is deterministic. A range of its
+/// own keeps the id spaces apart. The ceiling is not a guess at an AWS quota: it
+/// exists so a create loop cannot grow the emulator's heap without bound, and
+/// `CreateSdiSource`'s own modelled `TooManyRequestsException` is the refusal
+/// once the store is full.
+const FIRST_SDI_SOURCE_ID: u64 = 7_000_000;
+
+/// See [`FIRST_SDI_SOURCE_ID`].
+pub const MAX_SDI_SOURCES: usize = 100;
+
 /// The id the first input security group of a process gets. AWS input security
 /// group ids are numeric strings, the same shape as channel and input ids; a
 /// range of its own keeps the id spaces apart, so a caller (or a test) that
@@ -172,13 +201,14 @@ const FIRST_INPUT_ID: u64 = 1_000_000;
 /// `TooManyRequestsException`, which is the refusal once the store is full.
 pub const MAX_INPUTS: usize = 100;
 
-/// The most `RequestId` entries kept for `CreateInput` idempotency — the same
+/// The most `RequestId` entries kept for `CreateInput` idempotency - the same
 /// bound, for the same reason, as [`MAX_IDEMPOTENCY_TOKENS`] on channels.
 pub const MAX_INPUT_IDEMPOTENCY_TOKENS: usize = MAX_INPUTS;
 
-/// The page size `ListChannels` uses when the request names no `MaxResults`, and
-/// the ceiling it clamps a larger `MaxResults` to. Finite, so one request cannot
-/// ask the service to project an unbounded number of channels in one response.
+/// The page size a list operation (`ListChannels`, `ListSdiSources`) uses when
+/// the request names no `MaxResults`, and the ceiling it clamps a larger
+/// `MaxResults` to. Finite, so one request cannot ask the service to project an
+/// unbounded number of resources in one response.
 pub const MAX_LIST_PAGE_SIZE: usize = 50;
 
 /// The state a channel's in-flight transition settles into once it comes due.
@@ -358,9 +388,10 @@ pub fn is_ipv4_cidr(cidr: &str) -> bool {
 /// first attempt made instead of a second one.
 ///
 /// One implementation for every resource kind that models an idempotency token
-/// (channels, inputs), so the cap and the eviction order cannot drift between
-/// them. The fields are PRIVATE: the only way in is [`Self::record`], which
-/// enforces the cap by evicting the oldest token.
+/// (channels, inputs, SDI sources), so the cap and the eviction order cannot
+/// drift between them, and a token used on two different creates cannot make one
+/// of them answer with the other's resource. The fields are PRIVATE: the only way
+/// in is [`Self::record`], which enforces the cap by evicting the oldest token.
 #[derive(Debug, Default)]
 pub struct IdempotencyTokens {
     /// token -> the id of the resource it created.
@@ -411,6 +442,46 @@ impl IdempotencyTokens {
     }
 }
 
+/// One created SdiSource, as `CreateSdiSource` stored it and `UpdateSdiSource`
+/// last changed it.
+///
+/// The members mirror the model's `SdiSource` shape, minus the two it derives:
+/// `Inputs` and `State` come from what else is in the store (see
+/// [`ComAmazonawsMedialiveMedialiveState::inputs_using_sdi_source`]) and from
+/// whether the source has been deleted, never from a field written at create
+/// time.
+#[derive(Debug, Clone)]
+pub struct SdiSourceRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: Option<String>,
+    pub mode: Option<String>,
+    pub r#type: Option<String>,
+    /// The request's `Tags`. `CreateSdiSource` accepts them but neither
+    /// `SdiSource` nor `SdiSourceSummary` carries a `Tags` member
+    /// (`smithy_query(query="shape", shape="SdiSource")`), so nothing reports
+    /// them until `ListTagsForResource` stops being a scaffold stub; they are
+    /// kept rather than dropped so that operation reads them from the store.
+    pub tags: HashMap<String, String>,
+    /// Whether `DeleteSdiSource` has deleted this source.
+    ///
+    /// A deleted SdiSource is NOT dropped from the account: `DELETED` is one of
+    /// the three states the model gives it (`smithy_query(query="shape",
+    /// shape="SdiSourceState")`: IDLE | IN_USE | DELETED), and it is terminal,
+    /// so the record stays readable in that state rather than vanishing. PRIVATE,
+    /// so the only way into it is [`delete_sdi_source`] and the only way to read
+    /// it is [`SdiSourceRecord::is_deleted`].
+    deleted: bool,
+}
+
+impl SdiSourceRecord {
+    /// Whether this source has been deleted, which is what puts it in the
+    /// terminal `DELETED` state.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted
+    }
+}
+
 /// Per-service state for com-amazonaws-medialive-medialive. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMedialiveMedialiveState {
@@ -440,6 +511,14 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     pub next_input_id: u64,
     /// `CreateInput`'s `RequestId` (`@idempotencyToken`) -> the input it created.
     input_tokens: IdempotencyTokens,
+    /// Every SdiSource that exists, keyed by its minted `Id`, in a `BTreeMap`
+    /// for the same reason as [`Self::channels`].
+    pub sdi_sources: BTreeMap<String, SdiSourceRecord>,
+    /// Mint counter behind [`Self::mint_sdi_source_id`].
+    pub next_sdi_source_id: u64,
+    /// `CreateSdiSource`'s `RequestId` (`@idempotencyToken`) -> the SdiSource it
+    /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
+    sdi_source_tokens: IdempotencyTokens,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
@@ -571,6 +650,96 @@ impl ComAmazonawsMedialiveMedialiveState {
     pub fn channel_for_token(&self, request_id: &str) -> Option<&str> {
         let id = self.channel_tokens.created(request_id)?;
         self.channels.get(id).map(|channel| channel.id.as_str())
+    }
+
+    /// Whether the SdiSource store is full, so `CreateSdiSource` must refuse
+    /// rather than mint another source.
+    pub fn sdi_sources_full(&self) -> bool {
+        self.sdi_sources.len() >= MAX_SDI_SOURCES
+    }
+
+    /// The next SdiSource id, as AWS shapes MediaLive resource ids: a numeric
+    /// string.
+    pub fn mint_sdi_source_id(&mut self) -> String {
+        let id = FIRST_SDI_SOURCE_ID + self.next_sdi_source_id;
+        self.next_sdi_source_id += 1;
+        id.to_string()
+    }
+
+    /// Record `token` as having created `sdi_source_id`.
+    pub fn record_sdi_source_token(&mut self, token: String, sdi_source_id: &str) {
+        self.sdi_source_tokens
+            .record(token, sdi_source_id, MAX_SDI_SOURCES);
+    }
+
+    /// The SdiSource a stored `RequestId` created, if that source still exists.
+    pub fn sdi_source_for_token(&self, request_id: &str) -> Option<&str> {
+        let id = self.sdi_source_tokens.created(request_id)?;
+        self.sdi_sources.get(id).map(|source| source.id.as_str())
+    }
+
+    /// The inputs that are currently using the SdiSource `id` - the model's
+    /// `Inputs` member ("The list of inputs that are currently using this SDI
+    /// source. This list will be empty if the SdiSource has just been deleted").
+    ///
+    /// Derived from the input store: an input names the sources it ingests from
+    /// in `CreateInput`'s `SdiSources` (`InputSdiSources`, "SDI Sources for this
+    /// Input"), whose entries are SdiSource ids, so this is every input id whose
+    /// list names `id`, in input-id order. A deleted source has nothing using it
+    /// any more, which is what makes its `Inputs` empty.
+    fn inputs_using_sdi_source(&self, id: &str) -> Vec<String> {
+        if self
+            .sdi_sources
+            .get(id)
+            .is_some_and(SdiSourceRecord::is_deleted)
+        {
+            return Vec::new();
+        }
+        self.inputs
+            .values()
+            .filter(|input| input.sdi_sources.iter().any(|source| source == id))
+            .map(|input| input.id.clone())
+            .collect()
+    }
+
+    /// Whether an input is attached to the SdiSource `id`, which is what
+    /// `DeleteSdiSource` refuses on ("The SdiSource must ... not be attached to
+    /// any input").
+    pub fn sdi_source_is_in_use(&self, id: &str) -> bool {
+        !self.inputs_using_sdi_source(id).is_empty()
+    }
+
+    /// The full `SdiSource` description of one stored source, or `None` when no
+    /// source has that id.
+    pub fn sdi_source_description(&self, id: &str) -> Option<SdiSource> {
+        let source = self.sdi_sources.get(id)?;
+        let inputs = self.inputs_using_sdi_source(id);
+        Some(SdiSource {
+            arn: Some(source.arn.clone()),
+            id: Some(source.id.clone()),
+            state: Some(sdi_source_state_for(source, &inputs).to_string()),
+            inputs: Some(inputs),
+            mode: source.mode.clone(),
+            name: source.name.clone(),
+            r#type: source.r#type.clone(),
+        })
+    }
+
+    /// The `SdiSourceSummary` projection of one stored source. The summary shape
+    /// carries exactly the `SdiSource` members
+    /// (`smithy_query(query="shape", shape="SdiSourceSummary")`), so it is the
+    /// same stored record read through the list shape.
+    pub fn sdi_source_summary(&self, source: &SdiSourceRecord) -> SdiSourceSummary {
+        let inputs = self.inputs_using_sdi_source(&source.id);
+        SdiSourceSummary {
+            arn: Some(source.arn.clone()),
+            id: Some(source.id.clone()),
+            state: Some(sdi_source_state_for(source, &inputs).to_string()),
+            inputs: Some(inputs),
+            mode: source.mode.clone(),
+            name: source.name.clone(),
+            r#type: source.r#type.clone(),
+        }
     }
 
     /// The full `Channel` description of one stored channel, or `None` when no
@@ -1147,6 +1316,48 @@ pub fn begin_stop(channel: &mut ChannelRecord, now: SystemTime) {
 /// Move a channel into `DELETING`, owing its removal from state.
 pub fn begin_delete(channel: &mut ChannelRecord, now: SystemTime) {
     channel.begin_transition(channel_state::DELETING, Settled::Gone, now);
+}
+
+/// The `State` of `source`, whose attached inputs are `inputs`.
+///
+/// `DELETED` once `DeleteSdiSource` has deleted it — the terminal state, which a
+/// deleted source keeps. Otherwise `IN_USE` when an input is attached to it and
+/// `IDLE` when none is, which is the `State` member's own definition ("whether
+/// the SDI source is attached to an SDI input (IN_USE) or not (IDLE)"). Derived
+/// from the store on every read, never written at create time.
+fn sdi_source_state_for(source: &SdiSourceRecord, inputs: &[String]) -> &'static str {
+    if source.is_deleted() {
+        sdi_source_state::DELETED
+    } else if inputs.is_empty() {
+        sdi_source_state::IDLE
+    } else {
+        sdi_source_state::IN_USE
+    }
+}
+
+/// Build a new SdiSource record from a `CreateSdiSource` request's id and ARN.
+///
+/// The caller stores the request's `Name`, `Mode`, `Type` and `Tags` on the
+/// record it gets back. There is no lifecycle transition to owe: a created
+/// SdiSource is `IDLE` immediately, because nothing is attached to it yet.
+pub fn new_sdi_source(id: String, arn: String) -> SdiSourceRecord {
+    SdiSourceRecord {
+        id,
+        arn,
+        name: None,
+        mode: None,
+        r#type: None,
+        tags: HashMap::new(),
+        deleted: false,
+    }
+}
+
+/// Delete an SdiSource: it moves to the terminal `DELETED` state and stays in
+/// the account, so `DescribeSdiSource` and `ListSdiSources` keep reporting it
+/// there rather than losing it. Idempotent — deleting an already deleted source
+/// changes nothing.
+pub fn delete_sdi_source(source: &mut SdiSourceRecord) {
+    source.deleted = true;
 }
 
 /// The region this request was signed for, which is the region every ARN this
