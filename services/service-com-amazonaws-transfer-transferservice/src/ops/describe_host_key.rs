@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeHostKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeHostKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeHostKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE stored host key of a stored server, by the `HostKeyId` the import
+//! minted: every member it renders was resolved by that import (the ARN, the genuine
+//! fingerprint and algorithm `Type` of the supplied material, the description, the
+//! import instant, the storage type and the tags), so this read computes nothing and
+//! changes nothing. An unknown server, or a key id the server does not hold, is a
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +145,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeHostKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeHostKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeHostKey"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DescribeHostKeyErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+
+        if !guard.servers.contains_key(&input.server_id) {
+            return Err(st::not_found(
+                DescribeHostKeyErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        }
+
+        // The key is addressed by the id the import minted on THIS server, so a key id
+        // the server does not hold is a not-found on the KEY rather than on the server
+        // that was resolved.
+        let key = (input.server_id.clone(), input.host_key_id.clone());
+        let stored = guard.host_keys.get(&key).ok_or_else(|| {
+            st::not_found(DescribeHostKeyErrorModeled::ResourceNotFoundException(
+                st::resource_not_found(st::RESOURCE_TYPE_HOST_KEY, &input.host_key_id),
+            ))
+        })?;
+
+        let host_key = DescribedHostKey {
+            arn: stored.arn.clone(),
+            host_key_id: Some(stored.host_key_id.clone()),
+            host_key_fingerprint: Some(stored.fingerprint.clone()),
+            description: stored.description.clone(),
+            r#type: Some(stored.key_type.clone()),
+            date_imported: Some(::aws_smithy_types::DateTime::from(stored.date_imported)),
+            // `Tags` reports the stored tag list, EMPTY rather than absent when the key
+            // carries none — the same convention `DescribeUser` follows. `Tags`'
+            // modelled `len 1..50` bounds what a caller may SEND, which the framework
+            // enforces before a handler runs.
+            tags: Some(stored.tags.clone()),
+            storage_type: Some(stored.storage_type.clone()),
+            // `SecretId` is "The ARN of the Secrets Manager secret that stores the host
+            // key material": this emulator stores no Secrets Manager secret, so it
+            // reports no id rather than an ARN naming a secret nothing holds.
+            secret_id: None,
+        };
+
+        Ok(DescribeHostKeyOutput { host_key })
     }
 }
