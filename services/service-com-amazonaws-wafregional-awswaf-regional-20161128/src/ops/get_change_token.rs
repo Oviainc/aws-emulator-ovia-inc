@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetChangeToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetChangeToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetChangeToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers with the change token a mutating call must carry: the token already minted
+//! and not yet consumed when there is one — "if your application submits a
+//! `GetChangeToken` request and then submits a second `GetChangeToken` request before
+//! submitting a create, update, or delete request, the second `GetChangeToken` request
+//! returns the same value as the first" — otherwise a freshly minted one, recorded in
+//! this service's state with status `PROVISIONED`.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +143,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetChangeToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetChangeTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetChangeToken"))
+        // `GetChangeTokenRequest` carries no members: the token comes from state.
+        let _ = (&input, ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetChangeTokenErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some("the AWS WAF change-token store is unavailable".to_string()),
+            })
+        })?;
+        // Minting the token IS what this operation does, so it writes: the value it
+        // returns must be one a later mutating call can recognise and consume.
+        let mut state = state.lock();
+        Ok(GetChangeTokenOutput {
+            change_token: Some(state.change_token()),
+        })
     }
 }

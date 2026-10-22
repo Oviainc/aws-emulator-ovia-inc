@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateIPSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateIPSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateIPSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the caller's `IPSetUpdate` list to the stored `IPSet`: `INSERT` adds an
+//! `IPSetDescriptor`, `DELETE` removes one, and the whole request is applied or
+//! refused as a unit. A descriptor's identity is the IP address and prefix length it
+//! denotes, not the text it was written as.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -179,6 +176,21 @@ impl From<UpdateIPSetErrorModeled> for UpdateIPSetError {
     }
 }
 
+/// A `WAFInvalidParameterException` naming the member AWS WAF did not recognise.
+///
+/// `field` is a `ParameterExceptionField` value and `reason` a
+/// `ParameterExceptionReason` value (the model's `PARAMETER_EXCEPTION_FIELD_VALUES` /
+/// `PARAMETER_EXCEPTION_REASON_VALUES`), so a client branching on them sees what the
+/// real service sends.
+fn invalid_parameter(field: &str, parameter: &str, reason: &str) -> UpdateIPSetError {
+    UpdateIPSetErrorModeled::WAFInvalidParameterException(WAFInvalidParameterException {
+        field: Some(field.to_string()),
+        parameter: Some(parameter.to_string()),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
 /// The `UpdateIPSet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -215,18 +227,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateIPSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateIPSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateIPSet"))
+        let _ = ctx;
+        // "You can insert a maximum of 1000 addresses in a single request."
+        if input.updates.len() > crate::state::MAX_UPDATES_PER_REQUEST {
+            return Err(UpdateIPSetErrorModeled::WAFLimitsExceededException(
+                WAFLimitsExceededException {
+                    message: Some(format!(
+                        "The request contains {} updates, more than the maximum of {} \
+                         addresses in a single request",
+                        input.updates.len(),
+                        crate::state::MAX_UPDATES_PER_REQUEST
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateIPSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
+                message: Some("the AWS WAF IPSet store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // The IPSet is the CONTAINER the updates go into, and the model reserves
+        // `WAFNonexistentContainerException` for exactly this: "You tried to add an IP
+        // address to or delete an IP address from an IPSet that doesn't exist."
+        let Some(stored) = state.ip_sets.get(&input.ip_set_id) else {
+            return Err(UpdateIPSetErrorModeled::WAFNonexistentContainerException(
+                WAFNonexistentContainerException {
+                    message: Some(format!("IPSet {} does not exist", input.ip_set_id)),
+                },
+            )
+            .into());
+        };
+
+        // Every update is applied to a WORKING COPY first, so a request that is
+        // refused part-way through leaves the stored IPSet (and the change token)
+        // exactly as they were.
+        let mut working = stored.clone();
+        for update in &input.updates {
+            let action = update.action.as_str();
+            let kind = update.ip_set_descriptor.r#type.as_str();
+            let value = update.ip_set_descriptor.value.as_str();
+
+            // "You tried to update an object (ByteMatchSet, IPSet, Rule, or WebACL)
+            // using an action other than INSERT or DELETE."
+            if action != crate::state::CHANGE_ACTION_INSERT
+                && action != crate::state::CHANGE_ACTION_DELETE
+            {
+                return Err(invalid_parameter("CHANGE_ACTION", action, "INVALID_OPTION"));
+            }
+            if kind != crate::state::IP_SET_TYPE_IPV4 && kind != crate::state::IP_SET_TYPE_IPV6 {
+                return Err(invalid_parameter("IPSET_TYPE", kind, "INVALID_OPTION"));
+            }
+            // The address must parse as one of `kind`'s family and carry a prefix
+            // length AWS WAF supports (IPv4 /8 and /16../32; IPv6 /24, /32, /48, /56,
+            // /64, /128) — otherwise it is an invalid value for this member.
+            let Some(cidr) = crate::state::parse_cidr(kind, value) else {
+                return Err(invalid_parameter("IPSET_TYPE", value, "ILLEGAL_ARGUMENT"));
+            };
+
+            let changed = if action == crate::state::CHANGE_ACTION_INSERT {
+                // One IPSet holds at most `MAX_IP_SET_DESCRIPTORS` addresses, so the
+                // descriptor state a caller can accumulate over many requests is
+                // bounded, not just the number of updates one request may carry.
+                if working.descriptors.len() >= crate::state::MAX_IP_SET_DESCRIPTORS {
+                    return Err(UpdateIPSetErrorModeled::WAFLimitsExceededException(
+                        WAFLimitsExceededException {
+                            message: Some(format!(
+                                "The request would exceed the maximum number of IP address \
+                                 ranges ({}) allowed in IPSet {}",
+                                crate::state::MAX_IP_SET_DESCRIPTORS,
+                                input.ip_set_id
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                working.insert_descriptor(kind, value, cidr)
+            } else {
+                working.remove_descriptor(&cidr)
+            };
+            // "The operation failed because there was nothing to do. For example: … You
+            // tried to remove an IP address from an IPSet, but the IP address isn't in
+            // the specified IPSet" — and, symmetrically, an INSERT of a descriptor the
+            // IPSet already holds.
+            if !changed {
+                return Err(UpdateIPSetErrorModeled::WAFInvalidOperationException(
+                    WAFInvalidOperationException {
+                        message: Some(format!(
+                            "There was nothing to do: the {action} of {kind} {value} leaves \
+                             IPSet {} unchanged",
+                            input.ip_set_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Only a request that will be applied consumes the caller's change token.
+        if !state.consume_change_token(&input.change_token) {
+            return Err(UpdateIPSetErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    message: Some(format!(
+                        "The change token {} is not a change token this request can use; \
+                         call GetChangeToken for a new one",
+                        input.change_token
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let ip_set_id = working.ip_set_id.clone();
+        state.ip_sets.insert(ip_set_id, working);
+
+        Ok(UpdateIPSetOutput {
+            change_token: Some(input.change_token),
+        })
     }
 }

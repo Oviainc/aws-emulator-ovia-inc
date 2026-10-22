@@ -28,6 +28,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `tokio::time::sleep` is how the IPSet tests let the change-token propagation span
+# elapse without any handler sleeping.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
