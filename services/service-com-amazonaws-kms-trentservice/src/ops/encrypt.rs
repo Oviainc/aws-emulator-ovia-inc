@@ -269,10 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::KeyRef::Found(key) => key,
             crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                 return Err(EncryptErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "KMS cannot find the key with identifier {} in {region}.",
-                        input.key_id
-                    )),
+                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
                 })
                 .into());
             }
@@ -291,10 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             return Err(EncryptErrorModeled::KMSInvalidStateException(
                 KMSInvalidStateException {
-                    message: Some(format!(
-                        "{} is not in a valid state for this operation. Its key state is {}.",
-                        key.arn, key.key_state
-                    )),
+                    message: Some(crate::state::invalid_state_message(key)),
                 },
             )
             .into());

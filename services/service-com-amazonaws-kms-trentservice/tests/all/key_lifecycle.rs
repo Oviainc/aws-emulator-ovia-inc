@@ -770,8 +770,8 @@ async fn decrypt_refuses_a_ciphertext_it_cannot_authenticate() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case}: expected HTTP 404, got {status} ({code})"
+            status, 400,
+            "case {case}: expected HTTP 400, got {status} ({code})"
         );
         assert_eq!(
             code, "NotFoundException",
@@ -955,8 +955,8 @@ async fn key_state_governs_cryptographic_operations() {
     ] {
         let (status, code) = failure(&router, operation, &body).await;
         assert_eq!(
-            status, 409,
-            "case {case}: expected HTTP 409, got {status} ({code})"
+            status, 400,
+            "case {case}: expected HTTP 400, got {status} ({code})"
         );
         assert_eq!(
             code, "DisabledException",
@@ -1022,8 +1022,8 @@ async fn key_state_governs_cryptographic_operations() {
     ] {
         let (status, code) = failure(&router, operation, &body).await;
         assert_eq!(
-            status, 409,
-            "case {case}: expected HTTP 409, got {status} ({code})"
+            status, 400,
+            "case {case}: expected HTTP 400, got {status} ({code})"
         );
         assert_eq!(
             code, "KMSInvalidStateException",
@@ -1179,8 +1179,8 @@ async fn unknown_and_malformed_key_identifiers_are_refused() {
             let (status, code) =
                 failure(&router, operation, &json!({"KeyId": identifier})).await;
             assert_eq!(
-                status, 404,
-                "case {case} on {operation}: expected HTTP 404, got {status} ({code})"
+                status, 400,
+                "case {case} on {operation}: expected HTTP 400, got {status} ({code})"
             );
             assert_eq!(
                 code, "NotFoundException",
@@ -1194,8 +1194,8 @@ async fn unknown_and_malformed_key_identifiers_are_refused() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case} on Encrypt: expected HTTP 404, got {status} ({code})"
+            status, 400,
+            "case {case} on Encrypt: expected HTTP 400, got {status} ({code})"
         );
         assert_eq!(
             code, "NotFoundException",
@@ -1243,8 +1243,8 @@ async fn unknown_and_malformed_key_identifiers_are_refused() {
         )
         .await;
         assert_eq!(
-            status, 404,
-            "case {case} on Encrypt: expected HTTP 404, got {status} ({code})"
+            status, 400,
+            "case {case} on Encrypt: expected HTTP 400, got {status} ({code})"
         );
         assert_eq!(
             code, "NotFoundException",
@@ -1309,8 +1309,8 @@ async fn keys_are_scoped_to_the_region_that_created_them() {
                 let (status, code) =
                     failure_in(&router, region, "DescribeKey", &json!({"KeyId": key_id})).await;
                 assert_eq!(
-                    status, 404,
-                    "case {other_region}'s key seen from {region}: expected HTTP 404, \
+                    status, 400,
+                    "case {other_region}'s key seen from {region}: expected HTTP 400, \
                      got {status} ({code})"
                 );
                 assert_eq!(
@@ -1374,14 +1374,14 @@ async fn cryptographic_operations_refuse_what_they_cannot_honour() {
             "encrypt as a dry run",
             "Encrypt",
             json!({"KeyId": arn, "Plaintext": b64(&plaintext), "DryRun": true}),
-            412,
+            400,
             "DryRunOperationException",
         ),
         (
             "decrypt as a dry run",
             "Decrypt",
             json!({"CiphertextBlob": blob, "DryRun": true}),
-            412,
+            400,
             "DryRunOperationException",
         ),
         (

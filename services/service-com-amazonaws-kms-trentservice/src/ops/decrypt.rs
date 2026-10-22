@@ -334,9 +334,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exists in this Region cannot decrypt anything.
         let Some(key) = state.key_in(&region, &envelope.key_id) else {
             return Err(DecryptErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "KMS cannot find the key with identifier {} in {region}.",
-                    envelope.key_id
+                message: Some(crate::state::key_not_found_message(
+                    &region,
+                    &envelope.key_id,
                 )),
             })
             .into());
@@ -366,9 +366,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
                     return Err(DecryptErrorModeled::NotFoundException(NotFoundException {
-                        message: Some(format!(
-                            "KMS cannot find the key with identifier {requested} in {region}."
-                        )),
+                        message: Some(crate::state::key_not_found_message(&region, requested)),
                     })
                     .into());
                 }
@@ -384,10 +382,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             return Err(DecryptErrorModeled::KMSInvalidStateException(
                 KMSInvalidStateException {
-                    message: Some(format!(
-                        "{} is not in a valid state for this operation. Its key state is {}.",
-                        key.arn, key.key_state
-                    )),
+                    message: Some(crate::state::invalid_state_message(key)),
                 },
             )
             .into());

@@ -203,10 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             crate::state::KeyRef::NotFound => {
                 Err(DescribeKeyErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "KMS cannot find the key with identifier {} in {region}.",
-                        input.key_id
-                    )),
+                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
                 })
                 .into())
             }

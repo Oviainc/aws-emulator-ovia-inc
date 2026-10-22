@@ -249,9 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::KeyRefMut::NotFound => {
                 return Err(ScheduleKeyDeletionErrorModeled::NotFoundException(
                     NotFoundException {
-                        message: Some(format!(
-                            "KMS cannot find the key with identifier {} in {region}.",
-                            input.key_id
+                        message: Some(crate::state::key_not_found_message(
+                            &region,
+                            &input.key_id,
                         )),
                     },
                 )
@@ -263,10 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if key.key_state == crate::state::KEY_STATE_PENDING_DELETION {
             return Err(ScheduleKeyDeletionErrorModeled::KMSInvalidStateException(
                 KMSInvalidStateException {
-                    message: Some(format!(
-                        "{} is not in a valid state for this operation. Its key state is {}.",
-                        key.arn, key.key_state
-                    )),
+                    message: Some(crate::state::invalid_state_message(key)),
                 },
             )
             .into());

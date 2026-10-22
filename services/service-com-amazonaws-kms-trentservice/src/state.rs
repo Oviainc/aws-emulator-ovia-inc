@@ -274,6 +274,76 @@ fn parse_key_identifier(id: &str) -> Result<KeyIdentifier, ()> {
     }
 }
 
+/// How a failed `KeyId` lookup is reported: by the ARN of the resource the REQUEST
+/// named.
+///
+/// A `KeyId` member accepts two kinds of thing — a key (a key id or a key ARN) and an
+/// alias (`alias/<name>` or an alias ARN) — and KMS reports a lookup that found
+/// nothing as a failure of the kind that was asked for, naming it by its ARN: a key
+/// id becomes the key ARN of this endpoint, an alias name the alias ARN of this
+/// endpoint, and an identifier that was already an ARN is reported as given. So an
+/// alias that resolves to no key is reported as a missing ALIAS, never as a missing
+/// key identifier.
+///
+/// `region` is the Region the request was signed for, and the Region of the ARN this
+/// builds, since a KMS key is a regional resource and the same key id in another
+/// Region is a different (absent) key. The exact sentences are examples of KMS's;
+/// what this function pins is WHICH resource, in which form, the message names.
+///
+/// An identifier that is an ARN but not a KMS key or alias ARN has no resource ARN to
+/// name, so it keeps the identifier-shaped wording. The operations that model
+/// `InvalidArnException` answer that instead and never reach this case; `Encrypt` and
+/// `Decrypt`, which do not model it, report such an identifier as not found.
+pub fn key_not_found_message(region: &str, requested: &str) -> String {
+    match parse_key_identifier(requested) {
+        Ok(KeyIdentifier::Alias { alias, scope }) => {
+            format!("Alias {} is not found.", arn_of(region, scope, requested, &alias))
+        }
+        Ok(KeyIdentifier::KeyId { key_id, scope }) => {
+            let resource = format!("key/{key_id}");
+            format!(
+                "Key '{}' does not exist",
+                arn_of(region, scope, requested, &resource)
+            )
+        }
+        Err(()) => format!("KMS cannot find the key with identifier {requested} in {region}."),
+    }
+}
+
+/// The ARN a resolved identifier names: the one the request gave when it gave an ARN
+/// (which is what `scope` records), otherwise the ARN `resource` denotes in `region`.
+fn arn_of(
+    region: &str,
+    scope: Option<(String, String)>,
+    requested: &str,
+    resource: &str,
+) -> String {
+    if scope.is_some() {
+        requested.to_string()
+    } else {
+        ::engine::emulator_arn(ARN_SERVICE, region, resource)
+    }
+}
+
+/// How a refusal caused by the key's own key state is worded.
+///
+/// KMS names the key by its ARN and says what about its state refuses the call, so
+/// the caller learns whether the state can change: a key whose deletion is scheduled
+/// is reported as pending deletion, and any other incompatible state is reported by
+/// naming that state. The exact sentences are examples of KMS's; what this function
+/// pins is that the refusal names the key and the reason, in ONE place, so no two
+/// operations word the same key state differently.
+pub fn invalid_state_message(key: &Cmk) -> String {
+    if key.key_state == KEY_STATE_PENDING_DELETION {
+        format!("{} is pending deletion.", key.arn)
+    } else {
+        format!(
+            "{} is not in a valid state for this operation. Its key state is {}.",
+            key.arn, key.key_state
+        )
+    }
+}
+
 /// One customer managed KMS key: its metadata, and the key material behind it.
 ///
 /// `Debug` is written by hand rather than derived so the key material is REDACTED:
