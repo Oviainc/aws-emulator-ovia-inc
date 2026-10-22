@@ -33,6 +33,21 @@
 //! inquiry record that `CreateComplianceInquiry` already accepts them with rather than in
 //! a second map beside it.
 //!
+//! FEEDBACK is the other record a caller writes onto an inquiry:
+//! `PutComplianceInquiryFeedback` records a rating on one of the inquiry's queries (or on
+//! the inquiry's response as a whole when the request names no query), so an
+//! [`InquiryFeedback`] lives on the inquiry record beside its tags, keyed by the query it
+//! was given on — a `Put` replaces the feedback already held for that key, and the record
+//! is reported back in the document [`ComplianceInquiry::export_document`] renders. That
+//! document's `feedback` key is this EMULATOR's rendering of what it holds, not modelled
+//! content: AWS publishes an export as an opaque S3 object whose format the API does not
+//! state (see [`INQUIRY_EXPORT_OBJECT`]), and the key is what makes the stored feedback
+//! readable at all — the model declares no operation that reports it back. The
+//! `clientToken` that call carries is remembered in
+//! [`ComAmazonawsArtifactArtifactState::inquiry_feedback_tokens`], so a repeat of one
+//! request replays its first answer and the same token on a different request is a
+//! conflict.
+//!
 //! An inquiry EXPORT is the second thing a caller creates: `ExportComplianceInquiry`
 //! produces a document from one inquiry, so each call mints an [`InquiryExport`] whose id
 //! the presigned URL it answers with carries.
@@ -48,6 +63,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+use sha2::{Digest, Sha256};
 use smithy_server_runtime::Violation;
 
 use crate::ops::types::{
@@ -127,8 +143,9 @@ pub const INQUIRY_RESOURCE_TYPE: &str = "ComplianceInquiry";
 /// `GetComplianceInquiryMetadata` must still find it — so the create is refused instead.
 pub const INQUIRY_CAPACITY: usize = 1_000;
 
-/// How many `CreateComplianceInquiry` `clientToken` records are remembered for replay
-/// before the oldest is forgotten. The same kind of emulator-owned bound as
+/// How many `clientToken` records ONE operation remembers for replay before the oldest is
+/// forgotten — `CreateComplianceInquiry`'s and `PutComplianceInquiryFeedback`'s tokens are
+/// each held to this bound. The same kind of emulator-owned bound as
 /// [`INQUIRY_CAPACITY`]: AWS documents no lifetime for this token, so the records are
 /// bounded by count rather than expired on a span this emulator would be inventing.
 pub const INQUIRY_IDEMPOTENCY_CAPACITY: usize = 1_000;
@@ -564,6 +581,38 @@ impl InquiryQuery {
     }
 }
 
+/// One piece of feedback a caller submitted on a compliance inquiry, as
+/// `PutComplianceInquiryFeedback` persists it.
+///
+/// The record is keyed on the inquiry by the query it was given on, so a later `Put` on
+/// that query REPLACES it: feedback is the caller's current rating of one response, not an
+/// append-only log, which is also what bounds the set an inquiry can hold to its queries
+/// plus the one entry for the inquiry as a whole.
+#[derive(Debug, Clone)]
+pub struct InquiryFeedback {
+    /// "The sequential identifier of the query to provide feedback on", or `None` when the
+    /// request named none and the feedback is on the inquiry's response as a whole.
+    pub query_identifier: Option<i32>,
+    /// One of `FeedbackRating`'s values.
+    pub rating: String,
+    /// "The reason codes that describe why you rated the response" — `FeedbackReasonCode`
+    /// values, ascending and without repeats: which reasons were given is a SET, so
+    /// neither the order a request listed them in nor a repeat is part of it.
+    pub reason_codes: Vec<String>,
+    /// "An optional comment for the feedback." `@sensitive` in the model, so it is never
+    /// written to a log or an error message.
+    pub comment: Option<String>,
+    /// "The response revision ID", as the request named it.
+    ///
+    /// Recorded rather than compared: nothing in this emulator generates a response or an
+    /// edit to one (see [`InquiryQuery::response`]), so no stored revision exists for a
+    /// request's value to be stale against, and no staleness refusal is synthesised for a
+    /// comparison nothing could make.
+    pub response_revision_id: Option<i32>,
+    /// "The timestamp when the feedback was submitted" — what the call answered with.
+    pub submitted_at: SystemTime,
+}
+
 /// One compliance inquiry a caller created, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct ComplianceInquiry {
@@ -591,6 +640,10 @@ pub struct ComplianceInquiry {
     /// [`materialise`](Self::materialise) applies the transition the clock already owed.
     pub processing_due_at: Option<SystemTime>,
     pub tags: BTreeMap<String, String>,
+    /// The feedback `PutComplianceInquiryFeedback` has recorded on this inquiry, keyed by
+    /// the `queryIdentifier` it was given on — `None` for the feedback on the inquiry's
+    /// response as a whole, which a `BTreeMap` orders first.
+    pub feedback: BTreeMap<Option<i32>, InquiryFeedback>,
 }
 
 impl ComplianceInquiry {
@@ -733,12 +786,47 @@ impl ComplianceInquiry {
             "includeCitations": include_citations,
             "queryIdentifiers": covered,
             "queries": queries,
+            "feedback": self.feedback_entries(covered),
             "tags": self.tags,
         });
         // Pretty-printed: the document is what a caller downloads and reads, not a wire
         // payload. A value that will not render leaves the document empty rather than
         // half-written, which the download then reports as the server error it is.
         ::serde_json::to_vec_pretty(&document).unwrap_or_default()
+    }
+
+    /// The feedback this inquiry holds for the queries `covered` names, as the exported
+    /// document reports it — read off the stored [`InquiryFeedback`] records, in the key
+    /// order the store holds them in (the inquiry-wide entry first, then by ascending
+    /// query identifier).
+    ///
+    /// Filtered to `covered` for the same reason the `queries` list is: the document is a
+    /// report on the queries the export covers, so feedback on a query it does not cover
+    /// is not part of it.
+    ///
+    /// Like every other key of this document, `feedback` is this emulator's own rendering
+    /// rather than a modelled shape — AWS states no format for the exported object — and
+    /// it is the only place a caller can read the stored feedback back, because the model
+    /// declares no operation that reports it.
+    fn feedback_entries(&self, covered: &[i32]) -> Vec<::serde_json::Value> {
+        self.feedback
+            .values()
+            .filter(|entry| {
+                entry
+                    .query_identifier
+                    .is_none_or(|identifier| covered.contains(&identifier))
+            })
+            .map(|entry| {
+                ::serde_json::json!({
+                    "queryIdentifier": entry.query_identifier,
+                    "rating": entry.rating,
+                    "reasonCodes": entry.reason_codes,
+                    "comment": entry.comment,
+                    "responseRevisionId": entry.response_revision_id,
+                    "submittedAt": rendered_timestamp(entry.submitted_at),
+                })
+            })
+            .collect()
     }
 }
 
@@ -757,6 +845,21 @@ fn rendered_timestamp(value: SystemTime) -> String {
 pub struct InquiryCreateRecord {
     pub inquiry_id: String,
     pub fingerprint: String,
+}
+
+/// What one remembered `PutComplianceInquiryFeedback` `clientToken` replays: the inquiry
+/// the first call with that token recorded feedback on, the fingerprint of that request —
+/// so the same token on a DIFFERENT request is a conflict rather than a replay — and the
+/// `submittedAt` the first call answered, which is what the replay answers again.
+///
+/// "If this token matches a previous request, the service ignores the request, but does not
+/// return an error" (`PutComplianceInquiryFeedbackRequest$clientToken`): ignoring the
+/// request means the stored feedback and the answered timestamp both stay the first call's.
+#[derive(Debug, Clone)]
+pub struct InquiryFeedbackRecord {
+    pub inquiry_id: String,
+    pub fingerprint: String,
+    pub submitted_at: SystemTime,
 }
 
 /// One export `ExportComplianceInquiry` produced: the document it minted for an inquiry,
@@ -876,6 +979,15 @@ pub struct ComAmazonawsArtifactArtifactState {
     /// so the oldest is the one forgotten once the map is full. The tokens are
     /// caller-chosen, so their own order says nothing about when they arrived.
     pub inquiry_create_token_order: ::std::collections::VecDeque<String>,
+    /// `PutComplianceInquiryFeedback` `clientToken` -> what it replays. Bounded by
+    /// [`INQUIRY_IDEMPOTENCY_CAPACITY`], and separate from
+    /// [`inquiry_create_tokens`](Self::inquiry_create_tokens) because an idempotency token
+    /// identifies one call of ONE operation: the same token on two different operations is
+    /// two calls, not a replay.
+    pub inquiry_feedback_tokens: BTreeMap<String, InquiryFeedbackRecord>,
+    /// The order [`inquiry_feedback_tokens`](Self::inquiry_feedback_tokens) were recorded
+    /// in, so the oldest is the one forgotten once the map is full.
+    pub inquiry_feedback_token_order: ::std::collections::VecDeque<String>,
     /// The calling account's customer-agreements, keyed by id. A `BTreeMap` is what
     /// gives `ListCustomerAgreements` the stable total order its pagination token
     /// indexes into.
@@ -903,6 +1015,8 @@ impl Default for ComAmazonawsArtifactArtifactState {
             inquiry_seq: 0,
             inquiry_create_tokens: BTreeMap::new(),
             inquiry_create_token_order: ::std::collections::VecDeque::new(),
+            inquiry_feedback_tokens: BTreeMap::new(),
+            inquiry_feedback_token_order: ::std::collections::VecDeque::new(),
             customer_agreements: seed_customer_agreements(),
             inquiry_exports: BTreeMap::new(),
             inquiry_export_seq: 0,
@@ -958,22 +1072,38 @@ impl ComAmazonawsArtifactArtifactState {
     /// held — so a caller sending a fresh `clientToken` on every request cannot grow this
     /// map without end.
     pub fn record_inquiry_create(&mut self, token: String, inquiry_id: &str, fingerprint: &str) {
-        let record = InquiryCreateRecord {
-            inquiry_id: inquiry_id.to_string(),
-            fingerprint: fingerprint.to_string(),
-        };
-        if self
-            .inquiry_create_tokens
-            .insert(token.clone(), record)
-            .is_none()
-        {
-            self.inquiry_create_token_order.push_back(token);
-        }
-        while self.inquiry_create_token_order.len() > INQUIRY_IDEMPOTENCY_CAPACITY {
-            if let Some(oldest) = self.inquiry_create_token_order.pop_front() {
-                self.inquiry_create_tokens.remove(&oldest);
-            }
-        }
+        remember_token(
+            &mut self.inquiry_create_tokens,
+            &mut self.inquiry_create_token_order,
+            token,
+            InquiryCreateRecord {
+                inquiry_id: inquiry_id.to_string(),
+                fingerprint: fingerprint.to_string(),
+            },
+        );
+    }
+
+    /// Remember that `token` recorded the feedback the first call with it submitted on
+    /// `inquiry_id` at `submitted_at`, from the request `fingerprint` — bounded exactly as
+    /// [`record_inquiry_create`](Self::record_inquiry_create) is, so a caller sending a
+    /// fresh `clientToken` on every request cannot grow this map without end.
+    pub fn record_inquiry_feedback_token(
+        &mut self,
+        token: String,
+        inquiry_id: &str,
+        fingerprint: &str,
+        submitted_at: SystemTime,
+    ) {
+        remember_token(
+            &mut self.inquiry_feedback_tokens,
+            &mut self.inquiry_feedback_token_order,
+            token,
+            InquiryFeedbackRecord {
+                inquiry_id: inquiry_id.to_string(),
+                fingerprint: fingerprint.to_string(),
+                submitted_at,
+            },
+        );
     }
 
     /// Mint and persist a term grant for one report version, returning its token.
@@ -1063,6 +1193,30 @@ impl ComAmazonawsArtifactArtifactState {
             },
         );
         id
+    }
+}
+
+/// Remember what one `clientToken` replays, forgetting the oldest remembered token once
+/// [`INQUIRY_IDEMPOTENCY_CAPACITY`] are held.
+///
+/// `order` is what says which token is the oldest: the tokens are caller-chosen, so their
+/// own order says nothing about when they arrived.
+fn remember_token<R>(
+    tokens: &mut BTreeMap<String, R>,
+    order: &mut ::std::collections::VecDeque<String>,
+    token: String,
+    record: R,
+) {
+    if tokens.insert(token.clone(), record).is_none() {
+        order.push_back(token);
+    }
+    while order.len() > INQUIRY_IDEMPOTENCY_CAPACITY {
+        match order.pop_front() {
+            Some(oldest) => {
+                tokens.remove(&oldest);
+            }
+            None => break,
+        }
     }
 }
 
@@ -1351,6 +1505,22 @@ pub fn inquiry_token_mismatch(inquiry_id: &str) -> ConflictException {
     }
 }
 
+/// The modelled `ConflictException` for a `clientToken` replayed on a feedback submission
+/// that is not the one it recorded feedback for.
+///
+/// The same judgement [`inquiry_token_mismatch`] states for a create, for the same reason:
+/// an `@idempotencyToken` identifies ONE call, so honouring it on a different request would
+/// either hide the second submission or silently replace the first.
+pub fn feedback_token_mismatch(inquiry_id: &str) -> ConflictException {
+    ConflictException {
+        message: "the clientToken was already used to submit different feedback on a \
+                  compliance inquiry"
+            .to_string(),
+        resource_id: inquiry_id.to_string(),
+        resource_type: INQUIRY_RESOURCE_TYPE.to_string(),
+    }
+}
+
 /// The modelled `ValidationException` for a token this service never issued, carrying
 /// `ValidationExceptionReason`'s `invalidToken`.
 ///
@@ -1389,29 +1559,38 @@ pub fn too_many_tags(total: usize) -> ValidationException {
     }
 }
 
-/// The modelled `ValidationException` for a request whose `queryIdentifiers` name queries
-/// the targeted inquiry does not own.
+/// The modelled `ValidationException` for a request whose query identifiers name queries
+/// the targeted inquiry does not own, stated against `member` — the member of THAT request
+/// which carried them (`queryIdentifiers` on an export, `queryIdentifier` on a feedback
+/// submission).
 ///
 /// The clause is built from the REQUEST — the member that carried the value and the
 /// requirement it failed — in the same validation envelope
 /// [`constraint_violation_message`] renders for a modelled constraint, and without
 /// echoing the refused identifiers back: the request already carried them.
-pub fn unknown_query_identifiers() -> ValidationException {
+pub fn unknown_query_identifiers(member: &str) -> ValidationException {
+    let clause = unknown_query_identifier_clause(member);
     ValidationException {
-        message: format!("1 validation error detected: {UNKNOWN_QUERY_IDENTIFIER_MESSAGE}"),
+        message: format!("1 validation error detected: {clause}"),
         reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
         field_list: Some(vec![ValidationExceptionField {
-            name: "queryIdentifiers".to_string(),
-            message: UNKNOWN_QUERY_IDENTIFIER_MESSAGE.to_string(),
+            name: member.to_string(),
+            message: clause,
         }]),
     }
 }
 
 /// The clause [`unknown_query_identifiers`] states, in both the message and the
 /// `fieldList` entry: the member path and the requirement its value failed.
-pub const UNKNOWN_QUERY_IDENTIFIER_MESSAGE: &str =
-    "Value at 'queryIdentifiers' failed to satisfy constraint: every query identifier must \
-     name a query of the compliance inquiry";
+pub fn unknown_query_identifier_clause(member: &str) -> String {
+    format!(
+        "Value at '{member}' failed to satisfy constraint: {UNKNOWN_QUERY_IDENTIFIER_REQUIREMENT}"
+    )
+}
+
+/// The requirement half of [`unknown_query_identifier_clause`].
+pub const UNKNOWN_QUERY_IDENTIFIER_REQUIREMENT: &str =
+    "every query identifier must name a query of the compliance inquiry";
 
 /// The `ValidationException` message every token refusal in this service states: a token
 /// (a `nextToken` or a `termToken`) this service did not issue is refused with this one
@@ -1490,6 +1669,81 @@ pub fn page_size(max_results: Option<i32>) -> usize {
     // without a panicking combinator, because nothing a request carries may abort a
     // handler. The floor is the fallback for the same reason.
     usize::try_from(requested.clamp(1, REPORT_PAGE_LIMIT)).unwrap_or(1)
+}
+
+/// A digest of the request one `@idempotencyToken` identifies, so the same token replayed
+/// on a DIFFERENT request can be told from a retry of the same one.
+///
+/// Every member that shapes what the call recorded is absorbed, each labelled and
+/// LENGTH-PREFIXED, so no two different requests can produce the same digest by splitting
+/// their fields differently; an optional member absorbs its PRESENCE before its value, so
+/// a member the request left out is distinguishable from every value it could have carried,
+/// the empty one included.
+#[derive(Debug, Default)]
+pub struct RequestFingerprint {
+    hasher: Sha256,
+}
+
+/// The presence marker [`RequestFingerprint`] absorbs for an optional member the request
+/// named a value for.
+const PRESENT: u8 = 1;
+
+/// The presence marker [`RequestFingerprint`] absorbs for an optional member the request
+/// left out.
+const ABSENT: u8 = 0;
+
+impl RequestFingerprint {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Absorb one labelled, length-prefixed field.
+    pub fn absorb(&mut self, label: &str, value: &[u8]) {
+        self.hasher
+            .update(u64::try_from(label.len()).unwrap_or(u64::MAX).to_be_bytes());
+        self.hasher.update(label.as_bytes());
+        self.hasher
+            .update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        self.hasher.update(value);
+    }
+
+    /// Absorb a string-valued member.
+    pub fn absorb_str(&mut self, label: &str, value: &str) {
+        self.absorb(label, value.as_bytes());
+    }
+
+    /// Absorb an optional string-valued member, PRESENCE included.
+    pub fn absorb_optional_str(&mut self, label: &str, value: Option<&str>) {
+        self.absorb_optional(label, value.map(str::as_bytes));
+    }
+
+    /// Absorb an optional integer member, PRESENCE included.
+    pub fn absorb_optional_i32(&mut self, label: &str, value: Option<i32>) {
+        match value {
+            Some(value) => self.absorb_optional(label, Some(&value.to_be_bytes())),
+            None => self.absorb_optional(label, None),
+        }
+    }
+
+    /// Absorb an optional member's PRESENCE and then, when it has one, its value.
+    ///
+    /// The presence marker is what keeps a member the request left out distinguishable
+    /// from every value it could have carried — including the empty one, which absorbing
+    /// an absent member as a zero-length value would collide with.
+    fn absorb_optional(&mut self, label: &str, value: Option<&[u8]>) {
+        match value {
+            Some(value) => {
+                self.absorb(label, &[PRESENT]);
+                self.absorb(label, value);
+            }
+            None => self.absorb(label, &[ABSENT]),
+        }
+    }
+
+    /// The digest, as the hex string an idempotency record stores.
+    pub fn finish(self) -> String {
+        hex::encode(self.hasher.finalize())
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

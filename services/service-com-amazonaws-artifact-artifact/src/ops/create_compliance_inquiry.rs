@@ -97,8 +97,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use sha2::{Digest, Sha256};
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -247,6 +245,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // caller of this very call sees the non-terminal status it just returned.
             processing_due_at: Some(now + crate::state::INQUIRY_PROCESSING_SPAN),
             tags,
+            // No feedback until `PutComplianceInquiryFeedback` records some.
+            feedback: ::std::collections::BTreeMap::new(),
             id: id.clone(),
         };
 
@@ -328,41 +328,34 @@ fn enumerate_queries(
 /// A fingerprint of the request this create was made from, so a replayed `clientToken`
 /// can be told from a token reused on different content.
 ///
-/// Every member that shapes the created inquiry is absorbed, each prefixed with its
-/// length, so no two different requests can produce the same digest by splitting their
-/// fields differently. The tags are absorbed in key order (`BTreeMap`), because a map's
-/// wire order is not part of the request.
+/// Every member that shapes the created inquiry is absorbed into the shared
+/// [`crate::state::RequestFingerprint`], which labels and length-prefixes each one so no
+/// two different requests can produce the same digest by splitting their fields
+/// differently. The tags are absorbed in key order (`BTreeMap`), because a map's wire
+/// order is not part of the request.
 fn request_fingerprint(
     name: &str,
     support_mode: &str,
     content: &crate::state::InquiryContentRecord,
     tags: &::std::collections::BTreeMap<String, String>,
 ) -> String {
-    let mut hasher = Sha256::new();
-    absorb(&mut hasher, "name", name.as_bytes());
-    absorb(&mut hasher, "supportMode", support_mode.as_bytes());
+    let mut fingerprint = crate::state::RequestFingerprint::new();
+    fingerprint.absorb_str("name", name);
+    fingerprint.absorb_str("supportMode", support_mode);
     match content {
         crate::state::InquiryContentRecord::Text(query) => {
-            absorb(&mut hasher, "query", query.as_bytes());
+            fingerprint.absorb_str("query", query);
         }
         crate::state::InquiryContentRecord::File { sections, content } => {
             for section in sections {
-                absorb(&mut hasher, "fileSection", section.as_bytes());
+                fingerprint.absorb_str("fileSection", section);
             }
-            absorb(&mut hasher, "fileContent", content);
+            fingerprint.absorb("fileContent", content);
         }
     }
     for (key, value) in tags {
-        absorb(&mut hasher, "tagKey", key.as_bytes());
-        absorb(&mut hasher, "tagValue", value.as_bytes());
+        fingerprint.absorb_str("tagKey", key);
+        fingerprint.absorb_str("tagValue", value);
     }
-    hex::encode(hasher.finalize())
-}
-
-/// Absorb one length-prefixed, labelled field into `hasher`.
-fn absorb(hasher: &mut Sha256, label: &str, value: &[u8]) {
-    hasher.update(u64::try_from(label.len()).unwrap_or(u64::MAX).to_be_bytes());
-    hasher.update(label.as_bytes());
-    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-    hasher.update(value);
+    fingerprint.finish()
 }
