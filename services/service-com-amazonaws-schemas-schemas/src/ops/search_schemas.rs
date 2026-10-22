@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchSchemas
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchSchemas`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchSchemas::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the schemas of ONE registry whose own text includes the requested
+//! keywords, one page at a time. A pure read: it selects over what the creates
+//! persisted and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -90,12 +85,22 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-schemas-schemas.json");
 // here — hence the `SearchSchemasError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.schemas#SearchSchemas")]
+//
+// `extra_errors` widens the set with `NotFoundException`, a shape the SERVICE models
+// that this operation's `errors` list omits: the registry whose schemas are searched
+// is named by an `@httpLabel`, so a search of a registry that does not exist has no
+// empty answer to give — it is the same 404 every other registry-scoped operation
+// here declares, and the same widening `ListSchemas` makes.
+#[smithy_macros::operation_error(
+    "com.amazonaws.schemas#SearchSchemas",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum SearchSchemasErrorModeled {
     BadRequestException(BadRequestException),
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
     UnauthorizedException(UnauthorizedException),
 }
@@ -151,18 +156,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchSchemas` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchSchemasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchSchemas"))
+        // `ctx` carries request metadata only; this operation reports the ARNs the
+        // creates stored rather than deriving any, so it needs nothing from it.
+        let _ = ctx;
+        // The model gives `Limit` no range: fewer than one item is not a page, and
+        // more than `MAX_PAGE_SIZE` would materialise the whole selected store into
+        // one response, so the handler owns both bounds — the same bounds every
+        // listing in this service serves.
+        let page_size = crate::state::requested_page_size(input.limit).map_err(|refusal| {
+            SearchSchemasError::from(SearchSchemasErrorModeled::BadRequestException(refusal))
+        })?;
+
+        // A search costs one pass over the matched text PER KEYWORD, so the number of
+        // keywords one request may name is capped and checked here — before the store
+        // is touched, so an over-long request is refused rather than scanned. See
+        // `crate::state::MAX_KEYWORDS_PER_SEARCH`.
+        let keywords = keywords_of(&input.keywords);
+        if keywords.len() > crate::state::MAX_KEYWORDS_PER_SEARCH {
+            return Err(SearchSchemasErrorModeled::BadRequestException(
+                crate::state::too_many_keywords(keywords.len()),
+            )
+            .into());
+        }
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SearchSchemasError::from(SearchSchemasErrorModeled::InternalServerErrorException(
+                crate::state::internal_error(),
+            ))
+        })?;
+        let state = store.lock();
+
+        let registry = state.registries.get(&input.registry_name).ok_or_else(|| {
+            SearchSchemasError::from(SearchSchemasErrorModeled::NotFoundException(
+                crate::state::registry_not_found(&input.registry_name),
+            ))
+        })?;
+
+        // The members that decide WHICH schemas this search contains. Bound into the
+        // `NextToken`, so a token cannot resume a differently-selected search.
+        let selection = format!(
+            "registryName={};keywords={}",
+            input.registry_name, input.keywords
+        );
+
+        // The scan is LAZY: `page_by_key` pulls from this filter only until the page
+        // is full plus one, so a search that finds its page early stops there. The
+        // fold buffer below is allocated ONCE for the whole scan and reused for each
+        // schema, so matching allocates nothing per schema.
+        let mut folded = String::new();
+        let matching = registry
+            .schemas
+            .iter()
+            .filter(|(_, schema)| includes_every_keyword(schema, &keywords, &mut folded));
+        let page = crate::state::page_by_key(
+            matching,
+            &selection,
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .map_err(|_| {
+            SearchSchemasError::from(SearchSchemasErrorModeled::BadRequestException(
+                crate::state::invalid_next_token(),
+            ))
+        })?;
+
+        Ok(SearchSchemasOutput {
+            next_token: page.next_token,
+            schemas: Some(
+                page.items
+                    .into_iter()
+                    .map(|schema| SearchSchemaSummary {
+                        registry_name: Some(input.registry_name.clone()),
+                        schema_arn: Some(schema.arn.clone()),
+                        schema_name: Some(schema.name.clone()),
+                        // "An array of schema version summaries": one entry per
+                        // version this service holds for the schema, in version
+                        // order — the version map's keys are the numbers.
+                        schema_versions: Some(
+                            schema
+                                .versions
+                                .values()
+                                .map(|version| SearchSchemaVersionSummary {
+                                    created_date: Some(version.created_date.into()),
+                                    schema_version: Some(version.version.to_string()),
+                                    r#type: Some(version.r#type.clone()),
+                                })
+                                .collect(),
+                        ),
+                    })
+                    .collect(),
+            ),
+        })
+    }
+}
+
+/// The keywords one `Keywords` value carries, folded to lower case.
+///
+/// `Keywords` is a single `__string`, but the member is plural — "limits the results
+/// to only schemas that include the provided keywords" — so one value carries a LIST
+/// of keywords, separated by commas or whitespace; empty pieces are dropped. A value
+/// that carries no keyword at all (empty, or separators only) therefore limits
+/// nothing, which is all "specifying this limits the results" can mean for a value
+/// that specifies none.
+fn keywords_of(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|keyword| !keyword.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether a schema "includes" every one of `keywords`.
+///
+/// A schema's own text is its name together with the content of every version this
+/// service holds for it: the name identifies the schema and the content is the schema
+/// document whose parts a keyword names. Keywords match as substrings and
+/// case-insensitively — a search is not a lookup by exact name — and ALL of them must
+/// occur, so adding a keyword only ever narrows the result.
+///
+/// `folded` is a scratch buffer the caller owns: the schema's text is folded into it
+/// once per schema (not once per keyword) and its capacity is reused across the scan,
+/// so a search allocates nothing per schema and matches with the standard library's
+/// linear substring search rather than a quadratic hand-rolled fold. The number of
+/// passes over it is bounded by `crate::state::MAX_KEYWORDS_PER_SEARCH`.
+fn includes_every_keyword(
+    schema: &crate::state::Schema,
+    keywords: &[String],
+    folded: &mut String,
+) -> bool {
+    if keywords.is_empty() {
+        return true;
+    }
+    folded.clear();
+    folded.extend(schema.name.chars().flat_map(char::to_lowercase));
+    for version in schema.versions.values() {
+        folded.push('\n');
+        folded.extend(version.content.chars().flat_map(char::to_lowercase));
+    }
+    keywords.iter().all(|keyword| folded.contains(keyword.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One `Keywords` value is a list: commas and whitespace separate its keywords,
+    /// case is folded, and a value that names none limits nothing.
+    #[test]
+    fn a_keywords_value_is_a_case_folded_list() {
+        for (raw, expected) in [
+            ("order", vec!["order"]),
+            ("Order", vec!["order"]),
+            ("order placed", vec!["order", "placed"]),
+            ("order,placed", vec!["order", "placed"]),
+            ("order, placed\tv1\n", vec!["order", "placed", "v1"]),
+            (",,  ,", vec![]),
+            ("", vec![]),
+        ] {
+            let parsed = keywords_of(raw);
+            assert_eq!(
+                parsed, expected,
+                "case {raw:?}: expected {expected:?}, got {parsed:?}"
+            );
+        }
     }
 }

@@ -19,7 +19,7 @@ use smithy_server_runtime::MultiServiceRouter;
 pub(crate) const REGION: &str = "us-west-2";
 
 /// The account segment every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One emulator with its own store, reached over HTTP.
 ///
@@ -635,7 +635,7 @@ async fn a_delete_removes_the_resource_from_every_read() {
     );
 }
 
-fn schema_names(answer: &Answer) -> Vec<String> {
+pub(crate) fn schema_names(answer: &Answer) -> Vec<String> {
     answer.body["Schemas"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a Schemas array in {:?}", answer.body))
@@ -710,7 +710,7 @@ async fn following_next_token_walks_each_listing_exactly_once() {
 
 /// Follow a listing to exhaustion, returning every item in order. Panics if the
 /// listing does not terminate within one page per item plus one.
-async fn walk(
+pub(crate) async fn walk(
     emulator: &Emulator,
     path: &str,
     limit: Option<usize>,
@@ -726,10 +726,14 @@ async fn walk(
         if let Some(token) = &token {
             query.push(format!("nextToken={token}"));
         }
+        // `path` may already carry the members that SELECT the listing (a search's
+        // keywords, say), so the pagination members are appended to whatever query
+        // string it has rather than starting a second one.
+        let separator = if path.contains('?') { '&' } else { '?' };
         let uri = if query.is_empty() {
             path.to_string()
         } else {
-            format!("{path}?{}", query.join("&"))
+            format!("{path}{separator}{}", query.join("&"))
         };
         let answer = emulator.call("GET", &uri, None).await;
         assert_eq!(

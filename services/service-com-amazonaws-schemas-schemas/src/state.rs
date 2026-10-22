@@ -430,6 +430,22 @@ pub const MAX_CODE_BINDINGS_PER_SCHEMA: usize = 500;
 /// reads past one page, so clamping loses nothing.
 pub const MAX_PAGE_SIZE: usize = 100;
 
+/// The most keywords one `SearchSchemas` request may name.
+///
+/// A keyword search costs the PRODUCT of two factors: how many keywords the request
+/// names, and how much stored text each one is matched against. The stored side is
+/// already bounded ([`MAX_STORED_CONTENT_BYTES`]), but the request side is not —
+/// `Keywords` is one query-string value that yields one more keyword for every
+/// separator a caller puts in it, so without this cap a single small GET could ask
+/// for an arbitrary multiple of a scan of the whole store. With it, one request costs
+/// at most `MAX_KEYWORDS_PER_SEARCH` passes over the text of the registry it names.
+///
+/// Refused past the cap with the service's own `BadRequestException` (HTTP 400): this
+/// model declares no quota error, and the store cannot serve the request as asked, so
+/// no retry of it will succeed. The number is the emulator's own bound, not a
+/// published AWS limit, and is set high enough that no ordinary search meets it.
+pub const MAX_KEYWORDS_PER_SEARCH: usize = 10;
+
 /// The page size to serve a request whose `Limit` member is `limit`.
 ///
 /// `Err` when the request asked for a page of fewer than one item: the model gives
@@ -563,6 +579,14 @@ pub fn limit_out_of_range(limit: i32) -> BadRequestException {
 pub fn store_cap_reached(what: &str, cap: usize) -> BadRequestException {
     bad_request(format!(
         "This emulator holds at most {cap} {what}; delete one before creating another."
+    ))
+}
+
+/// Refuse a search that names more keywords than one request may carry. Names the
+/// member, the bound and what the request asked for, as a validation error does.
+pub fn too_many_keywords(named: usize) -> BadRequestException {
+    bad_request(format!(
+        "Keywords may name at most {MAX_KEYWORDS_PER_SEARCH} keywords, but this request named {named}."
     ))
 }
 
