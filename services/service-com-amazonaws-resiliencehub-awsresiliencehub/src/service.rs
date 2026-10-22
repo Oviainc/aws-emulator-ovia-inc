@@ -45,6 +45,38 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether the request these `parts` came from matches this service's SigV4 signing name
+/// AND the URI path space its own model publishes (`crate::ROUTE_PATH_SEGMENTS`, derived
+/// from the model's `smithy.api#http` URIs at build time — one literal first segment per
+/// operation, e.g. `/list-apps`, `/describe-app`).
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable owner
+/// of that rule, and it is CALLED here rather than re-implemented: the request's route key
+/// must match this service's signing name AND its first URI path segment must be one of
+/// the segments passed, by exact segment equality. The shim is the same one
+/// `appconfig`, `appconfigdata`, `ivs` and `ivsrealtime` use, and it keeps this crate's
+/// dependency set — and so the workspace lock file every concurrent change rewrites —
+/// untouched.
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed only
+/// the request's parts, so the two things it reads — the URI and the headers — are
+/// re-presented to it as a bodiless request. It reads neither the body nor the method, so
+/// nothing it decides on is missing.
+fn claims_route_key_and_own_path(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-resiliencehub-awsresiliencehub` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +106,21 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // This service signs as `resiliencehub` — a signing name it SHARES with the V2
+        // Resilience Hub endpoint (`services/service-com-amazonaws-resiliencehubv2-\
+        // ngrhservicecore`, `aws.auth#sigv4` name `resiliencehub`, the same
+        // `endpointPrefix`). The router resolves a request's routing key from the SigV4
+        // credential scope first, so both services see the same key, and claiming on the
+        // signing name ALONE makes BOTH claim every request — which the router refuses as
+        // `500 AmbiguousService` (in an awsJson envelope, which no restJson1 client can
+        // parse) instead of serving either.
+        //
+        // AWS separates the two by API version in the URI path, which is what this claim
+        // uses: this model is `restJson1` with each operation bound under its own literal
+        // first segment (`/list-apps`, `/create-resiliency-policy`, …), so the generated
+        // `ROUTE_PATH_SEGMENTS` names them all and the claim is the route key AND one of
+        // them, leaving the V2 `/v2/…` space to V2 alone.
+        claims_route_key_and_own_path(parts)
     }
 
     fn override_operation(

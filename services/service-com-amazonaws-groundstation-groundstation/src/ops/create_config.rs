@@ -149,6 +149,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        let mut guard = state.lock();
+
+        // What the service will accept in a `configData` — the ranges the model
+        // documents for its numeric members, the uplink frequencies this account is
+        // authorised to transmit on, and a recording bucket whose location the service
+        // can read — is a rule of the service, not of the wire format, so the boundary
+        // validator let this request through. A `configData` outside those is refused
+        // HERE, before an id and an ARN are minted and before anything is written, so a
+        // caller never holds an ARN for a config the service would not have created.
+        guard
+            .validate_config_data(&input.config_data)
+            .map_err(CreateConfigErrorModeled::InvalidParameterException)?;
+
         // The config's type is not a request member: it is whichever member of the
         // `ConfigTypeData` union the caller set.
         let config_type = crate::state::config_type_of(&input.config_data).to_string();
@@ -167,8 +180,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             config_data: input.config_data,
             tags: input.tags.unwrap_or_default(),
         };
-
-        let mut guard = state.lock();
 
         // An `uplinkEchoConfig` echoes a specific ANTENNA UPLINK config, named by ARN:
         // like every ARN-valued reference it must resolve to a config that exists, and
