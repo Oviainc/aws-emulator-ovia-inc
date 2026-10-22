@@ -96,17 +96,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Every operation this service models declares `BadRequestException`
+        // (HTTP 400) as its client-input error, and declares no
+        // `ValidationException` at all — so a framework refusal of a value the
+        // model constrains has to be worded as `BadRequestException`, or a
+        // client branching on this service's error codes sees a code the model
+        // does not contain. Both the code and the message are replaced.
+        //
+        // An authentication refusal keeps the framework's wording: it is the
+        // emulator's own answer, not one this service models.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                // The clause wording stays in the one place that owns it:
+                // `constraints::envelope` renders the violation list into the
+                // standard "N validation error(s) detected: …" envelope.
+                message: aws_smithy_schema_server::constraints::envelope(violations)
+                    .unwrap_or_else(|| {
+                        "the request is not valid for this operation".to_string()
+                    }),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
