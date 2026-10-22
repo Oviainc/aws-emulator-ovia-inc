@@ -27,6 +27,26 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The `X-Amz-Target` prefix from the crate's OPERATIONS.md wire-protocol section.
 const TARGET_PREFIX: &str = "AnyScaleScalingPlannerFrontendService.";
 
+/// The error code of an `awsJson1_1` error body: the shape name out of `__type`.
+///
+/// `pub(crate)` so every suite reads the code the same way.
+pub(crate) fn error_code(body: &Value) -> &str {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .rsplit(['#', '/'])
+        .next()
+        .unwrap_or_default()
+}
+
+/// The `$.Message` member of an `awsJson1_1` error body.
+pub(crate) fn error_message(body: &Value) -> &str {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
 /// name (`autoscaling-plans`) — the routing signal the router reads. Request
 /// authentication is off in tests, so the signature itself is never verified.
@@ -35,13 +55,16 @@ const SIGV4_HEADER: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host;x-amz-target, Signature=00";
 
 /// One emulator: a single shared engine with this one service mounted on it.
-struct Emulator {
+///
+/// `pub(crate)` so every suite in this test target drives the emulator the same way
+/// rather than building a second harness beside this one.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -49,7 +72,7 @@ impl Emulator {
     }
 
     /// Dispatch one operation and return `(http status, parsed body)`.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = ::http::Request::builder()
             .method("POST")
             .uri("/")
@@ -65,7 +88,7 @@ impl Emulator {
     }
 
     /// Dispatch one operation that must succeed, and return its body.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let (status, parsed) = self.call(operation, &body).await;
         assert_eq!(
             status, 200,
@@ -75,21 +98,13 @@ impl Emulator {
     }
 
     /// Dispatch one operation that must fail, and return `(status, error code)`.
-    async fn err(&self, operation: &str, body: Value) -> (u16, String) {
+    pub(crate) async fn err(&self, operation: &str, body: Value) -> (u16, String) {
         let (status, parsed) = self.call(operation, &body).await;
         assert_ne!(
             status, 200,
             "case {operation} {body}: expected a failure, got HTTP 200 with {parsed}"
         );
-        let code = parsed
-            .get("__type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .rsplit(['#', '/'])
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        (status, code)
+        (status, error_code(&parsed).to_string())
     }
 
     /// Read or write the stored state directly, WITHOUT going through a handler — so
@@ -135,7 +150,7 @@ impl Emulator {
     }
 
     /// Make every plan's pending transition due, so the next call settles it.
-    fn make_all_due(&self) {
+    pub(crate) fn make_all_due(&self) {
         self.with_state(|state| {
             let past = SystemTime::now() - Duration::from_secs(1);
             for plan in state.scaling_plans.values_mut() {
@@ -176,7 +191,7 @@ fn instruction(
 }
 
 /// The one-instruction plan body most tests start from.
-fn simple_instructions() -> Vec<Value> {
+pub(crate) fn simple_instructions() -> Vec<Value> {
     vec![instruction(
         "autoscaling",
         "autoScalingGroup/my-asg",
@@ -189,7 +204,7 @@ fn simple_instructions() -> Vec<Value> {
 }
 
 /// A CloudFormation-stack application source, distinct per `n`.
-fn stack_source(n: usize) -> Value {
+pub(crate) fn stack_source(n: usize) -> Value {
     json!({
         "CloudFormationStackARN":
             format!("arn:aws:cloudformation:us-east-1:000000000000:stack/s{n}/abc")

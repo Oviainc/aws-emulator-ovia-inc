@@ -167,13 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation models no not-found error, so an unknown plan (or a version
         // this service does not have) is refused as a validation issue rather than
-        // answered with an empty 200.
+        // answered with an empty 200 — carrying the same request-derived not-found
+        // wording as the operations that do model `ObjectNotFoundException`.
         let plan = state
             .plan(&input.scaling_plan_name, input.scaling_plan_version)
             .ok_or_else(|| {
-                validation(format!(
-                    "No scaling plan found with name '{}' and version {}",
-                    input.scaling_plan_name, input.scaling_plan_version
+                validation(crate::state::plan_not_found_message(
+                    &input.scaling_plan_name,
+                    input.scaling_plan_version,
                 ))
             })?;
 

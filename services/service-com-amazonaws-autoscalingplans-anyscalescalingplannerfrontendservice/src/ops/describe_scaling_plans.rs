@@ -159,11 +159,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let names = input.scaling_plan_names.unwrap_or_default();
         let sources = input.application_sources.unwrap_or_default();
 
-        // "If you specify application sources, you cannot specify scaling plan names."
-        if !names.is_empty() && !sources.is_empty() {
-            return Err(validation(
-                "ScalingPlanNames and ApplicationSources cannot both be specified",
-            ));
+        // "If you specify application sources, you cannot specify scaling plan names",
+        // and `ScalingPlanVersion` is part of the name-based selector ("If you specify a
+        // scaling plan version, you must also specify a scaling plan name"), so
+        // application sources conflict with either of them. AWS refuses the whole
+        // conflict with one fixed sentence.
+        if !sources.is_empty() && (!names.is_empty() || input.scaling_plan_version.is_some()) {
+            return Err(validation(APPLICATION_SOURCES_CONFLICT));
         }
         // "The names of the scaling plans (up to 10)."
         if names.len() > MAX_PLAN_NAMES {
@@ -243,6 +245,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// `ScalingPlanNames` is documented as "The names of the scaling plans (up to 10)".
 const MAX_PLAN_NAMES: usize = 10;
+
+/// AWS's fixed refusal for a request that selects by application source AND by the
+/// name-based selector (`ScalingPlanNames` and/or `ScalingPlanVersion`) at once.
+const APPLICATION_SOURCES_CONFLICT: &str =
+    "Application sources cannot be provided with scaling plan names or version";
 
 /// Namespace for this operation's `NextToken` cursors.
 const CURSOR_KIND: &str = "plans";

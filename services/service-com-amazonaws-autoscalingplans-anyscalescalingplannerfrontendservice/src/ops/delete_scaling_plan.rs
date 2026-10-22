@@ -150,9 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let plan = state
             .plan_mut(&input.scaling_plan_name, input.scaling_plan_version)
             .ok_or_else(|| {
-                not_found(format!(
-                    "No scaling plan found with name '{}' and version {}",
-                    input.scaling_plan_name, input.scaling_plan_version
+                not_found(crate::state::plan_not_found_message(
+                    &input.scaling_plan_name,
+                    input.scaling_plan_version,
                 ))
             })?;
 

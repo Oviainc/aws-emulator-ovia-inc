@@ -292,6 +292,18 @@ pub fn validate_application_source(source: &ApplicationSource) -> Result<String,
     }
 }
 
+/// AWS's wording for "the name and version in this request name no stored plan",
+/// built from the request's own `ScalingPlanName` and `ScalingPlanVersion`.
+///
+/// Every operation that looks a plan up by name and version refuses with this one
+/// text, whatever error shape it models the refusal in (`ObjectNotFoundException`
+/// where the operation models it, `ValidationException` where it does not), so a
+/// client that discriminates not-found variants by message reads the same sentence
+/// on every path.
+pub fn plan_not_found_message(name: &str, version: i64) -> String {
+    format!("No scaling plan found for scaling plan name: {name}, version: {version}")
+}
+
 /// Encode a pagination cursor as an opaque token.
 ///
 /// The `kind` prefix is part of the encoded value, so a token minted by one
