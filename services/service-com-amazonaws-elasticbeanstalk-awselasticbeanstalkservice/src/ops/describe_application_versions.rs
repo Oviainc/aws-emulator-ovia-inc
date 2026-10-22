@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeApplicationVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeApplicationVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeApplicationVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the application versions the store holds, restricted to the
+//! `ApplicationName` and `VersionLabels` the request filters on and paginated by
+//! `MaxRecords`/`NextToken`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +146,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeApplicationVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeApplicationVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeApplicationVersions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeApplicationVersionsError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        // A report: the store is only READ here. Nothing about an application
+        // version changes with the clock, so this operation owes no
+        // materialisation either.
+        let store = state.lock();
+
+        // Both members are filters over the stored versions: "Specify an
+        // application name to show only application versions for that
+        // application" and "Specify a version label to show a specific
+        // application version". A filter that matches nothing contributes no
+        // description rather than failing the call, so an application that does
+        // not exist is reported as holding no versions.
+        let mut matching: Vec<&crate::state::ApplicationVersion> = store
+            .application_versions
+            .values()
+            .filter(|version| {
+                input
+                    .application_name
+                    .as_ref()
+                    .is_none_or(|name| version.application_name == *name)
+            })
+            .filter(|version| {
+                input
+                    .version_labels
+                    .as_ref()
+                    .is_none_or(|labels| labels.contains(&version.version_label))
+            })
+            .collect();
+        // "List of ApplicationVersionDescription objects sorted in order of
+        // creation": the most recently created version first, the order an
+        // `ApplicationDescription`'s `Versions` list is reported in too. The
+        // store's creation sequence makes that a total order even for versions
+        // created inside one clock tick, so the order — and with it the page
+        // boundary below — is stable across calls.
+        matching.sort_by_key(|version| std::cmp::Reverse(version.sequence));
+
+        // "If no MaxRecords is specified, all available application versions
+        // are retrieved in a single response." The continuation token is the
+        // ARN of the first version of the next page, which identifies that
+        // version within the same filtered order on every later page.
+        let offset = match input.next_token.as_deref() {
+            Some(token) => matching
+                .iter()
+                .position(|version| version.arn == token)
+                .ok_or_else(|| {
+                    DescribeApplicationVersionsError::invalid_parameter_value(format!(
+                        "Invalid NextToken: {token}"
+                    ))
+                })?,
+            None => 0,
+        };
+        let page = &matching[offset..];
+        // `MaxRecords` is modelled `range 1..1000`, so the boundary validator
+        // has already refused anything outside that before this handler runs:
+        // the conversion cannot see a non-positive page size, and the guard
+        // keeps it from inventing an empty page with a continuation token if a
+        // future model widens the range.
+        let max_records = input
+            .max_records
+            .and_then(|max_records| usize::try_from(max_records).ok())
+            .filter(|max_records| *max_records > 0);
+        let (page, next_token) = match max_records {
+            Some(max_records) if page.len() > max_records => {
+                (&page[..max_records], Some(page[max_records].arn.clone()))
+            }
+            _ => (page, None),
+        };
+
+        let application_versions = page
+            .iter()
+            .map(|version| version.to_description())
+            .collect();
+
+        Ok(DescribeApplicationVersionsOutput {
+            application_versions: Some(application_versions),
+            next_token,
+        })
     }
 }
