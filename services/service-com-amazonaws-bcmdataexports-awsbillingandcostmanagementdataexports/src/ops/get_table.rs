@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one entry of this service's table catalog: the table the request names, the
+//! table properties in force for it (the request's values over the catalog's defaults),
+//! and the schema those properties select. Reporting only — the catalog is fixed service
+//! data held in [`crate::state`], so nothing a caller does changes what a later caller
+//! reads.
+//!
+//! A `TableName` the catalog does not publish, a table property the named table does not
+//! publish, or a property value outside that property's valid values is refused with the
+//! modelled `ValidationException` (HTTP 400): none of them names a configuration of a
+//! table, so there is no schema to report for it.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +154,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTable"))
+        // The catalog this operation reports is service data, not per-account state:
+        // neither the engine nor the request's metadata selects an entry of it.
+        let _ = (ctx, &self.engine);
+
+        let table = crate::state::table_spec(&input.table_name).ok_or_else(|| {
+            GetTableErrorModeled::ValidationException(crate::state::unknown_table(
+                &input.table_name,
+            ))
+        })?;
+
+        // Every property the table publishes, at the requested value where the request
+        // names it and at the catalog default otherwise — so the response says which
+        // configuration the reported schema belongs to, including the defaults the
+        // request left unsaid.
+        let properties = table
+            .effective_properties(input.table_properties.as_ref())
+            .map_err(GetTableErrorModeled::ValidationException)?;
+        let schema = table.schema(&properties);
+
+        Ok(GetTableOutput {
+            table_name: Some(table.name.to_string()),
+            description: Some(table.description.to_string()),
+            // A table that publishes no properties has no configuration to report, so
+            // the member is absent rather than an empty map.
+            table_properties: (!properties.is_empty())
+                .then(|| properties.into_iter().collect()),
+            schema: Some(schema),
+        })
     }
 }

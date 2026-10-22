@@ -46,12 +46,12 @@ const NAME_MAX_LEN: usize = 128;
 
 /// An in-process client: the one shared engine, this service mounted on a router, and a
 /// signed-looking request per call.
-struct Client {
+pub(crate) struct Client {
     router: MultiServiceRouter,
 }
 
 impl Client {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The signature itself is not under test here; routing and the handlers are.
@@ -62,7 +62,7 @@ impl Client {
 
     /// Call `operation` with `body`, signed for [`REGION`], and return the HTTP status
     /// and the parsed JSON body.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.call_in_region(REGION, operation, body).await
     }
 
@@ -104,7 +104,7 @@ impl Client {
     }
 
     /// Call `operation`, requiring a 200, and return the response body.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(status, 200, "{operation}: expected HTTP 200, got {status} with {parsed}");
         parsed
@@ -123,7 +123,7 @@ impl Client {
 
 /// The wire error code of a modelled failure: awsJson carries it in `__type`, optionally
 /// namespace-qualified.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     let raw = body
         .get("__type")
         .and_then(Value::as_str)

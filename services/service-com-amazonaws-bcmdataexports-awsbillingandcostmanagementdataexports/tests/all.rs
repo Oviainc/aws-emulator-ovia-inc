@@ -15,3 +15,5 @@
 mod export_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/table_catalog.rs"]
+mod table_catalog;
