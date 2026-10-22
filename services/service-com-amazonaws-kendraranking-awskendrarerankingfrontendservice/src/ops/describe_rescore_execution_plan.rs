@@ -4,7 +4,8 @@
 //!
 //! Reports the plan `CreateRescoreExecutionPlan` persisted under `Id`, member for
 //! member, and answers `ResourceNotFoundException` for an id the store does not
-//! hold. A pure read: it writes nothing.
+//! hold. A pure read: a transition the clock already owes (`CREATING` -> `ACTIVE`,
+//! `UPDATING` -> `ACTIVE`) is reported as due without writing anything.
 //!
 //! ## Shape of an operation
 //!
@@ -192,12 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(plan) = store.plans.get(&input.id) else {
             return Err(
                 DescribeRescoreExecutionPlanErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Rescore execution plan {} was not found.",
-                            input.id
-                        )),
-                    },
+                    crate::state::plan_not_found(),
                 )
                 .into(),
             );

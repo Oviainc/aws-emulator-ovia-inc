@@ -3,7 +3,9 @@
 //! @op Rescore
 //!
 //! Ranks the SUBMITTED documents for the submitted query under the named rescore
-//! execution plan, which must exist in this service's store. Every result item names a
+//! execution plan, which must exist in this service's store and must have reached
+//! `ACTIVE` — a plan still `CREATING` is refused with the modelled `ValidationException`
+//! ("When the value is ACTIVE, the rescore execution plan is ready for use."). Every result item names a
 //! document the request carried, with a score computed from that document's own text
 //! and original score, and the list is ordered by descending score.
 //!
@@ -196,10 +198,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 400 before any scoring runs, so one request cannot multiply work without bound.
         if input.documents.len() > crate::state::MAX_DOCUMENTS_PER_RESCORE {
             return Err(RescoreErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "Documents carries {} documents; at most {} may be rescored in one request.",
-                    input.documents.len(),
-                    crate::state::MAX_DOCUMENTS_PER_RESCORE
+                message: Some(crate::state::constraint_report(
+                    DOCUMENTS_MEMBER,
+                    ::smithy_server_runtime::ViolationKind::MaxLength(
+                        crate::state::MAX_DOCUMENTS_PER_RESCORE as i64,
+                    ),
                 )),
             })
             .into());
@@ -229,27 +232,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The store is consulted only to answer whether the plan exists and to mint this
-        // ranking's identifier; the guard is dropped before any caller-sized scoring, so
-        // one request's batch never runs under the shared-state lock.
-        let rescore_id = {
+        // The store is consulted only to answer whether the plan exists, whether it is
+        // ready to serve, and to mint this ranking's identifier; the guard is dropped
+        // before any caller-sized scoring, so one request's batch never runs under the
+        // shared-state lock.
+        enum PlanState {
+            Missing,
+            NotActive,
+            Ready(String),
+        }
+        let plan_state = {
             let mut store = state.lock();
-            if store.plans.contains_key(&input.rescore_execution_plan_id) {
-                Some(store.next_id(crate::state::now_millis()))
-            } else {
-                None
+            let now = crate::state::now_millis();
+            // A transition the clock already owes is reported as due, so a plan whose
+            // transient span has passed serves this call even if nobody polled it.
+            match store.plans.get(&input.rescore_execution_plan_id) {
+                None => PlanState::Missing,
+                Some(plan) if plan.status_at(now) != crate::state::STATUS_ACTIVE => {
+                    PlanState::NotActive
+                }
+                Some(_) => PlanState::Ready(store.next_id(now)),
             }
         };
-        let Some(rescore_id) = rescore_id else {
-            return Err(RescoreErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "Rescore execution plan {} was not found.",
-                        input.rescore_execution_plan_id
-                    )),
-                },
-            )
-            .into());
+        let rescore_id = match plan_state {
+            // A plan the store does not hold: the resource-not-found error, with this
+            // service's constant not-found message.
+            PlanState::Missing => {
+                return Err(RescoreErrorModeled::ResourceNotFoundException(
+                    crate::state::plan_not_found(),
+                )
+                .into())
+            }
+            // The plan exists but has not reached ACTIVE, so it cannot serve the data
+            // plane yet ("When the value is ACTIVE, the rescore execution plan is ready
+            // for use."): the modelled 400, not a served ranking.
+            PlanState::NotActive => {
+                return Err(
+                    RescoreErrorModeled::ValidationException(crate::state::plan_not_active()).into(),
+                )
+            }
+            PlanState::Ready(rescore_id) => rescore_id,
         };
 
         let query_terms = distinct_query_terms(&input.search_query);
@@ -287,6 +309,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The validation-path name of the `Documents` input member: a validation report names
+/// a member in lowerCamel, which is the report's casing convention applied to the
+/// Smithy member name, not a fact of the model.
+const DOCUMENTS_MEMBER: &str = "documents";
 
 /// How much of the blended score the document's own original score contributes.
 /// Emulator-chosen: see the caveat in this module's documentation.

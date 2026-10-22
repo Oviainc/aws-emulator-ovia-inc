@@ -14,12 +14,14 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, call_in, create_plan, emulator, error_code};
+use crate::harness::{
+    call, call_in, create_active_plan, create_plan, emulator, error_code,
+    sleep_past_the_transition,
+};
 
 /// A 36-character `RescoreExecutionPlanId` that no `CreateRescoreExecutionPlan` call in
 /// these tests mints, for the not-found cases.
 const UNKNOWN_PLAN_ID: &str = "00000000-0000-4000-8000-000000000000";
-
 
 /// The `DocumentId`s of a `Rescore` answer, in the order the service returned them.
 fn result_document_ids(body: &Value) -> Vec<String> {
@@ -73,7 +75,9 @@ async fn the_plan_lifecycle_is_served_from_the_persisted_plan() {
         "create: unexpected Arn {arn}"
     );
 
-    // DESCRIBE — every member read back from what create persisted.
+    // DESCRIBE — every member read back from what create persisted. Creation is
+    // asynchronous, so the first read still reports the transient CREATING status; the
+    // plan is read again below once the clock owes it ACTIVE.
     let (status, described) =
         call(&router, "DescribeRescoreExecutionPlan", json!({ "Id": id })).await;
     assert_eq!(status, 200, "describe: unexpected answer {described}");
@@ -96,8 +100,8 @@ async fn the_plan_lifecycle_is_served_from_the_persisted_plan() {
     );
     assert_eq!(
         described["Status"],
-        json!("ACTIVE"),
-        "describe: got {described}"
+        json!("CREATING"),
+        "describe: a plan whose creation has not settled is CREATING, got {described}"
     );
     assert!(
         described["CreatedAt"].is_number() && described["UpdatedAt"].is_number(),
@@ -118,10 +122,31 @@ async fn the_plan_lifecycle_is_served_from_the_persisted_plan() {
     assert_eq!(summaries.len(), 1, "list: got {listed}");
     assert_eq!(summaries[0]["Id"], json!(id), "list: got {listed}");
     assert_eq!(summaries[0]["Name"], json!("my-plan"), "list: got {listed}");
-    assert_eq!(summaries[0]["Status"], json!("ACTIVE"), "list: got {listed}");
+    assert_eq!(
+        summaries[0]["Status"],
+        json!("CREATING"),
+        "list: a listing reports the same status as a describe, got {listed}"
+    );
     assert!(
         listed["NextToken"].is_null(),
         "list: the final page carries no NextToken, got {listed}"
+    );
+
+    // The clock owes CREATING -> ACTIVE: once it is due, every reader reports ACTIVE.
+    sleep_past_the_transition();
+    let (status, described) =
+        call(&router, "DescribeRescoreExecutionPlan", json!({ "Id": id })).await;
+    assert_eq!(status, 200, "describe after settling: got {described}");
+    assert_eq!(
+        described["Status"],
+        json!("ACTIVE"),
+        "describe after settling: got {described}"
+    );
+    let (_, listed) = call(&router, "ListRescoreExecutionPlans", json!({})).await;
+    assert_eq!(
+        listed["SummaryItems"][0]["Status"],
+        json!("ACTIVE"),
+        "list after settling: got {listed}"
     );
 
     // RESCORE — one scored item per submitted document, under the live plan.
@@ -230,7 +255,8 @@ async fn repeating_a_client_token_returns_the_one_plan_it_created() {
 async fn an_id_no_plan_was_created_for_is_not_found_on_every_operation_that_addresses_one() {
     let router = emulator();
     // A live plan beside it, so the 404 is about the id and not about an empty store.
-    let live = create_plan(&router, "live-plan").await;
+    // ACTIVE, so the delete below is about the id and not about the plan's status.
+    let live = create_active_plan(&router, "live-plan").await;
 
     let cases: Vec<(&str, Value)> = vec![
         (
@@ -297,7 +323,7 @@ struct RescoreCase {
 #[tokio::test]
 async fn rescore_ranks_exactly_the_submitted_documents_by_descending_score() {
     let router = emulator();
-    let plan = create_plan(&router, "ranking-plan").await;
+    let plan = create_active_plan(&router, "ranking-plan").await;
 
     // The rows differ along document count, which text fields carry the query's terms,
     // the text vs. pre-tokenized form of those fields, the sign and magnitude of
@@ -435,7 +461,7 @@ async fn rescore_ranks_exactly_the_submitted_documents_by_descending_score() {
 #[tokio::test]
 async fn a_pre_tokenized_field_scores_the_same_as_its_text_form() {
     let router = emulator();
-    let plan = create_plan(&router, "tokenized-plan").await;
+    let plan = create_active_plan(&router, "tokenized-plan").await;
 
     // `Title`/`TokenizedTitle` and `Body`/`TokenizedBody` are two forms of one field,
     // so the same words must score the same whichever form carries them.
@@ -577,7 +603,7 @@ async fn a_pagination_token_this_service_did_not_issue_is_refused() {
 #[tokio::test]
 async fn a_request_outside_a_constraint_is_refused_with_validation_exception() {
     let router = emulator();
-    let plan = create_plan(&router, "validating-plan").await;
+    let plan = create_active_plan(&router, "validating-plan").await;
 
     // One row per constraint class: the name's pattern and length, an absent required
     // member, the empty document list, a value outside a published numeric range, an id
@@ -750,8 +776,9 @@ async fn a_plan_past_the_quota_is_refused_with_the_modelled_quota_error() {
     );
 
     // Deleting a plan frees its slot, so the quota is a live count and not a one-way
-    // latch.
+    // latch. The plan has to be ACTIVE first: a delete mid-provisioning is a conflict.
     let freed = first_listed_plan(&router).await;
+    sleep_past_the_transition();
     let (status, deleted) = call(
         &router,
         "DeleteRescoreExecutionPlan",

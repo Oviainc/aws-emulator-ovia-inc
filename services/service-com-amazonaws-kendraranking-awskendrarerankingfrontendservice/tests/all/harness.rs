@@ -7,12 +7,25 @@
 //! assert, not in how they reach the service.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_kendraranking_awskendrarerankingfrontendservice::state;
 use service_com_amazonaws_kendraranking_awskendrarerankingfrontendservice::EmulatedService;
+
+/// The error message of an error body, under either casing the protocols render the
+/// member with.
+pub fn error_message(body: &Value) -> String {
+    for key in ["Message", "message"] {
+        if let Some(text) = body[key].as_str() {
+            return text.to_string();
+        }
+    }
+    String::new()
+}
 
 /// The `X-Amz-Target` prefix every request to this awsJson1_0 service carries (see the
 /// crate's `OPERATIONS.md`).
@@ -73,7 +86,9 @@ pub fn error_code(body: &Value) -> String {
     raw.rsplit('#').next().unwrap_or(raw).to_string()
 }
 
-/// Create a plan named `name` and return its id.
+/// Create a plan named `name` and return its id. The plan is `CREATING` when this
+/// returns: creation is asynchronous, and the clock owes it `ACTIVE`. Use
+/// [`create_active_plan`] where the test needs a plan ready to serve.
 pub async fn create_plan(router: &MultiServiceRouter, name: &str) -> String {
     let (status, body) = call(router, "CreateRescoreExecutionPlan", json!({ "Name": name })).await;
     assert_eq!(status, 200, "create {name}: unexpected answer {body}");
@@ -81,4 +96,22 @@ pub async fn create_plan(router: &MultiServiceRouter, name: &str) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("create {name}: no Id in {body}"))
         .to_string()
+}
+
+/// Wait until the clock owes every plan created before this call its settled status
+/// (`CREATING` -> `ACTIVE`, `UPDATING` -> `ACTIVE`), with room to spare.
+///
+/// A BLOCKING sleep rather than `tokio::time::sleep`: the workspace pins tokio without
+/// the `time` feature, and nothing else is pending on this runtime.
+pub fn sleep_past_the_transition() {
+    let span = u64::try_from(state::TRANSIENT_STATUS_MILLIS).unwrap_or(500);
+    std::thread::sleep(Duration::from_millis(span) + Duration::from_millis(250));
+}
+
+/// [`create_plan`], then wait out the transient `CREATING` status so the plan is
+/// `ACTIVE` and can serve `Rescore`.
+pub async fn create_active_plan(router: &MultiServiceRouter, name: &str) -> String {
+    let id = create_plan(router, name).await;
+    sleep_past_the_transition();
+    id
 }

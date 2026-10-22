@@ -8,6 +8,11 @@
 //! `DescribeRescoreExecutionPlan` and `ListRescoreExecutionPlans`. A repeated
 //! `ClientToken` returns the plan that token already created.
 //!
+//! Provisioning is asynchronous: the plan is stored `CREATING` and the clock owes it
+//! `ACTIVE` ([`crate::state::CREATION_TRANSITION_DELAY`]), so a caller reading straight
+//! after this call still sees `CREATING` — and `Rescore` refuses the plan until it is
+//! `ACTIVE`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -192,6 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
+        let now = crate::state::now_millis();
         let mut store = state.lock();
 
         // "Multiple calls to the CreateRescoreExecutionPlanRequest API with the same
@@ -234,7 +240,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A 36-character id in the shape `RescoreExecutionPlanId` models
         // (`length 36..36`, pattern `^[a-zA-Z0-9][a-zA-Z0-9-]*$`), minted by the store so
         // no two plans can share one.
-        let now = crate::state::now_millis();
         let id = store.next_id(now);
         let arn = crate::state::plan_arn(&region, &id);
 
@@ -252,8 +257,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 capacity_units: input.capacity_units,
                 created_at_millis: now,
                 updated_at_millis: now,
-                status: crate::state::STATUS_ACTIVE.to_string(),
-                pending_status: None,
+                // Creating a plan is asynchronous: it is stored CREATING and the clock
+                // owes it ACTIVE a transient span later ("When the value is ACTIVE, the
+                // rescore execution plan is ready for use.").
+                status: crate::state::STATUS_CREATING.to_string(),
+                pending_status: Some(crate::state::PendingStatus::due_after_transient_span(
+                    crate::state::STATUS_ACTIVE,
+                    now,
+                )),
                 error_message: None,
                 tags: input.tags.unwrap_or_default(),
             },

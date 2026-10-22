@@ -191,12 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(plan) = store.plans.get_mut(&input.id) else {
             return Err(
                 DeleteRescoreExecutionPlanErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(format!(
-                            "Rescore execution plan {} was not found.",
-                            input.id
-                        )),
-                    },
+                    crate::state::plan_not_found(),
                 )
                 .into(),
             );

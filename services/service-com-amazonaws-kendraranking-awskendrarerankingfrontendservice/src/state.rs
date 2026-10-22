@@ -4,25 +4,177 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::ops::types::{CapacityUnitsConfiguration, Tag};
+use smithy_server_runtime::{Violation, ViolationKind};
+
+use crate::ops::types::{
+    CapacityUnitsConfiguration, ResourceNotFoundException, Tag, ValidationException,
+};
 
 /// The `RescoreExecutionPlanStatus` value a plan that is ready to serve `Rescore`
 /// carries ("When the value is `ACTIVE`, the rescore execution plan is ready for
 /// use." — `RescoreExecutionPlanSummary$Status` in the model).
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 
+/// The `RescoreExecutionPlanStatus` value a plan carries while the service is still
+/// provisioning a freshly created plan (`CREATING` is one of the five values
+/// `RescoreExecutionPlanStatus` models). Creating a rescore execution plan is
+/// asynchronous: the plan is reported in this non-terminal status first and only then
+/// becomes [`STATUS_ACTIVE`], which is what makes polling
+/// `DescribeRescoreExecutionPlan` until `ACTIVE` the documented way to use one
+/// (`DescribeRescoreExecutionPlanResponse$Status`: "When the value is ACTIVE, the
+/// rescore execution plan is ready for use.").
+pub const STATUS_CREATING: &str = "CREATING";
+
+/// How this service states that a rescore execution plan id names no plan it holds.
+///
+/// A CONSTANT, request-independent sentence: the service names the resource class that
+/// was not found and never echoes the identifier it was asked for, so the same text
+/// answers an id that never existed and an id whose plan was deleted.
+pub const PLAN_NOT_FOUND_MESSAGE: &str = "The specified Resource Execution Plan ID does not exist.";
+
+/// How this service states that a plan exists but is not [`STATUS_ACTIVE`] yet, so it
+/// cannot serve the data plane. Request-independent, like [`PLAN_NOT_FOUND_MESSAGE`].
+pub const PLAN_NOT_ACTIVE_MESSAGE: &str =
+    "Rescore Execution Plan status is invalid, must be in ACTIVE state";
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for a plan id the store does not
+/// hold — the ONE place that message is built, so every plan-lookup path states it
+/// identically.
+pub fn plan_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(PLAN_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// The modelled `ValidationException` (HTTP 400) a data-plane call against a plan that
+/// is not [`STATUS_ACTIVE`] is refused with.
+pub fn plan_not_active() -> ValidationException {
+    ValidationException {
+        message: Some(PLAN_NOT_ACTIVE_MESSAGE.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The validation report this service answers a constraint violation with.
+//
+// Two rules, both this service's own rendering of the standard AWS report, and
+// both applied to EVERY constraint class and every operation (the boundary
+// validator reaches them through `service.rs`'s `override_refusal`):
+//
+// * a clause names WHERE the offending value was and WHAT it had to satisfy, and
+//   never renders the value itself;
+// * a `@pattern` requirement quotes the expression WITHOUT the `^` / `$` the model
+//   spells it with, which is the expression the service advertises.
+// ---------------------------------------------------------------------------
+
+/// The error code every refusal this service rewords answers with: the same code the
+/// modelled `ValidationException` (HTTP 400) already carries, so rewording the body
+/// never moves a client off the code it branches on.
+pub const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The text [`Violation::message`] puts between the offending value's position and the
+/// requirement it failed.
+///
+/// The LAST occurrence is the real separator: a requirement never contains this text,
+/// while a caller-supplied value interpolated before it might.
+const CONSTRAINT_SEPARATOR: &str = " failed to satisfy constraint: ";
+
+/// A `@pattern` expression without the anchors a model may spell it with. A `$` escaped
+/// by a backslash is a literal dollar sign inside the expression, not the end anchor, so
+/// it stays.
+fn unanchored(pattern: &str) -> &str {
+    let body = pattern.strip_prefix('^').unwrap_or(pattern);
+    match body.strip_suffix('$') {
+        Some(trimmed) => {
+            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
+            if backslashes % 2 == 0 {
+                trimmed
+            } else {
+                body
+            }
+        }
+        None => body,
+    }
+}
+
+/// One clause of the validation report: WHERE the offending value was, and WHAT it had
+/// to satisfy. The value itself is never part of a clause.
+pub fn clause(member: &str, requirement: &str) -> String {
+    format!("Value at '{member}' failed to satisfy constraint: {requirement}")
+}
+
+/// The standard AWS validation report around `clauses`: the violation count, then every
+/// clause joined with `; `.
+pub fn validation_report(clauses: &[String]) -> String {
+    match clauses {
+        [single] => format!("1 validation error detected: {single}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
+}
+
+/// The clause one [`Violation`] states under this service's rules.
+///
+/// The requirement is lifted out of the framework's OWN rendering of the violation
+/// rather than re-spelled here, so every constraint class is worded exactly as the
+/// boundary validator words it; only the `@pattern` expression is rewritten, and only to
+/// drop its anchors. What the clause drops is the rendering of the value.
+fn violation_clause(violation: &Violation) -> String {
+    let advertised = match &violation.kind {
+        ViolationKind::Pattern(pattern) => Violation {
+            path: violation.path.clone(),
+            kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
+            value: violation.value.clone(),
+        },
+        _ => violation.clone(),
+    };
+    let rendered = advertised.message();
+    match rendered.rsplit_once(CONSTRAINT_SEPARATOR) {
+        // A member that was ABSENT has no value to omit, and the framework's own clause
+        // already says exactly that (`Value null at '<member>' …`), so it stands.
+        Some((_, requirement)) if violation.value.is_some() => clause(&violation.path, requirement),
+        _ => rendered,
+    }
+}
+
+/// The report for every constraint violation the boundary validator found, in the order
+/// it found them. This is what `service.rs`'s `override_refusal` answers with.
+pub fn refusal_report(violations: &[Violation]) -> String {
+    let clauses: Vec<String> = violations.iter().map(violation_clause).collect();
+    validation_report(&clauses)
+}
+
+/// The report for one member that failed `kind`, for a handler stating a constraint the
+/// model cannot express itself.
+pub fn constraint_report(member: &str, kind: ViolationKind) -> String {
+    validation_report(&[violation_clause(&Violation {
+        path: member.to_string(),
+        kind,
+        // A PRESENT value selects the value-omitting clause rather than the `Value null`
+        // one an absent member gets. What it holds is irrelevant: the value never
+        // reaches the body.
+        value: Some(String::new()),
+    })])
+}
+
 /// The `RescoreExecutionPlanStatus` value a plan carries while the service
 /// re-provisions it for an `UpdateRescoreExecutionPlan` call (`UPDATING` is one of the
 /// five values `RescoreExecutionPlanStatus` models).
 pub const STATUS_UPDATING: &str = "UPDATING";
 
-/// How long a plan a mutating call put into a transient status stays there before the
-/// clock owes it its settled status.
+/// How long a plan the service put into a transient status stays there before the
+/// clock owes it its settled status — a freshly created plan's `CREATING` -> `ACTIVE`
+/// and an updated plan's `UPDATING` -> `ACTIVE` alike.
 ///
-/// The model publishes no duration for the transition and the service re-provisions the
+/// The model publishes no duration for either transition and the service provisions the
 /// plan after the call has returned, so this span is the emulator's own. It is never
-/// zero: a caller acting straight after the mutating call observes the transient status
-/// — and the refusals it causes — exactly as it would on the real service.
+/// zero: a caller acting straight after the call observes the transient status — and the
+/// refusals it causes — exactly as it would on the real service. Nothing sleeps for it:
+/// the due instant is stored and read back through
+/// [`status_at`](RescoreExecutionPlan::status_at).
 pub const TRANSIENT_STATUS_MILLIS: i64 = 500;
 
 /// A status the clock owes a plan: the value the plan takes once `due_millis` has
@@ -33,6 +185,17 @@ pub struct PendingStatus {
     pub status: String,
     /// The instant the settled status comes due, Unix epoch milliseconds.
     pub due_millis: i64,
+}
+
+impl PendingStatus {
+    /// `settled`, due [`TRANSIENT_STATUS_MILLIS`] after `now_millis` — the one place the
+    /// transient span is turned into a due instant.
+    pub fn due_after_transient_span(settled: &str, now_millis: i64) -> Self {
+        Self {
+            status: settled.to_string(),
+            due_millis: now_millis.saturating_add(TRANSIENT_STATUS_MILLIS),
+        }
+    }
 }
 
 /// The signing name / ARN namespace of this service, as the model's
@@ -100,10 +263,7 @@ impl RescoreExecutionPlan {
     /// [`TRANSIENT_STATUS_MILLIS`] later.
     pub fn begin_transition(&mut self, transient: &str, settled: &str, now_millis: i64) {
         self.status = transient.to_string();
-        self.pending_status = Some(PendingStatus {
-            status: settled.to_string(),
-            due_millis: now_millis.saturating_add(TRANSIENT_STATUS_MILLIS),
-        });
+        self.pending_status = Some(PendingStatus::due_after_transient_span(settled, now_millis));
     }
 }
 

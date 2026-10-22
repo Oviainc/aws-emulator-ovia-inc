@@ -15,23 +15,12 @@
 //! * an update addressed to an id no plan was created for is refused with
 //!   `ResourceNotFoundException` (HTTP 404).
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_kendraranking_awskendrarerankingfrontendservice::state;
 
-use crate::harness::{call, create_plan, emulator, error_code};
-
-/// Long enough that the clock already owes the plan its settled status.
-///
-/// A BLOCKING sleep rather than `tokio::time::sleep`: the workspace pins tokio without
-/// the `time` feature, and nothing else is pending on this runtime.
-fn sleep_past_the_transition() {
-    let span = u64::try_from(state::TRANSIENT_STATUS_MILLIS).unwrap_or(500);
-    std::thread::sleep(Duration::from_millis(span) + Duration::from_millis(250));
-}
+use crate::harness::{call, create_plan, emulator, error_code, sleep_past_the_transition};
 
 /// Describe `id`, asserting the call succeeded, and return the body.
 async fn describe(router: &MultiServiceRouter, id: &str) -> Value {
@@ -41,7 +30,8 @@ async fn describe(router: &MultiServiceRouter, id: &str) -> Value {
 }
 
 /// Create a plan with every member set, so an update that carries one member can be
-/// seen to leave the others alone.
+/// seen to leave the others alone, and wait out the transient `CREATING` status so the
+/// plan is `ACTIVE` and can take an update.
 async fn create_full_plan(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = call(
         router,
@@ -54,6 +44,7 @@ async fn create_full_plan(router: &MultiServiceRouter, name: &str) -> String {
     )
     .await;
     assert_eq!(status, 200, "create {name}: got {created}");
+    sleep_past_the_transition();
     created["Id"]
         .as_str()
         .unwrap_or_else(|| panic!("create {name}: no Id in {created}"))
@@ -500,7 +491,6 @@ async fn an_update_touches_only_the_plan_it_addresses() {
     for name in names {
         ids.push(create_full_plan(&router, name).await);
     }
-
     // Update each plan in turn (one per emulator-wide span, so no conflict), and after
     // each one every OTHER plan must still carry the name it was created with.
     for (index, id) in ids.iter().enumerate() {

@@ -40,9 +40,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 /// The `com-amazonaws-kendraranking-awskendrarerankingfrontendservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -98,15 +96,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // ONE class is reworded, and the code is restated unchanged: a constraint
+        // violation is reported as this service's validation report — the violation
+        // count, then one `Value at '<member>' failed to satisfy constraint:
+        // <requirement>` clause per violation, with the offending value never
+        // rendered and a `@pattern` quoted without the model's `^` / `$` anchors.
+        // See `crate::state::refusal_report`. Its code is the one the modelled
+        // `ValidationException` (HTTP 400) already carries, so the rewording never
+        // moves a client off the code it branches on. An authentication refusal
+        // keeps the framework's wording: it is not an input-constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) if !violations.is_empty() => Some(Refused {
+                code: crate::state::VALIDATION_EXCEPTION.to_string(),
+                message: crate::state::refusal_report(violations),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
