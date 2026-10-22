@@ -17,3 +17,5 @@ mod member_accounts;
 mod policy_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tagging_and_managing_admins.rs"]
+mod tagging_and_managing_admins;

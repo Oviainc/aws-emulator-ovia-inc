@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAdminsManagingAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAdminsManagingAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAdminsManagingAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +111,14 @@ impl From<ListAdminsManagingAccountErrorModeled> for ListAdminsManagingAccountEr
     }
 }
 
+/// The largest page this operation serves, whether or not the caller bounds it.
+///
+/// The model's `com.amazonaws.fms#PaginationMaxResults` range is 1..100, so 100
+/// is the largest `MaxResults` a caller can ask for and therefore the largest
+/// page: a caller who sends none gets that bounded page plus a `NextToken`
+/// rather than the whole store in one response.
+const MAX_PAGE_SIZE: usize = 100;
+
 /// The `ListAdminsManagingAccount` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +155,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAdminsManagingAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAdminsManagingAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAdminsManagingAccount"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAdminsManagingAccountErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A token this service did not mint names no page boundary, so the
+        // request's parameters are invalid — the modelled `InvalidInputException`
+        // — rather than a page being invented for it.
+        let start = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_account_page_token(token) {
+                Some(start) => Some(start),
+                None => {
+                    return Err(ListAdminsManagingAccountErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                "NextToken is not a pagination token issued by \
+                                 ListAdminsManagingAccount"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
+
+        let store = state.lock();
+        let admins = store.managing_admin_accounts();
+        // No administrator manages the caller: there is no resource to enumerate
+        // at all, which is the modelled not-found and NOT an empty page — a
+        // caller probing whether it is managed has to be able to tell the two
+        // apart.
+        if admins.is_empty() {
+            return Err(ListAdminsManagingAccountErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(
+                        "no Firewall Manager administrator account manages the calling account"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // `managing_admin_accounts` is ordered, so a page boundary is a key in a
+        // total order: resume at the first account id at or after the token's,
+        // and an association added or removed between pages cannot reshuffle the
+        // ids already returned.
+        let remaining: Vec<&String> = match start.as_deref() {
+            Some(boundary) => admins
+                .iter()
+                .filter(|account| account.as_str() >= boundary)
+                .collect(),
+            None => admins.iter().collect(),
+        };
+
+        // Clamped into 1..=MAX_PAGE_SIZE rather than only capped: the modelled
+        // range already refuses a page size below 1, and this keeps a page from
+        // ever being empty-with-a-token (which a client would follow forever) if
+        // that validation ever changes.
+        let page_size = input
+            .max_results
+            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
+            .clamp(1, MAX_PAGE_SIZE);
+        let admin_accounts: Vec<String> = remaining
+            .iter()
+            .take(page_size)
+            .map(|account| (*account).clone())
+            .collect();
+        // A token only when an account is left AFTER this page, so the last page
+        // carries none.
+        let next_token = remaining
+            .get(page_size)
+            .map(|account| crate::state::encode_page_token(account));
+
+        Ok(ListAdminsManagingAccountOutput {
+            admin_accounts: Some(admin_accounts),
+            next_token,
+        })
     }
 }

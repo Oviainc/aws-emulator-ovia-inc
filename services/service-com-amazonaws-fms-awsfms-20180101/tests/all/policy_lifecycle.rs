@@ -12,6 +12,11 @@
 //! differ in security-service type, in resource-type form (single `ResourceType`
 //! vs a `ResourceTypeList`), in which optional members are present, in tag count
 //! and in policy status. Each rule is asserted on every row.
+//!
+//! The request harness here ([`emulator`], [`call`], [`call_in`], [`error_code`]
+//! and the [`REGION`] / [`ACCOUNT`] constants) is `pub(crate)` so the sibling
+//! suites in this test target drive the service through the SAME wire walk
+//! instead of growing a second copy of it.
 
 use std::sync::Arc;
 
@@ -21,10 +26,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region the test requests are signed for. Deliberately not the emulator's
 /// `us-east-1` default, so an ARN built from the default would not pass.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// A fresh emulator: one shared engine, this service mounted on a router.
 ///

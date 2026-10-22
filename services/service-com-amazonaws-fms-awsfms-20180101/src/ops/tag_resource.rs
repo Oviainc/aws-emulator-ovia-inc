@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +106,32 @@ impl From<TagResourceErrorModeled> for TagResourceError {
     }
 }
 
+/// The number of tags one Firewall Manager resource can carry.
+///
+/// The MODELLED bound, not an emulator-chosen one: every tag set this service
+/// reports or accepts travels as a `com.amazonaws.fms#TagList`, whose length is
+/// 0..200, so a resource holding more could not be read back through
+/// `ListTagsForResource`. A write that would cross it is refused with the
+/// modelled `LimitExceededException`, the error whose own documentation names
+/// "the operation exceeds a resource limit".
+const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The first tag key `tag_list` carries more than once, if any.
+///
+/// Keys are case-SENSITIVE (`com.amazonaws.fms#Tag$Key`: "Tag keys are
+/// case-sensitive"), so `env` and `Env` are two keys, not one repeated.
+fn first_duplicate_key(tag_list: &[Tag]) -> Option<&str> {
+    tag_list
+        .iter()
+        .enumerate()
+        .find(|(index, tag)| {
+            tag_list[..*index]
+                .iter()
+                .any(|earlier| earlier.key == tag.key)
+        })
+        .map(|(_, tag)| tag.key.as_str())
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,18 +168,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The ARN's FORM first: a string that is not an ARN at all is a caller
+        // programming error, refused before anything is looked up or written.
+        // The modelled `ResourceArn` pattern cannot express this, so the service
+        // check does — as a 400 `ValidationException`, never a 501.
+        if let Some(reason) = crate::state::arn_format_error(&input.resource_arn) {
+            return Err(crate::scaffolded::Scaffolded::validation(reason));
+        }
+
+        // One key cannot carry two values, so a request listing a key twice has
+        // no single outcome: it is refused rather than silently resolved.
+        if let Some(duplicate) = first_duplicate_key(&input.tag_list) {
+            return Err(TagResourceErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "TagList contains the tag key {duplicate} more than once"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // A well-formed ARN that names no stored resource is not-found, and the
+        // call must leave NO tag state behind — so the resource is resolved
+        // before any write, and nothing is inserted on this path.
+        let resolved = store
+            .policy_id_for_arn(&input.resource_arn)
+            .and_then(|policy_id| {
+                let record = store.policies.get(&policy_id)?;
+                Some((policy_id, record.policy_arn.clone(), record.tags.clone()))
+            });
+        let Some((policy_id, arn, held)) = resolved else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no Firewall Manager resource with the ARN {}",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Adds one or more tags": a key the resource already carries takes the
+        // new value, a key it does not carry is added, and the keys the request
+        // did not mention are left alone.
+        let mut tags = held;
+        crate::state::merge_tags(&mut tags, &input.tag_list);
+        if tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "a Firewall Manager resource can carry at most \
+                         {MAX_TAGS_PER_RESOURCE} tags; the request would leave {}",
+                        tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `PolicyRecord::tags` is authoritative and `tags_by_arn` is the index
+        // maintained from it, so the record is written first and the index
+        // refreshed from the same value: the two can never disagree.
+        if let Some(record) = store.policies.get_mut(&policy_id) {
+            record.tags = tags.clone();
+        }
+        store.tags_by_arn.insert(arn, tags);
+        Ok(TagResourceOutput {})
     }
 }

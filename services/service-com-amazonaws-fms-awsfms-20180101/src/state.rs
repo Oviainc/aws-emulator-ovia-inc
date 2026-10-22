@@ -129,6 +129,39 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
 }
 
 impl ComAmazonawsFmsAwsfms20180101State {
+    /// The `PolicyId` of the stored policy whose ARN is `arn`, or `None` when no
+    /// stored Firewall Manager resource carries that ARN.
+    ///
+    /// This is the ARN -> resource resolution every tagging operation does
+    /// before it reads or writes a tag: a policy is the only taggable Firewall
+    /// Manager resource this service persists today (applications lists and
+    /// protocols lists are still 501s), so an ARN naming anything else resolves
+    /// to nothing and the caller gets the modelled not-found.
+    pub fn policy_id_for_arn(&self, arn: &str) -> Option<String> {
+        self.policies
+            .iter()
+            .find(|(_, record)| record.policy_arn == arn)
+            .map(|(policy_id, _)| policy_id.clone())
+    }
+
+    /// The Firewall Manager administrator accounts that manage the calling
+    /// account, in account-id order.
+    ///
+    /// An organisation has ONE default administrator and its `AdminScope` is the
+    /// whole organisation, so while an association exists it manages every
+    /// account in that organisation — including the caller. With no association
+    /// there is no administrator to enumerate at all, which the caller is told
+    /// with the modelled `ResourceNotFoundException` rather than an empty page.
+    pub fn managing_admin_accounts(&self) -> Vec<String> {
+        let mut accounts: Vec<String> = self
+            .admin_account
+            .iter()
+            .map(|admin| admin.account_id.clone())
+            .collect();
+        accounts.sort();
+        accounts
+    }
+
     /// The accounts of the administrator's organization this store records, in
     /// ascending account-id order.
     ///
@@ -174,6 +207,59 @@ impl ComAmazonawsFmsAwsfms20180101State {
         }
         accounts
     }
+}
+
+/// Merge `added` into `existing` the way a tag write does: a key already present
+/// takes the new value in place, a key that is new is appended.
+///
+/// Tags are a key:value MAP (`com.amazonaws.fms#Tag` is one key and one value),
+/// so a resource can never hold two values for one key; and "add one or more
+/// tags" leaves the keys the request did not mention alone.
+pub fn merge_tags(existing: &mut Vec<Tag>, added: &[Tag]) {
+    for tag in added {
+        match existing.iter_mut().find(|held| held.key == tag.key) {
+            Some(held) => held.value = tag.value.clone(),
+            None => existing.push(tag.clone()),
+        }
+    }
+}
+
+/// The reason `arn` is not an Amazon Resource Name at all, or `None` when it is
+/// shaped like one.
+///
+/// Firewall Manager checks the FORM of a `ResourceArn` before it looks anything
+/// up, and the modelled `ResourceArn` pattern cannot express it (that pattern
+/// accepts any string of letters, digits and punctuation), so this check lives
+/// here and answers a 400 `ValidationException` — a malformed ARN is a caller
+/// programming error, distinct from an ARN that is well formed but names
+/// nothing.
+///
+/// The form is the documented ARN layout
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`: the literal
+/// `arn` prefix, six colon-separated fields, and a non-empty partition, service
+/// and resource. Region and account id are deliberately allowed to be empty —
+/// ARNs of global and account-less resources leave them so.
+pub fn arn_format_error(arn: &str) -> Option<String> {
+    if !arn.starts_with("arn:") {
+        return Some(format!(
+            "Incorrect arn format. error:ARNs must start with 'arn:': {arn}"
+        ));
+    }
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    if fields.len() < 6 {
+        return Some(format!(
+            "Incorrect arn format. error:ARNs must have six colon-separated fields, \
+             found {}: {arn}",
+            fields.len()
+        ));
+    }
+    let empty = match (fields[1], fields[2], fields[5]) {
+        ("", _, _) => Some("partition"),
+        (_, "", _) => Some("service"),
+        (_, _, "") => Some("resource"),
+        _ => None,
+    };
+    empty.map(|field| format!("Incorrect arn format. error:ARNs must name a {field}: {arn}"))
 }
 
 /// Whether `value` is an `AWSAccountId` as this service's model declares it
@@ -243,7 +329,8 @@ pub fn policy_arn(region: &str, policy_id: &str) -> String {
 }
 
 /// Encode a page boundary (the key the next page starts at — a `PolicyId` for
-/// `ListPolicies`, an account id for `ListMemberAccounts`) as an opaque
+/// `ListPolicies`, an account id for `ListMemberAccounts` and
+/// `ListAdminsManagingAccount`) as an opaque
 /// `PaginationToken`.
 ///
 /// Hex keeps the token inside the modelled `PaginationToken` pattern
@@ -274,8 +361,8 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 /// service.
 ///
 /// The decoded value must still be an `AWSAccountId` ([`is_account_id`]), so a
-/// foreign token that happens to be valid hex is refused rather than resumed
-/// from as an arbitrary key.
+/// token minted for a policy page — or any foreign token that happens to be
+/// valid hex — is refused rather than resumed from as an arbitrary key.
 pub fn decode_account_page_token(token: &str) -> Option<String> {
     let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
     is_account_id(&decoded).then_some(decoded)
