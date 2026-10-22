@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSourceServers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSourceServers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSourceServers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the source servers the store holds, honouring the request's `filters`
+//! and cutting the result into `maxResults`-sized pages. `@readonly` — this handler
+//! never writes. A source server is registered by the replication agent, which this
+//! emulator does not model yet, so an initialized account reports an empty `items`
+//! read from the store rather than a canned list.
 //!
 //! ## Shape of an operation
 //!
@@ -114,6 +111,56 @@ impl From<DescribeSourceServersErrorModeled> for DescribeSourceServersError {
     }
 }
 
+/// Namespaces this operation's `nextToken`, so a token minted by another paginated
+/// DRS operation is refused rather than silently resuming in the wrong collection.
+const PAGE_TOKEN_KIND: &str = "SourceServers";
+
+/// Whether `record` passes every filter the request set.
+///
+/// Each filter member is independent and absent means "do not filter on this":
+/// `sourceServerIDs` and `stagingAccountIDs` are membership tests, and `hardwareId`
+/// matches any of the hardware identifiers the server is known by.
+///
+/// An explicitly EMPTY list (both are modelled `length(min: 0)`) and an empty
+/// `hardwareId` are read the same way as an absent member: a filter that names no
+/// value selects nothing to narrow by, so it narrows nothing. Reading an empty list
+/// as "match no server" would make `filters: {"sourceServerIDs": []}` and
+/// `filters: {}` — two requests that name the same (empty) set of criteria — answer
+/// differently.
+fn matches_filters(
+    record: &crate::state::SourceServerRecord,
+    filters: Option<&DescribeSourceServersRequestFilters>,
+) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+
+    if let Some(ids) = filters.source_server_i_ds.as_deref() {
+        if !ids.is_empty() && !ids.contains(&record.source_server_id) {
+            return false;
+        }
+    }
+
+    if let Some(hardware_id) = filters.hardware_id.as_deref() {
+        if !hardware_id.is_empty() && !record.hardware_ids().iter().any(|id| id == hardware_id) {
+            return false;
+        }
+    }
+
+    if let Some(accounts) = filters.staging_account_i_ds.as_deref() {
+        if !accounts.is_empty()
+            && !record
+                .staging_account_id
+                .as_ref()
+                .is_some_and(|account| accounts.contains(account))
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// The `DescribeSourceServers` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,18 +197,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSourceServers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSourceServersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSourceServers"))
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeSourceServersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        // Shared-reference guard only: `@readonly`, so nothing here mutates the store.
+        let store = state.lock();
+
+        if !store.initialized {
+            return Err(
+                DescribeSourceServersErrorModeled::UninitializedAccountException(
+                    UninitializedAccountException {
+                        message: Some(
+                            "Elastic Disaster Recovery has not been initialized for this account; \
+                             call InitializeService first"
+                                .to_string(),
+                        ),
+                        code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A selection of BORROWS: only the page the caller asked for is rendered to
+        // the wire shape (see `paginate`), so the work under the lock is bounded.
+        let selected: Vec<(&str, &crate::state::SourceServerRecord)> = store
+            .source_servers
+            .iter()
+            .filter(|(_, record)| matches_filters(record, input.filters.as_ref()))
+            .map(|(id, record)| (id.as_str(), record))
+            .collect();
+
+        let page = crate::state::paginate(
+            PAGE_TOKEN_KIND,
+            selected,
+            input.max_results,
+            input.next_token.as_deref(),
+            crate::state::SourceServerRecord::to_wire,
+        )
+        .map_err(|message| {
+            DescribeSourceServersErrorModeled::ValidationException(ValidationException {
+                message: Some(message.clone()),
+                code: None,
+                reason: None,
+                field_list: Some(vec![ValidationExceptionField {
+                    name: Some("nextToken".to_string()),
+                    message: Some(message),
+                }]),
+            })
+        })?;
+
+        Ok(DescribeSourceServersOutput {
+            items: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }

@@ -27,6 +27,8 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# Shipped by the scaffold; left declared so this crate's Cargo.lock entry stays
+# exactly the generated one.
 hex = { workspace = true }
 
 [lints]
