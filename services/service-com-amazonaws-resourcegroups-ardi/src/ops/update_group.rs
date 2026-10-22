@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the describable attributes of a stored group — its description, criticality,
+//! owner and display name — in [`crate::state`] and reports the updated `Group` back. A
+//! member the request omits is left as it stands; the group's name, ARN, query,
+//! configuration, tags and memberships are never touched here.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +163,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGroup"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. `ctx` is read for the audit record
+        // this operation emits.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateGroupErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // Neither member is `@required`, but the operation addresses exactly one
+        // group, so a request naming none cannot be served. `Group` wins over the
+        // deprecated `GroupName`, so the group a request addresses never depends on
+        // which of the two is read.
+        let Some(identifier) = input.group.as_deref().or(input.group_name.as_deref()) else {
+            return Err(UpdateGroupErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "the request must name the group to update, in Group or GroupName"
+                        .to_string(),
+                ),
+            })
+            .into());
+        };
+        let not_found = || {
+            UpdateGroupError::from(UpdateGroupErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
+                },
+            ))
+        };
+        let mut store = state.lock();
+        let name = store.lookup(identifier).ok_or_else(not_found)?;
+        let record = store.groups.get_mut(&name).ok_or_else(not_found)?;
+        // Each attribute is optional and independent: a member the request carries
+        // replaces the stored value (an empty `Description` clears it, which the
+        // modelled 0..1024 length allows), and a member it omits leaves the stored
+        // value alone. The name and the ARN identify the group and are not
+        // updatable at all ("You cannot update the name of a resource group").
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        if let Some(criticality) = input.criticality {
+            record.criticality = Some(criticality);
+        }
+        if let Some(owner) = input.owner {
+            record.owner = Some(owner);
+        }
+        if let Some(display_name) = input.display_name {
+            record.display_name = Some(display_name);
+        }
+        // Reported from the stored record after the change, so the response and the
+        // store cannot disagree: a later `GetGroup` returns exactly this `Group`.
+        let group = record.to_group();
+        // Everything below is owned, so the store lock is released before the record
+        // is formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, where, what, and
+        // the outcome. Metadata only — no description text, no owner — and
+        // request-derived values are `Debug`-escaped so none can split a record.
+        tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            region = ?crate::state::request_region(ctx.parts()),
+            group = ?name,
+            outcome = "updated",
+            "resource group updated",
+        );
+        Ok(UpdateGroupOutput { group: Some(group) })
     }
 }

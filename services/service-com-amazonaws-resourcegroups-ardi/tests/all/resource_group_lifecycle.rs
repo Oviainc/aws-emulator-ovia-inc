@@ -27,16 +27,19 @@ use serde_json::{json, Value};
 use service_com_amazonaws_resourcegroups_ardi::EmulatedService;
 
 /// The emulator's canonical account id, which every ARN it mints carries.
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// One emulator: a shared engine, one registered service, and the router every
 /// request is dispatched through.
-struct Emulator {
+///
+/// Shared with the sibling suites of this test target (see `tests/all.rs`), so
+/// every suite drives the one restJson1 path rather than building its own.
+pub(crate) struct Emulator {
     router: smithy_server_runtime::MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine = Arc::new(engine::InMemoryEngine::new());
         let mut router = smithy_server_runtime::MultiServiceRouter::new();
         // These tests sign nothing, so request authentication is off; the
@@ -49,7 +52,7 @@ impl Emulator {
 
     /// Dispatch `POST <path>` with `body` as the restJson1 payload, signed (in
     /// scope only) for `region`. Returns the status and the parsed body.
-    async fn call_in(&self, region: &str, path: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_in(&self, region: &str, path: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(path)
@@ -80,12 +83,12 @@ impl Emulator {
     }
 
     /// `call_in` in `us-east-1`.
-    async fn call(&self, path: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, path: &str, body: &Value) -> (u16, Value) {
         self.call_in("us-east-1", path, body).await
     }
 
     /// Call `path`, requiring a 200, and return the body.
-    async fn ok(&self, path: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, path: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(path, body).await;
         assert_eq!(status, 200, "POST {path} {body}: expected 200, got {status} {parsed}");
         parsed
@@ -93,7 +96,7 @@ impl Emulator {
 }
 
 /// The error code (`__type`) a failure response carries.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("<none>")
 }
 
@@ -118,7 +121,7 @@ fn is_modelled_token(token: &str) -> bool {
 }
 
 /// The `GroupIdentifiers` names of a `ListGroups` page.
-fn identifier_names(page: &Value) -> Vec<String> {
+pub(crate) fn identifier_names(page: &Value) -> Vec<String> {
     page["GroupIdentifiers"]
         .as_array()
         .expect("GroupIdentifiers is a list")
@@ -430,7 +433,12 @@ async fn an_identifier_that_names_no_stored_group_is_not_found() {
     for (label, identifier) in identifiers {
         let calls = [
             ("/get-group", json!({ "Group": identifier })),
+            ("/get-group-configuration", json!({ "Group": identifier })),
             ("/delete-group", json!({ "Group": identifier })),
+            (
+                "/update-group",
+                json!({ "Group": identifier, "Description": "Nope" }),
+            ),
             (
                 "/group-resources",
                 json!({ "Group": identifier, "ResourceArns": member }),
@@ -444,6 +452,14 @@ async fn an_identifier_that_names_no_stored_group_is_not_found() {
                 (404, "NotFoundException"),
                 "case {label:?} on {path}: expected 404 NotFoundException, \
                  got {status} {answered}",
+            );
+            // Every one of them answers the service's own fixed sentence, which
+            // repeats nothing the caller sent.
+            assert_eq!(
+                answered["Message"].as_str(),
+                Some("The specified group does not exist"),
+                "case {label:?} on {path}: expected the fixed not-found message, \
+                 got {answered}",
             );
         }
     }
@@ -460,7 +476,13 @@ async fn an_identifier_that_names_no_stored_group_is_not_found() {
 #[tokio::test]
 async fn a_request_that_names_no_group_is_a_bad_request() {
     let emulator = Emulator::new();
-    for path in ["/get-group", "/delete-group", "/list-group-resources"] {
+    for path in [
+        "/get-group",
+        "/get-group-configuration",
+        "/delete-group",
+        "/update-group",
+        "/list-group-resources",
+    ] {
         let (status, body) = emulator.call(path, &json!({})).await;
         assert_eq!(
             (status, error_code(&body)),
@@ -1133,10 +1155,12 @@ async fn a_pagination_token_is_only_accepted_by_the_listing_that_issued_it() {
     }
 }
 
-/// A group `Configuration` is answered with 501, not with a group that claims a
-/// configuration nothing holds.
+/// A group `Configuration` is stored, and the configured group is an ordinary
+/// group afterwards. The configuration path itself is covered over a table of
+/// configurations in `tests/all/group_owner_configuration_and_update.rs`; this row
+/// pins that a configured create is persisted rather than refused.
 #[tokio::test]
-async fn creating_a_group_with_a_service_configuration_is_not_implemented() {
+async fn creating_a_group_with_a_service_configuration_stores_the_group() {
     let emulator = Emulator::new();
     let (status, body) = emulator
         .call(
@@ -1148,13 +1172,14 @@ async fn creating_a_group_with_a_service_configuration_is_not_implemented() {
         )
         .await;
     assert_eq!(
-        status, 501,
-        "expected 501 for a configured group, got {status} {body}",
+        status, 200,
+        "expected 200 for a configured group, got {status} {body}",
     );
     let listed = emulator.ok("/groups-list", &json!({})).await;
-    assert!(
-        identifier_names(&listed).is_empty(),
-        "a refused create must store nothing, got {listed}",
+    assert_eq!(
+        identifier_names(&listed),
+        vec!["configured".to_string()],
+        "a stored configured group must appear in the listing, got {listed}",
     );
 }
 
