@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetParameter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetParameter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetParameter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one parameter out of this service's Parameter Store state, at the version
+//! the request's `Name` selector addresses. A pure read: it writes nothing.
+//!
+//! `WithDecryption` does not change the reported value. This emulator stores a
+//! `SecureString`'s value as the `PutParameter` call gave it and holds no KMS
+//! ciphertext, so there is nothing to decrypt and nothing encrypted to report
+//! instead — the flag is accepted and the stored value is answered either way.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +165,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetParameter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetParameterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetParameter"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetParameterErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the Parameter Store is unavailable".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        // "Parameter names can't contain spaces. The service removes any spaces
+        // specified for the beginning or end of a parameter name. If the specified
+        // name for a parameter contains spaces between characters, the request fails
+        // with a ValidationException error."
+        let requested = crate::state::canonical_name(&input.name);
+        if requested.chars().any(char::is_whitespace) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Name {requested:?} contains a space between characters: parameter names can't \
+                 contain spaces"
+            )));
+        }
+
+        let (addressed, selector) = crate::state::split_selector(requested);
+        let record = state.parameter(addressed).ok_or_else(|| {
+            GetParameterErrorModeled::ParameterNotFound(ParameterNotFound {
+                message: Some(format!(
+                    "Parameter {addressed} not found. Verify the name and try again."
+                )),
+            })
+        })?;
+
+        // A selector is either a version number or a label. A version number names a
+        // retained version or nothing; a label resolves no version at all here —
+        // `LabelParameterVersion` is still a scaffold, so nothing can attach one — and
+        // a `name:label` that resolves to nothing is the parameter not being found,
+        // the version-not-found error being about a version number.
+        let version = match selector {
+            None => &record.current,
+            Some(selector) => match selector.parse::<i64>() {
+                Ok(number) => record.version(number).ok_or_else(|| {
+                    GetParameterErrorModeled::ParameterVersionNotFound(ParameterVersionNotFound {
+                        message: Some(format!(
+                            "Version {number} of parameter {} wasn't found. Verify the parameter \
+                             name and version, and try again.",
+                            record.name
+                        )),
+                    })
+                })?,
+                Err(_) => {
+                    return Err(GetParameterErrorModeled::ParameterNotFound(
+                        ParameterNotFound {
+                            message: Some(format!(
+                                "Parameter {} has no version labelled {selector}. Verify the name \
+                                 and try again.",
+                                record.name
+                            )),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        Ok(GetParameterOutput {
+            parameter: Some(record.to_modeled(version, selector.map(str::to_string))),
+        })
     }
 }
