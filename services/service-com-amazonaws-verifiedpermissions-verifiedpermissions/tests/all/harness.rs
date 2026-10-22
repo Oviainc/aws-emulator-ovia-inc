@@ -97,3 +97,14 @@ pub fn error_code(body: &Value) -> String {
         .unwrap_or_default()
         .to_string()
 }
+
+/// The `message` an awsJson1_0 fault carries. The modelled member is `message`;
+/// `Message` is accepted too, so an assertion is about the TEXT rather than
+/// about which spelling the protocol layer emitted.
+pub fn fault_message(body: &Value) -> String {
+    body.get("message")
+        .or_else(|| body.get("Message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}

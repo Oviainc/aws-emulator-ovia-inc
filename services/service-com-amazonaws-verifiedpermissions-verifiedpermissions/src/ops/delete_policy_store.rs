@@ -39,23 +39,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The deletion-protection refusal message, as a CONSTANT.
-///
-/// `com.amazonaws.verifiedpermissions#InvalidStateException` documents one fixed
-/// sentence pair for this refusal ("The policy store can't be deleted because
-/// deletion protection is enabled. ..."), and the recorded service answers the
-/// same constant on every call; the shape's only member is `message`, and
-/// `DeletePolicyStoreInput` carries nothing the service could report back. So no
-/// request value and no minted identifier belongs in this text: a client, test or
-/// log rule that matches it must match it identically for every store. The
-/// wording below is the sentence pair the service emits ON THE WIRE, which is
-/// what a client reads; the shape's documentation states the same fixed refusal
-/// in prose ("The policy store can't be deleted because deletion protection is
-/// enabled. To delete this policy store, disable deletion protection."), so
-/// taking the doc's phrasing instead would diverge from the recorded bytes while
-/// asserting the same rule.
-const DELETION_PROTECTION_MESSAGE: &str = "The policy store cannot be deleted because deletion \
-     protection is enabled. Deletion protection must be disabled first.";
+// The refusal message itself is a CONSTANT shared with the rest of the crate:
+// `crate::state::DELETION_PROTECTION_MESSAGE`, built into the modelled exception
+// by `crate::ops::deletion_protection_enabled()`, so there is exactly one copy
+// of the text and one place that raises this shape.
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -166,9 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "refused: deletion protection enabled",
             );
             return Err(DeletePolicyStoreErrorModeled::InvalidStateException(
-                InvalidStateException {
-                    message: DELETION_PROTECTION_MESSAGE.to_string(),
-                },
+                crate::ops::deletion_protection_enabled(),
             )
             .into());
         }

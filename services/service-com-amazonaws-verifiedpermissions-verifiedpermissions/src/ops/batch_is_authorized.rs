@@ -150,14 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let not_found = || {
-            BatchIsAuthorizedErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "No policy store exists with the input ID: {}",
-                    input.policy_store_id
-                ),
-                resource_id: input.policy_store_id.clone(),
-                resource_type: "POLICY_STORE".to_string(),
-            })
+            BatchIsAuthorizedErrorModeled::ResourceNotFoundException(
+                crate::ops::resource_not_found(&input.policy_store_id, "POLICY_STORE"),
+            )
         };
 
         // The model bounds `requests` below (`@length min 1`) but not above, so the

@@ -17,6 +17,8 @@ mod batch_get_policy;
 mod batch_is_authorized;
 #[path = "all/date_time_wire_format.rs"]
 mod date_time_wire_format;
+#[path = "all/error_messages.rs"]
+mod error_messages;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/identity_sources.rs"]

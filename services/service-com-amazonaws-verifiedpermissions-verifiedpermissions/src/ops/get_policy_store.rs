@@ -87,16 +87,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         // The reference this request named goes in `resourceId`, which the model
-        // makes required for exactly that, so the message is the constant the
-        // recorded responses for this operation's 404 carry — see
-        // [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] for the recording it
-        // comes from.
+        // makes required for exactly that, so the message is the constant every
+        // `ResourceNotFoundException` of this service carries — see
+        // [`crate::state::RESOURCE_NOT_FOUND_MESSAGE`] for the recordings it
+        // comes from, and `crate::ops::resource_not_found` for the one builder
+        // that fills it.
         let not_found = || {
-            GetPolicyStoreErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
-                resource_id: input.policy_store_id.clone(),
-                resource_type: "POLICY_STORE".to_string(),
-            })
+            GetPolicyStoreErrorModeled::ResourceNotFoundException(crate::ops::resource_not_found(
+                &input.policy_store_id,
+                "POLICY_STORE",
+            ))
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

@@ -148,14 +148,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let not_found = || {
-            IsAuthorizedErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "No policy store exists with the input ID: {}",
-                    input.policy_store_id
-                ),
-                resource_id: input.policy_store_id.clone(),
-                resource_type: "POLICY_STORE".to_string(),
-            })
+            IsAuthorizedErrorModeled::ResourceNotFoundException(crate::ops::resource_not_found(
+                &input.policy_store_id,
+                "POLICY_STORE",
+            ))
         };
 
         // Cedar evaluates a request against a complete triple, so each of the

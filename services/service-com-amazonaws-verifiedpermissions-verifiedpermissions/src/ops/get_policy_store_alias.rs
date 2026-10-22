@@ -95,14 +95,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let state = state.lock();
         let alias = state.aliases.get(&input.alias_name).ok_or_else(|| {
-            GetPolicyStoreAliasErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "No policy store alias exists with the input name: {}",
-                    input.alias_name
-                ),
-                resource_id: input.alias_name.clone(),
-                resource_type: "POLICY_STORE_ALIAS".to_string(),
-            })
+            GetPolicyStoreAliasErrorModeled::ResourceNotFoundException(
+                crate::ops::resource_not_found(&input.alias_name, "POLICY_STORE_ALIAS"),
+            )
         })?;
 
         Ok(GetPolicyStoreAliasOutput {
