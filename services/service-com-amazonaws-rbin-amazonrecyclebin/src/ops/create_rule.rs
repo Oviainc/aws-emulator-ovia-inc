@@ -215,14 +215,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ExcludeResourceTags` is "[Region-level retention rules only] ... You can't
         // specify exclusion tags for tag-level retention rules".
         if !resource_tags.is_empty() && !exclude_resource_tags.is_empty() {
-            return Err(CreateRuleErrorModeled::ValidationException(ValidationException {
-                message: Some(
-                    "ExcludeResourceTags can't be specified together with ResourceTags: \
-                     exclusion tags apply to Region-level retention rules only"
-                        .to_string(),
+            // A rule the MODEL cannot express, stated in the same envelope a modelled
+            // constraint takes: the member that cannot hold, and what it must satisfy.
+            return Err(CreateRuleErrorModeled::ValidationException(
+                crate::state::member_validation_failed(
+                    "excludeResourceTags",
+                    "Member must not be specified for a tag-level retention rule",
                 ),
-                reason: Some("INVALID_PARAMETER_VALUE".to_string()),
-            })
+            )
             .into());
         }
 
