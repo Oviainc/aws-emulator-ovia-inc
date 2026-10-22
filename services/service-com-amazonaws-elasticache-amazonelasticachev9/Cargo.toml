@@ -21,15 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Hex is the codec the opaque pagination `Marker` is built with (src/state.rs).
+# Hex is the codec the opaque pagination `Marker` is built with, and the one the
+# reserved-cache-node offering ids are rendered in (src/state.rs).
 hex = { workspace = true }
+# SHA-256 derives each reserved-cache-node offering's id from its attributes, so
+# the published catalog needs no counter and reports the same id on every read
+# (src/state.rs).
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true
