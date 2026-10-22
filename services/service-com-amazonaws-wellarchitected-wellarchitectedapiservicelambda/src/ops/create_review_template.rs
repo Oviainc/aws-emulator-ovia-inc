@@ -282,6 +282,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             owner: ::engine::emulator_account_id().to_string(),
             updated_at: std::time::SystemTime::now(),
             tags,
+            // A new template's lens reviews carry no answers yet: every question of
+            // every applied lens is `UNANSWERED` until one is recorded.
+            answers: std::collections::BTreeMap::new(),
         };
 
         store.review_templates.insert(template_arn.clone(), record);

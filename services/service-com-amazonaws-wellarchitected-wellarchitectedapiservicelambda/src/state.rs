@@ -5,9 +5,10 @@
 //! The workload lifecycle (`CreateWorkload`, `GetWorkload`, `ListWorkloads`,
 //! `UpdateWorkload`, `DeleteWorkload`), the milestones recorded against a workload
 //! (`CreateMilestone`, `GetMilestone`, `ListMilestones`), the review templates
-//! (`CreateReviewTemplate`, `GetReviewTemplate`) and the answers of a workload's lens
-//! reviews (`ListAnswers`) are backed entirely by the maps below, so a create is visible
-//! to the next request on the same engine. The custom lenses `ImportLens` imports and
+//! (`CreateReviewTemplate`, `GetReviewTemplate`), the answers of a workload's lens
+//! reviews (`ListAnswers`) and the answers of a review template's lens reviews
+//! (`ListReviewTemplateAnswers`) are backed entirely by the maps below, so a create is
+//! visible to the next request on the same engine. The custom lenses `ImportLens` imports and
 //! `ExportLens` reads back are backed the same way. The record types and their
 //! projections live here rather than in a handler because several operations reach them.
 //!
@@ -354,6 +355,21 @@ pub const REVIEW_TEMPLATE_UPDATE_STATUS_CURRENT: &str = "CURRENT";
 /// `ANSWERED`. Named here because the `QuestionCounts` roll-up below fills it from the
 /// lens question set rather than from an answer.
 pub const QUESTION_UNANSWERED: &str = "UNANSWERED";
+
+/// The `Question` bucket a question that CARRIES an answer counts under — the other
+/// member `smithy_query(query="shape", shape="Question")` publishes. Named here
+/// because the `QuestionCounts` roll-up below fills it from the stored answers.
+pub const QUESTION_ANSWERED: &str = "ANSWERED";
+
+/// `ReviewTemplateAnswerStatus$ANSWERED`: a review-template question the template
+/// records an answer for. The enum publishes exactly `ANSWERED` and `UNANSWERED`
+/// (`smithy_query(query="shape", shape="ReviewTemplateAnswerStatus")`), and it is the
+/// stored answer — not a separate flag — that decides which one a question reports.
+pub const REVIEW_TEMPLATE_ANSWER_STATUS_ANSWERED: &str = "ANSWERED";
+
+/// `ReviewTemplateAnswerStatus$UNANSWERED`: a review-template question the template
+/// records no answer for. See [`REVIEW_TEMPLATE_ANSWER_STATUS_ANSWERED`].
+pub const REVIEW_TEMPLATE_ANSWER_STATUS_UNANSWERED: &str = "UNANSWERED";
 
 /// The most milestones one workload holds: "A workload can have a maximum of 100
 /// milestones" (`MilestoneNumber` doc), which is also why `MilestoneNumber` is
@@ -723,19 +739,40 @@ pub struct ReviewTemplateRecord {
     pub owner: String,
     pub updated_at: SystemTime,
     pub tags: BTreeMap<String, String>,
+    /// The answers recorded against this template's lens reviews: lens ALIAS (as
+    /// [`lens_alias`] resolves it, so one entry however the request named the lens),
+    /// then `QuestionId`. Held exactly as a workload holds its own
+    /// ([`WorkloadRecord::answers`]) — a review template is reviewed against the same
+    /// lens question set, so the two cannot disagree about what an answer records.
+    pub answers: BTreeMap<String, BTreeMap<String, AnswerRecord>>,
 }
 
 impl ReviewTemplateRecord {
+    /// The answer this template records for one question of one lens, if any.
+    ///
+    /// `lens` is a lens as a request names it — an alias or an ARN — and resolves
+    /// through [`lens_alias`], so the same answer is found by either name.
+    pub fn answer(&self, lens: &str, question_id: &str) -> Option<&AnswerRecord> {
+        self.answers.get(lens_alias(lens))?.get(question_id)
+    }
+
+    /// Whether this template applies the lens a `LensAlias` names, however the template
+    /// and the request spell it: a lens review of a template exists only while that
+    /// lens is applied to it.
+    pub fn applies_lens(&self, lens: &str) -> bool {
+        self.lenses
+            .iter()
+            .any(|applied| lens_alias(applied) == lens_alias(lens))
+    }
     /// This template's question roll-up: one entry for every `Question` the enum
     /// publishes, so a caller reading a bucket to report review progress always finds
     /// it.
     ///
-    /// `UNANSWERED` counts the questions of every lens applied to the template; a lens
-    /// is applied once however many ways the request named it. No operation in this
-    /// emulator can answer a review-template question (`UpdateReviewTemplateAnswer`,
-    /// `GetReviewTemplateAnswer` and `ListReviewTemplateAnswers` are still stubs, each
-    /// with its own issue), so `ANSWERED` is 0. The map is DERIVED from the applied
-    /// lenses on every read and never stored, so it moves when the lenses do.
+    /// `ANSWERED` counts the questions of the applied lenses this template records an
+    /// answer for and `UNANSWERED` the rest; a lens is applied once however many ways
+    /// the request named it. The map is DERIVED from the applied lenses and the stored
+    /// answers on every read and never stored, so it moves when either does — exactly
+    /// as a workload's risk roll-up does ([`WorkloadRecord::risk_counts`]).
     pub fn question_counts(&self) -> BTreeMap<String, i32> {
         let mut counts: BTreeMap<String, i32> = QUESTION_VALUES
             .iter()
@@ -743,11 +780,19 @@ impl ReviewTemplateRecord {
             .collect();
         let applied: std::collections::BTreeSet<&str> =
             self.lenses.iter().map(|lens| lens_alias(lens)).collect();
-        let unanswered: usize = applied.iter().map(|lens| lens_question_count(lens)).sum();
-        counts.insert(
-            QUESTION_UNANSWERED.to_string(),
-            i32::try_from(unanswered).unwrap_or(i32::MAX),
-        );
+        for lens in applied {
+            for question in lens_questions(lens) {
+                let bucket = if self.answer(lens, question.question_id).is_some() {
+                    QUESTION_ANSWERED
+                } else {
+                    QUESTION_UNANSWERED
+                };
+                counts
+                    .entry(bucket.to_string())
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+            }
+        }
         counts
     }
 
@@ -1824,6 +1869,63 @@ pub fn decode_question_token(token: &str) -> Option<String> {
     Some(decode_cursor(token)?.get("q")?.as_str()?.to_string())
 }
 
+/// One page of a lens's questions: the questions to report, and the `NextToken` the next
+/// page resumes from when the selection does not fit in this one.
+#[derive(Debug)]
+pub struct QuestionPage<'a> {
+    /// The questions this page reports, in the LENS's own order.
+    pub questions: Vec<&'a FrameworkQuestion>,
+    /// The cursor a caller follows for the rest of the selection, `None` on the last
+    /// page.
+    pub next_token: Option<String>,
+}
+
+/// Page over a lens's question set: the questions `select` keeps, resumed just past the
+/// question `resume_after` names and cut to `page_size`.
+///
+/// Shared by every operation that pages over the answers of a lens review (a workload's
+/// or a review template's), so they cannot drift about the order, the cursor or where a
+/// page ends. The cursor is start-EXCLUSIVE and names a `QuestionId` in the lens's own
+/// order, so `select` can differ between pages without a question being served twice or
+/// skipped.
+///
+/// `None` when `resume_after` names a question the lens does not ask: that is not a
+/// cursor this review issued, so it is as undecodable as a malformed token and the
+/// caller answers it with its own modelled refusal.
+pub fn question_page<'a, Select: Fn(&FrameworkQuestion) -> bool>(
+    catalog: &'a [FrameworkQuestion],
+    select: Select,
+    resume_after: Option<&str>,
+    page_size: usize,
+) -> Option<QuestionPage<'a>> {
+    let selected: Vec<(usize, &FrameworkQuestion)> = catalog
+        .iter()
+        .enumerate()
+        .filter(|(_, question)| select(question))
+        .collect();
+    let start = match resume_after {
+        None => 0,
+        Some(question_id) => {
+            let position = catalog
+                .iter()
+                .position(|question| question.question_id == question_id)?;
+            selected.partition_point(|(index, _)| *index <= position)
+        }
+    };
+    let remaining = &selected[start.min(selected.len())..];
+    let page = &remaining[..remaining.len().min(page_size)];
+    let next_token = match page.last() {
+        Some((_, question)) if remaining.len() > page.len() => {
+            Some(encode_question_token(question.question_id))
+        }
+        _ => None,
+    };
+    Some(QuestionPage {
+        questions: page.iter().map(|(_, question)| *question).collect(),
+        next_token,
+    })
+}
+
 /// `ValidationExceptionReason$FIELD_VALIDATION_FAILED` — the modelled classification for
 /// a request whose members were read but whose values the service refused. See
 /// `VALIDATION_EXCEPTION_REASON_VALUES` for the enum's whole value set.
@@ -2013,10 +2115,28 @@ pub fn lens_review_not_found(workload_id: &str, lens: &str) -> ResourceNotFoundE
     )
 }
 
-/// How a lens review is named in an exception's `ResourceId`: the workload it belongs
-/// to and the lens it reviews.
-pub fn lens_review_resource_id(workload_id: &str, lens: &str) -> String {
-    format!("{workload_id}.{lens}")
+/// How a lens review is named in an exception's `ResourceId`: the resource it belongs
+/// to — a workload's id or a review template's ARN — and the lens it reviews.
+pub fn lens_review_resource_id(owner: &str, lens: &str) -> String {
+    format!("{owner}.{lens}")
+}
+
+/// [`resource_not_found`] for a lens that is not applied to the review template, so the
+/// template has no review of it to report.
+///
+/// Worded like [`lens_review_not_found`] — the same resource type and the same composite
+/// `ResourceId` — because it is the same resource: a lens review, here of a template
+/// rather than of a workload. `lens` is the lens AS SENT, which is how the caller named
+/// it.
+pub fn review_template_lens_review_not_found(
+    template_arn: &str,
+    lens: &str,
+) -> ResourceNotFoundException {
+    resource_not_found(
+        LENS_REVIEW_RESOURCE_TYPE,
+        lens_review_resource_id(template_arn, lens),
+        &format!("review of lens {lens} in a review template with ARN {template_arn}"),
+    )
 }
 
 /// [`resource_not_found`] for a `LensAlias` that names no readable custom lens — none

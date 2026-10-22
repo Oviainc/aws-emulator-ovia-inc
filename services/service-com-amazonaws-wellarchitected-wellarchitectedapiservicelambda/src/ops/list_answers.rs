@@ -172,15 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
-        // for a full page, so the modelled maximum is the default. The clamp restates that
-        // bound in the handler, so the page size is in 1..=50 whatever reaches here.
-        let page_size = usize::try_from(
-            input
-                .max_results
-                .unwrap_or(MAX_RESULTS_CEILING)
-                .clamp(1, MAX_RESULTS_CEILING),
-        )
-        .expect("MaxResults is clamped into 1..=50, which always fits in a usize");
+        // for a full page, so the modelled maximum is the default. One helper restates that
+        // bound for every paginated operation of this service.
+        let page_size = crate::state::page_size(input.max_results);
 
         // An opaque token this service did not issue is a bad request, not an empty page.
         // A token is this service's own cursor, not a value a caller composes: it cannot
@@ -236,59 +230,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The lens's questions, in the lens's own order, narrowed by the request's
-        // filters. `PillarId` and `QuestionPriority` FILTER the question set rather than
-        // resolving anything, so a value that matches no question is an empty page.
-        let catalog = crate::state::lens_questions(&input.lens_alias);
+        // filters and paged through the service's shared question cursor. `PillarId` and
+        // `QuestionPriority` FILTER the question set rather than resolving anything, so
+        // a value that matches no question is an empty page.
+        //
         // Every question of a workload lens review here carries
-        // `crate::state::DEFAULT_QUESTION_TYPE`, so this filter selects all of them or
-        // none.
+        // `crate::state::DEFAULT_QUESTION_TYPE`, so the priority filter selects all of
+        // them or none.
         let priority_selects = input.question_priority.as_deref().is_none_or(|priority| {
             priority == crate::state::question_priority_of(crate::state::DEFAULT_QUESTION_TYPE)
         });
-        let questions: Vec<(usize, &crate::state::FrameworkQuestion)> = if priority_selects {
-            catalog
-                .iter()
-                .enumerate()
-                .filter(|(_, question)| {
-                    input
+        let page = crate::state::question_page(
+            crate::state::lens_questions(&input.lens_alias),
+            |question| {
+                priority_selects
+                    && input
                         .pillar_id
                         .as_deref()
                         .is_none_or(|pillar| pillar == question.pillar_id)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // The cursor is start-EXCLUSIVE and names a `QuestionId`: the page resumes just
-        // past that question in the LENS's order, so the filters can differ between
-        // pages without a question being served twice or skipped.
-        let start = match resume_after.as_deref() {
-            None => 0,
-            Some(question_id) => {
-                let position = catalog
-                    .iter()
-                    .position(|question| question.question_id == question_id)
-                    // A cursor naming a question this lens does not ask is as
-                    // undecodable as a malformed one: it is not a cursor this review
-                    // issued.
-                    .ok_or_else(invalid_next_token)?;
-                questions.partition_point(|(index, _)| *index <= position)
-            }
-        };
-
-        let remaining = &questions[start.min(questions.len())..];
-        let page = &remaining[..remaining.len().min(page_size)];
-        let next_token = match page.last() {
-            Some((_, question)) if remaining.len() > page.len() => {
-                Some(crate::state::encode_question_token(question.question_id))
-            }
-            _ => None,
-        };
+            },
+            resume_after.as_deref(),
+            page_size,
+        )
+        .ok_or_else(invalid_next_token)?;
 
         let answer_summaries = page
+            .questions
             .iter()
-            .map(|(_, question)| {
+            .map(|question| {
                 answer_summary(question, workload.answer(&input.lens_alias, question.question_id))
             })
             .collect();
@@ -316,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map_or_else(|| input.lens_alias.clone(), |lens| lens.lens_arn.clone())
             }),
             answer_summaries: Some(answer_summaries),
-            next_token,
+            next_token: page.next_token,
         })
     }
 }
@@ -379,20 +348,8 @@ fn answer_summary(
 /// pagination again — which is what `CANNOT_PARSE` tells it.
 fn invalid_next_token() -> ListAnswersError {
     ListAnswersErrorModeled::ValidationException(crate::state::cannot_parse_exception(
-        NEXT_TOKEN_MEMBER,
-        INVALID_NEXT_TOKEN_MESSAGE,
+        crate::state::NEXT_TOKEN_MEMBER,
+        crate::state::INVALID_NEXT_TOKEN_MESSAGE,
     ))
     .into()
 }
-
-/// The sentence an undecodable token is refused with, as `ListWorkloads` words it: one
-/// service, one wording for one failure.
-const INVALID_NEXT_TOKEN_MESSAGE: &str = "The next token that was passed in is invalid.";
-
-/// The member an undecodable-token finding names (`ListAnswersInput$NextToken`).
-const NEXT_TOKEN_MEMBER: &str = "NextToken";
-
-/// The largest page `ListAnswers` serves, and the page size a request that omits
-/// `MaxResults` gets: the modelled `MaxResults` `@range(min: 1, max: 50)` maximum
-/// (`smithy_query(query="operation", operation="ListAnswers")`).
-const MAX_RESULTS_CEILING: i32 = 50;
