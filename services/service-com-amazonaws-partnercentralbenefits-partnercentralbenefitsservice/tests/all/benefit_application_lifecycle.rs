@@ -33,10 +33,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The region every request below signs for; the ARNs the service returns must carry it.
 /// It is also a value the modelled `Arn` region field admits
 /// (`([a-z]{2}(-gov)?-[a-z]+-\d{1})?`).
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// This service's sigv4 signing name, the 4th field of the credential scope the router
 /// resolves the service from (`OPERATIONS.md`, "Wire protocol").
@@ -46,12 +46,14 @@ const SIGNING_NAME: &str = "partnercentral-benefits";
 const TARGET_PREFIX: &str = "PartnerCentralBenefitsService";
 
 /// The production catalog, one of the two the service serves.
-const CATALOG: &str = "AWS";
+pub(crate) const CATALOG: &str = "AWS";
 
 /// One emulator holding this service on one shared engine.
 ///
-/// Reused by `tests/all/service_error_rules.rs`, which needs the same wire path for an
-/// account that is NOT an entitled partner — hence [`Harness::unentitled`].
+/// Reused by `tests/all/service_error_rules.rs` and
+/// `tests/all/recall_benefit_application.rs`, which need the same wire path — the latter
+/// as an entitled partner, the former for an account that is NOT one (hence
+/// [`Harness::unentitled`]).
 pub(crate) struct Harness {
     router: MultiServiceRouter,
 }
@@ -120,7 +122,7 @@ impl Harness {
     }
 
     /// Call one operation that must answer 200, and return its body.
-    async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, case: &str, operation: &str, body: &Value) -> Value {
         let (status, out) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -130,7 +132,7 @@ impl Harness {
     }
 
     /// Every `BenefitSummary` of one catalog, unfiltered.
-    async fn benefits(&self, catalog: &str) -> Vec<Value> {
+    pub(crate) async fn benefits(&self, catalog: &str) -> Vec<Value> {
         let out = self
             .ok(catalog, "ListBenefits", &json!({ "Catalog": catalog }))
             .await;
@@ -140,27 +142,37 @@ impl Harness {
             .clone()
     }
 
-    /// The id of the first `ACTIVE` benefit of [`CATALOG`], which every create below
-    /// applies for.
-    async fn active_benefit(&self) -> Value {
-        self.benefits(CATALOG)
+    /// The first `ACTIVE` benefit of [`CATALOG`], which every create below applies for.
+    pub(crate) async fn active_benefit(&self) -> Value {
+        self.active_benefit_of(CATALOG).await
+    }
+
+    /// The first `ACTIVE` benefit of `catalog`: the one implementation of that filter,
+    /// which `tests/all/recall_benefit_application.rs` reaches for the other catalogs.
+    pub(crate) async fn active_benefit_of(&self, catalog: &str) -> Value {
+        self.benefits(catalog)
             .await
             .into_iter()
             .find(|benefit| benefit["Status"] == json!("ACTIVE"))
-            .expect("the seeded catalog holds an ACTIVE benefit")
+            .unwrap_or_else(|| panic!("case {catalog:?}: the seeded catalog holds no ACTIVE benefit"))
     }
 
     /// Create an application that must succeed, and return its create response.
-    async fn create(&self, case: &str, body: &Value) -> Value {
+    pub(crate) async fn create(&self, case: &str, body: &Value) -> Value {
         self.ok(case, "CreateBenefitApplication", body).await
     }
 
-    /// Read one application back, asserting the read succeeded.
-    async fn get(&self, case: &str, identifier: &str) -> Value {
+    /// Read one application of [`CATALOG`] back, asserting the read succeeded.
+    pub(crate) async fn get(&self, case: &str, identifier: &str) -> Value {
+        self.get_in(case, CATALOG, identifier).await
+    }
+
+    /// Read one application of any catalog back, asserting the read succeeded.
+    pub(crate) async fn get_in(&self, case: &str, catalog: &str, identifier: &str) -> Value {
         self.ok(
             case,
             "GetBenefitApplication",
-            &json!({ "Catalog": CATALOG, "Identifier": identifier }),
+            &json!({ "Catalog": catalog, "Identifier": identifier }),
         )
         .await
     }
@@ -201,7 +213,7 @@ fn expected_arn(catalog: &str, resource: &str, id: &str) -> String {
 }
 
 /// A member of a JSON object as a string, failing the test when it is absent.
-fn text(case: &str, body: &Value, member: &str) -> String {
+pub(crate) fn text(case: &str, body: &Value, member: &str) -> String {
     body[member]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: expected a {member}, got {body:?}"))
@@ -214,7 +226,7 @@ fn text(case: &str, body: &Value, member: &str) -> String {
 /// `awsJson1_0` carries a `Timestamp` as epoch seconds by default and as an RFC-3339
 /// string where the model asks for `date-time`; both forms are accepted here so the
 /// comparison does not depend on which one the protocol chose.
-fn instant(case: &str, body: &Value, member: &str) -> i64 {
+pub(crate) fn instant(case: &str, body: &Value, member: &str) -> i64 {
     match &body[member] {
         Value::String(rendered) => DateTime::from_str(rendered, Format::DateTime)
             .unwrap_or_else(|error| {

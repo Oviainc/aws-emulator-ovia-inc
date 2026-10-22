@@ -202,21 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An IAM policy document is a JSON object whose top-level elements are
         // `Version` and `Id` (both optional) and `Statement` (required) — the IAM
-        // JSON policy grammar. So a document that does not parse, is not an object,
-        // or carries no `Statement` is not a policy, and the put is refused.
-        //
-        // Validation deliberately stops at that top level: the grammar BELOW
-        // `Statement` (the element names a statement may carry, and which of them
-        // are required for an identity policy) is not checked here, so a 200 from
-        // this operation is the claim "stored", not "every statement is valid IAM".
-        // Deepening it is its own change, not this bootstrap slice.
-        let parsed = ::serde_json::from_str::<::serde_json::Value>(&input.policy_document);
-        let is_policy = parsed.is_ok_and(|document| {
-            document
-                .as_object()
-                .is_some_and(|document| document.contains_key("Statement"))
-        });
-        if !is_policy {
+        // JSON policy grammar. The rule itself, and the note on how far it checks,
+        // live on `crate::state::is_policy_document`, which every operation taking
+        // a policy document shares.
+        if !crate::state::is_policy_document(&input.policy_document) {
             return Err(PutUserPolicyErrorModeled::MalformedPolicyDocumentException(
                 MalformedPolicyDocumentException {
                     message: Some(
