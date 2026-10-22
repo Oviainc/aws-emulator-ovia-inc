@@ -47,6 +47,35 @@ pub const MEMBER_STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`MEMBER_STATUS_ACTIVE`].
 pub const MEMBER_STATUS_INVITED: &str = "INVITED";
 
+/// The `isMetricsEnabled` a create stores when the request omits it.
+///
+/// Documented on both `CreateCollaborationInput$isMetricsEnabled` and
+/// `CreateMembershipInput$isMetricsEnabled`: "The default value is `false`." The
+/// service, not the caller, decides it, so the created resource reports it rather than
+/// leaving the member absent.
+pub const DEFAULT_IS_METRICS_ENABLED: bool = false;
+
+/// The `analyticsEngine` a collaboration created without one runs on.
+///
+/// The model's `AnalyticsEngine` enum declares `SPARK | CLEAN_ROOMS_SQL`, and
+/// `CreateCollaborationInput$analyticsEngine` notes "After July 16, 2025, the
+/// `CLEAN_ROOMS_SQL` parameter will no longer be available" — so `SPARK` is the engine
+/// a collaboration gets when the caller selects none.
+pub const DEFAULT_ANALYTICS_ENGINE: &str = "SPARK";
+
+/// Whether a membership accepts a machine-learning cost the collaboration creator
+/// assigned to nobody.
+///
+/// `QueryComputePaymentConfig$isResponsible` makes "the member who can query" the
+/// default payer for query compute, and the same rule gives job compute to the member
+/// with `CAN_RUN_JOB`; no ability in the `MemberAbility` catalog (CAN_QUERY |
+/// CAN_RECEIVE_RESULTS | CAN_RUN_JOB | CAN_EXPORT_QUERY_ANALYSIS_LOG) nor in the
+/// `CustomMLMemberAbility` catalog (CAN_RECEIVE_MODEL_OUTPUT |
+/// CAN_RECEIVE_INFERENCE_OUTPUT) runs model training, model inference or synthetic data
+/// generation, so nothing makes a member the default payer for an ML cost: an ML cost
+/// the creator assigned nobody is accepted as not-responsible.
+pub const DEFAULT_ML_IS_RESPONSIBLE: bool = false;
+
 /// `MembershipStatus` values this slice produces (model shape `MembershipStatus`:
 /// ACTIVE | REMOVED | COLLABORATION_DELETED).
 pub const MEMBERSHIP_STATUS_ACTIVE: &str = "ACTIVE";
@@ -119,10 +148,14 @@ pub struct CollaborationRecord {
     pub data_encryption_metadata: Option<DataEncryptionMetadata>,
     pub query_log_status: String,
     pub job_log_status: Option<String>,
-    pub analytics_engine: Option<String>,
+    /// The engine in force — the one the caller selected, else
+    /// [`DEFAULT_ANALYTICS_ENGINE`]. Not optional: the service always has one.
+    pub analytics_engine: String,
     pub auto_approved_change_types: Option<Vec<String>>,
     pub allowed_result_regions: Option<Vec<String>>,
-    pub is_metrics_enabled: Option<bool>,
+    /// The metrics setting in force — the one the caller sent, else
+    /// [`DEFAULT_IS_METRICS_ENABLED`]. Not optional, for the same reason.
+    pub is_metrics_enabled: bool,
     /// The initial members, not including the creator. Immutable, per the
     /// `CreateCollaboration` `members` doc.
     pub members: Vec<MemberSpecification>,
@@ -195,26 +228,31 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
         self.memberships.get(id)
     }
 
-    /// The caller's status as a member of `record`: ACTIVE once it holds a membership
-    /// (and always, for the creator, who owns the collaboration), INVITED while it has
-    /// been named as a member but has not joined yet. `None` when the caller is not
-    /// part of the collaboration.
+    /// The caller's status as a member of `record`: ACTIVE once it holds a membership in
+    /// the collaboration, INVITED while it is part of the collaboration — as the creator
+    /// or as a declared member — without one. `None` when the caller is not part of the
+    /// collaboration at all.
+    ///
+    /// The creator is no exception: `CreateMembership` is the documented way to join a
+    /// collaboration, and a collaboration's creator holds no membership until it calls
+    /// it, so it is INVITED to the collaboration it just created and becomes ACTIVE only
+    /// once that membership exists. A client that polls this member to learn whether it
+    /// still has to join therefore sees the join it owes.
     pub fn member_status_for(
         &self,
         record: &CollaborationRecord,
         account_id: &str,
     ) -> Option<&'static str> {
-        if account_id == record.creator_account_id {
-            return Some(MEMBER_STATUS_ACTIVE);
+        let part_of_collaboration = account_id == record.creator_account_id
+            || record.members.iter().any(|m| m.account_id == account_id);
+        if !part_of_collaboration {
+            return None;
         }
-        if record.members.iter().any(|m| m.account_id == account_id) {
-            return Some(if self.membership_of(&record.id, account_id).is_some() {
-                MEMBER_STATUS_ACTIVE
-            } else {
-                MEMBER_STATUS_INVITED
-            });
-        }
-        None
+        Some(if self.membership_of(&record.id, account_id).is_some() {
+            MEMBER_STATUS_ACTIVE
+        } else {
+            MEMBER_STATUS_INVITED
+        })
     }
 
     /// The modelled `Collaboration` as `account_id` sees it, or `None` when that
@@ -241,10 +279,10 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             data_encryption_metadata: record.data_encryption_metadata.clone(),
             query_log_status: record.query_log_status.clone(),
             job_log_status: record.job_log_status.clone(),
-            analytics_engine: record.analytics_engine.clone(),
+            analytics_engine: Some(record.analytics_engine.clone()),
             auto_approved_change_types: record.auto_approved_change_types.clone(),
             allowed_result_regions: record.allowed_result_regions.clone(),
-            is_metrics_enabled: record.is_metrics_enabled,
+            is_metrics_enabled: Some(record.is_metrics_enabled),
         })
     }
 
@@ -278,7 +316,7 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             member_status: member_status.to_string(),
             membership_id: membership.map(|m| m.id.clone()),
             membership_arn: membership.map(|m| m.arn.clone()),
-            analytics_engine: record.analytics_engine.clone(),
+            analytics_engine: Some(record.analytics_engine.clone()),
         })
     }
 }
@@ -306,6 +344,18 @@ pub fn membership_summary(membership: &Membership) -> MembershipSummary {
 /// source of truth. Never a literal.
 pub fn caller_account_id() -> &'static str {
     ::engine::emulator_account_id()
+}
+
+/// The `isMetricsEnabled` a created resource carries: what the caller asked for, else
+/// the documented [`DEFAULT_IS_METRICS_ENABLED`].
+pub fn effective_is_metrics_enabled(requested: Option<bool>) -> bool {
+    requested.unwrap_or(DEFAULT_IS_METRICS_ENABLED)
+}
+
+/// The `analyticsEngine` a created collaboration carries: what the caller selected, else
+/// the [`DEFAULT_ANALYTICS_ENGINE`].
+pub fn effective_analytics_engine(requested: Option<String>) -> String {
+    requested.unwrap_or_else(|| DEFAULT_ANALYTICS_ENGINE.to_string())
 }
 
 /// Now, as the modelled `Timestamp` type.
@@ -403,25 +453,69 @@ pub fn accept_payment_configuration(
 /// specified anyone as the member paying for query compute costs, then the member who
 /// can query is the default payer." The same rule is applied to job compute, whose
 /// paying ability is `CAN_RUN_JOB`.
+///
+/// Every OPTIONAL sub-config of the shape is then materialized, whichever of those three
+/// sources supplied the rest: a membership reports the responsibility it accepted for
+/// each cost the model names, so a cost nobody was assigned is reported as
+/// not-responsible instead of being left absent (see [`DEFAULT_ML_IS_RESPONSIBLE`]).
 pub fn membership_payment_configuration(
     requested: Option<&MembershipPaymentConfiguration>,
     grant: &MemberGrant,
 ) -> MembershipPaymentConfiguration {
-    if let Some(requested) = requested {
-        return requested.clone();
-    }
-    if let Some(set_by_creator) = grant.payment_configuration.as_ref() {
-        return accept_payment_configuration(set_by_creator);
-    }
     let has = |ability: &str| grant.member_abilities.iter().any(|a| a == ability);
+    let accepted = requested.cloned().or_else(|| {
+        grant
+            .payment_configuration
+            .as_ref()
+            .map(accept_payment_configuration)
+    });
+    let (query_compute, machine_learning, job_compute) = match accepted {
+        Some(accepted) => (
+            accepted.query_compute,
+            accepted.machine_learning,
+            accepted.job_compute,
+        ),
+        None => (
+            MembershipQueryComputePaymentConfig {
+                is_responsible: has(ABILITY_CAN_QUERY),
+            },
+            None,
+            None,
+        ),
+    };
     MembershipPaymentConfiguration {
-        query_compute: MembershipQueryComputePaymentConfig {
-            is_responsible: has(ABILITY_CAN_QUERY),
-        },
-        machine_learning: None,
-        job_compute: Some(MembershipJobComputePaymentConfig {
+        query_compute,
+        machine_learning: Some(materialize_ml_payment_config(machine_learning)),
+        job_compute: Some(job_compute.unwrap_or(MembershipJobComputePaymentConfig {
             is_responsible: has(ABILITY_CAN_RUN_JOB),
-        }),
+        })),
+    }
+}
+
+/// The machine-learning block a membership reports, with one accepted sub-config per ML
+/// cost `MembershipMLPaymentConfig` names (`modelTraining`, `modelInference`,
+/// `syntheticDataGeneration`): whatever was accepted for that cost, else
+/// [`DEFAULT_ML_IS_RESPONSIBLE`].
+fn materialize_ml_payment_config(
+    accepted: Option<MembershipMLPaymentConfig>,
+) -> MembershipMLPaymentConfig {
+    let accepted = accepted.unwrap_or_default();
+    MembershipMLPaymentConfig {
+        model_training: Some(accepted.model_training.unwrap_or(
+            MembershipModelTrainingPaymentConfig {
+                is_responsible: DEFAULT_ML_IS_RESPONSIBLE,
+            },
+        )),
+        model_inference: Some(accepted.model_inference.unwrap_or(
+            MembershipModelInferencePaymentConfig {
+                is_responsible: DEFAULT_ML_IS_RESPONSIBLE,
+            },
+        )),
+        synthetic_data_generation: Some(accepted.synthetic_data_generation.unwrap_or(
+            MembershipSyntheticDataGenerationPaymentConfig {
+                is_responsible: DEFAULT_ML_IS_RESPONSIBLE,
+            },
+        )),
     }
 }
 
@@ -438,7 +532,9 @@ pub struct NewMembership<'a> {
     pub default_result_configuration: Option<MembershipProtectedQueryResultConfiguration>,
     pub default_job_result_configuration: Option<MembershipProtectedJobResultConfiguration>,
     pub payment_configuration: MembershipPaymentConfiguration,
-    pub is_metrics_enabled: Option<bool>,
+    /// The metrics setting in force — the one the caller sent, else
+    /// [`DEFAULT_IS_METRICS_ENABLED`]. Not optional: the service always has one.
+    pub is_metrics_enabled: bool,
     pub created_at: DateTime,
 }
 
@@ -464,7 +560,7 @@ impl NewMembership<'_> {
             default_result_configuration: self.default_result_configuration,
             default_job_result_configuration: self.default_job_result_configuration,
             payment_configuration: self.payment_configuration,
-            is_metrics_enabled: self.is_metrics_enabled,
+            is_metrics_enabled: Some(self.is_metrics_enabled),
         }
     }
 }

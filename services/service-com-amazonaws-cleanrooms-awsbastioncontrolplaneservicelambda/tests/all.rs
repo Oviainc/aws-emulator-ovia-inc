@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/cleanrooms_collaboration_lifecycle.rs"]
 mod cleanrooms_collaboration_lifecycle;
+#[path = "all/cleanrooms_created_resource_defaults.rs"]
+mod cleanrooms_created_resource_defaults;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

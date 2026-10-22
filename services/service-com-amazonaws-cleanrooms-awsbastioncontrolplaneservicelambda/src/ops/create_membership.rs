@@ -7,6 +7,12 @@
 //! from the request, and the membership is indexed by (collaboration, account) so a
 //! second join is a `ConflictException`.
 //!
+//! An optional member whose value the SERVICE decides is materialized at creation, so a
+//! later read reports the setting in force rather than an absent member: the documented
+//! `isMetricsEnabled` default (`crate::state::effective_is_metrics_enabled`) and every
+//! optional sub-config of the accepted `MembershipPaymentConfiguration`
+//! (`crate::state::membership_payment_configuration`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -268,7 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             default_result_configuration: input.default_result_configuration,
             default_job_result_configuration: input.default_job_result_configuration,
             payment_configuration,
-            is_metrics_enabled: input.is_metrics_enabled,
+            is_metrics_enabled: st::effective_is_metrics_enabled(input.is_metrics_enabled),
             created_at: st::now(),
         }
         .build();

@@ -18,16 +18,16 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The account every emulated caller presents; the collaboration creator in these
 /// tests. Read from the vendored runtime so the test cannot drift from the emulator.
-fn account_id() -> &'static str {
+pub(crate) fn account_id() -> &'static str {
     engine::emulator_account_id()
 }
 
 /// The region the test signs for, so the ARNs the service mints are predictable.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// Every `MemberAbility` the model declares (shape `MemberAbility`), so the tables
 /// below cover the whole catalog rather than only the ability the issue cited.
-const ALL_MEMBER_ABILITIES: [&str; 4] = [
+pub(crate) const ALL_MEMBER_ABILITIES: [&str; 4] = [
     "CAN_QUERY",
     "CAN_RECEIVE_RESULTS",
     "CAN_RUN_JOB",
@@ -35,10 +35,10 @@ const ALL_MEMBER_ABILITIES: [&str; 4] = [
 ];
 
 /// Every `AnalyticsEngine` the model declares (shape `AnalyticsEngine`).
-const ALL_ANALYTICS_ENGINES: [&str; 2] = ["SPARK", "CLEAN_ROOMS_SQL"];
+pub(crate) const ALL_ANALYTICS_ENGINES: [&str; 2] = ["SPARK", "CLEAN_ROOMS_SQL"];
 
 /// Every `CollaborationQueryLogStatus` / `CollaborationJobLogStatus` the model declares.
-const ALL_LOG_STATUSES: [&str; 2] = ["ENABLED", "DISABLED"];
+pub(crate) const ALL_LOG_STATUSES: [&str; 2] = ["ENABLED", "DISABLED"];
 
 /// The published bounds of `ListCollaborations$maxResults` / `ListMemberships$maxResults`
 /// (model `MaxResults`, range 1..100).
@@ -47,7 +47,7 @@ const MAX_RESULTS_MAX: i64 = 100;
 
 /// One emulator: the single shared engine behind the router, as the production router
 /// builds it.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
     /// The same engine the mounted service holds, so a test can seed the store the
     /// handlers read — used only to fill a store up to its cap.
@@ -55,7 +55,7 @@ struct Emulator {
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -74,7 +74,7 @@ impl Emulator {
 
     /// Dispatch one request and return its status and JSON body (`Value::Null` for an
     /// empty body, which is what a 204 carries).
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let host = format!("cleanrooms.{REGION}.amazonaws.com");
         let payload = body
             .map(|b| serde_json::to_vec(&b).expect("serialize request body"))
@@ -112,11 +112,11 @@ impl Emulator {
         (status, json)
     }
 
-    async fn create_collaboration(&self, body: Value) -> (u16, Value) {
+    pub(crate) async fn create_collaboration(&self, body: Value) -> (u16, Value) {
         self.call("POST", "/collaborations", Some(body)).await
     }
 
-    async fn get_collaboration(&self, id: &str) -> (u16, Value) {
+    pub(crate) async fn get_collaboration(&self, id: &str) -> (u16, Value) {
         self.call("GET", &format!("/collaborations/{id}"), None).await
     }
 
@@ -125,11 +125,11 @@ impl Emulator {
             .await
     }
 
-    async fn create_membership(&self, body: Value) -> (u16, Value) {
+    pub(crate) async fn create_membership(&self, body: Value) -> (u16, Value) {
         self.call("POST", "/memberships", Some(body)).await
     }
 
-    async fn get_membership(&self, id: &str) -> (u16, Value) {
+    pub(crate) async fn get_membership(&self, id: &str) -> (u16, Value) {
         self.call("GET", &format!("/memberships/{id}"), None).await
     }
 
@@ -139,7 +139,7 @@ impl Emulator {
 }
 
 /// The wire error code a failure response carries (`__type` on restJson1).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or("<no __type>")
@@ -151,7 +151,7 @@ fn error_code(body: &Value) -> String {
 
 /// Whether `id` is in the form the model's `UUID` shape declares:
 /// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`.
-fn is_model_uuid(id: &str) -> bool {
+pub(crate) fn is_model_uuid(id: &str) -> bool {
     let groups: Vec<&str> = id.split('-').collect();
     groups.len() == 5
         && [8usize, 4, 4, 4, 12]
@@ -166,7 +166,7 @@ fn is_model_uuid(id: &str) -> bool {
 }
 
 /// A minimal valid CreateCollaboration body.
-fn minimal_collaboration(name: &str) -> Value {
+pub(crate) fn minimal_collaboration(name: &str) -> Value {
     json!({
         "name": name,
         "creatorDisplayName": "creator",
@@ -307,8 +307,8 @@ async fn create_collaboration_persists_and_get_collaboration_returns_it_unchange
         );
         assert_eq!(
             collaboration["memberStatus"].as_str(),
-            Some("ACTIVE"),
-            "case {:?}: the creator is ACTIVE in its own collaboration, got {:?}",
+            Some("INVITED"),
+            "case {:?}: the creator holds no membership yet, so it is INVITED, got {:?}",
             case.label,
             collaboration["memberStatus"]
         );
@@ -555,15 +555,26 @@ async fn list_collaborations_refuses_a_next_token_it_never_handed_out() {
 #[tokio::test]
 async fn list_collaborations_filters_on_member_status() {
     let emulator = Emulator::new();
+    let mut ids: Vec<String> = Vec::new();
     for n in 0..3 {
-        emulator
+        let (_, created) = emulator
             .create_collaboration(minimal_collaboration(&format!("filtered-{n}")))
             .await;
+        ids.push(created["collaboration"]["id"].as_str().unwrap().to_string());
     }
+    // The caller joins exactly one of the three, so the filter has rows on both sides:
+    // ACTIVE is the joined one, INVITED the two it still owes a membership.
+    let joined = ids[1].clone();
+    let (status, response) = emulator
+        .create_membership(json!({
+            "collaborationIdentifier": joined,
+            "queryLogStatus": "ENABLED",
+        }))
+        .await;
+    assert_eq!(status, 200, "CreateMembership failed: {response}");
 
-    // Catalog: model shape `FilterableMemberStatus` (INVITED | ACTIVE). The caller
-    // created each collaboration, so it is ACTIVE in all of them and INVITED in none.
-    for (member_status, expected) in [("ACTIVE", 3usize), ("INVITED", 0)] {
+    // Catalog: model shape `FilterableMemberStatus` (INVITED | ACTIVE).
+    for (member_status, expected) in [("ACTIVE", vec![joined.clone()]), ("INVITED", vec![ids[0].clone(), ids[2].clone()])] {
         let (status, body) = emulator
             .call(
                 "GET",
@@ -576,11 +587,13 @@ async fn list_collaborations_filters_on_member_status() {
             "case memberStatus={member_status}: expected 200, got {status} with {body}"
         );
         let rows = body["collaborationList"].as_array().unwrap();
+        let seen: Vec<String> = rows
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(
-            rows.len(),
-            expected,
-            "case memberStatus={member_status}: expected {expected} rows, got {}",
-            rows.len()
+            seen, expected,
+            "case memberStatus={member_status}: expected {expected:?}, got {seen:?}"
         );
         for row in rows {
             assert_eq!(
