@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-marketplacecatalog-awsmpseymour.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.marketplacecatalog#CancelChangeSetRequest")]
+// `skip_validation` names `Catalog`: the syntax this service publishes for a catalog
+// name is WIDER than the modelled `Catalog` `@pattern` (`^[a-zA-Z]+$`) and is quoted
+// back to the caller, so the HANDLER judges the member (`crate::state::check_catalog`)
+// and answers the modelled `ValidationException` and its 422. Every other member keeps
+// its modelled constraints and is refused at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.marketplacecatalog#CancelChangeSetRequest",
+    skip_validation = ["Catalog"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CancelChangeSetInput {
     pub catalog: String,

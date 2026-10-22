@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAccountConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAccountConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists the account-level expiry-events configuration this request
+//! names into [`crate::state`], where `GetAccountConfiguration` reads it back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAccountConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "The supported configuration option is DaysBeforeExpiry", so a request that
+//! carries no `ExpiryEvents` names no option to change and leaves the stored
+//! configuration exactly as it was.
+//!
+//! `DaysBeforeExpiry` is accepted in 1..=45: the model bounds it only from below
+//! (`@range(min: 1)`, refused at the boundary before this handler runs), and ACM
+//! refuses a notice window wider than its default 45-day one with the
+//! `ValidationException` this operation models.
+//!
+//! `IdempotencyToken` identifies the request: the token is indexed with what the
+//! request asked for, for the hour the token stays live ("Idempotency tokens time
+//! out after one hour"). Repeating a live token with the same `ExpiryEvents` is "the
+//! same request" and changes nothing; repeating it with anything else is a different
+//! request under a token ACM has already processed, which is `ConflictException`
+//! (HTTP 400); and a call that changes the token "ACM treats … as a new request" and
+//! applies. The token's modelled length and pattern are refused at the boundary
+//! before this handler runs.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +181,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAccountConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAccountConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAccountConfiguration"))
+        // `ctx` carries request metadata only; this configuration is account-level,
+        // so nothing here reads the request's Region.
+        let _ = ctx;
+
+        // Unreachable in the assembled emulator (the engine is the shared store).
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutAccountConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm account configuration store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // What this request asks for, beside its idempotency token: the
+        // `ExpiryEvents` it carries, if any.
+        let requested = input
+            .expiry_events
+            .as_ref()
+            .map(|expiry_events| crate::state::AccountConfiguration {
+                days_before_expiry: expiry_events.days_before_expiry,
+            });
+
+        // The model bounds `DaysBeforeExpiry` only from below, but ACM also refuses a
+        // notice window wider than the default one — refused here, before the token
+        // is recorded or anything is written, so a rejected request leaves no trace.
+        if let Some(days) = requested.as_ref().and_then(|c| c.days_before_expiry) {
+            if days > crate::state::MAX_DAYS_BEFORE_EXPIRY {
+                return Err(PutAccountConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "Days before expiry cannot be over {}.",
+                            crate::state::MAX_DAYS_BEFORE_EXPIRY
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The crate-wide convention: apply whatever the clock already owes before
+        // this call touches the store.
+        store.materialize_due(now);
+
+        // Tokens the clock has already timed out name no earlier request, so they go
+        // before this one is matched against the index.
+        store.expire_account_configuration_tokens(now);
+
+        match store
+            .account_configuration_requests
+            .get(&input.idempotency_token)
+        {
+            // "If you call PutAccountConfiguration multiple times with the same
+            // unexpired idempotency token, ACM treats it as the same request and
+            // returns the original result": the result of this operation is an empty
+            // success, so a repeat answers it without touching the store. It is
+            // deliberately not re-applied: a write under another token is a LATER
+            // request, and replaying a delivery of an earlier one must not rewind the
+            // account to what that earlier request configured.
+            Some(processed) if processed.expiry_events == requested => {
+                return Ok(PutAccountConfigurationOutput);
+            }
+            // A live token already stands for a DIFFERENT request. ACM refuses
+            // rather than silently applying one request's values under another
+            // request's token.
+            Some(_) => {
+                return Err(PutAccountConfigurationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(DIFFERENT_REQUEST_SAME_TOKEN.to_string()),
+                    },
+                )
+                .into());
+            }
+            None => {}
+        }
+
+        store.account_configuration_requests.insert(
+            input.idempotency_token.clone(),
+            crate::state::AccountConfigurationRequest {
+                expiry_events: requested.clone(),
+                processed_at: now,
+            },
+        );
+
+        // A request that names no `ExpiryEvents` carries no supported configuration
+        // option, so it changes nothing — and must not clear what is stored.
+        if let Some(configuration) = requested {
+            store.account_configuration = Some(configuration);
+        }
+
+        Ok(PutAccountConfigurationOutput)
     }
 }
+
+/// How ACM states a reused idempotency token: the token is live and stands for
+/// another request, which is what `ConflictException` ("you are trying to update a
+/// resource or configuration that is already being created or updated") reports here.
+const DIFFERENT_REQUEST_SAME_TOKEN: &str =
+    "A different request with same idempotency token has already been processed.";

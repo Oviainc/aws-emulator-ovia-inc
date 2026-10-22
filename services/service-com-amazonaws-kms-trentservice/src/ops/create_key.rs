@@ -5,12 +5,26 @@
 //! answers with the `KeyMetadata` computed from that record — the same metadata
 //! `DescribeKey` reports afterwards. This is the ONLY file to touch for this operation.
 //!
-//! This slice mints symmetric encryption keys with KMS-generated material: the default
-//! `KeySpec` SYMMETRIC_DEFAULT, `KeyUsage` ENCRYPT_DECRYPT and `Origin` AWS_KMS. Any
-//! other combination is refused with the modelled `UnsupportedOperationException`
-//! rather than minting a key whose cryptographic operations (`Sign`, `GenerateMac`,
-//! `GetPublicKey`, `ImportKeyMaterial`) are not implemented, so that no caller holds a
-//! key it could never use.
+//! This slice mints a key of EVERY `KeySpec` the model declares, with the `KeyUsage`
+//! values that spec accepts (`crate::state::KeySpecProfile` holds the matrix), and
+//! `Origin` AWS_KMS. The `KeyMetadata` it answers with projects the algorithms the
+//! spec supports under the key's usage, so a caller learns which signing, encryption,
+//! MAC or key-agreement algorithm it may name afterwards. A `KeyUsage` the spec does
+//! not support — or an omitted one for a spec that does not default it — is refused as
+//! a `ValidationException`, and an `Origin` that needs a custom key store with the
+//! modelled `UnsupportedOperationException`, since `CreateCustomKeyStore` is not
+//! implemented.
+//!
+//! `Origin` EXTERNAL mints a key with NO key material, waiting in `PendingImport` for
+//! the `ImportKeyMaterial` that supplies it.
+//!
+//! Key MATERIAL is generated only where this emulator can generate it honestly: the
+//! 256-bit AES-GCM key of a symmetric encryption key and the HMAC key of an HMAC spec.
+//! An asymmetric key is persisted WITHOUT a key pair (see
+//! `crate::state::KeyMaterial::KeyPairNotGenerated`), so the key itself is real
+//! control-plane state — described, listed, disabled, deleted like any other — while
+//! every operation that would use the private key answers the scaffold's 501 rather
+//! than a fabricated signature, public key or ciphertext.
 //!
 //! `BypassPolicyLockoutSafetyCheck` is accepted and has no effect: the lockout check
 //! asks whether the key policy lets the CALLING PRINCIPAL make a subsequent
@@ -358,10 +372,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, Some(deprecated)) => deprecated.to_string(),
             (None, None) => crate::state::KEY_SPEC_SYMMETRIC_DEFAULT.to_string(),
         };
-        let key_usage = input
-            .key_usage
-            .clone()
-            .unwrap_or_else(|| crate::state::KEY_USAGE_ENCRYPT_DECRYPT.to_string());
+        // "The KeySpec determines whether the KMS key contains a symmetric key or an
+        // asymmetric key pair. It also determines the algorithms that the KMS key
+        // supports"
+        // (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeySpec")`), so
+        // the spec is resolved to its profile FIRST: which key usage is valid, which
+        // algorithms the metadata reports and what key material is minted all follow
+        // from it.
+        let Some(profile) = crate::state::key_spec_profile(&key_spec) else {
+            return Err(unsupported(format!(
+                "KeySpec {key_spec} is not a key spec KMS supports."
+            )));
+        };
+
+        // "The default value is ENCRYPT_DECRYPT. This parameter is optional when you
+        // are creating a symmetric encryption KMS key; otherwise, it is required.
+        // ... Select only one valid value"
+        // (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeyUsage")`): a
+        // usage the spec does not support, or an omitted one the spec does not
+        // default, is a combination that cannot hold together rather than an
+        // unsupported capability.
+        let key_usage = match input.key_usage.clone() {
+            Some(key_usage) => key_usage,
+            None if key_spec == crate::state::KEY_SPEC_SYMMETRIC_DEFAULT => {
+                crate::state::KEY_USAGE_ENCRYPT_DECRYPT.to_string()
+            }
+            None => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "KeyUsage is required for KeySpec {key_spec}; it is optional only for a \
+                     symmetric encryption KMS key. Specify one of {}.",
+                    profile.supported_usages().join(", ")
+                )));
+            }
+        };
+        if !profile.supports(&key_usage) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "KeyUsage {key_usage} is not compatible with KeySpec {key_spec}, which \
+                 supports {}.",
+                profile.supported_usages().join(", ")
+            )));
+        }
+
         let origin = input
             .origin
             .clone()
@@ -388,21 +439,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  emulator has no custom key stores.",
             ));
         }
-        if origin != crate::state::ORIGIN_AWS_KMS {
+        // "The default is AWS_KMS, which means that KMS creates the key material. To
+        // create a KMS key with no key material (for imported key material), set this
+        // value to EXTERNAL"
+        // (`smithy_query(query="doc",shape="CreateKeyRequest",member="Origin")`). The
+        // AWS_CLOUDHSM and EXTERNAL_KEY_STORE origins both need a `CustomKeyStoreId`,
+        // refused above, so neither can name a key store that exists here.
+        if origin != crate::state::ORIGIN_AWS_KMS && origin != crate::state::ORIGIN_EXTERNAL {
             return Err(unsupported(format!(
-                "Origin {origin} is not supported: this emulator creates keys with \
-                 KMS-generated key material ({}).",
-                crate::state::ORIGIN_AWS_KMS
-            )));
-        }
-        if key_spec != crate::state::KEY_SPEC_SYMMETRIC_DEFAULT
-            || key_usage != crate::state::KEY_USAGE_ENCRYPT_DECRYPT
-        {
-            return Err(unsupported(format!(
-                "KeySpec {key_spec} with KeyUsage {key_usage} is not supported: this \
-                 emulator creates symmetric encryption keys ({} with {}).",
-                crate::state::KEY_SPEC_SYMMETRIC_DEFAULT,
-                crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+                "Origin {origin} requires a custom key store, and this emulator has none. \
+                 Use {} for KMS-generated key material or {} for imported key material.",
+                crate::state::ORIGIN_AWS_KMS,
+                crate::state::ORIGIN_EXTERNAL
             )));
         }
 
@@ -461,13 +509,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let Some(material) = crate::state::fresh_material() else {
-            // No entropy, no key: nothing is persisted and the caller sees a
-            // retryable server error rather than a key with predictable material.
-            return Err(CreateKeyErrorModeled::KMSInternalException(KMSInternalException {
-                message: Some("the key material could not be generated".to_string()),
-            })
-            .into());
+        // A key whose origin is EXTERNAL is created with NO key material and waits in
+        // `PendingImport`; for every other origin KMS generates the material the key
+        // spec calls for. EXTERNAL is accepted for every spec: "You can import key
+        // material for a symmetric encryption KMS key, HMAC KMS key, asymmetric
+        // encryption KMS key, or asymmetric signing KMS key"
+        // (`smithy_query(query="doc",shape="GetParametersForImport")`), which the
+        // older "valid only for symmetric KMS keys" sentence on the `Origin` member
+        // predates.
+        let material = if origin == crate::state::ORIGIN_EXTERNAL {
+            crate::state::KeyMaterial::AwaitingImport
+        } else {
+            let Some(material) = crate::state::mint_material(profile.material) else {
+                // No entropy, no key: nothing is persisted and the caller sees a
+                // retryable server error rather than a key with predictable material.
+                return Err(CreateKeyErrorModeled::KMSInternalException(
+                    KMSInternalException {
+                        message: Some("the key material could not be generated".to_string()),
+                    },
+                )
+                .into());
+            };
+            material
         };
 
         let key = crate::state::Cmk::new(

@@ -11,7 +11,12 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-marketplacecatalog-awsmpseymour.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.marketplacecatalog#ListChangeSetsRequest")]
+// `skip_validation` names `Catalog` and `NextToken` for the reasons given on
+// `ListAssessmentsInput`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.marketplacecatalog#ListChangeSetsRequest",
+    skip_validation = ["Catalog", "NextToken"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListChangeSetsInput {
     pub catalog: String,

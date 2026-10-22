@@ -84,6 +84,21 @@ pub const QUEUE_TYPE_CUSTOM: &str = TYPE_CUSTOM;
 /// `QueueStatus` values (`smithy_query(query="shape",shape="QueueStatus")`).
 pub const QUEUE_STATUS_ACTIVE: &str = "ACTIVE";
 
+/// The `InputPolicy` decision that forbids an input location
+/// (`smithy_query(query="shape",shape="InputPolicy")`, whose generated value set is
+/// [`crate::ops::types::INPUT_POLICY_VALUES`]).
+pub const INPUT_POLICY_DISALLOWED: &str = "DISALLOWED";
+/// The other `InputPolicy` decision: the one at least one input location must carry.
+/// See [`INPUT_POLICY_DISALLOWED`].
+pub const INPUT_POLICY_ALLOWED: &str = "ALLOWED";
+
+/// Every input location the modelled `Policy` carries a decision for, in the Smithy
+/// member spelling (`smithy_query(query="shape",shape="Policy")`): `S3Inputs`,
+/// `HttpInputs`, `HttpsInputs`. [`PolicyRecord::allows_no_input`] and
+/// [`policy_allows_no_input_message`] both read the set from here, so the condition that
+/// is checked and the locations the refusal names cannot drift apart.
+pub const INPUT_LOCATION_MEMBERS: [&str; 3] = ["S3Inputs", "HttpInputs", "HttpsInputs"];
+
 /// `PricingPlan` values (`smithy_query(query="shape",shape="PricingPlan")`).
 pub const PRICING_PLAN_ON_DEMAND: &str = "ON_DEMAND";
 /// See [`PRICING_PLAN_ON_DEMAND`].
@@ -357,6 +372,58 @@ fn system_resource_message(member: &str, action: &str) -> String {
     format!(
         "You specified an invalid value for {member}. You are not allowed to {action} \
          system resources."
+    )
+}
+
+/// How this service refuses a `PutPolicy` that allows no input location at all.
+///
+/// AWS states the constraint — a policy requires at least one input location to be set
+/// to `ALLOWED` — so the refusal names that constraint and the locations it covers,
+/// taken from [`INPUT_LOCATION_MEMBERS`] rather than a second hand-written list. What
+/// the API requires is the 400/`BadRequestException` pair plus a message naming the
+/// constraint; this wording is this emulator's rendering of it.
+pub fn policy_allows_no_input_message() -> String {
+    format!(
+        "You set your input policy to {disallowed} for all input locations: {all}. Policies \
+         require at least one input location to be set to {allowed}. Set at least one of \
+         {any} to {allowed} and resubmit your policy.",
+        disallowed = INPUT_POLICY_DISALLOWED,
+        allowed = INPUT_POLICY_ALLOWED,
+        all = input_locations_joined("and"),
+        any = input_locations_joined("or"),
+    )
+}
+
+/// [`INPUT_LOCATION_MEMBERS`] as an English list — "A, B, <conjunction> C" — so the
+/// refusal above reads as a sentence without hard-coding the member names twice.
+fn input_locations_joined(conjunction: &str) -> String {
+    match INPUT_LOCATION_MEMBERS.split_last() {
+        Some((last, leading)) if !leading.is_empty() => {
+            format!("{}, {conjunction} {last}", leading.join(", "))
+        }
+        _ => INPUT_LOCATION_MEMBERS.join(", "),
+    }
+}
+
+/// How this service refuses a request that pairs a reservation plan with a queue whose
+/// pricing plan is on-demand.
+///
+/// `ReservationPlanSettings` is "required for reserved queues and not applicable to
+/// on-demand queues", so both the create and the update that carry one for an on-demand
+/// queue state the same refusal; the sentence lives here so the two cannot drift.
+pub fn reservation_plan_not_applicable_message() -> String {
+    format!(
+        "ReservationPlanSettings does not apply when PricingPlan is {}.",
+        PRICING_PLAN_ON_DEMAND
+    )
+}
+
+/// As [`reservation_plan_not_applicable_message`], for a reserved queue created without
+/// the plan it requires.
+pub fn reservation_plan_required_message() -> String {
+    format!(
+        "ReservationPlanSettings is required when PricingPlan is {}.",
+        PRICING_PLAN_RESERVED
     )
 }
 
@@ -1139,6 +1206,27 @@ impl PolicyRecord {
             https_inputs: requested.https_inputs.clone(),
             s3_inputs: requested.s3_inputs.clone(),
         }
+    }
+
+    /// Whether this policy leaves NO input location allowed.
+    ///
+    /// A location the policy does not state carries no decision — it is allowed, which
+    /// is also what an account with no policy at all allows — so the policy allows
+    /// nothing only when EVERY input location the `Policy` shape models
+    /// ([`INPUT_LOCATION_MEMBERS`]) is explicitly `DISALLOWED`. This is the condition
+    /// AWS states a policy must not meet: "Policies require at least one input location
+    /// to be set to ALLOWED."
+    pub fn allows_no_input(&self) -> bool {
+        self.decisions()
+            .iter()
+            .all(|decision| decision.as_deref() == Some(INPUT_POLICY_DISALLOWED))
+    }
+
+    /// This record's decisions, one per member of [`INPUT_LOCATION_MEMBERS`] and in that
+    /// order. The array's length IS the member list's, so an input location added to one
+    /// and not the other does not compile.
+    fn decisions(&self) -> [&Option<String>; INPUT_LOCATION_MEMBERS.len()] {
+        [&self.s3_inputs, &self.http_inputs, &self.https_inputs]
     }
 
     /// The modelled `Policy`.

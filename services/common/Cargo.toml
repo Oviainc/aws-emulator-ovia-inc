@@ -12,10 +12,15 @@ emulator-server = { workspace = true }
 http = { workspace = true }
 # `front_door`: the operation wrapper, the schema it reads a member's HTTP binding
 # off, the constraint walk it runs and the request/response types it serves.
+# `validation`: the same `Schema` / `ShapeSerializer` seam, used to re-walk a built
+# input, and the `Violation` / constraint-path vocabulary the framework's own
+# constraint walk reports in.
 smithy-server-runtime = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
+# `validation`: the leaf types a `ShapeSerializer` is handed.
+aws-smithy-types = { workspace = true }
 # `stable_hex_id`'s mixing function: a maintained digest, so a derived id that
 # travels on the wire is reproducible across builds rather than tied to the
 # algorithm `std`'s default hasher happens to use.

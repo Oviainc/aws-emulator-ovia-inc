@@ -289,10 +289,20 @@ async fn every_client_error_answers_http_400_with_its_own_type() {
             400,
         ),
         (
-            "create a key spec this emulator does not mint",
+            // `CreateKey` mints every modelled KeySpec now; what it still refuses is
+            // an Origin that needs a custom key store, which is the same modelled
+            // 400 this row is here to exercise.
+            "create a key whose origin needs a custom key store",
             "CreateKey",
-            json!({"KeySpec": "RSA_2048"}),
+            json!({"Origin": "AWS_CLOUDHSM"}),
             "UnsupportedOperationException",
+            400,
+        ),
+        (
+            "create a key usage its key spec does not support",
+            "CreateKey",
+            json!({"KeySpec": "RSA_2048", "KeyUsage": "GENERATE_VERIFY_MAC"}),
+            "ValidationException",
             400,
         ),
         (

@@ -182,13 +182,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Every operation's `Catalog` member documents "Fixed value:
-        // AWSMarketplace", so any other catalog names nothing this service has.
-        if input.catalog != crate::state::AWS_MARKETPLACE_CATALOG {
-            return Err(StartChangeSetErrorModeled::ValidationException(
-                crate::state::wrong_catalog(&input.catalog),
-            )
-            .into());
+        // `Catalog` is judged here, not at the boundary (`skip_validation` on
+        // `StartChangeSetInput`): a value that is not a catalog NAME is refused
+        // for its syntax, and a well-formed name other than the fixed value
+        // every operation's `Catalog` documents names nothing this service has.
+        if let Err(fault) = crate::state::check_catalog(&input.catalog) {
+            return Err(StartChangeSetErrorModeled::ValidationException(fault).into());
+        }
+
+        // The two named members whose published syntax this operation states
+        // itself (`skip_validation` on `StartChangeSetInput`). Each is checked
+        // on its own and the FIRST one that fails ends the request, so a
+        // request with several malformed members is answered with ONE fault.
+        if let Some(name) = input.change_set_name.as_deref() {
+            if !crate::state::is_change_set_name(name) {
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::invalid_change_set_name(name),
+                )
+                .into());
+            }
+        }
+        if let Some(token) = input.client_request_token.as_deref() {
+            if !crate::state::is_client_request_token(token) {
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::invalid_client_request_token(token),
+                )
+                .into());
+            }
+        }
+
+        // The changes are judged for their SHAPE first, over the whole change
+        // set: every member the service publishes a syntax for, and the rule
+        // that the change set may not contradict itself. Nothing here reads the
+        // store, so a request the service would refuse is refused whatever the
+        // store holds — and a request with several malformed members is answered
+        // with ONE fault, the first one read.
+        //
+        // `claimed` holds the (entity, change type) pairs the changes have taken,
+        // keyed by the entity each change NAMES rather than by the record it
+        // resolves to.
+        let mut claimed: Vec<(String, String)> = Vec::with_capacity(input.change_set.len());
+        for change in &input.change_set {
+            // `Entity$Type` names an entity type, on its own or at a schema
+            // version (`<EntityType>@<version>`) — the form the service accepts
+            // and every real caller sends. It is judged here rather than at the
+            // boundary (`skip_validation` on `Entity`), against the types this
+            // catalog HAS: a reference naming none of them names no entity type.
+            if !crate::state::is_entity_type_reference(&change.entity.r#type) {
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::invalid_entity_type(&change.entity.r#type),
+                )
+                .into());
+            }
+            // `Entity$Identifier` has two published forms, both wider than the
+            // modelled `Identifier` pattern, so it too is judged here — and
+            // BEFORE the entity is looked up, so a malformed identifier is a
+            // refusal and only a well-formed one can be reported missing.
+            let Some(identifier) = change.entity.identifier.as_deref() else {
+                // A change naming no identifier creates an entity of its own, so
+                // it can take no pair with another change.
+                continue;
+            };
+            if !crate::state::is_entity_identifier(identifier) {
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::invalid_entity_identifier(identifier),
+                )
+                .into());
+            }
+            // "Within a single ChangeSet, you can't start the same change type
+            // against the same entity multiple times." A change set that does is
+            // the REQUEST contradicting itself — not a resource another caller
+            // holds — so it is refused as invalid, and refused on the entity the
+            // request NAMES: a change set that contradicts itself is refused
+            // whether or not that entity exists.
+            let entity_id = crate::state::entity_id_of(identifier).to_string();
+            if claimed
+                .iter()
+                .any(|(held, held_type)| *held == entity_id && *held_type == change.change_type)
+            {
+                return Err(StartChangeSetErrorModeled::ValidationException(
+                    crate::state::duplicate_change_pair(&change.change_type, &entity_id),
+                )
+                .into());
+            }
+            claimed.push((entity_id, change.change_type.clone()));
         }
 
         // "The intent related to the request. The default is APPLY." `Intent`
@@ -236,6 +313,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut changes: Vec<crate::state::ChangeRecord> =
             Vec::with_capacity(input.change_set.len());
         for change in &input.change_set {
+            let entity_type = crate::state::entity_type_of(&change.entity.r#type);
+
             // "You can use either Details or DetailsDocument, but not both."
             // A document nested deeper than the emulator stores is refused
             // here, before it is converted or persisted.
@@ -331,21 +410,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // nothing.
             let entity_id = match change.entity.identifier.as_deref() {
                 Some(identifier) => {
+                    // The identifier addresses the entity at an optional
+                    // revision, so what it names is the entity id inside it —
+                    // which is what a refusal for an absent entity names too.
+                    let entity_id = crate::state::entity_id_of(identifier);
                     let Some(entity) = store.resolve_identifier(identifier) else {
                         return Err(StartChangeSetErrorModeled::ResourceNotFoundException(
-                            crate::state::entity_not_found(identifier),
+                            crate::state::entity_not_found(entity_id),
                         )
                         .into());
                     };
-                    if entity.entity_type != change.entity.r#type {
+                    if entity.entity_type != entity_type {
                         let held = entity.entity_type.clone();
                         return Err(StartChangeSetErrorModeled::ValidationException(
                             crate::state::validation(
                                 "ChangeSet.Entity.Type",
-                                format!(
-                                    "entity {identifier} is a {held}, not a {}",
-                                    change.entity.r#type
-                                ),
+                                format!("entity {entity_id} is a {held}, not a {entity_type}"),
                             ),
                         )
                         .into());
@@ -367,29 +447,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::in_use(format!(
                             "entity {entity_id} is locked by the running change set {holder}"
                         )),
-                    )
-                    .into());
-                }
-                // "Within a single ChangeSet, you can't start the same change
-                // type against the same entity multiple times." A change set
-                // that does is REFUSED as invalid — the pair is not in use by
-                // another caller, it is the request that contradicts itself —
-                // so the answer is the modelled `ValidationException`, naming
-                // the change type and the entity it was repeated on.
-                if changes.iter().any(|held| {
-                    held.entity_id.as_deref() == Some(entity_id)
-                        && held.change_type == change.change_type
-                }) {
-                    return Err(StartChangeSetErrorModeled::ValidationException(
-                        crate::state::validation(
-                            "ChangeSet.ChangeType",
-                            format!(
-                                "Requested changes contain multiple changes for the same \
-                                 change type '{}' on entity '{entity_id}'. Entity - change \
-                                 type pairs should be unique.",
-                                change.change_type
-                            ),
-                        ),
                     )
                     .into());
                 }

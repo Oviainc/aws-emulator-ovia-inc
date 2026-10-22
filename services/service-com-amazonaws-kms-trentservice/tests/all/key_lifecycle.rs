@@ -11,186 +11,14 @@
 //! page a `Marker` resumes on, and which key state refuses a cryptographic
 //! operation.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
-use service_com_amazonaws_kms_trentservice::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The Region most cases sign for. Keys are regional, so a case that is about
-/// regional scoping names its own.
-const REGION: &str = "us-east-1";
-
-/// A router with only this service mounted, over one shared engine — the same
-/// assembly `core/router` performs, minus the other services.
-fn router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    // In-process tests sign with a placeholder key; signature verification is a
-    // front-door setting, not part of what these tests are about.
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// Call one operation in `region` and return its HTTP status and JSON body.
-async fn call(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: &Value,
-) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://kms.{region}.amazonaws.com/"))
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("TrentService.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEMULATOR/20260101/{region}/kms/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("the request builds");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, payload)
-}
-
-/// Call one operation in [`REGION`], requiring success.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
-    ok_in(router, REGION, operation, body).await
-}
-
-/// Call one operation in `region`, requiring success.
-async fn ok_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: &Value,
-) -> Value {
-    let (status, payload) = call(router, region, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "case {operation} {body}: expected HTTP 200, got {status} with {payload}"
-    );
-    payload
-}
-
-/// Call one operation in [`REGION`], requiring a failure, and report its status and
-/// wire error code.
-async fn failure(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, String) {
-    failure_in(router, REGION, operation, body).await
-}
-
-/// [`failure`], in `region`.
-async fn failure_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: &Value,
-) -> (u16, String) {
-    let (status, payload) = call(router, region, operation, body).await;
-    assert_ne!(
-        status, 200,
-        "case {operation} {body}: expected a failure, got HTTP 200 with {payload}"
-    );
-    (status, error_code(&payload))
-}
-
-/// The wire error code (`__type`) of an error body, without its namespace.
-fn error_code(payload: &Value) -> String {
-    payload["__type"]
-        .as_str()
-        .unwrap_or_default()
-        .rsplit(['#', ':'])
-        .next()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// A blob as awsJson1_1 carries it.
-fn b64(bytes: &[u8]) -> String {
-    aws_smithy_types::base64::encode(bytes)
-}
-
-/// The bytes behind a blob member.
-fn unb64(case: &str, payload: &Value, member: &str) -> Vec<u8> {
-    let encoded = payload[member]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case}: expected {member} in {payload}"));
-    aws_smithy_types::base64::decode(encoded)
-        .unwrap_or_else(|error| panic!("case {case}: {member} is not base64: {error}"))
-}
-
-/// Create a key and return its `KeyMetadata`.
-async fn create_key(router: &MultiServiceRouter, request: &Value) -> Value {
-    ok(router, "CreateKey", request).await["KeyMetadata"].clone()
-}
-
-/// The `KeyMetadata` `DescribeKey` reports for an identifier.
-async fn describe(router: &MultiServiceRouter, identifier: &str) -> Value {
-    ok(router, "DescribeKey", &json!({ "KeyId": identifier })).await["KeyMetadata"].clone()
-}
-
-/// A member of a metadata object, as a string.
-fn text(case: &str, value: &Value, member: &str) -> String {
-    value[member]
-        .as_str()
-        .unwrap_or_else(|| panic!("case {case}: expected a string {member} in {value}"))
-        .to_string()
-}
-
-/// Whether `id` has the shape of a KMS key id: a version-4 UUID (8-4-4-4-12
-/// lowercase hex with the version nibble `4`) for a single-Region key, and `mrk-`
-/// followed by 32 lowercase hex characters for a multi-Region one.
-fn is_key_id(id: &str, multi_region: bool) -> bool {
-    if multi_region {
-        return id
-            .strip_prefix("mrk-")
-            .is_some_and(|hex| hex.len() == 32 && is_lower_hex(hex));
-    }
-    let groups: Vec<&str> = id.split('-').collect();
-    let lengths = [8usize, 4, 4, 4, 12];
-    groups.len() == lengths.len()
-        && groups
-            .iter()
-            .zip(lengths)
-            .all(|(group, len)| group.len() == len && is_lower_hex(group))
-        && groups[2].starts_with('4')
-}
-
-/// Whether every character is a lowercase hexadecimal digit.
-fn is_lower_hex(text: &str) -> bool {
-    !text.is_empty()
-        && text
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-}
-
-/// Whether `haystack` contains `needle` as a contiguous run — how a test checks
-/// that a ciphertext does not simply carry its plaintext.
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack.len() >= needle.len()
-        && haystack.windows(needle.len()).any(|window| window == needle)
-}
-
-/// The key the encryption round-trip cases use.
-async fn enabled_key(router: &MultiServiceRouter) -> Value {
-    create_key(router, &json!({"Description": "round trip"})).await
-}
+// The wire plumbing lives in `tests/all/harness.rs`, shared with every other suite
+// in this crate.
+use super::harness::{
+    b64, contains, create_key, describe, enabled_key, failure, failure_in, is_key_id, ok, ok_in,
+    router, text, unb64, REGION,
+};
 
 // ---------------------------------------------------------------------------
 // CreateKey -> DescribeKey
@@ -406,28 +234,13 @@ async fn create_key_refuses_what_it_cannot_mint() {
 
     let cases: Vec<(&str, Value, &str)> = vec![
         (
-            "asymmetric key spec",
-            json!({"KeySpec": "RSA_2048"}),
+            "key material created in a CloudHSM cluster",
+            json!({"Origin": "AWS_CLOUDHSM"}),
             "UnsupportedOperationException",
         ),
         (
-            "HMAC key spec",
-            json!({"KeySpec": "HMAC_256", "KeyUsage": "GENERATE_VERIFY_MAC"}),
-            "UnsupportedOperationException",
-        ),
-        (
-            "signing key usage",
-            json!({"KeyUsage": "SIGN_VERIFY"}),
-            "UnsupportedOperationException",
-        ),
-        (
-            "key agreement key usage",
-            json!({"KeyUsage": "KEY_AGREEMENT"}),
-            "UnsupportedOperationException",
-        ),
-        (
-            "imported key material",
-            json!({"Origin": "EXTERNAL"}),
+            "key material in an external key store",
+            json!({"Origin": "EXTERNAL_KEY_STORE"}),
             "UnsupportedOperationException",
         ),
         (

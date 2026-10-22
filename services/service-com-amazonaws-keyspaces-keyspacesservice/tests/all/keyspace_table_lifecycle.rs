@@ -45,8 +45,9 @@ pub(crate) fn settle_wait() -> Duration {
 
 /// One emulator holding one shared engine, driven over HTTP exactly as the router does.
 ///
-/// Shared with the other suites of this test binary (`tests/all/type_lifecycle.rs`), so
-/// there is ONE harness for this service rather than a copy per file.
+/// Shared with the other suites of this test binary (`tests/all/type_lifecycle.rs`,
+/// `tests/all/column_types_and_auto_scaling.rs`), so there is ONE harness for this
+/// service rather than a copy per file.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
@@ -1300,11 +1301,9 @@ async fn requests_that_break_an_unmodelled_rule_are_refused_and_the_rest_accepte
 
     // The members this slice does not serve are refused honestly, with the 501 that says
     // the feature is not written yet — never accepted and silently dropped.
-    let unserved: [(&str, Value); 4] = [
-        (
-            "autoScalingSpecification",
-            json!({"writeCapacityAutoScaling": {"autoScalingDisabled": true}}),
-        ),
+    // (`autoScalingSpecification` is NOT among them: it is stored and reported by
+    // `GetTableAutoScalingSettings` — see `tests/all/column_types_and_auto_scaling.rs`.)
+    let unserved: [(&str, Value); 3] = [
         (
             "replicaSpecifications",
             json!([{"region": "eu-west-1", "readCapacityUnits": 5}]),

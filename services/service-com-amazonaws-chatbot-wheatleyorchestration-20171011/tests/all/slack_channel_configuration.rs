@@ -26,8 +26,7 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region the test signs for, so the minted ARNs carry it.
-const REGION: &str = "us-east-1";
+use crate::wire::{post, REGION};
 
 /// The canonical emulator account id (`emulator_server::EMULATOR_ACCOUNT_ID`), spelled
 /// out here so the test pins the ARN a client actually sees.
@@ -35,15 +34,6 @@ const ACCOUNT: &str = "000000000000";
 
 const IAM_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/chatbot-role";
 const OTHER_IAM_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/chatbot-other-role";
-
-/// A SigV4 credential scope naming this service and `region`; `MultiServiceRouter`
-/// routes on the scope's service name and the handlers read the region from it.
-fn authorization(region: &str) -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/chatbot/aws4_request, \
-         SignedHeaders=host;x-amz-date, Signature=deadbeef"
-    )
-}
 
 /// The Slack workspaces the requests below name, each with the display name it is
 /// authorized under.
@@ -87,28 +77,8 @@ async fn call_in_region(
     path: &str,
     body: &Value,
 ) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://chatbot.{region}.amazonaws.com{path}"))
-        .header("host", format!("chatbot.{region}.amazonaws.com"))
-        .header("content-type", "application/json")
-        .header("authorization", authorization(region))
-        .body(bytes::Bytes::from(body.to_string()))
-        .expect("build the request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let bytes = response.into_body();
-    let parsed = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            panic!(
-                "{path}: response body is not JSON ({e}): {}",
-                String::from_utf8_lossy(&bytes)
-            )
-        })
-    };
-    (status, parsed)
+    let answer = post(router, region, path, body).await;
+    (answer.status, answer.body)
 }
 
 /// POST `body` to `path`, signed for [`REGION`].

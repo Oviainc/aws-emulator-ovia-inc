@@ -318,11 +318,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tags = input.tags.clone().unwrap_or_default();
         if tags.len() > crate::state::MAX_TAGS {
             return Err(CreateStateMachineErrorModeled::TooManyTags(TooManyTags {
-                message: Some(format!(
-                    "a state machine accepts at most {} tags, got {}",
-                    crate::state::MAX_TAGS,
-                    tags.len()
-                )),
+                // The same fixed service text the tagging calls' `TooManyTags`
+                // carries: the refusal reports no request value.
+                message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
                 resource_name: Some(input.name.clone()),
             })
             .into());
