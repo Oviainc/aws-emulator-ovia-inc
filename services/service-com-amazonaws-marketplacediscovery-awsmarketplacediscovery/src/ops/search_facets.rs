@@ -316,11 +316,16 @@ fn facet_values(
     let mut facets: Vec<ListingFacet> = counts
         .into_iter()
         .map(|(value, (display_name, count))| ListingFacet {
+            // `ListingFacet$parent` is "The parent facet value for hierarchical facets, such
+            // as subcategories", so a facet value of a HIERARCHICAL facet type reports the
+            // value it is nested under and a top-level one reports none. `CATEGORY` is the
+            // one hierarchical facet type this service computes: its values are categories,
+            // which the catalog's taxonomy nests (`crate::state::CATEGORY_TAXONOMY`). No
+            // other facet type is a tree — a pricing model or a fulfillment option type is
+            // not nested under another — so their values carry no parent.
+            parent: facet_value_parent(facet_type, &value),
             value,
             display_name,
-            // The catalog's categories are flat, and no other facet type is hierarchical,
-            // so no facet value has a parent to report.
-            parent: None,
             count,
         })
         .collect();
@@ -331,6 +336,20 @@ fn facet_values(
             .then_with(|| left.value.cmp(&right.value))
     });
     facets
+}
+
+/// The facet value `value` of `facet_type` is nested under, or `None` when its facet type
+/// is not hierarchical or the value sits at the top of the hierarchy.
+///
+/// The parent is reported as a VALUE rather than a display name because
+/// `ListingFacet$value` is "[t]he internal value used for filtering when passed back in a
+/// search filter": a client refining a search walks from a parent value to its children
+/// with the same `CATEGORY` filter.
+fn facet_value_parent(facet_type: &str, value: &str) -> Option<String> {
+    match facet_type {
+        "CATEGORY" => crate::state::category_parent(value).map(str::to_string),
+        _ => None,
+    }
 }
 
 /// The `(value, displayName)` pairs one listing contributes to `facet_type`.

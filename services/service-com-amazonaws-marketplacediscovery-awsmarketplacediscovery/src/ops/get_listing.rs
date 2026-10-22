@@ -248,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetListingOutput {
             locale: Some(locale.to_string()),
             associated_entities,
-            badges: listing.badges.clone(),
+            badges: state.listing_badges(listing),
             catalog: state.catalog.clone(),
             categories: listing.categories.clone(),
             fulfillment_option_summaries: state.listing_fulfillment_option_summaries(listing),

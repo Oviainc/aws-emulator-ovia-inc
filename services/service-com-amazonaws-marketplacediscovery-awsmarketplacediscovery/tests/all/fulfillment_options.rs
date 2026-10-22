@@ -422,8 +422,30 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 async fn a_token_from_another_query_or_past_the_end_is_refused() {
     let router = router();
     let product_ids = every_product_id(&router).await;
-    let product_id = product_ids[0].clone();
-    let other_product_id = product_ids[1].clone();
+
+    // A product with MORE than one fulfillment option, so a one-option page truncates and
+    // the service mints a token at all; plus any other product, whose query that token was
+    // not minted for.
+    let mut multi_option: Option<String> = None;
+    for candidate in &product_ids {
+        if all_options(&router, candidate).await.len() > 1 {
+            multi_option = Some(candidate.clone());
+            break;
+        }
+    }
+    let product_id = multi_option.unwrap_or_else(|| {
+        panic!(
+            "case setup: the catalog must hold a product with several fulfillment options, got \
+             {product_ids:?}"
+        )
+    });
+    let other_product_id = product_ids
+        .iter()
+        .find(|candidate| **candidate != product_id)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("case setup: expected a second product in the catalog, got {product_ids:?}")
+        });
 
     let first = ok(
         &router,
