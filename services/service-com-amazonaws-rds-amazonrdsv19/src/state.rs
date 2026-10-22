@@ -8,7 +8,8 @@
 //! than in one operation file because every implemented operation shares them:
 //! `CreateDBInstance`, `DescribeDBInstances`, `ModifyDBInstance`,
 //! `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBInstance`,
-//! `CreateOptionGroup` and `DescribeOptionGroups` all project the same records.
+//! `CreateOptionGroup`, `ModifyOptionGroup` and `DescribeOptionGroups` all project the
+//! same records.
 //!
 //! RDS is a REGIONAL service, so every map is keyed by `(region, identifier)`: the
 //! region a request is signed for scopes what it can see and create, one identifier
@@ -32,9 +33,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     Certificate, CertificateDetails, DBInstance, DBParameterGroupStatus, DBSecurityGroupMembership,
-    DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint, EventCategoriesMap, OptionGroup,
-    OptionGroupMembership, PendingModifiedValues, Tag, VpcSecurityGroupMembership,
+    DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint, EventCategoriesMap, Option2,
+    OptionGroup, OptionGroupMembership, OptionSetting, PendingModifiedValues, Tag,
+    VpcSecurityGroupMembership,
 };
+
+pub mod option_catalog;
 
 /// How long after the call that starts it a status transition this service owes
 /// becomes due.
@@ -681,7 +685,8 @@ impl DbSnapshotRecord {
     }
 }
 
-/// A stored option group: everything `CreateOptionGroup` persists about one.
+/// A stored option group: everything `CreateOptionGroup` persists about one, plus the
+/// options `ModifyOptionGroup` has added to it.
 ///
 /// The ARN is NOT stored as text: it is a function of the stored region and name,
 /// which [`OptionGroupRecord::to_wire`] computes, so it cannot drift from the record
@@ -695,6 +700,11 @@ pub struct OptionGroupRecord {
     pub engine_name: String,
     pub major_engine_version: String,
     pub tags: Vec<Tag>,
+    /// The options `ModifyOptionGroup` added, by the catalogue's own spelling of each
+    /// option's name. Ordered, so the group reports its options the same way on every
+    /// read, and keyed by name, so adding an option twice updates its configuration
+    /// instead of storing a second copy of it.
+    pub options: BTreeMap<String, OptionRecord>,
 }
 
 impl OptionGroupRecord {
@@ -706,21 +716,139 @@ impl OptionGroupRecord {
 
     /// Project the stored record onto the modelled `OptionGroup` output shape.
     pub fn to_wire(&self) -> OptionGroup {
+        let options: Vec<Option2> = self
+            .options
+            .values()
+            .map(|option| option.to_wire(&self.engine_name))
+            .collect();
         OptionGroup {
             option_group_name: Some(self.name.clone()),
             option_group_description: Some(self.description.clone()),
             engine_name: Some(self.engine_name.clone()),
             major_engine_version: Some(self.major_engine_version.clone()),
-            // A group `CreateOptionGroup` minted holds no options — options are added
-            // by `ModifyOptionGroup`, which is still a stub — so the list is reported
-            // EMPTY rather than absent: the group exists and has nothing in it.
-            options: Some(Vec::new()),
+            // A group nothing has added an option to reports an EMPTY list rather than
+            // no list at all: the group exists and has nothing in it.
+            // `AllowsVpcAndNonVpcInstanceMemberships` — "Indicates whether this option
+            // group can be applied to both VPC and non-VPC instances" — is ALWAYS
+            // reported, so a caller can tell a group it may apply anywhere from one it
+            // may not. A group holding no option constrains nothing and can be applied
+            // to both; once it holds an option, that option's own placement
+            // requirements bind the group to instances of one network type, so the
+            // answer is `false`.
+            allows_vpc_and_non_vpc_instance_memberships: Some(options.is_empty()),
+            options: Some(options),
             option_group_arn: Some(self.arn()),
-            // `VpcId` belongs to a group bound to one VPC, and
-            // `SourceOptionGroup`/`SourceAccountId`/`CopyTimestamp` to a group
-            // `CopyOptionGroup` produced. Neither describes a group created here, so
-            // neither is reported rather than carrying a made-up value.
+            // `VpcId` belongs to a group bound to ONE VPC, which nothing here creates:
+            // "If AllowsVpcAndNonVpcInstanceMemberships is false, this field is blank.
+            // If AllowsVpcAndNonVpcInstanceMemberships is true and this field is blank,
+            // then this option group can be applied to both VPC and non-VPC
+            // instances." `SourceOptionGroup`/`SourceAccountId`/`CopyTimestamp` belong
+            // to a group `CopyOptionGroup` produced. None describes a group created
+            // here, so none is reported rather than carrying a made-up value.
             ..OptionGroup::default()
+        }
+    }
+}
+
+/// One option a `ModifyOptionGroup` call added to a group: the caller's CONFIGURATION
+/// of it.
+///
+/// The option's own facts — its description, whether it is permanent or persistent,
+/// the settings it publishes and each setting's default, data type and allowed values
+/// — are NOT copied in here. They are catalogue data ([`option_catalog`]), which
+/// [`OptionRecord::to_wire`] reads at projection time, so a stored group cannot drift
+/// from the catalogue the way a stored copy could.
+#[derive(Debug, Clone, Default)]
+pub struct OptionRecord {
+    /// The catalogue's own spelling of the option's name.
+    pub name: String,
+    /// `OptionConfiguration$Port`, when the request named one; otherwise the option's
+    /// published port, if it has one.
+    pub port: Option<i32>,
+    /// `OptionConfiguration$OptionVersion`, when the request named one.
+    pub version: Option<String>,
+    /// `OptionConfiguration$DBSecurityGroupMemberships`.
+    pub db_security_group_memberships: Vec<String>,
+    /// `OptionConfiguration$VpcSecurityGroupMemberships`.
+    pub vpc_security_group_memberships: Vec<String>,
+    /// The values the caller set, by setting name — only for the settings it set. A
+    /// setting absent here reports the catalogue's default, which is what makes
+    /// `Value` fall back to `DefaultValue`.
+    pub settings: BTreeMap<String, String>,
+}
+
+impl OptionRecord {
+    /// Project the stored option onto the modelled `Option` wire shape, in the context
+    /// of the group's engine: the engine is half of the catalogue key, because an
+    /// option one engine publishes is a different catalogue entry than another's.
+    pub fn to_wire(&self, engine_name: &str) -> Option2 {
+        let facts = option_catalog::option_facts(engine_name, &self.name);
+        let settings = facts
+            .map(|facts| {
+                facts
+                    .settings
+                    .iter()
+                    .map(|setting| OptionSetting {
+                        name: Some(setting.name.to_string()),
+                        // The value the caller set, else the published default: that
+                        // is what "The current value of the option setting" is for a
+                        // setting nobody has set.
+                        value: Some(
+                            self.settings
+                                .get(setting.name)
+                                .cloned()
+                                .unwrap_or_else(|| setting.default_value.to_string()),
+                        ),
+                        default_value: Some(setting.default_value.to_string()),
+                        description: Some(setting.description.to_string()),
+                        apply_type: Some(setting.apply_type.to_string()),
+                        data_type: Some(setting.data_type.to_string()),
+                        // A free-form setting publishes no value list, and reports no
+                        // `AllowedValues` member rather than an empty one.
+                        allowed_values: (!setting.allowed_values.is_empty())
+                            .then(|| setting.allowed_values.to_string()),
+                        is_modifiable: Some(setting.is_modifiable),
+                        is_collection: Some(setting.is_collection),
+                    })
+                    .collect()
+            })
+            // Unreachable with a record this service stored: `ModifyOptionGroup`
+            // refuses an option the group's engine does not publish, so every stored
+            // option has catalogue facts. An option whose entry has since been
+            // dropped from the catalogue reports what the record itself holds rather
+            // than invented metadata.
+            .unwrap_or_default();
+        Option2 {
+            option_name: Some(self.name.clone()),
+            option_description: facts.map(|facts| facts.description.to_string()),
+            persistent: facts.map(|facts| facts.persistent),
+            permanent: facts.map(|facts| facts.permanent),
+            // "If required, the port configured for this option to use" — so no port
+            // at all for an option that requires none.
+            port: self.port.or_else(|| facts.and_then(|facts| facts.port)),
+            option_version: self.version.clone(),
+            option_settings: Some(settings),
+            // Both membership lists are reported even when the option was configured
+            // with none: an empty list says the option opened access to nothing, which
+            // is not the same claim as no list at all.
+            db_security_group_memberships: Some(
+                self.db_security_group_memberships
+                    .iter()
+                    .map(|name| DBSecurityGroupMembership {
+                        db_security_group_name: Some(name.clone()),
+                        status: Some("authorized".to_string()),
+                    })
+                    .collect(),
+            ),
+            vpc_security_group_memberships: Some(
+                self.vpc_security_group_memberships
+                    .iter()
+                    .map(|id| VpcSecurityGroupMembership {
+                        vpc_security_group_id: Some(id.clone()),
+                        status: Some("active".to_string()),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -1161,6 +1289,74 @@ pub fn check_filter_terms(filters: &[crate::ops::types::Filter]) -> Result<(), S
     if terms > MAX_FILTER_TERMS {
         return Err(format!(
             "Filters carries {terms} values: this emulator serves at most {MAX_FILTER_TERMS}"
+        ));
+    }
+    Ok(())
+}
+
+/// How many security group memberships one option of an option group may carry.
+///
+/// `OptionConfiguration$DBSecurityGroupMemberships` and
+/// `OptionConfiguration$VpcSecurityGroupMemberships` publish no bound, and their values
+/// are STORED, so they are capped for the same reason as [`MAX_FILTER_TERMS`]: request
+/// data that enters the store has to be bounded. Generous next to the five security
+/// groups AWS lets one DB instance carry.
+pub const MAX_OPTION_SECURITY_GROUPS: usize = 32;
+
+/// How long a text value a `ModifyOptionGroup` request may store: the value of an
+/// option setting, or an `OptionVersion`. Neither member publishes a bound and both are
+/// stored, so this emulator caps them.
+pub const MAX_OPTION_TEXT_LEN: usize = 1024;
+
+/// Refuse stored request text longer than [`MAX_OPTION_TEXT_LEN`], naming the member
+/// and the bound it broke.
+pub fn check_option_text(member: &str, value: &str) -> Result<(), String> {
+    let length = value.chars().count();
+    if length > MAX_OPTION_TEXT_LEN {
+        return Err(format!(
+            "{member} carries {length} characters: this emulator stores at most \
+             {MAX_OPTION_TEXT_LEN}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a security group membership list longer than [`MAX_OPTION_SECURITY_GROUPS`],
+/// and any entry that is not of the form a security group name or id takes.
+pub fn check_security_group_memberships(member: &str, values: &[String]) -> Result<(), String> {
+    if values.len() > MAX_OPTION_SECURITY_GROUPS {
+        return Err(format!(
+            "{member} carries {} entries: this emulator stores at most \
+             {MAX_OPTION_SECURITY_GROUPS}",
+            values.len()
+        ));
+    }
+    for value in values {
+        // A DB security group name and a VPC security group id are both drawn from the
+        // letters/numbers/hyphens alphabet the identifier members share.
+        check_identifier(member, value, 255)?;
+    }
+    Ok(())
+}
+
+/// How many entries one `ModifyOptionGroup` request may name in `OptionsToInclude`,
+/// `OptionsToRemove`, or in one option configuration's `OptionSettings`.
+///
+/// None of those members publishes a bound, and the work a request costs is the PRODUCT
+/// of its option count and its settings count, so each factor is capped BEFORE any
+/// per-entry work runs — the same reason [`MAX_FILTER_TERMS`] caps a describe's filter
+/// terms. The bound is generous: the whole catalogue publishes fewer options than this
+/// for every engine together, and no option publishes more settings than this, so a
+/// request past it is asking for options and settings that do not exist.
+pub const MAX_OPTIONS_PER_REQUEST: usize = 64;
+
+/// Refuse an option or option-settings list longer than [`MAX_OPTIONS_PER_REQUEST`],
+/// naming the member and the bound it broke.
+pub fn check_option_list_len(member: &str, len: usize) -> Result<(), String> {
+    if len > MAX_OPTIONS_PER_REQUEST {
+        return Err(format!(
+            "{member} carries {len} entries: this emulator serves at most \
+             {MAX_OPTIONS_PER_REQUEST} per request"
         ));
     }
     Ok(())

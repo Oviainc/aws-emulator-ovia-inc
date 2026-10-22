@@ -175,7 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.option_groups.contains_key(&key) {
             return Err(CreateOptionGroupErrorModeled::OptionGroupAlreadyExistsFault(
                 OptionGroupAlreadyExistsFault {
-                    message: Some(format!("Option group already exists: {name}")),
+                    // Built from the request, so it names the group the caller asked
+                    // for and no other, in the wording this fault class uses ("The
+                    // option group you are trying to create already exists").
+                    message: Some(format!("An option group named {name} already exists.")),
                 },
             )
             .into());
@@ -207,6 +210,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             engine_name: input.engine_name,
             major_engine_version: input.major_engine_version,
             tags: input.tags.unwrap_or_default(),
+            // A group is created EMPTY: options are added to it by `ModifyOptionGroup`.
+            options: std::collections::BTreeMap::new(),
         };
         let option_group = record.to_wire();
         store.option_groups.insert(key, record);
