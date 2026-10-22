@@ -96,17 +96,35 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // This service does not word a modelled-constraint failure as the
+        // framework's generic `ValidationException`: every operation it exposes
+        // declares `BadRequestException` ("The input parameters don't match the
+        // service's restrictions.", HTTP 400) for exactly that, so a caller
+        // branching on the error code must see that code whether the value was
+        // refused at the boundary or inside a handler. The status (400) and the
+        // envelope stay with the protocol; only the code and the message change.
+        //
+        // An authentication refusal is left alone: the framework's wording for it
+        // is not a modelled-input failure and is not this service's to restate.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: match violations.as_slice() {
+                    [] => "The input parameters don't match the service's restrictions."
+                        .to_string(),
+                    [only] => only.message(),
+                    many => format!(
+                        "{} validation errors detected: {}",
+                        many.len(),
+                        many.iter()
+                            .map(smithy_server_runtime::Violation::message)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                },
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(

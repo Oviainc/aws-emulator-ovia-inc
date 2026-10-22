@@ -133,7 +133,32 @@ pub struct Tag {
     pub value: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline")]
+// `MediaCapturePipeline`'s schema is written out by hand rather than derived with
+// `#[smithy_macros::smithy(shape = ...)]`.
+//
+// WHY: the model targets both timestamp members at `Iso8601Timestamp`, which
+// carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape", shape="MediaCapturePipeline")` reports
+// `"timestampFormat": "date-time"` on `CreatedTimestamp`/`UpdatedTimestamp`). The
+// derive captures `@length`, `@pattern`, `@jsonName`, `@xmlName` and the HTTP
+// bindings onto each member schema but NOT `@timestampFormat`, and the restJson1
+// codec resolves the format from the member schema
+// (`vendor/smithy-schema-server/src/json.rs::write_timestamp`), falling back to
+// the protocol default of epoch-seconds. A derived `MediaCapturePipeline` therefore
+// renders `"CreatedTimestamp": 1761081534.919` where the service renders
+// `"2026-10-21T21:18:54.919Z"`, and an SDK built from this model fails to read it.
+//
+// Hand-writing the member schemas is what lets `.with_timestamp_format(DateTime)`
+// reach the two timestamp members. Everything else mirrors the derive exactly: the
+// member order and `member_index` values, the shape ids, and the write/read call
+// per member kind. Constraint traits are deliberately NOT carried: they are read
+// only by the request-path validating walk
+// (`vendor/smithy-server-runtime/src/operation.rs` validates `INPUT_SCHEMA` only),
+// and this shape appears in no operation input.
+//
+// This block is a WORKAROUND and should be deleted once the derive carries the
+// trait. The core-library change that fixes it for every service is filed as
+// `issues/things-that-do-not-work/20261021T223000Z-scaffold-codegen-drops-timestampformat-from-member-schemas.md`.
 #[derive(Debug, Clone, Default)]
 pub struct MediaCapturePipeline {
     pub media_pipeline_id: Option<String>,
@@ -148,6 +173,216 @@ pub struct MediaCapturePipeline {
     pub chime_sdk_meeting_configuration: Option<ChimeSdkMeetingConfiguration>,
     pub sse_aws_key_management_params: Option<SseAwsKeyManagementParams>,
     pub sink_iam_role_arn: Option<String>,
+}
+
+/// One member schema of [`MediaCapturePipeline`], at `index` in the member list.
+const fn media_capture_pipeline_member(
+    shape_id: &'static str,
+    name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            shape_id,
+            "com.amazonaws.chimesdkmediapipelines",
+            name,
+        ),
+        shape_type,
+        name,
+        index,
+    )
+}
+
+impl MediaCapturePipeline {
+    // Associated member-schema consts. `tests/all/media_capture_pipeline_lifecycle.rs`
+    // pins their names, order and `member_index` values against the model, so this
+    // hand-written block cannot drift from it silently.
+    const M_MEDIA_PIPELINE_ID: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$MediaPipelineId",
+        "MediaPipelineId",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_MEDIA_PIPELINE_ARN: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$MediaPipelineArn",
+        "MediaPipelineArn",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    const M_SOURCE_TYPE: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SourceType",
+        "SourceType",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    const M_SOURCE_ARN: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SourceArn",
+        "SourceArn",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    const M_STATUS: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$Status",
+        "Status",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+    const M_SINK_TYPE: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SinkType",
+        "SinkType",
+        ::aws_smithy_schema::ShapeType::String,
+        5,
+    );
+    const M_SINK_ARN: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SinkArn",
+        "SinkArn",
+        ::aws_smithy_schema::ShapeType::String,
+        6,
+    );
+    /// `@timestampFormat("date-time")`, from the `Iso8601Timestamp` shape this
+    /// member targets. THE reason this schema is hand-written.
+    const M_CREATED_TIMESTAMP: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$CreatedTimestamp",
+        "CreatedTimestamp",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        7,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as `CreatedTimestamp` above.
+    const M_UPDATED_TIMESTAMP: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$UpdatedTimestamp",
+        "UpdatedTimestamp",
+        ::aws_smithy_schema::ShapeType::Timestamp,
+        8,
+    )
+    .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    const M_CHIME_SDK_MEETING_CONFIGURATION: ::aws_smithy_schema::Schema =
+        media_capture_pipeline_member(
+            "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$ChimeSdkMeetingConfiguration",
+            "ChimeSdkMeetingConfiguration",
+            ::aws_smithy_schema::ShapeType::Structure,
+            9,
+        );
+    const M_SSE_AWS_KEY_MANAGEMENT_PARAMS: ::aws_smithy_schema::Schema =
+        media_capture_pipeline_member(
+            "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SseAwsKeyManagementParams",
+            "SseAwsKeyManagementParams",
+            ::aws_smithy_schema::ShapeType::Structure,
+            10,
+        );
+    const M_SINK_IAM_ROLE_ARN: ::aws_smithy_schema::Schema = media_capture_pipeline_member(
+        "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline$SinkIamRoleArn",
+        "SinkIamRoleArn",
+        ::aws_smithy_schema::ShapeType::String,
+        11,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.chimesdkmediapipelines#MediaCapturePipeline",
+            "com.amazonaws.chimesdkmediapipelines",
+            "MediaCapturePipeline",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_MEDIA_PIPELINE_ID,
+            &Self::M_MEDIA_PIPELINE_ARN,
+            &Self::M_SOURCE_TYPE,
+            &Self::M_SOURCE_ARN,
+            &Self::M_STATUS,
+            &Self::M_SINK_TYPE,
+            &Self::M_SINK_ARN,
+            &Self::M_CREATED_TIMESTAMP,
+            &Self::M_UPDATED_TIMESTAMP,
+            &Self::M_CHIME_SDK_MEETING_CONFIGURATION,
+            &Self::M_SSE_AWS_KEY_MANAGEMENT_PARAMS,
+            &Self::M_SINK_IAM_ROLE_ARN,
+        ],
+    );
+}
+
+pub static MEDIA_CAPTURE_PIPELINE_SCHEMA: &::aws_smithy_schema::Schema =
+    &MediaCapturePipeline::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for MediaCapturePipeline {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.media_pipeline_id.as_ref() {
+            s.write_string(&Self::M_MEDIA_PIPELINE_ID, v.as_str())?;
+        }
+        if let Some(v) = self.media_pipeline_arn.as_ref() {
+            s.write_string(&Self::M_MEDIA_PIPELINE_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.source_type.as_ref() {
+            s.write_string(&Self::M_SOURCE_TYPE, v.as_str())?;
+        }
+        if let Some(v) = self.source_arn.as_ref() {
+            s.write_string(&Self::M_SOURCE_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.sink_type.as_ref() {
+            s.write_string(&Self::M_SINK_TYPE, v.as_str())?;
+        }
+        if let Some(v) = self.sink_arn.as_ref() {
+            s.write_string(&Self::M_SINK_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.created_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_CREATED_TIMESTAMP, v)?;
+        }
+        if let Some(v) = self.updated_timestamp.as_ref() {
+            s.write_timestamp(&Self::M_UPDATED_TIMESTAMP, v)?;
+        }
+        if let Some(v) = self.chime_sdk_meeting_configuration.as_ref() {
+            s.write_struct(&Self::M_CHIME_SDK_MEETING_CONFIGURATION, v)?;
+        }
+        if let Some(v) = self.sse_aws_key_management_params.as_ref() {
+            s.write_struct(&Self::M_SSE_AWS_KEY_MANAGEMENT_PARAMS, v)?;
+        }
+        if let Some(v) = self.sink_iam_role_arn.as_ref() {
+            s.write_string(&Self::M_SINK_IAM_ROLE_ARN, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for MediaCapturePipeline {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.media_pipeline_id = Some(d.read_string(member)?),
+                Some(1) => out.media_pipeline_arn = Some(d.read_string(member)?),
+                Some(2) => out.source_type = Some(d.read_string(member)?),
+                Some(3) => out.source_arn = Some(d.read_string(member)?),
+                Some(4) => out.status = Some(d.read_string(member)?),
+                Some(5) => out.sink_type = Some(d.read_string(member)?),
+                Some(6) => out.sink_arn = Some(d.read_string(member)?),
+                Some(7) => out.created_timestamp = Some(d.read_timestamp(member)?),
+                Some(8) => out.updated_timestamp = Some(d.read_timestamp(member)?),
+                Some(9) => {
+                    out.chime_sdk_meeting_configuration = Some(
+                        <ChimeSdkMeetingConfiguration as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    )
+                }
+                Some(10) => {
+                    out.sse_aws_key_management_params = Some(
+                        <SseAwsKeyManagementParams as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    )
+                }
+                Some(11) => out.sink_iam_role_arn = Some(d.read_string(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.chimesdkmediapipelines#BadRequestException")]
