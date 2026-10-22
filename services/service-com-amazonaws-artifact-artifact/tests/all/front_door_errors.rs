@@ -9,10 +9,10 @@
 //!
 //! 1. **The targeted resource is authorized first.** A request that names a resource
 //!    the gateway cannot authorize — an identifier that is not a well-formed id of its
-//!    type, so it names nothing, or one the account's own catalog does not hold — is
-//!    refused with HTTP 401 `UnauthorizedException`, ahead of the modelled member
-//!    constraints and ahead of the service's own not-found. A target it CAN authorize
-//!    is passed through to the operation, whatever the operation then answers.
+//!    type, so it names nothing, or one the account's own catalog or inquiry set does not
+//!    hold — is refused with HTTP 401 `UnauthorizedException`, ahead of the modelled
+//!    member constraints and ahead of the service's own not-found. A target it CAN
+//!    authorize is passed through to the operation, whatever the operation then answers.
 //! 2. **The request body is validated next.** A body that does not bind to the
 //!    modelled shape — a value outside an enum's set or a member's constraint, or a
 //!    member the shape requires and the body omits — is refused with HTTP 400
@@ -45,10 +45,23 @@ const UNAUTHORIZED: (u16, &str, &str) = (401, "UnauthorizedException", "Unauthor
 /// The front door's request-body refusal.
 const INVALID_BODY: (u16, &str, &str) = (400, "BadRequestException", "Invalid request body");
 
-/// `InquiryId`'s `^compliance-inquiry-[a-zA-Z0-9]{16}$`, satisfied: a well-formed id,
-/// so the front door has a resource to authorize. Spelled out here rather than taken
-/// from the crate so a wrong predicate in `src/state.rs` cannot make this suite pass.
+/// `InquiryId`'s `^compliance-inquiry-[a-zA-Z0-9]{16}$`, satisfied: a well-formed id, so
+/// the front door's PRE-DISPATCH checks have a target they can parse and go on to judge
+/// the body. It names no stored inquiry, which is why the rows below that use it are
+/// body-refusal rows: whether the account holds the inquiry is a state question, answered
+/// after the body is validated. Spelled out here rather than taken from the crate so a
+/// wrong predicate in `src/state.rs` cannot make this suite pass.
 const WELL_FORMED_INQUIRY: &str = "compliance-inquiry-0123456789abcdef";
+
+/// Well-formed inquiry ids the account holds no inquiry for — the second class of
+/// unauthorizable target, judged against this service's state rather than against the id
+/// syntax. The rows differ along what the 16-character suffix generalises over.
+const UNHELD_INQUIRY_IDS: &[(&str, &str)] = &[
+    ("all digits", "compliance-inquiry-0000000000000000"),
+    ("all lowercase", "compliance-inquiry-zzzzzzzzzzzzzzzz"),
+    ("all uppercase", "compliance-inquiry-ZZZZZZZZZZZZZZZZ"),
+    ("mixed case and digits", "compliance-inquiry-AbCdEf0123456789"),
+];
 
 /// Identifiers that satisfy no resource-id syntax of this service, so they name nothing
 /// the gateway could authorize. The rows differ along what the pattern generalises
@@ -294,24 +307,59 @@ async fn a_compliance_inquiry_target_the_front_door_cannot_authorize_is_refused_
     )
     .await;
     assert_refused("a report id as an inquiry id", &crossed, UNAUTHORIZED);
+
+    // The other class of unauthorizable target: a well-formed id the account holds no
+    // inquiry for. That judgement needs this service's state, so the HANDLER makes it and
+    // answers the same refusal — exactly as an unpublished `reportId` is answered above.
+    // Only `GetComplianceInquiryMetadata` is implemented today; the other three inquiry
+    // operations still answer their scaffolded 501 (their own stub issues), which is why
+    // they are not rows here.
+    for (case, id) in UNHELD_INQUIRY_IDS {
+        let answer = get(
+            &router,
+            &format!("/v1/compliance-inquiry/getMetadata?complianceInquiryId={id}"),
+        )
+        .await;
+        assert_refused(
+            &format!("GetComplianceInquiryMetadata unheld id, {case}"),
+            &answer,
+            UNAUTHORIZED,
+        );
+    }
 }
 
 #[tokio::test]
 async fn a_well_formed_target_reaches_the_operation() {
     let router = emulator();
 
-    // A well-formed inquiry id IS a target the gateway authorizes, so the front door
-    // passes the request through and the operation answers for itself — today its
-    // scaffolded 501, which this suite deliberately does not pin beyond "not refused by
-    // the front door".
+    // A target the gateway authorizes is passed through, and the operation answers for
+    // itself. For an inquiry that means an inquiry this account HOLDS, so one is created
+    // first: `GetComplianceInquiryMetadata` then serves it, and
+    // `ListComplianceInquiryQueries` answers its own scaffolded 501 — which this suite
+    // deliberately does not pin beyond "not refused by the front door".
+    let created = call(
+        &router,
+        "POST",
+        "/v1/compliance-inquiry/create",
+        Some(create_body(json!({}))),
+    )
+    .await;
+    assert_eq!(
+        created.status, 202,
+        "the control create must succeed, got {} with {:?}",
+        created.status, created.body
+    );
+    let held = created.body["complianceInquirySummary"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
     for (operation, answer) in [
         (
             "GetComplianceInquiryMetadata",
             get(
                 &router,
-                &format!(
-                    "/v1/compliance-inquiry/getMetadata?complianceInquiryId={WELL_FORMED_INQUIRY}"
-                ),
+                &format!("/v1/compliance-inquiry/getMetadata?complianceInquiryId={held}"),
             )
             .await,
         ),
@@ -319,9 +367,7 @@ async fn a_well_formed_target_reaches_the_operation() {
             "ListComplianceInquiryQueries",
             get(
                 &router,
-                &format!(
-                    "/v1/compliance-inquiry/listQueries?complianceInquiryId={WELL_FORMED_INQUIRY}"
-                ),
+                &format!("/v1/compliance-inquiry/listQueries?complianceInquiryId={held}"),
             )
             .await,
         ),
@@ -329,7 +375,7 @@ async fn a_well_formed_target_reaches_the_operation() {
         assert_ne!(
             answer.status,
             UNAUTHORIZED.0,
-            "case {operation}: a well-formed id must not be refused by the front door, got {:?}",
+            "case {operation}: an inquiry the account holds must not be refused, got {:?}",
             answer.body
         );
         assert_ne!(
@@ -339,6 +385,19 @@ async fn a_well_formed_target_reaches_the_operation() {
             answer.body
         );
     }
+
+    // And the read of the held inquiry is SERVED, which is what says the refusal above is
+    // a judgement on the target rather than a blanket denial of the operation.
+    let served = get(
+        &router,
+        &format!("/v1/compliance-inquiry/getMetadata?complianceInquiryId={held}"),
+    )
+    .await;
+    assert_eq!(
+        served.status, 200,
+        "case {held:?}: a held inquiry must be served, got {} with {:?}",
+        served.status, served.body
+    );
 
     // And a report the catalog publishes is served, which is what says the front door
     // judges the target rather than refusing the class of request.

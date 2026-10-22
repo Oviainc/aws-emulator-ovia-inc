@@ -89,8 +89,8 @@ pub const TERM_GRANT_CAPACITY: usize = 1_000;
 /// not issue.
 pub const REASON_INVALID_TOKEN: &str = "invalidToken";
 
-/// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException`
-/// report for a compliance inquiry id.
+/// The `resourceType` the modelled `ConflictException` reports for a compliance inquiry
+/// id.
 pub const INQUIRY_RESOURCE_TYPE: &str = "ComplianceInquiry";
 
 /// How many compliance inquiries the store holds before `CreateComplianceInquiry`
@@ -884,14 +884,12 @@ pub fn inquiry_arn(region: &str, inquiry_id: &str) -> String {
     ::engine::emulator_arn("artifact", region, &format!("compliance-inquiry/{inquiry_id}"))
 }
 
-/// The `ResourceNotFoundException` payload for an inquiry id the store does not hold.
-pub fn inquiry_not_found(inquiry_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("Compliance inquiry {inquiry_id} not found"),
-        resource_id: inquiry_id.to_string(),
-        resource_type: INQUIRY_RESOURCE_TYPE.to_string(),
-    }
-}
+// There is deliberately no not-found payload for a compliance inquiry id: an id the
+// account holds no inquiry for is answered with the front door's 401
+// `UnauthorizedException` (`crate::scaffolded::Scaffolded::unauthorized`) rather than the
+// modelled 404, exactly as a `reportId` the catalog does not publish is — the gateway
+// authorizes the target before the state is consulted, so the absence of a resource the
+// caller may not read is never confirmed.
 
 /// The modelled `ConflictException` for a `clientToken` replayed on a request that is
 /// not the one it created an inquiry for.
