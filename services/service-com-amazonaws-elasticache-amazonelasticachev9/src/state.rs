@@ -10,6 +10,11 @@
 //! the modelled `CacheCluster` / `CacheSubnetGroup` shapes, so the six handlers
 //! agree on one implementation instead of carrying copies that can drift.
 //!
+//! Beside those customer-created resources sits the one catalog this service
+//! publishes rather than mints: the service updates AWS releases for its cache
+//! engines. No operation creates one (the API has no such call), so the store
+//! starts out holding the catalog and `DescribeServiceUpdates` reports it.
+//!
 //! Everything else in this service (replication groups, serverless caches,
 //! snapshots, users, parameter groups, migrations, update actions) is still a
 //! scaffolded 501 and owns its own gap issue; where a member of an implemented
@@ -22,8 +27,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AvailabilityZone, CacheCluster, CacheNode, CacheParameterGroupStatus, CacheSubnetGroup,
     DestinationDetails, Endpoint, LogDeliveryConfiguration, LogDeliveryConfigurationRequest,
-    NotificationConfiguration, PendingModifiedValues, ScaleConfig, SecurityGroupMembership, Subnet,
-    Tag,
+    NotificationConfiguration, PendingModifiedValues, ScaleConfig, SecurityGroupMembership,
+    ServiceUpdate, Subnet, Tag,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -368,6 +373,26 @@ pub fn page_size(max_records: Option<i32>) -> Result<usize, String> {
         ));
     }
     Ok(usize::try_from(requested).unwrap_or(MAX_RECORDS_MIN as usize))
+}
+
+/// The page size a describe whose `MaxRecords` documents no bounds serves, or
+/// the reason the requested one is refused.
+///
+/// `DescribeServiceUpdates$MaxRecords` documents only "The maximum number of
+/// records to include in the response" — no "minimum 20; maximum 100" like the
+/// cluster and subnet-group describes carry (`smithy_query(query="doc",
+/// shape="DescribeServiceUpdatesMessage", member="MaxRecords")`) — so any
+/// positive count is a page it serves, and only a count that cannot be one is
+/// refused. [`MAX_RECORDS_DEFAULT`] is the page it serves when the request names
+/// no `MaxRecords` at all.
+pub fn unbounded_page_size(max_records: Option<i32>) -> Result<usize, String> {
+    let requested = max_records.unwrap_or(MAX_RECORDS_DEFAULT);
+    match usize::try_from(requested) {
+        Ok(size) if size > 0 => Ok(size),
+        _ => Err(format!(
+            "Invalid value {requested} for MaxRecords: must be at least 1."
+        )),
+    }
 }
 
 /// `engine` lowercased, or the reason it names no cache engine.
@@ -941,8 +966,218 @@ impl CacheSubnetGroupRecord {
     }
 }
 
+/// `ServiceUpdateStatus`'s values (`smithy_query(query="shape",
+/// shape="ServiceUpdateStatus")`: `available | cancelled | expired`). A filter
+/// naming anything else is refused by the boundary validator before a handler
+/// runs, because the member is a modelled enum.
+pub const SERVICE_UPDATE_AVAILABLE: &str = "available";
+/// See [`SERVICE_UPDATE_AVAILABLE`].
+pub const SERVICE_UPDATE_CANCELLED: &str = "cancelled";
+/// See [`SERVICE_UPDATE_AVAILABLE`].
+pub const SERVICE_UPDATE_EXPIRED: &str = "expired";
+
+/// The only value `ServiceUpdateType` declares
+/// (`smithy_query(query="shape", shape="ServiceUpdateType")`:
+/// `security-update`).
+pub const SERVICE_UPDATE_TYPE: &str = "security-update";
+
+/// The `EstimatedUpdateTime` every published update carries: "The estimated
+/// length of time the service update will take".
+///
+/// Nothing in the model or the docs states what that length is for a given
+/// update, so the emulator publishes one estimate for all of them rather than
+/// inventing a per-update one.
+pub const SERVICE_UPDATE_ESTIMATED_TIME: &str = "15 minutes";
+
+/// A day, the unit the published catalog's dates are spaced by.
+pub const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// One row of the service-update catalog this emulator publishes, as offsets in
+/// whole days from the instant the store came up.
+///
+/// AWS publishes ElastiCache service updates itself — the API has no operation
+/// that creates, cancels or expires one — and neither the model nor the docs
+/// name any particular update, so this table is the emulator's OWN published
+/// catalog rather than a claim about what AWS has released. The dates are
+/// relative to the store's own anchor so the catalog keeps the shape a real
+/// account sees (a recent update still inside its availability window, and an
+/// earlier one the clock has already carried past its end date) however long
+/// after this build the emulator runs.
+struct PublishedUpdate {
+    /// One of `ServiceUpdateSeverity`'s values (`critical | important | medium |
+    /// low`).
+    severity: &'static str,
+    /// How long before the anchor the update was released.
+    released_days_before: u64,
+    /// How long after its release the update is recommended to be applied by.
+    apply_by_days_after_release: u64,
+    /// How long after its release the update stops being available.
+    end_days_after_release: u64,
+    /// `AutoUpdateAfterRecommendedApplyByDate`: "whether the service update
+    /// will be automatically applied once the recommended apply-by date has
+    /// expired".
+    auto_update_after_recommended_apply_by_date: bool,
+}
+
+/// The catalog's rows. Every engine gets one update per row, so the set spans
+/// both the availability window a published update is inside and the one it has
+/// fallen out of.
+const PUBLISHED_UPDATES: [PublishedUpdate; 2] = [
+    PublishedUpdate {
+        severity: "critical",
+        released_days_before: 180,
+        apply_by_days_after_release: 30,
+        end_days_after_release: 120,
+        auto_update_after_recommended_apply_by_date: true,
+    },
+    PublishedUpdate {
+        severity: "important",
+        released_days_before: 7,
+        apply_by_days_after_release: 30,
+        end_days_after_release: 120,
+        auto_update_after_recommended_apply_by_date: false,
+    },
+];
+
+/// One published service update, as this emulator holds it.
+///
+/// `ServiceUpdateStatus` is NOT stored: it follows from the update's dates and
+/// the clock, so [`ServiceUpdateRecord::status`] derives it on every read
+/// instead of letting a stored copy drift from the dates beside it.
+#[derive(Debug, Clone)]
+pub struct ServiceUpdateRecord {
+    /// "The unique ID of the service update", and the identity
+    /// `ServiceUpdateName` names it by.
+    pub service_update_name: String,
+    /// "The Elasticache engine to which the update applies."
+    pub engine: String,
+    /// "The Elasticache engine version to which the update applies."
+    pub engine_version: String,
+    /// One of `ServiceUpdateSeverity`'s values.
+    pub severity: String,
+    /// One of `ServiceUpdateType`'s values — see [`SERVICE_UPDATE_TYPE`].
+    pub update_type: String,
+    /// "Provides details of the service update."
+    pub description: String,
+    /// "The date when the service update is initially available."
+    pub release_date: SystemTime,
+    /// "The recommendend date to apply the service update in order to ensure
+    /// compliance."
+    pub recommended_apply_by_date: SystemTime,
+    /// "The date after which the service update is no longer available."
+    pub end_date: SystemTime,
+    /// See [`PublishedUpdate::auto_update_after_recommended_apply_by_date`].
+    pub auto_update_after_recommended_apply_by_date: bool,
+    /// See [`SERVICE_UPDATE_ESTIMATED_TIME`].
+    pub estimated_update_time: String,
+}
+
+impl ServiceUpdateRecord {
+    /// This update's `ServiceUpdateStatus` at `now`.
+    ///
+    /// `ServiceUpdateEndDate` is "the date after which the service update is no
+    /// longer available", so an update the clock has carried past it is
+    /// `expired` and one still inside its window is `available`. The third
+    /// status, `cancelled`, is the status of an update AWS withdrew before its
+    /// end date; this emulator publishes none, and no operation in this service
+    /// withdraws one, so no record ever reports it.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now >= self.end_date {
+            SERVICE_UPDATE_EXPIRED
+        } else {
+            SERVICE_UPDATE_AVAILABLE
+        }
+    }
+
+    /// This record as the modelled `ServiceUpdate`, with its status taken from
+    /// the clock at `now`.
+    pub fn to_modeled(&self, now: SystemTime) -> ServiceUpdate {
+        ServiceUpdate {
+            service_update_name: Some(self.service_update_name.clone()),
+            service_update_release_date: Some(::aws_smithy_types::DateTime::from(self.release_date)),
+            service_update_end_date: Some(::aws_smithy_types::DateTime::from(self.end_date)),
+            service_update_severity: Some(self.severity.clone()),
+            service_update_recommended_apply_by_date: Some(::aws_smithy_types::DateTime::from(
+                self.recommended_apply_by_date,
+            )),
+            service_update_status: Some(self.status(now).to_string()),
+            service_update_description: Some(self.description.clone()),
+            service_update_type: Some(self.update_type.clone()),
+            engine: Some(self.engine.clone()),
+            engine_version: Some(self.engine_version.clone()),
+            auto_update_after_recommended_apply_by_date: Some(
+                self.auto_update_after_recommended_apply_by_date,
+            ),
+            estimated_update_time: Some(self.estimated_update_time.clone()),
+        }
+    }
+}
+
+/// The `YYYYMMDD` an update released at `at` is named after.
+///
+/// Built from the RFC-3339 rendering of the instant, so the service's one
+/// timestamp implementation is also what dates a name.
+fn release_date_label(at: SystemTime) -> String {
+    ::aws_smithy_types::DateTime::from(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .map(|rendered| {
+            rendered
+                .chars()
+                .take_while(|c| *c != 'T')
+                .filter(|c| c.is_ascii_digit())
+                .collect()
+        })
+        // Unreachable for an instant this century; an unrenderable date is
+        // simply not part of a name.
+        .unwrap_or_default()
+}
+
+/// The service-update catalog as of `anchor`, keyed by `ServiceUpdateName`.
+///
+/// One update per engine per row of [`PUBLISHED_UPDATES`], named the way AWS
+/// names an ElastiCache service update — `elasticache-<YYYYMMDD>-<NNN>`, the
+/// release date and a sequence number within that date. A `BTreeMap` is what
+/// gives `DescribeServiceUpdates` the stable total order its `Marker` indexes
+/// into.
+pub fn published_service_updates(anchor: SystemTime) -> BTreeMap<String, ServiceUpdateRecord> {
+    let mut catalog = BTreeMap::new();
+    for row in &PUBLISHED_UPDATES {
+        let release_date = anchor
+            .checked_sub(DAY * u32::try_from(row.released_days_before).unwrap_or(u32::MAX))
+            .unwrap_or(anchor);
+        let label = release_date_label(release_date);
+        for (index, engine) in ENGINES.iter().enumerate() {
+            let name = format!("elasticache-{label}-{:03}", index + 1);
+            let engine_version = default_engine_version(engine);
+            let severity = row.severity;
+            catalog.insert(
+                name.clone(),
+                ServiceUpdateRecord {
+                    service_update_name: name,
+                    engine: (*engine).to_string(),
+                    engine_version: engine_version.to_string(),
+                    severity: severity.to_string(),
+                    update_type: SERVICE_UPDATE_TYPE.to_string(),
+                    description: format!(
+                        "A {severity} security update for {engine} {engine_version}."
+                    ),
+                    release_date,
+                    recommended_apply_by_date: release_date
+                        + DAY * u32::try_from(row.apply_by_days_after_release).unwrap_or(u32::MAX),
+                    end_date: release_date
+                        + DAY * u32::try_from(row.end_days_after_release).unwrap_or(u32::MAX),
+                    auto_update_after_recommended_apply_by_date: row
+                        .auto_update_after_recommended_apply_by_date,
+                    estimated_update_time: SERVICE_UPDATE_ESTIMATED_TIME.to_string(),
+                },
+            );
+        }
+    }
+    catalog
+}
+
 /// Per-service state for com-amazonaws-elasticache-amazonelasticachev9. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// Every stored cluster, keyed by its (lowercased) `CacheClusterId` — the
     /// resource's identity in this API. A `BTreeMap` is what gives
@@ -951,10 +1186,34 @@ pub struct ComAmazonawsElasticacheAmazonelasticachev9State {
     /// Every stored subnet group, keyed by its (lowercased) name, ordered for
     /// the same reason.
     pub cache_subnet_groups: BTreeMap<String, CacheSubnetGroupRecord>,
+    /// The service updates this emulator publishes, keyed by
+    /// `ServiceUpdateName` and ordered for the same reason. AWS releases these
+    /// rather than an account creating them, so the store holds the catalog
+    /// from the moment it comes up — see [`published_service_updates`].
+    pub service_updates: BTreeMap<String, ServiceUpdateRecord>,
     /// The counter endpoint DNS labels are minted from.
     pub dns_token_seq: u64,
     /// The counter VPC ids are minted from.
     pub vpc_seq: u64,
+}
+
+impl Default for ComAmazonawsElasticacheAmazonelasticachev9State {
+    /// A store with no customer resources in it, already holding the published
+    /// service-update catalog.
+    ///
+    /// The engine builds this the first time a handler of this service asks for
+    /// its state, so that instant is the anchor the catalog's release and end
+    /// dates hang off — fixed for the life of the process, which is what makes
+    /// every later read of an update report the same dates.
+    fn default() -> Self {
+        Self {
+            cache_clusters: BTreeMap::new(),
+            cache_subnet_groups: BTreeMap::new(),
+            service_updates: published_service_updates(SystemTime::now()),
+            dns_token_seq: 0,
+            vpc_seq: 0,
+        }
+    }
 }
 
 impl ComAmazonawsElasticacheAmazonelasticachev9State {

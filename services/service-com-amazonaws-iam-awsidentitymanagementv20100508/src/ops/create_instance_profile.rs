@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstanceProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstanceProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: an instance profile created here is persisted in this service's state
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::instance_profiles`])
+//! and is what `GetInstanceProfile` reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstanceProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +166,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstanceProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstanceProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstanceProfile"))
+        // `ctx` carries request metadata only; nothing here depends on it — IAM is global,
+        // so not even the ARN's region segment comes from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateInstanceProfileErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter" — and "if any one of the tags is
+        // invalid … the entire request fails and the resource is not created" (`$Tags`),
+        // which is why this is checked before anything is written.
+        let tags = input.tags.filter(|tags| !tags.is_empty());
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(tags.iter().flatten().map(|tag| tag.key.as_str()))
+        {
+            return Err(CreateInstanceProfileErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // IAM entity names are unique within the account and "are not distinguished by
+        // case", so the case-folded name is the identity: a second create under any casing
+        // of a held name is a conflict rather than a second profile.
+        let key = crate::state::name_key(&input.instance_profile_name);
+        if store.instance_profiles.contains_key(&key) {
+            return Err(
+                CreateInstanceProfileErrorModeled::EntityAlreadyExistsException(
+                    EntityAlreadyExistsException {
+                        message: Some(format!(
+                            "Instance Profile {} already exists.",
+                            input.instance_profile_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An account holds a bounded number of instance profiles, so a caller cannot grow
+        // the account without limit; past the quota IAM refuses the create.
+        if store.instance_profiles.len() >= crate::state::MAX_INSTANCE_PROFILES_PER_ACCOUNT {
+            return Err(CreateInstanceProfileErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for InstanceProfilesPerAccount: {}",
+                        crate::state::MAX_INSTANCE_PROFILES_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "This parameter is optional. If it is not included, it defaults to a slash (/)"
+        // (`$Path`).
+        let path = input
+            .path
+            .unwrap_or_else(|| crate::state::DEFAULT_PATH.to_string());
+        let instance_profile = InstanceProfile {
+            arn: crate::state::instance_profile_arn(&path, &input.instance_profile_name),
+            path,
+            instance_profile_id: store.next_instance_profile_id(),
+            create_date: crate::state::now(),
+            // "The role associated with the instance profile" (`$Roles`): a freshly created
+            // profile has none until `AddRoleToInstanceProfile` binds one.
+            roles: Vec::new(),
+            // An empty `Tags` list is the same as none: report the member only when the
+            // profile actually carries tags.
+            tags,
+            instance_profile_name: input.instance_profile_name,
+        };
+
+        // The response is the record that was stored, so a caller sees exactly what a
+        // later `GetInstanceProfile` reports.
+        store
+            .instance_profiles
+            .insert(key, instance_profile.clone());
+        Ok(CreateInstanceProfileOutput { instance_profile })
     }
 }

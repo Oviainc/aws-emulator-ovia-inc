@@ -191,8 +191,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page = &remaining[..page_len];
         let has_more = remaining.len() > page_len;
 
-        // `TargetList` is modelled `length 1..100`, so an empty page is left
-        // ABSENT rather than serialized as an empty list.
+        // The page this call computed is always serialized, so a rule whose
+        // targets have all been removed reports `Targets: []`. The list shape's
+        // `@length(min: 1)` constrains the list a REQUEST may carry, not the one
+        // a response reports.
         let targets: Vec<Target> = page.iter().map(crate::state::StoredTarget::to_target).collect();
         // A NextToken only when something is actually left to read, so a client
         // that follows tokens terminates.
@@ -202,7 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|target| crate::state::encode_page_token(&target.id));
 
         Ok(ListTargetsByRuleOutput {
-            targets: (!targets.is_empty()).then_some(targets),
+            targets: Some(targets),
             next_token,
         })
     }

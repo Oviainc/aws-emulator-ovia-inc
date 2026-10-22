@@ -65,9 +65,38 @@
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — This error is thrown when the requested
 //!   resource is not found.
+//!
+//! ## Beside the model
+//!
+//! The recorded 200 carries one further top-level member the model declares on no
+//! shape — `deletedAt`, the instant the deletion was recorded — written through
+//! [`crate::state::RecordedMembers`]. See [`DELETED_AT_MEMBER`].
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The member `deletedAt` is written under, beside the modelled members.
+///
+/// RECORDED behaviour: `DeleteDomainOutput` declares `domainId`, `arn` and `status`
+/// and nothing else (`smithy_query(query="shape", shape="DeleteDomainOutput")`), so
+/// there is no generated field for `deletedAt` and this schema is what names it on the
+/// wire. Index 3 is the first free member index after those three (0..=2); the
+/// protocol's default timestamp format applies, as it does to every modelled timestamp
+/// of this service. See [`crate::state::RecordedMembers`].
+const DELETED_AT_MEMBER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.connecthealth#DeleteDomainOutput$deletedAt",
+        "com.amazonaws.connecthealth",
+        "deletedAt",
+    ),
+    ::aws_smithy_schema::ShapeType::Timestamp,
+    "deletedAt",
+    3,
+);
+
+/// What `DeleteDomain` answers: the modelled `DeleteDomainOutput` plus the recorded
+/// top-level `deletedAt`.
+pub type DeleteDomainResponse = crate::state::RecordedMembers<DeleteDomainOutput>;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -124,7 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DeleteDomain<Eng>
 {
     type Input = DeleteDomainInput;
-    type Output = DeleteDomainOutput;
+    type Output = DeleteDomainResponse;
     type Error = DeleteDomainError;
 
     const NAME: &'static str = "DeleteDomain";
@@ -160,11 +189,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `@idempotent`: a domain already being deleted keeps the due instant it
-        // already has, so repeating the call neither errors nor postpones the purge.
-        if domain.status != crate::state::DomainStatus::Deleting {
-            domain.status = crate::state::DomainStatus::Deleting;
-            domain.purge_due_at = Some(now + crate::state::DOMAIN_DELETION_SPAN);
+        // `@idempotent`: a domain already being deleted keeps the instants it already
+        // has, so repeating the call neither errors nor postpones the deletion.
+        if domain.deleted_at.is_none() {
+            domain.deleted_at = Some(now);
+            // Which status the call reports is the domain's own: a deletion that
+            // finishes inside the call reaches the terminal DELETED, one that has to
+            // wait for a resource provisioned outside this service reports the
+            // non-terminal DELETING and the clock materialises it after the span.
+            let (status, purge_due_at) = if domain.deletion_completes_in_call() {
+                (crate::state::DomainStatus::Deleted, now)
+            } else {
+                (
+                    crate::state::DomainStatus::Deleting,
+                    now + crate::state::DOMAIN_DELETION_SPAN,
+                )
+            };
+            domain.status = status;
+            domain.purge_due_at = Some(purge_due_at);
             // The subscriptions go with the domain ("and all associated resources").
             for subscription in domain.subscriptions.values_mut() {
                 subscription.status = crate::state::SubscriptionStatus::Deleted;
@@ -172,10 +214,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        Ok(DeleteDomainOutput {
-            domain_id: domain.domain_id.clone(),
-            arn: domain.arn.clone(),
-            status: domain.status.as_wire().to_string(),
-        })
+        let response = DeleteDomainResponse {
+            payload: DeleteDomainOutput {
+                domain_id: domain.domain_id.clone(),
+                arn: domain.arn.clone(),
+                status: domain.status.as_wire().to_string(),
+            },
+            members: domain
+                .deleted_at
+                .map(|deleted_at| {
+                    crate::state::RecordedMember::Instant(
+                        &DELETED_AT_MEMBER,
+                        crate::state::to_timestamp(deleted_at),
+                    )
+                })
+                .into_iter()
+                .collect(),
+        };
+        // A deletion that is already due — the one this call completed — is materialised
+        // here, so the record is gone before the next caller reads it.
+        store.purge_due_deletions(now);
+        Ok(response)
     }
 }

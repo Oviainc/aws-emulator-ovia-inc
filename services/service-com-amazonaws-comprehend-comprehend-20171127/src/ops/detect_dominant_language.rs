@@ -143,9 +143,11 @@ fn detector() -> &'static Detector {
 /// produce would be an invented one, and the modelled `Languages` member is
 /// optional precisely because a response need not name a language.
 ///
-/// `pub(crate)` because the asynchronous `StartDominantLanguageDetectionJob` analyses
-/// each of its input documents with the SAME engine, through this one function:
-/// synchronous and batch identification of a document must never be two
+/// `pub(crate)` because every other caller identifies a document with the SAME
+/// engine, through this one function: `BatchDetectDominantLanguage`, documented as
+/// this same inference over a batch of documents, and the asynchronous
+/// `StartDominantLanguageDetectionJob`, which analyses each of its input documents.
+/// Synchronous, batch and asynchronous identification of a document must never be
 /// implementations that can disagree.
 pub(crate) fn detect_languages(text: &str) -> Vec<DominantLanguage> {
     let sample: String = text.chars().take(IDENTIFICATION_SAMPLE_CHARS).collect();

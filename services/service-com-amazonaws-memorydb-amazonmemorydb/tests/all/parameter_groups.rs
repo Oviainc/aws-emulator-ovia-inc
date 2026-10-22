@@ -9,8 +9,9 @@
 //! The rules under test, each over a SET of inputs rather than one recorded request:
 //!
 //! * `CreateParameterGroup` persists the group and answers the stored record: `Name`
-//!   and `Family` as given, `Description` only when one was given, and an `ARN` scoped
-//!   to the region the request was signed for;
+//!   and `Family` folded to lower case (a MemoryDB resource name is a case-insensitive
+//!   identifier), `Description` as given or the service's default when none was given,
+//!   and an `ARN` scoped to the region the request was signed for;
 //! * `DescribeParameterGroups` answers from that same state — the one group a request
 //!   names, or every stored group in name order — so a read reports exactly what the
 //!   create persisted;
@@ -178,15 +179,14 @@ fn create_body(case: &Case) -> Value {
 
 /// What the service must report for one case, in the region it was created in.
 fn expected_group(case: &Case, region: &str) -> Value {
-    let mut group = json!({
+    json!({
         "Name": case.name,
         "Family": case.family,
+        // A group created without a `Description` carries the service's own default
+        // (`crate::state::DEFAULT_PARAMETER_GROUP_DESCRIPTION`), not an absent member.
+        "Description": case.description.unwrap_or(" "),
         "ARN": format!("arn:aws:memorydb:{region}:{ACCOUNT}:parametergroup/{}", case.name),
-    });
-    if let Some(description) = case.description {
-        group["Description"] = json!(description);
-    }
-    group
+    })
 }
 
 /// `ParameterGroups[*].Name` of a `DescribeParameterGroups` body, in answer order.
@@ -450,11 +450,11 @@ async fn a_request_that_names_nothing_is_refused() {
     )
     .await;
 
-    // Unknown names, including one that only differs from a stored name by case and one
-    // that is a prefix of it: the lookup is exact.
+    // Unknown names, including one that is a prefix of a stored name, one that extends
+    // it and one that differs by a trailing space: a name is folded to lower case
+    // before it is looked up, but nothing else about it is normalised.
     for name in [
         "no-such-group",
-        "ALPHA-GROUP",
         "alpha",
         "alpha-group-2",
         "alpha-group ",

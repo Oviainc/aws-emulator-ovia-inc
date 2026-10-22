@@ -43,6 +43,10 @@ const PAGE_SIZE: usize = 25;
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
     pub(crate) region: String,
+    /// The SINGLE shared engine the router hands every handler of this service, kept
+    /// so a suite can reach this service's store the way a handler does — for state
+    /// no operation of this API mints.
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -51,10 +55,11 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
         Self {
             router,
             region: region.to_string(),
+            engine,
         }
     }
 
@@ -1314,10 +1319,13 @@ async fn the_rule_store_is_capped_at_this_regions_quota() {
 #[tokio::test]
 async fn an_unimplemented_operation_still_answers_not_implemented() {
     // The slice implemented here is the setup-and-rule loop; everything else is still
-    // scaffolded and must say so rather than answer an empty success.
+    // scaffolded and must say so rather than answer an empty success. Any operation
+    // whose handler still carries the `SCAFFOLDED, NOT IMPLEMENTED` marker does — when
+    // the one named below is implemented, point this at another marked handler
+    // (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`).
     let emulator = Emulator::new();
     let (status, code) = emulator
-        .refused("DescribePendingAggregationRequests", &json!({}))
+        .refused("DescribeRemediationExecutionStatus", &json!({ "ConfigRuleName": "rule-000" }))
         .await;
     assert_eq!(
         (status, code.as_str()),

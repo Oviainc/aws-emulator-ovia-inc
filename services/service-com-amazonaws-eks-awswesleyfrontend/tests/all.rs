@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/access_entries.rs"]
 mod access_entries;
+#[path = "all/access_entry_listing.rs"]
+mod access_entry_listing;
 #[path = "all/access_policy_catalog.rs"]
 mod access_policy_catalog;
 #[path = "all/cluster_lifecycle.rs"]

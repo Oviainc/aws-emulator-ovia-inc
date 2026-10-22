@@ -46,9 +46,12 @@
 //! drop one. The store is keyed by `VpcId` in a [`BTreeMap`], which gives the describe
 //! path one stable order and lets a pagination token name the id the next page starts
 //! at. [`ComAmazonawsEc2Amazonec2State::subnets`] holds the account's subnets the same
-//! way, keyed by `SubnetId`. Further caller-created resources belong beside them as they
-//! are implemented, and should be validated against [`availability_zones_in_region`]
-//! rather than against a second zone list.
+//! way, keyed by `SubnetId`. [`ComAmazonawsEc2Amazonec2State::security_groups`] holds the
+//! account's security groups the same way, keyed by `GroupId`, and
+//! [`ComAmazonawsEc2Amazonec2State::images`] the images it can see, keyed by `ImageId`.
+//! Further caller-created resources belong beside them as they are implemented, and should
+//! be validated against [`availability_zones_in_region`] rather than against a second zone
+//! list.
 //!
 //! ## Launch templates
 //!
@@ -1017,20 +1020,7 @@ impl ComAmazonawsEc2Amazonec2State {
             region: region.to_string(),
             tags: Vec::new(),
             ip_permissions: Vec::new(),
-            ip_permissions_egress: vec![IpPermission {
-                ip_protocol: Some(ALL_IP_PROTOCOLS.to_string()),
-                // "For `tcp`, `udp`, and `icmp`, you must specify a port range"
-                // (`IpPermission$IpProtocol`) — an all-protocols rule carries none.
-                from_port: None,
-                to_port: None,
-                user_id_group_pairs: Some(Vec::new()),
-                ip_ranges: Some(vec![IpRange {
-                    cidr_ip: Some(ALL_IPV4_ADDRESSES.to_string()),
-                    description: None,
-                }]),
-                ipv6_ranges: Some(Vec::new()),
-                prefix_list_ids: Some(Vec::new()),
-            }],
+            ip_permissions_egress: vec![allow_all_egress()],
         });
         if let Some(group) = self.security_groups.get_mut(&group_id) {
             group.ip_permissions = Some(vec![IpPermission {
@@ -1136,6 +1126,70 @@ impl ComAmazonawsEc2Amazonec2State {
     /// stored. Saturating, so the budget can never wrap below zero.
     pub fn release_stored_bytes(&mut self, bytes: usize) {
         self.stored_bytes = self.stored_bytes.saturating_sub(bytes);
+    }
+
+    // -----------------------------------------------------------------------
+    // Security groups
+    // -----------------------------------------------------------------------
+
+    /// Whether another security group fits inside the store's ceiling
+    /// ([`MAX_SECURITY_GROUPS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with EC2's `SecurityGroupLimitExceeded` when it answers `false`.
+    pub fn has_security_group_capacity(&self) -> bool {
+        self.security_groups.len() < MAX_SECURITY_GROUPS
+    }
+
+    /// The id of the security group this account holds in `vpc_id` under `group_name`, if
+    /// it holds one.
+    ///
+    /// "Names are case-insensitive and must be unique within the VPC"
+    /// (`CreateSecurityGroupRequest$GroupName`), so the comparison folds ASCII case and a
+    /// name names at most one group per VPC. A scan of the store, which
+    /// [`MAX_SECURITY_GROUPS`] bounds.
+    pub fn security_group_id_for_name(&self, vpc_id: &str, group_name: &str) -> Option<String> {
+        self.security_groups
+            .values()
+            .find(|group| {
+                group.vpc_id.as_deref() == Some(vpc_id)
+                    && group
+                        .group_name
+                        .as_deref()
+                        .is_some_and(|held| held.eq_ignore_ascii_case(group_name))
+            })
+            .and_then(|group| group.group_id.clone())
+    }
+}
+
+/// The caller-chosen bytes one stored security group holds: its name, description and
+/// tags. Charged against [`MAX_STORED_BYTES`] so the store is bounded in bytes and not
+/// only in records.
+pub fn security_group_payload_bytes(group: &SecurityGroup) -> usize {
+    group.group_name.as_deref().map_or(0, str::len)
+        + group.description.as_deref().map_or(0, str::len)
+        + tag_list_bytes(group.tags.as_deref().unwrap_or_default())
+}
+
+/// The outbound rule every new security group carries: "a security group has an outbound
+/// rule that allows all outbound traffic" (Amazon VPC User Guide, "Security group rules"),
+/// which on the wire is the `-1` protocol over `0.0.0.0/0` — the same rule
+/// [`ComAmazonawsEc2Amazonec2State::insert_default_security_group`] gives the default
+/// group, so one definition serves both writers.
+pub fn allow_all_egress() -> IpPermission {
+    IpPermission {
+        ip_protocol: Some(ALL_IP_PROTOCOLS.to_string()),
+        // "For `tcp`, `udp`, and `icmp`, you must specify a port range"
+        // (`IpPermission$IpProtocol`) — an all-protocols rule carries none.
+        from_port: None,
+        to_port: None,
+        user_id_group_pairs: Some(Vec::new()),
+        ip_ranges: Some(vec![IpRange {
+            description: None,
+            cidr_ip: Some(ALL_IPV4_ADDRESSES.to_string()),
+        }]),
+        ipv6_ranges: Some(Vec::new()),
+        prefix_list_ids: Some(Vec::new()),
     }
 }
 
@@ -3337,3 +3391,96 @@ fn page_token_checksum(start_at: &str) -> u64 {
     start_at.hash(&mut hasher);
     hasher.finish()
 }
+
+// ---------------------------------------------------------------------------
+// Security groups: what the CREATE path adds to the describe path's own helpers
+// ---------------------------------------------------------------------------
+
+/// The `ResourceType` a `CreateSecurityGroup` tag specification may name: the group it
+/// creates (`ResourceType` enum member `security-group`).
+pub const RESOURCE_TYPE_SECURITY_GROUP: &str = "security-group";
+
+/// How many characters a security group name or description may carry: "Up to 255
+/// characters in length" (`CreateSecurityGroupRequest$GroupName` and `$Description`).
+/// Both members carry the same bound, which is why one constant serves both.
+pub const MAX_SECURITY_GROUP_TEXT_CHARS: usize = 255;
+
+/// The punctuation a security group name or description may carry beside letters, digits
+/// and spaces: "Valid characters: a-z, A-Z, 0-9, spaces, and ._-:/()#,@[]+=&;{}!$*"
+/// (`CreateSecurityGroupRequest$GroupName` and `$Description`).
+pub const SECURITY_GROUP_PUNCTUATION: &str = "._-:/()#,@[]+=&;{}!$*";
+
+/// The prefix a security group name may NOT start with: "Can't start with sg-"
+/// (`CreateSecurityGroupRequest$GroupName`), because that is the shape of a group id.
+pub const SECURITY_GROUP_ID_PREFIX: &str = "sg-";
+
+/// The largest number of security groups this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`], not an AWS quota: each group is a
+/// record in this process's memory, so the number a caller can create has to be finite.
+/// [`ComAmazonawsEc2Amazonec2State::has_security_group_capacity`] is the predicate a
+/// writer asks first; a create past it refuses with [`SECURITY_GROUP_LIMIT_EXCEEDED`].
+pub const MAX_SECURITY_GROUPS: usize = 2_500;
+
+/// EC2's error code for a create that would take the account past its security group
+/// quota (EC2 API error codes, "SecurityGroupLimitExceeded").
+pub const SECURITY_GROUP_LIMIT_EXCEEDED: &str = "SecurityGroupLimitExceeded";
+
+/// EC2's error code for a second security group with a name the VPC already holds: "You
+/// can't have two security groups for the same VPC with the same name"
+/// (`CreateSecurityGroup`).
+pub const INVALID_GROUP_DUPLICATE: &str = "InvalidGroup.Duplicate";
+
+/// Whether `id` is a well-formed security group id: `sg-` followed by 8 or 17 lowercase
+/// hexadecimal digits — the short and the long id form, exactly as
+/// [`instance_id_is_well_formed`] reads an instance id.
+pub fn security_group_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(SECURITY_GROUP_ID_PREFIX) else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17) && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Whether `text` is within the alphabet a security group name and description are
+/// documented to accept (see [`SECURITY_GROUP_PUNCTUATION`]).
+pub fn is_security_group_text(text: &str) -> bool {
+    text.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == ' ' || SECURITY_GROUP_PUNCTUATION.contains(c))
+}
+
+/// Refuse a second security group with a name the VPC already holds: HTTP 400
+/// `InvalidGroup.Duplicate`.
+pub fn invalid_group_duplicate<E>(group_name: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_GROUP_DUPLICATE,
+        400,
+        format!("The security group '{group_name}' already exists for VPC"),
+    )
+}
+
+/// Refuse a create that named no VPC in an account that has no default VPC to fall back
+/// on: HTTP 400 `VPCIdNotSpecified` — "The ID of the VPC. Required for a nondefault VPC"
+/// (`CreateSecurityGroupRequest$VpcId`).
+pub fn vpc_id_not_specified<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        VPC_ID_NOT_SPECIFIED,
+        400,
+        "No default VPC for this user, so the request must name a VpcId",
+    )
+}
+
+/// EC2's error code for a request that left out a VPC id the account has no default VPC to
+/// supply (EC2 API error codes, "VPCIdNotSpecified").
+pub const VPC_ID_NOT_SPECIFIED: &str = "VPCIdNotSpecified";
+
+/// Refuse a create that would take the store past [`MAX_SECURITY_GROUPS`]: HTTP 400
+/// `SecurityGroupLimitExceeded`.
+pub fn security_group_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        SECURITY_GROUP_LIMIT_EXCEEDED,
+        400,
+        format!("The maximum number of security groups has been reached ({MAX_SECURITY_GROUPS})"),
+    )
+}
+
+

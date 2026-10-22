@@ -66,6 +66,23 @@ pub async fn call_in_region(
     uri: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    let (status, body, _headers) = call_with_headers(router, region, method, uri, body).await;
+    (status, body)
+}
+
+/// Dispatch one request signed for `region` and read back its status, its JSON body
+/// AND its response headers, for a suite whose rule is about a header.
+///
+/// The one place a request is built and dispatched in this crate: [`call_in_region`]
+/// is this function with the headers dropped, so a suite that reads a header cannot
+/// drift from how every other suite reaches the emulator.
+pub async fn call_with_headers(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Value, Vec<(String, String)>) {
     let payload = body.map_or_else(Bytes::new, |value| {
         Bytes::from(serde_json::to_vec(&value).expect("serialize the request body"))
     });
@@ -80,13 +97,32 @@ pub async fn call_in_region(
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
     let bytes = response.into_body();
     let parsed = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
-    (status, parsed)
+    (status, parsed, headers)
+}
+
+/// One response header, read as a client reads it (header names are
+/// case-insensitive, so the lookup is too).
+pub fn header(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
 }
 
 /// The `message` member of a restJson1 error body (`jsonName: "message"` on

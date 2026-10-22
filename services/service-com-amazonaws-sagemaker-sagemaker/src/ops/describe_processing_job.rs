@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeProcessingJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeProcessingJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replays the processing job `CreateProcessingJob` stored under this
+//! `ProcessingJobName`, materialising first the move out of `InProgress` the clock
+//! already owed (`crate::state::ProcessingJob::settle_status`), and refusing an unknown
+//! name with the modelled `ResourceNotFound`. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeProcessingJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: the one write it makes is the status transition that was due at the
+//! stored instant whether or not anybody called, so two reads at the same instant answer
+//! identically.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +181,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeProcessingJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeProcessingJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeProcessingJob"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        let Some(job) = store.processing_jobs.get_mut(&input.processing_job_name) else {
+            return Err(DescribeProcessingJobErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!(
+                    "Could not find processing job \"{}\".",
+                    input.processing_job_name
+                )),
+            })
+            .into());
+        };
+
+        // The only write a reporting call makes: the move out of `InProgress` the clock
+        // already owed. It was due at the stored instant whether or not anybody described
+        // the job, so a waiter terminates and no caller's read changes the outcome.
+        let settled = job.settle_status(::std::time::SystemTime::now());
+
+        let output = DescribeProcessingJobOutput {
+            processing_job_name: job.name.clone(),
+            processing_job_arn: job.arn.clone(),
+            role_arn: Some(job.role_arn.clone()),
+            app_specification: job.app_specification.clone(),
+            processing_inputs: job.processing_inputs.clone(),
+            processing_output_config: job.processing_output_config.clone(),
+            processing_resources: job.processing_resources.clone(),
+            stopping_condition: job.stopping_condition.clone(),
+            environment: job.environment.clone(),
+            network_config: job.network_config.clone(),
+            experiment_config: job.experiment_config.clone(),
+            processing_job_status: job.status.clone(),
+            failure_reason: job.failure_reason.clone(),
+            creation_time: crate::state::timestamp(job.creation_time),
+            last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
+            processing_end_time: job.processing_end_time.map(crate::state::timestamp),
+            // Nothing ran the job's container image, so there is no instant it started
+            // at and no message it exited with. See
+            // `crate::state::NO_CONTAINER_RUNTIME_REASON`.
+            processing_start_time: None,
+            exit_message: None,
+            // These three report the resource that OWNS a processing job SageMaker
+            // created on a caller's behalf (a monitoring schedule, an AutoML job, a
+            // training job). `CreateProcessingJob` is the only producer of a job here, so
+            // every stored job is caller-created and owned by nothing.
+            monitoring_schedule_arn: None,
+            auto_ml_job_arn: None,
+            training_job_arn: None,
+        };
+        let job_arn = job.arn.clone();
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &job_arn, ctx);
+        }
+        Ok(output)
     }
 }

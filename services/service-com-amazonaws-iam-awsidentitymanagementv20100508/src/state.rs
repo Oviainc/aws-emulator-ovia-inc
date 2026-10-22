@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    Policy, PolicyVersion, Role, ServiceSpecificCredentialMetadata, Tag, User,
+    InstanceProfile, Policy, PolicyVersion, Role, ServiceSpecificCredentialMetadata, Tag, User,
 };
 
 /// IAM's default entity path: every entity whose request omits `Path` is created
@@ -39,6 +39,12 @@ const USER_ID_PREFIX: &str = "AIDA";
 /// [`UNIQUE_ID_SUFFIX_LEN`] base32 characters satisfies.
 const ROLE_ID_PREFIX: &str = "AROA";
 
+/// The prefix AWS gives an instance profile's unique id.
+/// `InstanceProfile$InstanceProfileId` is modelled as `idType` (len 16..128, pattern
+/// `^[\w]+$`), which this prefix plus [`UNIQUE_ID_SUFFIX_LEN`] base32 characters
+/// satisfies.
+const INSTANCE_PROFILE_ID_PREFIX: &str = "AIPA";
+
 /// The prefix AWS gives a managed policy's unique id. `Policy$PolicyId` is
 /// modelled as `idType` (len 16..128, pattern `^[\w]+$`), which this prefix plus
 /// [`UNIQUE_ID_SUFFIX_LEN`] base32 characters satisfies.
@@ -66,6 +72,13 @@ pub const MAX_ROLES_PER_ACCOUNT: usize = 1_000;
 /// value for this setting, the default value of one hour is applied", and
 /// `roleMaxSessionDurationType`'s range (3600..43200) puts one hour at its floor.
 pub const DEFAULT_MAX_SESSION_DURATION_SECONDS: i32 = 3_600;
+
+/// How many IAM instance profiles one account may hold. AWS's "IAM and STS quotas"
+/// page gives the quota "Instance profiles in an account: 1,000", and a create past
+/// it is refused with `LimitExceededException`, whose documentation says "the error
+/// message describes the limit exceeded". It is also what stops the instance profile
+/// map growing without end.
+pub const MAX_INSTANCE_PROFILES_PER_ACCOUNT: usize = 1_000;
 
 /// How many customer managed policies one account may hold. AWS's "IAM and STS
 /// quotas" page gives the quota "Customer managed policies in an account: 1,500",
@@ -450,6 +463,16 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// AWS-managed policies (`arn:aws:iam::aws:policy/...`) are NOT in here — they
     /// are owned by AWS, not by the account ([`AWS_MANAGED_POLICY_ACCOUNT`]).
     pub policies: BTreeMap<String, ManagedPolicy>,
+    /// The persisted IAM instance profiles, keyed by [`name_key`] of the instance
+    /// profile name, for the same reason users and roles are: IAM entity names are
+    /// unique within the account and "are not distinguished by case", while
+    /// `InstanceProfile::instance_profile_name` keeps the case the creator chose.
+    ///
+    /// The modelled [`InstanceProfile`] is stored exactly as every reader reports it,
+    /// including its `Roles` — "The role associated with the instance profile"
+    /// (`InstanceProfile$Roles`) — so `AddRoleToInstanceProfile` has one place to bind a
+    /// role and `GetInstanceProfile` one place to read it from.
+    pub instance_profiles: BTreeMap<String, InstanceProfile>,
     /// The managed policies attached to each role: [`name_key`] of the role name
     /// -> the attached policies' ARNs. A `BTreeSet` because a policy is attached
     /// to a role at most once (a repeat attach is the same attachment) and
@@ -462,6 +485,9 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub role_id_seq: u64,
     /// Monotonic counter feeding [`next_policy_id`](Self::next_policy_id).
     pub policy_id_seq: u64,
+    /// Monotonic counter feeding
+    /// [`next_instance_profile_id`](Self::next_instance_profile_id).
+    pub instance_profile_id_seq: u64,
 }
 
 impl ComAmazonawsIamAwsidentitymanagementv20100508State {
@@ -543,6 +569,16 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
     pub fn next_policy_id(&mut self) -> String {
         self.policy_id_seq += 1;
         unique_id(POLICY_ID_PREFIX, self.policy_id_seq)
+    }
+
+    /// Mint the next instance profile's `InstanceProfileId`.
+    ///
+    /// Unique and stable for the same reason [`next_user_id`](Self::next_user_id) is: the
+    /// counter is bijectively mixed into the suffix, and the id is minted once and then
+    /// stored with the profile.
+    pub fn next_instance_profile_id(&mut self) -> String {
+        self.instance_profile_id_seq += 1;
+        unique_id(INSTANCE_PROFILE_ID_PREFIX, self.instance_profile_id_seq)
     }
 
     /// The managed policy `arn` names, if the account holds it.
@@ -634,6 +670,18 @@ pub fn policy_arn(path: &str, policy_name: &str) -> String {
 /// segment is empty.
 pub fn role_arn(path: &str, role_name: &str) -> String {
     ::engine::emulator_arn("iam", "", &format!("role{path}{role_name}"))
+}
+
+/// The ARN of an IAM instance profile:
+/// `arn:aws:iam::<account>:instance-profile<path><name>`.
+///
+/// Built the same way [`user_arn`] is, from the `instance-profile` resource type.
+pub fn instance_profile_arn(path: &str, instance_profile_name: &str) -> String {
+    ::engine::emulator_arn(
+        "iam",
+        "",
+        &format!("instance-profile{path}{instance_profile_name}"),
+    )
 }
 
 /// The wall-clock instant a resource was created or last changed, in the

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSecurityGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSecurityGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a security group in the VPC the request names, stores it as the
+//! modelled [`SecurityGroup`] shape in
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::security_groups`], and answers its
+//! `GroupId`, ARN and tags.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSecurityGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +151,218 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSecurityGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSecurityGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSecurityGroup"))
+        use crate::state;
+
+        // "The name of the security group. Names are case-insensitive and must be unique
+        // within the VPC. Constraints: Up to 255 characters in length. Can't start with
+        // sg-. Valid characters: a-z, A-Z, 0-9, spaces, and ._-:/()#,@[]+=&;{}!$*"
+        // (`$GroupName`). The member is modelled `clientOptional`, so an empty string
+        // reaches this handler and has to be refused here.
+        let group_name = input.group_name.as_str();
+        if group_name.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter GroupName",
+            ));
+        }
+        if group_name.chars().count() > state::MAX_SECURITY_GROUP_TEXT_CHARS {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({group_name}) for parameter groupName is invalid. \
+                 Group name accepts at most {max} characters",
+                max = state::MAX_SECURITY_GROUP_TEXT_CHARS,
+            )));
+        }
+        if !state::is_security_group_text(group_name) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({group_name}) for parameter groupName is invalid. \
+                 Valid characters: a-z, A-Z, 0-9, spaces, and {punctuation}",
+                punctuation = state::SECURITY_GROUP_PUNCTUATION,
+            )));
+        }
+        if group_name.starts_with(state::SECURITY_GROUP_ID_PREFIX) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({group_name}) for parameter groupName is invalid. \
+                 Group name cannot start with {prefix}",
+                prefix = state::SECURITY_GROUP_ID_PREFIX,
+            )));
+        }
+
+        // "A description for the security group. Constraints: Up to 255 characters in
+        // length. Valid characters: a-z, A-Z, 0-9, spaces, and ._-:/()#,@[]+=&;{}!$*"
+        // (`$Description`) — the same alphabet and bound as the name, minus the `sg-`
+        // rule, which is a rule about ids and so is a rule about names only.
+        let description = input.description.as_str();
+        if description.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter GroupDescription",
+            ));
+        }
+        if description.chars().count() > state::MAX_SECURITY_GROUP_TEXT_CHARS {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({description}) for parameter groupDescription is invalid. \
+                 Group description accepts at most {max} characters",
+                max = state::MAX_SECURITY_GROUP_TEXT_CHARS,
+            )));
+        }
+        if !state::is_security_group_text(description) {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({description}) for parameter groupDescription is invalid. \
+                 Valid characters: a-z, A-Z, 0-9, spaces, and {punctuation}",
+                punctuation = state::SECURITY_GROUP_PUNCTUATION,
+            )));
+        }
+
+        // "The tags to assign to the security group" — "you must specify the resource type
+        // to tag, otherwise the request will fail" (`TagSpecification`), and the only type
+        // this action tags is the group it creates.
+        let mut tags: Vec<Tag> = Vec::new();
+        for specification in input.tag_specifications.iter().flatten() {
+            match specification.resource_type.as_deref() {
+                Some(state::RESOURCE_TYPE_SECURITY_GROUP) => {
+                    tags.extend(specification.tags.clone().unwrap_or_default());
+                }
+                Some(other) => {
+                    return Err(state::invalid_parameter_value(format!(
+                        "'{other}' is not a valid resource type for tagging on \
+                         CreateSecurityGroup"
+                    )))
+                }
+                None => {
+                    return Err(state::missing_parameter(
+                        "Tag specification resource type must have a value",
+                    ))
+                }
+            }
+        }
+        // The same tag rules `CreateVpc` applies: at most the documented number of tags per
+        // resource, each key and value within its documented length, no reserved prefix,
+        // and no key given twice ("Tag keys must be unique per resource").
+        if tags.len() > state::MAX_TAGS_PER_RESOURCE {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "The request carries {} tags, above the maximum of {max} per resource",
+                tags.len(),
+                max = state::MAX_TAGS_PER_RESOURCE,
+            )));
+        }
+        let mut keys_seen: ::std::collections::BTreeSet<&str> =
+            ::std::collections::BTreeSet::new();
+        for tag in &tags {
+            let key = tag.key.as_deref().unwrap_or_default();
+            if key.is_empty() {
+                return Err(state::invalid_parameter_value("A tag key cannot be empty"));
+            }
+            if key.starts_with(state::RESERVED_TAG_PREFIX) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Tag key '{key}' is invalid: the '{prefix}' prefix is reserved",
+                    prefix = state::RESERVED_TAG_PREFIX,
+                )));
+            }
+            if !keys_seen.insert(key) {
+                return Err(state::invalid_parameter_value(format!(
+                    "Tag key '{key}' is given more than once; tag keys must be unique"
+                )));
+            }
+            state::validate_tag_size(key, tag.value.as_deref().unwrap_or_default())?;
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let region = state::request_region(ctx.parts());
+        let mut store = state_handle.lock();
+
+        // "The ID of the VPC. Required for a nondefault VPC" (`$VpcId`): a request that
+        // names none creates the group in the account's DEFAULT VPC, which is also the VPC
+        // an instance launched without a subnet lands in.
+        let vpc_id = match input.vpc_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(vpc_id) => {
+                if !store.vpcs.contains_key(vpc_id) {
+                    return Err(state::invalid_vpc_id_not_found(vpc_id));
+                }
+                vpc_id.to_string()
+            }
+            None => match store
+                .vpcs
+                .values()
+                .find(|vpc| vpc.is_default.unwrap_or(false))
+                .and_then(|vpc| vpc.vpc_id.clone())
+            {
+                Some(default_vpc) => default_vpc,
+                None => return Err(state::vpc_id_not_specified()),
+            },
+        };
+
+        // "You can't have two security groups for the same VPC with the same name"
+        // (`CreateSecurityGroup`), compared case-insensitively because "names are
+        // case-insensitive" (`$GroupName`).
+        if store
+            .security_group_id_for_name(&vpc_id, group_name)
+            .is_some()
+        {
+            return Err(state::invalid_group_duplicate(group_name));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of.
+        if !store.has_security_group_capacity() {
+            return Err(state::security_group_limit_exceeded());
+        }
+        let payload_bytes = group_name
+            .len()
+            .saturating_add(description.len())
+            .saturating_add(state::tag_list_bytes(&tags));
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `insert_security_group` derives the id, the ARN and the owning account itself, so
+        // this handler never invents one. "When you create a security group, it has no
+        // inbound rules" (Amazon VPC User Guide, "Security group rules"), and it carries the
+        // one documented allow-all outbound rule — the same [`state::allow_all_egress`] the
+        // default group gets, so one definition serves both writers.
+        let group_id = store.insert_security_group(state::SecurityGroupSpec {
+            group_name: group_name.to_string(),
+            description: description.to_string(),
+            vpc_id,
+            region,
+            ip_permissions: Vec::new(),
+            ip_permissions_egress: vec![state::allow_all_egress()],
+            tags,
+        });
+        // The caller-chosen bytes the record retains, charged against the budget the check
+        // above reserved them in, so the store is bounded in bytes and not only in records.
+        let charged = store
+            .security_groups
+            .get(&group_id)
+            .map(state::security_group_payload_bytes)
+            .unwrap_or(payload_bytes);
+        store.add_stored_bytes(charged);
+
+        // The answer is the record as it was stored, so `CreateSecurityGroup` and
+        // `DescribeSecurityGroups` cannot drift apart.
+        let Some(group) = store.security_groups.get(&group_id) else {
+            return Err(state::internal_error(
+                "the security group just created could not be read back",
+            ));
+        };
+        Ok(CreateSecurityGroupOutput {
+            group_id: group.group_id.clone(),
+            security_group_arn: group.security_group_arn.clone(),
+            // "The tags assigned to the security group" (`$Tags`): reported only when the
+            // group carries any, so an untagged group does not answer with an empty list.
+            tags: group
+                .tags
+                .clone()
+                .filter(|tags| !tags.is_empty()),
+        })
     }
 }

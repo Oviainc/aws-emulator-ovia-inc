@@ -19,3 +19,5 @@ mod event_bus_lifecycle;
 mod rule_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/target_response_members.rs"]
+mod target_response_members;

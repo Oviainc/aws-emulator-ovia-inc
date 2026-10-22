@@ -7,6 +7,12 @@
 //! Every call below goes through [`MultiServiceRouter::dispatch`] — the same
 //! entry point `core/router` serves — so routing, deserialization, the modelled
 //! constraints and the error envelope are all exercised, not bypassed.
+//!
+//! Every modelled CLIENT error below is asserted at HTTP 400, whatever exact code its
+//! shape's `@httpError` trait names: `@httpError` is an HTTP-binding trait and
+//! awsJson1_0 binds nothing to the transport, so this service reports an error's FAULT.
+//! The rule itself, over every status the model annotates, is pinned in
+//! `tests/all/error_envelopes.rs`.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -424,7 +430,7 @@ async fn client_token_makes_create_idempotent() {
 #[tokio::test]
 async fn an_id_no_data_store_carries_is_not_found() {
     let service = HealthLake::new();
-    // One real data store exists, so a 404 is about the id and not about an
+    // One real data store exists, so the refusal is about the id and not about an
     // empty service.
     let (real, _) = service
         .create(&json!({ "DatastoreTypeVersion": "R4" }))
@@ -457,8 +463,8 @@ async fn an_id_no_data_store_carries_is_not_found() {
                 .call(operation, &json!({ "DatastoreId": case }))
                 .await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: {operation} on an unknown id must answer 404, got {status}: {payload}"
+                status, 400,
+                "case {case:?}: {operation} on an unknown id must answer 400, got {status}: {payload}"
             );
             assert_eq!(
                 error_code(&payload),
@@ -840,8 +846,8 @@ async fn an_arn_naming_no_data_store_is_not_found() {
         ] {
             let (status, payload) = service.call(operation, &request).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: {operation} on an unknown ARN must answer 404, got {status}: {payload}"
+                status, 400,
+                "case {case:?}: {operation} on an unknown ARN must answer 400, got {status}: {payload}"
             );
             assert_eq!(
                 error_code(&payload),
@@ -874,8 +880,8 @@ async fn delete_moves_the_stored_record_through_deleting_to_deleted() {
         .call("DeleteFHIRDatastore", &json!({ "DatastoreId": &id }))
         .await;
     assert_eq!(
-        status, 409,
-        "deleting a CREATING data store must answer 409, got {status}: {payload}"
+        status, 400,
+        "deleting a CREATING data store must answer 400, got {status}: {payload}"
     );
     assert_eq!(
         error_code(&payload),
@@ -925,8 +931,8 @@ async fn delete_moves_the_stored_record_through_deleting_to_deleted() {
         .call("DeleteFHIRDatastore", &json!({ "DatastoreId": &id }))
         .await;
     assert_eq!(
-        status, 409,
-        "deleting a DELETING data store must answer 409, got {status}: {payload}"
+        status, 400,
+        "deleting a DELETING data store must answer 400, got {status}: {payload}"
     );
     assert_eq!(
         error_code(&payload),
@@ -948,8 +954,8 @@ async fn delete_moves_the_stored_record_through_deleting_to_deleted() {
         .call("DeleteFHIRDatastore", &json!({ "DatastoreId": &id }))
         .await;
     assert_eq!(
-        status, 404,
-        "deleting a DELETED data store must answer 404, got {status}: {payload}"
+        status, 400,
+        "deleting a DELETED data store must answer 400, got {status}: {payload}"
     );
     assert_eq!(
         error_code(&payload),
@@ -982,7 +988,7 @@ async fn the_store_bounds_how_many_data_stores_it_holds() {
         )
         .await;
     assert_eq!(
-        status, 429,
+        status, 400,
         "a create past the ceiling must be refused, got {status}: {payload}"
     );
     assert_eq!(

@@ -7,7 +7,7 @@
 //! [`StoredCluster::to_api`] / [`StoredAcl::to_api`] / [`StoredUser::to_api`]), so a
 //! describe can only report what a create or update actually persisted — or, for the
 //! resources an AWS account already has, what
-//! [`ComAmazonawsMemorydbAmazonmemorydbState::ensure_builtin_users`] materialises.
+//! [`ComAmazonawsMemorydbAmazonmemorydbState::ensure_builtins`] materialises.
 //!
 //! Besides the store itself this module owns the small amount of logic several
 //! operations share — the request's region, the ARN/endpoint naming, shard layout,
@@ -72,6 +72,20 @@ pub const MAX_RESOURCES_PER_KIND: usize = 500;
 /// of passwords belonging to the user. The maximum is two."
 pub const MAX_PASSWORDS_PER_USER: usize = 2;
 
+/// The most users one ACL may hold, and so the most one request may name in a
+/// membership list.
+///
+/// An UPPER BOUND, not decoration: `UserNameListInput` carries `len 1..` — a minimum
+/// with no maximum — so a membership list arrives caller-sized, and it both sizes the
+/// stored membership and is one factor of every add/remove comparison. Both write paths
+/// of an ACL's membership (`CreateACL`, `UpdateACL`) refuse a longer list, and a
+/// resulting membership above this, before any of that work runs, so neither the store
+/// nor the comparisons can be grown by a request. AWS answers its own per-account user
+/// quota with `UserQuotaExceededFault`; a membership larger than an ACL may hold is a
+/// value the service cannot serve, so it is refused with the modelled
+/// `InvalidParameterValueException` both operations declare.
+pub const MAX_USERS_PER_ACL: usize = 100;
+
 /// The most tags one resource may carry.
 ///
 /// `TagList` is `@length(min: 0, max: 200)` and is the shape `ListTags` reports a
@@ -88,10 +102,33 @@ pub const MIN_PASSWORD_LEN: usize = 16;
 /// The longest password MemoryDB accepts, from the same documented requirement.
 pub const MAX_PASSWORD_LEN: usize = 128;
 
-/// The characters the same documented requirement excludes from a user password:
-/// "cannot contain any of the following characters: ',' '\"' '/' '@'". Everything else
-/// that is printable ASCII — including the rest of the punctuation — is accepted.
-pub const FORBIDDEN_PASSWORD_CHARS: &[char] = &[',', '"', '/', '@'];
+// The Developer Guide's prose also lists characters a password "cannot contain"
+// (`,` `"` `/` `@`). The SERVICE does not enforce that list — a `CreateUser` carrying
+// any of them succeeds and the user settles with one password — and the model puts no
+// `@pattern` on `PasswordListInput`'s members, so `validate_password` enforces only the
+// printable-ASCII and length rules above.
+
+/// The longest a MemoryDB user, ACL, cluster or parameter-group name may be.
+///
+/// The model caps none of them (`UserName` is `len 1..`, the other names are plain
+/// `String`), but the service refuses a longer name with its modelled
+/// `InvalidParameterValueException`; a name of exactly this length is accepted.
+pub const MAX_RESOURCE_NAME_LEN: usize = 40;
+
+/// The smallest page size a MemoryDB listing accepts for `MaxResults`.
+///
+/// `MaxResults` is an `IntegerOptional` the model puts no `@range` on; the WINDOW comes
+/// from the service's own refusal, which names both of its bounds — the recorded
+/// `DescribeUsers(MaxResults=0)` answer is `InvalidParameterValueException` "Invalid
+/// value for max results. Must be between 1 and 50", and `MaxResults=51` is refused on
+/// the same path. So the bound lives here and every listing in this service reads it
+/// through [`max_results_rejection`], rather than each one inventing its own.
+pub const MIN_MAX_RESULTS: i32 = 1;
+
+/// The largest page size a MemoryDB listing accepts for `MaxResults`, the upper bound
+/// of the same recorded refusal as [`MIN_MAX_RESULTS`] ("Must be between 1 and 50"),
+/// read through the same [`max_results_rejection`].
+pub const MAX_MAX_RESULTS: i32 = 50;
 
 /// The number of hash slots a cluster spreads over its shards. Fixed by the Redis
 /// OSS / Valkey cluster protocol MemoryDB implements (slots `0..=16383`).
@@ -730,6 +767,7 @@ pub mod cluster_status {
 pub mod acl_status {
     pub const CREATING: &str = "creating";
     pub const ACTIVE: &str = "active";
+    pub const MODIFYING: &str = "modifying";
 }
 
 /// `User$Status`: "Indicates the user status. Can be \"active\", \"modifying\" or
@@ -763,6 +801,36 @@ pub const DEFAULT_USER_NAME: &str = "default";
 /// Valkey ACL syntax `User$AccessString` carries.
 pub const DEFAULT_USER_ACCESS_STRING: &str = "on ~* &* +@all";
 
+/// The ACL every MemoryDB account already has: MemoryDB creates an `open-access` ACL
+/// (whose only member is the built-in `default` user) in every account, so
+/// `DescribeACLs` answers with it — and `CreateCluster(ACLName="open-access")` resolves
+/// — before any `CreateACL` call ever runs.
+pub const OPEN_ACCESS_ACL_NAME: &str = "open-access";
+
+/// The pub/sub channel rule a Redis OSS / Valkey ACL falls back to when the access
+/// string names none: no channel is allowed. MemoryDB CANONICALISES the access string
+/// it was given before storing it, and the canonical form always states the channel
+/// permission, so `on ~* +@all` reads back as `on ~* resetchannels +@all` (see
+/// [`normalise_access_string`]).
+pub const DEFAULT_CHANNEL_RULE: &str = "resetchannels";
+
+/// The engine version a password- or no-password-authenticated user (and an ACL whose
+/// members are all of those) reports as `MinimumEngineVersion`: MemoryDB has supported
+/// ACL users authenticating with a password since its first engine version.
+pub const MIN_ENGINE_VERSION_PASSWORD_AUTH: &str = "6.2";
+
+/// The engine version an IAM-authenticated user — and any ACL with such a member —
+/// reports as `MinimumEngineVersion`: MemoryDB added IAM authentication for ACL users
+/// with engine version 7.0, so an ACL carrying one cannot be attached to a cluster
+/// running an older engine.
+pub const MIN_ENGINE_VERSION_IAM_AUTH: &str = "7.0";
+
+/// The description MemoryDB gives a parameter group created without one: a single
+/// space, which is what the service reports for `ParameterGroup$Description` when the
+/// `CreateParameterGroup` request omits the optional member, rather than no member at
+/// all.
+pub const DEFAULT_PARAMETER_GROUP_DESCRIPTION: &str = " ";
+
 /// `AuthenticationType` (`password` | `no-password` | `iam`): the built-in user
 /// authenticates without a password, so it carries no password count.
 pub const NO_PASSWORD_AUTHENTICATION: &str = "no-password";
@@ -791,12 +859,12 @@ pub struct ComAmazonawsMemorydbAmazonmemorydbState {
     /// ACLs by `ACLName`.
     pub acls: BTreeMap<String, StoredAcl>,
     /// Users by `UserName`, including the built-in `default` user
-    /// [`ComAmazonawsMemorydbAmazonmemorydbState::ensure_builtin_users`] materialises.
+    /// [`ComAmazonawsMemorydbAmazonmemorydbState::ensure_builtins`] materialises.
     /// A `BTreeMap`, so every listing is in name order and pagination over it is stable.
     pub users: BTreeMap<String, StoredUser>,
-    /// Whether the built-in users have already been materialised in this store, so
-    /// that materialising them is a one-off and never resurrects a deleted user.
-    pub builtin_users_materialised: bool,
+    /// Whether the built-in resources have already been materialised in this store, so
+    /// that materialising them is a one-off and never resurrects a deleted one.
+    pub builtins_materialised: bool,
     /// Parameter groups by `ParameterGroupName`, in name order like the maps above,
     /// so a listing over them pages stably.
     pub parameter_groups: BTreeMap<String, StoredParameterGroup>,
@@ -840,20 +908,21 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
         }
     }
 
-    /// Materialise the users this account ALREADY HAD before any call: MemoryDB
-    /// creates the `default` user in every account, so it is part of the store's
-    /// initial contents rather than something a caller made.
+    /// Materialise the resources this account ALREADY HAD before any call: MemoryDB
+    /// creates the `default` user and the `open-access` ACL that holds it in every
+    /// account, so both are part of the store's initial contents rather than something
+    /// a caller made.
     ///
     /// The engine hands every service an EMPTY store, so the built-ins are written on
     /// first touch instead of by a constructor; the flag makes that a one-off, so a
-    /// later delete of a built-in user is not undone by the next call. `region` is the
+    /// later delete of a built-in is not undone by the next call. `region` is the
     /// requesting caller's, exactly as every other resource in this store takes the
     /// region of the call that brought it into being.
-    pub fn ensure_builtin_users(&mut self, region: &str) {
-        if self.builtin_users_materialised {
+    pub fn ensure_builtins(&mut self, region: &str) {
+        if self.builtins_materialised {
             return;
         }
-        self.builtin_users_materialised = true;
+        self.builtins_materialised = true;
         self.users.insert(
             DEFAULT_USER_NAME.to_string(),
             StoredUser {
@@ -868,6 +937,37 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
                 arn: user_arn(region, DEFAULT_USER_NAME),
             },
         );
+        self.acls.insert(
+            OPEN_ACCESS_ACL_NAME.to_string(),
+            StoredAcl {
+                name: OPEN_ACCESS_ACL_NAME.to_string(),
+                // An ACL the account already had is usable: there is no create for the
+                // clock to owe a transition to.
+                status: acl_status::ACTIVE.to_string(),
+                settles_at: None,
+                user_names: vec![DEFAULT_USER_NAME.to_string()],
+                arn: acl_arn(region, OPEN_ACCESS_ACL_NAME),
+            },
+        );
+    }
+
+    /// `ACL$MinimumEngineVersion` — "The minimum engine version supported for the ACL":
+    /// the greatest minimum its MEMBERS require, because an ACL can only be attached to
+    /// a cluster whose engine supports every one of its users.
+    ///
+    /// DERIVED from the stored users, exactly as `ACL$Clusters` is derived from the
+    /// clusters, so the version an ACL reports follows every membership change and
+    /// cannot disagree with what its members report.
+    pub fn acl_minimum_engine_version(&self, user_names: &[String]) -> &'static str {
+        if user_names
+            .iter()
+            .filter_map(|name| self.users.get(name))
+            .any(|user| user.minimum_engine_version() == MIN_ENGINE_VERSION_IAM_AUTH)
+        {
+            MIN_ENGINE_VERSION_IAM_AUTH
+        } else {
+            MIN_ENGINE_VERSION_PASSWORD_AUTH
+        }
     }
 
     /// The names of the clusters currently referencing `acl_name`, in name order —
@@ -1090,11 +1190,15 @@ pub struct StoredNode {
 pub struct StoredParameterGroup {
     pub name: String,
     /// `ParameterGroup$Family`: "The name of the parameter group family that this
-    /// parameter group is compatible with." Stored verbatim — the model publishes no
-    /// catalog of families, so the service records the caller's rather than matching it
-    /// against a guessed list.
+    /// parameter group is compatible with." Stored folded to lower case like every
+    /// other name in this store — the model publishes no catalog of families, so the
+    /// service records the caller's rather than matching it against a guessed list.
     pub family: String,
-    pub description: Option<String>,
+    /// `ParameterGroup$Description`. NOT optional in the store: a group created
+    /// without one gets the service's own default
+    /// ([`DEFAULT_PARAMETER_GROUP_DESCRIPTION`]), so every stored group has a
+    /// description to report.
+    pub description: String,
     pub arn: String,
     /// The values an `UpdateParameterGroup` persisted for this group, by parameter
     /// name. ONLY the overrides: a parameter the group never changed reports its
@@ -1145,6 +1249,19 @@ pub struct StoredUser {
 }
 
 impl StoredUser {
+    /// `User$MinimumEngineVersion` — "The minimum engine version supported for the
+    /// user": the earliest engine version whose RBAC supports how this user
+    /// authenticates. IAM authentication arrived with
+    /// [`MIN_ENGINE_VERSION_IAM_AUTH`]; a password or password-less user works from
+    /// [`MIN_ENGINE_VERSION_PASSWORD_AUTH`] on.
+    pub fn minimum_engine_version(&self) -> &'static str {
+        if self.authentication_type == input_authentication_type::IAM {
+            MIN_ENGINE_VERSION_IAM_AUTH
+        } else {
+            MIN_ENGINE_VERSION_PASSWORD_AUTH
+        }
+    }
+
     /// The modelled `User` for this stored user. `acl_names` is the derived membership
     /// list, which only the state as a whole can compute.
     pub fn to_api(&self, acl_names: Vec<String>) -> User {
@@ -1153,11 +1270,9 @@ impl StoredUser {
             status: Some(self.status.clone()),
             access_string: Some(self.access_string.clone()),
             acl_names: Some(acl_names),
-            // Left ABSENT deliberately: nothing in this slice tracks the engine
-            // versions a user is usable with, and reporting one would be a
-            // plausible-looking value for state nothing keeps — the same choice
-            // `ACL$MinimumEngineVersion` makes.
-            minimum_engine_version: None,
+            // DERIVED from how the user authenticates, so it follows the stored
+            // authentication type rather than being recorded a second time.
+            minimum_engine_version: Some(self.minimum_engine_version().to_string()),
             authentication: Some(Authentication {
                 r#type: Some(self.authentication_type.clone()),
                 password_count: self.password_count,
@@ -1292,7 +1407,7 @@ impl StoredParameterGroup {
         ParameterGroup {
             name: Some(self.name.clone()),
             family: Some(self.family.clone()),
-            description: self.description.clone(),
+            description: Some(self.description.clone()),
             arn: Some(self.arn.clone()),
         }
     }
@@ -1300,13 +1415,16 @@ impl StoredParameterGroup {
 
 impl StoredAcl {
     /// The modelled `ACL` for this stored ACL. `clusters` is the derived membership
-    /// list, which only the state as a whole can compute.
-    pub fn to_api(&self, clusters: Vec<String>) -> ACL {
+    /// list and `minimum_engine_version` the version its members require, both of
+    /// which only the state as a whole can compute
+    /// ([`ComAmazonawsMemorydbAmazonmemorydbState::clusters_using_acl`] /
+    /// [`ComAmazonawsMemorydbAmazonmemorydbState::acl_minimum_engine_version`]).
+    pub fn to_api(&self, clusters: Vec<String>, minimum_engine_version: &str) -> ACL {
         ACL {
             name: Some(self.name.clone()),
             status: Some(self.status.clone()),
             user_names: Some(self.user_names.clone()),
-            minimum_engine_version: None,
+            minimum_engine_version: Some(minimum_engine_version.to_string()),
             pending_changes: None,
             clusters: Some(clusters),
             arn: Some(self.arn.clone()),
@@ -1337,8 +1455,9 @@ pub enum AuthenticationModeRejection {
 /// * `Type` names an `InputAuthenticationType` (`password` or `iam`);
 /// * `password` requires between 1 and [`MAX_PASSWORDS_PER_USER`] passwords, `iam`
 ///   accepts none at all;
-/// * each password is printable ASCII, [`MIN_PASSWORD_LEN`]..=[`MAX_PASSWORD_LEN`]
-///   characters long, and carries none of [`FORBIDDEN_PASSWORD_CHARS`].
+/// * each password is printable ASCII and [`MIN_PASSWORD_LEN`]..=[`MAX_PASSWORD_LEN`]
+///   characters long. The Developer Guide's narrower character list is NOT enforced:
+///   the service accepts a password carrying any of it.
 pub fn authentication_from_mode(
     mode: &AuthenticationMode,
 ) -> Result<(String, Option<i32>), AuthenticationModeRejection> {
@@ -1407,20 +1526,148 @@ fn validate_password(password: &str) -> Result<(), AuthenticationModeRejection> 
             "A user password must contain only printable ASCII characters.".to_string(),
         ));
     }
-    if password
-        .chars()
-        .any(|character| FORBIDDEN_PASSWORD_CHARS.contains(&character))
-    {
-        return Err(AuthenticationModeRejection::Value(format!(
-            "A user password must not contain any of the characters {}.",
-            FORBIDDEN_PASSWORD_CHARS
-                .iter()
-                .map(|character| format!("{character:?}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )));
-    }
+    // The Developer Guide's character exclusion (`,` `"` `/` `@`) is deliberately NOT
+    // enforced: the service accepts a password carrying any of them, and the model puts
+    // no `@pattern` on `PasswordListInput`'s members, so length and the printable-ASCII
+    // rule above are the whole of it.
     Ok(())
+}
+
+/// Why a membership list this long cannot be served, or `None` when it can.
+///
+/// Read by BOTH write paths of an ACL's membership before they do any per-name work, so
+/// one request cannot size the stored membership or the comparisons against it.
+pub fn member_count_rejection(member: &str, count: usize) -> Option<String> {
+    (count > MAX_USERS_PER_ACL).then(|| {
+        format!("{member} must not name more than {MAX_USERS_PER_ACL} users.")
+    })
+}
+
+/// A MemoryDB resource name as the service STORES it: folded to lower case.
+///
+/// User, ACL, cluster and parameter-group names (and a parameter group's family) are
+/// case-insensitive identifiers — the mixed-case and the lower-case spelling are one
+/// resource — so every write path folds the name on the way into state and every
+/// lookup folds the name it was given, and the two cannot disagree about which
+/// resource a request named.
+pub fn fold_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// Why `name` cannot name a MemoryDB resource, or `None` when it can.
+///
+/// The service enforces a TIGHTER rule than the model's `^[a-zA-Z][a-zA-Z0-9\-]*$`:
+/// at most [`MAX_RESOURCE_NAME_LEN`] characters, beginning with a letter, only ASCII
+/// letters, digits and hyphens, and neither a trailing hyphen nor two consecutive
+/// hyphens. `member` is the request member being refused, so the message names what
+/// the caller has to fix; the caller maps the refusal onto its own modelled
+/// `InvalidParameterValueException`.
+pub fn resource_name_rejection(member: &str, name: &str) -> Option<String> {
+    if name.chars().count() > MAX_RESOURCE_NAME_LEN {
+        return Some(format!(
+            "{member} length must not exceed {MAX_RESOURCE_NAME_LEN} characters."
+        ));
+    }
+    let well_formed = name.starts_with(|first: char| first.is_ascii_alphabetic())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        && !name.ends_with('-')
+        && !name.contains("--");
+    (!well_formed).then(|| {
+        format!(
+            "{member} must begin with a letter; must contain only ASCII letters, digits, \
+             and hyphens; and must not end with a hyphen or contain two consecutive \
+             hyphens."
+        )
+    })
+}
+
+/// Why a listing cannot serve this `MaxResults`, or `None` when it can.
+///
+/// EVERY paginated listing in this service reads the page-size window through here, so
+/// one request's page size is refused with the same rule and the same message whichever
+/// listing it was sent to. The caller maps the refusal onto its own modelled
+/// `InvalidParameterValueException`.
+pub fn max_results_rejection(max_results: Option<i32>) -> Option<String> {
+    let max = max_results?;
+    (!(MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&max)).then(|| {
+        format!(
+            "Invalid value for max results. Must be between {MIN_MAX_RESULTS} and \
+             {MAX_MAX_RESULTS}"
+        )
+    })
+}
+
+/// The canonical form of an access string, which is what the service stores and
+/// reports for `User$AccessString`.
+///
+/// `AccessString` is a Redis OSS / Valkey ACL rule list, and MemoryDB canonicalises it
+/// before storing it: the rules are rendered one space apart, and the pub/sub channel
+/// permission is always stated — a string that names no channel rule gets the engine's
+/// own default, [`DEFAULT_CHANNEL_RULE`], in the position the canonical order puts it
+/// (after the key patterns, before the command rules). So `on ~* +@all` is stored and
+/// reported as `on ~* resetchannels +@all`, while a string that already names its
+/// channels (`on ~* &* +@all`) keeps them.
+pub fn normalise_access_string(access_string: &str) -> String {
+    let mut rules: Vec<&str> = access_string.split_whitespace().collect();
+    let names_channels = rules.iter().any(|rule| is_channel_rule(rule));
+    if !names_channels {
+        // The canonical order states the channel permission after the key patterns and
+        // before the command rules, so the default goes in front of the first command
+        // rule — or at the end when the string carries none.
+        let position = rules
+            .iter()
+            .position(|rule| rule.starts_with('+') || rule.starts_with('-'))
+            .unwrap_or(rules.len());
+        rules.insert(position, DEFAULT_CHANNEL_RULE);
+    }
+    rules.join(" ")
+}
+
+/// Whether one ACL rule states the pub/sub channel permission: a channel pattern
+/// (`&<pattern>`) or one of the two keywords that set the whole permission at once.
+fn is_channel_rule(rule: &str) -> bool {
+    rule.starts_with('&')
+        || rule.eq_ignore_ascii_case(DEFAULT_CHANNEL_RULE)
+        || rule.eq_ignore_ascii_case("allchannels")
+}
+
+/// Why no engine version this service runs matches `engine_version` under `engine`, or
+/// `None` when one does.
+///
+/// A MemoryDB engine version belongs to ONE engine ([`ENGINE_VERSIONS`] is the catalog
+/// `DescribeEngineVersions` publishes), so naming an engine together with a version
+/// another engine offers is a combination that selects nothing — which is why the
+/// caller answers it with its modelled `InvalidParameterCombinationException`. A
+/// request that names no engine is checked against every engine's versions, because any
+/// of them could be the one it meant.
+///
+/// The version a cluster is created or updated with is the `<major>.<minor>` form
+/// `EngineVersionInfo$EngineVersion` publishes, NOT the `<major>.<minor>.<patch>` form
+/// of `EngineVersionInfo$EnginePatchVersion`: the patch release is the service's to
+/// choose, so a patch version is not a value a cluster can ask for and is refused here
+/// like any other version no engine publishes.
+pub fn engine_version_rejection(engine: Option<&str>, engine_version: Option<&str>) -> Option<String> {
+    let version = engine_version?;
+    let offered = ENGINE_VERSIONS.iter().any(|candidate| {
+        engine.is_none_or(|engine| engine == candidate.engine) && version == candidate.version()
+    });
+    (!offered).then(|| format!("Invalid engine version {version} specified for the cluster"))
+}
+
+/// Why `engine` names no engine this service runs, or `None` when it names one.
+///
+/// The model types `Engine` as a plain string, but the engines MemoryDB runs are the
+/// ones [`ENGINE_VERSIONS`] publishes, so anything else is a value the service cannot
+/// honour and the caller refuses it with its modelled
+/// `InvalidParameterValueException`.
+pub fn engine_rejection(engine: Option<&str>) -> Option<String> {
+    let engine = engine?;
+    let offered = ENGINE_VERSIONS
+        .iter()
+        .any(|candidate| candidate.engine == engine);
+    (!offered).then(|| format!("Invalid engine name {engine} specified for the cluster"))
 }
 
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it carries no

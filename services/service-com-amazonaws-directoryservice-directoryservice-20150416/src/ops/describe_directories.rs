@@ -86,6 +86,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The separator between the creation rank a cursor resumes after and the filter it was
+// issued under: the one `crate::state::CURSOR_SEPARATOR` every listing of this service
+// agrees on, so a token means one thing.
+use crate::state::CURSOR_SEPARATOR;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -291,16 +295,13 @@ fn invalid_parameter(message: String) -> DescribeDirectoriesError {
     .into()
 }
 
-/// Separates the creation rank a cursor resumes after from the filter it was issued
-/// under. Not a character a `DirectoryId` can contain, so the two halves are
-/// unambiguous.
-const CURSOR_SEPARATOR: char = '|';
-
 /// How a `DirectoryIds` filter is recorded in a cursor: the ids as the request listed
-/// them, or the empty string for an unfiltered listing. A later page must be asked for
-/// with the same filter, so a token cannot silently resume a different listing.
+/// them, or the empty string for an unfiltered listing, through the one shared
+/// [`crate::state::cursor_filter`] encoding. A later page must be asked for with the
+/// same filter, so a token cannot silently resume a different listing.
 fn cursor_filter(directory_ids: Option<&Vec<String>>) -> String {
-    directory_ids
+    let ids = directory_ids
         .map(|requested| requested.join(","))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    crate::state::cursor_filter(&[&ids])
 }

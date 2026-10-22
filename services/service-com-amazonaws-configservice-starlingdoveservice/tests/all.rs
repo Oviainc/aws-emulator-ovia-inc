@@ -17,5 +17,7 @@ mod config_aggregator_lifecycle;
 mod config_read_shape_and_compliance;
 #[path = "all/config_setup_and_rule_loop.rs"]
 mod config_setup_and_rule_loop;
+#[path = "all/pending_aggregation_requests.rs"]
+mod pending_aggregation_requests;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

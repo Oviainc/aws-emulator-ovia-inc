@@ -705,6 +705,41 @@ pub fn normalize_path(raw: &str) -> Result<String, PathProblem> {
     Ok(trimmed.to_string())
 }
 
+/// The canonical form of a `folderPath`: leading and trailing separators removed,
+/// so `"/src/"`, `"/src"` and `"src"` all address the same folder, and an empty
+/// path (or `"/"`) addresses the repository root — the tree itself, which always
+/// exists in a commit. Every other form is checked exactly as a file path is, so
+/// a folder and a file in it are addressed by the same path grammar.
+pub fn normalize_folder_path(raw: &str) -> Result<String, PathProblem> {
+    let trimmed = raw.trim_matches('/');
+    if trimmed.is_empty() {
+        // The root folder: the whole tree, named by no segment at all.
+        return Ok(String::new());
+    }
+    normalize_path(trimmed)
+}
+
+/// The entries of a tree snapshot that live under `folder`, keyed by their path
+/// RELATIVE to that folder. `folder` is `""` for the repository root, whose
+/// relative paths are the snapshot's own paths.
+///
+/// The result is itself a tree snapshot, so [`tree_id`] over it is the git tree
+/// object name of that folder, and calling this again with one of its own folder
+/// names descends another level.
+pub fn subtree(files: &BTreeMap<String, FileEntry>, folder: &str) -> BTreeMap<String, FileEntry> {
+    if folder.is_empty() {
+        return files.clone();
+    }
+    let prefix = format!("{folder}/");
+    files
+        .iter()
+        .filter_map(|(path, entry)| {
+            path.strip_prefix(&prefix)
+                .map(|relative| (relative.to_string(), entry.clone()))
+        })
+        .collect()
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

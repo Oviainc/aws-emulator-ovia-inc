@@ -160,14 +160,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the MemoryDB store is unreachable on this engine",
             ));
         };
-        if input.max_results.is_some_and(|max| max < 1) {
+        if let Some(message) = crate::state::max_results_rejection(input.max_results) {
+            // A page size outside the window names no page: refused with this
+            // operation's own modelled invalid-value error, through the one rule every
+            // listing in this service reads the page-size window with.
             return Err(DescribeClustersErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
-                    message: Some("MaxResults must be at least 1.".to_string()),
+                    message: Some(message),
                 },
             )
             .into());
         }
+        // A cluster name is a case-insensitive identifier, so the name this request
+        // asks about is folded exactly as the store is keyed.
+        let cluster_name = input.cluster_name.as_deref().map(crate::state::fold_name);
         let mut state = state.lock();
         // The only write a describe makes: the `creating`/`updating` -> `available`
         // transition the clock already owed at this instant, which was due whether or
@@ -175,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle(std::time::Instant::now());
 
         let show_shard_details = input.show_shard_details.unwrap_or(false);
-        let entries: Vec<(String, Cluster)> = match input.cluster_name.as_deref() {
+        let entries: Vec<(String, Cluster)> = match cluster_name.as_deref() {
             Some(name) => {
                 let Some(cluster) = state.clusters.get(name) else {
                     return Err(DescribeClustersErrorModeled::ClusterNotFoundFault(

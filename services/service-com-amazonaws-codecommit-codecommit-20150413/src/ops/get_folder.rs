@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFolder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFolder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFolder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: lists the immediate entries of one folder of the tree snapshot of
+//! the commit the specifier names, from `crate::state`.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +179,138 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFolder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFolderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFolder"))
+        let _ = ctx;
+        // The folder this call reads: the path with its separators canonicalized,
+        // where the empty path (and `"/"`) is the repository root.
+        let folder = match crate::state::normalize_folder_path(&input.folder_path) {
+            Ok(folder) => folder,
+            Err(_) => {
+                return Err(GetFolderErrorModeled::InvalidPathException(InvalidPathException {
+                    message: Some(format!("the path {} is not valid", input.folder_path)),
+                })
+                .into())
+            }
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let store = state.lock();
+        let repository = store.repositories.get(&input.repository_name).ok_or_else(|| {
+            GetFolderErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(format!(
+                        "the repository {} does not exist",
+                        input.repository_name
+                    )),
+                },
+            )
+        })?;
+
+        // `commitSpecifier` names a commit or a branch; absent, it is the
+        // repository's default branch.
+        let specifier = input
+            .commit_specifier
+            .clone()
+            .or_else(|| repository.default_branch.clone())
+            .unwrap_or_default();
+        let commit = repository.resolve_commit(&specifier).ok_or_else(|| {
+            GetFolderErrorModeled::CommitDoesNotExistException(CommitDoesNotExistException {
+                message: Some(format!(
+                    "the commit {specifier} does not exist in the repository {}",
+                    input.repository_name
+                )),
+            })
+        })?;
+
+        // Everything at or under the folder, keyed relative to it. A folder exists
+        // in a git tree exactly when some entry lives under it — except the root,
+        // which is the tree itself and so exists in every commit.
+        let entries = crate::state::subtree(&commit.files, &folder);
+        if entries.is_empty() && !folder.is_empty() {
+            return Err(GetFolderErrorModeled::FolderDoesNotExistException(
+                FolderDoesNotExistException {
+                    message: Some(format!(
+                        "the folder {folder} does not exist in the commit {}",
+                        commit.commit_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The fully qualified path of an entry of this folder, from the root of the
+        // tree — the form every path in a git tree (and so every path this service
+        // stores and reports) takes.
+        let absolute = |relative: &str| {
+            if folder.is_empty() {
+                relative.to_string()
+            } else {
+                format!("{folder}/{relative}")
+            }
+        };
+
+        // Only the IMMEDIATE entries are reported: a relative path of one segment
+        // is an entry of this folder, while a longer one belongs to a sub-folder,
+        // which is reported once, by its first segment.
+        let mut files: Vec<File> = Vec::new();
+        let mut symbolic_links: Vec<SymbolicLink> = Vec::new();
+        let mut folder_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (relative, entry) in &entries {
+            let Some((head, _)) = relative.split_once('/') else {
+                // A symbolic link is a blob whose mode says so, and the model
+                // reports it in its own list rather than among the files.
+                if entry.file_mode == crate::state::FILE_MODE_SYMLINK {
+                    symbolic_links.push(SymbolicLink {
+                        blob_id: Some(entry.blob_id.clone()),
+                        absolute_path: Some(absolute(relative)),
+                        relative_path: Some(relative.clone()),
+                        file_mode: Some(entry.file_mode.clone()),
+                    });
+                } else {
+                    files.push(File {
+                        blob_id: Some(entry.blob_id.clone()),
+                        absolute_path: Some(absolute(relative)),
+                        relative_path: Some(relative.clone()),
+                        file_mode: Some(entry.file_mode.clone()),
+                    });
+                }
+                continue;
+            };
+            folder_names.insert(head);
+        }
+        let sub_folders: Vec<Folder> = folder_names
+            .into_iter()
+            .map(|name| Folder {
+                // A sub-folder's `treeId` is the git tree object name of that
+                // sub-folder's own tree, over the entries that live under it.
+                tree_id: Some(crate::state::tree_id(&crate::state::subtree(
+                    &entries, name,
+                ))),
+                absolute_path: Some(absolute(name)),
+                relative_path: Some(name.to_string()),
+            })
+            .collect();
+
+        Ok(GetFolderOutput {
+            commit_id: commit.commit_id.clone(),
+            // The fully qualified path of the folder whose contents are returned:
+            // the path the request named this folder by.
+            folder_path: input.folder_path.clone(),
+            // The git tree object name of this folder's own tree, which for the
+            // root folder is the commit's tree id.
+            tree_id: Some(crate::state::tree_id(&entries)),
+            // Each list is reported "if any": a kind of entry this folder holds
+            // none of is left out rather than sent as an empty list.
+            sub_folders: (!sub_folders.is_empty()).then_some(sub_folders),
+            files: (!files.is_empty()).then_some(files),
+            symbolic_links: (!symbolic_links.is_empty()).then_some(symbolic_links),
+            // A submodule is a gitlink entry in a tree. Nothing this service can be
+            // asked to write creates one — `PutFile` writes a blob, and a commit's
+            // snapshot holds only blobs — so no stored commit holds one.
+            sub_modules: None,
+        })
     }
 }

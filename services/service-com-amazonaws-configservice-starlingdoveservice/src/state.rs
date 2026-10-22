@@ -17,8 +17,8 @@ use crate::ops::types::{
     AccountAggregationSource, AggregatorFilters, ComplianceContributorCount, ComplianceSummary,
     ConfigRule, ConfigSnapshotDeliveryProperties, ConfigurationAggregator, ConfigurationRecorder,
     ConfigurationRecorderStatus, DeliveryChannel, EvaluationModeConfiguration,
-    ExclusionByResourceTypes, OrganizationAggregationSource, RecordingGroup, RecordingMode,
-    RecordingStrategy, Scope, Source, Tag,
+    ExclusionByResourceTypes, OrganizationAggregationSource, PendingAggregationRequest,
+    RecordingGroup, RecordingMode, RecordingStrategy, Scope, Source, Tag,
 };
 
 /// The ARN namespace of this service (`awsService.arnNamespace` in the model), used
@@ -133,6 +133,13 @@ pub const DESCRIBE_CONFIGURATION_AGGREGATORS_PAGE_SIZE: i32 = 100;
 /// it matches the `ConfigRuleNames` length maximum (0..25) the same operation
 /// declares.
 pub const DESCRIBE_CONFIG_RULES_PAGE_SIZE: usize = 25;
+
+/// The most pending aggregation requests one `DescribePendingAggregationRequests`
+/// page carries: the maximum of that operation's own `Limit`
+/// (`DescribePendingAggregationRequestsRequest$Limit`, range 0..20, "The default is
+/// maximum. If you specify 0, Config uses the default"), so a request that asks for
+/// no limit is served this many.
+pub const DESCRIBE_PENDING_AGGREGATION_REQUESTS_MAX_LIMIT: usize = 20;
 
 /// Wording for the (unreachable in the assembled emulator) case where this
 /// service's store cannot be reached, i.e. the engine is not the shared
@@ -336,6 +343,58 @@ impl ConfigRuleEntry {
     }
 }
 
+/// One pending aggregation request this account holds.
+///
+/// A pending aggregation request is an aggregator account that has asked to aggregate
+/// this account's data and has not been authorized yet
+/// (`PendingAggregationRequest`: "An object that represents the account ID and region
+/// of an aggregator account that is requesting authorization but is not yet
+/// authorized"). The REQUESTER is therefore another account's aggregator, and the
+/// call that creates the entry — that account's `PutConfigurationAggregator`, naming
+/// this account as a source — reaches that account's Config, not this one: one
+/// engine's store stands for ONE account in ONE Region, so no operation served here
+/// mints one. `DeletePendingAggregationRequest` is the modelled operation that
+/// removes one, and `DescribePendingAggregationRequests` reports what the store
+/// holds, which for an account nobody has asked to aggregate is nothing.
+#[derive(Debug, Clone, Default)]
+pub struct PendingAggregationRequestEntry {
+    /// The 12-digit account id of the account requesting to aggregate data
+    /// (`PendingAggregationRequest$RequesterAccountId`).
+    pub requester_account_id: String,
+    /// The Region requesting to aggregate data
+    /// (`PendingAggregationRequest$RequesterAwsRegion`).
+    pub requester_aws_region: String,
+}
+
+impl PendingAggregationRequestEntry {
+    /// A pending request from the aggregator account `requester_account_id` in
+    /// `requester_aws_region`.
+    pub fn new(requester_account_id: &str, requester_aws_region: &str) -> Self {
+        Self {
+            requester_account_id: requester_account_id.to_string(),
+            requester_aws_region: requester_aws_region.to_string(),
+        }
+    }
+
+    /// The key this entry is stored under: the (account, Region) pair that identifies
+    /// the requesting aggregator, which is exactly what
+    /// `DeletePendingAggregationRequest` names.
+    pub fn key(&self) -> (String, String) {
+        (
+            self.requester_account_id.clone(),
+            self.requester_aws_region.clone(),
+        )
+    }
+
+    /// The modelled `PendingAggregationRequest`, read back out of state.
+    pub fn to_shape(&self) -> PendingAggregationRequest {
+        PendingAggregationRequest {
+            requester_account_id: Some(self.requester_account_id.clone()),
+            requester_aws_region: Some(self.requester_aws_region.clone()),
+        }
+    }
+}
+
 /// One persisted configuration aggregator.
 ///
 /// An aggregator aggregates EITHER individual source accounts
@@ -404,6 +463,13 @@ pub struct ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// Source of the next configuration recorder id, so every recorder Config
     /// creates here gets a distinct one.
     pub next_recorder_seq: u64,
+    /// Aggregator accounts that have asked to aggregate this account's data and are
+    /// not authorized yet, keyed by the (requester account, requester Region) pair
+    /// that identifies one. A `BTreeMap` so `DescribePendingAggregationRequests`
+    /// pages over a stable ordering and a page token survives entries added or
+    /// removed between pages. See [`PendingAggregationRequestEntry`] for which call
+    /// creates one.
+    pub pending_aggregation_requests: BTreeMap<(String, String), PendingAggregationRequestEntry>,
     /// Configuration aggregators, keyed by `ConfigurationAggregatorName`. A
     /// `BTreeMap` so `DescribeConfigurationAggregators` pages over a stable ordering
     /// and a page token survives aggregators created and deleted between pages.
@@ -661,6 +727,34 @@ pub fn encode_page_token(resume_at: &str) -> String {
 pub fn decode_page_token(token: &str) -> Option<String> {
     let bytes = ::aws_smithy_types::base64::decode(token).ok()?;
     String::from_utf8(bytes).ok()
+}
+
+/// The separator between the two fields of the key a pending aggregation request page
+/// resumes at. An `AccountId` is twelve digits (`PendingAggregationRequest$
+/// RequesterAccountId`, pattern `^\d{12}$`), so it never contains this character and
+/// the key splits unambiguously.
+const PENDING_AGGREGATION_REQUEST_KEY_SEPARATOR: char = '#';
+
+/// Encode the (account, Region) key a `DescribePendingAggregationRequests` page should
+/// resume at as an opaque `NextToken`.
+pub fn encode_pending_aggregation_request_token(key: &(String, String)) -> String {
+    encode_page_token(&format!(
+        "{}{PENDING_AGGREGATION_REQUEST_KEY_SEPARATOR}{}",
+        key.0, key.1
+    ))
+}
+
+/// The (account, Region) key a `NextToken` resumes at, or `None` when the token is
+/// malformed — i.e. not something [`encode_pending_aggregation_request_token`]
+/// produced, so it does not decode to an account id of twelve digits and a non-empty
+/// Region.
+pub fn decode_pending_aggregation_request_token(token: &str) -> Option<(String, String)> {
+    let key = decode_page_token(token)?;
+    let (account, region) = key.split_once(PENDING_AGGREGATION_REQUEST_KEY_SEPARATOR)?;
+    let well_formed = account.len() == 12
+        && account.chars().all(|digit| digit.is_ascii_digit())
+        && !region.is_empty();
+    well_formed.then(|| (account.to_string(), region.to_string()))
 }
 
 /// How Config words `NoSuchConfigRuleException` for a request that named a rule this
