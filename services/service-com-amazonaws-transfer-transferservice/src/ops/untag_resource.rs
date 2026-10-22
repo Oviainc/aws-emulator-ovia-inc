@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches the named tag keys from the resource its `Arn` identifies.
+//!
+//! The counterpart of `TagResource`: it resolves the resource by its stored ARN
+//! ([`crate::state::ComAmazonawsTransferTransferserviceState::tags_mut`]) and drops
+//! every tag whose key the request names, leaving the rest in their stored order
+//! ([`crate::state::remove_tags`]). A key the resource does not carry removes nothing
+//! and is not an error — the request asks for those keys to be absent, and after it
+//! they are — so repeating the call is idempotent. An `Arn` nothing answers to is
+//! refused with the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +167,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        use crate::state as st;
+
+        // The target is named by the request's `Arn` alone, so this operation reads no
+        // request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            UntagResourceErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        // The same resolution `TagResource` writes through: an ARN no stored resource
+        // answers to is a not-found, not a silent no-op.
+        let tags = guard.tags_mut(&input.arn).ok_or_else(|| {
+            st::not_found(UntagResourceErrorModeled::ResourceNotFoundException(
+                st::unknown_tagged_resource(&input.arn),
+            ))
+        })?;
+
+        st::remove_tags(tags, &input.tag_keys);
+        drop(guard);
+
+        // "No response is returned from this call": the modelled output is Unit.
+        Ok(UntagResourceOutput)
     }
 }

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags attached to the resource its `Arn` identifies.
+//!
+//! A PURE read (`@readonly`): it resolves the resource by its stored ARN
+//! ([`crate::state::ComAmazonawsTransferTransferserviceState::tags_of`]) and reports
+//! that set, so it answers exactly what `TagResource`/`UntagResource` wrote and what
+//! the resource's own `Describe*` reports. `@paginated` over `Tags`, paged by key in
+//! ascending order — a tag key is unique per resource, so that order is stable and a
+//! `NextToken` resumes deterministically, on the same token codec every `List*` in
+//! this service shares.
+//!
+//! The model declares NO not-found error for this operation, so an `Arn` nothing in
+//! the store answers to is not refused: it has no tags, which is reported as the
+//! `Arn` echoed back and the `Tags` member absent (`Tags` is modelled `len 1..50`,
+//! which an empty list does not satisfy).
 //!
 //! ## Shape of an operation
 //!
@@ -95,6 +101,18 @@ use super::types::*;
 // `ListTagsForResourceError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-transfer-transferservice.json");
 
+/// The constant prefix the paging position carries before it is encoded as a
+/// `NextToken`.
+///
+/// The shared token codec (`crate::state::encode_page_token`) encodes the LAST key of
+/// the page, and a tag key may be EMPTY (`TagKey` is modelled `len 0..128`) — which
+/// would encode as an empty token, and `NextToken` is modelled `len 1..6144` on the
+/// output AND on the input, so the caller could not send it back and the remaining
+/// pages would be unreachable. Prefixing every position with the same constant keeps
+/// the lexicographic order the position walk needs (an identical prefix cannot change
+/// it) and makes the encoded token non-empty for every key, including the empty one.
+const PAGE_KEY_PREFIX: &str = "tag:";
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
@@ -160,18 +178,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        use crate::state as st;
+
+        // The target is named by the request's `Arn` alone, so this operation reads no
+        // request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListTagsForResourceErrorModeled::InvalidNextTokenException(
+                    InvalidNextTokenException {
+                        message: "The NextToken is not valid".to_string(),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        let guard = state.lock();
+        // A tag set owes the clock no transition, so this read materialises nothing.
+        // Ordered by key for paging: a key is unique per resource, so the order is
+        // total and a token resumes at exactly one position.
+        let mut tags: Vec<Tag> = guard.tags_of(&input.arn).unwrap_or_default().to_vec();
+        drop(guard);
+        tags.sort_by(|left, right| left.key.cmp(&right.key));
+
+        let keys: Vec<String> = tags
+            .iter()
+            .map(|tag| format!("{PAGE_KEY_PREFIX}{}", tag.key))
+            .collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (page, next_key) =
+            st::page_bounds(&keys, after.as_deref(), st::page_limit(input.max_results));
+        let page_tags: Vec<Tag> = tags.get(page).unwrap_or_default().to_vec();
+
+        Ok(ListTagsForResourceOutput {
+            // The ARN the caller asked about, echoed as the output member documents.
+            arn: Some(input.arn),
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            // `Tags` is modelled `len 1..50`: a resource with no tags reports the
+            // member absent rather than an empty list.
+            tags: Some(page_tags).filter(|tags| !tags.is_empty()),
+        })
     }
 }

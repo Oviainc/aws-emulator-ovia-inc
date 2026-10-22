@@ -47,6 +47,8 @@ mod not_found_errors;
 mod profile_lifecycle;
 #[path = "all/resource_resolution_refusals.rs"]
 mod resource_resolution_refusals;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/security_policy_catalog.rs"]
 mod security_policy_catalog;
 #[path = "all/security_policy_listing.rs"]
