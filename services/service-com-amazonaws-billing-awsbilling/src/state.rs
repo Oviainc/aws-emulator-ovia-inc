@@ -7,6 +7,9 @@
 //! computes its answer from [`ComAmazonawsBillingAwsbillingState::billing_views`],
 //! which is keyed by the view's ARN and ordered, so a list and its pagination are
 //! deterministic.
+//!
+//! Beside it, [`ComAmazonawsBillingAwsbillingState::credits`] holds the account
+//! credits `GetCredits` reports, keyed and ordered by `creditId`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,6 +61,14 @@ pub const BILLING_SERVICE_CODE: &str = "billing";
 /// billing-view count.
 pub const BILLING_VIEWS_QUOTA_CODE: &str = "BillingViewsPerAccount";
 
+/// The most credits this emulator keeps resident for the whole billing family.
+///
+/// `credits` is the store `GetCredits` reports from; like `billing_views` it
+/// needs a ceiling so that nothing can grow the process without bound. This is
+/// an emulator resource bound, not a published AWS quota:
+/// [`ComAmazonawsBillingAwsbillingState::insert_credit`] refuses past it.
+pub const MAX_CREDITS: usize = 1024;
+
 /// The resource id of the account's default `PRIMARY` billing view.
 const PRIMARY_VIEW_ID: &str = "primary";
 
@@ -93,6 +104,75 @@ pub struct BillingView {
     pub tags: BTreeMap<String, String>,
 }
 
+/// A monetary amount, as the modeled `Amount` shape carries it: an ISO-4217
+/// `currencyCode` (`^[A-Z]{3}$`) and a decimal `currencyAmount`.
+///
+/// Held as the wire form rather than a float: the modeled `CurrencyAmount` is a
+/// string, and money must not be rounded by a binary float on the way through
+/// the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditAmount {
+    pub currency_code: String,
+    pub currency_amount: String,
+}
+
+/// One persisted account credit — the record `GetCredits` reports.
+///
+/// Mirrors the modeled `CreditData` shape, with instants kept as
+/// [`SystemTime`] (converted on read by [`timestamp`]) so that stored and
+/// requested periods compare on one scale. Enum-typed members are held as the
+/// model's own string values (`ApplicationType`, `CreditSharingType`,
+/// `CreditStatus`).
+#[derive(Debug, Clone)]
+pub struct Credit {
+    /// The modeled `CreditId`: 1..32 characters matching `^[0-9]+$`. This is
+    /// the key the credit is stored under.
+    pub credit_id: String,
+    /// The 12-digit account that owns the credit.
+    pub account_id: String,
+    pub credit_type: String,
+    pub initial_amount: CreditAmount,
+    pub remaining_amount: CreditAmount,
+    pub estimated_amount: Option<CreditAmount>,
+    /// The products the credit applies to; empty when it applies to any.
+    pub applicable_product_names: Vec<String>,
+    pub description: String,
+    /// When the credit becomes applicable.
+    pub start_date: SystemTime,
+    /// When the credit expires; `None` for a credit that does not expire.
+    pub end_date: Option<SystemTime>,
+    /// When the credit was fully consumed, if it has been.
+    pub exhaust_date: Option<SystemTime>,
+    /// An `ApplicationType` value, e.g. `AFTER_DISCOUNTS`.
+    pub application_type: Option<String>,
+    /// The accounts the credit may be shared with.
+    pub shareable_accounts: Vec<String>,
+    pub account_has_credit_sharing_enabled: Option<bool>,
+    pub credit_console_visibility: Option<String>,
+    /// A `CreditSharingType` value, e.g. `DEFAULT`.
+    pub credit_sharing_type: Option<String>,
+    pub cost_category_arn: Option<String>,
+    pub rule_name: Option<String>,
+    /// A `CreditStatus` value: `ENABLED` or `DISABLED`.
+    pub credit_status: Option<String>,
+    /// The purchase types the credit applies to.
+    pub purchase_type_applications: Vec<String>,
+}
+
+impl Credit {
+    /// Whether this credit's own life overlaps the closed period
+    /// `[start_secs, end_secs]`, both on [`epoch_secs`]' scale.
+    ///
+    /// A credit with no `end_date` never expires, so it overlaps every period
+    /// that ends on or after it started.
+    pub fn overlaps_period(&self, start_secs: f64, end_secs: f64) -> bool {
+        epoch_secs(self.start_date) <= end_secs
+            && self
+                .end_date
+                .is_none_or(|end| epoch_secs(end) >= start_secs)
+    }
+}
+
 /// Per-service state for com-amazonaws-billing-awsbilling. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsBillingAwsbillingState {
@@ -107,6 +187,10 @@ pub struct ComAmazonawsBillingAwsbillingState {
     /// Source of the next `billingview/custom-<n>` resource id. Used ONLY to
     /// build an ARN that is then stored in `billing_views`.
     pub next_view_id: u64,
+    /// Every credit held by an account of this emulator's consolidated billing
+    /// family, keyed and ordered by `creditId`, so `GetCredits` answers in a
+    /// deterministic order. Bounded by [`MAX_CREDITS`].
+    pub credits: BTreeMap<String, Credit>,
 }
 
 impl Default for ComAmazonawsBillingAwsbillingState {
@@ -135,6 +219,9 @@ impl Default for ComAmazonawsBillingAwsbillingState {
             billing_views,
             idempotency_tokens: HashMap::new(),
             next_view_id: 1,
+            // A fresh account holds no credits: the modeled `GetCredits`
+            // response "returns an empty list when no credits exist".
+            credits: BTreeMap::new(),
         }
     }
 }
@@ -179,6 +266,43 @@ impl ComAmazonawsBillingAwsbillingState {
     pub fn has_room_for_another_view(&self, writes_token: bool) -> bool {
         self.billing_views.len() < MAX_BILLING_VIEWS
             && (!writes_token || self.idempotency_tokens.len() < MAX_IDEMPOTENCY_TOKENS)
+    }
+
+    /// Store `credit` under its `creditId`, replacing any credit already held
+    /// under that id. Answers `false` — storing nothing — when the store is
+    /// already at [`MAX_CREDITS`], so a caller can refuse with a quota error
+    /// rather than growing the process without bound.
+    pub fn insert_credit(&mut self, credit: Credit) -> bool {
+        if !self.credits.contains_key(&credit.credit_id) && self.credits.len() >= MAX_CREDITS {
+            return false;
+        }
+        self.credits.insert(credit.credit_id.clone(), credit);
+        true
+    }
+
+    /// The credits `GetCredits` reports, in `creditId` order.
+    ///
+    /// `account_id` selects the owning account. `whole_family` widens the
+    /// selection to every account of the consolidated billing family — every
+    /// account this store knows, since the emulator's own account
+    /// (`engine::emulator_account_id`) is the family's management account.
+    /// Both bounds of the requested period are inclusive, on [`epoch_secs`]'
+    /// scale, and a credit is reported when its own life overlaps it.
+    ///
+    /// A pure read: it answers from the store and changes nothing in it.
+    pub fn credits_for_period(
+        &self,
+        account_id: &str,
+        whole_family: bool,
+        start_secs: f64,
+        end_secs: f64,
+    ) -> Vec<Credit> {
+        self.credits
+            .values()
+            .filter(|credit| whole_family || credit.account_id == account_id)
+            .filter(|credit| credit.overlaps_period(start_secs, end_secs))
+            .cloned()
+            .collect()
     }
 }
 

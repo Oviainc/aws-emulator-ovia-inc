@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCredits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCredits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCredits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: every answer is computed from
+//! [`crate::state::ComAmazonawsBillingAwsbillingState::credits`] — the credits the
+//! store holds for the requested account (or, with `payerAccountFlag`, for the whole
+//! consolidated billing family), narrowed to the requested period. This is a pure
+//! read: it writes nothing, so a later caller sees exactly what it saw.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCredits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCreditsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCredits"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+
+        // `GetCreditsRequest` carries no modeled constraint on any of its members
+        // (`accountId` targets the bare `String` shape), so the rules its
+        // documentation states are enforced here, with the modeled
+        // `ValidationException` naming the member that failed.
+        let now_secs = crate::state::epoch_secs(std::time::SystemTime::now());
+
+        if !is_account_id(&input.account_id) {
+            return Err(field_validation_failed(
+                ACCOUNT_ID_FIELD,
+                "accountId must be a 12-digit numeric string",
+            ));
+        }
+
+        let start_secs = crate::state::date_time_secs(&input.start_date);
+        if start_secs > now_secs {
+            return Err(field_validation_failed(
+                START_DATE_FIELD,
+                "startDate must be a past date",
+            ));
+        }
+        if start_secs < now_secs - MAX_START_DATE_LOOKBACK.as_secs_f64() {
+            return Err(field_validation_failed(
+                START_DATE_FIELD,
+                "startDate must not be more than one year before the current date",
+            ));
+        }
+
+        // "Defaults to the current date when omitted."
+        let end_secs = input
+            .end_date
+            .as_ref()
+            .map_or(now_secs, crate::state::date_time_secs);
+        if end_secs > now_secs {
+            return Err(field_validation_failed(
+                END_DATE_FIELD,
+                "endDate must not be a future date",
+            ));
+        }
+        if end_secs < start_secs {
+            // The sentence the service answers for this rule — "endDate ... must be
+            // on or after startDate" — as AWS words it.
+            return Err(field_validation_failed(
+                END_DATE_FIELD,
+                "End date cannot be before start date.",
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCreditsErrorModeled::InternalServerException(InternalServerException {
+                message: "the billing credit store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+
+        // "When the caller is the management account of a consolidated billing
+        // family and payerAccountFlag is true, the response aggregates credits
+        // across the entire family. Otherwise, the response includes only credits
+        // owned by the account specified in accountId." The emulator's own account
+        // is the management account of its family, so a request naming any other
+        // account is answered from that account's own credits alone.
+        let whole_family = input.payer_account_flag.unwrap_or(false)
+            && input.account_id == ::engine::emulator_account_id();
+
+        let credits = state
+            .credits_for_period(&input.account_id, whole_family, start_secs, end_secs)
+            .iter()
+            .map(credit_data)
+            .collect();
+
+        // Always a list, never absent: "Returns an empty list when no credits exist."
+        Ok(GetCreditsOutput {
+            credits: Some(credits),
+        })
     }
 }
+
+/// The `accountId` member name, as the modeled `ValidationExceptionField` reports it.
+const ACCOUNT_ID_FIELD: &str = "accountId";
+
+/// The `startDate` member name, for the same purpose.
+const START_DATE_FIELD: &str = "startDate";
+
+/// The `endDate` member name, for the same purpose.
+const END_DATE_FIELD: &str = "endDate";
+
+/// The `fieldValidationFailed` member of the modeled `ValidationExceptionReason`
+/// enum (`smithy_query(query="shape",shape="ValidationExceptionReason")`): the
+/// reason a member's value broke one of this operation's rules.
+const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
+
+/// How far before the current instant a `startDate` may reach.
+///
+/// From the modeled `GetCreditsRequest$startDate` doc: "Must be a past date that is
+/// not more than one year before the current date." A year is taken as 365 days.
+const MAX_START_DATE_LOOKBACK: std::time::Duration =
+    std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Whether `value` is an Amazon Web Services account id: exactly 12 digits, the form
+/// the modeled `AccountId` shape (`^[0-9]{12}$`) and this operation's `accountId` doc
+/// ("Must be a 12-digit numeric string") both state.
+fn is_account_id(value: &str) -> bool {
+    value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Refuse the request with the modeled 400 `ValidationException`, naming the member
+/// that failed and why, so the caller can fix the request from the error alone.
+fn field_validation_failed(field: &str, message: &str) -> GetCreditsError {
+    GetCreditsErrorModeled::ValidationException(ValidationException {
+        message: message.to_string(),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: field.to_string(),
+            message: message.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// One stored credit as the modeled `CreditData` the wire carries.
+///
+/// An empty stored list is reported as an absent member rather than an empty one:
+/// the model leaves `applicableProductNames`, `shareableAccounts` and
+/// `purchaseTypeApplications` optional, and "no restriction recorded" is what an
+/// empty one in the store means.
+fn credit_data(credit: &crate::state::Credit) -> CreditData {
+    CreditData {
+        credit_id: credit.credit_id.clone(),
+        account_id: credit.account_id.clone(),
+        credit_type: credit.credit_type.clone(),
+        initial_amount: amount(&credit.initial_amount),
+        remaining_amount: amount(&credit.remaining_amount),
+        estimated_amount: credit.estimated_amount.as_ref().map(amount),
+        applicable_product_names: optional_list(&credit.applicable_product_names),
+        description: credit.description.clone(),
+        start_date: crate::state::timestamp(credit.start_date),
+        end_date: credit.end_date.map(crate::state::timestamp),
+        exhaust_date: credit.exhaust_date.map(crate::state::timestamp),
+        application_type: credit.application_type.clone(),
+        shareable_accounts: optional_list(&credit.shareable_accounts),
+        account_has_credit_sharing_enabled: credit.account_has_credit_sharing_enabled,
+        credit_console_visibility: credit.credit_console_visibility.clone(),
+        credit_sharing_type: credit.credit_sharing_type.clone(),
+        cost_category_arn: credit.cost_category_arn.clone(),
+        rule_name: credit.rule_name.clone(),
+        credit_status: credit.credit_status.clone(),
+        purchase_type_applications: optional_list(&credit.purchase_type_applications),
+    }
+}
+
+/// A stored amount as the modeled `Amount` shape.
+fn amount(stored: &crate::state::CreditAmount) -> Amount {
+    Amount {
+        currency_code: stored.currency_code.clone(),
+        currency_amount: stored.currency_amount.clone(),
+    }
+}
+
+/// A stored list as an optional modeled list: absent when nothing is recorded.
+fn optional_list(values: &[String]) -> Option<Vec<String>> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.to_vec())
+    }
+}
+
