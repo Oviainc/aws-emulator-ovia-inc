@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReplicators
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReplicators`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages the stored replicators, reporting each one as a `ReplicatorSummary`
+//! derived from its stored replication setup. `ListReplicators` is a REGIONAL
+//! api, so it reports only the replicators this endpoint's region holds.
+//! `ReplicatorNameFilter` keeps the replicators whose name starts with it,
+//! `MaxResults` bounds the page, and `NextToken` is an opaque encoding of the
+//! last ARN returned, resolved against the live registry — absent from the last
+//! page.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReplicators::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Authentication and authorization are NOT this handler's business: the emulator
+//! verifies every request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +83,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::ops::Bound;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -119,6 +123,33 @@ impl From<ListReplicatorsErrorModeled> for ListReplicatorsError {
     }
 }
 
+/// The largest page `MaxResults` may ask for, from that member's `range` in the
+/// model (1..100). Also the size used when the request names none.
+const MAX_RESULTS_LIMIT: i32 = 100;
+
+/// Marker that prefixes a token's plaintext, so a token minted for some other
+/// list cannot be mistaken for one of these.
+const NEXT_TOKEN_PREFIX: &str = "kafka:replicators:";
+
+/// Encode the ARN a page stopped at as a token. Base64 of a marked plaintext:
+/// the token is ENCODED, not authenticated, so a caller could decode it or mint
+/// one. That is harmless here — the ARN inside is only used as a `>` comparison
+/// against the keys of the caller's own registry, so a forged resume point can
+/// only skip or repeat entries the caller may already list.
+fn encode_next_token(last_arn: &str) -> String {
+    ::aws_smithy_types::base64::encode(format!("{NEXT_TOKEN_PREFIX}{last_arn}"))
+}
+
+/// The ARN a token resumes after, or `None` when the token is not one this
+/// operation minted.
+fn decode_next_token(token: &str) -> Option<String> {
+    let decoded = ::aws_smithy_types::base64::decode(token).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    decoded
+        .strip_prefix(NEXT_TOKEN_PREFIX)
+        .map(ToString::to_string)
+}
+
 /// The `ListReplicators` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,18 +186,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReplicators` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReplicatorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReplicators"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListReplicatorsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // A token names the ARN the previous page stopped at; the next page starts
+        // after it in the registry's own order, so a replicator registered or
+        // removed between pages shifts nothing already returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match decode_next_token(token) {
+                Some(arn) => Some(arn),
+                None => {
+                    return Err(ListReplicatorsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            invalid_parameter: Some("NextToken".to_string()),
+                            message: Some("The pagination token is not valid.".to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let mut state = state.lock();
+
+        // Absent `MaxResults` pages at the largest size the model allows, and no
+        // request may ask for a longer page than that range permits.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_RESULTS_LIMIT))
+            .unwrap_or(MAX_RESULTS_LIMIT as usize)
+            .clamp(1, MAX_RESULTS_LIMIT as usize);
+
+        // PASS 1 — choose this page's registry keys. `ListReplicators` is a
+        // regional API, so it reports only the replicators this endpoint's region
+        // holds. The registry is ordered by ARN, so a token resumes by SEEKING to
+        // its position rather than walking the keys already returned; the scan
+        // from there stops as soon as the page is full, and only entries that
+        // fail the region or name-prefix test are skipped past.
+        let mut keys: Vec<String> = Vec::with_capacity(page_size);
+        let mut more_remain = false;
+        let resume_from = match resume_after.as_deref() {
+            Some(last) => Bound::Excluded(last),
+            None => Bound::Unbounded,
+        };
+        for (arn, replicator) in state
+            .replicators
+            .range::<str, _>((resume_from, Bound::Unbounded))
+        {
+            if replicator.region != region {
+                continue;
+            }
+            if input
+                .replicator_name_filter
+                .as_deref()
+                .is_some_and(|prefix| !replicator.name.starts_with(prefix))
+            {
+                continue;
+            }
+            if keys.len() == page_size {
+                more_remain = true;
+                break;
+            }
+            keys.push(arn.clone());
+        }
+
+        // PASS 2 — settle and render exactly the replicators this page reports.
+        // The only write is the CREATING -> RUNNING transition the clock already
+        // owed each of them, and the work is bounded by the page size rather than
+        // by the size of the registry.
+        let now = std::time::SystemTime::now();
+        let mut page: Vec<ReplicatorSummary> = Vec::with_capacity(keys.len());
+        for key in &keys {
+            // Every key came from pass 1 under THIS lock, so each one still
+            // resolves. Reported as a server fault rather than skipped: a page
+            // shorter than the keys the token was minted from would hide a
+            // replicator instead of failing, so a refactor that ever let the two
+            // passes see different registries fails loudly here.
+            let Some(replicator) = state.settled_replicator_in(&region, key, now) else {
+                debug_assert!(
+                    false,
+                    "replicator {key} was chosen for this page but no longer resolves"
+                );
+                return Err(ListReplicatorsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some(
+                            "a replicator selected for this page is no longer registered"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            page.push(replicator.to_replicator_summary());
+        }
+
+        // The token is minted from the REGISTRY KEY the resume comparison uses,
+        // not from the rendered `ReplicatorSummary`, so the two can never
+        // disagree and a full page can never be mistaken for the last one.
+        let next_token = if more_remain {
+            keys.last().map(|last| encode_next_token(last))
+        } else {
+            None
+        };
+
+        Ok(ListReplicatorsOutput {
+            next_token,
+            replicators: Some(page),
+        })
     }
 }
