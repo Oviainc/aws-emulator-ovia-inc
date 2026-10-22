@@ -43,6 +43,7 @@ use crate::ops::types::{
     Container, ContainerDefinition, ContainerInstance, Deployment, DeploymentCircuitBreaker,
     DeploymentConfiguration, DeploymentController, EphemeralStorage, Failure, KeyValuePair,
     LoadBalancer, NetworkConfiguration, PlacementConstraint, PlacementStrategy, PlatformDevice,
+    PortMapping,
     ProxyConfiguration, Resource, RuntimePlatform, Service, ServiceConnectConfiguration,
     ServiceCurrentRevisionSummary, ServiceEvent, ServiceRegistry, ServiceVolumeConfiguration, Tag,
     Task, TaskDefinition, TaskDefinitionPlacementConstraint, TaskOverride, ThresholdConfiguration,
@@ -178,6 +179,83 @@ pub const DEFAULT_LAUNCH_TYPE: &str = "EC2";
 
 /// `stopCode` for a stop the caller asked for, from the `TaskStopCode` enum.
 pub const STOP_CODE_USER_INITIATED: &str = "UserInitiated";
+
+/// The network mode that gives each task its own elastic network interface, from the
+/// `NetworkMode` enum. Named here because three derivations key off it: which launch
+/// types a revision is compatible with, which container-instance attributes it
+/// requires, and how a port mapping's `hostPort` is defaulted.
+pub const NETWORK_MODE_AWSVPC: &str = "awsvpc";
+
+/// The network mode that puts the containers on the host's own network namespace, from
+/// the `NetworkMode` enum. Like [`NETWORK_MODE_AWSVPC`] it maps a container port
+/// statically onto the same host port.
+pub const NETWORK_MODE_HOST: &str = "host";
+
+/// The network mode that leaves the containers without external connectivity, from the
+/// `NetworkMode` enum. The `networkMode` doc: "If the network mode is set to none, you
+/// cannot specify port mappings in your container definitions".
+pub const NETWORK_MODE_NONE: &str = "none";
+
+/// The `protocol` a port mapping takes when the registration names none. The
+/// `PortMapping$protocol` doc: "Valid values are tcp and udp (case-sensitive). The
+/// default is tcp."
+pub const DEFAULT_PORT_PROTOCOL: &str = "tcp";
+
+/// The `hostPort` a port mapping takes under a dynamic mapping strategy. The
+/// `PortMapping$hostPort` doc, for the `bridge` network mode: "you can omit the hostPort
+/// (or set it to 0) while specifying a containerPort and your container automatically
+/// receives a port in the ephemeral port range" — the port is picked when the task is
+/// placed, so the registered revision reports the `0` that asks for one.
+pub const DYNAMIC_HOST_PORT: i32 = 0;
+
+/// Every launch type a task-definition projection may report, in the order Amazon ECS
+/// reports them in `TaskDefinition$compatibilities`. The membership is the `Compatibility`
+/// enum (`smithy_query(query="shape", shape="com.amazonaws.ecs#Compatibility")`:
+/// `EC2`, `FARGATE`, `EXTERNAL`, `MANAGED_INSTANCES`); the ORDER is the one recorded ECS
+/// responses carry, so a client that reads the list positionally reads the same launch
+/// type the real service named. [`TaskDefinitionRecord::compatibilities`] filters it by
+/// what the stored revision's parameters support.
+pub const COMPATIBILITY_ORDER: [&str; 4] = ["EXTERNAL", "EC2", "MANAGED_INSTANCES", "FARGATE"];
+
+/// The container-instance attribute an `awsvpc` task needs: its own elastic network
+/// interface. One of the Amazon ECS container-agent capabilities (the ECS developer
+/// guide's "awsvpc network mode" requirements), reported through
+/// `TaskDefinition$requiresAttributes` so a client can check an instance before placing
+/// a task on it.
+pub const ATTRIBUTE_TASK_ENI: &str = "ecs.capability.task-eni";
+
+/// The minimum Docker remote-API version an `awsvpc` task needs on the container
+/// instance, as the agent publishes it (`com.amazonaws.ecs.capability.docker-remote-api.<version>`).
+pub const ATTRIBUTE_DOCKER_REMOTE_API_1_18: &str =
+    "com.amazonaws.ecs.capability.docker-remote-api.1.18";
+
+/// The attribute a container needs to read a Secrets Manager secret into an environment
+/// variable (`Secret$valueFrom` holding a `secretsmanager` ARN).
+pub const ATTRIBUTE_SECRETS_ASM_ENVIRONMENT: &str =
+    "ecs.capability.secrets.asm.environment-variables";
+
+/// The same, for a Systems Manager Parameter Store parameter.
+pub const ATTRIBUTE_SECRETS_SSM_ENVIRONMENT: &str =
+    "ecs.capability.secrets.ssm.environment-variables";
+
+/// The attribute a container needs to read a Secrets Manager secret into its log
+/// driver's configuration (`LogConfiguration$secretOptions`).
+pub const ATTRIBUTE_SECRETS_ASM_LOG_DRIVER: &str = "ecs.capability.secrets.asm.bootstrap.log-driver";
+
+/// The same, for a Systems Manager Parameter Store parameter.
+pub const ATTRIBUTE_SECRETS_SSM_LOG_DRIVER: &str = "ecs.capability.secrets.ssm.bootstrap.log-driver";
+
+/// The attribute a container needs to pull an environment variable file out of Amazon
+/// S3 (`EnvironmentFile$type` `s3`).
+pub const ATTRIBUTE_ENV_FILES_S3: &str = "ecs.capability.env-files.s3";
+
+/// The attribute a container instance needs to run a container with elevated privileges
+/// (`ContainerDefinition$privileged`).
+pub const ATTRIBUTE_PRIVILEGED_CONTAINER: &str = "com.amazonaws.ecs.capability.privileged-container";
+
+/// The prefix of the attribute a container instance needs to run a named log driver;
+/// the driver name (`LogConfiguration$logDriver`) completes it.
+pub const ATTRIBUTE_LOGGING_DRIVER_PREFIX: &str = "com.amazonaws.ecs.capability.logging-driver.";
 
 /// `healthStatus` this emulator reports. The `Container$healthStatus` doc: "If health
 /// checks aren't configured for this container in its task definition, then it reports
@@ -554,6 +632,9 @@ pub struct TaskDefinitionRecord {
     pub runtime_platform: Option<RuntimePlatform>,
     pub enable_fault_injection: Option<bool>,
     pub tags: Vec<Tag>,
+    /// The principal that registered this revision, resolved when the registration ran
+    /// — not when it is read back.
+    pub registered_by: String,
     pub registered_at: DateTime,
     pub deregistered_at: Option<DateTime>,
 }
@@ -580,26 +661,186 @@ fn container_definition_view(stored: &ContainerDefinition) -> ContainerDefinitio
     }
 }
 
+/// Whether `value_from` names a Secrets Manager secret rather than a Systems Manager
+/// parameter. The `Secret$valueFrom` doc: "the full ARN of the Secrets Manager secret or
+/// the full ARN or name of the Systems Manager Parameter Store parameter", so the
+/// service that holds it is the ARN's own service segment.
+fn is_secrets_manager_reference(value_from: &str) -> bool {
+    value_from
+        .split(':')
+        .nth(2)
+        .is_some_and(|service| service == "secretsmanager")
+}
+
+/// The container-instance attributes ONE container of a revision requires, appended to
+/// `out`. See [`TaskDefinitionRecord::requires_attributes`] for the rule.
+fn container_required_attributes(container: &ContainerDefinition, out: &mut Vec<String>) {
+    for secret in container.secrets.iter().flatten() {
+        out.push(
+            if is_secrets_manager_reference(&secret.value_from) {
+                ATTRIBUTE_SECRETS_ASM_ENVIRONMENT
+            } else {
+                ATTRIBUTE_SECRETS_SSM_ENVIRONMENT
+            }
+            .to_string(),
+        );
+    }
+    for file in container.environment_files.iter().flatten() {
+        if file.r#type.eq_ignore_ascii_case("s3") {
+            out.push(ATTRIBUTE_ENV_FILES_S3.to_string());
+        }
+    }
+    if container.privileged == Some(true) {
+        out.push(ATTRIBUTE_PRIVILEGED_CONTAINER.to_string());
+    }
+    if let Some(logging) = container.log_configuration.as_ref() {
+        out.push(format!(
+            "{ATTRIBUTE_LOGGING_DRIVER_PREFIX}{}",
+            logging.log_driver
+        ));
+        for secret in logging.secret_options.iter().flatten() {
+            out.push(
+                if is_secrets_manager_reference(&secret.value_from) {
+                    ATTRIBUTE_SECRETS_ASM_LOG_DRIVER
+                } else {
+                    ATTRIBUTE_SECRETS_SSM_LOG_DRIVER
+                }
+                .to_string(),
+            );
+        }
+    }
+}
+
+/// The `hostPort` and `protocol` Amazon ECS fills in for a port mapping the
+/// registration left partly blank, under `network_mode`.
+///
+/// `PortMapping$protocol`: "The default is tcp." `PortMapping$hostPort`: under `awsvpc`
+/// and `host` "the hostPort can either be left blank or set to the same value as the
+/// containerPort" (a STATIC mapping), while under `bridge` omitting it "(or set it to 0)"
+/// asks for a port out of the ephemeral range (a DYNAMIC mapping), which is picked when
+/// the task is placed. A mapping that declares a `containerPortRange` instead carries no
+/// single host port — the doc: "leave this field empty" — so nothing is filled in for it.
+/// The `none` network mode never reaches here with a mapping: it "cannot specify port
+/// mappings", so `RegisterTaskDefinition` refuses one.
+fn defaulted_port_mapping(mapping: &PortMapping, network_mode: &str) -> PortMapping {
+    let static_mapping = network_mode == NETWORK_MODE_AWSVPC || network_mode == NETWORK_MODE_HOST;
+    let host_port = match (mapping.host_port, mapping.container_port) {
+        (Some(declared), _) => Some(declared),
+        (None, _) if mapping.container_port_range.is_some() => None,
+        (None, Some(container_port)) if static_mapping => Some(container_port),
+        (None, Some(_)) => Some(DYNAMIC_HOST_PORT),
+        (None, None) => None,
+    };
+    PortMapping {
+        host_port,
+        protocol: Some(
+            mapping
+                .protocol
+                .clone()
+                .unwrap_or_else(|| DEFAULT_PORT_PROTOCOL.to_string()),
+        ),
+        ..mapping.clone()
+    }
+}
+
+/// The container definitions a registration STORES: the caller's own, with the members
+/// Amazon ECS fills in at registration time filled in, so every later read of the
+/// revision reports the same rendered definition.
+///
+/// Only the port-mapping defaults ([`defaulted_port_mapping`]) are rendered here;
+/// nothing else is invented for a member the caller left out.
+pub fn defaulted_container_definitions(
+    containers: &[ContainerDefinition],
+    network_mode: &str,
+) -> Vec<ContainerDefinition> {
+    containers
+        .iter()
+        .map(|container| ContainerDefinition {
+            port_mappings: container.port_mappings.as_ref().map(|mappings| {
+                mappings
+                    .iter()
+                    .map(|mapping| defaulted_port_mapping(mapping, network_mode))
+                    .collect()
+            }),
+            ..container.clone()
+        })
+        .collect()
+}
+
 impl TaskDefinitionRecord {
     /// The launch types this revision was validated against — `TaskDefinition$
     /// compatibilities`: "Amazon ECS validates the task definition parameters with
     /// those supported by the launch type."
     ///
-    /// Derived from the STORED revision, by the two rules the model's own docs state:
-    /// Fargate needs `awsvpc` ("For Amazon ECS tasks on Fargate, the awsvpc network
-    /// mode is required") plus task-level `cpu` and `memory` ("This field is required
-    /// for Fargate"), and `awsvpc` is not available to the external (on-premises)
-    /// launch type. EC2 supports every network mode, so it is always present.
+    /// Derived from the STORED revision and reported in [`COMPATIBILITY_ORDER`], by the
+    /// rules the model's own docs state: Fargate needs `awsvpc` ("For Amazon ECS tasks
+    /// on Fargate, the awsvpc network mode is required") plus task-level `cpu` and
+    /// `memory` ("This field is required for Fargate"); ECS Managed Instances place
+    /// tasks on AWS-managed capacity that gives each task its own network interface, so
+    /// they likewise need `awsvpc`; `awsvpc` is in turn not available to the external
+    /// (on-premises) launch type. EC2 supports every network mode, so it is always
+    /// present.
     pub fn compatibilities(&self) -> Vec<String> {
-        let awsvpc = self.network_mode == "awsvpc";
-        let mut out = vec![DEFAULT_LAUNCH_TYPE.to_string()];
-        if awsvpc && self.cpu.is_some() && self.memory.is_some() {
-            out.push("FARGATE".to_string());
+        let awsvpc = self.network_mode == NETWORK_MODE_AWSVPC;
+        COMPATIBILITY_ORDER
+            .iter()
+            .filter(|launch_type| match **launch_type {
+                "EC2" => true,
+                "EXTERNAL" => !awsvpc,
+                "MANAGED_INSTANCES" => awsvpc,
+                "FARGATE" => awsvpc && self.cpu.is_some() && self.memory.is_some(),
+                // Every launch type is classified above by its own documented
+                // requirements, so one added to [`COMPATIBILITY_ORDER`] later has to be
+                // classified deliberately rather than inheriting a neighbour's rule.
+                _ => false,
+            })
+            .map(|launch_type| (*launch_type).to_string())
+            .collect()
+    }
+
+    /// The container-instance attributes a task of this revision requires —
+    /// `TaskDefinition$requiresAttributes`: "The container instance attributes required
+    /// by your task."
+    ///
+    /// DERIVED from the stored revision: every feature it declares that only a container
+    /// instance publishing a capability can serve contributes that capability's
+    /// attribute — the `awsvpc` network mode needs [`ATTRIBUTE_TASK_ENI`] (and with it
+    /// the Docker remote-API version that carries task networking), a `secrets` or
+    /// `secretOptions` reference needs the attribute of the secret store it names, an
+    /// S3 `environmentFiles` entry needs [`ATTRIBUTE_ENV_FILES_S3`], a privileged
+    /// container needs [`ATTRIBUTE_PRIVILEGED_CONTAINER`] and a named `logDriver` needs
+    /// that driver's attribute. The names are the Amazon ECS container-agent
+    /// capabilities, which is what an instance registers them as, so
+    /// `ListAttributes`/`DescribeContainerInstances` and this list speak the same
+    /// vocabulary.
+    ///
+    /// Reported deduplicated and sorted by name, so a revision reads back the same list
+    /// however its containers were ordered. A revision that declares no such feature
+    /// requires nothing and the member stays ABSENT (`None`) rather than reporting an
+    /// empty list.
+    pub fn requires_attributes(&self) -> Option<Vec<Attribute>> {
+        let mut names = Vec::new();
+        if self.network_mode == NETWORK_MODE_AWSVPC {
+            names.push(ATTRIBUTE_DOCKER_REMOTE_API_1_18.to_string());
+            names.push(ATTRIBUTE_TASK_ENI.to_string());
         }
-        if !awsvpc {
-            out.push("EXTERNAL".to_string());
+        for container in &self.container_definitions {
+            container_required_attributes(container, &mut names);
         }
-        out
+        names.sort();
+        names.dedup();
+        if names.is_empty() {
+            return None;
+        }
+        Some(
+            names
+                .into_iter()
+                .map(|name| Attribute {
+                    name,
+                    ..Attribute::default()
+                })
+                .collect(),
+        )
     }
 
     /// The `TaskDefinition` every task-definition operation returns, built from what is
@@ -622,12 +863,7 @@ impl TaskDefinitionRecord {
             revision: self.revision,
             volumes: Some(self.volumes.clone()),
             status: Some(self.status.clone()),
-            // `requiresAttributes` reports the container-instance attributes a task
-            // needs. They are derived from what the containers of the revision require
-            // (a Docker volume driver, a logging driver, an agent version), which this
-            // emulator does not infer, so there is no attribute set to report and it
-            // stays absent.
-            requires_attributes: None,
+            requires_attributes: self.requires_attributes(),
             placement_constraints: Some(self.placement_constraints.clone()),
             compatibilities: Some(self.compatibilities()),
             runtime_platform: self.runtime_platform.clone(),
@@ -641,7 +877,9 @@ impl TaskDefinitionRecord {
             registered_at: Some(self.registered_at),
             deregistered_at: self.deregistered_at,
             delete_requested_at: None,
-            registered_by: None,
+            // "The principal that registered the task definition", as it was resolved
+            // when the registration ran.
+            registered_by: Some(self.registered_by.clone()),
             ephemeral_storage: self.ephemeral_storage.clone(),
             enable_fault_injection: self.enable_fault_injection,
         }
@@ -1330,7 +1568,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 None
             },
             // "The principal that created the service": the principal of the request
-            // that created it, as stored.
+            // that created it, as stored — the same principal
+            // `TaskDefinition$registeredBy` names.
             created_by: Some(service.created_by.clone()),
             enable_ecs_managed_tags: service.enable_ecs_managed_tags,
             propagate_tags: Some(service.propagate_tags.clone()),
@@ -1902,6 +2141,23 @@ pub fn task_arn_from_reference(region: &str, cluster_name: &str, reference: &str
 /// The ARN of a cluster: `arn:aws:ecs:<region>:<account>:cluster/<name>`.
 pub fn cluster_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("cluster/{name}"))
+}
+
+/// The ARN of the identity every caller of this emulator authenticates as, and so the
+/// principal a "who did this" member names (`TaskDefinition$registeredBy`: "The
+/// principal that registered the task definition").
+///
+/// Every request this emulator serves is signed with the emulator's own credentials, so
+/// the caller is the one IAM user it publishes — the very principal its
+/// `sts:GetCallerIdentity` answers, built the same way, so the principal a response
+/// names is one the caller can look up.
+///
+/// Distinct from [`caller_principal`], which spells a per-request name out of the
+/// request's own access key id: a member AWS fills from the AUTHENTICATED IAM identity
+/// has to name an identity that identity service knows, and a name derived from an
+/// access key id is not one.
+pub fn caller_identity_arn() -> String {
+    ::engine::emulator_arn("iam", "", "user/emulator")
 }
 
 /// The ARN of a task-definition revision:

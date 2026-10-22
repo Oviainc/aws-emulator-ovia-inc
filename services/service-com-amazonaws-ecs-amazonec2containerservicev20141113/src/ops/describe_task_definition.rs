@@ -205,11 +205,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DescribeTaskDefinitionOutput {
             task_definition: Some(record.view()),
-            tags: if include_tags {
-                Some(record.tags.clone())
+            // `tags` is a list the response always MATERIALISES, so a client may index
+            // it unconditionally; `include` decides its CONTENT, not its presence ("If
+            // TAGS is specified, the tags are included in the response. If this field is
+            // omitted, tags aren't included in the response.").
+            tags: Some(if include_tags {
+                record.tags.clone()
             } else {
-                None
-            },
+                Vec::new()
+            }),
         })
     }
 }

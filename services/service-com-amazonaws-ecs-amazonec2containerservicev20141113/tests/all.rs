@@ -27,5 +27,7 @@ mod service_projection;
 mod state_roundtrip;
 #[path = "all/task_definition_projection.rs"]
 mod task_definition_projection;
+#[path = "all/task_definition_rendering.rs"]
+mod task_definition_rendering;
 #[path = "all/task_lifecycle.rs"]
 mod task_lifecycle;

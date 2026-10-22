@@ -190,8 +190,9 @@ use super::types::*;
 const DEFAULT_NETWORK_MODE: &str = "bridge";
 
 /// The network mode a Fargate task definition must declare. The same doc: "For Amazon
-/// ECS tasks on Fargate, the `awsvpc` network mode is required."
-const FARGATE_NETWORK_MODE: &str = "awsvpc";
+/// ECS tasks on Fargate, the `awsvpc` network mode is required." Spelled once, in
+/// [`crate::state::NETWORK_MODE_AWSVPC`], which the projection's own awsvpc rules read.
+const FARGATE_NETWORK_MODE: &str = crate::state::NETWORK_MODE_AWSVPC;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -405,6 +406,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // "If the network mode is set to none, you cannot specify port mappings in
+            // your container definitions, and the tasks containers do not have external
+            // connectivity."
+            if network_mode == crate::state::NETWORK_MODE_NONE
+                && definition
+                    .port_mappings
+                    .as_ref()
+                    .is_some_and(|mappings| !mappings.is_empty())
+            {
+                return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(format!(
+                            "Invalid setting for container '{name}': 'portMappings' \
+                             cannot be specified when 'networkMode' is '{}'",
+                            crate::state::NETWORK_MODE_NONE
+                        )),
+                    },
+                )
+                .into());
+            }
             // One pass, so the duplicate check costs the same as the rest of the loop.
             if !names.insert(name.clone()) {
                 return Err(RegisterTaskDefinitionErrorModeled::ClientException(
@@ -451,7 +472,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             family: input.family.clone(),
             revision,
             status: crate::state::TASK_DEFINITION_ACTIVE.to_string(),
-            container_definitions: input.container_definitions.clone(),
+            // The members ECS fills in at registration time (a port mapping's
+            // `hostPort` and `protocol`) are rendered ONCE, here, so the stored
+            // revision is what every later read reports.
+            container_definitions: crate::state::defaulted_container_definitions(
+                &input.container_definitions,
+                &network_mode,
+            ),
             network_mode,
             cpu: input.cpu.clone(),
             memory: input.memory.clone(),
@@ -467,6 +494,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             runtime_platform: input.runtime_platform.clone(),
             enable_fault_injection: input.enable_fault_injection,
             tags: input.tags.clone().unwrap_or_default(),
+            // "The principal that registered the task definition": resolved on the
+            // registering call and stored with the revision.
+            registered_by: crate::state::caller_identity_arn(),
             registered_at: crate::state::now(),
             deregistered_at: None,
         };
