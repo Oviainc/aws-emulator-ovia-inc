@@ -204,7 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let account_id = crate::state::calling_account_id();
 
-        {
+        // Merge and read back under ONE guard: a second acquisition could observe
+        // another caller's concurrent update, and then the body would describe
+        // state this request did not produce.
+        let stored = {
             // "Only the settings that you include in the request body are
             // modified. Omitted settings remain unchanged." At the typed boundary
             // an omitted member arrives as `None`, so `None` leaves the stored
@@ -221,13 +224,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(regions) = input.visible_regions {
                 record.visible_regions = Some(regions);
             }
-        }
-
-        // Answer from PERSISTED state, read back after the write, rather than from
-        // the input: the response is "the current ... after the update", which also
-        // carries settings this request did not mention. Re-applying the same
-        // request therefore yields the same state and the same body (`@idempotent`).
-        let stored = state.lock().customization(account_id);
+            // Answer from PERSISTED state, read back after the write, rather than
+            // from the input: the response is "the current ... after the update",
+            // which also carries settings this request did not mention. Re-applying
+            // the same request therefore yields the same state and the same body
+            // (`@idempotent`).
+            record.clone()
+        };
 
         Ok(UpdateAccountCustomizationsOutput {
             account_color: Some(
