@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RequestCertificate
-//! IMPLEMENTED: mints a certificate ARN, persists the certificate record (status
-//! `PENDING_VALIDATION`, type `AMAZON_ISSUED`) with one validation entry per domain
-//! name, and returns the ARN. An `IdempotencyToken` re-sent with the same request
-//! parameters resolves to the certificate already created for it.
+//! IMPLEMENTED: validates the request's `DomainValidationOptions` (each entry must
+//! name a domain the certificate covers, with a `ValidationDomain` equal to that
+//! domain or a superdomain of it), mints a certificate ARN, persists the certificate
+//! record (status `PENDING_VALIDATION`, type `AMAZON_ISSUED`) with one validation
+//! entry per domain name, and returns the ARN. An `IdempotencyToken` re-sent with the
+//! same request parameters resolves to the certificate already created for it.
 //!
 //! `PENDING_VALIDATION` is not where the certificate stays: the call records the
 //! validation outcome the clock owes it ([`crate::state::PendingValidation`]) and the
@@ -259,7 +261,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // `DomainValidationOptions` may only name domains the certificate covers.
+        // `DomainValidationOptions` may only name domains the certificate covers,
+        // each with a `ValidationDomain` that is that domain or a superdomain of it.
         let validation_domains = validation_domains(&input, &names)?;
 
         let tags = crate::state::tag_map(input.tags.as_deref().unwrap_or_default()).map_err(
@@ -353,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &certificate_id,
                     name,
                     &validation_method,
-                    validation_domains.get(name.as_str()).copied(),
+                    validation_domains.get(name.as_str()).map(String::as_str),
                 )
             })
             .collect();
@@ -438,16 +441,32 @@ const CERTIFICATE_LIMIT: usize = 2_500;
 
 /// `DomainValidationOptions` as a `domain name -> validation domain` lookup.
 ///
-/// Every entry must name a domain the certificate covers; one that does not is
-/// `InvalidDomainValidationOptionsException`, the error this operation models for "one
-/// or more values in the DomainValidationOption structure is incorrect".
-fn validation_domains<'a>(
-    input: &'a RequestCertificateInput,
+/// Two things make an entry incorrect, and either is
+/// `InvalidDomainValidationOptionsException` — the error this operation models for
+/// "one or more values in the DomainValidationOption structure is incorrect":
+///
+/// * its `DomainName` is not a domain the certificate covers, so there is nothing for
+///   the entry to configure;
+/// * its `ValidationDomain` is neither that domain nor a superdomain of it, which is
+///   the rule `DomainValidationOption$ValidationDomain` states ("This must be the same
+///   as the `DomainName` value or a superdomain of the `DomainName` value") — ACM mails
+///   the validation addresses at that suffix, so a domain outside the requested one's
+///   own chain proves nothing about it. [`crate::state::is_validation_domain_for`]
+///   decides it.
+///
+/// The lookup is keyed by the covered name as the certificate holds it, so the
+/// per-domain validation records find their validation domain however the request
+/// cased the entry.
+fn validation_domains(
+    input: &RequestCertificateInput,
     names: &[String],
-) -> Result<std::collections::HashMap<&'a str, &'a str>, RequestCertificateError> {
+) -> Result<std::collections::HashMap<String, String>, RequestCertificateError> {
     let mut mapped = std::collections::HashMap::new();
     for option in input.domain_validation_options.iter().flatten() {
-        if !names.iter().any(|name| name == &option.domain_name) {
+        let Some(covered) = names
+            .iter()
+            .find(|name| crate::state::same_domain(name, &option.domain_name))
+        else {
             return Err(
                 RequestCertificateErrorModeled::InvalidDomainValidationOptionsException(
                     InvalidDomainValidationOptionsException {
@@ -459,11 +478,21 @@ fn validation_domains<'a>(
                 )
                 .into(),
             );
+        };
+        if !crate::state::is_validation_domain_for(&option.validation_domain, &option.domain_name) {
+            return Err(
+                RequestCertificateErrorModeled::InvalidDomainValidationOptionsException(
+                    InvalidDomainValidationOptionsException {
+                        message: Some(format!(
+                            "The validation domain, {}, must be a superdomain of the requested domain, {}.",
+                            option.validation_domain, option.domain_name
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
-        mapped.insert(
-            option.domain_name.as_str(),
-            option.validation_domain.as_str(),
-        );
+        mapped.insert(covered.clone(), option.validation_domain.clone());
     }
     Ok(mapped)
 }
@@ -513,7 +542,13 @@ fn domain_validation_record(
         }
         // EMAIL, and the default when the request named no method.
         _ => {
-            let mailed = validation_domain.unwrap_or(target);
+            // The validation domain is the SUFFIX of the mailboxes ACM writes to, and
+            // a mail suffix carries no wildcard label: a request that validates
+            // `*.example.com` through itself is mailed at `example.com`, the domain
+            // ACM proves control of.
+            let mailed = validation_domain
+                .map(crate::state::validation_target)
+                .unwrap_or(target);
             record.validation_domain = Some(mailed.to_string());
             record.validation_emails = crate::state::VALIDATION_EMAIL_LOCAL_PARTS
                 .iter()
@@ -534,7 +569,7 @@ struct DerivedRequest<'a> {
     validation_method: &'a str,
     key_algorithm: &'a str,
     tags: &'a std::collections::BTreeMap<String, String>,
-    validation_domains: &'a std::collections::HashMap<&'a str, &'a str>,
+    validation_domains: &'a std::collections::HashMap<String, String>,
 }
 
 /// The idempotency index key for a request: the caller's token plus a fingerprint of
@@ -587,7 +622,7 @@ fn idempotency_key(
     let mut domains: Vec<(&str, &str)> = derived
         .validation_domains
         .iter()
-        .map(|(domain, validation_domain)| (*domain, *validation_domain))
+        .map(|(domain, validation_domain)| (domain.as_str(), validation_domain.as_str()))
         .collect();
     domains.sort_unstable();
 
