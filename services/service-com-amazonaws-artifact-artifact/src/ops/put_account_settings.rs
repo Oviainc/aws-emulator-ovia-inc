@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAccountSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAccountSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Writes the account's Artifact settings: the desired notification subscription status
+//! replaces the stored one and the updated `AccountSettings` record is returned, so a
+//! later `GetAccountSettings` reports exactly what this call persisted.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAccountSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation is `@idempotent` in the model, and this handler keeps it so: writing the
+//! same status twice leaves the same record. A status outside the values
+//! `NotificationSubscriptionStatus` declares never reaches the store: this service is
+//! served through the gateway modelled in [`crate::service`], which judges this
+//! operation's BODY and answers HTTP 400 `BadRequestException` for one it cannot bind to
+//! the modelled shape, before the handler runs (`tests/all/front_door_errors.rs` pins
+//! that rule, and `tests/all/account_settings.rs` pins that nothing is persisted by such
+//! a request). `notificationSubscriptionStatus` is NOT modelled `@required`, so a request
+//! that names no desired status asks for no change: the stored record is reported
+//! unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +157,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAccountSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAccountSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAccountSettings"))
+        // The settings record is account-wide, so nothing in the request metadata shapes
+        // it; the request's credential scope is read only to ATTRIBUTE the change below.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // A state-changing call that changed nothing is still attributable, so the
+            // failure path records its outcome rather than passing silently.
+            ::tracing::info!(
+                target: "emulator::audit",
+                operation = "PutAccountSettings",
+                akid = %akid,
+                region = %region,
+                outcome = "unavailable",
+                "state-changing operation"
+            );
+            return Err(PutAccountSettingsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact account settings store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The desired status is a modelled enum member, so the boundary validator has
+        // already refused anything outside `NotificationSubscriptionStatus`: reaching here
+        // means the value, when present, is one the store may hold.
+        let account_settings = {
+            let mut store = state.lock();
+            if let Some(requested) = input.notification_subscription_status.as_deref() {
+                store
+                    .account_settings
+                    .set_notification_subscription_status(requested);
+            }
+            store.account_settings.to_settings()
+        };
+
+        // The settings change is attributable: the access key id the caller presented (a
+        // public identifier, never a secret), the scope's region, what the account's
+        // status now is, and whether this call changed it. No credential material and
+        // nothing the request did not send.
+        ::tracing::info!(
+            target: "emulator::audit",
+            operation = "PutAccountSettings",
+            akid = %akid,
+            region = %region,
+            notification_subscription_status = %account_settings
+                .notification_subscription_status
+                .as_deref()
+                .unwrap_or_default(),
+            changed = input.notification_subscription_status.is_some(),
+            outcome = "recorded",
+            "state-changing operation"
+        );
+
+        Ok(PutAccountSettingsOutput {
+            account_settings: Some(account_settings),
+        })
     }
 }
