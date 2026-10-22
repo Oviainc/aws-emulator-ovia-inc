@@ -7,12 +7,13 @@
 //! dispatched by the real `MultiServiceRouter`. Nothing here reaches into the store
 //! directly, so a response that is not computed from persisted state cannot pass.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_fsx_awssimbaapiservice_v20180301::state::{
-    MAX_FILE_SYSTEMS, MAX_ROUTE_TABLE_IDS,
+    region_subnets, SubnetRecord, MAX_FILE_SYSTEMS, MAX_ROUTE_TABLE_IDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -29,11 +30,40 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Longer than the service's own clock-owed transition span, so a transition that was due
 /// has certainly fallen due by the next call.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
-/// A subnet id matching the modelled `SubnetId` pattern `^(subnet-[0-9a-f]{8,})$`.
-pub(crate) const SUBNET_A: &str = "subnet-0123456789abcdef0";
-const SUBNET_B: &str = "subnet-00112233445566778";
+/// The subnets the account's network has in [`REGION`], which is what `CreateFileSystem`
+/// resolves `SubnetIds` against (the service's own `state::region_subnets`). A create
+/// below places its file system in these, because a subnet the account does not have is
+/// refused.
+pub(crate) static ACCOUNT_SUBNETS: LazyLock<Vec<SubnetRecord>> =
+    LazyLock::new(|| region_subnets(REGION));
+
+/// The first subnet of the account's network in [`REGION`].
+pub(crate) fn subnet_a() -> &'static str {
+    ACCOUNT_SUBNETS[0].subnet_id.as_str()
+}
+
+/// The second subnet of the account's network in [`REGION`], in another Availability Zone.
+pub(crate) fn subnet_b() -> &'static str {
+    ACCOUNT_SUBNETS[1].subnet_id.as_str()
+}
+
+/// `body` with a fresh `ClientRequestToken` stamped on it when it carries none.
+///
+/// `CreateFileSystem` requires the token ("This operation requires a client request token
+/// in the request that Amazon FSx uses to ensure idempotent creation"), and every case
+/// below that is not ABOUT the token wants one create per call, so each gets its own
+/// token rather than repeating the requirement at every call site.
+pub(crate) fn with_client_request_token(body: &Value) -> Value {
+    static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
+    let mut body = body.clone();
+    if body.get("ClientRequestToken").is_none() {
+        let serial = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        body["ClientRequestToken"] = json!(format!("case-token-{serial}"));
+    }
+    body
+}
 
 /// One emulator over one shared engine, with the service mounted the way the router mounts
 /// it in production.
@@ -92,7 +122,11 @@ pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Valu
 }
 
 /// Dispatch one operation, requiring a failure, and return `(status, error code)`.
-async fn failure(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, String) {
+pub(crate) async fn failure(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, String) {
     let (status, parsed) = call(router, operation, body).await;
     assert_ne!(
         status, 200,
@@ -200,14 +234,15 @@ async fn settled_lifecycle(router: &MultiServiceRouter, id: &str) -> String {
         .to_string()
 }
 
-/// A create request for one row of the type table.
+/// A create request for one row of the type table, carrying the required
+/// `ClientRequestToken`.
 fn create_request(file_system_type: &str, storage_type: &str, subnets: &[&str]) -> Value {
-    json!({
+    with_client_request_token(&json!({
         "FileSystemType": file_system_type,
         "StorageCapacity": 1200,
         "StorageType": storage_type,
         "SubnetIds": subnets,
-    })
+    }))
 }
 
 /// RULE: a created file system is persisted, and the response is that stored record, so a
@@ -221,12 +256,12 @@ async fn create_persists_every_file_system_type_and_describe_reports_it_back() {
     // (FileSystemType, StorageType) from the modelled `FileSystemType` /
     // `StorageType` enums, plus one and two subnets.
     let cases: &[(&str, &str, &[&str])] = &[
-        ("WINDOWS", "SSD", &[SUBNET_A]),
-        ("WINDOWS", "HDD", &[SUBNET_A, SUBNET_B]),
-        ("LUSTRE", "SSD", &[SUBNET_A]),
-        ("LUSTRE", "INTELLIGENT_TIERING", &[SUBNET_A]),
-        ("ONTAP", "SSD", &[SUBNET_A, SUBNET_B]),
-        ("OPENZFS", "INTELLIGENT_TIERING", &[SUBNET_A]),
+        ("WINDOWS", "SSD", &[subnet_a()]),
+        ("WINDOWS", "HDD", &[subnet_a(), subnet_b()]),
+        ("LUSTRE", "SSD", &[subnet_a()]),
+        ("LUSTRE", "INTELLIGENT_TIERING", &[subnet_a()]),
+        ("ONTAP", "SSD", &[subnet_a(), subnet_b()]),
+        ("OPENZFS", "INTELLIGENT_TIERING", &[subnet_a()]),
     ];
 
     let mut minted: Vec<String> = Vec::new();
@@ -362,7 +397,7 @@ async fn documented_defaults_are_applied_only_where_the_request_is_silent() {
         let (storage_type, network_type, expected_storage, expected_network) = *case;
         let mut request = json!({
             "FileSystemType": "WINDOWS",
-            "SubnetIds": [SUBNET_A],
+            "SubnetIds": [subnet_a()],
             "StorageCapacity": 32,
         });
         if let Some(storage_type) = storage_type {
@@ -372,7 +407,7 @@ async fn documented_defaults_are_applied_only_where_the_request_is_silent() {
             request["NetworkType"] = json!(network_type);
         }
 
-        let created = ok(&router, "CreateFileSystem", &request).await;
+        let created = ok(&router, "CreateFileSystem", &with_client_request_token(&request)).await;
         let id = created["FileSystem"]["FileSystemId"]
             .as_str()
             .unwrap_or_default()
@@ -440,7 +475,7 @@ async fn lustre_file_system_type_version_takes_its_documented_default() {
         let (file_system_type, deployment_type, metadata_mode, requested, expected) = *case;
         let mut request = json!({
             "FileSystemType": file_system_type,
-            "SubnetIds": [SUBNET_A],
+            "SubnetIds": [subnet_a()],
             "StorageCapacity": 1200,
         });
         if let Some(requested) = requested {
@@ -457,7 +492,7 @@ async fn lustre_file_system_type_version_takes_its_documented_default() {
             request["LustreConfiguration"] = lustre;
         }
 
-        let created = ok(&router, "CreateFileSystem", &request).await;
+        let created = ok(&router, "CreateFileSystem", &with_client_request_token(&request)).await;
         let id = created["FileSystem"]["FileSystemId"]
             .as_str()
             .unwrap_or_default()
@@ -481,12 +516,13 @@ async fn per_type_configuration_round_trips_without_echoing_secrets() {
         "CreateFileSystem",
         &json!({
             "FileSystemType": "WINDOWS",
-            "SubnetIds": [SUBNET_A, SUBNET_B],
+            "ClientRequestToken": "per-type-configuration",
+            "SubnetIds": [subnet_a(), subnet_b()],
             "StorageCapacity": 64,
             "WindowsConfiguration": {
                 "ThroughputCapacity": 32,
                 "DeploymentType": "MULTI_AZ_1",
-                "PreferredSubnetId": SUBNET_B,
+                "PreferredSubnetId": subnet_b(),
                 "WeeklyMaintenanceStartTime": "1:05:00",
                 "DailyAutomaticBackupStartTime": "03:00",
                 "AutomaticBackupRetentionDays": 7,
@@ -511,7 +547,7 @@ async fn per_type_configuration_round_trips_without_echoing_secrets() {
     for (member, expected) in [
         ("ThroughputCapacity", json!(32)),
         ("DeploymentType", json!("MULTI_AZ_1")),
-        ("PreferredSubnetId", json!(SUBNET_B)),
+        ("PreferredSubnetId", json!(subnet_b())),
         ("WeeklyMaintenanceStartTime", json!("1:05:00")),
         ("DailyAutomaticBackupStartTime", json!("03:00")),
         ("AutomaticBackupRetentionDays", json!(7)),
@@ -580,7 +616,8 @@ async fn update_mutates_the_stored_record_member_by_member() {
         "CreateFileSystem",
         &json!({
             "FileSystemType": "LUSTRE",
-            "SubnetIds": [SUBNET_A],
+            "ClientRequestToken": "update-member-by-member",
+            "SubnetIds": [subnet_a()],
             "StorageCapacity": 1200,
             "StorageType": "SSD",
             "FileSystemTypeVersion": "2.12",
@@ -665,7 +702,8 @@ async fn lifecycle_transitions_fall_due_after_the_call_that_starts_them() {
         "CreateFileSystem",
         &json!({
             "FileSystemType": "OPENZFS",
-            "SubnetIds": [SUBNET_A],
+            "ClientRequestToken": "lifecycle-transitions",
+            "SubnetIds": [subnet_a()],
             "StorageCapacity": 64,
         }),
     )
@@ -797,7 +835,8 @@ async fn describe_selects_by_id_and_pages_at_max_results() {
             "CreateFileSystem",
             &json!({
                 "FileSystemType": "WINDOWS",
-                "SubnetIds": [SUBNET_A],
+                "ClientRequestToken": format!("paging-{index}"),
+                "SubnetIds": [subnet_a()],
                 "StorageCapacity": 32 + index,
             }),
         )
@@ -1022,7 +1061,8 @@ async fn tags_are_stored_once_and_read_back_everywhere() {
         "CreateFileSystem",
         &json!({
             "FileSystemType": "WINDOWS",
-            "SubnetIds": [SUBNET_A],
+            "ClientRequestToken": "tagging",
+            "SubnetIds": [subnet_a()],
             "StorageCapacity": 32,
             "Tags": [{ "Key": "env", "Value": "dev" }],
         }),
@@ -1291,7 +1331,7 @@ async fn create_replays_one_client_request_token_to_one_file_system() {
     let router = emulator();
     let base = json!({
         "FileSystemType": "WINDOWS",
-        "SubnetIds": [SUBNET_A],
+        "SubnetIds": [subnet_a()],
         "StorageCapacity": 32,
         "StorageType": "SSD",
         "Tags": [
@@ -1327,7 +1367,7 @@ async fn create_replays_one_client_request_token_to_one_file_system() {
     let conflicts: &[(&str, Value)] = &[
         ("StorageCapacity", json!(64)),
         ("StorageType", json!("HDD")),
-        ("SubnetIds", json!([SUBNET_B])),
+        ("SubnetIds", json!([subnet_b()])),
         ("FileSystemType", json!("LUSTRE")),
         ("Tags", json!([{ "Key": "env", "Value": "prod" }])),
         ("NetworkType", json!("DUAL")),
@@ -1336,7 +1376,12 @@ async fn create_replays_one_client_request_token_to_one_file_system() {
         let (member, value) = case;
         let mut request = base.clone();
         request[*member] = value.clone();
-        let (status, code) = failure(&router, "CreateFileSystem", &request).await;
+        let (status, code) = failure(
+            &router,
+            "CreateFileSystem",
+            &with_client_request_token(&request),
+        )
+        .await;
         assert_eq!(
             (status, code.as_str()),
             (400, "IncompatibleParameterError"),
@@ -1400,13 +1445,13 @@ async fn create_is_refused_once_the_file_system_count_limit_is_reached() {
     let router = emulator();
     let request = json!({
         "FileSystemType": "WINDOWS",
-        "SubnetIds": [SUBNET_A],
+        "SubnetIds": [subnet_a()],
         "StorageCapacity": 32,
     });
 
     let mut ids: Vec<String> = Vec::new();
     for index in 0..MAX_FILE_SYSTEMS {
-        let created = ok(&router, "CreateFileSystem", &request).await;
+        let created = ok(&router, "CreateFileSystem", &with_client_request_token(&request)).await;
         let id = created["FileSystem"]["FileSystemId"]
             .as_str()
             .unwrap_or_default()
@@ -1418,7 +1463,12 @@ async fn create_is_refused_once_the_file_system_count_limit_is_reached() {
         ids.push(id);
     }
 
-    let (status, code) = failure(&router, "CreateFileSystem", &request).await;
+    let (status, code) = failure(
+        &router,
+        "CreateFileSystem",
+        &with_client_request_token(&request),
+    )
+    .await;
     assert_eq!(
         (status, code.as_str()),
         (400, "ServiceLimitExceeded"),
@@ -1439,13 +1489,18 @@ async fn create_is_refused_once_the_file_system_count_limit_is_reached() {
     )
     .await;
     tokio::time::sleep(PAST_TRANSITION).await;
-    let replacement = ok(&router, "CreateFileSystem", &request).await;
+    let replacement = ok(&router, "CreateFileSystem", &with_client_request_token(&request)).await;
     assert!(
         replacement["FileSystem"]["FileSystemId"].is_string(),
         "case make room: expected a create to succeed once a file system was removed, got \
          {replacement}"
     );
-    let (status, code) = failure(&router, "CreateFileSystem", &request).await;
+    let (status, code) = failure(
+        &router,
+        "CreateFileSystem",
+        &with_client_request_token(&request),
+    )
+    .await;
     assert_eq!(
         (status, code.as_str()),
         (400, "ServiceLimitExceeded"),
@@ -1464,7 +1519,8 @@ async fn route_table_ids_merge_as_a_bounded_set() {
         "CreateFileSystem",
         &json!({
             "FileSystemType": "ONTAP",
-            "SubnetIds": [SUBNET_A],
+            "ClientRequestToken": "route-table-merge",
+            "SubnetIds": [subnet_a()],
             "StorageCapacity": 1024,
             "OntapConfiguration": {
                 "DeploymentType": "SINGLE_AZ_1",
@@ -1592,7 +1648,8 @@ async fn create_without_a_subnet_is_refused() {
         json!({ "FileSystemType": "ONTAP", "SubnetIds": [], "StorageType": "SSD" }),
     ];
     for case in cases {
-        let (status, code) = failure(&router, "CreateFileSystem", case).await;
+        let (status, code) =
+            failure(&router, "CreateFileSystem", &with_client_request_token(case)).await;
         assert_eq!(
             (status, code.as_str()),
             (400, "InvalidNetworkSettings"),
