@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = input
             .request_id
             .as_deref()
-            .and_then(|token| state.event_bridge_rule_template_group_for_token(token))
+            .and_then(|token| state.event_bridge_rule_template_group_for_token(&region, token))
             .map(str::to_string)
         {
             let group = state
@@ -237,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut group = crate::state::new_event_bridge_rule_template_group(
             id.clone(),
             arn,
-            region,
+            region.clone(),
             input.name,
             now,
         );
@@ -249,10 +249,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state
             .event_bridge_rule_template_groups
             .insert(id.clone(), group);
-        if let Some(token) = input.request_id {
-            // Bounded, evicting write: a caller-chosen token can neither
-            // accumulate past the cap nor outlive the group it created.
-            state.record_event_bridge_rule_template_group_token(token, &id);
+        if let Some(token) = input.request_id.as_deref() {
+            // Bounded, evicting write, keyed by the region the token was
+            // presented in: a caller-chosen token can neither accumulate past
+            // the cap nor outlive the group it created, and two regions using one
+            // token do not overwrite each other.
+            state.record_event_bridge_rule_template_group_token(&region, token, &id);
         }
 
         let group = state

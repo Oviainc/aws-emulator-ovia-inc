@@ -30,7 +30,7 @@ use smithy_server_runtime::MultiServiceRouter;
 const TARGET_PREFIX: &str = "ServiceQuotasV20190624.";
 
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The history listing, whose name is too long to repeat in every row.
 const HISTORY: &str = "ListRequestedServiceQuotaChangeHistoryByQuota";
@@ -40,18 +40,18 @@ const HISTORY: &str = "ListRequestedServiceQuotaChangeHistoryByQuota";
 const PAST_DECISION: Duration = Duration::from_millis(1_200);
 
 /// A caller pointed at one regional endpoint of one emulator.
-struct Client {
+pub(crate) struct Client {
     router: MultiServiceRouter,
     region: String,
 }
 
 /// The ONE shared engine, exactly as the router builds it.
-fn emulator() -> Arc<engine::InMemoryEngine> {
+pub(crate) fn emulator() -> Arc<engine::InMemoryEngine> {
     Arc::new(engine::InMemoryEngine::new())
 }
 
 /// A caller for `region`, serving out of `engine`.
-fn client(engine: &Arc<engine::InMemoryEngine>, region: &str) -> Client {
+pub(crate) fn client(engine: &Arc<engine::InMemoryEngine>, region: &str) -> Client {
     let mut router = MultiServiceRouter::new();
     // These tests sign nothing, so they must not be refused for it.
     router.set_request_authentication(false);
@@ -68,7 +68,7 @@ fn client(engine: &Arc<engine::InMemoryEngine>, region: &str) -> Client {
 
 impl Client {
     /// Dispatch one awsJson1_1 call and return its status and parsed body.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = ::http::Request::builder()
             .method("POST")
             .uri("/")
@@ -97,7 +97,7 @@ impl Client {
     }
 
     /// Dispatch a call that must succeed, and return its body.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let (status, parsed) = self.call(operation, &body).await;
         assert_eq!(
             status, 200,
@@ -107,7 +107,7 @@ impl Client {
     }
 
     /// Dispatch a call that must be refused, and return its status and error code.
-    async fn refused(&self, operation: &str, body: Value) -> (u16, String) {
+    pub(crate) async fn refused(&self, operation: &str, body: Value) -> (u16, String) {
         let (status, parsed) = self.call(operation, &body).await;
         let code = parsed
             .get("__type")
@@ -122,7 +122,7 @@ impl Client {
 ///
 /// Asserts the page-size contract on the way: no page exceeds `MaxResults`, and the
 /// walk stops because a page came back without a `NextToken`.
-async fn walk_pages(
+pub(crate) async fn walk_pages(
     client: &Client,
     operation: &str,
     base: &Value,
@@ -133,7 +133,9 @@ async fn walk_pages(
     let mut token: Option<String> = None;
 
     // Bounded so a listing that never reports its last page fails instead of hanging.
-    for _ in 0..64 {
+    // The ceiling clears the longest listing (the service catalog, a few hundred
+    // entries) walked ONE item at a time, with headroom.
+    for _ in 0..2_048 {
         let mut body = base.clone();
         if let Some(size) = page_size {
             body["MaxResults"] = json!(size);
@@ -211,17 +213,31 @@ async fn a_listing_pages_the_same_items_whatever_the_page_size() {
         }
     }
 
-    // The catalog itself: the seeded services, in ServiceCode order.
+    // The catalog itself: the seeded services, in ServiceCode order, with no
+    // duplicates. The membership is asserted in tests/all/default_quota_catalog.rs;
+    // what this pins is that PAGING the catalog yields it once, in order.
     let services = walk_pages(&client, "ListServices", &json!({}), "Services", Some(2)).await;
     let codes: Vec<&str> = services
         .iter()
         .map(|service| service["ServiceCode"].as_str().unwrap_or_default())
         .collect();
+    let mut sorted = codes.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
     assert_eq!(
-        codes,
-        ["dynamodb", "ec2", "lambda", "s3", "vpc"],
-        "case ListServices: expected the seeded catalog in ServiceCode order, got {codes:?}"
+        codes, sorted,
+        "case ListServices: expected the catalog in ServiceCode order with no repeats, got \
+         {codes:?}"
     );
+    // Every service with a seeded quota set must be IN the catalog it is listed from.
+    for seeded in ["dynamodb", "ec2", "lambda", "s3", "vpc"] {
+        assert!(
+            codes.contains(&seeded),
+            "case ListServices: {seeded} has seeded quotas, so the catalog must list it, got \
+             {} entries",
+            codes.len()
+        );
+    }
     for service in &services {
         assert!(
             service["ServiceName"]
@@ -269,10 +285,6 @@ async fn a_single_quota_read_matches_the_entry_the_listing_returned() {
             None,
         )
         .await;
-        assert!(
-            !listed.is_empty(),
-            "case {service_code}: expected at least one applied quota, got {listed:?}"
-        );
 
         for quota in &listed {
             let quota_code = quota["QuotaCode"]
@@ -308,13 +320,21 @@ async fn a_single_quota_read_matches_the_entry_the_listing_returned() {
             );
 
             let default = client.ok("GetAWSDefaultServiceQuota", pair.clone()).await;
-            for member in ["QuotaName", "QuotaCode", "ServiceCode", "QuotaArn", "Unit"] {
+            for member in ["QuotaName", "QuotaCode", "ServiceCode", "Unit"] {
                 assert_eq!(
                     default["Quota"][member], quota[member],
                     "case {case}: the default and the applied quota must agree on {member}, got \
                      {default} and {quota}"
                 );
             }
+            // The ONE member they must NOT agree on: an AWS default is published by
+            // the service and owned by no account, so its ARN's account segment is
+            // empty, while the applied quota's names the account.
+            assert_eq!(
+                default["Quota"]["QuotaArn"].as_str(),
+                Some(format!("arn:aws:servicequotas:{region}::{case}").as_str()),
+                "case {case}: an AWS default quota's ARN carries no account, got {default}"
+            );
             assert_eq!(
                 default["Quota"]["Value"], quota["Value"],
                 "case {case}: with nothing applied the two values must agree, got {default}"

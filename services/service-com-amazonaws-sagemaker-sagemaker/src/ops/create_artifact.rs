@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateArtifact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateArtifact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateArtifact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a lineage artifact in `crate::state` under the `ArtifactArn` it
+//! mints from the request's Region, keeping `Source`, `ArtifactType`, `Properties`,
+//! `MetadataProperties` and `Tags` exactly as given, and refuses an `ArtifactName`
+//! already in use in that Region. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +144,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateArtifact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateArtifactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateArtifact"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // A lineage-entity property VALUE must carry at least one character. The model's
+        // `ArtifactPropertyValue` states `len 0..4096`, so the boundary validator lets an
+        // empty value through and the service's own minimum is enforced here, in the
+        // wording the boundary validator uses for a map-value constraint.
+        if let Some(properties) = &input.properties {
+            if properties.values().any(String::is_empty) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "1 validation error detected: Value '' at 'properties' failed to satisfy \
+                     constraint: Map value must satisfy constraint: [Member must have length \
+                     greater than or equal to 1, Member must have length less than or equal \
+                     to 4096]",
+                ));
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The store is bounded, so a caller cannot grow it without end; a create past the
+        // bound answers the limit failure this operation models.
+        if !store.artifacts_below_quota() {
+            return Err(CreateArtifactErrorModeled::ResourceLimitExceeded(ResourceLimitExceeded {
+                message: Some(format!(
+                    "The account-level service limit for artifacts is {}, with current \
+                     utilization of {} and a request delta of 1.",
+                    crate::state::ARTIFACT_QUOTA,
+                    store.artifacts.len()
+                )),
+            })
+            .into());
+        }
+        // `ArtifactName` is documented unique to an account in a Region, so a name already
+        // taken is refused rather than minting a second artifact answering to it.
+        if let Some(name) = &input.artifact_name {
+            if let Some(existing) = store.artifact_named(&region, name) {
+                let existing_arn = existing.arn.clone();
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "The artifact name \"{name}\" is already in use by \"{existing_arn}\"."
+                )));
+            }
+        }
+
+        // The id is the server's: a lineage entity is named by its ARN and the request
+        // carries no identifier to derive one from.
+        let arn =
+            crate::state::resource_arn(&region, "artifact", &crate::state::mint_lineage_entity_id());
+        // The minted id is unique within the run by construction, so the key is free;
+        // asserted rather than assumed, so an id-space defect fails a test run loudly
+        // instead of replacing a stored artifact in silence.
+        debug_assert!(
+            !store.artifacts.contains_key(&arn),
+            "a freshly minted artifact ARN must not already be in the store"
+        );
+
+        store.artifacts.insert(
+            arn.clone(),
+            crate::state::Artifact {
+                arn: arn.clone(),
+                region,
+                name: input.artifact_name,
+                artifact_type: input.artifact_type,
+                source: input.source,
+                // An absent map stays absent and an empty one stays empty: the two are
+                // distinguishable on the wire, so the store keeps them distinct.
+                properties: input
+                    .properties
+                    .map(|properties| properties.into_iter().collect()),
+                metadata_properties: input.metadata_properties,
+                tags: input.tags.unwrap_or_default(),
+                creation_time: now,
+                last_modified_time: now,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateArtifactOutput {
+            artifact_arn: Some(arn),
+        })
     }
 }

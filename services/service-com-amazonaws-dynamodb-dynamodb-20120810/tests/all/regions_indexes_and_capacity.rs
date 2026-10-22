@@ -30,6 +30,9 @@ use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{
 use service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+// The refusal-code reader is the harness's, so there is one implementation of it.
+use crate::emulator::error_code;
+
 /// The regions these tests span. `CreateTable`'s uniqueness scope is the region, so the
 /// rows differ in nothing but the region they are signed for.
 const REGIONS: [&str; 4] = ["us-east-1", "us-west-2", "eu-central-1", "ap-southeast-2"];
@@ -85,17 +88,6 @@ async fn ok(router: &MultiServiceRouter, region: &str, operation: &str, body: Va
         "case {region} {operation} {body}: expected HTTP 200, got {status} with {parsed}"
     );
     parsed
-}
-
-/// The wire error code (`__type`) of a refusal.
-fn error_code(body: &Value) -> String {
-    body.get("__type")
-        .and_then(Value::as_str)
-        .unwrap_or("<no __type>")
-        .rsplit(['#', '/'])
-        .next()
-        .unwrap_or("<no __type>")
-        .to_string()
 }
 
 /// Wait out a transient status and report the table, which must now be `ACTIVE`.

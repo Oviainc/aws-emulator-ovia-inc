@@ -2,14 +2,15 @@
 
 //! Engine state for the com-amazonaws-rds-amazonrdsv19 service.
 //!
-//! The DB instance, DB snapshot and option group records the implemented handlers
-//! read and write, plus the projection of a stored record onto the modelled
-//! `DBInstance` / `DBSnapshot` / `OptionGroup` wire shapes. These live here rather
-//! than in one operation file because every implemented operation shares them:
-//! `CreateDBInstance`, `DescribeDBInstances`, `ModifyDBInstance`,
-//! `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBInstance`,
-//! `CreateOptionGroup`, `ModifyOptionGroup` and `DescribeOptionGroups` all project the
-//! same records.
+//! The DB instance, DB snapshot, option group and DB subnet group records the
+//! implemented handlers read and write, plus the projection of a stored record onto
+//! the modelled `DBInstance` / `DBSnapshot` / `OptionGroup` / `DBSubnetGroup` wire
+//! shapes. These live here rather than in one operation file because every implemented
+//! operation shares them: `CreateDBInstance`, `DescribeDBInstances`,
+//! `ModifyDBInstance`, `CreateDBSnapshot`, `DescribeDBSnapshots`, `DeleteDBInstance`,
+//! `CreateOptionGroup`, `ModifyOptionGroup`, `DescribeOptionGroups`,
+//! `DeleteOptionGroup`, `CreateDBSubnetGroup` and `DescribeDBSubnetGroups` all project
+//! the same records.
 //!
 //! RDS is a REGIONAL service, so every map is keyed by `(region, identifier)`: the
 //! region a request is signed for scopes what it can see and create, one identifier
@@ -23,10 +24,11 @@
 //! bytes), [`MAX_REGIONS`] caps how many distinct regions hold records at all, and the
 //! per-region quotas cap the records in each. The store therefore holds at most
 //! `MAX_REGIONS * DB_INSTANCE_QUOTA_PER_REGION` instances,
-//! `MAX_REGIONS * DB_SNAPSHOT_QUOTA_PER_REGION` snapshots and
-//! `MAX_REGIONS * OPTION_GROUP_QUOTA_PER_REGION` option groups, whatever sequence of
-//! requests arrives, and every per-request scan reads one region's ordered range
-//! rather than the whole map.
+//! `MAX_REGIONS * DB_SNAPSHOT_QUOTA_PER_REGION` snapshots,
+//! `MAX_REGIONS * OPTION_GROUP_QUOTA_PER_REGION` option groups and
+//! `MAX_REGIONS * DB_SUBNET_GROUP_QUOTA_PER_REGION` DB subnet groups, whatever
+//! sequence of requests arrives, and every per-request scan reads one region's ordered
+//! range rather than the whole map.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
@@ -35,7 +37,7 @@ use crate::ops::types::{
     Certificate, CertificateDetails, DBInstance, DBParameterGroupStatus, DBSecurityGroupMembership,
     DBSnapshot, DBSubnetGroup, DomainMembership, Endpoint, EventCategoriesMap, EventSubscription,
     GlobalCluster, GlobalClusterMember, Option2, OptionGroup, OptionGroupMembership, OptionSetting,
-    PendingModifiedValues, Tag, VpcSecurityGroupMembership,
+    PendingModifiedValues, Subnet, Tag, VpcSecurityGroupMembership,
 };
 
 pub mod option_catalog;
@@ -79,6 +81,18 @@ pub const DB_SNAPSHOT_QUOTA_PER_REGION: usize = 100;
 /// account and Region; this store is keyed by region, so it is enforced per region.
 pub const OPTION_GROUP_QUOTA_PER_REGION: usize = 20;
 
+/// How many DB subnet groups one region may hold: Amazon RDS's published default quota
+/// ("DB subnet groups": 50 per Region). Reaching it is the modelled
+/// `DBSubnetGroupQuotaExceededFault` — "The request would result in the user exceeding
+/// the allowed number of DB subnet groups".
+pub const DB_SUBNET_GROUP_QUOTA_PER_REGION: usize = 50;
+
+/// How many subnets ONE DB subnet group may name: Amazon RDS's published default quota
+/// ("Subnets per DB subnet group": 20). Reaching it is the modelled
+/// `DBSubnetQuotaExceededFault` — "The request would result in the user exceeding the
+/// allowed number of subnets in a DB subnet groups".
+pub const MAX_SUBNETS_PER_DB_SUBNET_GROUP: usize = 20;
+
 /// The engines an option group may be associated with, as
 /// `CreateOptionGroupMessage$EngineName` lists them — the identical list
 /// `DescribeOptionGroupsMessage$EngineName` publishes for its filter
@@ -115,6 +129,146 @@ pub fn check_option_group_engine_name(engine_name: &str) -> Result<(), String> {
         "invalid value '{engine_name}' for EngineName: valid values are {}",
         OPTION_GROUP_ENGINE_NAMES.join(", ")
     ))
+}
+
+/// The engines a DB instance can run, as `CreateDBInstanceMessage$Engine` lists them
+/// (`smithy_query(query="doc",shape="CreateDBInstanceMessage",member="Engine")`:
+/// "Valid Values: aurora-mysql aurora-postgresql custom-oracle-ee custom-oracle-ee-cdb
+/// custom-oracle-se2 custom-oracle-se2-cdb custom-sqlserver-ee custom-sqlserver-se
+/// custom-sqlserver-web custom-sqlserver-dev db2-ae db2-ce db2-se mariadb mysql
+/// oracle-ee oracle-ee-cdb oracle-se2 oracle-se2-cdb postgres sqlserver-dev-ee
+/// sqlserver-ee sqlserver-se sqlserver-ex sqlserver-web"). These are values AWS
+/// allocated, so the only honest source is the model's own list; extend it when the
+/// model does.
+pub const DB_INSTANCE_ENGINES: [&str; 25] = [
+    "aurora-mysql",
+    "aurora-postgresql",
+    "custom-oracle-ee",
+    "custom-oracle-ee-cdb",
+    "custom-oracle-se2",
+    "custom-oracle-se2-cdb",
+    "custom-sqlserver-dev",
+    "custom-sqlserver-ee",
+    "custom-sqlserver-se",
+    "custom-sqlserver-web",
+    "db2-ae",
+    "db2-ce",
+    "db2-se",
+    "mariadb",
+    "mysql",
+    "oracle-ee",
+    "oracle-ee-cdb",
+    "oracle-se2",
+    "oracle-se2-cdb",
+    "postgres",
+    "sqlserver-dev-ee",
+    "sqlserver-ee",
+    "sqlserver-ex",
+    "sqlserver-se",
+    "sqlserver-web",
+];
+
+/// The engines the two sibling control planes this same front door serves publish for
+/// their own `CreateDBInstance` (`src/service.rs` claims the Amazon DocumentDB and
+/// Amazon Neptune Query surfaces too, and `DescribeOrderableDBInstanceOptions` reports
+/// their classes): `com.amazonaws.docdb#CreateDBInstanceMessage$Engine` ("Valid value:
+/// docdb") and Neptune's ("neptune"). A request for one of them is a request to THAT
+/// service, so its engine is as published as the ones above.
+pub const SIBLING_CONTROL_PLANE_ENGINES: [&str; 2] = ["docdb", "neptune"];
+
+/// Refuse an `Engine` outside the value list its member publishes
+/// ([`DB_INSTANCE_ENGINES`], plus the sibling control planes'
+/// [`SIBLING_CONTROL_PLANE_ENGINES`]). A value that is not an engine names no database
+/// engine at all, which is what the real service refuses with `InvalidParameterValue`.
+pub fn check_engine(engine: &str) -> Result<(), String> {
+    if DB_INSTANCE_ENGINES
+        .iter()
+        .chain(SIBLING_CONTROL_PLANE_ENGINES.iter())
+        .any(|known| known.eq_ignore_ascii_case(engine))
+    {
+        return Ok(());
+    }
+    Err("Invalid DB engine".to_string())
+}
+
+/// Refuse a `MajorEngineVersion` the engine-version catalogue does not carry for
+/// `engine_name`.
+///
+/// The major version is resolved against the SAME catalogue `DescribeDBEngineVersions`
+/// reports, so the two cannot disagree: a major version no entry of that engine carries
+/// is one this service cannot associate an option group with, and the group must not be
+/// stored under it. The message is the real service's own wording for this refusal,
+/// built from the request's engine name and major version.
+pub fn check_major_engine_version(engine_name: &str, major: &str) -> Result<(), String> {
+    if crate::ops::describe_db_engine_versions::offers_major_engine_version(engine_name, major) {
+        return Ok(());
+    }
+    Err(format!(
+        "Cannot find major version {major} for {engine_name}"
+    ))
+}
+
+/// Refuse a `DBInstanceClass` that is not of the published RDS DB instance class form.
+///
+/// A DB instance class is written `db.<family>.<size>` — `db.m5.large`,
+/// `db.t4g.micro`, `db.r5b.4xlarge.tpc2.mem8x` — plus the one exception
+/// [`SERVERLESS_INSTANCE_CLASS`], the Aurora Serverless v2 capacity class. The SIZE
+/// token is drawn from the published instance-size vocabulary ([`INSTANCE_SIZES`], or
+/// `<n>xlarge`), so a value whose size token is not one of those names no class at all
+/// and is what the real service refuses with `InvalidParameterValue`.
+///
+/// The FORM is the rule rather than a list of classes: which classes exist is AWS's
+/// per-region, per-engine matrix, which moves with every instance-type launch and which
+/// this service does not hold — `DescribeOrderableDBInstanceOptions` reports an
+/// explicitly partial subset of it, so refusing everything outside that subset would
+/// refuse classes AWS offers (`db.m6i.large`, `db.m5.2xlarge`).
+pub fn check_db_instance_class(db_instance_class: &str) -> Result<(), String> {
+    let malformed = || format!("Invalid DB Instance class: {db_instance_class}");
+    if db_instance_class == SERVERLESS_INSTANCE_CLASS {
+        return Ok(());
+    }
+    let Some(rest) = db_instance_class.strip_prefix("db.") else {
+        return Err(malformed());
+    };
+    let parts: Vec<&str> = rest.split('.').collect();
+    let [family, size, ..] = parts.as_slice() else {
+        return Err(malformed());
+    };
+    let family_ok = !family.is_empty()
+        && family
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    if !family_ok || !is_instance_size(size) {
+        return Err(malformed());
+    }
+    Ok(())
+}
+
+/// The Aurora Serverless v2 capacity class, the one DB instance class that is not
+/// `db.<family>.<size>` (`DescribeOrderableDBInstanceOptions` offers it for the Aurora
+/// engines).
+pub const SERVERLESS_INSTANCE_CLASS: &str = "db.serverless";
+
+/// The named instance sizes a DB instance class's size token may be, as AWS publishes
+/// them for its instance types. The remaining sizes are written `<n>xlarge`, which
+/// [`is_instance_size`] accepts on the form rather than by listing every `n`.
+pub const INSTANCE_SIZES: [&str; 6] = ["nano", "micro", "small", "medium", "large", "xlarge"];
+
+/// Whether `size` is a published instance-size token: one of [`INSTANCE_SIZES`] or
+/// `<n>xlarge` for a one- to three-digit `n` that is not zero-led (`2xlarge` …
+/// `112xlarge` — there is no `0xlarge` and no `04xlarge`).
+fn is_instance_size(size: &str) -> bool {
+    if INSTANCE_SIZES.contains(&size) {
+        return true;
+    }
+    match size.strip_suffix("xlarge") {
+        Some(count) => {
+            (1..=3).contains(&count.len())
+                && count.bytes().all(|b| b.is_ascii_digit())
+                && !count.starts_with('0')
+        }
+        None => false,
+    }
 }
 
 /// How many distinct regions this store keeps records for.
@@ -174,6 +328,12 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// Option groups by `(region, OptionGroupName)`. Ordered, so
     /// `DescribeOptionGroups` pages deterministically within a region.
     pub option_groups: BTreeMap<RegionalKey, OptionGroupRecord>,
+    /// DB subnet groups by `(region, DBSubnetGroupName)` — the name always stored
+    /// lowercased, as `CreateDBSubnetGroup` documents. These are what a request that
+    /// NAMES a DB subnet group (`CreateDBInstance$DBSubnetGroupName`) is resolved
+    /// against, so a name no group was created under is a not-found rather than a
+    /// silently accepted reference.
+    pub db_subnet_groups: BTreeMap<RegionalKey, DbSubnetGroupRecord>,
     /// Monotonic counter behind every server-assigned id this service mints, so
     /// resource ids and endpoint hosts are unique and reproducible.
     pub mint_counter: u64,
@@ -252,6 +412,49 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         range_in(&self.option_groups, region)
     }
 
+    /// The DB subnet groups stored in `region`, in name order.
+    pub fn db_subnet_groups_in(&self, region: &str) -> Vec<&DbSubnetGroupRecord> {
+        range_in(&self.db_subnet_groups, region)
+    }
+
+    /// The DB subnet group `name` resolves to in `region`, or `None` when nothing of
+    /// that name exists — what a request that NAMES a DB subnet group is resolved
+    /// against.
+    ///
+    /// Two things resolve: a group `CreateDBSubnetGroup` stored, and the `default`
+    /// group the real service provides in every region alongside the account's default
+    /// VPC. The default one is not stored because nobody creates it —
+    /// `CreateDBSubnetGroup` refuses that name ("Must not be default") for exactly that
+    /// reason — and `CreateDBInstance$PubliclyAccessible` documents a default that
+    /// branches on it, so a request naming it is resolving a group that exists.
+    pub fn resolve_db_subnet_group(
+        &self,
+        region: &str,
+        name: &str,
+    ) -> Option<DbSubnetGroupRecord> {
+        if let Some(stored) = self
+            .db_subnet_groups
+            .get(&(region.to_string(), name.to_string()))
+        {
+            return Some(stored.clone());
+        }
+        (name == DEFAULT_DB_SUBNET_GROUP)
+            .then(|| DbSubnetGroupRecord::account_default(region))
+    }
+
+    /// Every DB subnet group a request signed for `region` can see, in name order: the
+    /// groups stored there plus the account's `default` group.
+    pub fn visible_db_subnet_groups(&self, region: &str) -> Vec<DbSubnetGroupRecord> {
+        let mut groups: Vec<DbSubnetGroupRecord> = self
+            .db_subnet_groups_in(region)
+            .into_iter()
+            .cloned()
+            .collect();
+        groups.push(DbSubnetGroupRecord::account_default(region));
+        groups.sort_by(|left, right| left.name.cmp(&right.name));
+        groups
+    }
+
     /// Whether a record may be stored for `region`: either it already holds records, or
     /// the store has room for one more region ([`MAX_REGIONS`]).
     ///
@@ -264,6 +467,7 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .keys()
             .chain(self.db_snapshots.keys())
             .chain(self.option_groups.keys())
+            .chain(self.db_subnet_groups.keys())
             .map(|(stored, _)| stored.as_str())
             .collect();
         known.contains(region) || known.len() < MAX_REGIONS
@@ -357,7 +561,9 @@ pub struct DbInstanceRecord {
     /// the default group of the engine version it was created with.
     pub db_parameter_group_name: Option<String>,
     /// The option group applied to the instance: the one the request named, or the
-    /// default group of its engine and major engine version.
+    /// default group of its engine and major engine version. It is a REFERENCE, which
+    /// is what keeps a group an instance uses from being deleted under it
+    /// (`DeleteOptionGroup`).
     pub option_group_name: Option<String>,
     pub vpc_security_group_ids: Vec<String>,
     /// The legacy EC2-Classic DB security groups the request named, which is normally
@@ -831,6 +1037,89 @@ impl OptionGroupRecord {
     }
 }
 
+/// The name AWS gives the DB subnet group it creates alongside an account's default
+/// VPC. `CreateDBSubnetGroup$DBSubnetGroupName` refuses it ("Must not be default")
+/// because the service owns that name, and `CreateDBInstance$PubliclyAccessible`
+/// documents a default that branches on a request naming it.
+pub const DEFAULT_DB_SUBNET_GROUP: &str = "default";
+
+/// A stored DB subnet group: the name, the description and the EC2 subnets the request
+/// named.
+///
+/// It exists so a request that NAMES a DB subnet group can be resolved: an instance
+/// created against a group that was never created is a reference to nothing, which the
+/// real service refuses rather than accepts. The ARN is computed from the stored region
+/// and name, like the other records', so it cannot drift from the record.
+#[derive(Debug, Clone)]
+pub struct DbSubnetGroupRecord {
+    pub name: String,
+    /// The region the group was created in; the scope of its ARN.
+    pub region: String,
+    pub description: String,
+    /// The EC2 subnet ids the request named, in the order it named them.
+    pub subnet_ids: Vec<String>,
+    pub tags: Vec<Tag>,
+}
+
+impl DbSubnetGroupRecord {
+    /// The account's `default` DB subnet group in `region`: the group the real service
+    /// provides with the account's default VPC, which no request creates and which
+    /// therefore is not stored. Its subnets are the default VPC's subnets — EC2 facts
+    /// this service does not hold — so it names none rather than inventing any.
+    pub fn account_default(region: &str) -> Self {
+        Self {
+            name: DEFAULT_DB_SUBNET_GROUP.to_string(),
+            region: region.to_string(),
+            description: DEFAULT_DB_SUBNET_GROUP.to_string(),
+            subnet_ids: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+    /// `arn:aws:rds:<region>:<account>:subgrp:<name>` — `subgrp` is the resource type
+    /// RDS gives a DB subnet group in its ARN format.
+    pub fn arn(&self) -> String {
+        emulator_server::emulator_arn(
+            ARN_NAMESPACE,
+            &self.region,
+            &format!("subgrp:{}", self.name),
+        )
+    }
+
+    /// Project the stored record onto the modelled `DBSubnetGroup` output shape.
+    pub fn to_wire(&self) -> DBSubnetGroup {
+        DBSubnetGroup {
+            db_subnet_group_name: Some(self.name.clone()),
+            db_subnet_group_description: Some(self.description.clone()),
+            subnet_group_status: Some("Complete".to_string()),
+            // A group that names no subnet reports NO `Subnets` member rather than an
+            // empty list: an empty list would claim the group covers nothing, which is
+            // a different statement from "this service does not hold its subnets".
+            subnets: (!self.subnet_ids.is_empty()).then(|| {
+                self.subnet_ids
+                    .iter()
+                    .map(|id| Subnet {
+                        subnet_identifier: Some(id.clone()),
+                        subnet_status: Some("Active".to_string()),
+                        // The Availability Zone a subnet lies in, and the VPC it
+                        // belongs to, are EC2 facts: RDS reads them from the subnet,
+                        // and this service holds no subnets. Reported ABSENT rather
+                        // than carrying a made-up zone or VPC id, which a caller that
+                        // placed an instance by zone would be misled by.
+                        subnet_availability_zone: None,
+                        // `SubnetOutpost` describes a subnet on an Outpost, which
+                        // nothing here is.
+                        subnet_outpost: None,
+                    })
+                    .collect()
+            }),
+            db_subnet_group_arn: Some(self.arn()),
+            // `VpcId` and `SupportedNetworkTypes` are read off the subnets too, for the
+            // same reason.
+            ..DBSubnetGroup::default()
+        }
+    }
+}
+
 /// A stored Aurora global database cluster: the record `DescribeGlobalClusters` reports.
 ///
 /// Account-scoped rather than regional — see
@@ -1015,6 +1304,24 @@ impl OptionRecord {
             ),
         }
     }
+}
+
+/// Refuse a value that is not of the published EC2 subnet id form: `subnet-` followed
+/// by 8 or 17 lowercase hexadecimal characters. A value that is not a subnet id at all
+/// names no subnet, which is the modelled `InvalidSubnet`.
+pub fn check_subnet_id(subnet_id: &str) -> Result<(), String> {
+    let suffix = subnet_id.strip_prefix("subnet-").unwrap_or_default();
+    if (suffix.len() == 8 || suffix.len() == 17)
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "'{subnet_id}' is not an EC2 subnet id (expected subnet- followed by 8 or 17 \
+         hexadecimal characters)"
+    ))
 }
 
 /// The region segment of an ARN (`arn:aws:<service>:<region>:<account>:<resource>`), or
@@ -1595,17 +1902,30 @@ pub struct Page<T> {
 
 /// Take the page of `records` that starts at `marker` and holds at most
 /// `page_size` items. `records` must be ordered by its key.
+///
+/// A `marker` is only ever a key of the result set — that is what this function
+/// returns as `next_marker` — so a marker naming no key of `records` is one no prior
+/// page can have issued. It is REFUSED (the returned message is what the caller
+/// refuses the request with) rather than resynchronised to the nearest key: a
+/// paginator that silently restarts on a cursor the service never handed out reports a
+/// page the caller cannot place, and the real service answers an invalid-parameter
+/// error instead.
 pub fn paginate<T>(
     records: Vec<(String, T)>,
     marker: Option<&str>,
     page_size: usize,
-) -> Page<T> {
+) -> Result<Page<T>, String> {
     let start = match marker {
         None => 0,
         Some(marker) => records
             .iter()
-            .position(|(key, _)| key.as_str() >= marker)
-            .unwrap_or(records.len()),
+            .position(|(key, _)| key.as_str() == marker)
+            .ok_or_else(|| {
+                format!(
+                    "invalid value '{marker}' for Marker: it was not returned by a prior \
+                     request; omit Marker to start at the first page"
+                )
+            })?,
     };
     let end = start.saturating_add(page_size).min(records.len());
     let next_marker = records.get(end).map(|(key, _)| key.clone());
@@ -1615,7 +1935,7 @@ pub fn paginate<T>(
         .take(end.saturating_sub(start))
         .map(|(_, record)| record)
         .collect();
-    Page { items, next_marker }
+    Ok(Page { items, next_marker })
 }
 
 // ---------------------------------------------------------------------------

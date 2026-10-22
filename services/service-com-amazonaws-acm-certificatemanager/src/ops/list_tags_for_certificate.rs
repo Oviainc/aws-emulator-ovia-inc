@@ -165,7 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let store = state.lock();
+        // Tags do not depend on the certificate's status, but every handler
+        // materialises what the clock already owes first, so no two operations can
+        // report one store at two different instants.
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
         let Some(certificate) = store.certificates.get(&input.certificate_arn) else {
             return Err(
                 ListTagsForCertificateErrorModeled::ResourceNotFoundException(

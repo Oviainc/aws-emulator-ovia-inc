@@ -7,9 +7,15 @@
 //! projected from these records — see [`certificate_detail`] and
 //! [`certificate_summary`] — so `DescribeCertificate` and `ListCertificates` report
 //! what `RequestCertificate` stored rather than echoing their own input.
+//!
+//! A requested certificate does not stay `PENDING_VALIDATION`: ACM resolves its
+//! validation on its own, so the record carries the outcome the clock owes it and the
+//! instant it falls due ([`PendingValidation`]). Nothing sleeps for that instant —
+//! [`ComAmazonawsAcmCertificatemanagerState::materialize_due`] applies whatever was
+//! already due, and every handler calls it before reading or writing the store.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     CertificateDetail, CertificateOptions, CertificateSummary, DomainValidation, ExtendedKeyUsage,
@@ -27,16 +33,76 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// and `RSA_2048` is the RSA size ACM issues.
 pub const DEFAULT_KEY_ALGORITHM: &str = "RSA_2048";
 
+/// `ValidationMethod=EMAIL`, the method whose evidence is a mailbox: it is the only
+/// one for which `DomainValidation` carries `ValidationEmails` and
+/// `ValidationDomain`, both documented as what "ACM used to send domain validation
+/// emails".
+pub const VALIDATION_METHOD_EMAIL: &str = "EMAIL";
+
 /// `ValidationMethod` when `RequestCertificate` names none. ACM validates a public
 /// certificate by email unless the request asks for DNS or HTTP validation.
-pub const DEFAULT_VALIDATION_METHOD: &str = "EMAIL";
+pub const DEFAULT_VALIDATION_METHOD: &str = VALIDATION_METHOD_EMAIL;
 
 /// `CertificateStatus`: "A certificate enters status PENDING_VALIDATION upon being
 /// requested" (`CertificateDetail$Status` doc).
 pub const STATUS_PENDING_VALIDATION: &str = "PENDING_VALIDATION";
 
+/// `CertificateStatus`: "If validation succeeds, the certificate enters status
+/// ISSUED" (`CertificateDetail$Status` doc).
+pub const STATUS_ISSUED: &str = "ISSUED";
+
+/// `CertificateStatus` of a request ACM could not complete: "A certificate enters
+/// status PENDING_VALIDATION upon being requested, unless it fails for any of the
+/// reasons given in the troubleshooting topic Certificate request fails"
+/// (`CertificateDetail$Status` doc).
+pub const STATUS_FAILED: &str = "FAILED";
+
 /// `DomainStatus` of a domain whose ownership has not been proven yet.
 pub const DOMAIN_STATUS_PENDING_VALIDATION: &str = "PENDING_VALIDATION";
+
+/// `DomainStatus` of a domain whose ownership has been proven.
+pub const DOMAIN_STATUS_SUCCESS: &str = "SUCCESS";
+
+/// `DomainStatus` of a domain whose validation did not complete.
+pub const DOMAIN_STATUS_FAILED: &str = "FAILED";
+
+/// `FailureReason` of a public certificate request this emulator cannot carry
+/// through: validating a domain name means proving control of it out of band — a DNS
+/// record, a mailbox or an HTTP token on the domain itself — and this emulator makes
+/// no outbound connection, so no requested domain can ever be proven here. ACM's
+/// modelled reason for a request it cannot process without information it has to
+/// obtain elsewhere is `ADDITIONAL_VERIFICATION_REQUIRED`, and it is what the
+/// recorded AWS responses for unverifiable domains carry. `FailureReason` "exists
+/// only when the certificate status is FAILED" (`CertificateDetail$FailureReason`
+/// doc), so it is set only beside [`STATUS_FAILED`].
+pub const FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED: &str =
+    "ADDITIONAL_VERIFICATION_REQUIRED";
+
+/// How long after `RequestCertificate` the validation outcome falls due.
+///
+/// A CHOSEN span, not a documented one: AWS takes minutes to hours ("ACM makes
+/// repeated attempts to validate a certificate for 72 hours"), which no client could
+/// poll through here. It is never zero, so a caller that reads straight after
+/// requesting still observes `PENDING_VALIDATION`, and it is never slept on: the due
+/// instant is stored on the record and materialised by whichever call next touches
+/// the store (see [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
+pub const VALIDATION_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// How long a certificate this emulator issues is valid for: ACM certificates are
+/// valid for 13 months (395 days) (ACM user guide, "Managed certificate renewal"),
+/// which is the span between the `NotBefore` and `NotAfter` of an issued record.
+pub const CERTIFICATE_VALIDITY: Duration = Duration::from_secs(395 * 24 * 60 * 60);
+
+/// The `KeyUsageName` values of the X.509 Key Usage extension of a TLS server
+/// certificate ACM issues, which a certificate carries only once it has been issued.
+pub const ISSUED_KEY_USAGES: &[&str] = &["DIGITAL_SIGNATURE", "KEY_ENCIPHERMENT"];
+
+/// The `ExtendedKeyUsageName` values of the X.509 Extended Key Usage extension of a
+/// TLS certificate ACM issues, with the same lifecycle as [`ISSUED_KEY_USAGES`].
+pub const ISSUED_EXTENDED_KEY_USAGES: &[&str] = &[
+    "TLS_WEB_SERVER_AUTHENTICATION",
+    "TLS_WEB_CLIENT_AUTHENTICATION",
+];
 
 /// `CertificateType`: "For certificates provided by ACM, this value is
 /// `AMAZON_ISSUED`" (`CertificateDetail$Type` doc).
@@ -137,6 +203,46 @@ pub struct DomainValidationRecord {
     pub http_redirect: Option<HttpRedirect>,
 }
 
+/// How the validation of a requested certificate resolves.
+///
+/// Decided by the call that starts the transition, from what the request asks for,
+/// and applied when the transition falls due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationOutcome {
+    /// The certificate is issued: "If you are requesting a private certificate,
+    /// domain validation is not required" (`RequestCertificate` doc), so there is
+    /// nothing left to prove and the request completes.
+    Issued,
+    /// The request fails with [`FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED`]:
+    /// "If you are requesting a public certificate, each domain name that you specify
+    /// must be validated to verify that you own or control the domain"
+    /// (`RequestCertificate` doc), and that proof is out of band.
+    Failed,
+}
+
+/// The validation outcome the clock already owes a requested certificate.
+///
+/// Stored, never slept on: the instant it falls due is fixed by the call that started
+/// it, so the outcome is owed at that instant whether or not anybody calls again.
+#[derive(Debug, Clone)]
+pub struct PendingValidation {
+    /// When the outcome falls due.
+    pub due_at: SystemTime,
+    /// What falls due then.
+    pub outcome: ValidationOutcome,
+}
+
+impl PendingValidation {
+    /// The outcome owed to a certificate requested at `requested_at`, due
+    /// [`VALIDATION_SETTLE_DELAY`] later.
+    pub fn starting_at(requested_at: SystemTime, outcome: ValidationOutcome) -> Self {
+        Self {
+            due_at: requested_at + VALIDATION_SETTLE_DELAY,
+            outcome,
+        }
+    }
+}
+
 /// One stored ACM certificate. Every field a response reports is read from here.
 #[derive(Debug, Clone)]
 pub struct Certificate {
@@ -163,6 +269,13 @@ pub struct Certificate {
     pub managed_by: Option<String>,
     /// A `RenewalEligibility` value.
     pub renewal_eligibility: String,
+    /// A `FailureReason` value, which "exists only when the certificate status is
+    /// FAILED" (`CertificateDetail$FailureReason` doc).
+    pub failure_reason: Option<String>,
+    /// The validation outcome the clock owes this certificate, while it is still
+    /// `PENDING_VALIDATION`. `None` once the certificate has reached a terminal
+    /// status — there is nothing left for the clock to do.
+    pub pending_validation: Option<PendingValidation>,
     /// ARNs of the resources using this certificate.
     pub in_use_by: Vec<String>,
     /// The `KeyUsageName` values of the certificate's X.509 Key Usage extensions.
@@ -183,6 +296,69 @@ pub struct Certificate {
     pub tags: BTreeMap<String, String>,
 }
 
+impl Certificate {
+    /// Apply the validation outcome the clock already owes this certificate at `now`.
+    ///
+    /// A certificate ACM reports as `PENDING_VALIDATION` is waiting on work ACM does
+    /// on its own; the instant that work completes was fixed when the certificate was
+    /// requested, so applying it here materialises a change the clock already made
+    /// rather than a side effect of whoever happened to call.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        let Some(pending) = self
+            .pending_validation
+            .clone()
+            .filter(|pending| now >= pending.due_at)
+        else {
+            return;
+        };
+        self.pending_validation = None;
+        match pending.outcome {
+            ValidationOutcome::Issued => self.issue(pending.due_at),
+            ValidationOutcome::Failed => {
+                self.fail(FAILURE_REASON_ADDITIONAL_VERIFICATION_REQUIRED);
+            }
+        }
+    }
+
+    /// Record this certificate as issued at `at`: every domain is proven, the
+    /// validity window opens, and the X.509 extensions an issued certificate carries
+    /// come into existence.
+    fn issue(&mut self, at: SystemTime) {
+        self.status = STATUS_ISSUED.to_string();
+        self.failure_reason = None;
+        for validation in &mut self.domain_validations {
+            validation.validation_status = DOMAIN_STATUS_SUCCESS.to_string();
+        }
+        self.issued_at = Some(at);
+        self.not_before = Some(at);
+        self.not_after = Some(at + CERTIFICATE_VALIDITY);
+        self.key_usages = ISSUED_KEY_USAGES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        self.extended_key_usages = ISSUED_EXTENDED_KEY_USAGES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+    }
+
+    /// Record this certificate's request as failed for `reason`: no domain was
+    /// proven, and nothing was issued, so the issuance members stay absent.
+    ///
+    /// `ValidationEmails` is "a list of email addresses that ACM used to send domain
+    /// validation emails" (`DomainValidation$ValidationEmails` doc). A request that
+    /// ends with ownership still unproven sent none, so the list is dropped with the
+    /// validation it belonged to.
+    fn fail(&mut self, reason: &str) {
+        self.status = STATUS_FAILED.to_string();
+        self.failure_reason = Some(reason.to_string());
+        for validation in &mut self.domain_validations {
+            validation.validation_status = DOMAIN_STATUS_FAILED.to_string();
+            validation.validation_emails.clear();
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-acm-certificatemanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAcmCertificatemanagerState {
@@ -196,6 +372,18 @@ pub struct ComAmazonawsAcmCertificatemanagerState {
 }
 
 impl ComAmazonawsAcmCertificatemanagerState {
+    /// Apply every validation outcome the clock already owes at `now`.
+    ///
+    /// Call it FIRST in every handler that locks the store, so each operation sees the
+    /// state a caller would see after any other. One pass touches at most as many
+    /// records as the account may hold certificates, and each is one instant
+    /// comparison.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        for certificate in self.certificates.values_mut() {
+            certificate.materialize_due(now);
+        }
+    }
+
     /// Drop `arn`'s record and every idempotency entry that resolves to it, so a
     /// replayed `RequestCertificate` can never answer with an ARN that has no
     /// record behind it.
@@ -343,10 +531,17 @@ pub fn export_option(cert: &Certificate) -> String {
 }
 
 /// One stored validation as the modelled `DomainValidation`.
+///
+/// `ValidationEmails` is "a list of email addresses that ACM used to send domain
+/// validation emails" (`DomainValidation$ValidationEmails` doc), so it belongs to a
+/// domain validated BY EMAIL: it is reported for such a domain — as the empty list
+/// once no mailbox was used, which is a validation that never ran — and is absent for
+/// a domain validated by DNS or HTTP, where ACM sends no mail at all.
 fn domain_validation(record: &DomainValidationRecord) -> DomainValidation {
     DomainValidation {
         domain_name: record.domain_name.clone(),
-        validation_emails: (!record.validation_emails.is_empty())
+        validation_emails: (!record.validation_emails.is_empty()
+            || record.validation_method == VALIDATION_METHOD_EMAIL)
             .then(|| record.validation_emails.clone()),
         validation_domain: record.validation_domain.clone(),
         validation_status: Some(record.validation_status.clone()),
@@ -400,6 +595,9 @@ pub fn certificate_detail(cert: &Certificate) -> CertificateDetail {
         r#type: Some(cert.cert_type.clone()),
         certificate_authority_arn: cert.certificate_authority_arn.clone(),
         renewal_eligibility: Some(cert.renewal_eligibility.clone()),
+        // "This value exists only when the certificate status is FAILED"
+        // (`CertificateDetail$FailureReason` doc), which is what the record stores.
+        failure_reason: cert.failure_reason.clone(),
         options: cert.options.clone(),
         certificate_key_pair_origin: Some(cert.key_pair_origin.clone()),
         ..CertificateDetail::default()

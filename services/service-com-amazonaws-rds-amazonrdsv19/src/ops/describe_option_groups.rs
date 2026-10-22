@@ -200,7 +200,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|record| (record.name.clone(), record.to_wire()))
             .collect();
 
-        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeOptionGroupsError::invalid_parameter_value)?;
         Ok(DescribeOptionGroupsOutput {
             marker: page.next_marker,
             option_groups_list: Some(page.items),

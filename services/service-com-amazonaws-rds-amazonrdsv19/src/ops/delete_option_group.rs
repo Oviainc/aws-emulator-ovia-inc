@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteOptionGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteOptionGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation removes the stored option group from this service's
+//! store, so a later `DescribeOptionGroups` for that name answers the modelled
+//! not-found fault. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteOptionGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records live in [`crate::state`], shared with `CreateOptionGroup`,
+//! `DescribeOptionGroups` and the DB instance operations that REFERENCE an option
+//! group.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +151,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteOptionGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteOptionGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let region =
+            crate::state::request_region(ctx).map_err(DeleteOptionGroupError::validation)?;
+        let name = input.option_group_name;
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope. A
+        // name that names no stored group is the modelled 404 — the same answer a
+        // second delete of the same group gets, which is what lets a caller tell
+        // "deleted" from "never existed" at the first call.
+        let key = (region.clone(), name.clone());
+        if !store.option_groups.contains_key(&key) {
+            return Err(DeleteOptionGroupErrorModeled::OptionGroupNotFoundFault(
+                OptionGroupNotFoundFault {
+                    message: Some(format!("Specified OptionGroupName: {name} not found.")),
+                },
+            )
+            .into());
+        }
+        // "You can't delete default option groups" — the groups AWS mints per engine
+        // major version. This service does not STORE them (nothing creates them), so a
+        // delete naming one answers the 404 above rather than the state fault the real
+        // service answers; modelling those default groups is the subject of the issues
+        // that own them, and `CreateDBInstance` says the same of the names it stores
+        // unresolved.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteOptionGroup"))
+        // "You can't delete an option group that is associated with a DB instance" —
+        // the association is the instance record's own `OptionGroupName`, so the guard
+        // reads the store rather than trusting the caller.
+        if let Some(user) = store
+            .instances_in(&region)
+            .into_iter()
+            .find(|instance| instance.option_group_name.as_deref() == Some(name.as_str()))
+        {
+            let user = user.identifier.clone();
+            return Err(DeleteOptionGroupErrorModeled::InvalidOptionGroupStateFault(
+                InvalidOptionGroupStateFault {
+                    message: Some(format!(
+                        "The option group {name} can't be deleted because it is in use by \
+                         DB instance {user}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store
+            .option_groups
+            .remove(&key)
+            .expect("the group was found above and the store is locked");
+
+        Ok(DeleteOptionGroupOutput)
     }
 }
