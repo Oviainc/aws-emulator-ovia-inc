@@ -167,23 +167,40 @@ impl Emulator {
 
 /// `ServerId` is modelled `len 19..19`, pattern `^s-([0-9a-f]{17})$`.
 pub(crate) fn is_modelled_server_id(id: &str) -> bool {
-    id.len() == 19
-        && id.starts_with("s-")
-        && id[2..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    is_prefixed_lower_hex_id(id, "s-", 17)
 }
 
 /// `SshPublicKeyId` is modelled `len 21..21`, pattern `^key-[0-9a-f]{17}$`.
 pub(crate) fn is_modelled_key_id(id: &str) -> bool {
-    id.len() == 21
-        && id.starts_with("key-")
-        && id[4..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    is_prefixed_lower_hex_id(id, "key-", 17)
+}
+
+/// `WebAppId` is modelled `len 24..24`, pattern `^webapp-[0-9a-f]{17}$`.
+pub(crate) fn is_modelled_web_app_id(id: &str) -> bool {
+    is_prefixed_lower_hex_id(id, "webapp-", 17)
+}
+
+/// `DescribedWebAppVpcConfig.VpcEndpointId` is modelled `len 22..22`, pattern
+/// `^vpce-[0-9a-f]{17}$`.
+pub(crate) fn is_modelled_vpc_endpoint_id(id: &str) -> bool {
+    is_prefixed_lower_hex_id(id, "vpce-", 17)
 }
 
 /// `ProfileId` is modelled `len 19..19`, pattern `^p-([0-9a-f]{17})$`.
 pub(crate) fn is_modelled_profile_id(id: &str) -> bool {
-    id.len() == 19
-        && id.starts_with("p-")
-        && id[2..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    is_prefixed_lower_hex_id(id, "p-", 17)
+}
+
+/// Whether `id` is `prefix` followed by exactly `digits` lowercase hex digits — the
+/// ONE copy of the `<prefix>-[0-9a-f]{n}` rule every minted identifier in this model
+/// follows, so each predicate above is just its prefix and digit count.
+fn is_prefixed_lower_hex_id(id: &str, prefix: &str, digits: usize) -> bool {
+    id.strip_prefix(prefix).is_some_and(|rest| {
+        rest.len() == digits
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    })
 }
 
 /// `HostKeyId` is modelled `len 25..25`, pattern `^hostkey-[0-9a-f]{17}$`.

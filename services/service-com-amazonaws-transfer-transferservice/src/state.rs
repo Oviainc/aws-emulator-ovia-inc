@@ -2,9 +2,10 @@
 
 //! Engine state for the com-amazonaws-transfer-transferservice service.
 //!
-//! Everything AWS Transfer Family's server + user + AS2 profile + connector + host-key
-//! lifecycle needs to answer a read from stored state lives here: the resource maps
-//! (servers, their users and host keys, the AS2 profiles, the connectors, and the
+//! Everything AWS Transfer Family's server + user + web app + AS2 profile + connector
+//! + host-key lifecycle needs to answer a read from stored state lives here: the
+//! resource maps (servers, their users and host keys, the web apps, the AS2 profiles,
+//! the connectors, and the
 //! workflows a server's
 //! `WorkflowDetails` attach), the
 //! id-minting counter, the
@@ -28,8 +29,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    EndpointDetails, HomeDirectoryMapEntry, IdentityProviderDetails, PosixProfile, ProtocolDetails,
-    ProxyConfig, ResourceNotFoundException, S3StorageOptions, SftpPortWithOptions, Tag,
+    DescribedWebAppEndpointDetails, DescribedWebAppIdentityProviderDetails, EndpointDetails,
+    HomeDirectoryMapEntry, IdentityProviderDetails, PosixProfile, ProtocolDetails, ProxyConfig,
+    ResourceNotFoundException, S3StorageOptions, SftpPortWithOptions, Tag, WebAppUnits,
     WorkflowDetails, WorkflowStep,
 };
 
@@ -116,6 +118,21 @@ pub const DEFAULT_IP_ADDRESS_TYPE: &str = "IPV4";
 /// `[IPV4, DUALSTACK]`).
 pub const IP_ADDRESS_TYPE_DUALSTACK: &str = "DUALSTACK";
 
+/// `WebAppEndpointPolicy`'s documented default ("Setting for the type of endpoint
+/// policy for the web app. The default value is STANDARD"). The enum is
+/// `[FIPS, STANDARD]`.
+pub const DEFAULT_WEB_APP_ENDPOINT_POLICY: &str = "STANDARD";
+
+/// `WebAppEndpointType`'s publicly-accessible value (the enum is `[PUBLIC, VPC]`),
+/// which is what a web app created without `EndpointDetails` is hosted on: the member
+/// is documented as "PUBLIC for publicly accessible endpoints and VPC for VPC-hosted
+/// endpoints that provide network isolation", and the only `WebAppEndpointDetails`
+/// member is `Vpc`.
+pub const WEB_APP_ENDPOINT_TYPE_PUBLIC: &str = "PUBLIC";
+
+/// `WebAppEndpointType`'s VPC-hosted value — see [`WEB_APP_ENDPOINT_TYPE_PUBLIC`].
+pub const WEB_APP_ENDPOINT_TYPE_VPC: &str = "VPC";
+
 /// `Protocols`' default: SFTP alone, the only protocol a `PUBLIC`,
 /// `SERVICE_MANAGED` server can serve.
 pub const DEFAULT_PROTOCOL: &str = "SFTP";
@@ -180,6 +197,16 @@ pub const MAX_STORED_SERVERS: usize = 200;
 /// `len 1..50`), which the framework's boundary validator enforces before a handler
 /// runs. `DeleteUser` releases one record; `DeleteServer` releases all of a server's.
 pub const MAX_USERS_PER_SERVER: usize = 1_000;
+
+/// How many web apps the store holds before `CreateWebApp` refuses instead of growing.
+///
+/// Chosen on the same basis as [`MAX_STORED_SERVERS`] — the emulator's OWN bound on
+/// the store, not a claim about any account's quota (this emulator models no Service
+/// Quotas). It is what stops `web_apps` growing without end; `DeleteWebApp` releases a
+/// record. Each stored record is itself bounded by the modelled lengths of the members
+/// it holds (`WebAppAccessEndpoint` `len 1..1024`, `Tags` `len 1..50`), which the
+/// framework's boundary validator enforces before a handler runs.
+pub const MAX_STORED_WEB_APPS: usize = 200;
 
 /// How many connectors the store holds before a connector create refuses with the
 /// modelled `ServiceUnavailableException` instead of growing.
@@ -270,6 +297,10 @@ pub const RESOURCE_TYPE_USER: &str = "User";
 /// `ResourceType` for one of a user's SSH public keys, addressed by its
 /// `SshPublicKeyId`. Same convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_SSH_PUBLIC_KEY: &str = "SshPublicKey";
+
+/// `ResourceType` for the web app resource. Same convention as
+/// [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_WEB_APP: &str = "WebApp";
 
 /// `ResourceType` for the AS2 profile resource, addressed by its `ProfileId`. Same
 /// convention as [`RESOURCE_TYPE_SERVER`].
@@ -377,6 +408,12 @@ pub fn unknown_server(server_id: &str) -> ResourceNotFoundException {
 /// The not-found payload for a `UserName` the named server does not hold.
 pub fn unknown_user(user_name: &str) -> ResourceNotFoundException {
     resource_not_found(RESOURCE_TYPE_USER, user_name)
+}
+
+/// The not-found payload for a `WebAppId` the store does not hold — never created, or
+/// already deleted.
+pub fn unknown_web_app(web_app_id: &str) -> ResourceNotFoundException {
+    resource_not_found(RESOURCE_TYPE_WEB_APP, web_app_id)
 }
 
 /// The not-found payload for a `ProfileId` the store does not hold — never created, or
@@ -1632,6 +1669,40 @@ pub fn home_directory_violation(
     }
 }
 
+/// One stored Transfer Family web app, keyed by `WebAppId`.
+///
+/// Every member a reader reports is RESOLVED here, at create time — the documented
+/// `WebAppEndpointPolicy` default, the `EndpointType` the endpoint configuration
+/// selects, the web app's own endpoint host name, the `AccessEndpoint` (the caller's
+/// custom URL or the default one), and the IAM Identity Center application the create
+/// registered. So `DescribeWebApp` projects the stored record without re-applying a
+/// default, and the identity-provider and endpoint details are kept in the `Described*`
+/// shapes the readers answer with.
+#[derive(Debug, Clone)]
+pub struct WebApp {
+    pub web_app_id: String,
+    pub arn: String,
+    /// The identity provider as the readers report it, with the `ApplicationArn` the
+    /// create minted already in place.
+    pub identity_provider_details: Option<DescribedWebAppIdentityProviderDetails>,
+    /// The URL users are given for this web app: the caller's custom
+    /// `AccessEndpoint`, or [`default_access_endpoint`] when the create named none.
+    pub access_endpoint: String,
+    /// The web app's own unique endpoint host name — see [`web_app_endpoint`].
+    pub web_app_endpoint: String,
+    /// `WebAppUnits` exactly as the caller set it. The model documents no default, so
+    /// a create that named none leaves this `None` rather than inventing a unit count.
+    pub web_app_units: Option<WebAppUnits>,
+    pub web_app_endpoint_policy: String,
+    /// `PUBLIC` or `VPC`, selected by whether the create configured a VPC endpoint.
+    pub endpoint_type: String,
+    /// The endpoint configuration as the readers report it, with the `VpcEndpointId`
+    /// the create minted for a VPC-hosted web app. `None` for a `PUBLIC` web app,
+    /// which has no VPC endpoint to report.
+    pub endpoint_details: Option<DescribedWebAppEndpointDetails>,
+    pub tags: Vec<Tag>,
+}
+
 /// The first documented step requirement a submitted step LIST violates, worded as the
 /// refusal states it and naming the step by its zero-based index in `member` — the way
 /// a JSON request indexes the list — `None` when every step satisfies them.
@@ -1829,6 +1900,9 @@ pub struct ComAmazonawsTransferTransferserviceState {
     /// Users by `(ServerId, UserName)`, so one server's users are a contiguous,
     /// ordered range for `ListUsers`.
     pub users: BTreeMap<(String, String), User>,
+    /// Web apps by `WebAppId` (`"webapp-" + 17 hex`). `BTreeMap` so `ListWebApps` pages
+    /// in a stable, resumable order.
+    pub web_apps: BTreeMap<String, WebApp>,
     /// Host keys by `(ServerId, HostKeyId)`, so one server's keys are a contiguous,
     /// ordered range for `ListHostKeys`.
     pub host_keys: BTreeMap<(String, String), HostKey>,
@@ -1856,8 +1930,16 @@ impl ComAmazonawsTransferTransferserviceState {
     /// counter value below 16^17, which a counter incremented once per created
     /// resource cannot reach.
     pub fn mint_id(&mut self, prefix: &str) -> String {
+        self.mint_hex_id(prefix, 17)
+    }
+
+    /// The ONE minting rule: bump the counter and render it as `<prefix>-<digits
+    /// lowercase hex digits>`, zero-padded. Every minted identifier in this service is
+    /// this shape and differs only in its prefix and width, so the counter bump and the
+    /// formatting live here once.
+    fn mint_hex_id(&mut self, prefix: &str, digits: usize) -> String {
         self.next_id_seq += 1;
-        format!("{prefix}-{:017x}", self.next_id_seq)
+        format!("{prefix}-{:0width$x}", self.next_id_seq, width = digits)
     }
 
     /// The users stored for `server_id`, in `ListUsers` paging order.
@@ -1913,6 +1995,23 @@ impl ComAmazonawsTransferTransferserviceState {
     /// [`MAX_STORED_SERVERS`].
     pub fn has_server_capacity(&self) -> bool {
         self.servers.len() < MAX_STORED_SERVERS
+    }
+
+    /// Whether the store can take another web app, i.e. is below
+    /// [`MAX_STORED_WEB_APPS`].
+    pub fn has_web_app_capacity(&self) -> bool {
+        self.web_apps.len() < MAX_STORED_WEB_APPS
+    }
+
+    /// Mint the `apl-<16 hex digits>` identifier of the IAM Identity Center
+    /// application a `CreateWebApp` registers for the new web app.
+    ///
+    /// `IdentityCenterApplicationArn`'s modelled pattern ends in `apl-[a-zA-Z0-9]{16}`
+    /// — 16 characters, one fewer than [`Self::mint_id`] emits — so this is
+    /// [`Self::mint_hex_id`] at that width. It shares the one counter, so an
+    /// application id is unique across this store like every other minted id.
+    pub fn mint_identity_center_application_id(&mut self) -> String {
+        self.mint_hex_id("apl", 16)
     }
 
     /// Whether the store can take another connector, i.e. is below
@@ -1995,6 +2094,64 @@ pub fn user_arn(region: &str, server_id: &str, user_name: &str) -> String {
         region,
         &format!("user/{server_id}/{user_name}"),
     )
+}
+
+/// `arn:aws:transfer:<region>:<account>:webapp/<WebAppId>`.
+pub fn web_app_arn(region: &str, web_app_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("webapp/{web_app_id}"))
+}
+
+/// The DNS label suffix of a web app's own endpoint host name.
+///
+/// `WebAppEndpoint` is documented as "the unique URL for your Transfer Family web app
+/// ... the value that you use when you configure Origins on CloudFront", i.e. a host
+/// name unique to the web app in its Region. The service publishes no host-name
+/// grammar, so this suffix is the emulator's OWN: what matters, and what
+/// [`web_app_endpoint`] guarantees, is that the name is derived from the web app's id
+/// and Region and so is unique, stable across reads, and different for two web apps.
+/// The emulator serves no web app UI, so nothing resolves this name.
+const WEB_APP_ENDPOINT_SUFFIX: &str = "transfer-webapp";
+
+/// `<WebAppId>.transfer-webapp.<region>.on.aws` — the web app's own endpoint host
+/// name. Derived from the id and the Region, never stored input; see
+/// [`WEB_APP_ENDPOINT_SUFFIX`].
+pub fn web_app_endpoint(region: &str, web_app_id: &str) -> String {
+    format!("{web_app_id}.{WEB_APP_ENDPOINT_SUFFIX}.{region}.on.aws")
+}
+
+/// The `AccessEndpoint` of a web app whose create named none.
+///
+/// `AccessEndpoint` is documented as "the URL that you provide to your users for them
+/// to interact with the Transfer Family web app. You can specify a custom URL or use
+/// the default value" — so when no custom URL is given the default is the `https://`
+/// URL of the web app's own endpoint, the only URL the service has for the app.
+pub fn default_access_endpoint(web_app_endpoint: &str) -> String {
+    format!("https://{web_app_endpoint}")
+}
+
+/// The ARN of the IAM Identity Center application a `CreateWebApp` registers in the
+/// Identity Center instance the caller named, or `None` when the caller named no
+/// instance.
+///
+/// `DescribedIdentityCenterConfig.ApplicationArn` is documented as "the ARN for the
+/// IAM Identity Center application: this value is set automatically when you create
+/// your web app" — an application inside the given INSTANCE, which is why the
+/// instance's own id is carried over from `InstanceArn` and only the `apl-` half is
+/// minted. `None` when `InstanceArn` names no instance: there is then no instance to
+/// register an application in, and nothing is invented. `InstanceArn`'s modelled
+/// pattern (`^arn:[\w-]+:sso:::instance/(sso)?ins-[a-zA-Z0-9-.]{16}$`) is enforced
+/// before a handler runs, so a present one always carries the `:instance/` segment
+/// this reads.
+pub fn identity_center_application_arn(
+    instance_arn: &str,
+    application_id: &str,
+) -> Option<String> {
+    let (_, instance) = instance_arn.split_once(":instance/")?;
+    Some(::engine::emulator_arn(
+        "sso",
+        "",
+        &format!("application/{instance}/{application_id}"),
+    ))
 }
 
 /// `arn:aws:transfer:<region>:<account>:host-key/<ServerId>/<HostKeyId>`.

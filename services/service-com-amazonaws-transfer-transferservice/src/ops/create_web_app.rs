@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWebApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWebApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWebApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `WebAppId` and PERSISTS the web app in this service's engine store, so
+//! `DescribeWebApp` rebuilds its answer from it. Every member a reader reports is
+//! resolved HERE, once: the documented `WebAppEndpointPolicy` default, the
+//! `EndpointType` the endpoint configuration selects, the web app's own endpoint host
+//! name, the `AccessEndpoint` (the caller's custom URL, else the default one), the
+//! `VpcEndpointId` of a VPC-hosted web app, and the IAM Identity Center application
+//! this create registers — so no reader re-applies a default.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +168,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWebApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWebAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWebApp"))
+        use crate::state as st;
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            CreateWebAppErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let region = st::request_region(ctx.parts());
+
+        let mut guard = state.lock();
+
+        // The store is BOUNDED: past its capacity a create is refused rather than
+        // adding another record. `CreateWebApp` models no capacity error, so the
+        // refusal is the modelled `ThrottlingException` (HTTP 429) — the only modelled
+        // answer that means "the service did not take this request; try again" — and
+        // the capacity is released by `DeleteWebApp`.
+        if !guard.has_web_app_capacity() {
+            return Err(CreateWebAppErrorModeled::ThrottlingException(ThrottlingException {
+                // `ThrottlingException` models only `RetryAfterSeconds`, and no
+                // documented retry delay exists for this refusal, so none is invented.
+                retry_after_seconds: None,
+            })
+            .into());
+        }
+
+        let web_app_id = guard.mint_id("webapp");
+        let web_app_endpoint = st::web_app_endpoint(&region, &web_app_id);
+
+        // The identity provider as every reader reports it: the instance and role the
+        // caller named, plus the Identity Center application this create registers in
+        // that instance.
+        let identity_provider_details = match input.identity_provider_details {
+            WebAppIdentityProviderDetails::IdentityCenterConfig(config) => {
+                let application_arn = match config.instance_arn.as_deref() {
+                    Some(instance_arn) => {
+                        let application_id = guard.mint_identity_center_application_id();
+                        st::identity_center_application_arn(instance_arn, &application_id)
+                    }
+                    None => None,
+                };
+                DescribedWebAppIdentityProviderDetails::IdentityCenterConfig(
+                    DescribedIdentityCenterConfig {
+                        application_arn,
+                        instance_arn: config.instance_arn,
+                        role: config.role,
+                    },
+                )
+            }
+        };
+
+        // `EndpointType` is not a request member: it is what the endpoint
+        // configuration selects — `VPC` for a web app whose endpoint is hosted in a
+        // VPC, `PUBLIC` for one with no VPC configuration at all. A VPC-hosted web app
+        // gets the `VpcEndpointId` of the endpoint this create makes for it;
+        // `DescribedWebAppVpcConfig` models no security group or IP address type, so
+        // the ones a caller may send are not reported by any reader.
+        let (endpoint_type, endpoint_details) = match input.endpoint_details {
+            Some(WebAppEndpointDetails::Vpc(vpc)) => {
+                let vpc_endpoint_id = guard.mint_id("vpce");
+                (
+                    st::WEB_APP_ENDPOINT_TYPE_VPC.to_string(),
+                    Some(DescribedWebAppEndpointDetails::Vpc(DescribedWebAppVpcConfig {
+                        subnet_ids: vpc.subnet_ids,
+                        vpc_id: vpc.vpc_id,
+                        vpc_endpoint_id: Some(vpc_endpoint_id),
+                    })),
+                )
+            }
+            None => (st::WEB_APP_ENDPOINT_TYPE_PUBLIC.to_string(), None),
+        };
+
+        let web_app = st::WebApp {
+            arn: st::web_app_arn(&region, &web_app_id),
+            identity_provider_details: Some(identity_provider_details),
+            // A create that named no custom URL takes the documented default, resolved
+            // once, here.
+            access_endpoint: input
+                .access_endpoint
+                .unwrap_or_else(|| st::default_access_endpoint(&web_app_endpoint)),
+            web_app_endpoint,
+            web_app_units: input.web_app_units,
+            web_app_endpoint_policy: input
+                .web_app_endpoint_policy
+                .unwrap_or_else(|| st::DEFAULT_WEB_APP_ENDPOINT_POLICY.to_string()),
+            endpoint_type,
+            endpoint_details,
+            tags: input.tags.unwrap_or_default(),
+            web_app_id: web_app_id.clone(),
+        };
+        guard.web_apps.insert(web_app_id.clone(), web_app);
+        drop(guard);
+
+        Ok(CreateWebAppOutput { web_app_id })
     }
 }
