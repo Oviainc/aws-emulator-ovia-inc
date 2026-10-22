@@ -15,5 +15,7 @@
 mod channel_lifecycle;
 #[path = "all/channel_policy.rs"]
 mod channel_policy;
+#[path = "all/channel_reset.rs"]
+mod channel_reset;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetChannelState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetChannelState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Records, on the addressed channel in [`crate::state`], the instant its
+//! ingest state was refreshed, and reports that instant with the channel's identity. A
+//! reset leaves the channel's CONFIGURATION alone, so `ModifiedAt` and the ETag — which
+//! track the configuration a conditional update races with — keep their values, and a
+//! later `GetChannel` reports the stored `ResetAt` byte for byte.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetChannelState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `handle` below is the implementation; `crate::state` holds the store it writes.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +162,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetChannelState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetChannelStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetChannelState"))
+        // A reset addresses an already-stored channel by name, and the ARN it answers
+        // with is the one that channel was created with, so nothing else about the
+        // request (its region included) takes part in it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ResetChannelStateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // A channel only exists inside its group, so an unresolved parent is reported as
+        // the resource that is actually missing rather than as a missing channel.
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(ResetChannelStateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel group {} not found",
+                        input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                },
+            )
+            .into());
+        };
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(ResetChannelStateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Channel {} not found in channel group {}",
+                        input.channel_name, input.channel_group_name
+                    )),
+                    resource_type_not_found: Some("CHANNEL".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The reset instant: the moment this call refreshed the channel's ingest stream.
+        // It is persisted, and OVERWRITTEN by each later reset, because the field records
+        // the LAST reset; the response reports exactly the value that was stored.
+        let reset_at = crate::state::now();
+        channel.reset_at = Some(reset_at);
+
+        Ok(ResetChannelStateOutput {
+            channel_group_name: channel.group_name.clone(),
+            channel_name: channel.name.clone(),
+            arn: channel.arn.clone(),
+            reset_at,
+        })
     }
 }

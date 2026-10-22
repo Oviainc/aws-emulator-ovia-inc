@@ -31,12 +31,15 @@ use smithy_server_runtime::MultiServiceRouter;
 const REGION: &str = "us-west-2";
 
 /// A MediaPackageV2 emulator plus a tiny restJson1 client for it.
-struct Emulator {
+///
+/// `pub(crate)` so the crate's other suites drive the emulator through this one client
+/// rather than each growing its own copy of it (see `tests/all/channel_reset.rs`).
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // This suite signs nothing: it exercises handler behaviour, not authentication.
@@ -49,7 +52,7 @@ impl Emulator {
 
     /// Send one request and return its status and parsed JSON body (`Value::Null` for an
     /// empty body).
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
@@ -81,7 +84,7 @@ impl Emulator {
         (status, parsed)
     }
 
-    async fn create_group(&self, name: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn create_group(&self, name: &str, body: Value) -> (u16, Value) {
         let mut body = body;
         body["ChannelGroupName"] = json!(name);
         self.call("POST", "/channelGroup", Some(body)).await
@@ -96,7 +99,7 @@ impl Emulator {
             .await
     }
 
-    async fn create_channel(&self, group: &str, name: &str, body: Value) -> (u16, Value) {
+    pub(crate) async fn create_channel(&self, group: &str, name: &str, body: Value) -> (u16, Value) {
         let mut body = body;
         body["ChannelName"] = json!(name);
         self.call(
@@ -107,7 +110,7 @@ impl Emulator {
         .await
     }
 
-    async fn get_channel(&self, group: &str, name: &str) -> (u16, Value) {
+    pub(crate) async fn get_channel(&self, group: &str, name: &str) -> (u16, Value) {
         self.call("GET", &format!("/channelGroup/{group}/channel/{name}/"), None)
             .await
     }
@@ -167,7 +170,7 @@ impl Emulator {
 }
 
 /// The `__type` discriminator of an error envelope.
-fn error_type(body: &Value) -> &str {
+pub(crate) fn error_type(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 
