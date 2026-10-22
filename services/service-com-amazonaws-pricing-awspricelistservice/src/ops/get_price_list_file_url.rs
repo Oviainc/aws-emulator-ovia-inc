@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPriceListFileUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPriceListFileUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPriceListFileUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves a stored `PriceListArn` and file format to the file's URL.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +147,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPriceListFileUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPriceListFileUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPriceListFileUrl"))
+        let state_handle = match crate::state::service_state(&*self.engine) {
+            Some(state) => state,
+            None => {
+                return Err(GetPriceListFileUrlErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the pricing catalog is unavailable".to_string()),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // The ARN is the identity of a stored price list — the one ListPriceLists
+        // reported — so an ARN the catalog does not hold names no resource. The lock is
+        // scoped to this read: opening the file listener below awaits.
+        let (known_arn, file_path, file_formats) = {
+            let state = state_handle.lock();
+            match state.price_lists.get(&input.price_list_arn) {
+                Some(record) => (
+                    true,
+                    record
+                        .path_for_format(&input.file_format)
+                        .map(str::to_string),
+                    record.file_formats.join(", "),
+                ),
+                None => (false, None, String::new()),
+            }
+        };
+
+        if !known_arn {
+            return Err(GetPriceListFileUrlErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no price list with ARN '{}'",
+                        input.price_list_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A known price list published in other formats than the one asked for is a bad
+        // parameter, not a missing resource.
+        let Some(file_path) = file_path else {
+            return Err(GetPriceListFileUrlErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "FileFormat '{}' is not published for this price list; available \
+                         formats are {file_formats}",
+                        input.file_format
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // The file is served by the emulator itself, on its own loopback listener, from
+        // this same catalog — so the URL is fetchable and never names a host outside the
+        // emulator. The listener is opened once and kept, so the URL for an
+        // (ARN, format) is the same on every call.
+        let Some(base_url) = crate::state::ensure_file_base_url(&*self.engine, &state_handle).await
+        else {
+            return Err(GetPriceListFileUrlErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some(
+                        "the price-list file listener could not be opened".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetPriceListFileUrlOutput {
+            url: Some(format!("{base_url}{file_path}")),
+        })
     }
 }

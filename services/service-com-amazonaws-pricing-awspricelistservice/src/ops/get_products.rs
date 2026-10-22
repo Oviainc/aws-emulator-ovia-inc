@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProducts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProducts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProducts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the stored product-offer documents that satisfy every supplied filter.
 //!
 //! ## Shape of an operation
 //!
@@ -163,20 +155,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProducts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProductsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProducts"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetProductsErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the pricing catalog is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        if let Some(requested) = input.format_version.as_deref() {
+            if requested != state.format_version {
+                return Err(GetProductsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "FormatVersion '{requested}' is not supported; this service \
+                             publishes '{}'",
+                            state.format_version
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let Some(catalog) = state.catalog(&input.service_code) else {
+            return Err(GetProductsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("service code '{}' not found", input.service_code)),
+            })
+            .into());
+        };
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        // The model declares `Filter.Type` as an enum, so the framework's constraint
+        // validation refuses an unknown type before this handler runs. Refusing it here
+        // too keeps the operation's own answer a modelled error rather than a silent
+        // "matches nothing" if the member is ever widened.
+        for filter in filters {
+            if !FILTER_TYPE_VALUES.contains(&filter.r#type.as_str()) {
+                return Err(GetProductsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "filter Type '{}' is not one of {}",
+                            filter.r#type,
+                            FILTER_TYPE_VALUES.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A product is returned only when it satisfies EVERY filter, each matched
+        // against the product's own stored attributes.
+        let matched: Vec<&crate::state::Product> = catalog
+            .products
+            .iter()
+            .filter(|product| {
+                filters
+                    .iter()
+                    .all(|filter| filter_matches(filter, catalog, product))
+            })
+            .collect();
+
+        // The token is bound to this exact query, filters included, so a token minted
+        // for one filter set cannot page through another.
+        let mut fingerprint_parts = vec![Self::NAME.to_string(), input.service_code.clone()];
+        for filter in filters {
+            fingerprint_parts.push(filter.r#type.clone());
+            fingerprint_parts.push(filter.field.clone());
+            fingerprint_parts.push(filter.value.clone());
+        }
+        let fingerprint_parts: Vec<&str> =
+            fingerprint_parts.iter().map(String::as_str).collect();
+        let fingerprint = crate::state::query_fingerprint(&fingerprint_parts);
+
+        let (page, next_token) = crate::state::paginate(
+            &matched,
+            &fingerprint,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            GetProductsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                message: Some("the pagination token is invalid".to_string()),
+            })
+        })?;
+
+        Ok(GetProductsOutput {
+            format_version: Some(state.format_version.clone()),
+            price_list: Some(
+                page.iter()
+                    .map(|product| product.offer_json.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// Whether `product` satisfies `filter`.
+///
+/// The field names a product metadata attribute, or the pseudo-field `ServiceCode`,
+/// which the model documents alongside the attribute names. The comparison is the one
+/// the filter's type documents: `TERM_MATCH`/`EQUALS` an exact value, `CONTAINS` a
+/// substring, and `ANY_OF`/`NONE_OF` membership of the filter's comma-separated list.
+fn filter_matches(
+    filter: &Filter,
+    catalog: &crate::state::ServiceCatalog,
+    product: &crate::state::Product,
+) -> bool {
+    let field_value: Option<&str> = if filter.field == "ServiceCode" {
+        Some(catalog.service_code.as_str())
+    } else {
+        product.attributes.get(&filter.field).map(String::as_str)
+    };
+
+    match filter.r#type.as_str() {
+        "TERM_MATCH" | "EQUALS" => field_value == Some(filter.value.as_str()),
+        "CONTAINS" => field_value.is_some_and(|value| value.contains(filter.value.as_str())),
+        "ANY_OF" => field_value.is_some_and(|value| any_of(&filter.value, value)),
+        // A product that carries the field at all must not hold one of the listed
+        // values; one that does not carry it holds none of them.
+        "NONE_OF" => field_value.is_none_or(|value| !any_of(&filter.value, value)),
+        _ => false,
+    }
+}
+
+/// Whether `value` is one of the comma-separated alternatives in `list`.
+fn any_of(list: &str, value: &str) -> bool {
+    list.split(',')
+        .map(str::trim)
+        .any(|alternative| alternative == value)
 }

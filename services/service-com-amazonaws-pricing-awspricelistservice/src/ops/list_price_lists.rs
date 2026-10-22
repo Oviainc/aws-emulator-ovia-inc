@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPriceLists
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPriceLists`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPriceLists::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the price-list references held for a service, currency and effective date.
 //!
 //! ## Shape of an operation
 //!
@@ -180,20 +172,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPriceLists` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPriceListsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPriceLists"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPriceListsErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the pricing catalog is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let state = state.lock();
+
+        // The modelled `^[A-Z]{3}$` is refused before this handler runs; what is left
+        // to refuse is a well-formed ISO-4217 code the Price List API does not publish
+        // price lists in at all. The accepted set belongs to the API rather than to
+        // this catalog's contents, so a supported currency the requested service has
+        // no list in is a legitimate empty page, not a bad parameter.
+        if !crate::state::PricingState::publishes_currency(&input.currency_code) {
+            return Err(ListPriceListsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "CurrencyCode '{}' is not a currency this API publishes price \
+                         lists in; supported currencies are {}",
+                        input.currency_code,
+                        crate::state::SUPPORTED_CURRENCY_CODES.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if state.catalog(&input.service_code).is_none() {
+            return Err(ListPriceListsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("service code '{}' not found", input.service_code)),
+            })
+            .into());
+        }
+
+        // A price list is in effect at the requested instant when it took effect on or
+        // before it; a RegionCode, when given, narrows the list to that Region.
+        let effective_at = input.effective_date.secs();
+        let matched: Vec<&crate::state::PriceListRecord> = state
+            .price_lists
+            .values()
+            .filter(|record| {
+                record.service_code == input.service_code
+                    && record.currency_code == input.currency_code
+                    && input.region_code.as_ref().is_none_or(|region| {
+                        record.region_code.as_deref() == Some(region.as_str())
+                    })
+                    && record.effective_epoch_secs() <= effective_at
+            })
+            .collect();
+
+        let fingerprint = crate::state::query_fingerprint(&[
+            Self::NAME,
+            &input.service_code,
+            &input.currency_code,
+            input.region_code.as_deref().unwrap_or(""),
+            &effective_at.to_string(),
+        ]);
+        let (page, next_token) = crate::state::paginate(
+            &matched,
+            &fingerprint,
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|_| {
+            ListPriceListsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                message: Some("the pagination token is invalid".to_string()),
+            })
+        })?;
+
+        Ok(ListPriceListsOutput {
+            price_lists: Some(
+                page.iter()
+                    .map(|record| PriceList {
+                        price_list_arn: Some(record.arn.clone()),
+                        region_code: record.region_code.clone(),
+                        currency_code: Some(record.currency_code.clone()),
+                        file_formats: Some(record.file_formats.clone()),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
