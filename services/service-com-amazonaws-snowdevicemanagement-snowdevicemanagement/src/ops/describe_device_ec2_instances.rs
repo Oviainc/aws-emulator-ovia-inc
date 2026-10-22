@@ -5,8 +5,9 @@
 //! device `managedDeviceId` names: one `InstanceSummary` for each requested
 //! `instanceIds` entry the cache holds, in the cache's own order, so neither the
 //! order nor the repetition of the requested ids changes the answer. A request
-//! addressed to a device this account does not have activated is refused by the
-//! device gate (`crate::state::…::gated_device`) with the modelled
+//! addressed to a device this account does not have activated in the signed Region
+//! — including every request to a Region with no activated device at all — is
+//! refused by the device gate (`crate::state::…::gated_device`) with the modelled
 //! `AccessDeniedException`, which discloses nothing about the id.
 //!
 //! ## Shape of an operation
@@ -162,13 +163,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        store.ensure_seeded(&region, now);
+        // The account-level device gate comes FIRST — before the clock-owed
+        // settlement and before the addressed id is resolved: a Region this
+        // account has activated no device in is refused without this call
+        // touching the store at all, exactly as the other gated operations are.
+        if !store.has_activated_device(&region) {
+            return Err(DescribeDeviceEc2InstancesErrorModeled::AccessDeniedException(
+                crate::state::no_devices_in_region(),
+            )
+            .into());
+        }
         store.settle(now);
 
-        // The device gate runs before the instance ids are looked at, so a request
-        // for a device the account does not manage is refused rather than answered
-        // with an empty list.
-        let device = match store.gated_device(&input.managed_device_id) {
+        // The device gate runs before the instance ids are looked at, and before
+        // the addressed id is resolved: a Region this account has activated no
+        // device in, and a device outside the Region's inventory, are the same
+        // refusal, so the caller learns nothing about the id it named.
+        let device = match store.gated_device(&region, &input.managed_device_id) {
             Ok(device) => device,
             Err(denied) => {
                 return Err(

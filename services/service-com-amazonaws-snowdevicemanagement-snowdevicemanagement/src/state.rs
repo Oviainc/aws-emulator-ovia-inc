@@ -3,12 +3,24 @@
 //! Engine state for the com-amazonaws-snowdevicemanagement-snowdevicemanagement service.
 //!
 //! Snow Device Management manages Amazon Web Services Snow Family devices that an
-//! account already ordered: the API models NO device-creation operation, so the
-//! device inventory is part of the emulator's own fixture and is seeded once, on
-//! the first call that touches the store ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::ensure_seeded`]).
+//! account already ordered with remote management enabled: the API models NO
+//! device-creation operation, so a device enters the inventory only through
+//! [`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::activate_devices`],
+//! never through a request. An account/region that has activated no device
+//! therefore holds an EMPTY inventory, which is the precondition the service's
+//! account-level device gate reports: every operation the model declares
+//! `AccessDeniedException` on is refused with [`no_devices_in_region`] before it
+//! resolves any id (see
+//! [`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::has_activated_device`]).
 //! Everything else in here is minted by a caller: `CreateTask` persists a [`Task`]
 //! plus one [`Execution`] per target, `CancelTask` moves them to `CANCELED`, and
 //! the reporting operations compute their answers from these records.
+//!
+//! The inventory and the tasks are REGIONAL, the way the service is: Snow Device
+//! Management reports "all devices on your Amazon Web Services account that have
+//! Amazon Web Services Snow Device Management enabled in the Amazon Web Services
+//! Region where the command is run", so a record carries the region it belongs to
+//! and is invisible — and ungated — in every other one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
@@ -17,7 +29,7 @@ use crate::ops::types::{
     AccessDeniedException, Capacity, CpuOptions, DeviceSummary, EbsInstanceBlockDevice,
     ExecutionSummary, Instance, InstanceBlockDeviceMapping, InstanceState, InstanceSummary,
     PhysicalNetworkInterface, ResourceNotFoundException, SecurityGroupIdentifier,
-    SoftwareInformation,
+    SoftwareInformation, TaskSummary,
 };
 
 /// The region an ARN is built for when the request carries no SigV4 credential
@@ -28,8 +40,8 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// (also its sigv4 signing name).
 pub const ARN_NAMESPACE: &str = "snow-device-management";
 
-/// The largest page `ListDevices` / `ListExecutions` serve, and the page size they
-/// use when the request names no `maxResults`: both model it
+/// The largest page `ListDevices` / `ListTasks` / `ListExecutions` serve, and the
+/// page size they use when the request names no `maxResults`: all three model it
 /// `@range(min: 1, max: 100)`.
 pub const PAGE_LIMIT: i32 = 100;
 
@@ -61,6 +73,11 @@ pub const DEVICE_RESOURCE_TYPE: &str = "managed-device";
 
 /// The `resourceType` segment a not-found message names for a task.
 pub const TASK_RESOURCE_TYPE: &str = "task";
+
+/// The `resourceType` segment a not-found message names for an execution. An
+/// execution is addressed by the `(taskId, managedDeviceId)` pair rather than by an
+/// id of its own, so that pair is what the message states.
+pub const EXECUTION_RESOURCE_TYPE: &str = "execution";
 
 /// The tag-key prefix AWS reserves for its own use.
 ///
@@ -94,18 +111,21 @@ pub const MAX_TAG_VALUE_LENGTH: usize = 256;
 /// not this prose.
 pub const TAG_RESOURCE_INVALID_ARN_MESSAGE: &str = "Invalid input resource arn";
 
-/// What the device gate ([`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::gated_device`])
-/// is refused with.
+/// What the account-level device gate ([`no_devices_in_region`],
+/// [`ComAmazonawsSnowdevicemanagementSnowdevicemanagementState::gated_device`]) is
+/// refused with.
 ///
-/// Recorded behaviour of the real service: a request addressed to a managed
-/// device the account does not have activated in the request's region is refused
-/// with `AccessDeniedException` (the model gives the shape and its `@httpError
-/// 403`; it gives no text), and the refusal names device/region availability
-/// rather than an IAM principal — it never says whether that id exists, which is
-/// why one message answers every such request.
+/// Recorded behaviour of the real service: a request to a Region where the account
+/// has no Snow device with Snow Device Management activated — or one addressed to a
+/// device outside that inventory — is refused with `AccessDeniedException` (the
+/// model gives the shape and its `@httpError 403`; it gives no text), and the
+/// refusal names device/region availability rather than an IAM principal: it never
+/// says whether that id exists, which is why one message answers every such
+/// request.
 pub const NO_DEVICES_MESSAGE: &str = "No devices found in this region.";
 
-/// The root device volume of every seeded Amazon EC2 instance.
+/// The root device volume of every Amazon EC2 instance the fixture places on a
+/// device.
 ///
 /// `Instance$rootDeviceName` is documented as "The device name of the root device
 /// volume (for example, `/dev/sda1`)", which is also the root device a Linux AMI
@@ -131,6 +151,9 @@ pub enum TaskCommand {
 pub struct Device {
     pub managed_device_id: String,
     pub managed_device_arn: String,
+    /// The Region this device has Snow Device Management enabled in. A request
+    /// signed for any other Region neither sees it nor is let past the gate by it.
+    pub region: String,
     /// "The type of Amazon Web Services Snow Family device."
     pub device_type: String,
     /// "The ID of the job used to order the device."
@@ -228,7 +251,7 @@ impl Ec2Instance {
                     name: Some(self.state_name.clone()),
                 }),
                 private_ip_address: Some(self.private_ip_address.clone()),
-                // A seeded instance is reachable on the device's internal
+                // A fixture instance is reachable on the device's internal
                 // network only: a Snow instance has a public address when the
                 // operator attaches a direct network interface to it, and this
                 // API models no way to ask for one.
@@ -278,6 +301,8 @@ impl Ec2Instance {
 pub struct Task {
     pub task_id: String,
     pub task_arn: String,
+    /// The Region the task was created in — the one its targets are managed in.
+    pub region: String,
     pub targets: Vec<String>,
     pub command: TaskCommand,
     pub description: Option<String>,
@@ -296,6 +321,16 @@ impl Task {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect()
+    }
+
+    /// The `TaskSummary` projection `ListTasks` returns.
+    pub fn to_summary(&self) -> TaskSummary {
+        TaskSummary {
+            task_id: self.task_id.clone(),
+            task_arn: Some(self.task_arn.clone()),
+            state: Some(self.state.clone()),
+            tags: Some(self.tag_map()),
+        }
     }
 }
 
@@ -348,68 +383,101 @@ pub struct ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     /// `DescribeExecution` addresses one by, and an order `ListExecutions`
     /// paginates over.
     pub executions: BTreeMap<(String, String), Execution>,
-    /// A `CreateTask` `clientToken` to the task that token created, so a repeated
-    /// create reports the first task instead of minting a second.
-    pub idempotency: HashMap<String, String>,
+    /// A `CreateTask` `clientToken` to the task that token created, keyed by the
+    /// `(region, clientToken)` pair the token was used in, so a repeated create
+    /// reports the first task instead of minting a second — and a token reused in
+    /// another Region, where that task does not exist, names nothing.
+    pub idempotency: HashMap<(String, String), String>,
     /// The counter task ids are minted from.
     pub task_id_seq: u64,
     /// The counter execution ids are minted from.
     pub execution_id_seq: u64,
-    /// Whether the device inventory has been seeded yet.
-    seeded: bool,
+    /// The counter managed-device ids are minted from.
+    device_id_seq: u64,
 }
 
-/// How many devices the fixture inventory holds.
-const SEEDED_DEVICE_COUNT: u64 = 3;
+/// The `AccessDeniedException` the account-level device gate answers with.
+///
+/// Every operation the model declares `AccessDeniedException` on consults the gate
+/// BEFORE resolving any id, so a caller of a Region with no activated device never
+/// learns whether a particular device or task id exists there.
+pub fn no_devices_in_region() -> AccessDeniedException {
+    AccessDeniedException {
+        message: NO_DEVICES_MESSAGE.to_string(),
+    }
+}
 
 impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
-    /// Seed the managed-device inventory, once per process.
+    /// Whether this account has any device with Snow Device Management activated in
+    /// `region` — the account-level precondition every device- and task-scoped
+    /// operation of this service is gated on.
+    pub fn has_activated_device(&self, region: &str) -> bool {
+        self.devices.values().any(|device| device.region == region)
+    }
+
+    /// The device `managed_device_id` names in `region`, or `None` when this
+    /// account manages no such device there.
+    pub fn device_in(&self, region: &str, managed_device_id: &str) -> Option<&Device> {
+        self.devices
+            .get(managed_device_id)
+            .filter(|device| device.region == region)
+    }
+
+    /// The task `task_id` names in `region`, or `None` when no such task was
+    /// created there.
+    pub fn task_in(&self, region: &str, task_id: &str) -> Option<&Task> {
+        self.tasks
+            .get(task_id)
+            .filter(|task| task.region == region)
+    }
+
+    /// Activate Snow Device Management on `count` devices in `region`, answering
+    /// the ids they were given.
     ///
-    /// Snow Device Management has no device-creation operation — a device becomes
-    /// manageable because the account ordered one — so the emulator ships an
-    /// inventory instead. It is seeded on the first call that touches the store
-    /// rather than at construction because the device ARNs name the region the
-    /// request was signed for, and the store is built before any request exists.
-    /// Ids, ARNs and job ids are derived from the device's index, so they are
-    /// stable for the life of the process.
-    pub fn ensure_seeded(&mut self, region: &str, now: SystemTime) {
-        if self.seeded {
-            return;
-        }
-        self.seeded = true;
-        for index in 0..SEEDED_DEVICE_COUNT {
-            let managed_device_id = seeded_device_id(index);
-            // Two of the three devices were ordered by the same job, so a
-            // `jobId` filter has both a multi-device and a single-device answer
-            // to compute.
-            let associated_with_job = seeded_job_id(index / 2);
+    /// This is the ONLY way a device enters the inventory, and it is deliberately
+    /// not reachable from a request: Snow Device Management models no
+    /// device-creation operation, because a device becomes manageable by being
+    /// ORDERED — a Snow Family job created with remote management enabled — which
+    /// is another service's API. Until something activates a device here, this
+    /// account's inventory in `region` is empty and every gated operation answers
+    /// [`no_devices_in_region`], which is what AWS answers for such an account.
+    ///
+    /// Ids, ARNs and job ids are the store's own: an id is minted from the
+    /// monotonic device counter (so it is unique across Regions), and two
+    /// consecutive devices share one ordering job, the way one job ships more than
+    /// one device.
+    pub fn activate_devices(&mut self, region: &str, count: u64, now: SystemTime) -> Vec<String> {
+        let mut activated = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        for _ in 0..count {
+            let index = self.device_id_seq;
+            self.device_id_seq += 1;
+            let managed_device_id = managed_device_id(index);
             let device = Device {
                 managed_device_arn: device_arn(&managed_device_id, region),
-                device_type: SEEDED_DEVICE_TYPES[usize::try_from(index)
-                    .expect("the seeded device count fits in usize")
-                    % SEEDED_DEVICE_TYPES.len()]
+                region: region.to_string(),
+                device_type: DEVICE_TYPES[usize::try_from(index % DEVICE_TYPES_LEN)
+                    .expect("an index modulo the type count fits in usize")]
                 .to_string(),
-                // Every seeded device is `LOCKED`: unlocking one is what an
-                // `unlock` task does, and a device AWS hands back already
-                // unlocked would make that task unobservable.
+                // A device Snow Device Management has just been activated on is
+                // `LOCKED`: unlocking one is what an `unlock` task does, and a
+                // device that arrived unlocked would make that task unobservable.
                 device_state: "LOCKED".to_string(),
                 physical_network_interfaces: vec![PhysicalNetworkInterface {
                     physical_network_interface_id: Some(format!("s.ni-{index:016x}")),
                     // `PhysicalConnectorType`'s values, cycled so the inventory
                     // is not uniform.
                     physical_connector_type: Some(
-                        SEEDED_CONNECTOR_TYPES[usize::try_from(index)
-                            .expect("the seeded device count fits in usize")
-                            % SEEDED_CONNECTOR_TYPES.len()]
+                        CONNECTOR_TYPES[usize::try_from(index % CONNECTOR_TYPES_LEN)
+                            .expect("an index modulo the connector count fits in usize")]
                         .to_string(),
                     ),
-                    // `IpAddressAssignment`: a seeded device holds a fixed
+                    // `IpAddressAssignment`: an activated device holds a fixed
                     // address, so it is `STATIC`.
                     ip_address_assignment: Some("STATIC".to_string()),
-                    ip_address: Some(format!("10.0.0.{}", index + 10)),
+                    ip_address: Some(format!("10.0.0.{}", index % 240 + 10)),
                     netmask: Some("255.255.255.0".to_string()),
                     default_gateway: Some("10.0.0.1".to_string()),
-                    mac_address: Some(format!("02:00:00:00:00:{:02x}", index + 1)),
+                    mac_address: Some(format!("02:00:00:00:00:{:02x}", index % 256)),
                 }],
                 device_capacities: vec![
                     Capacity {
@@ -429,37 +497,41 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
                 ],
                 software: SoftwareInformation {
                     installed_version: Some("1.0.0".to_string()),
-                    // Nothing is being installed on a seeded device, so there is
-                    // no version in flight and no install in progress.
+                    // Nothing is being installed on a device that just arrived, so
+                    // there is no version in flight and no install in progress.
                     installing_version: None,
                     install_state: Some("NA".to_string()),
                 },
                 tags: BTreeMap::new(),
                 last_reached_out_at: now,
                 last_updated_at: now,
-                associated_with_job,
-                ec2_instances: seeded_instances(index, now),
+                associated_with_job: ordering_job_id(index / 2),
+                ec2_instances: fixture_instances(index, now),
                 managed_device_id: managed_device_id.clone(),
             };
-            self.devices.insert(managed_device_id, device);
+            self.devices.insert(managed_device_id.clone(), device);
+            activated.push(managed_device_id);
         }
+        activated
     }
 
-    /// The managed device `managed_device_id` names, or the device gate's
-    /// refusal — [`NO_DEVICES_MESSAGE`] as an `AccessDeniedException`.
+    /// The managed device `managed_device_id` names in `region`, or the device
+    /// gate's refusal — [`NO_DEVICES_MESSAGE`] as an `AccessDeniedException`.
     ///
     /// Snow Device Management manages devices the account already ordered and
-    /// activated, so a request addressed to a device outside that inventory is
-    /// refused rather than resolved: the caller learns neither whether the id
-    /// exists nor anything about it. Every operation that takes a
-    /// `managedDeviceId` declares `AccessDeniedException` (`@httpError 403`),
-    /// which is what this refusal is reported as.
-    pub fn gated_device(&self, managed_device_id: &str) -> Result<&Device, AccessDeniedException> {
-        self.devices
-            .get(managed_device_id)
-            .ok_or_else(|| AccessDeniedException {
-                message: NO_DEVICES_MESSAGE.to_string(),
-            })
+    /// activated in a Region, so a request addressed to a device outside that
+    /// inventory is refused rather than resolved: the caller learns neither
+    /// whether the id exists nor anything about it, and a Region with no
+    /// activated device at all is refused the same way. Every operation that
+    /// takes a `managedDeviceId` declares `AccessDeniedException` (`@httpError
+    /// 403`), which is what this refusal is reported as.
+    pub fn gated_device(
+        &self,
+        region: &str,
+        managed_device_id: &str,
+    ) -> Result<&Device, AccessDeniedException> {
+        self.device_in(region, managed_device_id)
+            .ok_or_else(no_devices_in_region)
     }
 
     /// Mint an unused task id. `TaskId` is bounded 1..64 and otherwise
@@ -581,41 +653,49 @@ impl ComAmazonawsSnowdevicemanagementSnowdevicemanagementState {
     }
 }
 
-/// The ids of the seeded inventory, in `ListDevices` order.
+/// The id form a managed device carries.
 ///
 /// `ManagedDeviceId` is bounded 1..64 and otherwise unconstrained; `smd-` plus
-/// 16 hex digits is the shape AWS managed-device ids carry.
-pub fn seeded_device_id(index: u64) -> String {
+/// 16 hex digits is the shape AWS managed-device ids carry. The hex rendering of
+/// the store's counter keeps the ids in one stable total order, which is the order
+/// `ListDevices` pages over.
+pub fn managed_device_id(index: u64) -> String {
     format!("smd-{index:016x}")
 }
 
-/// The job ids the seeded inventory is associated with. `JobId` is bounded 1..64;
-/// `JID` plus a UUID is the shape Snow Family job ids carry.
-pub fn seeded_job_id(index: u64) -> String {
+/// The id form of the Snow Family job a device was ordered by. `JobId` is bounded
+/// 1..64; `JID` plus a UUID is the shape Snow Family job ids carry.
+pub fn ordering_job_id(index: u64) -> String {
     format!("JID{index:08x}-0000-4000-8000-{index:012x}")
 }
 
-/// The Snow Family device types the seeded inventory cycles through.
-const SEEDED_DEVICE_TYPES: &[&str] = &["SNC1_HDD", "SNC1_SSD", "EDGE_C"];
+/// The Snow Family device types an activated inventory cycles through.
+const DEVICE_TYPES: &[&str] = &["SNC1_HDD", "SNC1_SSD", "EDGE_C"];
+
+/// `DEVICE_TYPES`'s length, as the `u64` the index arithmetic needs.
+const DEVICE_TYPES_LEN: u64 = DEVICE_TYPES.len() as u64;
 
 /// `PhysicalConnectorType`'s values, as the model lists them.
-const SEEDED_CONNECTOR_TYPES: &[&str] = &["RJ45", "SFP_PLUS", "QSFP"];
+const CONNECTOR_TYPES: &[&str] = &["RJ45", "SFP_PLUS", "QSFP"];
 
-/// How many Amazon EC2 instances the fixture places on each seeded device, by
+/// `CONNECTOR_TYPES`'s length, as the `u64` the index arithmetic needs.
+const CONNECTOR_TYPES_LEN: u64 = CONNECTOR_TYPES.len() as u64;
+
+/// How many Amazon EC2 instances the fixture places on each activated device, by
 /// device index.
 ///
 /// The counts differ so an answer computed from the device's own cache is
-/// distinguishable from one computed from the whole inventory, and the last
+/// distinguishable from one computed from the whole inventory, and the third
 /// device runs none: a device with no instances answers an empty list, not an
 /// error.
-const SEEDED_INSTANCE_COUNTS: &[u64] = &[4, 2, 0];
+const FIXTURE_INSTANCE_COUNTS: &[u64] = &[4, 2, 0];
 
 /// `InstanceStateName`'s values, each with the `InstanceState$code` the model
 /// documents for it ("the valid values for the instance state code" — `0`:
 /// pending, `16`: running, `32`: shutting-down, `48`: terminated, `64`:
 /// stopping, `80`: stopped). The fixture cycles through the whole set, so every
 /// published name/code pair appears in some instance.
-const SEEDED_INSTANCE_STATES: &[(&str, i32)] = &[
+const FIXTURE_INSTANCE_STATES: &[(&str, i32)] = &[
     ("PENDING", 0),
     ("RUNNING", 16),
     ("SHUTTING_DOWN", 32),
@@ -627,57 +707,58 @@ const SEEDED_INSTANCE_STATES: &[(&str, i32)] = &[
 /// The Snow Family compute instance types the fixture cycles through, each with
 /// the number of vCPUs it has, as the Snowball Edge developer guide's
 /// instance-type table lists them (`sbe-c` is the Compute Optimized family).
-const SEEDED_INSTANCE_TYPES: &[(&str, i32)] = &[
+const FIXTURE_INSTANCE_TYPES: &[(&str, i32)] = &[
     ("sbe-c.large", 2),
     ("sbe-c.xlarge", 4),
     ("sbe-c.2xlarge", 8),
     ("sbe-c.4xlarge", 16),
 ];
 
-/// The id of the seeded instance at `index` in the whole fixture.
+/// The id of the fixture instance at `index` in the whole inventory.
 ///
 /// A Snow device's local Amazon EC2 resources carry the EC2 id shape behind an
-/// `s.` prefix (the same prefix the seeded physical network interfaces use):
+/// `s.` prefix (the same prefix the activated physical network interfaces use):
 /// `s.i-` plus 17 hex digits for an instance.
-pub fn seeded_instance_id(index: u64) -> String {
+pub fn instance_id(index: u64) -> String {
     format!("s.i-{index:017x}")
 }
 
 /// The ids of the instances the fixture places on the device at `device_index`,
 /// in the order the device cache holds them (which is their id order, so a
 /// caller's request order cannot be what an answer's order comes from).
-pub fn seeded_instance_ids(device_index: u64) -> Vec<String> {
-    let offset = seeded_instance_offset(device_index);
-    (0..seeded_instance_count(device_index))
-        .map(|slot| seeded_instance_id(offset + slot))
+pub fn device_instance_ids(device_index: u64) -> Vec<String> {
+    let offset = instance_offset(device_index);
+    (0..instance_count(device_index))
+        .map(|slot| instance_id(offset + slot))
         .collect()
 }
 
 /// How many instances the fixture places on the device at `device_index`.
-fn seeded_instance_count(device_index: u64) -> u64 {
+fn instance_count(device_index: u64) -> u64 {
     usize::try_from(device_index)
         .ok()
-        .and_then(|index| SEEDED_INSTANCE_COUNTS.get(index))
+        .and_then(|index| FIXTURE_INSTANCE_COUNTS.get(index))
         .copied()
         .unwrap_or(0)
 }
 
 /// How many instances the fixture placed on the devices before `device_index`,
 /// which is where that device's instance ids start.
-fn seeded_instance_offset(device_index: u64) -> u64 {
-    (0..device_index).map(seeded_instance_count).sum()
+fn instance_offset(device_index: u64) -> u64 {
+    (0..device_index).map(instance_count).sum()
 }
 
 /// The Amazon EC2 instances the fixture places on the device at `device_index`.
-fn seeded_instances(device_index: u64, now: SystemTime) -> BTreeMap<String, Ec2Instance> {
-    let offset = seeded_instance_offset(device_index);
+fn fixture_instances(device_index: u64, now: SystemTime) -> BTreeMap<String, Ec2Instance> {
+    let offset = instance_offset(device_index);
     let mut instances = BTreeMap::new();
-    for slot in 0..seeded_instance_count(device_index) {
+    for slot in 0..instance_count(device_index) {
         let index = usize::try_from(offset + slot).expect("the fixture instance count fits usize");
         let launch_index = i32::try_from(slot).expect("the per-device instance count fits in i32");
-        let (state_name, state_code) = SEEDED_INSTANCE_STATES[index % SEEDED_INSTANCE_STATES.len()];
-        let (instance_type, vcpus) = SEEDED_INSTANCE_TYPES[index % SEEDED_INSTANCE_TYPES.len()];
-        let instance_id = seeded_instance_id(offset + slot);
+        let (state_name, state_code) =
+            FIXTURE_INSTANCE_STATES[index % FIXTURE_INSTANCE_STATES.len()];
+        let (instance_type, vcpus) = FIXTURE_INSTANCE_TYPES[index % FIXTURE_INSTANCE_TYPES.len()];
+        let instance_id = instance_id(offset + slot);
         instances.insert(
             instance_id.clone(),
             Ec2Instance {
@@ -873,8 +954,8 @@ pub enum ArnRefusal {
 /// `@length(min: 1, max: 64)`. Anything else never named a resource of this
 /// service — [`ArnRefusal::Malformed`]. A well-formed ARN for another account is
 /// [`ArnRefusal::ForeignAccount`]; one for this account resolves to the id a
-/// caller's record is keyed by, whatever region the ARN names, because the
-/// inventory and the task store are per-account.
+/// caller's record is keyed by, whatever region the ARN names, because a device id
+/// and a task id are unique across the account's regions.
 pub fn parse_tagged_resource_arn(resource_arn: &str) -> Result<TaggedResource, ArnRefusal> {
     let malformed = || ArnRefusal::Malformed(INVALID_RESOURCE_ARN_MESSAGE.to_string());
 
