@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMultiplexProgram
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMultiplexProgram`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMultiplexProgram::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the program is stored in the multiplex the request names (the
+//! `programs` of that multiplex's record in the `multiplexes` slice of [`crate::state`])
+//! and every value the response carries is read back out of the stored record or derived
+//! from the rest of the store, never built from the request in flight. A retry carrying
+//! the same `@idempotencyToken` `RequestId` answers with the program the first call
+//! created.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +156,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMultiplexProgram` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMultiplexProgramErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMultiplexProgram"))
+        // A multiplex program has no ARN and no id of its own — it is named by
+        // its multiplex and its `ProgramName` — so nothing here depends on the
+        // region the request was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Transitions the clock had already made due were owed whether or not
+        // this create ran, so they are materialised before anything is read:
+        // a multiplex whose delete has come due holds no new program.
+        state.settle(now);
+
+        // A retried create (same `@idempotencyToken` `RequestId`) must answer
+        // with the program the first one created, not a second program.
+        if let Some((multiplex_id, program_name)) =
+            state.multiplex_program_for_token(&input.request_id)
+        {
+            let program = state
+                .multiplex_program_description(&multiplex_id, &program_name)
+                .ok_or_else(unavailable)?;
+            return Ok(CreateMultiplexProgramOutput {
+                multiplex_program: Some(program),
+            });
+        }
+
+        // The published settings ranges and lengths, the documented mutual
+        // exclusion inside `VideoSettings`, the multiplex's state, the two
+        // uniqueness rules, the per-multiplex cap and the insert are one step in
+        // the state slice, so this handler cannot check one of them and write
+        // past another.
+        state
+            .insert_multiplex_program(
+                &input.multiplex_id,
+                input.program_name.clone(),
+                input.multiplex_program_settings,
+            )
+            .map_err(|refusal| refused(refusal, &input.multiplex_id, &input.program_name))?;
+        // Bounded, evicting write: a caller-chosen token can neither accumulate
+        // past the cap nor resolve to anything once the program it created is
+        // gone (`multiplex_program_for_token` answers only for a program that
+        // exists).
+        state.record_multiplex_program_token(
+            input.request_id,
+            &input.multiplex_id,
+            &input.program_name,
+        );
+
+        let program = state
+            .multiplex_program_description(&input.multiplex_id, &input.program_name)
+            .ok_or_else(unavailable)?;
+        Ok(CreateMultiplexProgramOutput {
+            multiplex_program: Some(program),
+        })
     }
+}
+
+/// Turn a store refusal into this operation's own modelled error.
+///
+/// A settings value outside the range or the length the model publishes for it,
+/// and `VideoSettings` defining both of the two alternatives its documentation
+/// makes exclusive, are bad requests, and the message names the member, the rule
+/// and the value the request carried so the caller can fix the request from that
+/// text alone. A name or a program number another program of the same multiplex
+/// already holds is a conflict with the state, as is a multiplex that is going
+/// away. A full multiplex is this emulator's own ceiling — a throttle, not a
+/// fault in the request.
+///
+/// This operation models NO `NotFoundException`
+/// (`smithy_query(query="operation", operation="CreateMultiplexProgram")`), so a
+/// `MultiplexId` naming no stored multiplex is answered with the modelled client
+/// error for a request that cannot be satisfied, carrying the same wording every
+/// reader of this service uses for a resource that is not there.
+fn refused(
+    refusal: crate::state::MultiplexProgramRefusal,
+    multiplex_id: &str,
+    program_name: &str,
+) -> CreateMultiplexProgramError {
+    use crate::state::MultiplexProgramRefusal as Refusal;
+    match refusal {
+        Refusal::MultiplexNotFound => {
+            CreateMultiplexProgramErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::not_found_message("Multiplex", multiplex_id)),
+            })
+        }
+        Refusal::MultiplexGone(state) => {
+            CreateMultiplexProgramErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Multiplex {multiplex_id} is {state}; no program can be created in it"
+                )),
+            })
+        }
+        Refusal::ProgramNameInUse => {
+            CreateMultiplexProgramErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Multiplex {multiplex_id} already has a program named {program_name}"
+                )),
+            })
+        }
+        Refusal::ProgramNumberInUse {
+            program_number,
+            held_by,
+        } => CreateMultiplexProgramErrorModeled::ConflictException(ConflictException {
+            message: Some(format!(
+                "multiplexProgramSettings.programNumber {program_number} is already used by the program {held_by} of multiplex {multiplex_id}"
+            )),
+        }),
+        Refusal::SettingOutOfRange {
+            member,
+            value,
+            min,
+            max,
+        } => CreateMultiplexProgramErrorModeled::BadRequestException(BadRequestException {
+            message: Some(format!(
+                "multiplexProgramSettings.{member} must be between {min} and {max}, got {value}"
+            )),
+        }),
+        Refusal::SettingTooLong {
+            member,
+            length,
+            max,
+        } => CreateMultiplexProgramErrorModeled::BadRequestException(BadRequestException {
+            message: Some(format!(
+                "multiplexProgramSettings.{member} must be at most {max} characters, got {length}"
+            )),
+        }),
+        Refusal::VideoSettingsOverSpecified => {
+            CreateMultiplexProgramErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "multiplexProgramSettings.videoSettings must define exactly one of constantBitrate and statmuxSettings"
+                        .to_string(),
+                ),
+            })
+        }
+        Refusal::MultiplexFull => {
+            CreateMultiplexProgramErrorModeled::TooManyRequestsException(TooManyRequestsException {
+                message: Some(format!(
+                    "This emulator stores at most {} programs in one multiplex; delete one before creating another",
+                    crate::state::MAX_MULTIPLEX_PROGRAMS
+                )),
+            })
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the program in. A modelled server error, never
+/// a fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateMultiplexProgramError {
+    CreateMultiplexProgramErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

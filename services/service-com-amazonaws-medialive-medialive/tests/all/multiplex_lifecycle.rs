@@ -17,8 +17,9 @@ use crate::wire::{call, error_code, medialive, ACCOUNT};
 
 /// The collection URI `CreateMultiplex` is bound to
 /// (`smithy_query(query="operation", operation="CreateMultiplex")`:
-/// `POST /prod/multiplexes`).
-const MULTIPLEXES: &str = "/prod/multiplexes";
+/// `POST /prod/multiplexes`). Shared with the multiplex PROGRAM suite, which
+/// builds its own URIs under one multiplex of this collection.
+pub(crate) const MULTIPLEXES: &str = "/prod/multiplexes";
 
 /// The published bounds of `MultiplexSettings$TransportStreamBitrate`, from its
 /// target shape `__integerMin1000000Max100000000`
@@ -52,7 +53,7 @@ const RANGED_SETTINGS: [(&str, (i64, i64)); 4] = [
 
 /// The two members `MultiplexSettings` requires, at the low end of their
 /// published ranges: the row's own values are what each test varies.
-fn settings(bitrate: i64, transport_stream_id: i64) -> Value {
+pub(crate) fn settings(bitrate: i64, transport_stream_id: i64) -> Value {
     json!({
         "transportStreamBitrate": bitrate,
         "transportStreamId": transport_stream_id,
@@ -62,7 +63,7 @@ fn settings(bitrate: i64, transport_stream_id: i64) -> Value {
 /// A `CreateMultiplex` body carrying the two availability zones the member
 /// documents, so a test that is not about the zone count does not have to spell
 /// them.
-fn create_body(name: &str, request_id: &str, multiplex_settings: Value) -> Value {
+pub(crate) fn create_body(name: &str, request_id: &str, multiplex_settings: Value) -> Value {
     json!({
         "name": name,
         "requestId": request_id,
@@ -93,7 +94,7 @@ async fn create_multiplex(router: &MultiServiceRouter, body: Value) -> (u16, Val
 }
 
 /// A created multiplex, with the create itself asserted to have succeeded.
-async fn created(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
+pub(crate) async fn created(router: &MultiServiceRouter, case: &str, body: Value) -> Value {
     let (status, multiplex) = create_multiplex(router, body).await;
     assert_eq!(
         status, 201,
@@ -104,7 +105,7 @@ async fn created(router: &MultiServiceRouter, case: &str, body: Value) -> Value 
 
 /// `DescribeMultiplex`: its status and body. The description is the response
 /// itself, not a wrapper member.
-async fn describe_multiplex(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
+pub(crate) async fn describe_multiplex(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
     call(router, "GET", &format!("{MULTIPLEXES}/{id}"), None).await
 }
 
