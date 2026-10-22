@@ -340,10 +340,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(StartTranscriptionJobErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "The requested job name {} already exists. Use a different job name \
-                         and try your request again.",
-                        input.transcription_job_name
+                    // The kind, not the caller's name — see
+                    // [`crate::state::name_already_exists_message`].
+                    message: Some(crate::state::name_already_exists_message(
+                        crate::state::KIND_JOB,
                     )),
                 },
             )

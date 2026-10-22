@@ -183,12 +183,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(tags) = store.tags(&resource) else {
-            return Err(ListTagsForResourceErrorModeled::NotFoundException(
-                NotFoundException {
-                    message: Some(format!(
-                        "The requested resource {} couldn't be found. Check the ARN and try \
-                         your request again.",
-                        input.resource_arn
+            // An ARN that names no resource this account holds is this service's
+            // `BadRequestException` — the shape its recorded not-found responses
+            // carry — not the modelled `NotFoundException`, and the message names the
+            // KIND of resource the ARN's type segment denotes.
+            return Err(ListTagsForResourceErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::not_found_message(
+                        crate::state::resource_kind(&resource.resource_type),
                     )),
                 },
             )
