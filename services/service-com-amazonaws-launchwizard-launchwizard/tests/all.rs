@@ -23,3 +23,5 @@ mod state_roundtrip;
 mod validation_messages;
 #[path = "all/workload_catalogue.rs"]
 mod workload_catalogue;
+#[path = "all/workload_deployment_patterns.rs"]
+mod workload_deployment_patterns;

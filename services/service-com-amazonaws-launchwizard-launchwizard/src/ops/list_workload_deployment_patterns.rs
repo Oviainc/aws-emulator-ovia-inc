@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkloadDeploymentPatterns
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkloadDeploymentPatterns`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkloadDeploymentPatterns::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the deployment patterns a workload of the seeded catalogue in
+//! [`crate::state`] offers, one page at a time. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +148,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkloadDeploymentPatterns` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkloadDeploymentPatternsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkloadDeploymentPatterns"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWorkloadDeploymentPatternsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Launch Wizard state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // `@readonly`: a page is a pure read of the seeded catalogue. The workload is
+        // resolved first, so a name the catalogue does not hold is a 404 rather than an
+        // empty list — an empty list means "this workload offers no pattern".
+        let summaries: Vec<WorkloadDeploymentPatternDataSummary> = {
+            let store = state.lock();
+            let Some(workload) = store.workloads.get(&input.workload_name) else {
+                return Err(
+                    ListWorkloadDeploymentPatternsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::WORKLOAD_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // `patterns` is keyed by `deploymentPatternName`, so the patterns are
+            // reported in that order and a token resumes after the one the previous
+            // page ended on.
+            workload
+                .patterns
+                .values()
+                .map(crate::state::DeploymentPattern::to_summary)
+                .collect()
+        };
+
+        let (page, next_token) = crate::state::paginate(
+            summaries,
+            input.max_results,
+            input.next_token.as_deref(),
+            |pattern| pattern.deployment_pattern_name.clone().unwrap_or_default(),
+        )
+        .map_err(|message| {
+            ListWorkloadDeploymentPatternsErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        })?;
+
+        Ok(ListWorkloadDeploymentPatternsOutput {
+            workload_deployment_patterns: Some(page),
+            next_token,
+        })
     }
 }
