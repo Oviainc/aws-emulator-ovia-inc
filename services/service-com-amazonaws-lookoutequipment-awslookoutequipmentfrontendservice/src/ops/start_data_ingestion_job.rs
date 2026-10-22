@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDataIngestionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDataIngestionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDataIngestionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists a new ingestion job against an existing dataset and records the job's input
+//! configuration and role on the parent dataset, so both are observable through
+//! `DescribeDataset` and `DescribeDataIngestionJob`. The job starts `IN_PROGRESS` and the
+//! dataset moves to `INGESTION_IN_PROGRESS`; the clock owes both their settled values one
+//! [`crate::state::TRANSITION_SPAN`] later.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +164,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDataIngestionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDataIngestionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDataIngestionJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartDataIngestionJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the lookoutequipment store is unavailable on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        guard.settle(now);
+
+        // The job belongs to a dataset, so an unknown name is a 404 and nothing is stored.
+        let Some(dataset) = guard.datasets.get(&input.dataset_name) else {
+            return Err(StartDataIngestionJobErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("dataset {} was not found", input.dataset_name),
+                },
+            )
+            .into());
+        };
+        let dataset_arn = dataset.arn.clone();
+        let dataset_in_transition = dataset.is_in_transition();
+        let jobs_on_dataset = dataset.ingestion_job_ids.len();
+
+        // `ClientToken` is `@idempotencyToken`: replaying one answers with the job it
+        // started the first time, rather than starting a second ingestion.
+        let replayed = guard
+            .replayed(
+                crate::state::OP_START_DATA_INGESTION_JOB,
+                &input.client_token,
+            )
+            .map(str::to_string);
+        if let Some(job_id) = replayed {
+            match guard.ingestion_jobs.get(&job_id) {
+                Some(job) if job.dataset_name == input.dataset_name => {
+                    return Ok(StartDataIngestionJobOutput {
+                        job_id: Some(job.job_id.clone()),
+                        status: Some(job.status.clone()),
+                    });
+                }
+                Some(job) => {
+                    return Err(StartDataIngestionJobErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "ClientToken was already used to start an ingestion job on \
+                                 dataset {}, so it cannot start one on dataset {}",
+                                job.dataset_name, input.dataset_name
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                None => {}
+            }
+        }
+
+        // A dataset with an ingestion still owed cannot take another one: the request
+        // conflicts with the current state of the target resource, which is what
+        // `ConflictException` reports.
+        if dataset_in_transition {
+            return Err(StartDataIngestionJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "dataset {} is {}, so another data ingestion job cannot start yet",
+                        input.dataset_name,
+                        crate::state::DATASET_STATUS_INGESTION_IN_PROGRESS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Both ingestion stores are bounded, so a caller looping on start cannot grow this
+        // process's memory without limit: past either ceiling the start is refused with
+        // the modelled "Resource limitations have been exceeded".
+        if jobs_on_dataset >= crate::state::MAX_INGESTION_JOBS_PER_DATASET {
+            return Err(
+                StartDataIngestionJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "dataset {} already holds the maximum of {} data ingestion jobs",
+                            input.dataset_name,
+                            crate::state::MAX_INGESTION_JOBS_PER_DATASET
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        if guard.ingestion_jobs.len() >= crate::state::MAX_INGESTION_JOBS {
+            return Err(
+                StartDataIngestionJobErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "an account may hold at most {} data ingestion jobs in a Region",
+                            crate::state::MAX_INGESTION_JOBS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut job_id = guard.mint_job_id();
+        while guard.ingestion_jobs.contains_key(&job_id) {
+            job_id = guard.mint_job_id();
+        }
+        let due_at = now + crate::state::TRANSITION_SPAN;
+
+        guard.ingestion_jobs.insert(
+            job_id.clone(),
+            crate::state::IngestionJobRecord {
+                job_id: job_id.clone(),
+                dataset_name: input.dataset_name.clone(),
+                dataset_arn,
+                ingestion_input_configuration: input.ingestion_input_configuration.clone(),
+                role_arn: input.role_arn.clone(),
+                created_at: now,
+                status: crate::state::INGESTION_STATUS_IN_PROGRESS.to_string(),
+                pending: Some(crate::state::PendingTransition {
+                    to: crate::state::INGESTION_STATUS_SUCCESS.to_string(),
+                    due_at,
+                }),
+                client_token: input.client_token.clone(),
+            },
+        );
+
+        // The side effect on the parent dataset: the ingestion configuration and role of
+        // this call become the dataset's, and its status moves to the transient one with
+        // `ACTIVE` owed to the clock.
+        if let Some(dataset) = guard.datasets.get_mut(&input.dataset_name) {
+            dataset.ingestion_input_configuration =
+                Some(input.ingestion_input_configuration.clone());
+            dataset.role_arn = Some(input.role_arn.clone());
+            dataset.status = crate::state::DATASET_STATUS_INGESTION_IN_PROGRESS.to_string();
+            dataset.last_updated_at = now;
+            dataset.pending = Some(crate::state::PendingTransition {
+                to: crate::state::DATASET_STATUS_ACTIVE.to_string(),
+                due_at,
+            });
+            dataset.ingestion_job_ids.push(job_id.clone());
+        }
+        guard.note_pending_job(&job_id);
+        guard.note_pending_dataset(&input.dataset_name);
+
+        guard.remember(
+            crate::state::OP_START_DATA_INGESTION_JOB,
+            &input.client_token,
+            &job_id,
+        );
+
+        // Answer from the STORED job, so this body is the one `DescribeDataIngestionJob`
+        // answers with.
+        let stored = guard
+            .ingestion_jobs
+            .get(&job_id)
+            .expect("the ingestion job was just inserted");
+        Ok(StartDataIngestionJobOutput {
+            job_id: Some(stored.job_id.clone()),
+            status: Some(stored.status.clone()),
+        })
     }
 }

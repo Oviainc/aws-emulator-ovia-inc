@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the dataset held in [`crate::state`] — the ARN, timestamps, status, inline
+//! schema, KMS key and the ingestion configuration a `StartDataIngestionJob` recorded.
+//! An unknown name is the modelled `ResourceNotFoundException` (404), never an empty 200.
+//!
+//! Reporting, not mutating: `settle` only materialises the status change the clock had
+//! already made due at this instant.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +185,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDataset"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeDatasetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the lookoutequipment store is unavailable on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        let Some(record) = guard.datasets.get(&input.dataset_name) else {
+            return Err(DescribeDatasetErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("dataset {} was not found", input.dataset_name),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeDatasetOutput {
+            dataset_name: Some(record.name.clone()),
+            dataset_arn: Some(record.arn.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(record.created_at)),
+            last_updated_at: Some(::aws_smithy_types::DateTime::from(record.last_updated_at)),
+            status: Some(record.status.clone()),
+            schema: record.schema.clone(),
+            server_side_kms_key_id: record.server_side_kms_key_id.clone(),
+            ingestion_input_configuration: record.ingestion_input_configuration.clone(),
+            role_arn: record.role_arn.clone(),
+            data_start_time: record.data_start_time.map(::aws_smithy_types::DateTime::from),
+            data_end_time: record.data_end_time.map(::aws_smithy_types::DateTime::from),
+            source_dataset_arn: record.source_dataset_arn.clone(),
+            // `DataQualitySummary` and `IngestedFilesSummary` are measurements of the
+            // sensor data an ingestion read. This emulator ingests no S3 objects, so it
+            // has nothing measured to report and synthesises neither; the same is why
+            // `DataStartTime` / `DataEndTime` stay absent until something sets them.
+            data_quality_summary: None,
+            ingested_files_summary: None,
+        })
     }
 }

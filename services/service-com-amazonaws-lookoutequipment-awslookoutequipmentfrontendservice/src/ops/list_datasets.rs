@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatasets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatasets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatasets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the datasets actually held in [`crate::state`], in name order, honouring
+//! the `DatasetNameBeginsWith` prefix filter and capping the page at `MaxResults`. A
+//! `NextToken` is emitted only when datasets remain, and resumes exactly where the page
+//! ended.
+//!
+//! Reporting, not mutating: `settle` only materialises the status changes the clock had
+//! already made due at this instant.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +153,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatasets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatasetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatasets"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDatasetsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the lookoutequipment store is unavailable on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A `NextToken` this service never minted cannot name a position to resume from;
+        // `ListDatasets` models no pagination-specific error, so it is a `ValidationException`.
+        let Ok(after) = crate::state::decode_cursor(input.next_token.as_deref()) else {
+            return Err(ListDatasetsErrorModeled::ValidationException(
+                ValidationException {
+                    message: "NextToken is not a token this service issued".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        let prefix = input.dataset_name_begins_with.unwrap_or_default();
+        let ordered: Vec<(String, crate::ops::types::DatasetSummary)> = guard
+            .datasets
+            .iter()
+            .filter(|(name, _)| name.starts_with(&prefix))
+            .map(|(name, record)| (name.clone(), record.to_summary()))
+            .collect();
+
+        let page = crate::state::page_of(ordered, after.as_deref(), input.max_results);
+
+        Ok(ListDatasetsOutput {
+            dataset_summaries: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }
