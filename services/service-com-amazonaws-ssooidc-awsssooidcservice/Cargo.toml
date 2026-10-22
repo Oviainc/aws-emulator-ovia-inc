@@ -28,6 +28,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `time` so an integration test can await the clock-owed device-authorization
+# approval without blocking the test runtime's worker.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

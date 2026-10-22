@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDeviceAuthorization
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDeviceAuthorization`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDeviceAuthorization::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates and persists a device authorization for an authenticated client: the
+//! verification codes RFC 8628's device grant hands a device, which `CreateToken` then
+//! resolves by `deviceCode`.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +91,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as st;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -132,6 +128,11 @@ impl From<StartDeviceAuthorizationErrorModeled> for StartDeviceAuthorizationErro
     fn from(modeled: StartDeviceAuthorizationErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// Lifts one of this operation's modeled failures into its error channel.
+fn modeled(error: StartDeviceAuthorizationErrorModeled) -> StartDeviceAuthorizationError {
+    error.into()
 }
 
 /// The `StartDeviceAuthorization` operation.
@@ -170,18 +171,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDeviceAuthorization` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDeviceAuthorizationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDeviceAuthorization"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            modeled(StartDeviceAuthorizationErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("server_error".to_string()),
+                    error_description: Some(
+                        "the service state for AWS SSO OIDC is unavailable".to_string(),
+                    ),
+                },
+            ))
+        })?;
+
+        // `startUrl` is the portal the user is sent to, so it must be a URI the
+        // user agent can actually open.
+        if !st::is_absolute_uri(&input.start_url) {
+            return Err(modeled(
+                StartDeviceAuthorizationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        error: Some("invalid_request".to_string()),
+                        reason: None,
+                        error_description: Some(format!(
+                            "startUrl '{}' is not an absolute URI",
+                            input.start_url
+                        )),
+                    },
+                ),
+            ));
+        }
+
+        let now = SystemTime::now();
+        let region = st::request_region(ctx.parts());
+        let mut store = state.lock();
+        // Reclaim the authorizations that can no longer be exchanged. The store's
+        // capacity is checked further down, just before the record is inserted:
+        // a caller presenting a bad pair must learn that, not that the store is
+        // full.
+        store.purge_spent_device_authorizations(now);
+
+        // The pair must authenticate against a registration this service minted:
+        // an unknown `clientId` or a wrong `clientSecret` is `invalid_client`.
+        let client = match store.authenticate_client(&input.client_id, &input.client_secret, now) {
+            Ok(client) => client,
+            Err(failure) => {
+                return Err(modeled(
+                    StartDeviceAuthorizationErrorModeled::InvalidClientException(
+                        InvalidClientException {
+                            error: Some("invalid_client".to_string()),
+                            error_description: Some(failure.description().to_string()),
+                        },
+                    ),
+                ))
+            }
+        };
+        // Starting the device flow is the device-code grant, so a registration
+        // that restricted its grants to others may not start one.
+        if !client.allows_grant(st::GRANT_TYPE_DEVICE_CODE) {
+            return Err(modeled(
+                StartDeviceAuthorizationErrorModeled::UnauthorizedClientException(
+                    UnauthorizedClientException {
+                        error: Some("unauthorized_client".to_string()),
+                        error_description: Some(format!(
+                            "the client is not registered for the {} grant",
+                            st::GRANT_TYPE_DEVICE_CODE
+                        )),
+                    },
+                ),
+            ));
+        }
+
+        // This authorization adds a record to the store, so refuse here — after
+        // the pair authenticated — rather than grow it past its bound.
+        if !store.has_room_for_device_authorization() {
+            return Err(modeled(
+                StartDeviceAuthorizationErrorModeled::SlowDownException(SlowDownException {
+                    error: Some("slow_down".to_string()),
+                    error_description: Some(format!(
+                        "the service is holding its maximum of {} device authorizations; retry later",
+                        st::MAX_DEVICE_AUTHORIZATIONS
+                    )),
+                }),
+            ));
+        }
+
+        let user_code = match store.fresh_user_code() {
+            Some(user_code) => user_code,
+            None => {
+                return Err(modeled(
+                    StartDeviceAuthorizationErrorModeled::SlowDownException(SlowDownException {
+                        error: Some("slow_down".to_string()),
+                        error_description: Some(
+                            "the service could not mint a free user code; retry later".to_string(),
+                        ),
+                    }),
+                ))
+            }
+        };
+        let verification_uri = st::verification_uri(&region);
+        let authorization = st::DeviceAuthorization {
+            device_code: st::mint_opaque_value(),
+            verification_uri_complete: format!("{verification_uri}?user_code={user_code}"),
+            verification_uri,
+            user_code,
+            client_id: input.client_id.clone(),
+            start_url: input.start_url.clone(),
+            created_at: now,
+            approval_due_at: now + st::APPROVAL_DELAY,
+            expires_in: st::DEVICE_CODE_EXPIRES_IN,
+            interval: st::DEVICE_CODE_INTERVAL,
+            status: st::DeviceAuthStatus::Pending,
+        };
+
+        let output = StartDeviceAuthorizationOutput {
+            device_code: Some(authorization.device_code.clone()),
+            user_code: Some(authorization.user_code.clone()),
+            verification_uri: Some(authorization.verification_uri.clone()),
+            verification_uri_complete: Some(authorization.verification_uri_complete.clone()),
+            expires_in: authorization.expires_in,
+            interval: authorization.interval,
+        };
+        store.insert_device_authorization(authorization);
+        Ok(output)
     }
 }
