@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateReportGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateReportGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateReportGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a report group and persists it in [`crate::state`]: this is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +141,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateReportGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateReportGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateReportGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this service models no server fault, and 501 is the
+            // only honest answer for "this emulator cannot serve the call at all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateReportGroup (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::report_group_arn(&region, &input.name);
+
+        // An `S3` export has to name the bucket the raw data is exported to. The model
+        // leaves `s3Destination` and its `bucket` optional because the same structure
+        // also describes a `NO_EXPORT` config, so this combination passes the boundary
+        // validator and is refused here with the operation's own input error.
+        if input.export_config.export_config_type.as_deref() == Some("S3")
+            && input
+                .export_config
+                .s3_destination
+                .as_ref()
+                .and_then(|destination| destination.bucket.as_deref())
+                .is_none_or(str::is_empty)
+        {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(CreateReportGroupErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        "exportConfig.s3Destination.bucket must be set when \
+                         exportConfig.exportConfigType is S3"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let now = crate::state::now_millis();
+        let created = crate::state::datetime(now);
+        let mut guard = state.lock();
+
+        // Report group names are unique per account, so a second create under a name
+        // this account already holds is refused rather than overwriting the record.
+        if guard.report_groups.contains_key(&input.name) {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::AlreadyExists,
+                Some(&arn),
+            );
+            return Err(CreateReportGroupErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!("Report group already exists: {arn}")),
+                },
+            )
+            .into());
+        }
+
+        // The account's report-group quota, which is also the ceiling that keeps the
+        // store from growing without bound as requests arrive.
+        if guard.report_groups.len() >= crate::state::MAX_REPORT_GROUPS {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::QuotaExceeded,
+                Some(&arn),
+            );
+            return Err(CreateReportGroupErrorModeled::AccountLimitExceededException(
+                AccountLimitExceededException {
+                    message: Some(format!(
+                        "Cannot have more than {} report groups in this account",
+                        crate::state::MAX_REPORT_GROUPS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let report_group = ReportGroup {
+            arn: Some(arn.clone()),
+            name: Some(input.name.clone()),
+            r#type: Some(input.r#type),
+            export_config: Some(input.export_config),
+            created: Some(created),
+            // Nothing has changed the record yet, so it was last modified when it was
+            // created; `UpdateReportGroup` is what moves this on.
+            last_modified: Some(created),
+            tags: input.tags,
+            // `status` is read-only and a created report group is usable at once, so
+            // it is `ACTIVE` from this call: there is no non-terminal status here for
+            // the clock to move it out of.
+            status: Some(crate::state::REPORT_GROUP_ACTIVE_STATUS.to_string()),
+        };
+
+        guard.report_groups.insert(
+            input.name,
+            crate::state::StoredReportGroup {
+                report_group: report_group.clone(),
+                created_millis: now,
+                last_modified_millis: now,
+            },
+        );
+        // The lock is dropped before the audit record is written, so a log consumer
+        // can never hold this service's state.
+        drop(guard);
+
+        crate::state::audit(
+            Self::NAME,
+            ctx.parts(),
+            crate::state::AuditOutcome::ReportGroupCreated,
+            Some(&arn),
+        );
+
+        Ok(CreateReportGroupOutput {
+            report_group: Some(report_group),
+        })
     }
 }

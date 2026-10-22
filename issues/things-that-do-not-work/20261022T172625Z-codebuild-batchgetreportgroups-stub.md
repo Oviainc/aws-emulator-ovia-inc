@@ -31,3 +31,19 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the codebuild emulator
 Call BatchGetReportGroups and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Update: the operation is implemented
+`BatchGetReportGroups` was implemented alongside `CreateReportGroup`
+(`issues/things-that-now-work/20261022T172625Z-codebuild-createreportgroup-stub.md`),
+because a create has to be proved by reading the resource back through an implemented
+reader. The handler at
+`services/service-com-amazonaws-codebuild-codebuild-20161006/src/ops/batch_get_report_groups.rs`
+no longer carries the `SCAFFOLDED, NOT IMPLEMENTED:` census line and no longer answers
+501: it reports the stored report group for each ARN the request names, in request
+order, and puts every other ARN in `reportGroupsNotFound`. Cover is in
+`services/service-com-amazonaws-codebuild-codebuild-20161006/tests/all/report_group_lifecycle.rs`.
+Whoever picks this issue up should confirm the recorded unit
+`codebuild.deploy-codebuild-report-group-cfn-policy-applies` and close it; the remaining
+report-group operations it may also need (`ListReportGroups`, `UpdateReportGroup`,
+`DeleteReportGroup`, the resource-policy operations) are still scaffolds under their own
+issues.

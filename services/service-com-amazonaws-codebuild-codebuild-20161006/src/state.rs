@@ -5,9 +5,11 @@
 //! Every implemented CodeBuild operation computes its answer from the records
 //! here: `CreateProject` writes a [`Project`], `StartBuild` writes a
 //! [`StoredBuild`], `StartSandbox` writes a [`StoredSandbox`],
+//! `CreateReportGroup` writes a [`StoredReportGroup`],
 //! `ImportSourceCredentials` writes a [`StoredSourceCredentials`],
 //! `BatchDeleteBuilds` removes a build, and the reporting operations
-//! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetSandboxes`, `ListProjects`,
+//! (`BatchGetProjects`, `BatchGetBuilds`, `BatchGetSandboxes`,
+//! `BatchGetReportGroups`, `ListProjects`,
 //! `ListBuildsForProject`, `ListSourceCredentials`) only read them.
 //!
 //! The model shapes themselves are what is stored, so a read hands back exactly
@@ -17,8 +19,8 @@
 use std::collections::BTreeMap;
 
 use crate::ops::types::{
-    Build, BuildPhase, PhaseContext, Project, Sandbox, SandboxSession, SandboxSessionPhase,
-    SourceCredentialsInfo,
+    Build, BuildPhase, PhaseContext, Project, ReportGroup, Sandbox, SandboxSession,
+    SandboxSessionPhase, SourceCredentialsInfo,
 };
 
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
@@ -96,6 +98,24 @@ pub const USERNAME_AUTH_TYPE: &str = "BASIC_AUTH";
 /// the same here, which is also the ceiling that stops `projects` growing without
 /// bound as requests arrive.
 pub const MAX_PROJECTS: usize = 5_000;
+
+/// Report groups this emulator holds for the account.
+///
+/// Real CodeBuild caps report groups per region for an account and answers
+/// `AccountLimitExceededException` once the cap is reached; `CreateReportGroup`
+/// does the same here, which is also the ceiling that stops `report_groups`
+/// growing without bound as requests arrive. The NUMBER is this emulator's, not
+/// a published AWS quota.
+pub const MAX_REPORT_GROUPS: usize = 5_000;
+
+/// The status a report group carries while it exists.
+///
+/// `ReportGroupStatusType` has exactly two values and the model documents them:
+/// `ACTIVE` — "The report group is active" — and `DELETING` — "The report group
+/// is in the process of being deleted". A created report group is usable
+/// immediately, so it is `ACTIVE` from the call that made it: there is no
+/// non-terminal status for the clock to move it out of.
+pub const REPORT_GROUP_ACTIVE_STATUS: &str = "ACTIVE";
 
 /// Build records this emulator retains, across every project.
 ///
@@ -202,6 +222,9 @@ pub struct ComAmazonawsCodebuildCodebuild20161006State {
     pub next_build_numbers: BTreeMap<String, i64>,
     /// `StartBuild` idempotency tokens, keyed by (project name, token).
     pub start_build_tokens: BTreeMap<(String, String), StartBuildToken>,
+    /// Report groups, keyed by report group name (names are unique per account,
+    /// the same way project names are).
+    pub report_groups: BTreeMap<String, StoredReportGroup>,
     /// Imported source-repository credentials, keyed by the `ServerType` they
     /// were imported for.
     ///
@@ -252,6 +275,19 @@ pub struct StoredBuild {
     pub start_millis: i64,
     /// Epoch millis at which this build's terminal transition became due.
     pub settle_due_millis: i64,
+}
+
+/// A persisted report group: the modelled [`ReportGroup`] plus the instants its
+/// `created` / `lastModified` timestamps report, kept as the integers a list
+/// operation sorts on — the same shape [`StoredProject`] takes.
+#[derive(Debug, Clone)]
+pub struct StoredReportGroup {
+    /// The record every reader hands back.
+    pub report_group: ReportGroup,
+    /// Epoch millis the report group was created at.
+    pub created_millis: i64,
+    /// Epoch millis the report group was last changed at.
+    pub last_modified_millis: i64,
 }
 
 /// One set of imported source-repository credentials.
@@ -443,6 +479,21 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
             IDEMPOTENCY_TOKEN_TTL_MILLIS,
             MAX_IDEMPOTENCY_TOKENS,
         );
+    }
+
+    /// The report group `arn` names, if this account holds it.
+    ///
+    /// Report groups are keyed by name because that is what is unique per
+    /// account, while every report-group operation addresses them by ARN. The
+    /// name is taken from the ARN's resource segment for the map lookup, and the
+    /// candidate is then kept only if its STORED ARN is exactly the one asked
+    /// for — so an ARN for another partition, region, account or resource type
+    /// can never resolve to a local record, and the read stays logarithmic in
+    /// the number of report groups held.
+    pub fn report_group_by_arn(&self, arn: &str) -> Option<&StoredReportGroup> {
+        let (_, name) = arn.rsplit_once(":report-group/")?;
+        let stored = self.report_groups.get(name)?;
+        (stored.report_group.arn.as_deref() == Some(arn)).then_some(stored)
     }
 
     /// Read a build, first materialising the transition the clock already owes
@@ -771,6 +822,90 @@ pub fn project_arn(region: &str, name: &str) -> String {
 /// `arn:aws:codebuild:<region>:<account>:build/<id>`.
 pub fn build_arn(region: &str, id: &str) -> String {
     ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("build/{id}"))
+}
+
+/// `arn:aws:codebuild:<region>:<account>:report-group/<name>`.
+pub fn report_group_arn(region: &str, name: &str) -> String {
+    ::emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("report-group/{name}"))
+}
+
+/// Longest request-derived value one audit field carries.
+///
+/// A SigV4 access key id, a request path and a resource name are all
+/// caller-controlled, so an unbounded echo would let one request emit an
+/// arbitrarily long log line.
+const MAX_AUDIT_FIELD: usize = 256;
+
+/// What the `resource` field reads as when the call resolved no resource.
+pub const AUDIT_NO_RESOURCE: &str = "-";
+
+/// A request-derived value as it may appear in an audit record: control
+/// characters (above all CR and LF, which would forge a second record) replaced,
+/// and the whole value bounded by [`MAX_AUDIT_FIELD`] on a character boundary.
+fn audit_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| if character.is_control() { '.' } else { character })
+        .take(MAX_AUDIT_FIELD)
+        .collect()
+}
+
+/// What a call answered, as the one closed set [`audit`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditOutcome {
+    /// A report group was minted and stored.
+    ReportGroupCreated,
+    /// The request was refused as invalid (400 `InvalidInputException`).
+    ValidationRefused,
+    /// A resource of that name already exists (400
+    /// `ResourceAlreadyExistsException`).
+    AlreadyExists,
+    /// An account quota — the service's, or this emulator's own ceiling — was met
+    /// (400 `AccountLimitExceededException`).
+    QuotaExceeded,
+}
+
+impl AuditOutcome {
+    /// The stable token this outcome is logged as.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReportGroupCreated => "report-group-created",
+            Self::ValidationRefused => "validation-refused",
+            Self::AlreadyExists => "already-exists",
+            Self::QuotaExceeded => "quota-exceeded",
+        }
+    }
+}
+
+/// One structured audit record for a state-changing call: which operation, the
+/// identity the request presented, what it was addressed to, the resource it
+/// resolved and the outcome. The `tracing` subscriber supplies the timestamp.
+///
+/// There is no network peer in the record because a Smithy handler is not given
+/// one: the request's parts carry its method, URI, headers and extensions, and
+/// nothing in this framework puts a peer address in them, so the presented
+/// credential is what identifies the caller. Never the credential itself — only
+/// the access key id — and deliberately metadata only: no tag, buildspec or
+/// export destination is logged, so a caller's own data never reaches the log.
+/// Every interpolated value is request-derived, so [`audit_field`] bounds it and
+/// replaces the control characters that would otherwise let one request forge a
+/// second record.
+pub fn audit(
+    operation: &str,
+    parts: &::http::request::Parts,
+    outcome: AuditOutcome,
+    resource: Option<&str>,
+) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ARN_NAMESPACE,
+        operation = %audit_field(operation),
+        access_key_id = %audit_field(&request_initiator(parts)),
+        request_target = %audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        resource = %audit_field(resource.unwrap_or(AUDIT_NO_RESOURCE)),
+        outcome = outcome.as_str(),
+        "codebuild api call"
+    );
 }
 
 /// `arn:aws:codebuild:<region>:<account>:token/<server type, lowercased>` — the

@@ -15,6 +15,8 @@
 mod batch_delete_builds;
 #[path = "all/project_build_lifecycle.rs"]
 mod project_build_lifecycle;
+#[path = "all/report_group_lifecycle.rs"]
+mod report_group_lifecycle;
 #[path = "all/sandbox_lifecycle.rs"]
 mod sandbox_lifecycle;
 #[path = "all/source_credentials.rs"]
