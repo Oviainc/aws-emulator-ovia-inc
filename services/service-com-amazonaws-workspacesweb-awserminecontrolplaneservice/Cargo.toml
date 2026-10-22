@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque pagination-token codec: the hex of the page key the token resumes after.
+hex = { workspace = true }
+# SHA-256, the mixing the minted resource ids are rendered from.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

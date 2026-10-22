@@ -19,6 +19,8 @@ mod job_lifecycle;
 mod job_template_crud;
 #[path = "all/job_templates.rs"]
 mod job_templates;
+#[path = "all/jobs_query.rs"]
+mod jobs_query;
 #[path = "all/policy_lifecycle.rs"]
 mod policy_lifecycle;
 #[path = "all/preset_lifecycle.rs"]

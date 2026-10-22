@@ -3,7 +3,9 @@
 //! Engine state for the com-amazonaws-transfer-transferservice service.
 //!
 //! Everything AWS Transfer Family's server + user + AS2 profile lifecycle needs to
-//! answer a read from stored state lives here: the resource maps, the id-minting counter, the
+//! answer a read from stored state lives here: the resource maps (servers, their users,
+//! the AS2 profiles, and the workflows a server's `WorkflowDetails` attach), the
+//! id-minting counter, the
 //! documented create-time defaults and the clock-due server state transitions (the
 //! `ServerTransition` rule `StartServer`/`StopServer` share), the ARN shapes, and the
 //! opaque pagination token codec the `List*` operations share.
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::ops::types::{
     EndpointDetails, HomeDirectoryMapEntry, IdentityProviderDetails, PosixProfile, ProtocolDetails,
     ProxyConfig, ResourceNotFoundException, S3StorageOptions, SftpPortWithOptions, Tag,
-    WorkflowDetails,
+    WorkflowDetails, WorkflowStep,
 };
 
 /// The region used for an ARN when the request carries no SigV4 credential scope to
@@ -253,6 +255,42 @@ pub const RESOURCE_TYPE_SSH_PUBLIC_KEY: &str = "SshPublicKey";
 /// convention as [`RESOURCE_TYPE_SERVER`].
 pub const RESOURCE_TYPE_PROFILE: &str = "Profile";
 
+/// `ResourceType` for the workflow resource, addressed by its `WorkflowId`. Same
+/// convention as [`RESOURCE_TYPE_SERVER`].
+pub const RESOURCE_TYPE_WORKFLOW: &str = "Workflow";
+
+/// The `WorkflowStepType` enum's values (`[COPY, CUSTOM, TAG, DELETE, DECRYPT]`).
+/// Each one names the ONE `WorkflowStep.*StepDetails` member that configures it, which
+/// is what [`workflow_step_violation`] enforces.
+pub const WORKFLOW_STEP_TYPE_COPY: &str = "COPY";
+pub const WORKFLOW_STEP_TYPE_CUSTOM: &str = "CUSTOM";
+pub const WORKFLOW_STEP_TYPE_TAG: &str = "TAG";
+pub const WORKFLOW_STEP_TYPE_DELETE: &str = "DELETE";
+pub const WORKFLOW_STEP_TYPE_DECRYPT: &str = "DECRYPT";
+
+/// `SourceFileLocation`'s documented default, on every step-details shape that carries
+/// the member ("To use the previous file as the input, enter `${previous.file}`. In
+/// this case, this workflow step uses the output file from the previous workflow step
+/// as input. This is the default value").
+pub const DEFAULT_SOURCE_FILE_LOCATION: &str = "${previous.file}";
+
+/// `OverwriteExisting`'s documented default, on every step-details shape that carries
+/// the member ("A flag that indicates whether to overwrite an existing file of the same
+/// name. The default is `FALSE`"). It is the `OverwriteExisting` enum's `FALSE` value
+/// (the enum is `[FALSE, TRUE]`).
+pub const DEFAULT_OVERWRITE_EXISTING: &str = "FALSE";
+
+/// How many workflows the store holds before `CreateWorkflow` refuses with the
+/// modelled `ServiceUnavailableException` instead of growing.
+///
+/// Chosen on the same basis as [`MAX_STORED_SERVERS`] — the emulator's own bound on the
+/// store, not a claim about any account's Service Quota, which this emulator does not
+/// model. Each stored workflow is itself bounded by the modelled lengths of what it
+/// holds (`Steps` and `OnExceptionSteps` `len 0..8`, `Description` `len 0..256`, `Tags`
+/// `len 1..50`, `StructuredLogDestinations` `len 0..1`), which the framework's boundary
+/// validator enforces before a handler runs, and `DeleteWorkflow` releases one.
+pub const MAX_STORED_WORKFLOWS: usize = 200;
+
 /// How many SSH public keys ONE user holds before `ImportSshPublicKey` refuses
 /// instead of growing.
 ///
@@ -295,6 +333,12 @@ pub fn unknown_profile(profile_id: &str) -> ResourceNotFoundException {
     resource_not_found(RESOURCE_TYPE_PROFILE, profile_id)
 }
 
+/// The not-found payload for a `WorkflowId` the store does not hold — never created,
+/// or already deleted.
+pub fn unknown_workflow(workflow_id: &str) -> ResourceNotFoundException {
+    resource_not_found(RESOURCE_TYPE_WORKFLOW, workflow_id)
+}
+
 /// Lift an operation's modelled not-found variant into its error channel, answered
 /// with [`RESOURCE_NOT_FOUND_HTTP_STATUS`] rather than the model's `@httpError`.
 ///
@@ -313,6 +357,23 @@ pub struct SshKey {
     pub ssh_public_key_body: String,
     /// When this key was added to the user.
     pub date_imported: SystemTime,
+}
+
+/// One stored Transfer Family workflow, keyed by `WorkflowId`.
+///
+/// The steps are held in the caller's own order — a workflow runs its steps in the
+/// order they were submitted — with every documented step-detail default already
+/// applied by [`resolve_workflow_steps`], so a reader projects them without
+/// defaulting a second time.
+#[derive(Debug, Clone)]
+pub struct Workflow {
+    pub workflow_id: String,
+    pub arn: String,
+    pub description: Option<String>,
+    pub steps: Vec<WorkflowStep>,
+    pub on_exception_steps: Vec<WorkflowStep>,
+    pub structured_log_destinations: Vec<String>,
+    pub tags: Vec<Tag>,
 }
 
 /// One stored Transfer Family user, keyed by `(ServerId, UserName)`.
@@ -458,6 +519,22 @@ impl Server {
             SERVER_STATE_STARTING,
             SERVER_STATE_START_FAILED,
         )
+    }
+
+    /// Whether this server's `WorkflowDetails` attach `workflow_id` to either of the
+    /// two triggers the shape carries (`OnUpload`, `OnPartialUpload`).
+    ///
+    /// A workflow attached to a server is IN USE by it, which is what `DeleteWorkflow`
+    /// refuses on.
+    pub fn references_workflow(&self, workflow_id: &str) -> bool {
+        let Some(details) = self.workflow_details.as_ref() else {
+            return false;
+        };
+        [&details.on_upload, &details.on_partial_upload]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|detail| detail.workflow_id == workflow_id)
     }
 }
 
@@ -689,6 +766,12 @@ fn required_when(member: &str, condition: &str) -> String {
     format!("{member} must be specified when {condition}")
 }
 
+/// "`<member>` must be specified" — a member the model documents as part of what the
+/// request names, with no condition attached, and did not send.
+fn required_member(member: &str) -> String {
+    format!("{member} must be specified")
+}
+
 /// "`<member>` cannot be specified when `<condition>`" — a member the model documents
 /// as unusable under a condition the request meets, and sent anyway.
 fn forbidden_when(member: &str, condition: &str) -> String {
@@ -917,6 +1000,171 @@ pub fn home_directory_violation(
     }
 }
 
+/// The first documented step requirement a submitted step LIST violates, worded as the
+/// refusal states it and naming the step by its zero-based index in `member` — the way
+/// a JSON request indexes the list — `None` when every step satisfies them.
+///
+/// `member` is the request member the list came from (`Steps` or `OnExceptionSteps`),
+/// so one message locates the step a caller has to fix.
+pub fn workflow_steps_violation(member: &str, steps: &[WorkflowStep]) -> Option<String> {
+    steps
+        .iter()
+        .enumerate()
+        .find_map(|(index, step)| workflow_step_violation(&format!("{member}[{index}]"), step))
+}
+
+/// The documented requirement ONE workflow step violates, worded as the refusal states
+/// it — `None` when it violates none.
+///
+/// Both rules below are sentences in this service's own model:
+///
+/// * `WorkflowStep.Type` "specifies which of the following actions is being taken for
+///   this step", and each `*StepDetails` member is documented as the details "for a
+///   step that" performs exactly that one action — so a step carries the details
+///   structure its `Type` names, and no other. A step that names no `Type` names no
+///   action at all.
+/// * each details shape documents what the step acts ON as part of what the step
+///   "consists of": a `CUSTOM` step is "a custom step with an Lambda function target"
+///   whose `Target` is "The ARN for the Lambda function that is being called", a `COPY`
+///   step consists of "An Amazon S3 location for the destination of the file copy", and
+///   a `TAG` step's `Tags` are the "1 to 10 key/value pairs" it adds. `DECRYPT`'s own
+///   two (`Type`, `DestinationFileLocation`) are `@required` members of
+///   `DecryptStepDetails`, so the boundary validator refuses those before a handler
+///   runs, and `DELETE` acts on the source file alone.
+fn workflow_step_violation(path: &str, step: &WorkflowStep) -> Option<String> {
+    let Some(step_type) = step.r#type.as_deref().filter(|named| !named.is_empty()) else {
+        return Some(required_member(&format!("{path}.Type")));
+    };
+    let condition = format!("Type is {step_type}");
+
+    // The details member each step type selects: present for its own type, absent for
+    // every other one.
+    for (member, submitted, selected_by) in [
+        (
+            "CopyStepDetails",
+            step.copy_step_details.is_some(),
+            WORKFLOW_STEP_TYPE_COPY,
+        ),
+        (
+            "CustomStepDetails",
+            step.custom_step_details.is_some(),
+            WORKFLOW_STEP_TYPE_CUSTOM,
+        ),
+        (
+            "TagStepDetails",
+            step.tag_step_details.is_some(),
+            WORKFLOW_STEP_TYPE_TAG,
+        ),
+        (
+            "DeleteStepDetails",
+            step.delete_step_details.is_some(),
+            WORKFLOW_STEP_TYPE_DELETE,
+        ),
+        (
+            "DecryptStepDetails",
+            step.decrypt_step_details.is_some(),
+            WORKFLOW_STEP_TYPE_DECRYPT,
+        ),
+    ] {
+        let member = format!("{path}.{member}");
+        match (submitted, step_type == selected_by) {
+            (false, true) => return Some(required_when(&member, &condition)),
+            (true, false) => {
+                return Some(settable_only_when(
+                    &member,
+                    &format!("Type is {selected_by}"),
+                ))
+            }
+            _ => {}
+        }
+    }
+
+    // What the step acts on. An empty string names nothing: `CustomStepTarget` is
+    // `len 0..170`, so the modelled length admits one, and its pattern
+    // `^arn:[a-z-]+:lambda:.*$` is what refuses it at the boundary — this is the
+    // belt-and-braces check that an absent target is refused here either way.
+    match step_type {
+        WORKFLOW_STEP_TYPE_CUSTOM
+            if step.custom_step_details.as_ref().is_some_and(|details| {
+                details
+                    .target
+                    .as_deref()
+                    .is_none_or(|target| target.trim().is_empty())
+            }) =>
+        {
+            Some(required_when(
+                &format!("{path}.CustomStepDetails.Target"),
+                &condition,
+            ))
+        }
+        WORKFLOW_STEP_TYPE_COPY
+            if step
+                .copy_step_details
+                .as_ref()
+                .is_some_and(|details| details.destination_file_location.is_none()) =>
+        {
+            Some(required_when(
+                &format!("{path}.CopyStepDetails.DestinationFileLocation"),
+                &condition,
+            ))
+        }
+        WORKFLOW_STEP_TYPE_TAG
+            if step.tag_step_details.as_ref().is_some_and(|details| {
+                details.tags.as_ref().is_none_or(|tags| tags.is_empty())
+            }) =>
+        {
+            Some(required_when(
+                &format!("{path}.TagStepDetails.Tags"),
+                &condition,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The steps as they will be STORED: the caller's order, with every documented
+/// step-detail default resolved once, here, so no reader has to re-apply one.
+pub fn resolve_workflow_steps(steps: Vec<WorkflowStep>) -> Vec<WorkflowStep> {
+    steps.into_iter().map(resolve_workflow_step).collect()
+}
+
+/// `current` when the caller sent one, else `fallback` — the one place a step-detail
+/// default is applied.
+fn defaulted(current: Option<String>, fallback: &str) -> Option<String> {
+    Some(current.unwrap_or_else(|| fallback.to_string()))
+}
+
+/// One step with its documented defaults applied: every details shape that carries
+/// `SourceFileLocation` defaults it to [`DEFAULT_SOURCE_FILE_LOCATION`], and every one
+/// that carries `OverwriteExisting` defaults it to [`DEFAULT_OVERWRITE_EXISTING`].
+fn resolve_workflow_step(mut step: WorkflowStep) -> WorkflowStep {
+    if let Some(details) = step.copy_step_details.as_mut() {
+        details.source_file_location =
+            defaulted(details.source_file_location.take(), DEFAULT_SOURCE_FILE_LOCATION);
+        details.overwrite_existing =
+            defaulted(details.overwrite_existing.take(), DEFAULT_OVERWRITE_EXISTING);
+    }
+    if let Some(details) = step.custom_step_details.as_mut() {
+        details.source_file_location =
+            defaulted(details.source_file_location.take(), DEFAULT_SOURCE_FILE_LOCATION);
+    }
+    if let Some(details) = step.tag_step_details.as_mut() {
+        details.source_file_location =
+            defaulted(details.source_file_location.take(), DEFAULT_SOURCE_FILE_LOCATION);
+    }
+    if let Some(details) = step.delete_step_details.as_mut() {
+        details.source_file_location =
+            defaulted(details.source_file_location.take(), DEFAULT_SOURCE_FILE_LOCATION);
+    }
+    if let Some(details) = step.decrypt_step_details.as_mut() {
+        details.source_file_location =
+            defaulted(details.source_file_location.take(), DEFAULT_SOURCE_FILE_LOCATION);
+        details.overwrite_existing =
+            defaulted(details.overwrite_existing.take(), DEFAULT_OVERWRITE_EXISTING);
+    }
+    step
+}
+
 /// Per-service state for com-amazonaws-transfer-transferservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsTransferTransferserviceState {
@@ -929,6 +1177,9 @@ pub struct ComAmazonawsTransferTransferserviceState {
     /// AS2 profiles by `ProfileId` (`"p-" + 17 hex`). `BTreeMap` so `ListProfiles`
     /// pages in a stable, resumable order, like [`Self::servers`].
     pub profiles: BTreeMap<String, Profile>,
+    /// Workflows by `WorkflowId` (`"w-" + 17 hex`). `BTreeMap` so `ListWorkflows` pages
+    /// in a stable, resumable order.
+    pub workflows: BTreeMap<String, Workflow>,
     /// Monotonic counter behind every minted id, so ids are unique and reproducible.
     pub next_id_seq: u64,
 }
@@ -988,6 +1239,25 @@ impl ComAmazonawsTransferTransferserviceState {
         self.profiles.len() < MAX_STORED_PROFILES
     }
 
+    /// Whether the store can take another workflow, i.e. is below
+    /// [`MAX_STORED_WORKFLOWS`].
+    pub fn has_workflow_capacity(&self) -> bool {
+        self.workflows.len() < MAX_STORED_WORKFLOWS
+    }
+
+    /// The ids of the servers that currently attach `workflow_id`, in `ServerId` order.
+    ///
+    /// A workflow attached to a server is in use by it; `DeleteWorkflow` refuses while
+    /// this is non-empty, so the servers' `WorkflowDetails` cannot come to name a
+    /// workflow that no longer exists.
+    pub fn servers_using_workflow(&self, workflow_id: &str) -> Vec<&str> {
+        self.servers
+            .values()
+            .filter(|server| server.references_workflow(workflow_id))
+            .map(|server| server.server_id.as_str())
+            .collect()
+    }
+
     /// `UserCount` for every server that has users, in ONE pass over the user map.
     ///
     /// `ListServers` renders up to [`MAX_PAGE_SIZE`] servers per call; counting each
@@ -1032,6 +1302,11 @@ pub fn user_arn(region: &str, server_id: &str, user_name: &str) -> String {
         region,
         &format!("user/{server_id}/{user_name}"),
     )
+}
+
+/// `arn:aws:transfer:<region>:<account>:workflow/<WorkflowId>`.
+pub fn workflow_arn(region: &str, workflow_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("workflow/{workflow_id}"))
 }
 
 /// The region the caller signed this request for.

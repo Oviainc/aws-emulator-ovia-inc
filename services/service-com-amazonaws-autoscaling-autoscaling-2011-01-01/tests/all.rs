@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/auto_scaling_group_lifecycle.rs"]
 mod auto_scaling_group_lifecycle;
+#[path = "all/reference_data_catalogs.rs"]
+mod reference_data_catalogs;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

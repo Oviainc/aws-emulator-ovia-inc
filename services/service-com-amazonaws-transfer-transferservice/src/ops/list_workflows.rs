@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkflows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkflows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkflows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the stored workflows in `BTreeMap` (`WorkflowId`) order, with the same page
+//! bound and opaque-token contract as `ListServers`. Reports each workflow's
+//! identifier, description and ARN from state and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkflows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkflowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkflows"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            ListWorkflowsErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListWorkflowsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                    message: "The NextToken is not valid".to_string(),
+                })
+            })?),
+            None => None,
+        };
+
+        // A pure read: nothing here writes, and no clock transition is owed on a
+        // workflow — a created workflow is usable at once.
+        let guard = state.lock();
+
+        // ONE walk of the workflow map for the page's records, so the per-request work
+        // is `workflows + page`.
+        let stored: Vec<&st::Workflow> = guard.workflows.values().collect();
+        let ids: Vec<&str> = stored
+            .iter()
+            .map(|workflow| workflow.workflow_id.as_str())
+            .collect();
+        let (page, next_key) =
+            st::page_bounds(&ids, after.as_deref(), st::page_limit(input.max_results));
+
+        let workflows = stored
+            .get(page)
+            .unwrap_or_default()
+            .iter()
+            .map(|stored| ListedWorkflow {
+                arn: Some(stored.arn.clone()),
+                // `Description` is optional and carries no documented default, so a
+                // workflow created without one reports none rather than an empty
+                // string.
+                description: stored.description.clone(),
+                workflow_id: Some(stored.workflow_id.clone()),
+            })
+            .collect();
+
+        Ok(ListWorkflowsOutput {
+            // A token only when a further page remains.
+            next_token: next_key.as_deref().map(st::encode_page_token),
+            workflows,
+        })
     }
 }

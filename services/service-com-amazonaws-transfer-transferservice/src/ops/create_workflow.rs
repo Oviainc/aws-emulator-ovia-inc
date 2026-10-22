@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `WorkflowId`, resolves every documented step-detail default once, and stores
+//! the workflow so `DescribeWorkflow` and `ListWorkflows` report it from state. A step
+//! that does not carry the details structure its `Type` names, or whose details do not
+//! name what the step acts on, is refused with the modelled `InvalidRequestException`
+//! before anything is persisted (`state::workflow_steps_violation`).
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +170,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkflow"))
+        use crate::state as st;
+
+        // A step the service would never run is refused BEFORE the state write, with
+        // the modelled `InvalidRequestException` (HTTP 400) the model documents as
+        // "thrown when the client submits a malformed request" — so a caller never gets
+        // back a `WorkflowId` for a workflow that cannot execute. Both step lists are
+        // held to the same rule: the exception steps are steps.
+        let violation = st::workflow_steps_violation("Steps", &input.steps).or_else(|| {
+            st::workflow_steps_violation(
+                "OnExceptionSteps",
+                input.on_exception_steps.as_deref().unwrap_or_default(),
+            )
+        });
+        if let Some(message) = violation {
+            return Err(CreateWorkflowErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            CreateWorkflowErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+        let region = st::request_region(ctx.parts());
+
+        let mut guard = state.lock();
+
+        // The store is BOUNDED: past its capacity a create is refused rather than
+        // adding another record. The modelled `ServiceUnavailableException` is the
+        // refusal that says the service cannot take this request; the capacity is
+        // released by `DeleteWorkflow`.
+        if !guard.has_workflow_capacity() {
+            return Err(CreateWorkflowErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some(format!(
+                        "this emulator already holds the maximum of {} workflows; \
+                         delete one before creating another",
+                        st::MAX_STORED_WORKFLOWS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `WorkflowId` is `^w-([a-z0-9]{17})$`, which the shared minter's
+        // `<prefix>-<17 hex digits>` satisfies.
+        let workflow_id = guard.mint_id("w");
+        let workflow = st::Workflow {
+            arn: st::workflow_arn(&region, &workflow_id),
+            description: input.description,
+            // Stored in the caller's own order, with the documented step-detail
+            // defaults resolved once: a workflow runs its steps in the order they were
+            // submitted, and a reader projects them without defaulting again.
+            steps: st::resolve_workflow_steps(input.steps),
+            on_exception_steps: st::resolve_workflow_steps(
+                input.on_exception_steps.unwrap_or_default(),
+            ),
+            structured_log_destinations: input.structured_log_destinations.unwrap_or_default(),
+            tags: input.tags.unwrap_or_default(),
+            workflow_id: workflow_id.clone(),
+        };
+        guard.workflows.insert(workflow_id.clone(), workflow);
+        drop(guard);
+
+        Ok(CreateWorkflowOutput { workflow_id })
     }
 }

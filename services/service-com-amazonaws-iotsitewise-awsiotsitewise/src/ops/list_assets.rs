@@ -187,7 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(label) => Some(store.resolve_asset_model_id(label).ok_or_else(|| {
                 ListAssetsError::Modeled(ListAssetsErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("The asset model {label} could not be found."),
+                        message: crate::state::not_found_message(
+                            crate::state::RESOURCE_ASSET_MODEL,
+                            label,
+                        ),
                     },
                 ))
             })?),

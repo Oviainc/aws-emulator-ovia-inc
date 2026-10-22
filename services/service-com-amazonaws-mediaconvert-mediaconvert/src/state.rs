@@ -16,7 +16,8 @@
 //! Nothing here grows without a ceiling and nothing here walks an unbounded set:
 //!
 //! * `queues` is capped at [`MAX_QUEUES`], `jobs` at [`MAX_JOBS`], `job_templates` at
-//!   [`MAX_JOB_TEMPLATES`] and `presets` at [`MAX_PRESETS`]; a create past the cap is
+//!   [`MAX_JOB_TEMPLATES`], `presets` at [`MAX_PRESETS`] and `jobs_queries` at
+//!   [`MAX_JOBS_QUERIES`]; a create past the cap is
 //!   refused with the modelled `ServiceQuotaExceededException` (HTTP 402) instead of
 //!   growing the store. The built-in system templates `job_templates` is seeded with are
 //!   inside that cap, and no request path removes or re-seeds them: `UpdateJobTemplate`
@@ -28,13 +29,18 @@
 //!   grow one record without limit either; past the cap it answers the same quota error.
 //! * Every lookup is an O(log n) `BTreeMap` probe; no handler clones the whole store.
 //! * [`ComAmazonawsMediaconvertMediaconvertState::settle`] — the only work a reporting
-//!   operation does — touches ONLY the jobs whose due instant has already passed, by
-//!   draining the `pending` index that is ordered by that instant. It costs
-//!   O(k log n) in the number k of jobs actually settling, which is zero on the
+//!   operation does — touches ONLY the records whose due instant has already passed, by
+//!   draining the `pending` and `pending_queries` indexes that are ordered by that
+//!   instant, and does a CONSTANT amount of work per record it drains. It costs
+//!   O(k log n) in the number k of records actually due, which is zero on the
 //!   overwhelming majority of calls; it is never a sweep of the job set.
-//! * `ListJobs` is the one operation that orders the jobs, over at most `MAX_JOBS`
-//!   records, and returns at most one page of twenty. `ListJobTemplates` orders the
-//!   job templates the same way and pages them the same way.
+//! * `ListJobs` orders the jobs, over at most `MAX_JOBS` records, and returns at most
+//!   one page of twenty, through [`page_of_jobs`]. `StartJobsQuery` walks the same record
+//!   set ONCE, when the query is started, evaluating at most [`MAX_JOBS_QUERY_TERMS`]
+//!   filter terms per record, and stores only the one page of ids it selected; no later
+//!   call re-runs that match, so no request's cost grows with the number of stored
+//!   queries. `ListJobTemplates` orders the job templates the same way and pages them the
+//!   same way.
 //!
 //! # No panic on caller-supplied input
 //!
@@ -51,7 +57,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AccelerationSettings, HopDestination, Job, JobSettings, JobTemplate, JobTemplateSettings,
-    Policy, Preset, PresetSettings, Queue, ReservationPlan, ReservationPlanSettings, Timing,
+    Output, Policy, Preset, PresetSettings, Queue, ReservationPlan, ReservationPlanSettings,
+    Timing,
 };
 
 /// The built-in queue a job with no `Queue` member is sent to.
@@ -90,6 +97,35 @@ pub const JOB_STATUS_PROGRESSING: &str = "PROGRESSING";
 pub const JOB_STATUS_CANCELED: &str = "CANCELED";
 /// See [`JOB_STATUS_SUBMITTED`].
 pub const JOB_STATUS_ERROR: &str = "ERROR";
+
+/// `JobsQueryStatus` values (`smithy_query(query="shape",shape="JobsQueryStatus")`): the
+/// status `GetJobsQueryResults` reports for a query `StartJobsQuery` started. Its doc:
+/// "A job query's status can be SUBMITTED, PROGRESSING, COMPLETE, or ERROR."
+pub const JOBS_QUERY_STATUS_SUBMITTED: &str = "SUBMITTED";
+/// See [`JOBS_QUERY_STATUS_SUBMITTED`].
+pub const JOBS_QUERY_STATUS_COMPLETE: &str = "COMPLETE";
+
+/// `JobsQueryFilterKey` values
+/// (`smithy_query(query="shape",shape="JobsQueryFilterKey")`): the job detail one filter
+/// of a jobs query matches on. `JobsQueryFilter$Key`'s own documentation says what each
+/// one holds — "queue - Your Queue's name or ARN", "status - Your job's status",
+/// "fileInput - Your input file URL, or partial input file name",
+/// "jobEngineVersionRequested - The Job engine version that you requested for your job",
+/// "jobEngineVersionUsed - The Job engine version that your job used", "audioCodec - Your
+/// output's audio codec", "videoCodec - Your output's video codec" and "errorCode - The
+/// error code that your job failed with" — and [`JobRecord::matches_filter`] reads each
+/// one off the stored job.
+pub const JOBS_QUERY_FILTER_KEY_QUEUE: &str = "queue";
+/// See [`JOBS_QUERY_FILTER_KEY_QUEUE`].
+pub const JOBS_QUERY_FILTER_KEY_STATUS: &str = "status";
+/// See [`JOBS_QUERY_FILTER_KEY_QUEUE`].
+pub const JOBS_QUERY_FILTER_KEY_FILE_INPUT: &str = "fileInput";
+/// See [`JOBS_QUERY_FILTER_KEY_QUEUE`].
+pub const JOBS_QUERY_FILTER_KEY_JOB_ENGINE_VERSION_REQUESTED: &str = "jobEngineVersionRequested";
+/// See [`JOBS_QUERY_FILTER_KEY_QUEUE`].
+pub const JOBS_QUERY_FILTER_KEY_AUDIO_CODEC: &str = "audioCodec";
+/// See [`JOBS_QUERY_FILTER_KEY_QUEUE`].
+pub const JOBS_QUERY_FILTER_KEY_VIDEO_CODEC: &str = "videoCodec";
 
 /// `Order` values (`smithy_query(query="shape",shape="Order")`).
 pub const ORDER_ASCENDING: &str = "ASCENDING";
@@ -143,6 +179,30 @@ pub const MAX_QUEUES: usize = 1_000;
 /// bound, as [`MAX_QUEUES`] is, and the ceiling on every walk over the job set.
 pub const MAX_JOBS: usize = 10_000;
 
+/// How many jobs queries this store holds before `StartJobsQuery` is refused. A chosen
+/// capacity bound, as [`MAX_QUEUES`] is, refused with the same modelled
+/// `ServiceQuotaExceededException` the operation declares.
+pub const MAX_JOBS_QUERIES: usize = 1_000;
+
+/// How many filter terms — one per value of one `JobsQueryFilterKey` — one jobs query
+/// matches on before `StartJobsQuery` refuses it.
+///
+/// A CHOSEN bound, not a documented AWS quota: `__listOfJobsQueryFilter` carries no
+/// length constraint, so without it a single request could ask for an unbounded amount
+/// of matching work. Forty is five values for each of the eight keys
+/// `JobsQueryFilterKey` declares, well above any real query. Past it the refusal is the
+/// modelled `BadRequestException` — "a problem in the request", which a caller fixes by
+/// sending fewer filter values.
+///
+/// With it, the WHOLE cost of running a query is bounded: `StartJobsQuery` matches the
+/// job set once, walking at most [`MAX_JOBS`] records and evaluating at most
+/// `MAX_JOBS_QUERY_TERMS` terms per record, each against a filter value of at most 100
+/// bytes (every value targets `__stringMax100`, whose length constraint the boundary
+/// validator enforces before a handler runs). Nothing multiplies that by the number of
+/// queries in the store: a query is matched by the one request that started it, never
+/// again.
+pub const MAX_JOBS_QUERY_TERMS: usize = 40;
+
 /// How many job templates this store holds before `CreateJobTemplate` is refused. A
 /// chosen capacity bound, as [`MAX_QUEUES`] is, refused with the same modelled
 /// `ServiceQuotaExceededException` the operation declares.
@@ -188,6 +248,16 @@ const FALLBACK_REGION: &str = "us-east-1";
 /// transcode takes. It is deliberately non-zero so a caller acting immediately after
 /// `CreateJob` still observes `SUBMITTED` and the state errors that go with it.
 const JOB_SETTLES_AFTER: Duration = Duration::from_millis(750);
+
+/// How long after `StartJobsQuery` a jobs query leaves the non-terminal `SUBMITTED`
+/// status for `COMPLETE`.
+///
+/// A chosen span, not a documented one: the operation is only documented as
+/// asynchronous ("Start an asynchronous jobs query ... To receive the list of jobs that
+/// match your query, call the GetJobsQueryResults API"). It is deliberately non-zero so
+/// a caller reading the results immediately after starting the query still observes the
+/// query in `SUBMITTED` with no results yet.
+const JOBS_QUERY_COMPLETES_AFTER: Duration = Duration::from_millis(500);
 
 /// Why a job that leaves `SUBMITTED` here ends in `ERROR` rather than `COMPLETE`.
 ///
@@ -696,6 +766,70 @@ impl JobRecord {
         encode_cursor(self.created_at, &self.id)
     }
 
+    /// Whether this job matches ONE `(key, value)` pair of a jobs query's filter list.
+    ///
+    /// Each `JobsQueryFilterKey` is read off THIS record — the same state [`Self::view`]
+    /// reports — so a query matches on what a reader of the job would see, never on the
+    /// text of the request that created it.
+    pub fn matches_filter(&self, key: &str, value: &str) -> bool {
+        match key {
+            // "Your Queue's name or ARN", so either form resolves to the name of the
+            // queue this job was sent to.
+            JOBS_QUERY_FILTER_KEY_QUEUE => self.queue == queue_name_from_reference(value),
+            JOBS_QUERY_FILTER_KEY_STATUS => self.status == value,
+            // "Your input file URL, or PARTIAL input file name" — so a containment test
+            // over the inputs' `FileInput`, not an equality one.
+            JOBS_QUERY_FILTER_KEY_FILE_INPUT => self.input_files().any(|file| file.contains(value)),
+            JOBS_QUERY_FILTER_KEY_JOB_ENGINE_VERSION_REQUESTED => {
+                self.job_engine_version_requested.as_deref() == Some(value)
+            }
+            JOBS_QUERY_FILTER_KEY_AUDIO_CODEC => self.audio_codecs().any(|codec| codec == value),
+            JOBS_QUERY_FILTER_KEY_VIDEO_CODEC => self.video_codecs().any(|codec| codec == value),
+            // The two remaining keys, `jobEngineVersionUsed` and `errorCode`, match on
+            // the `Job` members no job in this store carries: nothing transcoded a job
+            // here, so no engine version was USED and no transcoder error code was
+            // produced — exactly the absent members [`Self::view`] reports. No stored job
+            // matches either, and a key the model does not declare never reaches here at
+            // all: the member targets the `JobsQueryFilterKey` enum, so the boundary
+            // validator has already refused it.
+            _ => false,
+        }
+    }
+
+    /// The `FileInput` of every input of this job's settings.
+    fn input_files(&self) -> impl Iterator<Item = &str> + '_ {
+        self.settings
+            .inputs
+            .iter()
+            .flatten()
+            .filter_map(|input| input.file_input.as_deref())
+    }
+
+    /// Every output of every output group of this job's settings.
+    fn outputs(&self) -> impl Iterator<Item = &Output> + '_ {
+        self.settings
+            .output_groups
+            .iter()
+            .flatten()
+            .flat_map(|group| group.outputs.iter().flatten())
+    }
+
+    /// The `Codec` of every audio description of every output of this job.
+    fn audio_codecs(&self) -> impl Iterator<Item = &str> + '_ {
+        self.outputs()
+            .flat_map(|output| output.audio_descriptions.iter().flatten())
+            .filter_map(|description| description.codec_settings.as_ref())
+            .filter_map(|settings| settings.codec.as_deref())
+    }
+
+    /// The `Codec` of every output's video description.
+    fn video_codecs(&self) -> impl Iterator<Item = &str> + '_ {
+        self.outputs()
+            .filter_map(|output| output.video_description.as_ref())
+            .filter_map(|description| description.codec_settings.as_ref())
+            .filter_map(|settings| settings.codec.as_deref())
+    }
+
     /// The modelled `Job`.
     pub fn view(&self, region: &str) -> Job {
         Job {
@@ -747,6 +881,152 @@ impl JobRecord {
             .unwrap_or(ACCELERATION_MODE_DISABLED);
         (mode == ACCELERATION_MODE_DISABLED)
             .then(|| ACCELERATION_STATUS_NOT_APPLICABLE.to_string())
+    }
+}
+
+/// One `(key, value)` pair of a jobs query's filter list: one `JobsQueryFilterKey` and
+/// one of the `Values` the caller paired with it.
+///
+/// A filter naming several values becomes one term per value, because the match over
+/// them is an OR — see [`JobsQueryRecord::matches`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobsQueryTerm {
+    pub key: String,
+    pub value: String,
+}
+
+/// One asynchronous jobs query: the query `StartJobsQuery` persisted, and the page of
+/// jobs it matched.
+///
+/// `StartJobsQuery` is asynchronous — "Start an asynchronous jobs query using the
+/// provided filters. To receive the list of jobs that match your query, call the
+/// GetJobsQueryResults API using the query ID returned by this API" — so a query starts
+/// in the non-terminal `SUBMITTED` status and reports no results until the clock makes
+/// its completion due, at which point
+/// [`ComAmazonawsMediaconvertMediaconvertState::settle`] moves it to `COMPLETE`.
+///
+/// The MATCH itself runs once, when the query is STARTED
+/// ([`ComAmazonawsMediaconvertMediaconvertState::accept_jobs_query`]): the page is a
+/// snapshot of the job set at that instant, stored on the record, so every read of the
+/// query reports the same page — polling the results does not change them — and the
+/// matching work is bounded and paid for by the one request that asked for it, never
+/// multiplied by however many queries happen to come due together. Nothing a caller can
+/// observe distinguishes that from matching at the completion instant, except a job
+/// created inside the completion window, which the API documents nothing about either
+/// way.
+#[derive(Debug, Clone)]
+pub struct JobsQueryRecord {
+    /// The query's id, which `GetJobsQueryResults` looks it up by; assigned by
+    /// [`ComAmazonawsMediaconvertMediaconvertState::accept_jobs_query`].
+    pub id: String,
+    /// The filter list, one term per `(Key, value)` pair. At most
+    /// [`MAX_JOBS_QUERY_TERMS`] of them.
+    pub terms: Vec<JobsQueryTerm>,
+    /// The `Order` the caller asked the matches to be sorted in, if any.
+    pub order: Option<String>,
+    /// "Optional. Number of jobs, up to twenty, that will be included in the jobs
+    /// query."
+    pub max_results: Option<i32>,
+    /// One of the [`JOBS_QUERY_STATUS_SUBMITTED`] values.
+    pub status: String,
+    /// When the clock owes this query its exit from `SUBMITTED`; `None` once the query
+    /// has reached a status nothing further is due from.
+    pub completes_at: Option<SystemTime>,
+    /// The ids of the jobs on the page this query matched, in the order it matched them.
+    /// Reported once the query is [`JOBS_QUERY_STATUS_COMPLETE`].
+    pub matched: Vec<String>,
+    /// The cursor for the batch after this page, or `None` when this page is the last.
+    pub result_next_token: Option<String>,
+}
+
+impl JobsQueryRecord {
+    /// Whether `job` is one this query matches.
+    ///
+    /// `JobsQueryFilter`'s own documentation: "Provide one or more JobsQueryFilter
+    /// objects, each containing a Key with an associated Values array. Note that
+    /// MediaConvert queries jobs using OR logic." So a job matches when it matches ANY
+    /// term — any value of any filter — and a query carrying no term at all narrows
+    /// nothing and matches every job, as a listing with no filter does.
+    pub fn matches(&self, job: &JobRecord) -> bool {
+        self.terms.is_empty()
+            || self
+                .terms
+                .iter()
+                .any(|term| job.matches_filter(&term.key, &term.value))
+    }
+}
+
+/// One page of jobs and the cursor that resumes after it.
+#[derive(Debug)]
+pub struct JobPage<'a> {
+    pub jobs: Vec<&'a JobRecord>,
+    /// The [`encode_cursor`] token of the last job of the page, and only when a further
+    /// page exists.
+    pub next_token: Option<String>,
+}
+
+/// The page of `jobs` a paged jobs reader reports.
+///
+/// Every paged reader of the job set goes through this one function — `ListJobs` and the
+/// page a jobs query matches — so the ordering, the cursor and the page size cannot drift
+/// apart between them. "Your most recently created jobs": ordered by creation time,
+/// newest first unless the caller asked for [`ORDER_ASCENDING`], with the id breaking
+/// ties so the order is total and a page boundary cannot repeat or skip a job.
+///
+/// `resume_from` is the ordering key a caller's `nextToken` decoded to; a token that
+/// decodes to nothing is refused by the handler that read it, with its modelled
+/// `BadRequestException`, so there is no failure left to answer here.
+pub fn page_of_jobs<'a>(
+    jobs: impl Iterator<Item = &'a JobRecord>,
+    order: Option<&str>,
+    resume_from: Option<&(u128, String)>,
+    max_results: Option<i32>,
+) -> JobPage<'a> {
+    let mut matching: Vec<&JobRecord> = jobs.collect();
+    matching.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let order = order.unwrap_or(ORDER_DESCENDING);
+    if order == ORDER_DESCENDING {
+        matching.reverse();
+    }
+    let ascending = order == ORDER_ASCENDING;
+
+    let start = match resume_from {
+        None => 0,
+        Some((nanos, id)) => {
+            let anchor = (*nanos, id.as_str());
+            // Resume at the first job strictly past the anchor key in this direction.
+            // The anchor itself need not still be in the result set, so a job whose
+            // status changed between pages is skipped, not an error.
+            matching
+                .iter()
+                .position(|job| {
+                    if ascending {
+                        job.ordering_key() > anchor
+                    } else {
+                        job.ordering_key() < anchor
+                    }
+                })
+                .unwrap_or(matching.len())
+        }
+    };
+
+    // Both `maxResults` members carry the model's own 1..20 range, so the framework has
+    // already refused anything outside it; the fallback only covers the absent case.
+    let page_size = usize::try_from(max_results.unwrap_or(DEFAULT_PAGE_SIZE))
+        .unwrap_or(DEFAULT_PAGE_SIZE as usize);
+    let page = &matching[start.min(matching.len())..];
+    let page = &page[..page_size.min(page.len())];
+    // A token only when there is a further page to fetch.
+    let next_token = (start + page.len() < matching.len())
+        .then(|| page.last().map(|job| job.cursor()))
+        .flatten();
+    JobPage {
+        jobs: page.to_vec(),
+        next_token,
     }
 }
 
@@ -814,12 +1094,14 @@ pub enum DeleteQueueOutcome {
     HasActiveJobs { submitted: i32, progressing: i32 },
 }
 
-/// What the store did when asked to accept a new job.
+/// What the store did when asked to accept a new record it mints the id of — a job, or
+/// a jobs query.
 #[derive(Debug)]
 pub enum AcceptOutcome {
-    /// The job is stored under this id.
+    /// The record is stored under this id.
     Stored(String),
-    /// The store is at [`MAX_JOBS`].
+    /// The store is at its capacity for that kind of record ([`MAX_JOBS`] jobs,
+    /// [`MAX_JOBS_QUERIES`] jobs queries).
     AtCapacity,
 }
 
@@ -855,6 +1137,9 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// Only `DescribeEndpoints` in `DEFAULT` mode adds one; nothing ever rewrites one,
     /// which is what makes the URL a caller reads back stable.
     pub endpoints: BTreeMap<String, String>,
+    /// Jobs queries by `Id`, as `StartJobsQuery` stored them and
+    /// `GetJobsQueryResults` reads them back. At most [`MAX_JOBS_QUERIES`] entries.
+    pub jobs_queries: BTreeMap<String, JobsQueryRecord>,
     /// `ClientRequestToken` -> the job it created, so `CreateJob` is idempotent for
     /// [`IDEMPOTENCY_WINDOW`]. One entry per stored job at most, so it is bounded by
     /// [`MAX_JOBS`].
@@ -863,8 +1148,13 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// due. [`Self::settle`] drains the already-due prefix, which is why settling never
     /// walks the job set.
     pending: BTreeSet<(SystemTime, String)>,
+    /// The jobs queries still owed their exit from `SUBMITTED`, ordered by the instant it
+    /// comes due, drained by [`Self::settle`] exactly as `pending` is.
+    pending_queries: BTreeSet<(SystemTime, String)>,
     /// Monotonic suffix source for a minted job id; never reset, so no id repeats.
     job_sequence: u64,
+    /// Monotonic suffix source for a minted jobs query id. See `job_sequence`.
+    jobs_query_sequence: u64,
     /// How long after `CreateJob` a job is due to leave `SUBMITTED`.
     ///
     /// Defaults to [`JOB_SETTLES_AFTER`]. It is a field rather than a constant so a test
@@ -872,6 +1162,12 @@ pub struct ComAmazonawsMediaconvertMediaconvertState {
     /// case, a short one to observe the transition — instead of racing the real clock.
     /// Nothing on a request path writes it.
     pub job_settles_after: Duration,
+    /// How long after `StartJobsQuery` a jobs query is due to leave `SUBMITTED`.
+    ///
+    /// Defaults to [`JOBS_QUERY_COMPLETES_AFTER`], and is a field for the same reason
+    /// `job_settles_after` is: a test pins the span it needs instead of racing the real
+    /// clock. Nothing on a request path writes it.
+    pub jobs_query_completes_after: Duration,
 }
 
 impl Default for ComAmazonawsMediaconvertMediaconvertState {
@@ -913,39 +1209,128 @@ impl Default for ComAmazonawsMediaconvertMediaconvertState {
             // No account endpoint exists until a `DescribeEndpoints` in `DEFAULT` mode
             // creates one, so `GET_ONLY` on a fresh account answers an empty list.
             endpoints: BTreeMap::new(),
+            // No jobs query exists until a caller starts one.
+            jobs_queries: BTreeMap::new(),
             idempotency: BTreeMap::new(),
             pending: BTreeSet::new(),
+            pending_queries: BTreeSet::new(),
             job_sequence: 0,
+            jobs_query_sequence: 0,
             job_settles_after: JOB_SETTLES_AFTER,
+            jobs_query_completes_after: JOBS_QUERY_COMPLETES_AFTER,
         }
     }
 }
 
 impl ComAmazonawsMediaconvertMediaconvertState {
-    /// Materialise every job status change the clock had already made due at `now`.
+    /// Materialise every status change the clock had already made due at `now` — a job's
+    /// exit from `SUBMITTED` and a jobs query's completion.
     ///
-    /// Bounded by the number of jobs actually settling, not by the size of the store:
-    /// `pending` is ordered by due instant, so this drains its already-due prefix and
-    /// stops at the first entry still in the future. It is the only write a reporting
-    /// operation makes, and the change it applies was owed at `now` whether or not
-    /// anybody called.
+    /// Bounded by the number of records actually due, not by the size of the store: both
+    /// pending indexes are ordered by due instant, so this drains their already-due
+    /// prefix, oldest first across the two, and stops at the first entry still in the
+    /// future. Each drained entry costs a bounded, constant amount of work — a job's
+    /// status and timing, or a query's status flip — so the cost of one call is the
+    /// number of records that came due and nothing else; neither kind re-reads the store.
+    /// It is the only write a reporting operation makes, and every change it applies was
+    /// owed at `now` whether or not anybody called.
     pub fn settle(&mut self, now: SystemTime) {
-        while let Some(entry) = self.pending.first().cloned() {
-            let (due, id) = entry;
-            if due > now {
-                break;
-            }
-            self.pending.remove(&(due, id.clone()));
-            if let Some(job) = self.jobs.get_mut(&id) {
-                if job.status == JOB_STATUS_SUBMITTED {
-                    job.status = JOB_STATUS_ERROR.to_string();
-                    job.error_message = Some(NO_TRANSCODER_MESSAGE.to_string());
-                    job.timing.start_time = Some(due);
-                    job.timing.finish_time = Some(due);
+        loop {
+            let next_job = self.pending.first().cloned();
+            let next_query = self.pending_queries.first().cloned();
+            match (next_job, next_query) {
+                // The two timelines are drained as one, oldest due instant first, so
+                // each change lands in the order the clock made it due.
+                (Some(job), query) if query.as_ref().is_none_or(|(due, _)| job.0 <= *due) => {
+                    if job.0 > now {
+                        break;
+                    }
+                    self.pending.remove(&job);
+                    self.settle_job(job.0, &job.1);
                 }
-                job.settles_at = None;
+                (_, Some(query)) => {
+                    if query.0 > now {
+                        break;
+                    }
+                    self.pending_queries.remove(&query);
+                    self.complete_jobs_query(&query.1);
+                }
+                // Nothing is due. `(Some(_), None)` cannot reach here — a pending job
+                // with no pending query always takes the first arm, whose guard holds
+                // when there is no query — but guards do not count towards
+                // exhaustiveness, so it is named rather than left to a catch-all.
+                (None, None) | (Some(_), None) => break,
             }
         }
+    }
+
+    /// The exit from `SUBMITTED` the clock owed the job `id` at `due`.
+    fn settle_job(&mut self, due: SystemTime, id: &str) {
+        if let Some(job) = self.jobs.get_mut(id) {
+            if job.status == JOB_STATUS_SUBMITTED {
+                job.status = JOB_STATUS_ERROR.to_string();
+                job.error_message = Some(NO_TRANSCODER_MESSAGE.to_string());
+                job.timing.start_time = Some(due);
+                job.timing.finish_time = Some(due);
+            }
+            job.settles_at = None;
+        }
+    }
+
+    /// The completion the clock owed the jobs query `id`: it leaves the non-terminal
+    /// `SUBMITTED` status for `COMPLETE`, and its results become readable.
+    ///
+    /// CONSTANT work per query, deliberately: the page was matched once when the query
+    /// was started ([`Self::accept_jobs_query`]), so no amount of queries coming due in
+    /// the same instant can make one `settle` call do more than a status flip each.
+    fn complete_jobs_query(&mut self, id: &str) {
+        if let Some(query) = self.jobs_queries.get_mut(id) {
+            if query.status == JOBS_QUERY_STATUS_SUBMITTED {
+                query.status = JOBS_QUERY_STATUS_COMPLETE.to_string();
+            }
+            // A completed query is terminal, so the clock owes it nothing further.
+            query.completes_at = None;
+        }
+    }
+
+    /// Store a newly started jobs query, refusing it once the store is at
+    /// [`MAX_JOBS_QUERIES`].
+    ///
+    /// RUNS the query: the page its filters, order, cursor and page size select is
+    /// matched here, once, and stored on the record — see [`JobsQueryRecord`] for why the
+    /// match happens at the start rather than at the completion. The work is bounded by
+    /// [`MAX_JOBS`] records times [`MAX_JOBS_QUERY_TERMS`] terms, and is paid by this one
+    /// request; the results stay unreadable until the query completes.
+    ///
+    /// Owns the id, the starting status, the page and the `pending_queries` entry
+    /// together, so they cannot be left inconsistent by a caller that forgets one.
+    /// `resume_from` is the ordering key the request's `nextToken` decoded to.
+    pub fn accept_jobs_query(
+        &mut self,
+        mut record: JobsQueryRecord,
+        resume_from: Option<&(u128, String)>,
+        now: SystemTime,
+    ) -> AcceptOutcome {
+        if self.jobs_queries.len() >= MAX_JOBS_QUERIES {
+            return AcceptOutcome::AtCapacity;
+        }
+        let id = mint_id(now, &mut self.jobs_query_sequence, &self.jobs_queries);
+        let due = now + self.jobs_query_completes_after;
+        let page = page_of_jobs(
+            self.jobs.values().filter(|job| record.matches(job)),
+            record.order.as_deref(),
+            resume_from,
+            record.max_results,
+        );
+        record.id = id.clone();
+        // SUBMITTED is not terminal, so the clock owes this query its completion.
+        record.status = JOBS_QUERY_STATUS_SUBMITTED.to_string();
+        record.completes_at = Some(due);
+        record.matched = page.jobs.iter().map(|job| job.id.clone()).collect();
+        record.result_next_token = page.next_token;
+        self.pending_queries.insert((due, id.clone()));
+        self.jobs_queries.insert(id.clone(), record);
+        AcceptOutcome::Stored(id)
     }
 
     /// Store a newly submitted job, refusing it once the store is at [`MAX_JOBS`].
@@ -1008,22 +1393,10 @@ impl ComAmazonawsMediaconvertMediaconvertState {
 
     /// A fresh, unused job id.
     ///
-    /// Shaped like a MediaConvert job id — the submit instant in epoch milliseconds, a
-    /// hyphen, then a short suffix — and drawn from a stored sequence rather than a
-    /// random source, so the id a caller is handed is the id that was persisted. The
-    /// loop terminates: the sequence strictly increases and the store holds fewer than
-    /// [`MAX_JOBS`] ids.
+    /// See [`mint_id`]: the id is drawn from a stored sequence rather than a random
+    /// source, so the id a caller is handed is the id that was persisted.
     fn mint_job_id(&mut self, now: SystemTime) -> String {
-        let millis = now
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_millis());
-        loop {
-            self.job_sequence += 1;
-            let candidate = format!("{millis}-{}", base36(self.job_sequence));
-            if !self.jobs.contains_key(&candidate) {
-                return candidate;
-            }
-        }
+        mint_id(now, &mut self.job_sequence, &self.jobs)
     }
 
     /// Delete a queue: "Permanently delete a queue you have created."
@@ -1148,6 +1521,26 @@ impl ComAmazonawsMediaconvertMediaconvertState {
             }
         }
         (submitted, progressing)
+    }
+}
+
+/// A fresh id no key of `taken` already holds.
+///
+/// Shaped like a MediaConvert resource id the service mints — the instant in epoch
+/// milliseconds, a hyphen, then a short suffix — and drawn from the stored `sequence`
+/// rather than a random source, so the id a caller is handed is the id that was
+/// persisted. The loop terminates: the sequence strictly increases and every map it
+/// mints into is capped well below the number of distinct suffixes.
+fn mint_id<V>(now: SystemTime, sequence: &mut u64, taken: &BTreeMap<String, V>) -> String {
+    let millis = now
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis());
+    loop {
+        *sequence += 1;
+        let candidate = format!("{millis}-{}", base36(*sequence));
+        if !taken.contains_key(&candidate) {
+            return candidate;
+        }
     }
 }
 

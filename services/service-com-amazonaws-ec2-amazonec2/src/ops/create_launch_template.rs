@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLaunchTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLaunchTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLaunchTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores a launch template with its first version in
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::launch_templates`], so
+//! `DeleteLaunchTemplate` has a template to delete and reports the one this call minted.
+//!
+//! The id, the create time, the creating principal and the default and latest version
+//! numbers are derived by the store, never taken from the request; the first version keeps
+//! the request's `LaunchTemplateData` verbatim, so nothing a caller set is dropped.
+//!
+//! A name is refused unless the modelled `LaunchTemplateName` can carry it, and a name the
+//! account already holds a template under is refused with
+//! `InvalidLaunchTemplateName.AlreadyExistsException`: a name resolves one template for
+//! `DeleteLaunchTemplate`, so two templates can never share one.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +160,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLaunchTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLaunchTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            LAUNCH_TEMPLATE_TAGGABLE_RESOURCE, LaunchTemplateSpec, MAX_CLIENT_TOKEN_CHARS,
+            MAX_LAUNCH_TEMPLATE_NAME_CHARS, MAX_LAUNCH_TEMPLATES, MAX_STORED_BYTES,
+            MAX_TAGS_PER_RESOURCE, MAX_USER_DATA_BYTES, MIN_LAUNCH_TEMPLATE_NAME_CHARS,
+            launch_template_limit_exceeded, launch_template_name_already_exists,
+            launch_template_name_is_well_formed, launch_template_payload_bytes,
+            require_service_state, validate_tag_size,
+        };
+
+        // Nothing here depends on the Region: a launch template carries no Region member,
+        // and the principal `CreatedBy` reports is an IAM ARN, which is global.
+        let _ = ctx;
+
+        // `CreateLaunchTemplate$LaunchTemplateName` targets a plain `String`, so the
+        // boundary validator enforces nothing on it, while every member that REPORTS or
+        // NAMES a template targets the modelled `LaunchTemplateName`. A name that one
+        // cannot carry is refused here rather than stored.
+        if !launch_template_name_is_well_formed(&input.launch_template_name) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for launchTemplateName. \
+                 A launch template name is {MIN_LAUNCH_TEMPLATE_NAME_CHARS} to \
+                 {MAX_LAUNCH_TEMPLATE_NAME_CHARS} characters of \
+                 letters, digits and the characters ()./-_",
+                input.launch_template_name
+            )));
+        }
+        // Documented on `ClientToken`: "Constraint: Maximum 128 ASCII characters." The
+        // model declares no `@length`, and the token is retained as a key of the
+        // idempotency map, so the handler is the only place the bound can exist.
+        if let Some(token) = input.client_token.as_deref() {
+            if token.chars().count() > MAX_CLIENT_TOKEN_CHARS || !token.is_ascii() {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "ClientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} ASCII characters"
+                )));
+            }
+        }
+        // Documented on `TagSpecifications`: "To tag the launch template, the resource
+        // type must be launch-template." This call creates no other resource, so a
+        // specification naming anything else — or naming nothing — is refused rather
+        // than accepted and discarded.
+        let mut tags: Vec<Tag> = Vec::new();
+        for specification in input.tag_specifications.iter().flatten() {
+            if specification.resource_type.as_deref() != Some(LAUNCH_TEMPLATE_TAGGABLE_RESOURCE) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{}' for resourceType. \
+                     The resource type of a CreateLaunchTemplate tag specification must be \
+                     '{LAUNCH_TEMPLATE_TAGGABLE_RESOURCE}'",
+                    specification.resource_type.as_deref().unwrap_or_default()
+                )));
+            }
+            for tag in specification.tags.iter().flatten() {
+                validate_tag_size(
+                    tag.key.as_deref().unwrap_or_default(),
+                    tag.value.as_deref().unwrap_or_default(),
+                )?;
+                tags.push(tag.clone());
+            }
+        }
+        // "Each resource can have a maximum of 50 tags" (`CreateTags`), which is the same
+        // ceiling however the tags reach the resource.
+        if tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "The request carries {} tags, above the maximum of \
+                 {MAX_TAGS_PER_RESOURCE} per resource",
+                tags.len()
+            )));
+        }
+        // "You must specify at least one parameter for the launch template data"
+        // (`smithy_query(query="shape",shape="RequestLaunchTemplateData")`). The member is
+        // `clientOptional`, so the boundary validator lets an empty one through, and an
+        // empty version would store a template that launches nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLaunchTemplate"))
+        // The shape carries dozens of members, so emptiness is decided by comparing the
+        // request's data with a default one rather than by naming each member — which also
+        // means a member the model gains later counts without this check being revisited.
+        // The rendering is used for this comparison only; it is never reported or logged,
+        // because `UserData` is `@sensitive`.
+        if format!("{:?}", input.launch_template_data)
+            == format!("{:?}", RequestLaunchTemplateData::default())
+        {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain at least one parameter for LaunchTemplateData",
+            ));
+        }
+        // AWS documents a 16 KB limit on instance user data, and this is the user data
+        // every instance launched from the template will get. The model declares no
+        // `@length` on it, and the template retains it, so it is bounded here.
+        if input
+            .launch_template_data
+            .user_data
+            .as_ref()
+            .is_some_and(|user_data| user_data.len() > MAX_USER_DATA_BYTES)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "User data accepts at most {MAX_USER_DATA_BYTES} bytes"
+            )));
+        }
+
+        // `OperatorRequest$Principal` is "the service provider that manages the
+        // resource", and `OperatorResponse$Managed` is true "if the resource is managed by
+        // a service provider" — so a request naming a principal creates a managed
+        // template, and one naming none creates a template no provider manages, which is
+        // reported as no operator rather than an empty one. `HiddenByDefault` follows the
+        // account's managed-resource visibility settings, which nothing in this emulator
+        // sets, so it is reported absent instead of guessed.
+        let operator = input
+            .operator
+            .as_ref()
+            .and_then(|operator| operator.principal.clone())
+            .filter(|principal| !principal.is_empty())
+            .map(|principal| OperatorResponse {
+                managed: Some(true),
+                principal: Some(principal),
+                hidden_by_default: None,
+            });
+
+        let spec = LaunchTemplateSpec {
+            name: input.launch_template_name.clone(),
+            // The emulator serves one account, whose root principal is the only one that
+            // can have created anything in it.
+            created_by: ::engine::emulator_arn("iam", "", "root"),
+            create_time: ::std::time::SystemTime::now(),
+            tags,
+            operator,
+            version_description: input.version_description.clone(),
+            data: input.launch_template_data.clone(),
+        };
+        let payload_bytes = launch_template_payload_bytes(&spec);
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Idempotency: one ClientToken names the one template it created, so a repeat of
+        // the same request answers with that template instead of creating a second one.
+        // Looked up here and answered below the DryRun check, because a replay stores
+        // nothing and so clears the ceilings a fresh create has to.
+        let replayed = match input.client_token.as_deref() {
+            Some(token) => store.launch_template_client_tokens.get(token).cloned(),
+            None => None,
+        };
+
+        // Every remaining check is READ-ONLY, and a replay clears them all by storing
+        // nothing.
+        if replayed.is_none() {
+            if store.launch_template_id_for_name(&spec.name).is_some() {
+                return Err(launch_template_name_already_exists(&spec.name));
+            }
+            if store.launch_templates.len() >= MAX_LAUNCH_TEMPLATES {
+                return Err(launch_template_limit_exceeded(format!(
+                    "This account holds {MAX_LAUNCH_TEMPLATES} launch templates, \
+                     which is the most it may hold"
+                )));
+            }
+            if store.would_exceed_stored_bytes(payload_bytes) {
+                return Err(launch_template_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store {payload_bytes} more",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every read-only check
+        // made, and BEFORE the first write: the flag asks whether the request WOULD have
+        // succeeded, so one that would have been refused is refused with that reason
+        // instead, and one that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let launch_template_id = match replayed {
+            Some(launch_template_id) => launch_template_id,
+            None => {
+                let launch_template_id = store.insert_launch_template(spec);
+                if let Some(token) = input.client_token.clone() {
+                    store
+                        .launch_template_client_tokens
+                        .insert(token, launch_template_id.clone());
+                }
+                launch_template_id
+            }
+        };
+
+        // The response is the STORED template, read back out of the store, so this call
+        // and every later reader report the same one.
+        let launch_template = store
+            .launch_templates
+            .get(&launch_template_id)
+            .map(|record| record.template.clone())
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "launch template '{launch_template_id}' was not stored"
+                ))
+            })?;
+        Ok(CreateLaunchTemplateOutput {
+            launch_template: Some(launch_template),
+            // "If the launch template contains parameters or parameter combinations that
+            // are not valid, an error code and an error message are returned for each
+            // issue that's found" (`CreateLaunchTemplateResult$Warning`). Every parameter
+            // this handler checks is refused outright rather than warned about, so a
+            // stored template has no findings to report.
+            warning: None,
+        })
     }
 }

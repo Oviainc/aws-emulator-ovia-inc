@@ -325,8 +325,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A launch template carries the launch parameters this handler would have to
-        // resolve, and no operation that creates one is implemented yet, so there is
-        // nothing to resolve them against.
+        // resolve, merge with the ones the request carries and then report on the
+        // instances it mints. `CreateLaunchTemplate` stores a template, but resolving a
+        // stored version into a launch is work this slice has not done, so a launch that
+        // names one is refused rather than answered with an instance whose parameters
+        // came from somewhere else.
         if input.launch_template.is_some() {
             return Err(Scaffolded::not_implemented(
                 "RunInstances with a LaunchTemplate",

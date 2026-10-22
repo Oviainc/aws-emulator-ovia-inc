@@ -40,6 +40,18 @@
 //! belong beside them as they are implemented, and should be validated against
 //! [`availability_zones_in_region`] rather than against a second zone list.
 //!
+//! ## Launch templates
+//!
+//! [`ComAmazonawsEc2Amazonec2State::launch_templates`] holds the account's launch
+//! templates as [`LaunchTemplateRecord`]s: the modelled [`LaunchTemplate`] every operation
+//! that reports one answers with, plus the versions of the template, because "deleting a
+//! launch template deletes all of its versions" (`DeleteLaunchTemplate`) — so the versions
+//! have to be part of the one record the delete removes. The store is keyed by
+//! `LaunchTemplateId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
+//! are kept in, and a template is reached by name through
+//! [`ComAmazonawsEc2Amazonec2State::launch_template_id_for_name`] because the API lets a
+//! caller name either.
+//!
 //! ## The default VPC's default subnets
 //!
 //! "When we create a default VPC, we create a default subnet in each Availability Zone
@@ -57,8 +69,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::ops::types::{
     AvailabilityZone, AvailabilityZoneMessage, BlockPublicAccessStates, GroupIdentifier,
     INSTANCE_TYPE_VALUES, Instance, InstanceState, InstanceTypeOffering, LOCATION_TYPE_VALUES,
-    Monitoring, Placement, PrivateDnsNameOptionsOnLaunch, RunInstancesOutput, StateReason, Subnet,
-    Tag, Vpc, VpcCidrBlockAssociation, VpcCidrBlockState,
+    LaunchTemplate, Monitoring, OperatorResponse, Placement, PrivateDnsNameOptionsOnLaunch,
+    RequestLaunchTemplateData, RunInstancesOutput, StateReason, Subnet, Tag, Vpc,
+    VpcCidrBlockAssociation, VpcCidrBlockState,
 };
 
 /// The `Reservation` shape, under the name the scaffold generated for it.
@@ -450,6 +463,68 @@ pub const INVALID_PAGINATION_TOKEN: &str = "InvalidPaginationToken";
 /// carries: a 5xx is retryable to an SDK's retry classifier.
 pub const INTERNAL_ERROR: &str = "InternalError";
 
+/// EC2's error code for a request that named a launch template id this account holds no
+/// launch template for.
+pub const INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND: &str = "InvalidLaunchTemplateId.NotFound";
+
+/// EC2's error code for a request that named something that is not a launch template id
+/// at all, so there is nothing to look up.
+pub const INVALID_LAUNCH_TEMPLATE_ID_MALFORMED: &str = "InvalidLaunchTemplateId.Malformed";
+
+/// EC2's error code for a request that named a launch template name no launch template of
+/// this account carries.
+pub const INVALID_LAUNCH_TEMPLATE_NAME_NOT_FOUND: &str =
+    "InvalidLaunchTemplateName.NotFoundException";
+
+/// EC2's error code for a create that named a launch template name this account already
+/// holds a launch template under: `DeleteLaunchTemplate` and `DescribeLaunchTemplates`
+/// resolve a template by NAME as well as by id
+/// (`smithy_query(query="operation",operation="DeleteLaunchTemplate")`), so a name can
+/// only ever name one template.
+pub const INVALID_LAUNCH_TEMPLATE_NAME_ALREADY_EXISTS: &str =
+    "InvalidLaunchTemplateName.AlreadyExistsException";
+
+/// EC2's error code for a create that would take the account past the number of launch
+/// templates it may hold.
+pub const LAUNCH_TEMPLATE_LIMIT_EXCEEDED: &str = "LaunchTemplateLimitExceeded";
+
+/// The most launch templates this emulator holds at once.
+///
+/// The real service bounds them with the account's "Launch templates per Region" quota of
+/// 5,000 (Amazon EC2 service quotas); this emulator has no quota service, so the same
+/// number is the fixed ceiling, and it is what keeps the store's growth bounded however
+/// many times a caller creates one.
+pub const MAX_LAUNCH_TEMPLATES: usize = 5_000;
+
+/// The fewest characters a launch template name may carry: the `@length` minimum of the
+/// modelled `LaunchTemplateName`
+/// (`smithy_query(query="shape",shape="LaunchTemplateName")`), which is the type every
+/// operation that REPORTS or NAMES a template uses.
+pub const MIN_LAUNCH_TEMPLATE_NAME_CHARS: usize = 3;
+
+/// The most characters a launch template name may carry: that same `@length` maximum.
+pub const MAX_LAUNCH_TEMPLATE_NAME_CHARS: usize = 128;
+
+/// Every character the modelled `LaunchTemplateName` pattern
+/// `^[a-zA-Z0-9\(\)\.\-/_]+$` admits beside the ASCII letters and digits.
+pub const LAUNCH_TEMPLATE_NAME_PUNCTUATION: &str = "()./-_";
+
+/// The most characters a `ClientToken` may carry. From `CreateLaunchTemplate$ClientToken`'s
+/// own doc: "Constraint: Maximum 128 ASCII characters."
+pub const MAX_CLIENT_TOKEN_CHARS: usize = 128;
+
+/// The resource type `CreateLaunchTemplate$TagSpecifications` accepts.
+///
+/// From the member's documentation: "To tag the launch template, the resource type must be
+/// `launch-template`." Any other type names a resource this operation does not create.
+pub const LAUNCH_TEMPLATE_TAGGABLE_RESOURCE: &str = "launch-template";
+
+/// The version number of the first version of a launch template: `CreateLaunchTemplate`
+/// creates "the first version of the launch template"
+/// (`CreateLaunchTemplate$VersionDescription`), and `LaunchTemplateVersion$VersionNumber`
+/// counts from one.
+pub const FIRST_LAUNCH_TEMPLATE_VERSION: i64 = 1;
+
 /// Every filter `DescribeAvailabilityZones` documents, as its `Filters` member lists
 /// them
 /// (`smithy_query(query="doc",shape="DescribeAvailabilityZonesRequest",member="Filters")`).
@@ -552,6 +627,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// field-by-field copy. Ordered by id, which is the order the describe reports and
     /// pages over.
     pub subnets: BTreeMap<String, Subnet>,
+    /// Every launch template the account holds, by `LaunchTemplateId`, each with its
+    /// versions — see the module docs.
+    pub launch_templates: BTreeMap<String, LaunchTemplateRecord>,
+    /// A `CreateLaunchTemplate` `ClientToken` and the launch template id it minted, so a
+    /// repeat of the same request answers with that template instead of creating a second
+    /// one. Cleared for a template a delete removes, so the token cannot name a template
+    /// that is gone.
+    pub launch_template_client_tokens: HashMap<String, String>,
     /// Monotonic source of generated resource-id suffixes, so an id is unique within a
     /// run and deterministic across runs.
     pub id_counter: u64,
@@ -572,6 +655,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             next_private_ip: 0,
             vpcs: BTreeMap::new(),
             subnets: BTreeMap::new(),
+            launch_templates: BTreeMap::new(),
+            launch_template_client_tokens: HashMap::new(),
             id_counter: 0,
         };
         let default_vpc = state.insert_vpc(
@@ -740,6 +825,303 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         inserted
     }
+
+    /// Store a launch template with its first version, and answer the `LaunchTemplateId` it
+    /// was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller: the id, and the default and latest version numbers — the first version is
+    /// the only version, so it is both — so two writers cannot report the same template
+    /// differently. The bytes the record retains are counted into the store's budget here
+    /// as well, and [`Self::remove_launch_template`] is what gives them back.
+    pub fn insert_launch_template(&mut self, spec: LaunchTemplateSpec) -> String {
+        let launch_template_id = self.next_id("lt");
+        let payload_bytes = launch_template_payload_bytes(&spec);
+        let template = LaunchTemplate {
+            launch_template_id: Some(launch_template_id.clone()),
+            launch_template_name: Some(spec.name),
+            create_time: Some(system_time_to_date_time(spec.create_time)),
+            created_by: Some(spec.created_by.clone()),
+            default_version_number: Some(FIRST_LAUNCH_TEMPLATE_VERSION),
+            latest_version_number: Some(FIRST_LAUNCH_TEMPLATE_VERSION),
+            tags: Some(spec.tags),
+            operator: spec.operator,
+        };
+        let mut versions = BTreeMap::new();
+        versions.insert(
+            FIRST_LAUNCH_TEMPLATE_VERSION,
+            LaunchTemplateVersionRecord {
+                version_number: FIRST_LAUNCH_TEMPLATE_VERSION,
+                version_description: spec.version_description,
+                create_time: spec.create_time,
+                created_by: spec.created_by,
+                default_version: true,
+                data: spec.data,
+            },
+        );
+        self.launch_templates.insert(
+            launch_template_id.clone(),
+            LaunchTemplateRecord {
+                template,
+                versions,
+                payload_bytes,
+            },
+        );
+        self.add_stored_bytes(payload_bytes);
+        launch_template_id
+    }
+
+    /// The id of the launch template this account holds under `name`, if it holds one.
+    ///
+    /// A scan of the store, which [`MAX_LAUNCH_TEMPLATES`] bounds; a name names at most one
+    /// template, because a create that reuses one is refused.
+    pub fn launch_template_id_for_name(&self, name: &str) -> Option<String> {
+        self.launch_templates
+            .values()
+            .find(|record| record.launch_template_name() == name)
+            .map(|record| record.launch_template_id().to_string())
+    }
+
+    /// Remove the launch template `launch_template_id` names — with every version it holds,
+    /// since "deleting a launch template deletes all of its versions"
+    /// (`DeleteLaunchTemplate`) and they live on the one record this removes — and answer
+    /// it as it was last reported.
+    ///
+    /// Every `CreateLaunchTemplate` client token that named it goes too: a token must never
+    /// answer with a template that is no longer stored. The bytes the record held go back
+    /// to the store's budget.
+    pub fn remove_launch_template(
+        &mut self,
+        launch_template_id: &str,
+    ) -> Option<LaunchTemplateRecord> {
+        let record = self.launch_templates.remove(launch_template_id)?;
+        self.launch_template_client_tokens
+            .retain(|_, minted| minted != launch_template_id);
+        self.release_stored_bytes(record.payload_bytes);
+        Some(record)
+    }
+
+    /// Give `bytes` of the caller-chosen byte budget back, for a record that is no longer
+    /// stored. Saturating, so the budget can never wrap below zero.
+    pub fn release_stored_bytes(&mut self, bytes: usize) {
+        self.stored_bytes = self.stored_bytes.saturating_sub(bytes);
+    }
+}
+
+/// One stored launch template: the modelled [`LaunchTemplate`] every operation that reports
+/// one answers with, plus the versions the template holds.
+///
+/// The template is kept as the modelled shape itself — the way the VPC and subnet stores
+/// keep theirs — so every member a writer sets round-trips through every reader without a
+/// field-by-field copy that can silently drop one.
+#[derive(Debug, Clone)]
+pub struct LaunchTemplateRecord {
+    /// The template as `CreateLaunchTemplate` and `DeleteLaunchTemplate` report it.
+    pub template: LaunchTemplate,
+    /// The template's versions, by `VersionNumber`. `CreateLaunchTemplate` stores the
+    /// first one; a delete of the template takes all of them with it.
+    pub versions: BTreeMap<i64, LaunchTemplateVersionRecord>,
+    /// The caller-chosen bytes this record retains, counted into the store's budget while
+    /// it is stored.
+    pub payload_bytes: usize,
+}
+
+impl LaunchTemplateRecord {
+    /// The template's own id, which is also the key the store holds it under.
+    pub fn launch_template_id(&self) -> &str {
+        self.template
+            .launch_template_id
+            .as_deref()
+            .unwrap_or_default()
+    }
+
+    /// The template's name, the second key a caller may name it by.
+    pub fn launch_template_name(&self) -> &str {
+        self.template
+            .launch_template_name
+            .as_deref()
+            .unwrap_or_default()
+    }
+}
+
+/// One version of a stored launch template: the launch parameters the caller gave for it,
+/// kept verbatim, beside what the service recorded about the version itself.
+#[derive(Debug, Clone)]
+pub struct LaunchTemplateVersionRecord {
+    /// This version's number; the first version is [`FIRST_LAUNCH_TEMPLATE_VERSION`].
+    pub version_number: i64,
+    /// The description the caller gave the version, if it gave one.
+    pub version_description: Option<String>,
+    /// When the version was created.
+    pub create_time: SystemTime,
+    /// The principal that created it.
+    pub created_by: String,
+    /// Whether this is the template's default version.
+    pub default_version: bool,
+    /// The launch parameters, exactly as the request carried them, so nothing a caller set
+    /// is dropped by the store.
+    pub data: RequestLaunchTemplateData,
+}
+
+/// One launch template as a writer asks for it: the members a creator chooses. Everything
+/// the service derives — the launch template id, and the default and latest version
+/// numbers — is minted by [`ComAmazonawsEc2Amazonec2State::insert_launch_template`].
+#[derive(Debug, Clone)]
+pub struct LaunchTemplateSpec {
+    /// The template's name, already checked against the modelled `LaunchTemplateName`
+    /// constraints by [`launch_template_name_is_well_formed`].
+    pub name: String,
+    /// The principal that created it, as `LaunchTemplate$CreatedBy` reports it.
+    pub created_by: String,
+    /// When it was created.
+    pub create_time: SystemTime,
+    /// The tags the create asked for.
+    pub tags: Vec<Tag>,
+    /// The service provider that manages the template, when the request named one.
+    pub operator: Option<OperatorResponse>,
+    /// The description of the first version.
+    pub version_description: Option<String>,
+    /// The first version's launch parameters.
+    pub data: RequestLaunchTemplateData,
+}
+
+/// The caller-chosen bytes one stored launch template retains.
+///
+/// A version keeps the WHOLE `RequestLaunchTemplateData` — dozens of members, most of them
+/// caller-chosen strings and lists — so counting a handful of members by hand would leave
+/// most of what the store holds unaccounted for. The `Debug` rendering visits every member
+/// and its length grows with all of them, which is the measure the store's byte ceiling
+/// needs: it is used to decide whether the record fits, never reported to anyone.
+pub fn launch_template_payload_bytes(spec: &LaunchTemplateSpec) -> usize {
+    spec.name.len()
+        + spec.version_description.as_ref().map_or(0, String::len)
+        + tag_list_bytes(&spec.tags)
+        + format!("{:?}", spec.data).len()
+}
+
+/// Whether `id` is a well-formed launch template id.
+///
+/// A launch template id is `lt-` followed by 8 or 17 lowercase hexadecimal digits — the
+/// short and the long id form, the same two every EC2 resource id has. EC2 answers
+/// `InvalidLaunchTemplateId.Malformed` for anything else, BEFORE it looks the id up, which
+/// is a different answer from `InvalidLaunchTemplateId.NotFound` for a well-formed id no
+/// template was created for.
+pub fn launch_template_id_is_well_formed(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("lt-") else {
+        return false;
+    };
+    matches!(suffix.len(), 8 | 17)
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `name` is a name a launch template can carry: [`MIN_LAUNCH_TEMPLATE_NAME_CHARS`]
+/// to [`MAX_LAUNCH_TEMPLATE_NAME_CHARS`] characters, each of them an ASCII letter, an ASCII
+/// digit or one of [`LAUNCH_TEMPLATE_NAME_PUNCTUATION`].
+///
+/// `CreateLaunchTemplate$LaunchTemplateName` targets a plain `String` with no constraints
+/// of its own, while `LaunchTemplate$LaunchTemplateName` — the member every reader reports
+/// the name through — and `DeleteLaunchTemplate$LaunchTemplateName` target the modelled
+/// `LaunchTemplateName`, whose `@length` is 3..128 and whose `@pattern` is
+/// `^[a-zA-Z0-9\(\)\.\-/_]+$`
+/// (`smithy_query(query="shape",shape="LaunchTemplateName")`). A create the boundary
+/// validator lets through with a name outside that would store a template no reader could
+/// report and no caller could name, so the handler refuses it here.
+pub fn launch_template_name_is_well_formed(name: &str) -> bool {
+    let characters = name.chars().count();
+    (MIN_LAUNCH_TEMPLATE_NAME_CHARS..=MAX_LAUNCH_TEMPLATE_NAME_CHARS).contains(&characters)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || LAUNCH_TEMPLATE_NAME_PUNCTUATION.contains(c))
+}
+
+/// Resolve the one launch template a request names, by id or by name.
+///
+/// "You must specify either the launch template ID or the launch template name, but not
+/// both" (`DeleteLaunchTemplate$LaunchTemplateId`), so naming both is refused as a
+/// parameter combination and naming neither as a missing parameter — before either is
+/// looked up. An id is checked for shape first, the way EC2 orders a malformed id ahead of
+/// an unknown one; a name has no shape to be wrong, so an unknown name is simply not found.
+pub fn resolve_launch_template_id<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    launch_template_id: Option<&str>,
+    launch_template_name: Option<&str>,
+) -> Result<String, crate::scaffolded::Scaffolded<E>> {
+    match (launch_template_id, launch_template_name) {
+        (Some(_), Some(_)) => Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+            "Either the launch template ID or the launch template name may be specified, \
+             but not both",
+        )),
+        (Some(id), None) => {
+            if !launch_template_id_is_well_formed(id) {
+                return Err(invalid_launch_template_id_malformed(id));
+            }
+            if !store.launch_templates.contains_key(id) {
+                return Err(invalid_launch_template_id_not_found(id));
+            }
+            Ok(id.to_string())
+        }
+        (None, Some(name)) => store
+            .launch_template_id_for_name(name)
+            .ok_or_else(|| invalid_launch_template_name_not_found(name)),
+        (None, None) => Err(crate::scaffolded::Scaffolded::missing_parameter(
+            "The request must contain either the parameter LaunchTemplateId or the \
+             parameter LaunchTemplateName",
+        )),
+    }
+}
+
+/// Refuse a create that would take the account past the number of launch templates it may
+/// hold: HTTP 400 `LaunchTemplateLimitExceeded`.
+pub fn launch_template_limit_exceeded<E>(
+    message: impl Into<String>,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(LAUNCH_TEMPLATE_LIMIT_EXCEEDED, 400, message)
+}
+
+/// Refuse a request that named a launch template id no launch template of the account has:
+/// HTTP 400 `InvalidLaunchTemplateId.NotFound`.
+pub fn invalid_launch_template_id_not_found<E>(
+    launch_template_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND,
+        400,
+        format!("The launch template ID '{launch_template_id}' does not exist"),
+    )
+}
+
+/// Refuse a request that named something that is not a launch template id at all: HTTP 400
+/// `InvalidLaunchTemplateId.Malformed`.
+pub fn invalid_launch_template_id_malformed<E>(
+    launch_template_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_LAUNCH_TEMPLATE_ID_MALFORMED,
+        400,
+        format!("Invalid launch template ID: '{launch_template_id}'"),
+    )
+}
+
+/// Refuse a request that named a launch template name no launch template of the account
+/// carries: HTTP 400 `InvalidLaunchTemplateName.NotFoundException`.
+pub fn invalid_launch_template_name_not_found<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_LAUNCH_TEMPLATE_NAME_NOT_FOUND,
+        400,
+        format!("The launch template name '{name}' does not exist"),
+    )
+}
+
+/// Refuse a create that named a launch template name this account already holds a template
+/// under: HTTP 400 `InvalidLaunchTemplateName.AlreadyExistsException`.
+pub fn launch_template_name_already_exists<E>(name: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_LAUNCH_TEMPLATE_NAME_ALREADY_EXISTS,
+        400,
+        format!("The launch template name '{name}' is already in use"),
+    )
 }
 
 /// One subnet as a writer asks for it: the members a creator chooses. Everything the

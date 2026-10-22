@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases one stored workflow by `WorkflowId`. A workflow a server still attaches
+//! through its `WorkflowDetails` is IN USE, so the delete is refused with the modelled
+//! `InvalidRequestException` naming those servers rather than leaving them pointing at
+//! a workflow that no longer exists; an unknown id answers the modelled
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +160,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkflow"))
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            DeleteWorkflowErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+
+        if !guard.workflows.contains_key(&input.workflow_id) {
+            return Err(st::not_found(
+                DeleteWorkflowErrorModeled::ResourceNotFoundException(st::unknown_workflow(
+                    &input.workflow_id,
+                )),
+            ));
+        }
+
+        // A workflow a server attaches is in use: deleting it would leave that
+        // server's `WorkflowDetails` naming a workflow that no longer exists, so the
+        // request is refused with the modelled `InvalidRequestException` (HTTP 400)
+        // and the workflow stays. The caller detaches it (`UpdateServer`) first.
+        let in_use = guard.servers_using_workflow(&input.workflow_id);
+        if !in_use.is_empty() {
+            let message = format!(
+                "the workflow cannot be deleted while it is attached to server(s) {}",
+                in_use.join(", ")
+            );
+            return Err(DeleteWorkflowErrorModeled::InvalidRequestException(
+                InvalidRequestException { message },
+            )
+            .into());
+        }
+
+        guard.workflows.remove(&input.workflow_id);
+        drop(guard);
+
+        Ok(DeleteWorkflowOutput {})
     }
 }

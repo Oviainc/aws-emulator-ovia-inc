@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartJobsQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartJobsQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Start an asynchronous jobs query: `StartJobsQuery` persists the query the caller
+//! described (its filter list, order, page size and resume cursor) and answers the id
+//! `GetJobsQueryResults` reads it back by. The query itself runs when the clock makes its
+//! completion due; see [`crate::state::JobsQueryRecord`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartJobsQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A 501 from this operation is history: it is implemented, and this is the ONLY file to
+//! touch for it.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +160,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartJobsQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartJobsQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartJobsQuery"))
+        // Nothing here depends on the request's region: the query's output is its id.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartJobsQueryErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("this service's state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Provide one or more JobsQueryFilter objects, each containing a Key with an
+        // associated Values array": a filter naming no key describes no job detail to
+        // match on, so it is a problem in the request, refused naming the member it is
+        // in. The key itself targets the `JobsQueryFilterKey` enum, so a key the model
+        // does not declare is already refused before this handler runs.
+        let mut terms = Vec::new();
+        for filter in input.filter_list.iter().flatten() {
+            let Some(key) = filter.key.as_deref() else {
+                return Err(StartJobsQueryErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(
+                            "You must specify Key for each JobsQueryFilter in filterList."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            for value in filter.values.iter().flatten() {
+                terms.push(crate::state::JobsQueryTerm {
+                    key: key.to_string(),
+                    value: value.clone(),
+                });
+            }
+        }
+        if terms.len() > crate::state::MAX_JOBS_QUERY_TERMS {
+            return Err(
+                StartJobsQueryErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(format!(
+                        "You specified {} filter values in filterList. A jobs query \
+                         matches on at most {} of them.",
+                        terms.len(),
+                        crate::state::MAX_JOBS_QUERY_TERMS
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The cursor is this service's own opaque token: "Use this string to request the
+        // next batch of jobs matched by a jobs query." One this service never issued is
+        // refused here, rather than starting a query that could not be computed.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                let Some(anchor) = crate::state::decode_cursor(token) else {
+                    return Err(StartJobsQueryErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(
+                                "nextToken is not a token this service issued.".to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                };
+                Some(anchor)
+            }
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // The id, the starting status, the matched page and the clock-owed completion are
+        // all owned by `accept_jobs_query`, which also enforces the store's
+        // `MAX_JOBS_QUERIES` ceiling, so caller-driven growth is bounded.
+        let record = crate::state::JobsQueryRecord {
+            // `accept_jobs_query` mints and assigns the id, the status, the due instant
+            // and the page.
+            id: String::new(),
+            terms,
+            order: input.order,
+            max_results: input.max_results,
+            status: String::new(),
+            completes_at: None,
+            matched: Vec::new(),
+            result_next_token: None,
+        };
+
+        match state.accept_jobs_query(record, resume_from.as_ref(), now) {
+            crate::state::AcceptOutcome::Stored(id) => Ok(StartJobsQueryOutput { id: Some(id) }),
+            crate::state::AcceptOutcome::AtCapacity => Err(
+                StartJobsQueryErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "You have reached the maximum of {} jobs queries.",
+                            crate::state::MAX_JOBS_QUERIES
+                        )),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPortals
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPortals`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPortals::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `PortalSummary` per stored web portal, in a deterministic total order
+//! (creation instant, then ARN), paged by `maxResults` with an opaque `nextToken` that
+//! resumes exactly after the last item of the previous page. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +68,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as st;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +141,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPortals` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPortalsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPortals"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListPortalsErrorModeled::InternalServerException(st::state_unavailable())
+        })?;
+
+        // Only a token this service issued can name a position in the page order.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(st::decode_page_token(token).ok_or_else(|| {
+                ListPortalsErrorModeled::ValidationException(st::cannot_parse(
+                    "nextToken",
+                    "is not a pagination token this service issued",
+                ))
+            })?),
+        };
+
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+
+        // The page order is a total order over the stored records, so a token names one
+        // exact position whatever was created or deleted in between.
+        let mut ordered: Vec<&crate::state::PortalRecord> = store.portals.values().collect();
+        ordered.sort_by(|a, b| a.page_key().cmp(&b.page_key()));
+
+        let mut remaining = ordered.into_iter().skip_while(|record| match &resume_after {
+            None => false,
+            Some((millis, arn)) => record.page_key() <= (*millis, arn.as_str()),
+        });
+
+        // `maxResults` is a maximum, not a demand, and a page is a response this process
+        // builds in memory: it is clamped to the service page-size maximum, which is also
+        // the page size when the request names none. So one small request cannot be
+        // amplified into a response proportional to the whole store.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(st::MAX_LIST_PAGE_SIZE)
+            .clamp(1, st::MAX_LIST_PAGE_SIZE);
+        let mut portals = Vec::new();
+        let mut last_key = None;
+        for record in remaining.by_ref().take(page_size) {
+            last_key = Some((record.creation_millis(), record.portal_arn.clone()));
+            portals.push(record.to_summary(now));
+        }
+
+        // A `nextToken` is emitted only when a further record remains.
+        let next_token = match (remaining.next(), last_key) {
+            (Some(_), Some((millis, arn))) => Some(st::encode_page_token((millis, arn.as_str()))),
+            _ => None,
+        };
+
+        Ok(ListPortalsOutput {
+            portals: Some(portals),
+            next_token,
+        })
     }
 }
