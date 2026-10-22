@@ -19,6 +19,8 @@ mod cache_parameter_groups;
 mod reserved_cache_nodes_offerings;
 #[path = "all/service_updates.rs"]
 mod service_updates;
+#[path = "all/serverless_cache_lifecycle.rs"]
+mod serverless_cache_lifecycle;
 #[path = "all/snapshots.rs"]
 mod snapshots;
 #[path = "all/state_roundtrip.rs"]
