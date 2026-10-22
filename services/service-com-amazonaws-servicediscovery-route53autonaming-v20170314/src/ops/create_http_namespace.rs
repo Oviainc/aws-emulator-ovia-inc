@@ -184,23 +184,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // A replayed `CreatorRequestId` for the SAME name returns the operation the
-        // first call filed rather than creating a second namespace — but ONLY while the
-        // namespace it created is still stored. Once `DeleteNamespace` has removed it
-        // the token is stale, and replaying it would answer success for a create this
-        // call never made, so the namespace is created again.
-        let still_stored = state.namespace_ids_by_name.contains_key(&input.name);
-        if still_stored {
-            if let Some(token) = input.creator_request_id.as_deref() {
-                if let Some(operation_id) = state.replayed(
-                    crate::state::IdempotencyScope::CreateHttpNamespace,
-                    token,
-                    &input.name,
-                ) {
-                    return Ok(CreateHttpNamespaceOutput {
-                        operation_id: Some(operation_id),
-                    });
-                }
-            }
+        // first call filed rather than creating a second namespace — but only while
+        // the namespace it created is still stored, which
+        // [`crate::state::ComAmazonawsServicediscoveryRoute53autonamingV20170314State::replayed_namespace_create`]
+        // is what decides for every namespace create.
+        if let Some(operation_id) = state.replayed_namespace_create(
+            crate::state::IdempotencyScope::CreateHttpNamespace,
+            input.creator_request_id.as_deref(),
+            &input.name,
+        ) {
+            return Ok(CreateHttpNamespaceOutput {
+                operation_id: Some(operation_id),
+            });
         }
 
         if let Some(existing) = state
@@ -244,6 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creator_request_id: input.creator_request_id.clone(),
             http_name: Some(input.name.clone()),
             hosted_zone_id: None,
+            soa_ttl: None,
             tags: input
                 .tags
                 .unwrap_or_default()

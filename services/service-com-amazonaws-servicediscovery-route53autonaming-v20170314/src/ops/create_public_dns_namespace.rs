@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePublicDnsNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePublicDnsNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePublicDnsNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +160,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePublicDnsNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePublicDnsNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePublicDnsNamespace"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePublicDnsNamespaceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        if input
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags.len() > crate::state::MAX_TAGS_PER_RESOURCE)
+        {
+            return Err(CreatePublicDnsNamespaceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "The list of tags on the resource is over the quota of {}.",
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                    resource_name: None,
+                },
+            )
+            .into());
+        }
+
+        // `PublicDnsNamespaceProperties` models `DnsProperties` and its `SOA` as
+        // required, so a stated `Properties` always carries a TTL — and the modelled
+        // `RecordTTL` range (0..=2147483647) is refused before this handler runs.
+        let soa_ttl = input
+            .properties
+            .as_ref()
+            .map(|properties| properties.dns_properties.soa.ttl);
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        // A replayed `CreatorRequestId` for the SAME name returns the operation the
+        // first call filed rather than creating a second namespace — but only while
+        // the namespace it created is still stored, which
+        // [`crate::state::ComAmazonawsServicediscoveryRoute53autonamingV20170314State::replayed_namespace_create`]
+        // is what decides for every namespace create.
+        if let Some(operation_id) = state.replayed_namespace_create(
+            crate::state::IdempotencyScope::CreatePublicDnsNamespace,
+            input.creator_request_id.as_deref(),
+            &input.name,
+        ) {
+            return Ok(CreatePublicDnsNamespaceOutput {
+                operation_id: Some(operation_id),
+            });
+        }
+
+        // One name index holds every namespace type, so a public DNS namespace cannot
+        // take a name any namespace already answers to.
+        if let Some(existing) = state
+            .namespace_ids_by_name
+            .get(&input.name)
+            .and_then(|id| state.namespaces.get(id))
+        {
+            return Err(CreatePublicDnsNamespaceErrorModeled::NamespaceAlreadyExists(
+                NamespaceAlreadyExists {
+                    message: Some(format!("The namespace {} already exists.", input.name)),
+                    namespace_id: Some(existing.id.clone()),
+                    creator_request_id: existing.creator_request_id.clone(),
+                },
+            )
+            .into());
+        }
+
+        if state.namespaces.len() >= crate::state::MAX_NAMESPACES {
+            return Err(CreatePublicDnsNamespaceErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The namespace can't be created because this emulator holds its quota of \
+                         {} namespaces.",
+                        crate::state::MAX_NAMESPACES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.next_id("ns", 16);
+        let hosted_zone_id = state.next_hosted_zone_id();
+        let namespace = crate::state::NamespaceRecord {
+            arn: crate::state::service_arn(&region, &format!("namespace/{id}")),
+            id: id.clone(),
+            name: input.name.clone(),
+            // `Namespace$Type`: instances in a `DNS_PUBLIC` namespace "can be
+            // discovered using public DNS queries and using the DiscoverInstances
+            // API", so the namespace carries BOTH the hosted zone Cloud Map creates
+            // for it and the HTTP name `DiscoverInstances` resolves it by.
+            namespace_type: "DNS_PUBLIC".to_string(),
+            description: input.description.clone(),
+            create_date: now,
+            creator_request_id: input.creator_request_id.clone(),
+            http_name: Some(input.name.clone()),
+            hosted_zone_id: Some(hosted_zone_id),
+            soa_ttl,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.key, tag.value))
+                .collect(),
+        };
+        let name = input.name.clone();
+        state.namespace_ids_by_name.insert(input.name, id.clone());
+        state.namespaces.insert(id.clone(), namespace);
+
+        let operation_id =
+            state.record_operation("CREATE_NAMESPACE", now, [("NAMESPACE".to_string(), id)]);
+        if let Some(token) = input.creator_request_id.as_deref() {
+            state.remember(
+                crate::state::IdempotencyScope::CreatePublicDnsNamespace,
+                token,
+                &name,
+                &operation_id,
+            );
+        }
+
+        Ok(CreatePublicDnsNamespaceOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }
