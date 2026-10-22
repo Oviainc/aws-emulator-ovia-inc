@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBrokers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBrokers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBrokers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: a REPORTING operation. One `BrokerSummary` per stored broker, in a
+//! stable order (creation instant, then id), paged by `MaxResults` with an opaque
+//! round-trippable `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +67,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -143,18 +139,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBrokers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBrokersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBrokers"))
+        let _ = ctx;
+        let Some(state) = state::service_state(&*self.engine) else {
+            return Err(ListBrokersErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        // Only a token this service issued names an offset; anything else is a
+        // client error, not an empty page.
+        let offset = match input.next_token.as_deref().filter(|t| !t.is_empty()) {
+            None => 0,
+            Some(token) => match state::decode_page_token(token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(ListBrokersErrorModeled::BadRequestException(
+                        BadRequestException {
+                            error_attribute: Some("nextToken".to_string()),
+                            message: Some(
+                                "nextToken is not a token this service issued; \
+                                 pass back the nextToken from a previous ListBrokers response"
+                                    .to_string(),
+                            ),
+                            resource_share_errors: None,
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let ordered = store.brokers_in_order();
+        let page = state::page_of(ordered.len(), input.max_results, offset);
+        let summaries = ordered[page.start..page.end]
+            .iter()
+            .map(|broker| BrokerSummary {
+                broker_id: Some(broker.broker_id.clone()),
+                broker_arn: Some(broker.broker_arn.clone()),
+                broker_name: Some(broker.broker_name.clone()),
+                broker_state: Some(broker.broker_state(now).to_string()),
+                engine_type: broker.engine_type.clone(),
+                deployment_mode: broker.deployment_mode.clone(),
+                host_instance_type: Some(broker.host_instance_type.clone()),
+                created: Some(broker.created_timestamp()),
+            })
+            .collect();
+
+        Ok(ListBrokersOutput {
+            broker_summaries: Some(summaries),
+            next_token: page.next_token,
+        })
     }
 }

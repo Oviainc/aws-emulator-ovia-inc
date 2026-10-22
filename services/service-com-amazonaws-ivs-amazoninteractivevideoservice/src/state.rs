@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AdConfiguration, Channel, MultitrackInputConfiguration, RecordingConfiguration,
-    RenditionConfiguration, StreamKey, ThumbnailConfiguration,
+    RenditionConfiguration, Stream, StreamKey, ThumbnailConfiguration,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -30,6 +30,14 @@ pub struct ComAmazonawsIvsAmazoninteractivevideoserviceState {
     /// a key to its channel: `ListStreamKeys` filters on it and `DeleteChannel`
     /// drops every key that names the channel it removed.
     pub stream_keys: BTreeMap<String, StreamKey>,
+    /// The stream each channel carries, keyed by the ARN of that channel: a
+    /// channel ingests at most one stream at a time, so its ARN identifies the
+    /// stream. A channel with no entry here — or one whose entry has left the
+    /// `LIVE` state — is not broadcasting, which is the whole distinction
+    /// `GetStream`'s `ChannelNotBroadcasting` answer carries. An entry is only
+    /// ever reported through its channel, and `DeleteChannel` drops it with the
+    /// channel it belongs to.
+    pub streams: BTreeMap<String, Stream>,
     /// Every viewer-session revocation this store has started, keyed by the
     /// `(channelArn, viewerId)` pair it names and holding the HIGHEST viewer
     /// session version revoked for that pair so far. A `BTreeMap` for the same
@@ -330,6 +338,83 @@ pub fn mint_stream_key(
     };
     state.stream_keys.insert(arn, key.clone());
     key
+}
+
+/// The `StreamState` of a channel that is ingesting, from the modelled
+/// `StreamState` enum (`LIVE | OFFLINE`, see
+/// [`crate::ops::types::STREAM_STATE_VALUES`]).
+pub const STREAM_STATE_LIVE: &str = "LIVE";
+
+/// The `StreamHealth` of a stream whose ingest session is connected and
+/// delivering, from the modelled `StreamHealth` enum (`HEALTHY | STARVING |
+/// UNKNOWN`, see [`crate::ops::types::STREAM_HEALTH_VALUES`]).
+pub const STREAM_HEALTH_HEALTHY: &str = "HEALTHY";
+
+/// A fresh `StreamId`.
+///
+/// The modelled shape is exactly 26 characters and matches `^st-[a-zA-Z0-9]+$`,
+/// so an id is the `st-` prefix plus 23 characters from that alphabet; hex is a
+/// subset of it, and [`ComAmazonawsIvsAmazoninteractivevideoserviceState::mint_hex`]
+/// never repeats a value.
+fn mint_stream_id(state: &mut ComAmazonawsIvsAmazoninteractivevideoserviceState) -> String {
+    let digest = state.mint_hex("stream", 12);
+    format!("st-{}", &digest[..23])
+}
+
+/// The LIVE stream `channel_arn` is currently ingesting, or `None` when that
+/// channel is not broadcasting.
+///
+/// Only a stream in the `LIVE` state is an active one: an entry that has left
+/// that state is a channel whose broadcast has ended, which every operation
+/// about the active stream must treat exactly like a channel that never had one.
+pub fn live_stream(
+    state: &ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    channel_arn: &str,
+) -> Option<Stream> {
+    state
+        .streams
+        .get(channel_arn)
+        .filter(|stream| stream.state.as_deref() == Some(STREAM_STATE_LIVE))
+        .cloned()
+}
+
+/// Start the stream an ingest session has brought up on `channel_arn`, persist it
+/// and return it.
+///
+/// One place mints a stream, so every operation that reports one answers the same
+/// representation: the stream is bound to the channel it is ingested on, is played
+/// back from that channel's own `playbackUrl`, and starts at the instant the
+/// ingest connected. `viewerCount` is 0 because no playback session is attached to
+/// it yet, and `health` is `HEALTHY` because an ingest session is connected and
+/// delivering — a measurement that would move it to `STARVING` belongs to whoever
+/// is feeding the ingest. A channel that is ALREADY broadcasting keeps the stream
+/// it has: IVS holds one stream per channel, so a second ingest cannot mint a
+/// second stream id for the same channel.
+pub fn start_stream(
+    state: &mut ComAmazonawsIvsAmazoninteractivevideoserviceState,
+    channel_arn: &str,
+) -> Stream {
+    if let Some(live) = live_stream(state, channel_arn) {
+        return live;
+    }
+    let playback_url = state
+        .channels
+        .get(channel_arn)
+        .and_then(|channel| channel.playback_url.clone());
+    let stream_id = mint_stream_id(state);
+    let stream = Stream {
+        channel_arn: Some(channel_arn.to_string()),
+        stream_id: Some(stream_id),
+        playback_url,
+        start_time: Some(::aws_smithy_types::DateTime::from(
+            std::time::SystemTime::now(),
+        )),
+        state: Some(STREAM_STATE_LIVE.to_string()),
+        health: Some(STREAM_HEALTH_HEALTHY.to_string()),
+        viewer_count: 0,
+    };
+    state.streams.insert(channel_arn.to_string(), stream.clone());
+    stream
 }
 
 /// The one way [`start_viewer_session_revocation`] can fail: the store is at
