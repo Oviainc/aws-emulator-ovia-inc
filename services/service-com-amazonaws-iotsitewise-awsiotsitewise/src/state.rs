@@ -18,8 +18,8 @@ use crate::ops::types::{
     AggregatedValue, Aggregates, AssetHierarchy, AssetModelCompositeModel,
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
-    AssetPropertyValue, AssetStatus, AssetSummary, GatewayCapabilitySummary, GatewayPlatform,
-    PropertyType, TimeInNanos, Variant,
+    AssetPropertyValue, AssetStatus, AssetSummary, ExpressionVariable, GatewayCapabilitySummary,
+    GatewayPlatform, PropertyType, TimeInNanos, Variant,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -310,6 +310,27 @@ impl AssetModelRecord {
                 (self.composite_model_parent(child) == Some(id)).then(|| child.to_string())
             })
             .collect()
+    }
+
+    /// `id` and every composite model nested inside it, at any depth.
+    ///
+    /// Exactly the composite models that stop being reachable when `id` goes
+    /// away: a nested composite model is addressed only through the chain of
+    /// parents that contains it, so `DeleteAssetModelCompositeModel` removes the
+    /// whole subtree rather than leaving records no path reaches. Each id is
+    /// listed once, so a link that somehow pointed into a cycle cannot spin here.
+    pub fn composite_model_subtree(&self, id: &str) -> Vec<String> {
+        let mut subtree = vec![id.to_string()];
+        let mut at = 0;
+        while at < subtree.len() {
+            for child in self.composite_model_children(&subtree[at]) {
+                if !subtree.contains(&child) {
+                    subtree.push(child);
+                }
+            }
+            at += 1;
+        }
+        subtree
     }
 
     /// The ids of the composite models this model holds directly: the ones that
@@ -1114,6 +1135,13 @@ pub const RESOURCE_ASSET: &str = "Asset";
 /// The resource kind those errors name for an asset model.
 pub const RESOURCE_ASSET_MODEL: &str = "Asset Model";
 
+/// The resource kind those errors name for a composite model of an asset model.
+///
+/// A composite model is not a top-level resource, so it is named as what it is
+/// rather than as an "Asset Model"; it lives here beside its siblings so the
+/// operations that address one cannot each invent a kind of their own.
+pub const RESOURCE_ASSET_MODEL_COMPOSITE_MODEL: &str = "Asset Model Composite Model";
+
 /// The message a not-found refusal carries: the resource kind, then the
 /// identifier the REQUEST supplied (a raw id or an `externalId:` label, exactly
 /// as sent).
@@ -1304,6 +1332,28 @@ pub fn asset_model_etag(record: &AssetModelRecord) -> String {
     let mut tag = ::hex::encode(digest);
     tag.truncate(ETAG_LENGTH);
     tag
+}
+
+/// The expression variables of a property's formula: those of its `transform`
+/// or of its `metric`.
+///
+/// An `attribute` or a `measurement` carries no formula and so contributes no
+/// variables. ONE definition of what a property's formula depends on, so every
+/// rule about formula dependencies asks the same question of the same members.
+pub fn formula_variables(
+    property: &AssetModelProperty,
+) -> impl Iterator<Item = &ExpressionVariable> {
+    let transform = property
+        .r#type
+        .transform
+        .iter()
+        .flat_map(|transform| transform.variables.iter());
+    let metric = property
+        .r#type
+        .metric
+        .iter()
+        .flat_map(|metric| metric.variables.iter().flatten());
+    transform.chain(metric)
 }
 
 /// Total order on a `TimeInNanos`: whole seconds first, then the nanosecond
