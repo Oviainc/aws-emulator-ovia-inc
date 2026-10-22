@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/benefit_application_lifecycle.rs"]
 mod benefit_application_lifecycle;
+#[path = "all/recall_benefit_application.rs"]
+mod recall_benefit_application;
 #[path = "all/service_error_rules.rs"]
 mod service_error_rules;
 #[path = "all/state_roundtrip.rs"]
