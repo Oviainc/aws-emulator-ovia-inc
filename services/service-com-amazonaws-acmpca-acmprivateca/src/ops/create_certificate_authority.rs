@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCertificateAuthority
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCertificateAuthority`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCertificateAuthority::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,13 +136,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-acmpca-acmprivateca.jso
 // here — hence the `CreateCertificateAuthorityError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.acmpca#CreateCertificateAuthority")]
+// `RequestFailedException` is widened in: the service models it, this operation does
+// not list it, and it is the only modelled answer for "this emulator could not reach
+// its own state store" — the one failure below that is not about the request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.acmpca#CreateCertificateAuthority",
+    extra_errors = ["RequestFailedException"]
+)]
 #[derive(Debug)]
 pub enum CreateCertificateAuthorityErrorModeled {
     InvalidArgsException(InvalidArgsException),
     InvalidPolicyException(InvalidPolicyException),
     InvalidTagException(InvalidTagException),
     LimitExceededException(LimitExceededException),
+    RequestFailedException(RequestFailedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -205,18 +203,213 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCertificateAuthority` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCertificateAuthorityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCertificateAuthority"))
+        // Modeled constraints (the enums, the tag key pattern, the member lengths) are
+        // refused before this handler runs; what is left are the rules the SERVICE
+        // enforces over a combination of members.
+        validate_configuration(&input.certificate_authority_configuration)?;
+        validate_revocation_configuration(input.revocation_configuration.as_ref())?;
+        validate_tags(input.tags.as_deref())?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateCertificateAuthorityErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // @idempotent: a repeat of the same token inside the five-minute window answers
+        // with the CA the first call minted instead of minting a second one.
+        if let Some(arn) = crate::state::replay_idempotent(
+            &mut state.create_idempotency,
+            input.idempotency_token.as_ref(),
+            now,
+        ) {
+            return Ok(CreateCertificateAuthorityOutput {
+                certificate_authority_arn: Some(arn),
+            });
+        }
+
+        // Every CA lives in memory for the life of the process, so the store is capped
+        // and a create past the cap answers the quota error the operation models.
+        if state.certificate_authorities.len() >= crate::state::MAX_CERTIFICATE_AUTHORITIES {
+            return Err(CreateCertificateAuthorityErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the quota of {} certificate authorities for this account and region has \
+                         been exceeded",
+                        crate::state::MAX_CERTIFICATE_AUTHORITIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let id = crate::state::mint_resource_id();
+        let arn = ::emulator_server::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &region,
+            &format!("certificate-authority/{id}"),
+        );
+        let configuration = input.certificate_authority_configuration;
+        let record = crate::state::CertificateAuthorityRecord {
+            csr_pem: crate::state::derive_csr_pem(&arn, &configuration),
+            owner_account: ::emulator_server::emulator_account_id().to_string(),
+            ca_type: input.certificate_authority_type,
+            // A new CA is returned in CREATING and settles into PENDING_CERTIFICATE on
+            // the clock, so a caller that reads it immediately still sees the transient
+            // status in which its CSR is not available yet.
+            status: crate::state::STATUS_CREATING.to_string(),
+            serial: crate::state::mint_serial(&arn),
+            created_at: now,
+            last_state_change_at: now,
+            settles_at: now + crate::state::SETTLE_AFTER,
+            not_before: None,
+            not_after: None,
+            failure_reason: None,
+            configuration,
+            revocation_configuration: input.revocation_configuration,
+            usage_mode: input
+                .usage_mode
+                .unwrap_or_else(|| crate::state::DEFAULT_USAGE_MODE.to_string()),
+            key_storage_security_standard: input
+                .key_storage_security_standard
+                .unwrap_or_else(|| {
+                    crate::state::DEFAULT_KEY_STORAGE_SECURITY_STANDARD.to_string()
+                }),
+            ca_certificate_pem: None,
+            ca_certificate_chain_pem: None,
+            restorable_until: None,
+            tags: input.tags.unwrap_or_default(),
+            next_serial: 1,
+            certificates: ::std::collections::HashMap::new(),
+            issue_idempotency: ::std::collections::HashMap::new(),
+            arn: arn.clone(),
+        };
+
+        crate::state::record_idempotent(
+            &mut state.create_idempotency,
+            input.idempotency_token,
+            &arn,
+            now,
+        );
+        state.certificate_authorities.insert(arn.clone(), record);
+
+        Ok(CreateCertificateAuthorityOutput {
+            certificate_authority_arn: Some(arn),
+        })
     }
+}
+
+/// Refuse a CA configuration the service cannot build a CA from.
+fn validate_configuration(
+    configuration: &CertificateAuthorityConfiguration,
+) -> Result<(), CreateCertificateAuthorityError> {
+    if crate::state::subject_is_empty(&configuration.subject) {
+        return Err(invalid_args(
+            "CertificateAuthorityConfiguration.Subject must carry at least one X.500 \
+             distinguished name attribute",
+        ));
+    }
+    Ok(())
+}
+
+/// The revocation rules the `RevocationConfiguration` member documents: "A configuration
+/// disabling CRLs or OCSP must contain only the Enabled=False parameter, and will fail if
+/// other parameters such as CustomCname or ExpirationInDays are included." An enabled CRL
+/// configuration conversely needs the bucket it is written to and the period it expires
+/// after.
+fn validate_revocation_configuration(
+    revocation: Option<&RevocationConfiguration>,
+) -> Result<(), CreateCertificateAuthorityError> {
+    let Some(revocation) = revocation else {
+        return Ok(());
+    };
+    if let Some(crl) = revocation.crl_configuration.as_ref() {
+        if crl.enabled {
+            if crl.s3_bucket_name.is_none() {
+                return Err(invalid_args(
+                    "RevocationConfiguration.CrlConfiguration.S3BucketName is required when \
+                     CRLs are enabled",
+                ));
+            }
+            if crl.expiration_in_days.is_none() {
+                return Err(invalid_args(
+                    "RevocationConfiguration.CrlConfiguration.ExpirationInDays is required when \
+                     CRLs are enabled",
+                ));
+            }
+        } else if let Some((member, _)) = [
+            ("ExpirationInDays", crl.expiration_in_days.is_some()),
+            ("CustomCname", crl.custom_cname.is_some()),
+            ("S3BucketName", crl.s3_bucket_name.is_some()),
+            ("S3ObjectAcl", crl.s3_object_acl.is_some()),
+            (
+                "CrlDistributionPointExtensionConfiguration",
+                crl.crl_distribution_point_extension_configuration.is_some(),
+            ),
+            ("CrlType", crl.crl_type.is_some()),
+            ("CustomPath", crl.custom_path.is_some()),
+        ]
+        .iter()
+        .find(|(_, present)| *present)
+        {
+            return Err(invalid_args(format!(
+                "RevocationConfiguration.CrlConfiguration must contain only Enabled=false when \
+                 CRLs are disabled, but {member} was included"
+            )));
+        }
+    }
+    if let Some(ocsp) = revocation.ocsp_configuration.as_ref() {
+        if !ocsp.enabled && ocsp.ocsp_custom_cname.is_some() {
+            return Err(invalid_args(
+                "RevocationConfiguration.OcspConfiguration must contain only Enabled=false when \
+                 OCSP is disabled, but OcspCustomCname was included",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Tag keys are unique within a resource, and the `aws:` prefix is reserved for the tags
+/// AWS itself applies.
+fn validate_tags(tags: Option<&[Tag]>) -> Result<(), CreateCertificateAuthorityError> {
+    let mut seen: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+    for tag in tags.unwrap_or_default() {
+        if tag.key.starts_with("aws:") {
+            return Err(invalid_tag(format!(
+                "the tag key '{}' uses the reserved 'aws:' prefix",
+                tag.key
+            )));
+        }
+        if !seen.insert(tag.key.as_str()) {
+            return Err(invalid_tag(format!(
+                "the tag key '{}' is given twice",
+                tag.key
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// "One or more of the specified arguments was not valid.", naming the member and the
+/// rule it broke so the caller can fix the request from the message alone.
+fn invalid_args(message: impl Into<String>) -> CreateCertificateAuthorityError {
+    CreateCertificateAuthorityErrorModeled::InvalidArgsException(InvalidArgsException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// "The tag associated with the CA is not valid. The invalid argument is contained in the
+/// message field."
+fn invalid_tag(message: impl Into<String>) -> CreateCertificateAuthorityError {
+    CreateCertificateAuthorityErrorModeled::InvalidTagException(InvalidTagException {
+        message: Some(message.into()),
+    })
+    .into()
 }

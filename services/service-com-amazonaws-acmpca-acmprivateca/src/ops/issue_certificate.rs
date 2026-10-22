@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op IssueCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `IssueCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`IssueCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,7 +149,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-acmpca-acmprivateca.jso
 // here — hence the `IssueCertificateError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.acmpca#IssueCertificate")]
+// `RequestFailedException` is widened in: the service models it, this operation does
+// not list it, and it is the only modelled answer for "this emulator could not reach
+// its own state store".
+#[smithy_macros::operation_error(
+    "com.amazonaws.acmpca#IssueCertificate",
+    extra_errors = ["RequestFailedException"]
+)]
 #[derive(Debug)]
 pub enum IssueCertificateErrorModeled {
     InvalidArgsException(InvalidArgsException),
@@ -167,6 +164,7 @@ pub enum IssueCertificateErrorModeled {
     LimitExceededException(LimitExceededException),
     MalformedCSRException(MalformedCSRException),
     ResourceNotFoundException(ResourceNotFoundException),
+    RequestFailedException(RequestFailedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -220,18 +218,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `IssueCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(IssueCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("IssueCertificate"))
+        let _ = ctx;
+        let ca_arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&ca_arn).is_none() {
+            return Err(IssueCertificateErrorModeled::InvalidArnException(
+                InvalidArnException {
+                    message: Some(format!(
+                        "'{ca_arn}' does not refer to a certificate authority in this service"
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(template_arn) = input.template_arn.as_deref() {
+            if !template_arn.contains(":template/") {
+                return Err(IssueCertificateErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(format!(
+                            "'{template_arn}' does not refer to a certificate template"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The certification request the CA is asked to answer has to be a PKCS#10 PEM
+        // block; anything else is malformed, whatever the CA's state.
+        if ::std::str::from_utf8(&input.csr)
+            .ok()
+            .and_then(|text| crate::state::parse_pem_block(text, crate::state::PEM_LABEL_CSR))
+            .is_none()
+        {
+            return Err(IssueCertificateErrorModeled::MalformedCSRException(
+                MalformedCSRException {
+                    message: Some(
+                        "Csr must be a PEM-encoded CERTIFICATE REQUEST block whose body is base64"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(IssueCertificateErrorModeled::RequestFailedException(
+                RequestFailedException {
+                    message: Some("the private CA store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        let Some(record) = state.certificate_authority_mut(&ca_arn, now) else {
+            return Err(IssueCertificateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "the certificate authority {ca_arn} was not found"
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Only a CA that holds its own certificate can sign with it.
+        if record.status != crate::state::STATUS_ACTIVE {
+            return Err(IssueCertificateErrorModeled::InvalidStateException(
+                InvalidStateException {
+                    message: Some(format!(
+                        "the certificate authority {ca_arn} is in state {}, which cannot issue \
+                         certificates",
+                        record.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // @idempotent: a repeat of the same token inside the five-minute window answers
+        // with the certificate the first call issued instead of issuing a second one.
+        if let Some(arn) = crate::state::replay_idempotent(
+            &mut record.issue_idempotency,
+            input.idempotency_token.as_ref(),
+            now,
+        ) {
+            return Ok(IssueCertificateOutput {
+                certificate_arn: Some(arn),
+            });
+        }
+
+        // Every issued certificate lives in memory for the life of the process, so the
+        // per-CA store is capped and an issuance past the cap answers the quota error
+        // the operation models.
+        if record.certificates.len() >= crate::state::MAX_CERTIFICATES_PER_CA {
+            return Err(IssueCertificateErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the quota of {} certificates issued by one certificate authority has \
+                         been exceeded",
+                        crate::state::MAX_CERTIFICATES_PER_CA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The specified signing algorithm family (RSA or ECDSA) must match the
+        // algorithm family of the CA's secret key." (`IssueCertificateRequest`
+        // documentation.) The CA signs with the key it was created with, so a
+        // signature of another family is one it could not have produced.
+        let key_algorithm = record.configuration.key_algorithm.clone();
+        let key_family = crate::state::algorithm_family(&key_algorithm);
+        let signature_family = crate::state::algorithm_family(&input.signing_algorithm);
+        if let (Some(key_family), Some(signature_family)) = (key_family, signature_family) {
+            if key_family != signature_family {
+                return Err(invalid_args(format!(
+                    "SigningAlgorithm {} does not match the {key_algorithm} key of certificate \
+                     authority {ca_arn}",
+                    input.signing_algorithm
+                )));
+            }
+        }
+
+        // `ValidityNotBefore` customises the start of the window; without one the
+        // window starts at issuance.
+        let not_before = match input.validity_not_before.as_ref() {
+            Some(validity) => {
+                crate::state::resolve_validity(now, validity).map_err(invalid_args)?
+            }
+            None => now,
+        };
+        let not_after =
+            crate::state::resolve_validity(not_before, &input.validity).map_err(invalid_args)?;
+        let window = not_after.duration_since(not_before).map_err(|_| {
+            invalid_args(
+                "Validity must resolve to an instant after the start of the certificate's \
+                 validity period",
+            )
+        })?;
+        if window < ::std::time::Duration::from_secs(1) {
+            return Err(invalid_args(
+                "Validity must resolve to at least one second after the start of the \
+                 certificate's validity period",
+            ));
+        }
+        // "Short-lived certificate validity is limited to seven days."
+        // (`CreateCertificateAuthorityRequest$UsageMode` docs.)
+        if record.usage_mode == "SHORT_LIVED_CERTIFICATE"
+            && window > crate::state::SHORT_LIVED_MAX_VALIDITY
+        {
+            return Err(invalid_args(
+                "Validity may not exceed seven days for a certificate authority whose \
+                 UsageMode is SHORT_LIVED_CERTIFICATE",
+            ));
+        }
+
+        let serial = crate::state::mint_serial(&format!("{ca_arn}|{}", record.next_serial));
+        let arn = format!("{ca_arn}/certificate/{serial}");
+        let certificate = crate::state::IssuedCertificate {
+            certificate_pem: crate::state::derive_certificate_pem(
+                record,
+                &serial,
+                &input.csr,
+                &input.signing_algorithm,
+                input.template_arn.as_ref(),
+                not_before,
+                not_after,
+            ),
+            certificate_chain_pem: record.issued_chain(),
+            signing_algorithm: input.signing_algorithm,
+            template_arn: input.template_arn,
+            not_before,
+            not_after,
+            issued_at: now,
+            // Issuance completes on the clock, so a caller that reads the certificate
+            // straight back still sees the request in progress.
+            available_at: now + crate::state::SETTLE_AFTER,
+            serial,
+            arn: arn.clone(),
+        };
+
+        record.next_serial += 1;
+        crate::state::record_idempotent(
+            &mut record.issue_idempotency,
+            input.idempotency_token,
+            &arn,
+            now,
+        );
+        record.certificates.insert(arn.clone(), certificate);
+
+        Ok(IssueCertificateOutput {
+            certificate_arn: Some(arn),
+        })
     }
+}
+
+/// "One or more of the specified arguments was not valid.", naming the member and the
+/// rule it broke so the caller can fix the request from the message alone.
+fn invalid_args(message: impl Into<String>) -> IssueCertificateError {
+    IssueCertificateErrorModeled::InvalidArgsException(InvalidArgsException {
+        message: Some(message.into()),
+    })
+    .into()
 }
