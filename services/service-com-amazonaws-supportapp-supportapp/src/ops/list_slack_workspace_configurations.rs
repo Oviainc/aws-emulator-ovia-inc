@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSlackWorkspaceConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSlackWorkspaceConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSlackWorkspaceConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the Slack workspaces registered to this account, in `teamId` order, a
+//! page at a time. Every reported member comes from the record
+//! `RegisterSlackWorkspaceForOrganization` stored — nothing here is canned.
 //!
 //! ## Shape of an operation
 //!
@@ -140,23 +135,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_SLACK_WORKSPACE_CONFIGURATIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the Slack workspaces this account has registered, a page at a time.
+    ///
+    /// `@readonly`: the answer is computed from the registry
+    /// `RegisterSlackWorkspaceForOrganization` writes, and nothing is stored here, so a
+    /// listing never changes what a later caller sees.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSlackWorkspaceConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSlackWorkspaceConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSlackWorkspaceConfigurations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSlackWorkspaceConfigurationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Support App store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // The cursor is a position in the listing's order: the page resumes after the
+        // records the token says were already reported, so a caller that follows the
+        // tokens walks the whole store. A token this service did not mint names no
+        // position, so it is refused rather than silently read as "from the beginning".
+        // This operation models no client-input error, so the refusal goes through the
+        // scaffold's 400 `ValidationException` channel.
+        let start_at = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_cursor(token).ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation("the specified nextToken is not valid")
+            })?,
+        };
+
+        let mut remaining = store
+            .slack_workspace_configurations
+            .values()
+            .skip(start_at);
+
+        let page: Vec<SlackWorkspaceConfiguration> = remaining
+            .by_ref()
+            .take(crate::state::WORKSPACE_PAGE_SIZE)
+            .map(crate::state::SlackWorkspaceConfig::to_modeled)
+            .collect();
+
+        // A `nextToken` is returned only when a further page exists, so a caller that
+        // follows the tokens stops exactly once every registered workspace was
+        // reported.
+        let next_token = remaining
+            .next()
+            .map(|_| crate::state::encode_cursor(start_at + page.len()));
+
+        Ok(ListSlackWorkspaceConfigurationsOutput {
+            next_token,
+            // The member is optional in the model, but it is what this operation
+            // reports, so the list is always present — empty for an account with no
+            // registered workspace.
+            slack_workspace_configurations: Some(page),
+        })
     }
 }
