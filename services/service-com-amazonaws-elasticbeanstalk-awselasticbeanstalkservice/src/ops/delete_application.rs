@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: deletes the application and its versions from the store, terminating its
+//! environments when `TerminateEnvByForce` asks for it. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApplication"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteApplicationError::internal_failure("the Elastic Beanstalk store is unavailable")
+        })?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        if !store.applications.contains_key(&input.application_name) {
+            return Err(DeleteApplicationError::invalid_parameter_value(format!(
+                "No Application named '{}' found.",
+                input.application_name
+            )));
+        }
+
+        // "You cannot delete an application that has a running environment" —
+        // unless "TerminateEnvByForce … running environments will be terminated
+        // before deleting the application".
+        let running: Vec<String> = store
+            .environments
+            .values()
+            .filter(|environment| {
+                environment.application_name == input.application_name
+                    && !environment.is_terminated()
+            })
+            .map(|environment| environment.environment_id.clone())
+            .collect();
+        if !running.is_empty() {
+            if input.terminate_env_by_force != Some(true) {
+                let names: Vec<&str> = store
+                    .environments
+                    .values()
+                    .filter(|environment| running.contains(&environment.environment_id))
+                    .map(|environment| environment.environment_name.as_str())
+                    .collect();
+                return Err(DeleteApplicationErrorModeled::OperationInProgressException(
+                    OperationInProgressException {
+                        message: Some(format!(
+                            "Cannot delete application {} because it still has running \
+                             environments: {}. Terminate them, or set TerminateEnvByForce.",
+                            input.application_name,
+                            names.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+            for environment_id in running {
+                if let Some(environment) = store.environments.get_mut(&environment_id) {
+                    if environment.status != crate::state::STATUS_TERMINATING {
+                        environment.begin_termination();
+                    }
+                }
+            }
+        }
+
+        // "Deletes the specified application along with all associated versions
+        // and configurations." The terminated environments stay in the store, as
+        // deleted environments a DescribeEnvironments with `IncludeDeleted` can
+        // still report.
+        store.applications.remove(&input.application_name);
+        store
+            .application_versions
+            .retain(|(application_name, _), _| *application_name != input.application_name);
+
+        Ok(DeleteApplicationOutput)
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TerminateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TerminateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TerminateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: moves the stored environment into `Terminating` and answers with its
+//! description; the move to `Terminated` is due shortly after. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -201,18 +195,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TerminateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TerminateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TerminateEnvironment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TerminateEnvironmentError::internal_failure(
+                "the Elastic Beanstalk store is unavailable",
+            )
+        })?;
+        let mut store = state.lock();
+        store.materialize_due_transitions();
+
+        // "You must specify either this or an EnvironmentId, or both."
+        if input.environment_id.is_none() && input.environment_name.is_none() {
+            return Err(TerminateEnvironmentError::missing_required_parameter(
+                "Must specify either EnvironmentId or EnvironmentName.",
+            ));
+        }
+        // `TerminateResources` selects whether the environment's AWS resources
+        // are deleted and `ForceTerminate` forces termination of an environment
+        // whose resources are already gone. This emulator provisions no
+        // resources, so neither changes what is stored.
+        let _ = (input.terminate_resources, input.force_terminate);
+
+        let environment_id = store
+            .resolve_environment_id(
+                input.environment_id.as_deref(),
+                input.environment_name.as_deref(),
+            )
+            .ok_or_else(|| {
+                TerminateEnvironmentError::invalid_parameter_value(match (
+                    input.environment_id.as_deref(),
+                    input.environment_name.as_deref(),
+                ) {
+                    (Some(id), _) => format!("No Environment found for EnvironmentId = '{id}'."),
+                    (None, Some(name)) => {
+                        format!("No Environment found for EnvironmentName = '{name}'.")
+                    }
+                    (None, None) => unreachable!("refused above"),
+                })
+            })?;
+
+        let environment = store.environments.get_mut(&environment_id).ok_or_else(|| {
+            TerminateEnvironmentError::invalid_parameter_value(format!(
+                "No Environment found for EnvironmentId = '{environment_id}'."
+            ))
+        })?;
+        // "Ready: Environment is available to have an action performed on it,
+        // such as update or terminate." An environment already shutting down or
+        // shut down cannot be terminated again.
+        if environment.status == crate::state::STATUS_TERMINATING || environment.is_terminated() {
+            return Err(TerminateEnvironmentError::invalid_parameter_value(format!(
+                "Environment {} is not in a state from which it can be terminated.",
+                environment.environment_name
+            )));
+        }
+
+        // "Terminating: Environment is in the shut-down process." The move to
+        // `Terminated` is what the clock then owes.
+        environment.begin_termination();
+        Ok(crate::state::environment_description!(
+            TerminateEnvironmentOutput,
+            &*environment
+        ))
     }
 }

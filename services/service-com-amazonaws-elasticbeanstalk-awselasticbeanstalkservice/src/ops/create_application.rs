@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: stores the application and answers with the `ApplicationDescription`
+//! built from what was stored. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +137,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApplicationError::internal_failure("the Elastic Beanstalk store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        // "The name of the application. Must be unique within your account." —
+        // a name already in the store is refused, never overwritten.
+        if store.applications.contains_key(&input.application_name) {
+            return Err(CreateApplicationError::invalid_parameter_value(format!(
+                "Application {} already exists.",
+                input.application_name
+            )));
+        }
+
+        // "TooManyApplicationsException: The specified account has reached its
+        // limit of applications." Enforcing the quota is also what bounds the
+        // store: the number of records a caller can create is capped.
+        if store.applications.len() >= crate::state::MAX_APPLICATIONS {
+            return Err(CreateApplicationErrorModeled::TooManyApplicationsException(
+                TooManyApplicationsException {
+                    message: Some(format!(
+                        "The number of applications in this account has reached the limit of {}.",
+                        crate::state::MAX_APPLICATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let created = crate::state::now();
+        let application = crate::state::Application {
+            name: input.application_name.clone(),
+            arn: crate::state::application_arn(&region, &input.application_name),
+            description: input.description,
+            date_created: created,
+            date_updated: created,
+            resource_lifecycle_config: input.resource_lifecycle_config,
+            // A configuration template is a separate resource, created by
+            // `CreateConfigurationTemplate` (still scaffolded). This list is
+            // reported from what the store holds, so it starts empty rather than
+            // naming a template nothing holds.
+            configuration_templates: Vec::new(),
+            tags: input.tags.unwrap_or_default(),
+        };
+        // "Creates an application that has … no application versions."
+        let description = application.to_description(Vec::new());
+        store
+            .applications
+            .insert(application.name.clone(), application);
+
+        Ok(CreateApplicationOutput {
+            application: Some(description),
+        })
     }
 }
