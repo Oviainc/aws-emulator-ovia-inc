@@ -23,6 +23,12 @@
 //! `PutUsers`, `PutActions` and `PutActionInteractions`, and `InvalidInputException`
 //! (400) for `PutEvents`, whose model declares no not-found error.
 //!
+//! A registered dataset also carries its [`DatasetType`], derived from the ARN the
+//! control plane minted (`dataset/<dataset group>/<DATASET_TYPE>`), because a dataset's
+//! type is what decides which metadata put it serves: `PutItems` serves an Items
+//! dataset, `PutUsers` a Users dataset and `PutActions` an Actions dataset, and anything
+//! else is `InvalidInputException` (400).
+//!
 //! ## What this store retains
 //!
 //! Ingestion never stops, so every place this store can grow is bounded and the bound
@@ -272,22 +278,87 @@ pub struct Record {
     pub updated_at: SystemTime,
 }
 
+/// The dataset types Amazon Personalize publishes, in the spelling its control plane
+/// reports them back in.
+///
+/// Source: the documentation of `CreateDatasetRequest$datasetType` in the Amazon
+/// Personalize control-plane model — "One of the following (case insensitive) values:
+/// Interactions, Items, Users, Actions, Action_Interactions"
+/// (`smithy_query(query="doc", shape="CreateDatasetRequest", member="datasetType",
+/// model_path="services/service-com-amazonaws-personalize-amazonpersonalize/smithy-model/com-amazonaws-personalize-amazonpersonalize.json")`).
+/// `CreateDataset` belongs to the `personalize` service, not this one, which is why the
+/// catalog is restated here (the sibling crate keeps the same list in its own
+/// `canonical_dataset_type`) rather than making one service crate depend on another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetType {
+    Interactions,
+    Items,
+    Users,
+    Actions,
+    ActionInteractions,
+}
+
+impl DatasetType {
+    /// Every published dataset type, so a caller (or a test) enumerates the set from one
+    /// place instead of restating it.
+    pub const ALL: [DatasetType; 5] = [
+        DatasetType::Interactions,
+        DatasetType::Items,
+        DatasetType::Users,
+        DatasetType::Actions,
+        DatasetType::ActionInteractions,
+    ];
+
+    /// The canonical spelling, as `CreateDataset` documents it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DatasetType::Interactions => "Interactions",
+            DatasetType::Items => "Items",
+            DatasetType::Users => "Users",
+            DatasetType::Actions => "Actions",
+            DatasetType::ActionInteractions => "Action_Interactions",
+        }
+    }
+
+    /// The type `value` names, matched case-insensitively because the control plane
+    /// documents the values that way (and renders them upper-cased inside an ARN), or
+    /// `None` when it names no published type at all.
+    pub fn parse(value: &str) -> Option<Self> {
+        DatasetType::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str().eq_ignore_ascii_case(value))
+    }
+
+    /// The type a dataset ARN names: see [`dataset_type_segment`].
+    pub fn from_arn(dataset_arn: &str) -> Option<Self> {
+        Self::parse(dataset_type_segment(dataset_arn))
+    }
+}
+
+/// The segment of a dataset ARN that names its TYPE: a Personalize dataset ARN's
+/// resource is `dataset/<dataset group name>/<DATASET_TYPE>`, so the type is the last
+/// `/`-delimited segment — a dataset's identity inside its group IS its type, which is
+/// why the control plane puts it there instead of a name.
+///
+/// The one place this emulator decides a dataset's type from its ARN.
+pub fn dataset_type_segment(dataset_arn: &str) -> &str {
+    dataset_arn.split('/').next_back().unwrap_or(dataset_arn)
+}
+
 /// A registered dataset and the metadata records put into it. `BTreeMap` so a reader
 /// walks the records in a deterministic order.
 ///
-/// One dataset carries all three collections and no dataset TYPE, so a metadata put is
-/// stored by the operation's kind rather than matched against the type its ARN names.
-/// That is what the bootstrap issue asked for: its state model gives a dataset the three
-/// collections and no type, and its reproduction steps address all three kinds through a
-/// single `.../ITEMS` ARN, so refusing a mismatch would have refused those steps. The
-/// crate's own tests nevertheless address each kind through a dataset of its own type
-/// (`.../ITEMS`, `.../USERS`, `.../ACTIONS`), so carrying the type on the seam and
-/// refusing a mismatch — which is what the real service does — is purely additive. Filed
-/// as
-/// `issues/things-that-do-not-work/20261022T000100Z-personalize-events-accepts-a-metadata-put-against-a-dataset-of-another-type.md`.
+/// A dataset carries the three metadata collections AND its [`DatasetType`], derived
+/// once from its ARN when it is registered: the type is what decides which metadata put
+/// a dataset serves, so a `PutUsers` into an Items dataset is refused rather than
+/// stored.
 #[derive(Debug, Default, Clone)]
 pub struct Dataset {
     pub arn: String,
+    /// The type the ARN names, as [`DatasetType::from_arn`] derived it. `None` when that
+    /// segment is not one of the published values — such a dataset serves no metadata put
+    /// at all (every one of them is refused with `InvalidInputException`).
+    pub dataset_type: Option<DatasetType>,
     pub items: BTreeMap<String, Record>,
     pub users: BTreeMap<String, Record>,
     pub actions: BTreeMap<String, Record>,
@@ -302,6 +373,19 @@ pub enum MetadataKind {
     Items,
     Users,
     Actions,
+}
+
+impl MetadataKind {
+    /// The dataset type whose records this kind IS — the only type of dataset the
+    /// operation carrying these records serves (`PutItems` an Items dataset, `PutUsers` a
+    /// Users dataset, `PutActions` an Actions dataset).
+    pub fn dataset_type(self) -> DatasetType {
+        match self {
+            MetadataKind::Items => DatasetType::Items,
+            MetadataKind::Users => DatasetType::Users,
+            MetadataKind::Actions => DatasetType::Actions,
+        }
+    }
 }
 
 impl Dataset {
@@ -352,6 +436,11 @@ pub enum MetadataPutError {
 /// Replacing a record already stored never grows the collection, so it is accepted at
 /// the cap.
 ///
+/// The dataset must be of the TYPE these records are ([`MetadataKind::dataset_type`]):
+/// a batch of users is not a batch of items, so a put whose dataset names another type —
+/// or no published type at all — is refused with `InvalidInputException` (400) and stores
+/// nothing.
+///
 /// The target is resolved FIRST, so a request that names an unknown (or busy) dataset
 /// and also carries an unusable record answers for the target rather than for the
 /// record: the stronger, more specific fault is the one the caller has to fix.
@@ -367,6 +456,34 @@ pub fn put_metadata_records(
         .ok_or(MetadataPutError::NotFound)?;
     if dataset.in_use {
         return Err(MetadataPutError::InUse);
+    }
+
+    // The records' type against the dataset's: both come from the request (the operation
+    // decides the records' type, the `datasetArn` the dataset's), so the message names
+    // both.
+    let records_type = kind.dataset_type();
+    match dataset.dataset_type {
+        Some(dataset_type) if dataset_type == records_type => {}
+        Some(dataset_type) => {
+            return Err(MetadataPutError::InvalidInput(format!(
+                "The dataset {dataset_arn} is a {} dataset, so it does not take {} records.",
+                dataset_type.as_str(),
+                records_type.as_str()
+            )));
+        }
+        None => {
+            return Err(MetadataPutError::InvalidInput(format!(
+                "The dataset {dataset_arn} names the dataset type {:?}, which is not one of {}; \
+                 it takes no {} records.",
+                dataset_type_segment(dataset_arn),
+                DatasetType::ALL
+                    .iter()
+                    .map(|candidate| candidate.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                records_type.as_str()
+            )));
+        }
     }
 
     let mut parsed = Vec::with_capacity(records.len());
@@ -469,6 +586,10 @@ impl ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState {
     /// Register the dataset `dataset_arn`, or return the one already registered with
     /// its records intact.
     ///
+    /// The dataset's [`DatasetType`] is DERIVED from the ARN here — the one place that
+    /// decides it — so every dataset in the registry carries the type its ARN names
+    /// without the seam having to be told it twice.
+    ///
     /// Answers `None` once the store holds [`MAX_DATASETS`] of them, for the same
     /// reason as [`Self::register_event_tracker`].
     pub fn register_dataset(&mut self, dataset_arn: &str) -> Option<&mut Dataset> {
@@ -480,6 +601,7 @@ impl ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState {
                 .entry(dataset_arn.to_string())
                 .or_insert_with(|| Dataset {
                     arn: dataset_arn.to_string(),
+                    dataset_type: DatasetType::from_arn(dataset_arn),
                     ..Dataset::default()
                 }),
         )

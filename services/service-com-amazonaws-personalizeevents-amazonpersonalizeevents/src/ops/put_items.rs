@@ -9,8 +9,9 @@
 //! A repeated `itemId` REPLACES the record stored for it — the latest call for an id is
 //! that record, not a second one. The `datasetArn` must name a dataset this emulator
 //! knows (`ResourceNotFoundException`, 404, when it does not; `ResourceInUseException`,
-//! 409, when it is marked in use), and `properties` must be a JSON object
-//! (`InvalidInputException`, 400). Item metadata documents no reserved property keys —
+//! 409, when it is marked in use), that dataset must be an ITEMS dataset — the type the
+//! ARN's last segment names — (`InvalidInputException`, 400, for a dataset of any other
+//! type), and `properties` must be a JSON object (`InvalidInputException`, 400). Item metadata documents no reserved property keys —
 //! that rule belongs to the two event streams — so a key named like an event field is
 //! accepted here. The behaviour itself lives in `crate::state::put_metadata_records`,
 //! which `PutUsers` and `PutActions` share.

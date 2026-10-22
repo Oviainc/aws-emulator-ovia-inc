@@ -22,7 +22,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_personalizeevents_amazonpersonalizeevents::state::{
     ComAmazonawsPersonalizeeventsAmazonpersonalizeeventsState as PersonalizeEventsState, Dataset,
-    MetadataKind, Record, StoredActionInteraction, StoredEvent,
+    DatasetType, MetadataKind, Record, StoredActionInteraction, StoredEvent,
     MAX_ACTION_INTERACTIONS_PER_TRACKER, MAX_EVENTS_PER_TRACKER, MAX_EVENT_TRACKERS,
     MAX_RECORDS_PER_DATASET_COLLECTION, RESERVED_PROPERTY_KEYS,
 };
@@ -194,6 +194,17 @@ impl Emulator {
             .get(dataset_arn)
             .map(|dataset: &Dataset| dataset.records(kind).clone())
             .unwrap_or_default()
+    }
+
+    /// The type the registry derived for a registered dataset, or `None` when it derived
+    /// none (or the dataset is not registered at all).
+    fn dataset_type(&self, dataset_arn: &str) -> Option<DatasetType> {
+        self.engine
+            .state::<PersonalizeEventsState>()
+            .lock()
+            .datasets
+            .get(dataset_arn)
+            .and_then(|dataset: &Dataset| dataset.dataset_type)
     }
 }
 
@@ -1984,5 +1995,178 @@ async fn a_generated_event_id_is_unique_across_trackers_and_both_streams() {
         minted.len(),
         "case \"every call\": every generated event id must differ from every other, \
          across trackers and across both streams, got {minted:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A dataset's TYPE decides which metadata put it serves.
+// ---------------------------------------------------------------------------
+
+/// A dataset ARN naming the type `segment`, in the dataset group `group`: the resource of
+/// a Personalize dataset ARN is `dataset/<dataset group name>/<DATASET_TYPE>`, so the
+/// type is the last segment.
+fn dataset_arn_of_type(group: &str, segment: &str) -> String {
+    format!("arn:aws:personalize:us-east-1:123456789012:dataset/{group}/{segment}")
+}
+
+/// A one-record metadata put for `case`, with the record named the way that operation
+/// names its records.
+fn metadata_body(case: &MetadataCase, dataset_arn: &str, id: &str) -> Value {
+    json!({ "datasetArn": dataset_arn, case.collection: [{ case.id_member: id }] })
+}
+
+/// Every ARN type segment the table below addresses each metadata put with, and the type
+/// the derivation must read out of it.
+///
+/// The published values come from `DatasetType::ALL`, whose doc comment cites the Amazon
+/// Personalize control plane's `CreateDatasetRequest$datasetType` documentation ("One of
+/// the following (case insensitive) values: Interactions, Items, Users, Actions,
+/// Action_Interactions"); an ARN renders them upper-cased. The extra rows are the casings
+/// that documentation makes equivalent, and segments that name no published type at all —
+/// including `INTERACTIONS` and `ACTION_INTERACTIONS`, which the bootstrap issue never
+/// cited.
+fn type_segments() -> Vec<(String, Option<DatasetType>)> {
+    let mut segments: Vec<(String, Option<DatasetType>)> = DatasetType::ALL
+        .into_iter()
+        .map(|dataset_type| {
+            (
+                dataset_type.as_str().to_ascii_uppercase(),
+                Some(dataset_type),
+            )
+        })
+        .collect();
+    segments.extend([
+        // The documented spelling itself, plus a lower-cased and a mixed-case one: the
+        // match is case insensitive.
+        (
+            "Action_Interactions".to_string(),
+            Some(DatasetType::ActionInteractions),
+        ),
+        ("users".to_string(), Some(DatasetType::Users)),
+        ("iTeMs".to_string(), Some(DatasetType::Items)),
+        // Segments naming no published type: a near miss in either direction, the
+        // compound value without its underscore, a name, and an empty segment.
+        ("ITEM".to_string(), None),
+        ("INTERACTION".to_string(), None),
+        ("ACTIONINTERACTIONS".to_string(), None),
+        ("my-dataset".to_string(), None),
+        (String::new(), None),
+    ]);
+    segments
+}
+
+/// `PutItems`, `PutUsers` and `PutActions` each serve only a dataset of the type their
+/// records ARE — the type the dataset ARN's last segment names. A put against a dataset
+/// of any other published type, or of no published type at all, is refused with the
+/// modelled `InvalidInputException` (400) and stores nothing.
+#[tokio::test]
+async fn a_metadata_put_serves_only_a_dataset_whose_type_matches_its_records() {
+    let emulator = Emulator::new();
+
+    for (index, (segment, expected_type)) in type_segments().into_iter().enumerate() {
+        for case in &METADATA_CASES {
+            // One dataset per (segment, operation) pair, so no row can be satisfied by
+            // what another row stored.
+            let group = format!("type-table-{index}-{}", case.collection);
+            let dataset_arn = dataset_arn_of_type(&group, &segment);
+            emulator.seed_dataset(&dataset_arn);
+            assert_eq!(
+                emulator.dataset_type(&dataset_arn),
+                expected_type,
+                "case {dataset_arn:?}: expected the registry to derive {expected_type:?} from \
+                 the ARN, got {:?}",
+                emulator.dataset_type(&dataset_arn)
+            );
+
+            let records_type = case.kind.dataset_type();
+            let case_label = format!("{} into a {segment:?} dataset", case.route);
+            let reply = emulator
+                .post(case.route, &metadata_body(case, &dataset_arn, "record-1"))
+                .await;
+            let stored = emulator.stored_records(&dataset_arn, case.kind);
+
+            if expected_type == Some(records_type) {
+                assert_accepted(&case_label, &reply);
+                assert_eq!(
+                    stored.keys().cloned().collect::<Vec<_>>(),
+                    vec!["record-1".to_string()],
+                    "case {case_label:?}: expected exactly the record it carried, got {:?}",
+                    stored.keys().collect::<Vec<_>>()
+                );
+            } else {
+                assert_refused(&case_label, &reply, 400, "InvalidInputException");
+                assert!(
+                    stored.is_empty(),
+                    "case {case_label:?}: a refused put must store nothing, got {:?}",
+                    stored.keys().collect::<Vec<_>>()
+                );
+                if let Some(dataset_type) = expected_type {
+                    // Both types come from the request, so the refusal names both.
+                    assert!(
+                        reply.body.contains(dataset_type.as_str())
+                            && reply.body.contains(records_type.as_str()),
+                        "case {case_label:?}: expected the message to name the dataset's type \
+                         {:?} and the records' type {:?}, got {:?}",
+                        dataset_type.as_str(),
+                        records_type.as_str(),
+                        reply.body
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The issue's own step, and the put that IS served: a users put addressed at the
+/// bootstrap issue's `.../demo/ITEMS` dataset is refused and stores nothing, while the
+/// same records go in through `.../demo/USERS` — so the refusal is about the dataset's
+/// type and not about the records.
+#[tokio::test]
+async fn a_users_put_against_the_items_dataset_is_refused_and_the_users_dataset_takes_it() {
+    let emulator = Emulator::new();
+    emulator.seed_dataset(ITEMS_DATASET);
+    emulator.seed_dataset(USERS_DATASET);
+
+    let users = json!([{ "userId": "user-1" }]);
+    let refused = emulator
+        .post(
+            "/users",
+            &json!({ "datasetArn": ITEMS_DATASET, "users": users }),
+        )
+        .await;
+    assert_refused(
+        "PutUsers into the demo ITEMS dataset",
+        &refused,
+        400,
+        "InvalidInputException",
+    );
+    for (dataset_arn, kind) in [
+        (ITEMS_DATASET, MetadataKind::Users),
+        (ITEMS_DATASET, MetadataKind::Items),
+    ] {
+        assert!(
+            emulator.stored_records(dataset_arn, kind).is_empty(),
+            "case \"PutUsers into the demo ITEMS dataset\": nothing may be stored in {kind:?}, \
+             got {:?}",
+            emulator.stored_records(dataset_arn, kind)
+        );
+    }
+
+    let accepted = emulator
+        .post(
+            "/users",
+            &json!({ "datasetArn": USERS_DATASET, "users": users }),
+        )
+        .await;
+    assert_accepted("PutUsers into the demo USERS dataset", &accepted);
+    assert_eq!(
+        emulator
+            .stored_records(USERS_DATASET, MetadataKind::Users)
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["user-1".to_string()],
+        "case \"PutUsers into the demo USERS dataset\": expected the user it carried, got {:?}",
+        emulator.stored_records(USERS_DATASET, MetadataKind::Users)
     );
 }
