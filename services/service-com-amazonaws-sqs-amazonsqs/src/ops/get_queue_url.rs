@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueueUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueueUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueueUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the url of the queue named `QueueName`, as the create that allocated it
+//! minted it — the same url on every call, which is what lets a client that knows only
+//! the name address the queue.
+//!
+//! A pure read: it resolves the stored [`crate::state::Queue`] and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueueUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueueUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueueUrl"))
+        use crate::state;
+
+        let _ = ctx;
+        let store = state::service_state(&*self.engine).ok_or_else(|| {
+            GetQueueUrlErrorModeled::UnsupportedOperation(state::store_unavailable())
+        })?;
+        let store = store.lock();
+
+        // "To access a queue owned by another Amazon Web Services account, use the
+        // QueueOwnerAWSAccountId parameter to specify the account ID of the queue's
+        // owner." This emulator presents exactly one account, so a request naming any
+        // other owner resolves to no queue at all.
+        if let Some(owner) = input
+            .queue_owner_aws_account_id
+            .as_deref()
+            .filter(|owner| *owner != ::engine::emulator_account_id())
+        {
+            return Err(GetQueueUrlErrorModeled::QueueDoesNotExist(QueueDoesNotExist {
+                message: Some(format!(
+                    "The queue {} is not owned by account {owner}.",
+                    input.queue_name,
+                )),
+            })
+            .into());
+        }
+
+        let queue = store.queues.get(&input.queue_name).ok_or_else(|| {
+            GetQueueUrlErrorModeled::QueueDoesNotExist(QueueDoesNotExist {
+                message: Some(format!(
+                    "The queue named {} does not exist in this account and Region.",
+                    input.queue_name,
+                )),
+            })
+        })?;
+
+        Ok(GetQueueUrlOutput {
+            queue_url: Some(queue.url.clone()),
+        })
     }
 }

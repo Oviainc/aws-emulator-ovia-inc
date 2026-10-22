@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -63,6 +63,39 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
         }
     }
+}
+
+/// The error Amazon SQS names for a value the boundary validator refused, or `None` to
+/// leave the framework's wording in place.
+///
+/// One case, and it is model-driven rather than keyed to a member name: a value
+/// outside `QueueAttributeName`'s value set is an attribute name that does not exist,
+/// which this service's model has an error shape for — `InvalidAttributeName`, "The
+/// specified attribute doesn't exist." (HTTP 400, the same status the refusal already
+/// carries). Every operation that takes attribute names reaches it through the same
+/// enum, so matching on the refused value SET covers all of them without naming one.
+///
+/// An attribute name supplied as a MAP KEY (`CreateQueue`/`SetQueueAttributes`
+/// `Attributes`) never arrives here: the constraint walk captures a map key rather than
+/// validating it, so those handlers refuse an unknown name themselves
+/// (`crate::state::validate_attributes`). This covers the LIST form
+/// (`GetQueueAttributes` `AttributeNames`), which the walk does validate.
+fn refusal_for(violation: &Violation) -> Option<Refused> {
+    let ViolationKind::EnumValue(allowed) = &violation.kind else {
+        return None;
+    };
+    if allowed.len() != crate::ops::types::QUEUE_ATTRIBUTE_NAME_VALUES.len()
+        || !allowed
+            .iter()
+            .all(|value| crate::ops::types::QUEUE_ATTRIBUTE_NAME_VALUES.contains(&value.as_str()))
+    {
+        return None;
+    }
+    let name = violation.value.as_deref().unwrap_or(&violation.path);
+    Some(Refused {
+        code: "InvalidAttributeName".to_string(),
+        message: format!("Unknown Attribute {name}."),
+    })
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -98,15 +131,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. Both the code and the message are replaced, because a
+        // client branches on the code. Everything [`refusal_for`] does not recognise
+        // keeps the framework's own wording.
+        match refusal {
+            Refusal::Invalid(violations) => violations.iter().find_map(refusal_for),
+            // Authentication and every refusal added later keep the framework's
+            // wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
