@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIpRoutes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIpRoutes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIpRoutes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the IP address blocks `AddIpRoutes` routed to a stored directory, in block
+//! order, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +71,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// The cursor a page hands back carries the boundary and the filter the page was
+// issued under: the one `crate::state::CURSOR_SEPARATOR` every listing of this service
+// agrees on, so a token cannot be read as a page of another listing or another filter.
+use crate::state::CURSOR_SEPARATOR;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +149,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIpRoutes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIpRoutesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIpRoutes"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The cursor a previous page handed back: the address block this page resumes
+        // after, together with the filter it was issued under — for this listing, the
+        // `DirectoryId` whose routes it pages over. Blocks are what the page boundary is
+        // carried as, so it survives a route being added between pages, and a token
+        // issued for another directory (or another listing) is refused rather than
+        // served as a page of this one.
+        let filter = crate::state::cursor_filter(&[&input.directory_id]);
+        let after_block = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_cursor(CURSOR_KIND, token)
+                    .and_then(|value| {
+                        let (block, issued_for) = value.split_once(CURSOR_SEPARATOR)?;
+                        if issued_for != filter.as_str() {
+                            return None;
+                        }
+                        Some(block.to_string())
+                    })
+                    .ok_or_else(|| {
+                        ListIpRoutesErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
+                                request_id: None,
+                            },
+                        )
+                    })?,
+            ),
+        };
+        let page_size = crate::state::page_size(input.limit);
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
+            ListIpRoutesErrorModeled::EntityDoesNotExistException(EntityDoesNotExistException {
+                message: Some(crate::state::no_such_directory(&input.directory_id)),
+                request_id: None,
+            })
+        })?;
+
+        // The page is built from the store's own keys, in key order, so the boundary a
+        // token carries is the stored block rather than a value read back off the
+        // response.
+        let mut page: Vec<(String, IpRouteInfo)> = directory
+            .ip_routes
+            .iter()
+            .filter(|(block, _)| after_block.as_ref().is_none_or(|after| *block > after))
+            .map(|(block, route)| (block.clone(), route.to_info(&directory.directory_id)))
+            .collect();
+        drop(store);
+
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+        let page_ended_after = page.last().map(|(block, _)| block.clone());
+
+        Ok(ListIpRoutesOutput {
+            ip_routes_info: Some(page.into_iter().map(|(_, info)| info).collect()),
+            // Only a truncated page has a next one; the final page carries no token.
+            next_token: if truncated {
+                page_ended_after.map(|block| {
+                    crate::state::encode_cursor(
+                        CURSOR_KIND,
+                        &format!("{block}{CURSOR_SEPARATOR}{filter}"),
+                    )
+                })
+            } else {
+                None
+            },
+        })
     }
 }
+
+/// Which listing this operation's `NextToken` belongs to, so a token issued by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "ip-routes";
