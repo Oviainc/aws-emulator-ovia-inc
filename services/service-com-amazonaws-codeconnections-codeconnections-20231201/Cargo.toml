@@ -24,7 +24,7 @@ tracing = { workspace = true }
 # Hex codec for the opaque `ListConnections` page token and for rendering the
 # digest a connection's resource id is minted from.
 hex = { workspace = true }
-# The digest behind a connection's opaque resource id (see `state::connection_resource_id`).
+# The digest behind a connection's or host's opaque resource id (see `state::resource_id`).
 sha2 = { workspace = true }
 
 [build-dependencies]

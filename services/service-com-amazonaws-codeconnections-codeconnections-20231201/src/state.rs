@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::ops::types::{Connection, Tag};
+use crate::ops::types::{Connection, Host, Tag, VpcConfiguration};
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. `emulator_arn`'s own documentation gives `us-east-1` as the
@@ -22,6 +22,15 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// handshake that moves it is a console action, not something the clock owes, so a
 /// connection this service mints stays `PENDING` until something updates it.
 pub const CONNECTION_STATUS_ON_CREATE: &str = "PENDING";
+
+/// The status a host minted through the API, CLI or an SDK carries.
+///
+/// From `CreateHost`'s own documentation: "A host created through the CLI or the SDK
+/// is in `PENDING` status by default. You can make its status `AVAILABLE` by setting
+/// up the host in the console." Setting the host up is a console action, not
+/// something the clock owes, so a host this service mints stays `PENDING` until
+/// something updates it.
+pub const HOST_STATUS_ON_CREATE: &str = "PENDING";
 
 /// The largest page `ListConnections` renders, whatever the caller asked for.
 ///
@@ -41,6 +50,13 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// `LimitExceededException` (429, "Exceeded the maximum limit for connections."),
 /// which is the error the operation already declares for exactly this.
 pub const MAX_CONNECTIONS: usize = 1000;
+
+/// The largest number of hosts this emulator stores for the account.
+///
+/// A CHOSEN bound, exactly like [`MAX_CONNECTIONS`] and for the same reason: the store
+/// lives in the emulator's process. `CreateHost` refuses past it with the modeled
+/// `LimitExceededException` (429), the only error that operation declares.
+pub const MAX_HOSTS: usize = 1000;
 
 /// A connection as this service persists it.
 ///
@@ -81,6 +97,48 @@ impl StoredConnection {
     }
 }
 
+/// A host as this service persists it.
+///
+/// One record per `HostArn`; every member of the modeled `Host` shape that the API
+/// can observe is stored here, so `GetHost` (and any later reader) renders from the
+/// same row rather than recomputing one.
+#[derive(Debug, Clone)]
+pub struct StoredHost {
+    pub name: String,
+    pub host_arn: String,
+    /// One of the modeled `ProviderType` values; `CreateHost` models it required.
+    pub provider_type: String,
+    /// The endpoint of the infrastructure the host represents.
+    pub provider_endpoint: String,
+    /// The VPC configuration provisioned for the host, when the create supplied one.
+    pub vpc_configuration: Option<VpcConfiguration>,
+    /// The modeled `HostStatus` (free-form 1..64; the shape's doc lists PENDING,
+    /// AVAILABLE, VPC_CONFIG_DELETING, VPC_CONFIG_INITIALIZING,
+    /// VPC_CONFIG_FAILED_INITIALIZATION).
+    pub status: String,
+    /// The status description, when the service has one to report.
+    pub status_message: Option<String>,
+    /// The tags supplied at create time, in the order they were supplied.
+    pub tags: Vec<Tag>,
+}
+
+impl StoredHost {
+    /// Render the stored row as the modeled `Host` structure: the single projection
+    /// from state onto the wire shape, so every reader reports the same host the
+    /// same way.
+    pub fn to_modeled(&self) -> Host {
+        Host {
+            name: Some(self.name.clone()),
+            host_arn: Some(self.host_arn.clone()),
+            provider_type: Some(self.provider_type.clone()),
+            provider_endpoint: Some(self.provider_endpoint.clone()),
+            vpc_configuration: self.vpc_configuration.clone(),
+            status: Some(self.status.clone()),
+            status_message: self.status_message.clone(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-codeconnections-codeconnections-20231201. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodeconnectionsCodeconnections20231201State {
@@ -90,11 +148,19 @@ pub struct ComAmazonawsCodeconnectionsCodeconnections20231201State {
     /// token can name a position in it.
     pub connections: BTreeMap<String, StoredConnection>,
     /// How many connections this store has ever minted: the sequence number behind
-    /// the next connection's resource id (see [`connection_resource_id`]).
+    /// the next connection's resource id (see [`resource_id`]).
     ///
     /// It counts mints rather than live connections, so it never rewinds when one is
     /// deleted — which is what keeps a deleted connection's ARN from coming back.
     pub connections_minted: u64,
+    /// Every host this account holds, keyed by its `HostArn`.
+    ///
+    /// A `BTreeMap` for the same reason as `connections`: a total, stable order a
+    /// page token can name a position in.
+    pub hosts: BTreeMap<String, StoredHost>,
+    /// How many hosts this store has ever minted: the sequence number behind the next
+    /// host's resource id (see [`resource_id`]). It counts mints, so it never rewinds.
+    pub hosts_minted: u64,
 }
 
 impl ComAmazonawsCodeconnectionsCodeconnections20231201State {
@@ -110,27 +176,46 @@ impl ComAmazonawsCodeconnectionsCodeconnections20231201State {
             .values()
             .any(|connection| connection.connection_name == name)
     }
+
+    /// The tags stored against the resource this ARN names, or `None` when the
+    /// service holds no such resource.
+    ///
+    /// Every resource this service persists is taggable (`CreateConnection` and
+    /// `CreateHost` both take a `TagList`), so tag reporting resolves an ARN against
+    /// each store rather than against connections alone. An ARN names at most one
+    /// resource: the modeled patterns put the resource type in the ARN
+    /// (`connection/…` vs `host/…`).
+    pub fn tags_for_resource(&self, resource_arn: &str) -> Option<&[Tag]> {
+        self.connections
+            .get(resource_arn)
+            .map(|connection| connection.tags.as_slice())
+            .or_else(|| self.hosts.get(resource_arn).map(|host| host.tags.as_slice()))
+    }
 }
 
-/// A fresh resource id for a connection: 32 hex characters grouped the way a
-/// connection id is grouped (8-4-4-4-12), to go after `connection/` in its ARN.
+/// A fresh resource id for one of this service's resources: 32 hex characters grouped
+/// the way a connection or host id is grouped (8-4-4-4-12), to go after
+/// `<resource_kind>/` in its ARN.
 ///
-/// UNIQUENESS comes from `sequence`, a counter this store never rewinds
-/// ([`ComAmazonawsCodeconnectionsCodeconnections20231201State::connections_minted`]),
-/// so the ARN built from it is never reused — the `ConnectionArn` member documents
-/// "The ARN is never reused if the connection is deleted" — even after the deleted
-/// connection's name is freed and taken again. The digest is what makes the id OPAQUE,
-/// the way this project's other services derive their opaque labels (see
+/// UNIQUENESS comes from `sequence`, a per-kind counter this store never rewinds
+/// ([`ComAmazonawsCodeconnectionsCodeconnections20231201State::connections_minted`],
+/// [`ComAmazonawsCodeconnectionsCodeconnections20231201State::hosts_minted`]), so the
+/// ARN built from it is never reused — the `ConnectionArn` member documents "The ARN is
+/// never reused if the connection is deleted" — even after the deleted resource's name
+/// is freed and taken again. `resource_kind` is mixed in so two kinds minted at the same
+/// sequence cannot collide. The digest is what makes the id OPAQUE, the way this
+/// project's other services derive their opaque labels (see
 /// `service-com-amazonaws-mediapackagev2-mediapackagev2`'s `state::egress_domain`), so
-/// the id carries neither the account's name nor a count of its connections; mixing in
+/// the id carries neither the account's name nor a count of its resources; mixing in
 /// the minting instant keeps two emulator runs from minting the same first id.
-pub fn connection_resource_id(account_id: &str, region: &str, sequence: u64) -> String {
+pub fn resource_id(resource_kind: &str, account_id: &str, region: &str, sequence: u64) -> String {
     let minted_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let mut hasher = Sha256::new();
     for field in [
+        resource_kind.as_bytes(),
         account_id.as_bytes(),
         region.as_bytes(),
         &sequence.to_le_bytes(),

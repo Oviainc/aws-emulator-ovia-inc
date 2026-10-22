@@ -17,11 +17,11 @@ use service_com_amazonaws_codeconnections_codeconnections_20231201::state::{
 };
 
 /// The region the test signs for, so a minted ARN must carry exactly this one.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The `ProviderType` values the model accepts, from
 /// `smithy_query(query="shape", shape="ProviderType")` — the enum's `values` list.
-const PROVIDER_TYPES: &[&str] = &[
+pub(crate) const PROVIDER_TYPES: &[&str] = &[
     "Bitbucket",
     "GitHub",
     "GitHubEnterpriseServer",
@@ -30,8 +30,9 @@ const PROVIDER_TYPES: &[&str] = &[
     "AzureDevOps",
 ];
 
-/// A host ARN matching the modeled `HostArn` pattern. No host exists in this
-/// emulator (CreateHost is still a scaffold), so this names a missing resource.
+/// A host ARN matching the modeled `HostArn` pattern. This suite mints no host, so
+/// it names a resource this service does not hold (`host_association.rs` covers the
+/// case where the host is really there).
 fn some_host_arn() -> String {
     format!(
         "arn:aws:codeconnections:{REGION}:{}:host/0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
@@ -40,7 +41,7 @@ fn some_host_arn() -> String {
 }
 
 /// One emulator holding only this service, driven in-process.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These tests assert handler behaviour, not signature verification.
@@ -54,7 +55,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation and return its HTTP status and parsed JSON body.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     operation: &str,
     body: serde_json::Value,
@@ -106,7 +107,7 @@ async fn call_signed_for(
 }
 
 /// Create a connection and return its ARN, failing the test on any non-200.
-async fn create(router: &MultiServiceRouter, name: &str, provider: &str) -> String {
+pub(crate) async fn create(router: &MultiServiceRouter, name: &str, provider: &str) -> String {
     let (status, body) = call(
         router,
         "CreateConnection",
@@ -638,9 +639,9 @@ async fn a_connection_name_is_unique_within_the_account() {
     );
 }
 
-/// A `HostArn` names a host resource. No host exists in this emulator, so the create
-/// is refused with the modeled `ResourceUnavailableException` (400) rather than
-/// storing a connection that points at a resource that is not there.
+/// A `HostArn` names a host resource. This suite mints no host, so the create is
+/// refused with the modeled `ResourceUnavailableException` (400) rather than storing
+/// a connection that points at a resource that is not there.
 #[tokio::test]
 async fn a_host_arn_that_names_no_host_is_refused() {
     let router = router();

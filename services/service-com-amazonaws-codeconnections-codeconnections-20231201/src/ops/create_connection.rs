@@ -171,27 +171,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `HostArn` names a host resource, and a host only exists once `CreateHost`
-        // minted it. That operation is still a scaffold, so this service holds no
-        // host at all and any `HostArn` a caller supplies names one that does not
-        // exist — for which the modelled answer is `ResourceUnavailableException`
-        // (400, "Resource not found. Verify the ARN for the host resource and try
-        // again."), not a connection pointing at a resource that is not there.
-        if let Some(host_arn) = input.host_arn.as_deref() {
-            return Err(CreateConnectionErrorModeled::ResourceUnavailableException(
-                ResourceUnavailableException {
-                    message: Some(format!(
-                        "Resource not found. Verify the ARN for the host resource and try again: {host_arn}"
-                    )),
-                },
-            )
-            .into());
-        }
-
         let region = crate::state::request_region(ctx.parts());
         let tags = input.tags.unwrap_or_default();
 
         let mut store = state.lock();
+
+        // `HostArn` is an optional reference to another resource this service holds,
+        // so it is RESOLVED against the host store rather than judged by being
+        // present: a host the store holds is associated with the new connection, and
+        // only an ARN naming no host is refused — with the modelled
+        // `ResourceUnavailableException` (400, "Resource not found. Verify the ARN for
+        // the host resource and try again."), because a connection must never point at
+        // a resource that is not there. An absent member associates nothing.
+        if let Some(host_arn) = input.host_arn.as_deref() {
+            if !store.hosts.contains_key(host_arn) {
+                return Err(CreateConnectionErrorModeled::ResourceUnavailableException(
+                    ResourceUnavailableException {
+                        message: Some(format!(
+                            "Resource not found. Verify the ARN for the host resource and try again: {host_arn}"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
 
         // The request-level condition first: a name that is taken makes THIS request
         // invalid, and the caller needs that specific reason even when the store is
@@ -236,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &format!(
                 "connection/{}",
-                crate::state::connection_resource_id(&owner_account_id, &region, sequence)
+                crate::state::resource_id("connection", &owner_account_id, &region, sequence)
             ),
         );
 
@@ -246,7 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             provider_type: input.provider_type,
             owner_account_id,
             connection_status: crate::state::CONNECTION_STATUS_ON_CREATE.to_string(),
-            host_arn: None,
+            // The host resolved above, so the association is persisted and every
+            // reader (`GetConnection`, `ListConnections`, its `HostArnFilter`)
+            // reports it from this one row.
+            host_arn: input.host_arn,
             tags,
         };
         let stored_tags = record.tags.clone();

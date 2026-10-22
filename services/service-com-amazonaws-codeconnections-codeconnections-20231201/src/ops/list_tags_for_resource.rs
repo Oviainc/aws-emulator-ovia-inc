@@ -151,9 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        // Connections are the only taggable resource this service holds so far; a
-        // resource it does not hold is not found.
-        let Some(record) = store.connections.get(&input.resource_arn) else {
+        // Every resource this service persists is taggable (`CreateConnection` and
+        // `CreateHost` both take a `TagList`), so the ARN is resolved against each
+        // store rather than against connections alone; a resource this service does
+        // not hold is not found.
+        let Some(tags) = store.tags_for_resource(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!(
@@ -168,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListTagsForResourceOutput {
             // This operation's whole output IS the tag list, so it always renders
             // one — empty when the resource carries no tags.
-            tags: Some(record.tags.clone()),
+            tags: Some(tags.to_vec()),
         })
     }
 }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHost
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHost`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHost::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -96,10 +87,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codeconnections-codecon
 // here — hence the `CreateHostError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codeconnections#CreateHost")]
+//
+// One shape this SERVICE models that this OPERATION does not list is widened in:
+//
+// * `InternalServerException` (503) — the modelled server fault for a state store
+//   this handler cannot reach, which must never be reported as a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codeconnections#CreateHost",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum CreateHostErrorModeled {
     LimitExceededException(LimitExceededException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -153,18 +153,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHost` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHostErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHost"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateHostErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let tags = input.tags.unwrap_or_default();
+
+        let mut store = state.lock();
+
+        // The store lives in this process, so the number of records a caller can
+        // accumulate is capped and the overflow is refused with the only error this
+        // operation models. See `state::MAX_HOSTS`.
+        if store.hosts.len() >= crate::state::MAX_HOSTS {
+            return Err(CreateHostErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Exceeded the maximum limit for hosts ({}).",
+                        crate::state::MAX_HOSTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The resource id is minted from a counter the store never rewinds, so a
+        // deleted host's ARN never comes back on a later host — the same rule
+        // `CreateConnection` mints a connection id under.
+        let sequence = store.hosts_minted;
+        store.hosts_minted = store.hosts_minted.saturating_add(1);
+        let account_id = ::engine::emulator_account_id().to_string();
+        let host_arn = ::engine::emulator_arn(
+            "codeconnections",
+            &region,
+            &format!(
+                "host/{}",
+                crate::state::resource_id("host", &account_id, &region, sequence)
+            ),
+        );
+
+        let record = crate::state::StoredHost {
+            name: input.name,
+            host_arn: host_arn.clone(),
+            provider_type: input.provider_type,
+            provider_endpoint: input.provider_endpoint,
+            vpc_configuration: input.vpc_configuration,
+            status: crate::state::HOST_STATUS_ON_CREATE.to_string(),
+            // Nothing is wrong with a freshly minted host, so there is no status
+            // description to report. The member is optional for exactly that.
+            status_message: None,
+            tags,
+        };
+        let stored_tags = record.tags.clone();
+        store.hosts.insert(host_arn.clone(), record);
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key
+        // id, what changed, and the outcome. No secret is logged — the access key id is
+        // the public half the request already carries in its SigV4 scope.
+        ::tracing::info!(
+            operation = "CreateHost",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            host_arn = %host_arn,
+            outcome = "created",
+            "codeconnections state change"
+        );
+
+        Ok(CreateHostOutput {
+            host_arn: Some(host_arn),
+            // The modelled member reports the tags of the created host, so a host
+            // created with none has no tag list to report — the same rendering
+            // `CreateConnection` uses, and deliberately not `ListTagsForResource`'s,
+            // whose whole output IS the tag list.
+            tags: if stored_tags.is_empty() {
+                None
+            } else {
+                Some(stored_tags)
+            },
+        })
     }
 }

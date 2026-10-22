@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetHost
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetHost`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetHost::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -90,11 +81,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codeconnections-codecon
 // here — hence the `GetHostError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codeconnections#GetHost")]
+//
+// One shape this SERVICE models that this OPERATION does not list is widened in:
+//
+// * `InternalServerException` (503) — the modelled server fault for a state store
+//   this handler cannot reach, which must never be reported as a client error.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codeconnections#GetHost",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetHostErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ResourceUnavailableException(ResourceUnavailableException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,18 +148,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetHost` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetHostErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetHost"))
+        // A pure report: it resolves the ARN in state and renders the stored row.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetHostErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The CodeConnections resource store is unavailable. Try again.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // An ARN naming no host this service holds gets the error the service models
+        // for exactly that — `ResourceUnavailableException` (400, "Resource not found.
+        // Verify the ARN for the host resource and try again."), the same answer
+        // `CreateConnection` gives an unresolvable `HostArn`, so one missing host
+        // reads the same way wherever it is named.
+        let Some(record) = store.hosts.get(&input.host_arn) else {
+            return Err(GetHostErrorModeled::ResourceUnavailableException(
+                ResourceUnavailableException {
+                    message: Some(format!(
+                        "Resource not found. Verify the ARN for the host resource and try again: {}",
+                        input.host_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let host = record.to_modeled();
+        Ok(GetHostOutput {
+            name: host.name,
+            status: host.status,
+            provider_type: host.provider_type,
+            provider_endpoint: host.provider_endpoint,
+            vpc_configuration: host.vpc_configuration,
+        })
     }
 }
