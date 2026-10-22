@@ -7,6 +7,10 @@
 //! enrolled, and the instant of this call. The status it answers with is the
 //! value read back out of the store after the write.
 //!
+//! Becoming `Active` also starts the analysis that produces this account's
+//! recommendations, so the record carries the instant those recommendations come
+//! due; opting out clears it, and opting in again starts a fresh analysis.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,7 +179,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // Set once, when the account first enrolls.
                     created_timestamp: now,
                     last_updated_timestamp: now,
+                    recommendations_due_at: None,
                 });
+            // Enrolling starts the analysis that produces this account's
+            // recommendations, so the instant they are due is set when the
+            // account becomes `Active` and cleared when it opts out — opting in
+            // again starts a fresh analysis. A call that leaves an already
+            // active account active does not restart it.
+            let becoming_active = input.status == crate::state::STATUS_ACTIVE;
+            if becoming_active {
+                if enrollment.recommendations_due_at.is_none() {
+                    enrollment.recommendations_due_at =
+                        Some(crate::state::Enrollment::generation_due_at());
+                }
+            } else {
+                enrollment.recommendations_due_at = None;
+            }
             enrollment.status = input.status.clone();
             enrollment.include_member_accounts = include_member_accounts;
             // Refreshed on every call, including the first.

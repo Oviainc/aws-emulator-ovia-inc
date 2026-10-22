@@ -4,7 +4,9 @@
 //!
 //! Merges the preference members the request supplies into the caller's stored
 //! preferences — an omitted member keeps its stored value — and answers with the
-//! record that merge produced.
+//! effective record that merge produced: the stored values, plus the default the
+//! service applies for a member the account has still never set, which is what a
+//! following `GetPreferences` reports as well.
 //!
 //! ## Shape of an operation
 //!
@@ -165,13 +167,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::caller_account_id().to_string();
         let stored = {
             let mut store = state.lock();
-            let preferences = store.preferences.entry(account_id).or_default();
+            let preferences = store.preferences.entry(account_id.clone()).or_default();
             preferences.merge(
                 input.savings_estimation_mode,
                 input.member_account_discount_visibility,
                 input.preferred_commitment,
             );
-            preferences.clone()
+            // Report the same effective record a read of the preferences
+            // reports, so the write's answer and the following read agree.
+            store.effective_preferences(&account_id)
         };
 
         Ok(UpdatePreferencesOutput {

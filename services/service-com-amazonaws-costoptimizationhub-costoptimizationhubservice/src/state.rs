@@ -5,17 +5,24 @@
 //! Three stores, all keyed the way Cost Optimization Hub scopes its data:
 //!
 //! * `enrollments` — one [`Enrollment`] per account id, written by
-//!   `UpdateEnrollmentStatus` and read by `ListEnrollmentStatuses`.
+//!   `UpdateEnrollmentStatus` and read by `ListEnrollmentStatuses` — and by the
+//!   recommendation readers, because Cost Optimization Hub reports
+//!   recommendations for an ENROLLED account only, and only once the analysis
+//!   that enrollment starts is due.
 //! * `preferences` — one [`Preferences`] per account id, written by
 //!   `UpdatePreferences` and read by `GetPreferences` (and by the recommendation
 //!   readers, because `savingsEstimationMode` decides whether the figures they
-//!   report are before or after discounts).
+//!   report are before or after discounts). A member the account never set reads
+//!   back as the default the service applies for it.
 //! * `recommendations` + `recommendation_order` — the recommendation catalog
-//!   `ListRecommendations` pages over and `GetRecommendation` looks ids up in.
+//!   `ListRecommendations` pages over and `GetRecommendation` looks ids up in,
+//!   narrowed to what the calling account may read by
+//!   [`ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState::visible_recommendations`].
 //!   The catalog is part of the store's initial value, so both readers see the
 //!   same rows and neither has to write anything to serve a read.
 
 use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::DateTime;
 
@@ -37,6 +44,16 @@ pub const AFTER_DISCOUNTS: &str = "AfterDiscounts";
 /// `EnrollmentStatus` values, from the model's enum of the same name.
 pub const STATUS_ACTIVE: &str = "Active";
 
+/// How long after an account enrolls its recommendations are due.
+///
+/// Cost Optimization Hub derives recommendations from the enrolled account's
+/// observed usage, so an account that has just opted in has none yet: AWS
+/// documents "after you opt in, it can take up to 24 hours for Cost
+/// Optimization Hub to display your recommendations". The emulator owes the same
+/// transition on an emulator-scale span rather than a real day, so a caller that
+/// lists straight after enrolling still observes the pre-analysis state.
+const RECOMMENDATION_GENERATION_DELAY: Duration = Duration::from_millis(500);
+
 /// Currency every figure in the catalog is denominated in.
 const CURRENCY_CODE: &str = "USD";
 
@@ -51,11 +68,55 @@ pub struct Enrollment {
     pub include_member_accounts: bool,
     pub created_timestamp: DateTime,
     pub last_updated_timestamp: DateTime,
+    /// When the analysis this enrollment started is due to have produced
+    /// recommendations, or `None` while the account is not enrolled. Set by
+    /// `UpdateEnrollmentStatus` when the account becomes `Active`; the instant is
+    /// stored, never waited for.
+    pub recommendations_due_at: Option<SystemTime>,
 }
+
+impl Enrollment {
+    /// Whether this enrollment's recommendations are available to read: the
+    /// account is enrolled and the analysis the enrollment started is due.
+    pub fn recommendations_available(&self) -> bool {
+        self.status == STATUS_ACTIVE
+            && self
+                .recommendations_due_at
+                .is_some_and(|due| SystemTime::now() >= due)
+    }
+
+    /// The instant an enrollment that becomes `Active` now owes its
+    /// recommendations at.
+    pub fn generation_due_at() -> SystemTime {
+        SystemTime::now() + RECOMMENDATION_GENERATION_DELAY
+    }
+}
+
+/// The `SavingsEstimationMode` the service applies to an account that has
+/// expressed no preference: savings are reported net of the commitment and
+/// discount amounts that already apply to the account, which is also the mode
+/// `GetPreferences` reports for such an account.
+pub const DEFAULT_SAVINGS_ESTIMATION_MODE: &str = AFTER_DISCOUNTS;
+
+/// The `MemberAccountDiscountVisibility` the service applies to an account that
+/// has expressed no preference: the discounts of every member account are
+/// visible (`All`), the widest of the two values the enum offers.
+pub const DEFAULT_MEMBER_ACCOUNT_DISCOUNT_VISIBILITY: &str = "All";
+
+/// The commitment term the service applies where the account states none. From
+/// the model's `PreferredCommitment$term` doc: "If the value is null, it will
+/// default to `ThreeYears` (highest savings) where applicable".
+pub const DEFAULT_COMMITMENT_TERM: &str = "ThreeYears";
+
+/// The payment option the service applies where the account states none. From
+/// the model's `PreferredCommitment$paymentOption` doc: "If the value is null,
+/// it will default to `AllUpfront` (highest savings) where applicable".
+pub const DEFAULT_COMMITMENT_PAYMENT_OPTION: &str = "AllUpfront";
 
 /// An account's Cost Optimization Hub preferences. Every member is optional
 /// because an account that has never called `UpdatePreferences` has expressed no
-/// preference at all, and `GetPreferences` reports exactly what was stored.
+/// preference for it; the value the service then applies — and reports — is the
+/// default, which [`Preferences::effective`] resolves.
 #[derive(Debug, Clone, Default)]
 pub struct Preferences {
     /// `SavingsEstimationMode`: `AfterDiscounts` | `BeforeDiscounts`.
@@ -92,6 +153,49 @@ impl Preferences {
             }
             self.preferred_commitment = Some(stored);
         }
+    }
+
+    /// The account's EFFECTIVE preferences: every member the account set carries
+    /// its stored value, and every member it never set carries the default the
+    /// service applies in its place, at each level of the record — so a term
+    /// stated without a payment option still reports the default payment option.
+    ///
+    /// This is what a read of an account's preferences reports: the preference
+    /// the service acts on, never an empty record, because the service always
+    /// acts on one.
+    pub fn effective(&self) -> Self {
+        let commitment = self.preferred_commitment.clone().unwrap_or_default();
+        Self {
+            savings_estimation_mode: Some(self.effective_savings_estimation_mode().to_string()),
+            member_account_discount_visibility: Some(
+                self.member_account_discount_visibility
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_MEMBER_ACCOUNT_DISCOUNT_VISIBILITY.to_string()),
+            ),
+            preferred_commitment: Some(PreferredCommitment {
+                term: Some(
+                    commitment
+                        .term
+                        .unwrap_or_else(|| DEFAULT_COMMITMENT_TERM.to_string()),
+                ),
+                payment_option: Some(
+                    commitment
+                        .payment_option
+                        .unwrap_or_else(|| DEFAULT_COMMITMENT_PAYMENT_OPTION.to_string()),
+                ),
+            }),
+        }
+    }
+
+    /// The `savingsEstimationMode` the figures reported to this account are
+    /// computed under: the stored preference, or the service's default where the
+    /// account expressed none. The recommendation readers resolve the mode
+    /// through this, so the money they report agrees with the mode a read of the
+    /// preferences reports.
+    pub fn effective_savings_estimation_mode(&self) -> &str {
+        self.savings_estimation_mode
+            .as_deref()
+            .unwrap_or(DEFAULT_SAVINGS_ESTIMATION_MODE)
     }
 }
 
@@ -134,10 +238,11 @@ impl Pricing {
         round_cents(self.cost_before_discounts - self.discounts_total())
     }
 
-    /// The cost to report under a stored `savingsEstimationMode`: after
-    /// discounts when the account set `AfterDiscounts`, otherwise the
-    /// undiscounted cost (which is what `BeforeDiscounts` names, and what an
-    /// account that has expressed no preference is shown).
+    /// The cost to report under a `savingsEstimationMode`: after discounts when
+    /// the mode is `AfterDiscounts`, otherwise the undiscounted cost (which is
+    /// what `BeforeDiscounts` names). The mode is the account's EFFECTIVE one
+    /// ([`Preferences::effective_savings_estimation_mode`]), so an account that
+    /// has expressed no preference is reported under the service's default.
     pub fn cost_for_mode(&self, mode: Option<&str>) -> f64 {
         if mode == Some(AFTER_DISCOUNTS) {
             self.cost_after_discounts()
@@ -683,6 +788,43 @@ impl Default for ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState 
                 .insert(recommendation.recommendation_id.clone(), recommendation);
         }
         state
+    }
+}
+
+impl ComAmazonawsCostoptimizationhubCostoptimizationhubserviceState {
+    /// The account's effective preferences: what it set, with the service's
+    /// default for every member it never set (see [`Preferences::effective`]).
+    /// An account that has never called `UpdatePreferences` has a record of
+    /// defaults, not an empty one.
+    pub fn effective_preferences(&self, account_id: &str) -> Preferences {
+        self.preferences
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
+            .effective()
+    }
+
+    /// The recommendations this account can read, in catalog order.
+    ///
+    /// Cost Optimization Hub reports recommendations for an ENROLLED account
+    /// only, and only once the analysis that enrollment starts is due (see
+    /// [`RECOMMENDATION_GENERATION_DELAY`]), so an account that never opted in,
+    /// one that opted out, and one that has just opted in all read the empty set
+    /// rather than someone else's catalog.
+    pub fn visible_recommendations(&self, account_id: &str) -> Vec<StoredRecommendation> {
+        if !self
+            .enrollments
+            .get(account_id)
+            .is_some_and(Enrollment::recommendations_available)
+        {
+            return Vec::new();
+        }
+        self.recommendation_order
+            .iter()
+            .filter_map(|id| self.recommendations.get(id))
+            .filter(|row| row.account_id == account_id)
+            .cloned()
+            .collect()
     }
 }
 

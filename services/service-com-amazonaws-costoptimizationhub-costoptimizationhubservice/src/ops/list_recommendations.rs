@@ -2,11 +2,14 @@
 
 //! @op ListRecommendations
 //!
-//! Pages over the recommendation catalog in the store: narrows it by every
-//! `filter` member the request sets, keeps one recommendation per resource
-//! unless `includeAllRecommendations` asks for them all, orders it by `orderBy`,
-//! and cuts the page `maxResults`/`nextToken` ask for. The money members are
-//! computed from each row's stored prices under the caller's stored
+//! Pages over the recommendations the calling account may read: the catalog an
+//! ENROLLED account has once the analysis its enrollment started is due (an
+//! account that never opted in, one that opted out, and one that has just opted
+//! in all read the empty set), narrowed by every `filter` member the request
+//! sets, de-duped to one recommendation per resource unless
+//! `includeAllRecommendations` asks for them all, ordered by `orderBy`, and cut
+//! to the page `maxResults`/`nextToken` ask for. The money members are computed
+//! from each row's stored prices under the caller's effective
 //! `savingsEstimationMode` preference.
 //!
 //! ## Shape of an operation
@@ -182,20 +185,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (mode, mut rows) = {
             let store = state.lock();
             let mode = store
-                .preferences
-                .get(crate::state::caller_account_id())
-                .and_then(|preferences| preferences.savings_estimation_mode.clone());
+                .effective_preferences(crate::state::caller_account_id())
+                .savings_estimation_mode;
             let rows: Vec<crate::state::StoredRecommendation> = store
-                .recommendation_order
-                .iter()
-                .filter_map(|id| store.recommendations.get(id))
+                .visible_recommendations(crate::state::caller_account_id())
+                .into_iter()
                 .filter(|row| {
                     input
                         .filter
                         .as_ref()
                         .is_none_or(|filter| row.matches_filter(filter))
                 })
-                .cloned()
                 .collect();
             (mode, rows)
         };

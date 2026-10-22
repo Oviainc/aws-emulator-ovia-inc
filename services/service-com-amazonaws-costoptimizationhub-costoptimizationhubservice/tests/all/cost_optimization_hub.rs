@@ -101,7 +101,7 @@ fn id(suffix: &str) -> String {
     format!("0ec38a3a-1a0a-4a4f-9d2a-1f1e9a7c{suffix}")
 }
 
-/// Every recommendation the store holds, in catalog order.
+/// Every recommendation the store reports to the caller, in catalog order.
 async fn all_ids(router: &MultiServiceRouter) -> Vec<String> {
     let payload = ok(
         router,
@@ -110,6 +110,34 @@ async fn all_ids(router: &MultiServiceRouter) -> Vec<String> {
     )
     .await;
     ids(&payload)
+}
+
+/// How long a test waits for the analysis an enrollment starts to come due.
+/// Longer than the span the service owes it, so the wait is not a race.
+const ANALYSIS_WAIT: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// A router whose account is enrolled and whose recommendations have come due.
+///
+/// Cost Optimization Hub reports recommendations for an ENROLLED account only,
+/// and only once the analysis that enrollment starts has had time to produce
+/// them, so every test about the catalog has to establish both first.
+async fn enrolled_router() -> MultiServiceRouter {
+    let router = router();
+    ok(
+        &router,
+        "UpdateEnrollmentStatus",
+        &json!({"status": "Active", "includeMemberAccounts": false}),
+    )
+    .await;
+    // Poll the way a client would, bounded: a catalog that never arrives fails
+    // the test instead of hanging it.
+    for _ in 0..40 {
+        if !all_ids(&router).await.is_empty() {
+            return router;
+        }
+        std::thread::sleep(ANALYSIS_WAIT / 4);
+    }
+    panic!("case enrolled: the enrolled account's recommendations never came due");
 }
 
 fn close(actual: f64, expected: f64) -> bool {
@@ -281,51 +309,68 @@ async fn list_enrollment_statuses_filters_and_pages() {
 // ---------------------------------------------------------------------------
 
 /// `UpdatePreferences` sets the members it supplies and leaves every omitted
-/// member at its stored value, at each level of the record; `GetPreferences`
-/// reports exactly what was stored.
+/// member at its stored value, at each level of the record; a read reports the
+/// EFFECTIVE record — what the account set, plus the default the service applies
+/// for every member it never set — and the write answers with the same record a
+/// following read does.
 #[tokio::test]
-async fn preferences_merge_and_persist() {
+async fn preferences_merge_and_read_back_with_the_service_defaults() {
     let router = router();
 
-    // Nothing is stored before the first UpdatePreferences, so nothing is
-    // reported: the service invents no preference the caller never set.
+    // The defaults the service applies to an account that has expressed no
+    // preference. The commitment pair is the model's own: `PreferredCommitment$term`
+    // documents "If the value is null, it will default to ThreeYears (highest
+    // savings) where applicable" and `$paymentOption` the same for AllUpfront.
+    let defaults = json!({
+        "savingsEstimationMode": "AfterDiscounts",
+        "memberAccountDiscountVisibility": "All",
+        "preferredCommitment": {"term": "ThreeYears", "paymentOption": "AllUpfront"},
+    });
     let initial = ok(&router, "GetPreferences", &json!({})).await;
-    for member in [
-        "savingsEstimationMode",
-        "memberAccountDiscountVisibility",
-        "preferredCommitment",
-    ] {
-        assert!(
-            initial[member].is_null(),
-            "case before-update: expected {member} absent, got {initial}"
-        );
-    }
+    assert_eq!(
+        &initial, &defaults,
+        "case before-update: expected the service defaults {defaults}, got {initial}"
+    );
 
-    // (request, the whole record the store must then hold). Rows differ in which
-    // members they set — including one that sets only a nested member.
-    let cases: [(Value, Value); 6] = [
+    // (request, the effective record every later read must report). Rows differ
+    // in which members they set — one member, a nested member on its own, two at
+    // once, and a request that sets nothing — and every enum value comes from
+    // the model's own enums (SavingsEstimationMode, MemberAccountDiscountVisibility,
+    // Term, PaymentOption).
+    let cases: [(Value, Value); 7] = [
         (
             json!({"savingsEstimationMode": "BeforeDiscounts"}),
-            json!({"savingsEstimationMode": "BeforeDiscounts"}),
-        ),
-        (
-            json!({"memberAccountDiscountVisibility": "None"}),
-            json!({"savingsEstimationMode": "BeforeDiscounts", "memberAccountDiscountVisibility": "None"}),
-        ),
-        (
-            json!({"preferredCommitment": {"term": "ThreeYears"}}),
             json!({
                 "savingsEstimationMode": "BeforeDiscounts",
-                "memberAccountDiscountVisibility": "None",
-                "preferredCommitment": {"term": "ThreeYears"},
+                "memberAccountDiscountVisibility": "All",
+                "preferredCommitment": {"term": "ThreeYears", "paymentOption": "AllUpfront"},
             }),
         ),
         (
-            json!({"preferredCommitment": {"paymentOption": "AllUpfront"}}),
+            json!({"memberAccountDiscountVisibility": "None"}),
             json!({
                 "savingsEstimationMode": "BeforeDiscounts",
                 "memberAccountDiscountVisibility": "None",
                 "preferredCommitment": {"term": "ThreeYears", "paymentOption": "AllUpfront"},
+            }),
+        ),
+        // A nested member on its own: the payment option it does not state keeps
+        // the default.
+        (
+            json!({"preferredCommitment": {"term": "OneYear"}}),
+            json!({
+                "savingsEstimationMode": "BeforeDiscounts",
+                "memberAccountDiscountVisibility": "None",
+                "preferredCommitment": {"term": "OneYear", "paymentOption": "AllUpfront"},
+            }),
+        ),
+        // The other nested member: the stored term survives the write.
+        (
+            json!({"preferredCommitment": {"paymentOption": "PartialUpfront"}}),
+            json!({
+                "savingsEstimationMode": "BeforeDiscounts",
+                "memberAccountDiscountVisibility": "None",
+                "preferredCommitment": {"term": "OneYear", "paymentOption": "PartialUpfront"},
             }),
         ),
         (
@@ -333,18 +378,27 @@ async fn preferences_merge_and_persist() {
             json!({
                 "savingsEstimationMode": "AfterDiscounts",
                 "memberAccountDiscountVisibility": "None",
-                "preferredCommitment": {"term": "ThreeYears", "paymentOption": "AllUpfront"},
+                "preferredCommitment": {"term": "OneYear", "paymentOption": "PartialUpfront"},
             }),
         ),
         (
             json!({
                 "memberAccountDiscountVisibility": "All",
-                "preferredCommitment": {"term": "OneYear", "paymentOption": "NoUpfront"},
+                "preferredCommitment": {"term": "ThreeYears", "paymentOption": "NoUpfront"},
             }),
             json!({
                 "savingsEstimationMode": "AfterDiscounts",
                 "memberAccountDiscountVisibility": "All",
-                "preferredCommitment": {"term": "OneYear", "paymentOption": "NoUpfront"},
+                "preferredCommitment": {"term": "ThreeYears", "paymentOption": "NoUpfront"},
+            }),
+        ),
+        // A request that sets nothing changes nothing.
+        (
+            json!({}),
+            json!({
+                "savingsEstimationMode": "AfterDiscounts",
+                "memberAccountDiscountVisibility": "All",
+                "preferredCommitment": {"term": "ThreeYears", "paymentOption": "NoUpfront"},
             }),
         ),
     ];
@@ -353,7 +407,7 @@ async fn preferences_merge_and_persist() {
         let updated = ok(&router, "UpdatePreferences", request).await;
         assert_eq!(
             &updated, expected,
-            "case {request}: expected the merged record {expected}, got {updated}"
+            "case {request}: expected the effective record {expected}, got {updated}"
         );
 
         // The round trip: a separate read must see the same record, twice.
@@ -371,11 +425,86 @@ async fn preferences_merge_and_persist() {
 // Recommendations
 // ---------------------------------------------------------------------------
 
+/// Recommendations are reported only for an account that is ENROLLED and whose
+/// analysis has come due: every other enrollment state reports the empty set,
+/// and a `GetRecommendation` for a catalog id the caller cannot see is a 404
+/// rather than a row.
+///
+/// The rule is the service's own: Cost Optimization Hub derives recommendations
+/// from an enrolled account's observed usage, and AWS documents that after
+/// opting in it takes time before the recommendations appear — so the state a
+/// read reports follows the enrollment the caller established, never a catalog
+/// nobody opted into.
+#[tokio::test]
+async fn recommendations_need_an_enrolled_account_whose_analysis_is_due() {
+    let router = router();
+    let catalog_id = id("0001");
+    let list = json!({"includeAllRecommendations": true});
+
+    // (the status this step moves the account to — `None` is "never called" —
+    // whether the catalog is reported in the instant after that call, and
+    // whether it is reported once the analysis has had time to run)
+    let cases: [(Option<&str>, bool, bool); 5] = [
+        // No enrollment at all: nothing to report, then or later.
+        (None, false, false),
+        // Opting in starts the analysis, which is not finished when the call
+        // returns, so a caller acting straight after it still sees no catalog.
+        (Some("Active"), false, true),
+        // Opting out ends the enrollment.
+        (Some("Inactive"), false, false),
+        // Opting in again starts a fresh analysis.
+        (Some("Active"), false, true),
+        (Some("Inactive"), false, false),
+    ];
+
+    for (step, (status, now_visible, later_visible)) in cases.iter().enumerate() {
+        let case = format!("step {step} status {status:?}");
+        if let Some(status) = status {
+            ok(
+                &router,
+                "UpdateEnrollmentStatus",
+                &json!({"status": status, "includeMemberAccounts": false}),
+            )
+            .await;
+        }
+
+        let immediate = ok(&router, "ListRecommendations", &list).await;
+        assert_eq!(
+            !ids(&immediate).is_empty(),
+            *now_visible,
+            "case {case} immediately after the call: expected reported={now_visible}, \
+             got {immediate}"
+        );
+
+        std::thread::sleep(ANALYSIS_WAIT);
+        let later = ok(&router, "ListRecommendations", &list).await;
+        assert_eq!(
+            !ids(&later).is_empty(),
+            *later_visible,
+            "case {case} once the analysis is due: expected reported={later_visible}, got {later}"
+        );
+
+        // The detail view agrees with the list: an id the caller cannot see is
+        // an id this account does not hold.
+        let (code, payload) = call(
+            &router,
+            "GetRecommendation",
+            &json!({"recommendationId": catalog_id}),
+        )
+        .await;
+        let expected_code = if *later_visible { 200 } else { 404 };
+        assert_eq!(
+            code, expected_code,
+            "case {case} GetRecommendation: expected HTTP {expected_code}, got {code} with {payload}"
+        );
+    }
+}
+
 /// Every `filter` member narrows the list to the rows whose stored value the
 /// filter admits; several members narrow together.
 #[tokio::test]
 async fn recommendation_filters_select_the_matching_rows() {
-    let router = router();
+    let router = enrolled_router().await;
     let account = engine::emulator_account_id();
     let volume_arn = engine::emulator_arn("ec2", "us-east-1", "volume/vol-00112233445566003");
 
@@ -467,7 +596,7 @@ async fn recommendation_filters_select_the_matching_rows() {
 /// resource is listed or only the one that saves the most.
 #[tokio::test]
 async fn include_all_recommendations_dedupes_by_resource() {
-    let router = router();
+    let router = enrolled_router().await;
 
     let all = ok(
         &router,
@@ -516,7 +645,7 @@ async fn include_all_recommendations_dedupes_by_resource() {
 /// the last page carries no token.
 #[tokio::test]
 async fn recommendation_pagination_resumes_where_the_previous_page_ended() {
-    let router = router();
+    let router = enrolled_router().await;
     let expected = all_ids(&router).await;
 
     for page_size in [1_i64, 2, 3, 6, 7, 20] {
@@ -599,7 +728,7 @@ async fn recommendation_pagination_resumes_where_the_previous_page_ended() {
 /// refused.
 #[tokio::test]
 async fn order_by_sorts_along_the_named_dimension() {
-    let router = router();
+    let router = enrolled_router().await;
 
     // Every dimension is a `Recommendation` member name, so the answer can be
     // checked by reading that member back off each item.
@@ -716,7 +845,7 @@ fn value_greater(left: &Value, right: &Value) -> bool {
 /// derived members agree with it.
 #[tokio::test]
 async fn get_recommendation_agrees_with_the_list_entry() {
-    let router = router();
+    let router = enrolled_router().await;
     let listed = ok(
         &router,
         "ListRecommendations",
@@ -792,7 +921,7 @@ async fn get_recommendation_agrees_with_the_list_entry() {
 /// never an empty success.
 #[tokio::test]
 async fn get_recommendation_rejects_an_unknown_id() {
-    let router = router();
+    let router = enrolled_router().await;
     for unknown in [
         "does-not-exist",
         "0ec38a3a-1a0a-4a4f-9d2a-1f1e9a7c9999",
@@ -823,17 +952,20 @@ async fn get_recommendation_rejects_an_unknown_id() {
 }
 
 /// The stored `savingsEstimationMode` decides whether the money members are
-/// reported before or after discounts — the same stored prices, read two ways.
+/// reported before or after discounts — the same stored prices, read two ways —
+/// and an account that has stated no preference is reported under the default
+/// the service applies (`AfterDiscounts`), the same mode `GetPreferences` names.
 #[tokio::test]
 async fn savings_estimation_mode_changes_the_reported_money() {
-    let router = router();
+    let router = enrolled_router().await;
     let rightsize = id("0001");
 
     // (stored savingsEstimationMode, expected monthly cost, expected saving).
     // Row 0001 costs 280.32 before a 28.03 savings-plan discount and its
-    // recommended resource 140.16 before a 14.02 discount.
+    // recommended resource 140.16 before a 14.02 discount. `None` is the
+    // account that has set no preference, read under the default.
     let cases: [(Option<&str>, f64, f64); 4] = [
-        (None, 280.32, 140.16),
+        (None, 252.29, 126.15),
         (Some("BeforeDiscounts"), 280.32, 140.16),
         (Some("AfterDiscounts"), 252.29, 126.15),
         (Some("BeforeDiscounts"), 280.32, 140.16),
@@ -893,7 +1025,7 @@ async fn savings_estimation_mode_changes_the_reported_money() {
 /// a `GetRecommendation`, answer the same thing.
 #[tokio::test]
 async fn reads_do_not_change_what_a_later_caller_sees() {
-    let router = router();
+    let router = enrolled_router().await;
     let request = json!({"includeAllRecommendations": true});
 
     let first = ok(&router, "ListRecommendations", &request).await;

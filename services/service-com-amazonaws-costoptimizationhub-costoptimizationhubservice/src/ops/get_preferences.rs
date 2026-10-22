@@ -2,9 +2,11 @@
 
 //! @op GetPreferences
 //!
-//! Reports the preferences `UpdatePreferences` stored for the calling account.
-//! An account that has set no preference has none stored, and this answers with
-//! the members absent rather than with a value it never wrote.
+//! Reports the calling account's EFFECTIVE preferences: every member
+//! `UpdatePreferences` stored for the account carries its stored value, and
+//! every member the account never set carries the default the service applies in
+//! its place (`crate::state::Preferences::effective`). The report is never an
+//! empty record, because the service always acts on one preference per member.
 //!
 //! ## Shape of an operation
 //!
@@ -153,17 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let stored = state
+        let effective = state
             .lock()
-            .preferences
-            .get(crate::state::caller_account_id())
-            .cloned()
-            .unwrap_or_default();
+            .effective_preferences(crate::state::caller_account_id());
 
         Ok(GetPreferencesOutput {
-            savings_estimation_mode: stored.savings_estimation_mode,
-            member_account_discount_visibility: stored.member_account_discount_visibility,
-            preferred_commitment: stored.preferred_commitment,
+            savings_estimation_mode: effective.savings_estimation_mode,
+            member_account_discount_visibility: effective.member_account_discount_visibility,
+            preferred_commitment: effective.preferred_commitment,
         })
     }
 }
