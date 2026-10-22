@@ -162,6 +162,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Argument validation, BEFORE the store is consulted: a `TopicArn` that is
+        // not an ARN at all is bad input, which this operation's documented
+        // idempotence does not cover — "deleting a topic that does not exist does not
+        // result in an error" is about a topic, and this value names none.
+        if let Some(message) = crate::state::arn_refusal("TopicArn", &input.topic_arn) {
+            return Err(DeleteTopicErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteTopicErrorModeled::InternalErrorException(
                 InternalErrorException {

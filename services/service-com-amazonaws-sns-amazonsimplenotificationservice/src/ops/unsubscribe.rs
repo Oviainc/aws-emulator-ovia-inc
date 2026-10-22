@@ -68,29 +68,25 @@
 use super::types::*;
 use crate::state;
 
-/// The fields every ARN holds: `arn:<partition>:<service>:<region>:<account>:<resource>`.
-const ARN_FIELDS: usize = 6;
-
 /// The fields a SUBSCRIPTION's ARN holds: an ARN whose resource is a topic name
 /// followed by the subscription's own id segment
 /// (`arn:aws:sns:<region>:<account>:<topic>:<id>`, as `Subscribe` mints it).
-const SUBSCRIPTION_ARN_FIELDS: usize = ARN_FIELDS + 1;
+const SUBSCRIPTION_ARN_FIELDS: usize = state::ARN_ELEMENTS + 1;
 
 /// Why `arn` is not a subscription ARN, or `None` when it is one.
 ///
 /// The reason names the member's constraint and is built from the request, the way
 /// SNS's own argument validation reports one ("An ARN must have at least 6 elements,
-/// not 1"); nothing of the recorded wire text is required beyond that.
+/// not 1"); nothing of the recorded wire text is required beyond that. The generic
+/// ARN shape comes from [`state::arn_shape_reason`], the one place this crate judges
+/// it, so every ARN-typed member of this service states that part alike; what is
+/// added here is what makes an ARN a SUBSCRIPTION's.
 fn malformed_subscription_arn(arn: &str) -> Option<String> {
-    let fields: Vec<&str> = arn.split(':').collect();
-    if fields.len() < ARN_FIELDS {
-        return Some(format!(
-            "An ARN must have at least {ARN_FIELDS} elements, not {}",
-            fields.len()
-        ));
+    if let Some(reason) = state::arn_shape_reason(arn) {
+        return Some(reason);
     }
+    let fields: Vec<&str> = arn.split(':').collect();
     let well_formed = fields.len() == SUBSCRIPTION_ARN_FIELDS
-        && fields[0] == "arn"
         && fields[2] == "sns"
         && fields[1..].iter().all(|field| !field.is_empty())
         && state::topic_name_is_valid(fields[5]);

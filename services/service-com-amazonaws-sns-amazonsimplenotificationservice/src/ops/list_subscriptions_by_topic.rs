@@ -142,6 +142,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Argument validation, BEFORE the store is consulted: a `TopicArn` that is
+        // not an ARN at all is bad input, not a topic that does not exist.
+        if let Some(message) = crate::state::arn_refusal("TopicArn", &input.topic_arn) {
+            return Err(ListSubscriptionsByTopicErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(ListSubscriptionsByTopicErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -155,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.topics.contains_key(&input.topic_arn) {
             return Err(ListSubscriptionsByTopicErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(format!("Topic does not exist: {}", input.topic_arn)),
+                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
                 },
             )
             .into());

@@ -363,32 +363,8 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// change from landing at all. The digest comes from `sha2`, which this crate
     /// already depends on.
     pub fn next_unique_id(&mut self) -> String {
-        use std::hash::{BuildHasher, Hasher};
-
         self.id_counter = self.id_counter.saturating_add(1);
-        let nanos = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since_epoch| since_epoch.as_nanos());
-        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-        hasher.write_u64(self.id_counter);
-        let entropy = hasher.finish();
-
-        let digest = Sha256::digest(format!("{}:{nanos}:{entropy}", self.id_counter));
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        // The version (4) and variant (RFC 4122) nibbles, so the id is well formed and
-        // not mistaken for a name-based or time-based one.
-        bytes[6] = (bytes[6] & 0x0f) | 0x40;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        let hex = hex::encode(bytes);
-        format!(
-            "{}-{}-{}-{}-{}",
-            &hex[0..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..32]
-        )
+        uuid_v4_shaped(self.id_counter)
     }
 
     /// Record one delivery of `message` to `subscription_arn`, then bring the log back
@@ -469,6 +445,116 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
         self.retained_delivery_bytes
     }
 }
+
+/// An id in the 8-4-4-4-12 hexadecimal form of a version-4 UUID, derived from
+/// `counter` plus the clock and the process's randomly seeded hasher.
+///
+/// The ONE place this crate shapes such an id, reached by
+/// [`ComAmazonawsSnsAmazonsimplenotificationserviceState::next_unique_id`] (whose
+/// counter is the store's) and by [`new_request_id`] (whose counter is this
+/// module's). Unique because a monotone counter goes into it; unpredictable
+/// because the hasher's random seed does too.
+fn uuid_v4_shaped(counter: u64) -> String {
+    use std::hash::{BuildHasher, Hasher};
+
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since_epoch| since_epoch.as_nanos());
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(counter);
+    let entropy = hasher.finish();
+
+    let digest = Sha256::digest(format!("{counter}:{nanos}:{entropy}"));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // The version (4) and variant (RFC 4122) nibbles, so the id is well formed and
+    // not mistaken for a name-based or time-based one.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// The id one response reports as its own: the value of the `<RequestId>` element
+/// every SNS response document carries.
+///
+/// A correlation id, not a security token, and per-response rather than
+/// per-resource: two responses are distinguishable, which is what a client logs
+/// and a proxy correlates on. It needs no state, so it is a free function rather
+/// than a method on the store — a request that fails before any store is reached
+/// still answers with one.
+pub fn new_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The monotone part of a request id, so two ids minted inside one clock tick
+    /// still differ.
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+
+    uuid_v4_shaped(MINTED.fetch_add(1, Ordering::Relaxed))
+}
+
+/// How many colon-separated elements an ARN has:
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`.
+pub const ARN_ELEMENTS: usize = 6;
+
+/// Why `value` is not an ARN at all, worded as the `Reason:` clause of an
+/// `InvalidParameterException` states it — or `None` when it has an ARN's shape.
+///
+/// This is ARGUMENT validation, not a lookup: a value that could not name any
+/// resource in any account is bad input, so an ARN-typed member is checked for
+/// this BEFORE the store is consulted. Reporting it as a resource that does not
+/// exist tells a caller the opposite of what happened — "it is gone" instead of
+/// "you sent me something that is not an ARN" — and an idempotent delete then
+/// swallows the defect entirely.
+///
+/// Only the SHAPE is judged here. An ARN-shaped value that names no resource of
+/// this account is a lookup miss, which each operation reports as its own
+/// modelled `NotFoundException`.
+pub fn arn_shape_reason(value: &str) -> Option<String> {
+    let elements = value.split(':').count();
+    if elements < ARN_ELEMENTS {
+        return Some(format!(
+            "An ARN must have at least {ARN_ELEMENTS} elements, not {elements}"
+        ));
+    }
+    if !value.starts_with("arn:") {
+        return Some("An ARN must begin with 'arn:'".to_string());
+    }
+    None
+}
+
+/// The message an ARN-typed `member` holding `value` is refused with, or `None`
+/// when `value` has an ARN's shape: it names the member and the constraint the
+/// value failed, and never echoes the value itself.
+pub fn arn_refusal(member: &str, value: &str) -> Option<String> {
+    arn_shape_reason(value).map(|reason| format!("Invalid parameter: {member} Reason: {reason}"))
+}
+
+/// The sentence SNS states for a topic no account of this emulator holds.
+///
+/// Fixed, and the SAME for every operation that looks a topic up: SNS names the
+/// resource kind that is missing and does NOT echo the identifier the caller sent
+/// back at it. Recorded evidence: `GetTopicAttributes` on a deleted topic answers
+/// `404 NotFound` with exactly `Topic does not exist`.
+pub const TOPIC_DOES_NOT_EXIST: &str = "Topic does not exist";
+
+/// The sentence SNS refuses an unacceptable topic name with.
+///
+/// `Invalid parameter:` plus the parameter as SNS names it (`Topic Name`, not the
+/// Smithy member `Name`), and nothing else: the sentence is the same whichever
+/// name rule the value broke — the character set, the length, or the
+/// [`FIFO_SUFFIX`] a FIFO topic's name needs — and it does not reproduce the name
+/// the caller sent. Recorded evidence: `CreateTopic` with `FifoTopic=true` and a
+/// name that does not end in `.fifo` answers `400 InvalidParameter` with exactly
+/// `Invalid parameter: Topic Name`.
+pub const INVALID_TOPIC_NAME: &str = "Invalid parameter: Topic Name";
 
 /// The region this request addresses: the one in its SigV4 credential scope, or
 /// [`DEFAULT_REGION`] when the request carries no scope to read.

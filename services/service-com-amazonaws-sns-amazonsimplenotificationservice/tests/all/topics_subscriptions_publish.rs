@@ -18,26 +18,31 @@ use service_com_amazonaws_sns_amazonsimplenotificationservice::{
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The emulator under test: one shared engine, one SNS service, one router.
-struct Sns {
+///
+/// `pub(crate)` so a sibling suite in this test target drives SNS over the same
+/// wire harness rather than building a second one.
+pub(crate) struct Sns {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
 
 /// One answered SNS call.
-struct Answer {
-    status: u16,
-    body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
+    /// The `x-amzn-requestid` response header, when the response carries one.
+    pub(crate) request_id_header: Option<String>,
 }
 
 impl Answer {
     /// The text of the first `<tag>…</tag>` element of the response, if any.
-    fn element(&self, tag: &str) -> Option<String> {
+    pub(crate) fn element(&self, tag: &str) -> Option<String> {
         self.elements(tag).into_iter().next()
     }
 
     /// The text of every `<tag>…</tag>` element of the response, in document order,
     /// with the XML entities the envelope escapes decoded back.
-    fn elements(&self, tag: &str) -> Vec<String> {
+    pub(crate) fn elements(&self, tag: &str) -> Vec<String> {
         let open = format!("<{tag}>");
         let close = format!("</{tag}>");
         let mut found = Vec::new();
@@ -52,13 +57,13 @@ impl Answer {
     }
 
     /// The awsQuery `<Code>` of an error response, or `""` on a success envelope.
-    fn code(&self) -> String {
+    pub(crate) fn code(&self) -> String {
         self.element("Code").unwrap_or_default()
     }
 }
 
 impl Sns {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
@@ -67,13 +72,18 @@ impl Sns {
 
     /// Call `action` with form parameters, signed (in scope only — the emulator does
     /// not verify signatures by default) for `us-east-1`.
-    async fn call(&self, action: &str, params: &[(&str, &str)]) -> Answer {
+    pub(crate) async fn call(&self, action: &str, params: &[(&str, &str)]) -> Answer {
         self.call_in_region("us-east-1", action, params).await
     }
 
     /// Call `action` as a client configured for `region`: the region an ARN this
     /// request mints must carry.
-    async fn call_in_region(&self, region: &str, action: &str, params: &[(&str, &str)]) -> Answer {
+    pub(crate) async fn call_in_region(
+        &self,
+        region: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Answer {
         let mut body = format!("Action={action}&Version=2010-03-31");
         for (name, value) in params {
             body.push('&');
@@ -97,14 +107,20 @@ impl Sns {
             .expect("the test request is well formed");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let request_id_header = response
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         Answer {
             status,
             body: String::from_utf8_lossy(response.body()).to_string(),
+            request_id_header,
         }
     }
 
     /// A topic created in `us-east-1`, with its ARN.
-    async fn topic(&self, name: &str) -> String {
+    pub(crate) async fn topic(&self, name: &str) -> String {
         let answer = self.call("CreateTopic", &[("Name", name)]).await;
         assert_eq!(
             answer.status, 200,

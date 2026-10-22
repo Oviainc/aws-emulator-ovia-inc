@@ -349,13 +349,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Argument validation, BEFORE the store is consulted: a `TopicArn` that is
+        // not an ARN at all is bad input, not a topic that does not exist.
+        if let Some(message) = crate::state::arn_refusal("TopicArn", &input.topic_arn) {
+            return Err(SubscribeErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let protocol = input.protocol.to_ascii_lowercase();
         if !PROTOCOLS.contains(&protocol.as_str()) {
             return Err(SubscribeErrorModeled::InvalidParameterException(
                 InvalidParameterException {
+                    // The sentence SNS states for an unsupported protocol, which
+                    // names the string the caller sent because SNS's own sentence
+                    // does — it is what the caller has to change.
                     message: Some(format!(
-                        "Invalid parameter: Protocol - must be one of {}: {}",
-                        PROTOCOLS.join(", "),
+                        "Invalid parameter: Amazon SNS does not support this protocol string: {}",
                         input.protocol
                     )),
                 },
@@ -395,7 +408,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !store.topics.contains_key(&input.topic_arn) {
             return Err(SubscribeErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Topic does not exist: {}", input.topic_arn)),
+                message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
             })
             .into());
         }

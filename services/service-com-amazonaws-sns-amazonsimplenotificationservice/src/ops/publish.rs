@@ -353,21 +353,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         if state::topic_name_from_arn(&destination).is_none() {
+            // Argument validation first: a destination that is not an ARN at all is
+            // bad input, whichever member carried it — not an unemulated endpoint
+            // kind and not a topic that does not exist.
+            let member = if input.topic_arn.is_some() {
+                "TopicArn"
+            } else {
+                "TargetArn"
+            };
+            if let Some(message) = state::arn_refusal(member, &destination) {
+                return Err(invalid_parameter(message));
+            }
             if input.target_arn.is_some() {
                 return Err(crate::scaffolded::Scaffolded::not_implemented(
                     "Publish to a platform endpoint TargetArn",
                 ));
             }
             return Err(invalid_parameter(format!(
-                "Invalid parameter: TopicArn - not an SNS topic ARN: {destination}"
+                "Invalid parameter: {member} Reason: not an SNS topic ARN"
             )));
         }
 
         if let Some(structure) = input.message_structure.as_deref() {
             if structure != JSON_MESSAGE_STRUCTURE {
                 return Err(invalid_parameter(format!(
-                    "Invalid parameter: MessageStructure - the only valid value is \
-                     {JSON_MESSAGE_STRUCTURE}: {structure}"
+                    "Invalid parameter: MessageStructure Reason: the only valid value is \
+                     {JSON_MESSAGE_STRUCTURE}"
                 )));
             }
             if let Some(reason) = json_message_error(&input.message) {
@@ -423,7 +434,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(topic) = store.topics.get(&destination).cloned() else {
             return Err(PublishErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Topic does not exist: {destination}")),
+                message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
             })
             .into());
         };
@@ -452,7 +463,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if topic.is_fifo {
             if input.message_group_id.is_none() {
                 return Err(invalid_parameter(
-                    "Invalid parameter: MessageGroupId - required for a FIFO topic".to_string(),
+                    // The sentence SNS states for the ordering parameter a FIFO
+                    // publish must carry.
+                    "Invalid parameter: The MessageGroupId parameter is required for FIFO topics"
+                        .to_string(),
                 ));
             }
             let content_based = topic

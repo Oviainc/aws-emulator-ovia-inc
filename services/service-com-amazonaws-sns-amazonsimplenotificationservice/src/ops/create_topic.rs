@@ -100,11 +100,10 @@ use std::collections::HashMap;
 /// The attribute that asks for a FIFO topic.
 const FIFO_TOPIC_ATTRIBUTE: &str = "FifoTopic";
 
-/// The suffix a FIFO topic's name carries, and the longest name SNS accepts — both
-/// shared with the ARN reader in [`crate::state`], which uses the same rule to tell a
-/// topic ARN from another SNS ARN.
+/// The suffix a FIFO topic's name carries — shared with the ARN reader in
+/// [`crate::state`], which uses the same rule to tell a topic ARN from another SNS
+/// ARN.
 const FIFO_SUFFIX: &str = state::FIFO_SUFFIX;
-const MAX_TOPIC_NAME_LEN: usize = state::MAX_TOPIC_NAME_LEN;
 
 /// "Can't add more than 50 tags to a topic" (`TagLimitExceededException` doc).
 const MAX_TAGS_PER_TOPIC: usize = 50;
@@ -220,12 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state::topic_name_is_valid(&input.name) {
             return Err(CreateTopicErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "Invalid parameter: Name - topic names must be 1 to {MAX_TOPIC_NAME_LEN} \
-                         characters of ASCII letters, numbers, underscores and hyphens, and a \
-                         FIFO topic name must end with {FIFO_SUFFIX}: {}",
-                        input.name
-                    )),
+                    message: Some(state::INVALID_TOPIC_NAME.to_string()),
                 },
             )
             .into());
@@ -268,10 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if is_fifo && !input.name.ends_with(FIFO_SUFFIX) {
             return Err(CreateTopicErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "Invalid parameter: Name - a FIFO topic name must end with {FIFO_SUFFIX}: {}",
-                        input.name
-                    )),
+                    message: Some(state::INVALID_TOPIC_NAME.to_string()),
                 },
             )
             .into());
@@ -308,7 +299,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already is: a re-create that asks for a DIFFERENT value of an attribute the
         // topic holds is not idempotent, and is refused rather than silently ignored.
         if let Some(existing) = store.topics.get(&arn) {
-            if let Some((name, requested)) = attributes.iter().find(|(name, requested)| {
+            if let Some((name, _)) = attributes.iter().find(|(name, requested)| {
                 existing
                     .attributes
                     .get(*name)
@@ -317,11 +308,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(CreateTopicErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(format!(
-                            "Invalid parameter: Attributes Reason: a topic with the name {} \
-                             already exists with a different {name}: requested {requested}, \
-                             held {}",
-                            input.name,
-                            existing.attributes.get(name).cloned().unwrap_or_default()
+                            "Invalid parameter: Attributes Reason: a topic with this name \
+                             already exists with a different {name}"
                         )),
                     },
                 )

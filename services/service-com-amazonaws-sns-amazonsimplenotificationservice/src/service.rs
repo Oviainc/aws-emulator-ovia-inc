@@ -35,15 +35,218 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! This file uses three of them: `override_operation` and `override_routing_error`
+//! to add the `<RequestId>` element to every awsQuery error document (below), and
+//! `override_refusal` to keep a `@sensitive` member's value out of a validation
+//! refusal.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The awsQuery error document
+//!
+//! SNS speaks awsQuery, whose error document is
+//! `<ErrorResponse><Error>…</Error><RequestId>…</RequestId></ErrorResponse>`: the
+//! `<RequestId>` is a sibling of `<Error>`, OUTSIDE it, so no error shape's members
+//! can carry it and the framework's error serializer — which writes only the error
+//! shape's own members, inside `<Error>` — cannot either. It is a property of the
+//! RESPONSE, not of the error, so this file adds it where every response this
+//! service answers with passes: [`WithRequestId`], the wrapper
+//! `override_operation` hands the router in place of each modelled operation, and
+//! `override_routing_error` for the one failure that names no operation at all.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+use aws_smithy_types::body::SdkBody;
+
+/// The closing tag of the awsQuery error document, and the only marker that tells
+/// an error response apart from a success envelope (whose own request id already
+/// sits in `<ResponseMetadata>`).
+const ERROR_RESPONSE_CLOSE: &str = "</ErrorResponse>";
+
+/// The closing tag of the error element the request id is a SIBLING of: what sits
+/// between it and [`ERROR_RESPONSE_CLOSE`] is the only place a `<RequestId>` of
+/// this document can be.
+const ERROR_ELEMENT_CLOSE: &str = "</Error>";
+
+/// The element an awsQuery error document carries beside `<Error>`.
+const REQUEST_ID_ELEMENT: &str = "<RequestId>";
+
+/// The header AWS reports the same id in, so a client correlating on the header
+/// and one reading the document see one value.
+const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
+
+/// The input members this service's model marks `@sensitive`, spelled the way a
+/// validation path spells them (lowerCamel, as
+/// `aws_smithy_schema_server::constraints::path::member` builds it).
+///
+/// Source: `smithy_query(query="operation", operation="CreateSMSSandboxPhoneNumber,
+/// VerifySMSSandboxPhoneNumber,DeleteSMSSandboxPhoneNumber,Publish,
+/// CheckIfPhoneNumberIsOptedOut,OptInPhoneNumber", model_path=
+/// "services/service-com-amazonaws-sns-amazonsimplenotificationservice/smithy-model/\
+/// com-amazonaws-sns-amazonsimplenotificationservice.json")`: every one of them
+/// reports `"sensitive": true` on its phone-number member — `PhoneNumber` on four,
+/// `phoneNumber` on two, and a validation path spells both `phoneNumber`. They are
+/// also the only input members of this service that both carry the trait and carry
+/// a constraint to fail. An entry added here comes from that same query, never from
+/// one request's shape.
+const SENSITIVE_MEMBER_PATHS: &[&str] = &["phoneNumber"];
+
+/// Whether `path` names, or sits under, a member the model marks `@sensitive`: a
+/// value held under a sensitive member is sensitive too, so any segment naming one
+/// redacts the clause.
+fn is_sensitive_path(path: &str) -> bool {
+    path.split('.')
+        .any(|segment| SENSITIVE_MEMBER_PATHS.contains(&segment))
+}
+
+/// The error code the query protocols name a declared-bound refusal with (`query`
+/// in `vendor/smithy-server-runtime/src/pre_dispatch.rs`). Repeated here because
+/// [`Refused`] replaces the code and the message TOGETHER, and only the message
+/// changes below: a client branches on the code, so it must be the one it would
+/// have seen.
+///
+/// It is the code for a value that failed a DECLARED BOUND and for nothing else.
+/// A refusal the framework describes with the same `Refusal::Invalid` but renders
+/// under another code — an absent required member, which travels as a codec error
+/// and renders as `MalformedInput` — must not be reworded here, and
+/// [`without_sensitive_values`] declines any refusal that carries one.
+const BOUND_REFUSAL_CODE: &str = "ValidationError";
+
+/// A constraint refusal reworded so that no `@sensitive` member's value appears in
+/// it, or `None` when the refusal echoes no sensitive value and the framework's own
+/// wording stands.
+///
+/// The clause is the framework's, with the echoed value lifted out of it: the
+/// requirement a caller has to read ("Member must satisfy regular expression
+/// pattern: …") is exactly as stated for every other member, and only the
+/// `Value '<the number>' at` opening becomes `Value at`. The pattern replaced is
+/// built from the SAME two fields the renderer interpolated, so it matches the
+/// echo exactly whatever the value holds.
+fn without_sensitive_values(violations: &[Violation]) -> Option<Refused> {
+    // An absent required member renders under a DIFFERENT code than a failed bound
+    // (see [`BOUND_REFUSAL_CODE`]), and it echoes no value to withhold, so a
+    // refusal carrying one is left to the framework entirely rather than reworded
+    // under a code it would not have answered with.
+    let absent_member = violations
+        .iter()
+        .any(|v| matches!(v.kind, ViolationKind::MissingRequiredMember));
+    let echoes_sensitive = violations
+        .iter()
+        .any(|v| v.value.is_some() && is_sensitive_path(&v.path));
+    if absent_member || !echoes_sensitive {
+        return None;
+    }
+    let mut message = aws_smithy_schema_server::envelope(violations)?;
+    for violation in violations {
+        let Some(value) = violation.value.as_deref() else {
+            continue;
+        };
+        if !is_sensitive_path(&violation.path) {
+            continue;
+        }
+        message = message.replace(
+            &format!("Value '{value}' at '{}'", violation.path),
+            &format!("Value at '{}'", violation.path),
+        );
+    }
+    Some(Refused {
+        code: BOUND_REFUSAL_CODE.to_string(),
+        message,
+    })
+}
+
+/// `resp` with the `<RequestId>` element an awsQuery error document carries, when
+/// it is such a document and does not already have one.
+///
+/// Every other response is returned untouched: a success envelope already carries
+/// its request id inside `<ResponseMetadata>`, and a body that is not an
+/// `<ErrorResponse>` document has nowhere this element belongs.
+fn with_request_id(mut resp: RtResponse) -> RtResponse {
+    let Some(bytes) = resp.body().bytes() else {
+        return resp;
+    };
+    let Ok(body) = std::str::from_utf8(bytes) else {
+        return resp;
+    };
+    // The LAST occurrence: every interpolated value in the document is XML-escaped,
+    // so the closing tag cannot appear inside one, and anchoring on the last keeps
+    // that true of any document the framework adds around it later.
+    let Some(close) = body.rfind(ERROR_RESPONSE_CLOSE) else {
+        return resp;
+    };
+    // Only the SIBLING position counts as "already has one": a `<RequestId>`
+    // somewhere inside `<Error>` (a member of some future error shape, say) is a
+    // different element and does not answer for this one.
+    let siblings = match body[..close].rfind(ERROR_ELEMENT_CLOSE) {
+        Some(error_end) => &body[error_end..close],
+        None => &body[..close],
+    };
+    if siblings.contains(REQUEST_ID_ELEMENT) {
+        return resp;
+    }
+    let request_id = crate::state::new_request_id();
+    let mut document = String::with_capacity(body.len() + request_id.len() + 24);
+    document.push_str(&body[..close]);
+    document.push_str(REQUEST_ID_ELEMENT);
+    document.push_str(&request_id);
+    document.push_str("</RequestId>");
+    document.push_str(&body[close..]);
+    *resp.body_mut() = SdkBody::from(document);
+    // Dropped rather than fatal if the HTTP layer cannot carry it: the document
+    // already states the id, and a header is not worth failing a modelled error for.
+    let _ = resp.headers_mut().try_insert(REQUEST_ID_HEADER, request_id);
+    resp
+}
+
+/// Every modelled operation of this service, answered through
+/// [`with_request_id`].
+///
+/// One value serves them all: the operation a request names is resolved from the
+/// request the same way the router resolves it, and `run` delegates to it, so this
+/// wrapper adds the response element and decides nothing else — not routing, not
+/// auth (its `auth_schemes` stays `None`, which defers to the modelled operation
+/// the routing key names), and not the body.
+///
+/// The lookup happens twice per request — once in `override_operation`, which
+/// hands this wrapper back only for a key the routing table answers, and once
+/// here. That is deliberate and costs one `HashMap` probe: declining in
+/// `override_operation` is what keeps a request naming no modelled action on the
+/// ROUTER's own path (its routing-error answer, rendered before authentication)
+/// rather than quietly moving it behind this wrapper.
+struct WithRequestId;
+
+impl ErasedOperation for WithRequestId {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            let definition = svc.definition();
+            let modeled = definition
+                .protocol()
+                .routing_key(req)
+                .ok()
+                .and_then(|key| definition.routing_table().get(key));
+            match modeled {
+                Some(op) => with_request_id(op.run(svc, req, ctx).await),
+                // Unreachable through `override_operation`, which hands this
+                // wrapper back only for a request the routing table answers:
+                // state the protocol's own routing failure rather than panic.
+                None => with_request_id(definition.routing_error_response(req)),
+            }
+        })
+    }
+}
 
 /// The `com-amazonaws-sns-amazonsimplenotificationservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -52,6 +255,8 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Held, not built per request: `override_operation` returns a reference to it.
+    with_request_id: WithRequestId,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +266,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            with_request_id: WithRequestId,
         }
     }
 }
@@ -87,40 +293,39 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve every modelled operation through [`WithRequestId`], which answers
+        // from the generated routing table and then adds the `<RequestId>` element
+        // the awsQuery error document carries beside `<Error>` — the one place every
+        // response of every operation passes through, so no operation can answer an
+        // error document without it. A request the routing table does not answer is
+        // left to the router, which renders this service's own routing failure.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.entry.routing_table().get(key)?;
+        Some(&self.with_request_id)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The framework refuses a request that fails a modelled constraint before
+        // any handler runs, and its clause echoes the rejected value. A member the
+        // model marks `@sensitive` must not have its value reproduced in an error
+        // string, so the clause for one states the constraint alone. Every other
+        // refusal keeps the framework's wording, which is already what a caller
+        // needs.
+        match refusal {
+            Refusal::Invalid(violations) => without_sensitive_values(violations),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
-        // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // The protocol-correct default (query -> 400 InvalidAction text/xml), plus
+        // the `<RequestId>` element every awsQuery error document carries: a request
+        // that named no modelled action is answered with the same document shape as
+        // one that named a modelled action and failed.
+        Some(with_request_id(self.entry.routing_error_response(req)))
     }
 
     fn override_framework_error(
