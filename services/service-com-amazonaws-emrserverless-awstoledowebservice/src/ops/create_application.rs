@@ -313,6 +313,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 job_runs: ::std::collections::BTreeMap::new(),
                 job_run_tokens: ::std::collections::HashMap::new(),
                 next_job_run_seq: 0,
+                sessions: ::std::collections::BTreeMap::new(),
+                session_tokens: ::std::collections::HashMap::new(),
+                next_session_seq: 0,
             },
         );
         store
