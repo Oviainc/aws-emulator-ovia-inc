@@ -22,13 +22,13 @@ use std::sync::Arc;
 
 /// The span `crate::state::LIFECYCLE_SETTLE_MS` gives a domain lifecycle step, plus
 /// slack, so a test that waits for a settled domain is not racing the clock.
-const SETTLED: std::time::Duration = std::time::Duration::from_millis(600);
+pub(crate) const SETTLED: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// One emulator: a single shared engine behind the DataZone service, driven over HTTP.
 ///
 /// `pub(crate)` because every suite in this test target drives the service the same
-/// way: a sibling suite (`tests/all/update_project.rs`) reuses this harness instead of
-/// copying it.
+/// way: the sibling suites (`tests/all/update_project.rs`, `tests/all/glossary_lifecycle.rs`)
+/// reuse this harness instead of copying it.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }

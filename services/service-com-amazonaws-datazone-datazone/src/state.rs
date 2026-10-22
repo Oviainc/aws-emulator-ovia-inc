@@ -38,6 +38,11 @@ pub const PROJECT_STATUS_ACTIVE: &str = "ACTIVE";
 /// `com.amazonaws.datazone#DomainVersion`: V1 | V2).
 pub const DEFAULT_DOMAIN_VERSION: &str = "V1";
 
+/// The `GlossaryStatus` members (model enum `com.amazonaws.datazone#GlossaryStatus`:
+/// DISABLED | ENABLED).
+pub const GLOSSARY_STATUS_ENABLED: &str = "ENABLED";
+pub const GLOSSARY_STATUS_DISABLED: &str = "DISABLED";
+
 /// The `Revision` (`com.amazonaws.datazone#Revision`, len 1..64) a freshly created
 /// revisioned resource carries: DataZone numbers revisions from 1, as a decimal string.
 pub const FIRST_REVISION: &str = "1";
@@ -80,11 +85,38 @@ pub struct Domain {
     /// The projects stored in this domain, so they go with it when it is deleted.
     /// Bounded by [`MAX_PROJECTS_PER_DOMAIN`].
     pub projects: BTreeMap<String, Project>,
+    /// The business glossaries stored in this domain, keyed by glossary id, so they go
+    /// with the domain when it is deleted. Bounded by [`MAX_GLOSSARIES_PER_DOMAIN`].
+    pub glossaries: BTreeMap<String, Glossary>,
     /// The custom asset types stored in this domain, keyed by the type's NAME — the
     /// `AssetTypeIdentifier` `GetAssetType`/`DeleteAssetType` address a type by — so a
     /// name is unique within the domain and the types go with it when it is deleted.
     /// Bounded by [`MAX_ASSET_TYPES_PER_DOMAIN`].
     pub asset_types: BTreeMap<String, AssetType>,
+}
+
+/// One stored DataZone business glossary.
+///
+/// A glossary belongs to a domain and is owned by a project in that domain; the terms
+/// under it are a separate resource with its own operations.
+#[derive(Debug, Clone)]
+pub struct Glossary {
+    pub id: String,
+    pub domain_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub owning_project_id: String,
+    /// One of [`GLOSSARY_STATUS_ENABLED`] / [`GLOSSARY_STATUS_DISABLED`].
+    pub status: String,
+    /// `usageRestrictions` as stored (model list `GlossaryUsageRestrictions`, 1..1 of
+    /// `ASSET_GOVERNED_TERMS`): empty when the request named none.
+    pub usage_restrictions: Vec<String>,
+    pub created_by: String,
+    pub created_at_ms: i64,
+    /// Who last updated the glossary and when — `None` until something does, because
+    /// `GetGlossary` reports `updatedAt`/`updatedBy` as optional members.
+    pub updated_by: Option<String>,
+    pub updated_at_ms: Option<i64>,
 }
 
 /// The stored form of the modelled `SingleSignOn` structure.
@@ -160,6 +192,10 @@ pub const MAX_DOMAINS: usize = 100;
 /// the same refusal (`CreateProject` models `ServiceQuotaExceededException` too).
 pub const MAX_PROJECTS_PER_DOMAIN: usize = 500;
 
+/// The most business glossaries this emulator stores in one domain, for the same reason
+/// and with the same refusal (`CreateGlossary` models `ServiceQuotaExceededException`).
+pub const MAX_GLOSSARIES_PER_DOMAIN: usize = 500;
+
 /// The most asset types this emulator stores in one domain, for the same reason and
 /// with the same refusal (`CreateAssetType` models `ServiceQuotaExceededException` too).
 pub const MAX_ASSET_TYPES_PER_DOMAIN: usize = 500;
@@ -168,11 +204,57 @@ pub const MAX_ASSET_TYPES_PER_DOMAIN: usize = 500;
 ///
 /// The token keys are CALLER-supplied, so the map is a caller-driven growth site and
 /// must be bounded: [`ComAmazonawsDatazoneDatazoneState::bound_idempotency`] first
-/// releases every token whose domain is gone (such a token can never be replayed into
+/// releases every token whose resource is gone (such a token can never be replayed into
 /// anything), then evicts the oldest entries beyond this ceiling. At most one token is
-/// recorded per stored domain, so this is never the binding cap in practice; it is
-/// enforced anyway so caller-chosen strings cannot accumulate on their own.
-pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_DOMAINS;
+/// recorded per stored resource, and a token evicted here only costs its request the
+/// idempotent replay — the resource it created stays stored and readable.
+pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_DOMAINS * 16;
+
+/// Which kind of resource a remembered `@idempotencyToken` created.
+///
+/// Part of the map KEY, not just the value: two operations can be handed the same
+/// caller-chosen token string, and a `CreateGlossary` repeat must not consume
+/// (or overwrite) the record a `CreateDomain` left under that token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IdempotentResource {
+    Domain,
+    Glossary,
+}
+
+/// The key one remembered `@idempotencyToken` is filed under.
+///
+/// TOTAL scoping, so no two creates can collide on one caller-chosen string: the
+/// operation's resource kind, the domain the create is scoped to, and the token.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IdempotencyKey {
+    kind: IdempotentResource,
+    /// The domain the create happens IN — empty for a create that is scoped to the
+    /// service rather than to a domain (a domain itself).
+    domain_id: String,
+    token: String,
+}
+
+impl IdempotencyKey {
+    /// The key a `CreateDomain` token is filed under. A domain create is scoped to the
+    /// service, so the key carries no domain.
+    pub fn domain(token: &str) -> Self {
+        Self {
+            kind: IdempotentResource::Domain,
+            domain_id: String::new(),
+            token: token.to_string(),
+        }
+    }
+
+    /// The key a `CreateGlossary` token is filed under: the same token in another
+    /// domain is a different key, so each domain keeps its own record.
+    pub fn glossary(domain_id: &str, token: &str) -> Self {
+        Self {
+            kind: IdempotentResource::Glossary,
+            domain_id: domain_id.to_string(),
+            token: token.to_string(),
+        }
+    }
+}
 
 /// What one remembered `@idempotencyToken` points at, plus when it was remembered so
 /// the oldest can be evicted first.
@@ -189,13 +271,14 @@ pub struct ComAmazonawsDatazoneDatazoneState {
     /// iterates in one stable order and a pagination token can resume from a key.
     /// Bounded by [`MAX_DOMAINS`].
     pub domains: BTreeMap<String, Domain>,
-    /// `clientToken` -> the domain the first request carrying it created, so a repeated
-    /// `@idempotencyToken` request returns that domain instead of creating a second one.
+    /// [`IdempotencyKey`] -> the resource the first request carrying that token created,
+    /// so a repeated `@idempotencyToken` request returns that resource instead of
+    /// creating a second one.
     ///
     /// Bounded: see [`MAX_IDEMPOTENCY_TOKENS`]. Write it through
     /// [`Self::record_idempotency`], which applies the bound, rather than inserting
     /// directly.
-    idempotency: BTreeMap<String, IdempotencyRecord>,
+    idempotency: BTreeMap<IdempotencyKey, IdempotencyRecord>,
     /// Monotonic counter behind every minted id, so no two resources in one process
     /// ever share an id even when minted in the same millisecond.
     id_seq: u64,
@@ -204,17 +287,43 @@ pub struct ComAmazonawsDatazoneDatazoneState {
 impl ComAmazonawsDatazoneDatazoneState {
     /// The domain a `clientToken` already created, if that domain is still stored.
     pub fn idempotent_domain(&self, token: &str) -> Option<&Domain> {
-        let record = self.idempotency.get(token)?;
+        let record = self.idempotency.get(&IdempotencyKey::domain(token))?;
         self.domains.get(&record.resource_id)
     }
 
-    /// Remember that `token` created `resource_id`, and re-apply the bound.
+    /// The glossary a `clientToken` already created in `domain_id`, if it is still
+    /// stored. The domain is part of the key, so the same token against a different
+    /// domain creates that domain's own glossary and leaves this record alone.
+    pub fn idempotent_glossary(&self, domain_id: &str, token: &str) -> Option<&Glossary> {
+        let record = self
+            .idempotency
+            .get(&IdempotencyKey::glossary(domain_id, token))?;
+        self.domains
+            .get(domain_id)?
+            .glossaries
+            .get(&record.resource_id)
+    }
+
+    /// Whether a remembered token still resolves to something this store holds. One
+    /// lookup per level, because the key carries the owning domain.
+    fn record_resolves(&self, key: &IdempotencyKey, record: &IdempotencyRecord) -> bool {
+        match key.kind {
+            IdempotentResource::Domain => self.domains.contains_key(&record.resource_id),
+            IdempotentResource::Glossary => self
+                .domains
+                .get(&key.domain_id)
+                .is_some_and(|domain| domain.glossaries.contains_key(&record.resource_id)),
+        }
+    }
+
+    /// Remember that the token `key` names created `resource_id`, and re-apply the
+    /// bound.
     ///
     /// Call it AFTER the resource is stored: a token naming a resource that is not in
     /// the store is released immediately by the bound below.
-    pub fn record_idempotency(&mut self, token: String, resource_id: String, now: i64) {
+    pub fn record_idempotency(&mut self, key: IdempotencyKey, resource_id: String, now: i64) {
         self.idempotency.insert(
-            token,
+            key,
             IdempotencyRecord {
                 resource_id,
                 recorded_at_ms: now,
@@ -223,16 +332,22 @@ impl ComAmazonawsDatazoneDatazoneState {
         self.bound_idempotency();
     }
 
-    /// Keep the remembered-token map bounded: release every token whose domain is no
+    /// Keep the remembered-token map bounded: release every token whose resource is no
     /// longer stored, then evict the oldest entries beyond [`MAX_IDEMPOTENCY_TOKENS`].
     ///
     /// Reached from [`Self::record_idempotency`] and from [`Self::settle_clock`] (which
     /// every handler calls), so a create/delete loop with fresh tokens releases each
-    /// token as its domain disappears and can never grow the store without limit.
+    /// token as its resource disappears and can never grow the store without limit.
     fn bound_idempotency(&mut self) {
-        let domains = &self.domains;
-        self.idempotency
-            .retain(|_, record| domains.contains_key(&record.resource_id));
+        let released: Vec<IdempotencyKey> = self
+            .idempotency
+            .iter()
+            .filter(|(key, record)| !self.record_resolves(key, record))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in released {
+            self.idempotency.remove(&key);
+        }
         let Some(excess) = self
             .idempotency
             .len()
@@ -241,14 +356,14 @@ impl ComAmazonawsDatazoneDatazoneState {
         else {
             return;
         };
-        let mut by_age: Vec<(i64, String)> = self
+        let mut by_age: Vec<(i64, IdempotencyKey)> = self
             .idempotency
             .iter()
-            .map(|(token, record)| (record.recorded_at_ms, token.clone()))
+            .map(|(key, record)| (record.recorded_at_ms, key.clone()))
             .collect();
         by_age.sort();
-        for (_, token) in by_age.into_iter().take(excess) {
-            self.idempotency.remove(&token);
+        for (_, key) in by_age.into_iter().take(excess) {
+            self.idempotency.remove(&key);
         }
     }
     /// Mint an opaque id suffix: lowercase base-36, so it satisfies both the
