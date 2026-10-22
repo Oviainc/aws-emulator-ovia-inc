@@ -9,6 +9,12 @@
 //! and `SearchCertificates` report what `RequestCertificate` stored rather than
 //! echoing their own input.
 //!
+//! Beside them, one [`AcmeEndpointRecord`] per managed ACME endpoint, keyed by its
+//! ARN, plus the idempotency index `CreateAcmeEndpoint` consults
+//! ([`AcmeEndpointIdempotency`]). `DescribeAcmeEndpoint` projects that record through
+//! [`acme_endpoint_detail`], and a freshly created endpoint is `CREATING` until the
+//! transition the clock owes it falls due, exactly as a pending certificate is.
+//!
 //! Beside the certificates sits the account-level singleton
 //! [`AccountConfiguration`]: `PutAccountConfiguration` writes it and
 //! `GetAccountConfiguration` reports it, so that round trip reads one record too.
@@ -23,10 +29,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AcmCertificateMetadata, CertificateDetail, CertificateMetadata, CertificateOptions,
-    CertificateSearchResult, CertificateSummary, DistinguishedName, DomainValidation,
-    ExpiryEventsConfiguration, ExtendedKeyUsage, GeneralName, HttpRedirect, KeyUsage,
-    ResourceRecord, Tag, X509Attributes,
+    AcmCertificateMetadata, AcmeEndpoint, CertificateAuthority, CertificateDetail,
+    CertificateMetadata, CertificateOptions, CertificateSearchResult, CertificateSummary,
+    DistinguishedName, DomainValidation, ExpiryEventsConfiguration, ExtendedKeyUsage, GeneralName,
+    HttpRedirect, KeyUsage, ResourceRecord, Tag, X509Attributes,
 };
 
 /// This service's SigV4 signing name, and the `acm` segment of every ARN it mints.
@@ -219,6 +225,40 @@ pub const SORT_ORDER_DESCENDING: &str = "DESCENDING";
 /// `HasAdditionalSubjectAlternativeNames` reports whether the certificate has more
 /// (`CertificateSummary$HasAdditionalSubjectAlternativeNames` doc).
 pub const SUMMARY_SAN_LIMIT: usize = 100;
+
+/// `AcmeEndpointStatus` of an ACME endpoint ACM is still standing up: an endpoint is
+/// "a managed ACME server with a unique endpoint URL" (`CreateAcmeEndpoint` doc), and
+/// `AcmeEndpointStatus` models `CREATING` beside `ACTIVE` precisely because the server
+/// is not serving the instant the call returns.
+pub const ACME_ENDPOINT_STATUS_CREATING: &str = "CREATING";
+
+/// `AcmeEndpointStatus` of an ACME endpoint that is serving: "After creation, ACME
+/// clients can use the endpoint URL to automate certificate issuance"
+/// (`CreateAcmeEndpoint` doc).
+pub const ACME_ENDPOINT_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The most ACME endpoint records this emulator stores, across every Region.
+///
+/// Not an AWS quota: ACM's own endpoint quota is per Region, and the Region of a
+/// request is read off the caller's SigV4 credential scope, so a per-Region bound is a
+/// bound the CALLER can partition by signing each request for another Region string.
+/// This cap is keyed on nothing in the request, so it bounds
+/// [`ComAmazonawsAcmCertificatemanagerState::acme_endpoints`] (and with it the
+/// per-request `materialize_due` pass over those records) however the request varies.
+/// `CreateAcmeEndpoint` checks it before inserting and answers its modelled quota error
+/// past it.
+pub const ACME_ENDPOINT_STORE_LIMIT: usize = 1_000;
+
+/// How long after `CreateAcmeEndpoint` the endpoint reaches
+/// [`ACME_ENDPOINT_STATUS_ACTIVE`].
+///
+/// A CHOSEN span, not a documented one: neither the model nor ACM's documentation
+/// states how long standing an ACME endpoint up takes. It is never zero, so a caller
+/// that describes the endpoint straight after creating it still observes `CREATING`,
+/// and it is never slept on: the due instant is stored on the record and materialised
+/// by whichever call next touches the store (see
+/// [`ComAmazonawsAcmCertificatemanagerState::materialize_due`]).
+pub const ACME_ENDPOINT_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
 /// The account-level configuration `PutAccountConfiguration` writes and
 /// `GetAccountConfiguration` reports. One per account, so the state holds a
@@ -499,6 +539,95 @@ impl Certificate {
     }
 }
 
+/// The status transition the clock already owes an ACME endpoint.
+///
+/// Stored, never slept on: the instant it falls due is fixed by the call that started
+/// the transition, so the endpoint reaches that status at that instant whether or not
+/// anybody calls again.
+#[derive(Debug, Clone)]
+pub struct PendingAcmeEndpointStatus {
+    /// When the transition falls due.
+    pub due_at: SystemTime,
+    /// The `AcmeEndpointStatus` the endpoint carries from then on.
+    pub status: String,
+}
+
+impl PendingAcmeEndpointStatus {
+    /// The transition owed to an endpoint created at `created_at`: it becomes
+    /// [`ACME_ENDPOINT_STATUS_ACTIVE`] [`ACME_ENDPOINT_ACTIVATION_DELAY`] later.
+    pub fn activating_at(created_at: SystemTime) -> Self {
+        Self {
+            due_at: created_at + ACME_ENDPOINT_ACTIVATION_DELAY,
+            status: ACME_ENDPOINT_STATUS_ACTIVE.to_string(),
+        }
+    }
+}
+
+/// One stored ACME endpoint. Every field `DescribeAcmeEndpoint` reports is read from
+/// here, so no response echoes its own request.
+#[derive(Debug, Clone)]
+pub struct AcmeEndpointRecord {
+    /// `arn:aws:acm:<region>:<account>:acme-endpoint/<id>`.
+    pub arn: String,
+    /// The server-managed ACME directory URL ([`acme_endpoint_url`]).
+    pub endpoint_url: String,
+    /// An `AcmeEndpointStatus` value.
+    pub status: String,
+    /// "The reason the ACME endpoint failed, if applicable"
+    /// (`AcmeEndpoint$FailureReason` doc), so it is set only beside a `FAILED` status.
+    pub failure_reason: Option<String>,
+    /// An `AcmeAuthorizationBehavior` value, as the create request configured it.
+    pub authorization_behavior: String,
+    /// An `AcmeContact` value, as the create request configured it.
+    pub contact: String,
+    /// The certificate authority the endpoint issues through.
+    pub certificate_authority: CertificateAuthority,
+    /// Tag key -> value applied to certificates issued through this endpoint.
+    pub certificate_tags: BTreeMap<String, String>,
+    /// Tag key -> value on the endpoint resource itself, as `ListTagsForResource`
+    /// reports them.
+    pub tags: BTreeMap<String, String>,
+    /// The status transition the clock owes this endpoint. `None` once it has
+    /// reached a status the clock owes nothing beyond.
+    pub pending_status: Option<PendingAcmeEndpointStatus>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl AcmeEndpointRecord {
+    /// Apply the status transition the clock already owes this endpoint at `now`.
+    ///
+    /// An endpoint ACM reports as `CREATING` is waiting on work ACM does on its own;
+    /// the instant that work completes was fixed when the endpoint was created, so
+    /// applying it here materialises a change the clock already made rather than a
+    /// side effect of whoever happened to call.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        let Some(pending) = self
+            .pending_status
+            .clone()
+            .filter(|pending| now >= pending.due_at)
+        else {
+            return;
+        };
+        self.pending_status = None;
+        self.status = pending.status;
+        // The endpoint changed at the instant the transition fell due, which is what
+        // `UpdatedAt` ("the time at which the ACME endpoint was last updated") reports
+        // — not the instant somebody happened to read it.
+        self.updated_at = pending.due_at;
+    }
+}
+
+/// What one `CreateAcmeEndpoint` idempotency token has already created.
+#[derive(Debug, Clone)]
+pub struct AcmeEndpointIdempotency {
+    /// A canonical rendering of every parameter the endpoint was created from, so a
+    /// re-sent token can be told apart from a changed request carrying the same token.
+    pub fingerprint: String,
+    /// The ARN the first call answered with.
+    pub acme_endpoint_arn: String,
+}
+
 /// Per-service state for com-amazonaws-acm-certificatemanager. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAcmCertificatemanagerState {
@@ -509,6 +638,14 @@ pub struct ComAmazonawsAcmCertificatemanagerState {
     /// certificate ARN, so re-sending one `RequestCertificate` returns the
     /// certificate it already created instead of making another.
     pub idempotency: HashMap<String, String>,
+    /// ACME endpoint ARN -> record. A `BTreeMap`, so an unsorted `ListAcmeEndpoints`
+    /// page and its `NextToken` walk one deterministic order.
+    pub acme_endpoints: BTreeMap<String, AcmeEndpointRecord>,
+    /// `CreateAcmeEndpoint` idempotency token -> what that token created. Separate
+    /// from [`Self::idempotency`] because the two index different resources: a token
+    /// resolves to the endpoint it created, and the two operations' tokens must not
+    /// be able to collide.
+    pub acme_endpoint_idempotency: HashMap<String, AcmeEndpointIdempotency>,
     /// The account's expiry-events configuration, as the last successful
     /// `PutAccountConfiguration` wrote it, and `None` until one has — when ACM is
     /// running the account on the documented default,
@@ -533,12 +670,25 @@ impl ComAmazonawsAcmCertificatemanagerState {
     ///
     /// Call it FIRST in every handler that locks the store, so each operation sees the
     /// state a caller would see after any other. One pass touches at most as many
-    /// records as the account may hold certificates, and each is one instant
-    /// comparison.
+    /// records as the account may hold certificates and ACME endpoints, and each is one
+    /// instant comparison.
     pub fn materialize_due(&mut self, now: SystemTime) {
         for certificate in self.certificates.values_mut() {
             certificate.materialize_due(now);
         }
+        for endpoint in self.acme_endpoints.values_mut() {
+            endpoint.materialize_due(now);
+        }
+    }
+
+    /// Drop `arn`'s ACME endpoint record and every idempotency token that resolves to
+    /// it, so a replayed `CreateAcmeEndpoint` can never answer with an ARN that has no
+    /// record behind it.
+    pub fn remove_acme_endpoint(&mut self, arn: &str) -> Option<AcmeEndpointRecord> {
+        let removed = self.acme_endpoints.remove(arn)?;
+        self.acme_endpoint_idempotency
+            .retain(|_, seen| seen.acme_endpoint_arn != arn);
+        Some(removed)
     }
 
     /// Drop `arn`'s record and every idempotency entry that resolves to it, so a
@@ -577,6 +727,41 @@ pub fn certificate_arn(region: &str, certificate_id: &str) -> String {
         region,
         &format!("certificate/{certificate_id}"),
     )
+}
+
+/// `arn:aws:acm:<region>:<account>:acme-endpoint/<endpoint_id>`, the form
+/// `AcmeEndpointArn`'s `@pattern` requires
+/// (`^arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:acme-endpoint/[a-zA-Z0-9-]+$`).
+pub fn acme_endpoint_arn(region: &str, endpoint_id: &str) -> String {
+    ::engine::emulator_arn(
+        SIGNING_NAME,
+        region,
+        &format!("acme-endpoint/{endpoint_id}"),
+    )
+}
+
+/// The ACME directory URL an endpoint serves on.
+///
+/// `AcmeEndpoint$EndpointUrl` is documented only as "The URL of the ACME endpoint",
+/// and `CreateAcmeEndpoint` models no member a caller could propose one with, so what
+/// matters is the invariant rather than AWS's exact host: the URL is SERVER-MANAGED
+/// and derived from the endpoint's own id and Region, so it is unique per endpoint,
+/// identical on every later read, and carries nothing the caller sent. It ends at the
+/// `directory` resource, the single URL an ACME client is given and starts from
+/// (RFC 8555 §7.1.1).
+pub fn acme_endpoint_url(region: &str, endpoint_id: &str) -> String {
+    format!("https://{endpoint_id}.acme.{region}.amazonaws.com/directory")
+}
+
+/// The `ResourceNotFoundException` message for an ACME endpoint ARN that no stored
+/// record answers to, built from the ARN the request asked for.
+///
+/// `ResourceNotFoundException` carries one modelled member (`message: String`) and the
+/// model documents no text for it, so the sentence follows the template every other
+/// lookup in this service renders ([`certificate_not_found_message`]): one complete
+/// sentence naming the requested ARN and terminated by a period.
+pub fn acme_endpoint_not_found_message(acme_endpoint_arn: &str) -> String {
+    format!("Could not find ACME endpoint {acme_endpoint_arn}.")
 }
 
 /// The certificate id in an ACM certificate ARN, or `None` when `arn` names
@@ -660,6 +845,33 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
         i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
         since_epoch.subsec_nanos(),
     )
+}
+
+/// A fingerprint of the parameters one request builds a record from, for an operation
+/// that honours an `@idempotencyToken`: re-sending a token must answer with what it
+/// already created, and the same token on a DIFFERENT request must be told apart from
+/// it rather than answering 200 while the change is discarded.
+///
+/// The parts are hashed as GROUPS: each group behind its own part COUNT, and every part
+/// inside it behind its own length. That is what makes the framing unambiguous — no
+/// value can move between groups, or run into its neighbour, and leave the fingerprint
+/// unchanged. A group marker pushed in-band as a part could not do that, since every
+/// part is caller-controlled text.
+///
+/// Both operations that key an index on a token (`RequestCertificate`,
+/// `CreateAcmeEndpoint`) render it here, so the framing lives in one place.
+pub fn fingerprint_groups(groups: &[&[&str]]) -> String {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    for group in groups {
+        hasher.update(group.len().to_le_bytes());
+        for part in *group {
+            hasher.update(part.len().to_le_bytes());
+            hasher.update(part.as_bytes());
+        }
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// The validation label ACM publishes for one `(certificate, domain, purpose)`:
@@ -937,6 +1149,30 @@ pub fn certificate_summary(cert: &Certificate) -> CertificateSummary {
         managed_by: cert.managed_by.clone(),
         certificate_key_pair_origin: Some(cert.key_pair_origin.clone()),
         ..CertificateSummary::default()
+    }
+}
+
+/// A stored ACME endpoint as `DescribeAcmeEndpoint`'s `AcmeEndpoint`.
+///
+/// `FailureReason` exists only for an endpoint that failed
+/// (`AcmeEndpoint$FailureReason` doc), which is what the record stores, and
+/// `CertificateTags` is reported only when the endpoint carries tags to apply to the
+/// certificates it issues — a create that named none leaves the member absent rather
+/// than reporting an empty list (`TagList` has a minimum length of 1, so an empty list
+/// is not a value the member can take).
+pub fn acme_endpoint_detail(endpoint: &AcmeEndpointRecord) -> AcmeEndpoint {
+    AcmeEndpoint {
+        acme_endpoint_arn: Some(endpoint.arn.clone()),
+        endpoint_url: Some(endpoint.endpoint_url.clone()),
+        status: Some(endpoint.status.clone()),
+        failure_reason: endpoint.failure_reason.clone(),
+        authorization_behavior: Some(endpoint.authorization_behavior.clone()),
+        contact: Some(endpoint.contact.clone()),
+        certificate_authority: Some(endpoint.certificate_authority.clone()),
+        certificate_tags: (!endpoint.certificate_tags.is_empty())
+            .then(|| tag_list(&endpoint.certificate_tags)),
+        created_at: Some(to_date_time(endpoint.created_at)),
+        updated_at: Some(to_date_time(endpoint.updated_at)),
     }
 }
 

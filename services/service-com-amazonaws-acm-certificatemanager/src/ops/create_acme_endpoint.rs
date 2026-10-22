@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAcmeEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAcmeEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints an ACME endpoint ARN and its server-managed ACME directory URL,
+//! persists the endpoint record (status `CREATING`) with the authorization behavior,
+//! contact requirement, certificate authority and certificate tags the request
+//! configured plus the resource tags it carries, and returns the ARN. An
+//! `IdempotencyToken` re-sent (in the same Region) with the same parameters resolves
+//! to the endpoint it already created; re-sent with different parameters it is refused
+//! as a conflict.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAcmeEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `CREATING` is not where the endpoint stays: "after creation, ACME clients can use
+//! the endpoint URL" (`CreateAcmeEndpoint` doc), so the call records the `ACTIVE`
+//! transition the clock owes it ([`crate::state::PendingAcmeEndpointStatus`]) and the
+//! instant it falls due, which whichever call next touches the store materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +167,244 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAcmeEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAcmeEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAcmeEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator (the engine IS the shared store);
+            // this operation models a server fault, so that is the honest answer.
+            return Err(CreateAcmeEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the acm acme endpoint store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Tags` tag the endpoint resource; `CertificateTags` are "tags to apply to
+        // certificates issued through this ACME endpoint". Both are refused for the
+        // same reserved-prefix rule, which `crate::state::tag_map` decides.
+        let tags = crate::state::tag_map(input.tags.as_deref().unwrap_or_default())
+            .map_err(validation_exception)?;
+        let certificate_tags =
+            crate::state::tag_map(input.certificate_tags.as_deref().unwrap_or_default())
+                .map_err(validation_exception)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let fingerprint = request_fingerprint(&input, &tags, &certificate_tags);
+        // An ACME endpoint is a REGIONAL resource, so the token index is keyed by the
+        // Region the request was signed for as well as the token: one token sent in two
+        // Regions names two creates, not one.
+        let idempotency = input
+            .idempotency_token
+            .as_deref()
+            .map(|token| idempotency_key(&region, token));
+
+        // ONE instant answers the whole request: it materialises the transitions the
+        // clock already owes and dates the endpoint this call creates.
+        let now = std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // What this request's `IdempotencyToken` has already created, if anything.
+        let replayed = idempotency
+            .as_ref()
+            .and_then(|key| store.acme_endpoint_idempotency.get(key))
+            .cloned();
+        if let Some(seen) = replayed {
+            // The token identifies ONE create. Re-sent with the same parameters it
+            // answers with the endpoint it already created and makes no second one;
+            // re-sent with different parameters it is a different request wearing an
+            // identifier that is already taken, so it is refused rather than silently
+            // discarding the change — which is what `ConflictException` ("you are
+            // trying to update a resource or configuration that is already being
+            // created or updated") names.
+            if seen.fingerprint != fingerprint {
+                return Err(CreateAcmeEndpointErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "the idempotency token of this request already created ACME endpoint {}, with different parameters",
+                            seen.acme_endpoint_arn
+                        )),
+                    },
+                )
+                .into());
+            }
+            // An entry whose endpoint has since been deleted is stale, so it is not
+            // reused: a minted ARN must always have a record behind it.
+            if store.acme_endpoints.contains_key(&seen.acme_endpoint_arn) {
+                return Ok(CreateAcmeEndpointOutput {
+                    acme_endpoint_arn: Some(seen.acme_endpoint_arn),
+                });
+            }
+        }
+
+        // The cap on the WHOLE map, checked first because it is the one bound nothing
+        // in the request can partition: the Region below comes off the caller's own
+        // credential scope, so a per-Region quota alone would let a caller that varies
+        // the Region string grow the store without limit. The token index gains an
+        // entry only beside a new endpoint, so it is bounded with the map; it is
+        // checked here as well so neither can pass the cap.
+        let stored = store.acme_endpoints.len();
+        let tokens = store.acme_endpoint_idempotency.len();
+        if stored >= crate::state::ACME_ENDPOINT_STORE_LIMIT
+            || tokens >= crate::state::ACME_ENDPOINT_STORE_LIMIT
+        {
+            // Name whichever count reached the cap, so the refusal says what is full.
+            let (full, held) = if stored >= crate::state::ACME_ENDPOINT_STORE_LIMIT {
+                ("ACME endpoints", stored)
+            } else {
+                ("ACME endpoint idempotency tokens", tokens)
+            };
+            return Err(
+                CreateAcmeEndpointErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this emulator already holds {held} {full}, the most it stores ({})",
+                            crate::state::ACME_ENDPOINT_STORE_LIMIT
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The per-Region endpoint quota: counted over the endpoints whose ARN this
+        // Region minted, and refused BEFORE the record is inserted, so the store cannot
+        // grow past it however many times the call is repeated. The map is keyed by ARN
+        // and the Region sits in the key's prefix, so the count is a range scan over
+        // that Region's keys rather than a walk of the whole map.
+        let region_prefix = crate::state::acme_endpoint_arn(&region, "");
+        let held = store
+            .acme_endpoints
+            .range(region_prefix.clone()..)
+            .take_while(|(arn, _)| arn.starts_with(&region_prefix))
+            .count();
+        if held >= ACME_ENDPOINT_LIMIT {
+            return Err(
+                CreateAcmeEndpointErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds {held} ACME endpoints in {region}, the quota of {ACME_ENDPOINT_LIMIT} for this Region"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let endpoint_id = uuid::Uuid::new_v4().to_string();
+        let arn = crate::state::acme_endpoint_arn(&region, &endpoint_id);
+
+        let endpoint = crate::state::AcmeEndpointRecord {
+            arn: arn.clone(),
+            // Server-managed: derived from the endpoint's own id and Region, never
+            // from anything the caller sent.
+            endpoint_url: crate::state::acme_endpoint_url(&region, &endpoint_id),
+            status: crate::state::ACME_ENDPOINT_STATUS_CREATING.to_string(),
+            // Nothing has failed: `FailureReason` is "the reason the ACME endpoint
+            // failed, if applicable" (`AcmeEndpoint$FailureReason` doc).
+            failure_reason: None,
+            authorization_behavior: input.authorization_behavior.clone(),
+            // `Contact` carries the model's `REQUIRED` default, so the boundary has
+            // already filled it when the request named none.
+            contact: input.contact.clone(),
+            certificate_authority: input.certificate_authority.clone(),
+            certificate_tags,
+            tags,
+            // ACM stands the managed ACME server up on its own, so the `ACTIVE`
+            // transition is owed from here on; the instant it falls due is fixed now
+            // and materialised by whichever call next touches the store.
+            pending_status: Some(crate::state::PendingAcmeEndpointStatus::activating_at(now)),
+            created_at: now,
+            updated_at: now,
+        };
+
+        store.acme_endpoints.insert(arn.clone(), endpoint);
+        if let Some(key) = idempotency {
+            store.acme_endpoint_idempotency.insert(
+                key,
+                crate::state::AcmeEndpointIdempotency {
+                    fingerprint,
+                    acme_endpoint_arn: arn.clone(),
+                },
+            );
+        }
+
+        Ok(CreateAcmeEndpointOutput {
+            acme_endpoint_arn: Some(arn),
+        })
     }
+}
+
+/// The number of ACME endpoints one account may hold in a Region.
+///
+/// Neither the model nor ACM's documentation states this quota, so the NUMBER is
+/// chosen — generously, since a bound that is too low refuses a request ACM would
+/// accept. What it encodes is that an account's ACME endpoints are a bounded resource
+/// and that past the bound this operation answers the quota error it models.
+///
+/// It is a FIDELITY bound, not the safety one: the Region it is counted over comes off
+/// the caller's credential scope, so the store as a whole is bounded by
+/// [`crate::state::ACME_ENDPOINT_STORE_LIMIT`], which no request can partition.
+const ACME_ENDPOINT_LIMIT: usize = 500;
+
+/// A refusal of the request as invalid, as this operation's own modelled
+/// `ValidationException` ("the supplied input failed to satisfy constraints").
+fn validation_exception(message: String) -> CreateAcmeEndpointError {
+    CreateAcmeEndpointErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The idempotency index key for a request: the Region it was signed for, then the
+/// caller's token.
+///
+/// An ACME endpoint is a regional resource, so a token names one create WITHIN a
+/// Region. The Region comes first and `AcmeEndpointArn`'s pattern allows no `/` in it
+/// (`[a-z0-9-]+`), so the separator cannot be read as part of a Region and two
+/// different `(Region, token)` pairs cannot render the same key.
+fn idempotency_key(region: &str, token: &str) -> String {
+    format!("{region}/{token}")
+}
+
+/// A fingerprint of EVERY parameter the endpoint is created from: the authorization
+/// behavior, the contact requirement, the certificate authority configuration and both
+/// tag maps. (The Region is not among them — it is part of the index key above.)
+///
+/// Rendered by [`crate::state::fingerprint_groups`], which frames each group behind its
+/// own part count, so a tag cannot move between `Tags` and `CertificateTags`, or run
+/// into its neighbour, and leave the fingerprint unchanged — which matters because
+/// every tag key and value is arbitrary caller-controlled text. Each tag map is
+/// rendered in key order, so the same request with its tags listed in another order
+/// fingerprints identically.
+fn request_fingerprint(
+    input: &CreateAcmeEndpointInput,
+    tags: &std::collections::BTreeMap<String, String>,
+    certificate_tags: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut configuration: Vec<&str> = vec![&input.authorization_behavior, &input.contact];
+
+    // The certificate authority is a union: its variant is part of the configuration,
+    // and so is each algorithm the variant allows, in the order the request listed
+    // them (the member is a list, so its order is the caller's).
+    let CertificateAuthority::PublicCertificateAuthority(authority) = &input.certificate_authority;
+    configuration.push("PublicCertificateAuthority");
+    for algorithm in authority.allowed_key_algorithms.iter().flatten() {
+        configuration.push(algorithm);
+    }
+
+    let tags: Vec<&str> = tags
+        .iter()
+        .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+        .collect();
+    let certificate_tags: Vec<&str> = certificate_tags
+        .iter()
+        .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+        .collect();
+
+    crate::state::fingerprint_groups(&[
+        configuration.as_slice(),
+        tags.as_slice(),
+        certificate_tags.as_slice(),
+    ])
 }

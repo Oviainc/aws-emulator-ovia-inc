@@ -591,9 +591,10 @@ struct DerivedRequest<'a> {
 /// re-send that changed one of them would answer 200 while silently discarding the
 /// change — or hand back another Region's ARN.
 ///
-/// Each group of parts is hashed behind its own length, and every part inside it
-/// length-prefixed, so no value can move between groups or run into its neighbour
-/// and leave the fingerprint unchanged: three domain names with no tags and one
+/// Each group of parts is fingerprinted behind its own length, and every part inside
+/// it length-prefixed by [`crate::state::fingerprint_groups`], so no value can move
+/// between groups or run into its neighbour and leave the fingerprint unchanged:
+/// three domain names with no tags and one
 /// domain name with a tag whose key and value are the other two are different
 /// requests and hash differently. The tags and validation domains are hashed in key
 /// order, so the same request with its tags listed in another order is recognised as
@@ -603,8 +604,6 @@ fn idempotency_key(
     input: &RequestCertificateInput,
     derived: &DerivedRequest<'_>,
 ) -> String {
-    use sha2::Digest;
-
     let options = input.options.as_ref();
     let certificate_authority_arn = input.certificate_authority_arn.clone().unwrap_or_default();
     let managed_by = input.managed_by.clone().unwrap_or_default();
@@ -633,34 +632,24 @@ fn idempotency_key(
         .collect();
     domains.sort_unstable();
 
-    let mut hasher = sha2::Sha256::new();
-    hash_group(&mut hasher, scalars);
-    hash_group(&mut hasher, derived.names.iter().map(String::as_str));
-    hash_group(
-        &mut hasher,
-        derived
-            .tags
-            .iter()
-            .flat_map(|(key, value)| [key.as_str(), value.as_str()]),
-    );
-    hash_group(
-        &mut hasher,
-        domains
-            .iter()
-            .flat_map(|(domain, validation_domain)| [*domain, *validation_domain]),
-    );
-    format!("{token}:{}", hex::encode(hasher.finalize()))
-}
+    let names: Vec<&str> = derived.names.iter().map(String::as_str).collect();
+    let tags: Vec<&str> = derived
+        .tags
+        .iter()
+        .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+        .collect();
+    let validation_domains: Vec<&str> = domains
+        .iter()
+        .flat_map(|(domain, validation_domain)| [*domain, *validation_domain])
+        .collect();
 
-/// Hash one group of fingerprint parts: how many parts it holds, then each part
-/// behind its own length.
-fn hash_group<'a>(hasher: &mut sha2::Sha256, parts: impl IntoIterator<Item = &'a str>) {
-    use sha2::Digest;
-
-    let parts: Vec<&str> = parts.into_iter().collect();
-    hasher.update(parts.len().to_le_bytes());
-    for part in parts {
-        hasher.update(part.len().to_le_bytes());
-        hasher.update(part.as_bytes());
-    }
+    format!(
+        "{token}:{}",
+        crate::state::fingerprint_groups(&[
+            scalars.as_slice(),
+            names.as_slice(),
+            tags.as_slice(),
+            validation_domains.as_slice(),
+        ])
+    )
 }
