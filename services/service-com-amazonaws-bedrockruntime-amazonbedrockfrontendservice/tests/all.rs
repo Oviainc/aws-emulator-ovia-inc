@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/bedrock_runtime_inference.rs"]
 mod bedrock_runtime_inference;
+#[path = "all/bedrock_runtime_request_claim.rs"]
+mod bedrock_runtime_request_claim;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
