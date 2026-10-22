@@ -14,6 +14,9 @@
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 
+#[path = "all/cloud_watch_alarm_template_groups.rs"]
+mod cloud_watch_alarm_template_groups;
+
 #[path = "all/event_bridge_rule_template_groups.rs"]
 mod event_bridge_rule_template_groups;
 
@@ -31,6 +34,12 @@ mod signal_maps;
 
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+
+// Not a suite of its own: the cloudwatch alarm template group request helpers
+// the group suites share, layered on `wire`. Declared because every file under
+// `tests/all/` must be.
+#[path = "all/support.rs"]
+mod support;
 
 /// The shared restJson1 harness the suites above drive the service through.
 #[path = "all/wire.rs"]
