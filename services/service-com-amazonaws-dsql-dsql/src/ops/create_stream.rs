@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStream
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStream`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStream::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and persists a change data capture stream of a cluster: a fresh
+//! lowercase-ULID `streamIdentifier`, the ARN derived from it, the cluster and
+//! the request's region, `CREATING` with the clock owing it `ACTIVE`, and the
+//! target, ordering, format and tags the caller asked for. The target's
+//! `roleArn` has to be a role this account can pass.
 //!
 //! ## Shape of an operation
 //!
@@ -116,13 +113,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `CreateStreamError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#CreateStream")]
+// `AccessDeniedException` and `InternalServerException` are widened in from this
+// service's `common_errors` (AccessDenied / InternalServer / Throttling /
+// Validation), which the per-operation error list does not repeat: an
+// authorization failure — a role this account may not pass — is a 403
+// `AccessDeniedException`, not a shape-level `ValidationException`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#CreateStream",
+    extra_errors = ["InternalServerException", "AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum CreateStreamErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
+    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -176,18 +183,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStream` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStreamErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStream"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateStreamErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        if !state.clusters.contains_key(&input.cluster_identifier) {
+            return Err(CreateStreamErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.cluster_identifier),
+            )
+            .into());
+        }
+
+        // Passing a role is an authorization decision, so it is settled before any
+        // state is touched: a role in another account cannot have its trust
+        // relationship with this service established, and the caller is told that
+        // it may not pass that role rather than that its request was malformed.
+        let role_arn = match &input.target_definition {
+            TargetDefinition::Kinesis(kinesis) => kinesis.role_arn.clone(),
+        };
+        if !is_passable_role(&role_arn) {
+            return Err(CreateStreamErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: "Cross-account pass role is not allowed.".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `@idempotencyToken`: a repeat of the SAME request answers with the stream
+        // the first call minted and mints no second one; the same token with
+        // different parameters is a conflict.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.cluster_identifier.clone(),
+            input.ordering.clone(),
+            input.format.clone(),
+            fingerprint_target(&input.target_definition),
+            crate::state::fingerprint_tags(input.tags.as_ref()),
+        ]);
+        if let Some(token) = input.client_token.as_deref() {
+            match state
+                .tokens_of(crate::state::TokenScope::CreateStream)
+                .verdict(token, &fingerprint)
+            {
+                crate::state::TokenVerdict::Replay(stream_identifier) => {
+                    if let Some(existing) = state
+                        .clusters
+                        .get(&input.cluster_identifier)
+                        .and_then(|cluster| cluster.streams.get(&stream_identifier))
+                    {
+                        return Ok(created_stream_output(&input.cluster_identifier, existing));
+                    }
+                }
+                crate::state::TokenVerdict::Mismatch => {
+                    return Err(CreateStreamErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
+                        resource_id: Some(input.cluster_identifier.clone()),
+                        resource_type: Some("stream".to_string()),
+                    })
+                    .into());
+                }
+                crate::state::TokenVerdict::Unused => {}
+            }
+        }
+
+        let mut stream_identifier = crate::state::new_resource_identifier();
+        let Some(cluster) = state.clusters.get_mut(&input.cluster_identifier) else {
+            return Err(CreateStreamErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.cluster_identifier),
+            )
+            .into());
+        };
+
+        // A cluster the clock still owes a transition, or one on its way out,
+        // cannot take a new stream.
+        if !cluster.accepts_mutation() {
+            return Err(CreateStreamErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "cluster {} cannot take a stream while its status is {}",
+                    cluster.identifier, cluster.status
+                ),
+                resource_id: Some(cluster.identifier.clone()),
+                resource_type: Some("cluster".to_string()),
+            })
+            .into());
+        }
+
+        // Each cluster's stream table is bounded for the same reason the cluster
+        // store is; the modelled quota error is the refusal at the ceiling.
+        if cluster.streams.len() >= crate::state::MAX_STREAMS_PER_CLUSTER {
+            return Err(CreateStreamErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of streams ({}) has already been created for this cluster.",
+                        crate::state::MAX_STREAMS_PER_CLUSTER
+                    ),
+                    resource_id: cluster.identifier.clone(),
+                    resource_type: "stream".to_string(),
+                    service_code: "dsql".to_string(),
+                    quota_code: "streams-per-cluster".to_string(),
+                },
+            )
+            .into());
+        }
+
+        while cluster.streams.contains_key(&stream_identifier) {
+            stream_identifier = crate::state::new_resource_identifier();
+        }
+        let stream = crate::state::Stream {
+            arn: crate::state::stream_arn(&region, &cluster.identifier, &stream_identifier),
+            status: crate::state::STREAM_STATUS_CREATING.to_string(),
+            creation_time: now,
+            ordering: input.ordering.clone(),
+            format: input.format.clone(),
+            target_definition: input.target_definition.clone(),
+            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+            // The clock, not a later caller, owes this stream its ACTIVE status.
+            pending: Some(crate::state::PendingTransition {
+                due_at: now + crate::state::SETTLE_AFTER,
+                next_status: crate::state::STREAM_STATUS_ACTIVE,
+            }),
+            stream_identifier: stream_identifier.clone(),
+        };
+
+        let created = created_stream_output(&input.cluster_identifier, &stream);
+        cluster.streams.insert(stream_identifier.clone(), stream);
+        if let Some(token) = input.client_token {
+            state
+                .tokens(crate::state::TokenScope::CreateStream)
+                .record(token, fingerprint, &stream_identifier);
+        }
+        Ok(created)
+    }
+}
+
+/// `CreateStreamOutput` read off the persisted stream: every member of the output
+/// is a field of the stored record, so a repeat of an idempotent call renders the
+/// same answer from the same state.
+fn created_stream_output(
+    cluster_identifier: &str,
+    stream: &crate::state::Stream,
+) -> CreateStreamOutput {
+    CreateStreamOutput {
+        cluster_identifier: cluster_identifier.to_string(),
+        stream_identifier: stream.stream_identifier.clone(),
+        arn: stream.arn.clone(),
+        status: stream.status.clone(),
+        creation_time: ::aws_smithy_types::DateTime::from(stream.creation_time),
+        ordering: stream.ordering.clone(),
+        format: stream.format.clone(),
+    }
+}
+
+/// Whether this service can pass `role_arn`.
+///
+/// A role is passable only when it belongs to the caller's own account: the
+/// service has to assume it, and a trust relationship with a role in another
+/// account cannot be established from here. The account is the fifth
+/// colon-separated field of an ARN (`arn:aws:iam::<account>:role/...`), which is
+/// the form `RoleArn`'s pattern fixes
+/// (`^arn:aws(-[^:]+)?:iam::[0-9]{12}:role(/[a-zA-Z0-9+=,.@_-]+)+$`,
+/// `smithy_query(query="shape", shape="KinesisTargetDefinition")`).
+fn is_passable_role(role_arn: &str) -> bool {
+    role_arn.split(':').nth(4) == Some(::engine::emulator_account_id())
+}
+
+/// Render a `targetDefinition` into one idempotency-fingerprint part.
+fn fingerprint_target(target: &TargetDefinition) -> String {
+    match target {
+        TargetDefinition::Kinesis(kinesis) => {
+            format!("kinesis:{}:{}", kinesis.stream_arn, kinesis.role_arn)
+        }
     }
 }

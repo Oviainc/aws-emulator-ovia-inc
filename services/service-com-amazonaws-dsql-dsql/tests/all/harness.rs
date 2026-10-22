@@ -1,0 +1,251 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The one wire harness this crate's suites drive the emulator through.
+//!
+//! Every call goes the whole way round — `MultiServiceRouter::dispatch` with a
+//! signed-looking restJson1 request — so the routes, the `@httpLabel` /
+//! `@httpQuery` bindings, the boundary constraint checks and the handlers are all
+//! exercised the way a client exercises them. Suites share it so a route or an
+//! envelope is spelled in one place.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use service_com_amazonaws_dsql_dsql::state::SETTLE_AFTER;
+use smithy_server_runtime::MultiServiceRouter;
+
+/// One emulator plus the region its requests are signed for.
+pub struct Dsql {
+    router: MultiServiceRouter,
+    region: String,
+}
+
+/// One answer from the emulator: the status, the restJson1 error code, and the body.
+pub struct Answer {
+    pub status: u16,
+    pub error: Option<String>,
+    pub body: Value,
+}
+
+impl Answer {
+    /// A string member of the response body, or the empty string when absent.
+    pub fn str(&self, member: &str) -> String {
+        self.body
+            .get(member)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A member of the response body, or `Value::Null` when absent.
+    pub fn get(&self, member: &str) -> Value {
+        self.body.get(member).cloned().unwrap_or(Value::Null)
+    }
+
+    /// The `message` of an error body, whichever casing the envelope used.
+    pub fn message(&self) -> String {
+        for member in ["message", "Message"] {
+            if let Some(message) = self.body.get(member).and_then(Value::as_str) {
+                return message.to_string();
+            }
+        }
+        String::new()
+    }
+}
+
+impl Dsql {
+    pub fn in_region(region: &str) -> Self {
+        // The one shared engine the router builds in production, handed to the
+        // service through its constructor.
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(service_com_amazonaws_dsql_dsql::EmulatedService::new(engine));
+        Self {
+            router,
+            region: region.to_string(),
+        }
+    }
+
+    pub fn new() -> Self {
+        Self::in_region("us-east-1")
+    }
+
+    /// The region this emulator's requests are signed for.
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    pub async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
+        let payload = body
+            .map(|v| serde_json::to_vec(&v).expect("a JSON body serializes"))
+            .unwrap_or_default();
+        let request = ::http::Request::builder()
+            .method(method)
+            .uri(format!("https://dsql.{}.amazonaws.com{path}", self.region))
+            // The routing key and the region both come from the SigV4 credential
+            // scope, exactly as they do for an SDK request.
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTESTTEST/20260101/{}/dsql/aws4_request, \
+                     SignedHeaders=host;x-amz-date, Signature=0123456789abcdef",
+                    self.region
+                ),
+            )
+            .header("content-type", "application/json")
+            .body(::bytes::Bytes::from(payload))
+            .expect("the request builds");
+
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let error = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let raw = response.into_body();
+        let body = if raw.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&raw).unwrap_or(Value::Null)
+        };
+        let error = error.or_else(|| {
+            body.get("__type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        Answer {
+            status,
+            error,
+            body,
+        }
+    }
+
+    pub async fn create(&self, body: Value) -> Answer {
+        self.call("POST", "/cluster", Some(body)).await
+    }
+
+    pub async fn get(&self, identifier: &str) -> Answer {
+        self.call("GET", &format!("/cluster/{identifier}"), None).await
+    }
+
+    pub async fn update(&self, identifier: &str, body: Value) -> Answer {
+        self.call("POST", &format!("/cluster/{identifier}"), Some(body))
+            .await
+    }
+
+    pub async fn delete(&self, identifier: &str) -> Answer {
+        self.call("DELETE", &format!("/cluster/{identifier}"), None)
+            .await
+    }
+
+    pub async fn list(&self, query: &str) -> Answer {
+        self.call("GET", &format!("/cluster{query}"), None).await
+    }
+
+    pub async fn get_policy(&self, identifier: &str) -> Answer {
+        self.call("GET", &format!("/cluster/{identifier}/policy"), None)
+            .await
+    }
+
+    pub async fn put_policy(&self, identifier: &str, body: Value) -> Answer {
+        self.call(
+            "POST",
+            &format!("/cluster/{identifier}/policy"),
+            Some(body),
+        )
+        .await
+    }
+
+    pub async fn delete_policy(&self, identifier: &str, query: &str) -> Answer {
+        self.call(
+            "DELETE",
+            &format!("/cluster/{identifier}/policy{query}"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn create_stream(&self, cluster_identifier: &str, body: Value) -> Answer {
+        self.call(
+            "POST",
+            &format!("/stream/{cluster_identifier}"),
+            Some(body),
+        )
+        .await
+    }
+
+    pub async fn get_stream(&self, cluster_identifier: &str, stream_identifier: &str) -> Answer {
+        self.call(
+            "GET",
+            &format!("/stream/{cluster_identifier}/{stream_identifier}"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn tag_resource(&self, resource_arn: &str, body: Value) -> Answer {
+        // `resourceArn` is an `@httpLabel`, so its colons and slashes travel
+        // percent-encoded the way an SDK sends them.
+        self.call(
+            "POST",
+            &format!("/tags/{}", percent_encode_label(resource_arn)),
+            Some(body),
+        )
+        .await
+    }
+
+    /// Create a cluster that accepts a mutation straight away: deletion protection
+    /// off, and the clock's `CREATING -> ACTIVE` transition already settled.
+    pub async fn create_settled(&self) -> String {
+        let created = self.create(json!({"deletionProtectionEnabled": false})).await;
+        assert_eq!(
+            created.status, 200,
+            "CreateCluster must succeed, got {} {:?}",
+            created.status, created.body
+        );
+        wait_for_the_clock().await;
+        created.str("identifier")
+    }
+}
+
+/// Percent-encode the characters an ARN carries that a URI path segment does not.
+pub fn percent_encode_label(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            ':' => "%3A".to_string(),
+            '/' => "%2F".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// Let the clock's pending transition come due. The emulator never sleeps for it —
+/// it stores the due instant — so a test that wants the settled state waits past it.
+pub async fn wait_for_the_clock() {
+    ::tokio::time::sleep(SETTLE_AFTER + Duration::from_millis(150)).await;
+}
+
+/// `ClusterId`'s `^[a-z0-9]{26}$`.
+pub fn is_cluster_id(value: &str) -> bool {
+    value.len() == 26
+        && value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// The ARN `ClusterArn`'s pattern requires for `identifier` in `region`.
+pub fn expected_arn(region: &str, identifier: &str) -> String {
+    format!(
+        "arn:aws:dsql:{region}:{}:cluster/{identifier}",
+        engine::EMULATOR_ACCOUNT_ID
+    )
+}
+
+/// A syntactically valid cluster id for a cluster that was never created.
+pub fn absent_identifier() -> String {
+    "zzzzzzzzzzzzzzzzzzzzzzzzzz".to_string()
+}

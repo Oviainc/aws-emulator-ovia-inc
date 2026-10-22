@@ -157,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetClusterErrorModeled::InternalServerException(
                 InternalServerException {
@@ -168,12 +167,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx);
         let mut state = state.lock();
         state.settle(std::time::SystemTime::now());
 
         let Some(cluster) = state.clusters.get(&input.identifier) else {
             return Err(GetClusterErrorModeled::ResourceNotFoundException(
-                crate::state::cluster_not_found(&input.identifier),
+                crate::state::cluster_not_found(&region, &input.identifier),
             )
             .into());
         };

@@ -5,8 +5,9 @@
 //! Mints and persists a cluster: a fresh lowercase-ULID `identifier`, the ARN and
 //! endpoint derived from it and the request's region, `CREATING` with the clock
 //! owing it `ACTIVE`, and the `tags` / `kmsEncryptionKey` / `multiRegionProperties`
-//! / `policy` the caller supplied. A repeated `clientToken` returns the cluster the
-//! first call minted rather than minting a second one.
+//! / `policy` the caller supplied. A repeated `clientToken` with the same
+//! parameters returns the cluster the first call minted rather than minting a
+//! second one; the same token with different parameters is refused as a conflict.
 //!
 //! ## Shape of an operation
 //!
@@ -216,15 +217,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        // `@idempotencyToken`: a repeat of the same call returns the result of the
-        // original one and has no additional effect.
+        // `@idempotencyToken`: a repeat of the SAME request returns the result of
+        // the original call and has no additional effect; the same token with
+        // DIFFERENT parameters is a different request wearing a used token, which
+        // is a conflict rather than a retry.
+        let fingerprint = create_fingerprint(&input);
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(existing) = state
-                .create_client_tokens
-                .get(token)
-                .and_then(|identifier| state.clusters.get(identifier))
+            match state
+                .tokens_of(crate::state::TokenScope::CreateCluster)
+                .verdict(token, &fingerprint)
             {
-                return Ok(created_cluster_output(existing));
+                crate::state::TokenVerdict::Replay(identifier) => {
+                    if let Some(existing) = state.clusters.get(&identifier) {
+                        return Ok(created_cluster_output(existing));
+                    }
+                }
+                crate::state::TokenVerdict::Mismatch => {
+                    return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
+                        resource_id: None,
+                        resource_type: Some("cluster".to_string()),
+                    })
+                    .into());
+                }
+                crate::state::TokenVerdict::Unused => {}
             }
         }
 
@@ -249,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let identifier = state.mint_cluster_identifier();
-        let cluster = crate::state::Cluster {
+        let mut cluster = crate::state::Cluster {
             arn: crate::state::cluster_arn(&region, &identifier),
             status: crate::state::STATUS_CREATING.to_string(),
             creation_time: now,
@@ -262,10 +278,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             multi_region_properties: input.multi_region_properties.clone(),
             endpoint: Some(crate::state::cluster_endpoint(&region, &identifier)),
             tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
-            // A policy supplied at creation is stored with its first version, so
-            // GetClusterPolicy has it to report once that operation is implemented.
-            policy_version: input.policy.as_ref().map(|_| "1".to_string()),
-            policy: input.policy.clone(),
+            policy: None,
+            policy_versions_issued: 0,
+            streams: std::collections::BTreeMap::new(),
             // The clock, not a later caller, owes this cluster its ACTIVE status.
             pending: Some(crate::state::PendingTransition {
                 due_at: now + crate::state::SETTLE_AFTER,
@@ -274,14 +289,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             delete_client_token: None,
             identifier: identifier.clone(),
         };
+        // A policy supplied at creation is attached with its first version, so
+        // `GetClusterPolicy` reports it exactly as it reports one `PutClusterPolicy`
+        // attached.
+        if let Some(document) = input.policy.clone() {
+            let version = cluster.next_policy_version();
+            cluster.policy = Some(crate::state::ClusterPolicy { document, version });
+        }
 
         let created = created_cluster_output(&cluster);
         state.clusters.insert(identifier.clone(), cluster);
         if let Some(token) = input.client_token {
-            state.record_create_token(token, &identifier);
+            state
+                .tokens(crate::state::TokenScope::CreateCluster)
+                .record(token, fingerprint, &identifier);
         }
         Ok(created)
     }
+}
+
+/// The parameters a `CreateCluster` `clientToken` is bound to: every member of
+/// the request except the token itself, so a retry carrying the same token is
+/// recognised only when it asks for the same cluster.
+fn create_fingerprint(input: &CreateClusterInput) -> String {
+    crate::state::request_fingerprint(&[
+        input.deletion_protection_enabled.to_string(),
+        input.kms_encryption_key.clone().unwrap_or_default(),
+        crate::state::fingerprint_multi_region(input.multi_region_properties.as_ref()),
+        input.policy.clone().unwrap_or_default(),
+        input.bypass_policy_lockout_safety_check.to_string(),
+        crate::state::fingerprint_tags(input.tags.as_ref()),
+    ])
 }
 
 /// `CreateClusterOutput` read off a persisted cluster: every member of the output

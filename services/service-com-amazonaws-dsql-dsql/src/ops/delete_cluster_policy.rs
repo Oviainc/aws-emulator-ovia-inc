@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteClusterPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteClusterPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteClusterPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches the resource-based policy from a cluster and answers with the
+//! `policyVersion` it removed, so a later `GetClusterPolicy` is
+//! `ResourceNotFoundException` again. A cluster with no policy attached has
+//! nothing to delete, which is a 404 rather than a silent success.
 //!
 //! ## Shape of an operation
 //!
@@ -87,12 +83,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `DeleteClusterPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#DeleteClusterPolicy")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#DeleteClusterPolicy",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteClusterPolicyErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -146,18 +146,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteClusterPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteClusterPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteClusterPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        if !state.clusters.contains_key(&input.identifier) {
+            return Err(DeleteClusterPolicyErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.identifier),
+            )
+            .into());
+        }
+
+        // `@idempotencyToken`: a retry of the SAME delete answers with the version
+        // the first call removed instead of the 404 a second, independent delete
+        // gets; the same token for a different delete is a conflict.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.identifier.clone(),
+            input.expected_policy_version.clone().unwrap_or_default(),
+        ]);
+        if let Some(token) = input.client_token.as_deref() {
+            match state
+                .tokens_of(crate::state::TokenScope::DeleteClusterPolicy)
+                .verdict(token, &fingerprint)
+            {
+                crate::state::TokenVerdict::Replay(removed_version) => {
+                    return Ok(DeleteClusterPolicyOutput {
+                        policy_version: removed_version,
+                    });
+                }
+                crate::state::TokenVerdict::Mismatch => {
+                    return Err(DeleteClusterPolicyErrorModeled::ConflictException(
+                        ConflictException {
+                            message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
+                            resource_id: Some(input.identifier.clone()),
+                            resource_type: Some("cluster".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::TokenVerdict::Unused => {}
+            }
+        }
+
+        let Some(cluster) = state.clusters.get_mut(&input.identifier) else {
+            return Err(DeleteClusterPolicyErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.identifier),
+            )
+            .into());
+        };
+
+        // Nothing attached: there is no policy, and no version, to delete.
+        let Some(attached) = cluster.policy.as_ref().map(|policy| policy.version.clone()) else {
+            return Err(DeleteClusterPolicyErrorModeled::ResourceNotFoundException(
+                match input.expected_policy_version.as_deref() {
+                    Some(expected) => crate::state::cluster_policy_version_not_found(
+                        &input.identifier,
+                        expected,
+                    ),
+                    None => crate::state::cluster_policy_not_found(&input.identifier),
+                },
+            )
+            .into());
+        };
+
+        // `expectedPolicyVersion` is the caller's claim about what it is deleting:
+        // a claim about another version must not delete this one.
+        if let Some(expected) = input.expected_policy_version.as_deref() {
+            if expected != attached {
+                return Err(DeleteClusterPolicyErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "The policy version of cluster {} is not {expected}.",
+                            cluster.identifier
+                        ),
+                        resource_id: Some(cluster.identifier.clone()),
+                        resource_type: Some("policy".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        cluster.policy = None;
+
+        if let Some(token) = input.client_token {
+            state
+                .tokens(crate::state::TokenScope::DeleteClusterPolicy)
+                .record(token, fingerprint, &attached);
+        }
+        Ok(DeleteClusterPolicyOutput {
+            policy_version: attached,
+        })
     }
 }

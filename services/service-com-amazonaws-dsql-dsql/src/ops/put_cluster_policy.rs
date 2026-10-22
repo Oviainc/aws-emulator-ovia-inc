@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutClusterPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutClusterPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutClusterPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a resource-based policy document to a cluster and answers with the
+//! `policyVersion` token it was stored under. Unless the caller sets
+//! `bypassPolicyLockoutSafetyCheck`, a document that would leave nobody able to
+//! replace it is refused; an `expectedPolicyVersion` that does not name the
+//! version currently attached is refused too, so two concurrent writers cannot
+//! lose one another's document.
 //!
 //! ## Shape of an operation
 //!
@@ -95,12 +93,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // here — hence the `PutClusterPolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dsql#PutClusterPolicy")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.dsql#PutClusterPolicy",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum PutClusterPolicyErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -154,18 +156,303 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutClusterPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutClusterPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutClusterPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutClusterPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the dsql cluster store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        if !state.clusters.contains_key(&input.identifier) {
+            return Err(PutClusterPolicyErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.identifier),
+            )
+            .into());
+        }
+
+        // `@idempotencyToken`: a repeat of the SAME request answers with the
+        // version the first call stored and attaches nothing further; the same
+        // token with a different document is a conflict.
+        let fingerprint = crate::state::request_fingerprint(&[
+            input.identifier.clone(),
+            input.policy.clone(),
+            input.bypass_policy_lockout_safety_check.to_string(),
+            input.expected_policy_version.clone().unwrap_or_default(),
+        ]);
+        if let Some(token) = input.client_token.as_deref() {
+            match state
+                .tokens_of(crate::state::TokenScope::PutClusterPolicy)
+                .verdict(token, &fingerprint)
+            {
+                crate::state::TokenVerdict::Replay(identifier) => {
+                    if let Some(version) = state
+                        .clusters
+                        .get(&identifier)
+                        .and_then(|cluster| cluster.policy.as_ref())
+                        .map(|policy| policy.version.clone())
+                    {
+                        return Ok(PutClusterPolicyOutput {
+                            policy_version: version,
+                        });
+                    }
+                }
+                crate::state::TokenVerdict::Mismatch => {
+                    return Err(PutClusterPolicyErrorModeled::ConflictException(
+                        ConflictException {
+                            message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
+                            resource_id: Some(input.identifier.clone()),
+                            resource_type: Some("cluster".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::TokenVerdict::Unused => {}
+            }
+        }
+
+        // The document has to be a policy before any of it can be reasoned about.
+        let document = parse_policy(&input.policy).ok_or_else(|| {
+            PutClusterPolicyError::from(PutClusterPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: "The policy is not a valid JSON policy document.".to_string(),
+                    reason: REASON_CANNOT_PARSE.to_string(),
+                    field_list: None,
+                },
+            ))
+        })?;
+
+        // The lockout safety check: a document that denies every principal the
+        // action that replaces it can never be replaced, so it is refused unless
+        // the caller explicitly accepts that risk. Nothing is attached when it is.
+        if !input.bypass_policy_lockout_safety_check && locks_out_every_principal(&document) {
+            return Err(PutClusterPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "The policy would prevent every principal from calling \
+                         {POLICY_MANAGEMENT_ACTION} on this cluster. Set \
+                         bypassPolicyLockoutSafetyCheck to true to apply it anyway."
+                    ),
+                    reason: REASON_OTHER.to_string(),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        let Some(cluster) = state.clusters.get_mut(&input.identifier) else {
+            return Err(PutClusterPolicyErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.identifier),
+            )
+            .into());
+        };
+
+        // A cluster on its way out takes no new policy.
+        if cluster.status == crate::state::STATUS_DELETING {
+            return Err(PutClusterPolicyErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "cluster {} cannot take a policy while its status is {}",
+                    cluster.identifier, cluster.status
+                ),
+                resource_id: Some(cluster.identifier.clone()),
+                resource_type: Some("cluster".to_string()),
+            })
+            .into());
+        }
+
+        // `expectedPolicyVersion` is the caller's claim about what it is
+        // replacing: a claim about a policy that is not there is a 404, and one
+        // about a version that is no longer current is a conflict.
+        if let Some(expected) = input.expected_policy_version.as_deref() {
+            match cluster.policy.as_ref() {
+                None => {
+                    return Err(PutClusterPolicyErrorModeled::ResourceNotFoundException(
+                        crate::state::cluster_policy_version_not_found(&input.identifier, expected),
+                    )
+                    .into());
+                }
+                Some(policy) if policy.version != expected => {
+                    return Err(PutClusterPolicyErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "The policy version of cluster {} is not {expected}.",
+                                cluster.identifier
+                            ),
+                            resource_id: Some(cluster.identifier.clone()),
+                            resource_type: Some("policy".to_string()),
+                        },
+                    )
+                    .into());
+                }
+                Some(_) => {}
+            }
+        }
+
+        let version = cluster.next_policy_version();
+        cluster.policy = Some(crate::state::ClusterPolicy {
+            document: input.policy.clone(),
+            version: version.clone(),
+        });
+
+        if let Some(token) = input.client_token {
+            state
+                .tokens(crate::state::TokenScope::PutClusterPolicy)
+                .record(token, fingerprint, &input.identifier);
+        }
+        Ok(PutClusterPolicyOutput {
+            policy_version: version,
+        })
     }
+}
+
+/// `ValidationExceptionReason` values this operation answers with
+/// (`smithy_query(query="shape", shape="ValidationExceptionReason")`:
+/// unknownOperation | cannotParse | fieldValidationFailed |
+/// deletionProtectionEnabled | other).
+const REASON_CANNOT_PARSE: &str = "cannotParse";
+/// See [`REASON_CANNOT_PARSE`].
+const REASON_OTHER: &str = "other";
+
+/// The action a principal needs to replace a cluster's policy — the one the
+/// lockout safety check is about. A policy that denies this to everybody can
+/// never be replaced.
+const POLICY_MANAGEMENT_ACTION: &str = "dsql:PutClusterPolicy";
+
+/// Parse a `PolicyDocument` into its JSON object, or `None` when it is not one.
+fn parse_policy(document: &str) -> Option<::serde_json::Map<String, ::serde_json::Value>> {
+    match ::serde_json::from_str::<::serde_json::Value>(document) {
+        Ok(::serde_json::Value::Object(object)) => Some(object),
+        _ => None,
+    }
+}
+
+/// Whether `document` denies EVERY principal the action that replaces it, which
+/// is what the lockout safety check exists to catch.
+///
+/// Read the way an IAM resource policy is read: an explicit `Deny` beats every
+/// `Allow`, so a `Deny` statement that covers all principals, covers
+/// [`POLICY_MANAGEMENT_ACTION`], covers this resource and carries no `Condition`
+/// narrowing it leaves nobody able to call that action again.
+fn locks_out_every_principal(document: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
+    statements(document).iter().any(|statement| {
+        effect_is(statement, "Deny")
+            && !statement.contains_key("Condition")
+            && covers_every_principal(statement)
+            && covers_management_action(statement)
+            && covers_every_resource(statement)
+    })
+}
+
+/// The `Statement` elements of a policy document: IAM accepts a single statement
+/// object as well as a list of them.
+fn statements(
+    document: &::serde_json::Map<String, ::serde_json::Value>,
+) -> Vec<::serde_json::Map<String, ::serde_json::Value>> {
+    match document.get("Statement") {
+        Some(::serde_json::Value::Array(entries)) => entries
+            .iter()
+            .filter_map(|entry| entry.as_object().cloned())
+            .collect(),
+        Some(::serde_json::Value::Object(one)) => vec![one.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the statement's `Effect` is `effect`, case-insensitively as IAM reads
+/// it.
+fn effect_is(statement: &::serde_json::Map<String, ::serde_json::Value>, effect: &str) -> bool {
+    statement
+        .get("Effect")
+        .and_then(::serde_json::Value::as_str)
+        .is_some_and(|stated| stated.eq_ignore_ascii_case(effect))
+}
+
+/// Whether the statement applies to every principal: `"Principal": "*"`, or a
+/// `Principal` block whose `AWS` entry is `*`.
+fn covers_every_principal(statement: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
+    match statement.get("Principal") {
+        Some(::serde_json::Value::String(principal)) => principal == "*",
+        Some(::serde_json::Value::Object(block)) => block
+            .values()
+            .flat_map(string_values)
+            .any(|principal| principal == "*"),
+        _ => false,
+    }
+}
+
+/// Whether the statement's `Action` set covers [`POLICY_MANAGEMENT_ACTION`].
+/// `NotAction` is the complement, so it covers the action unless it names it.
+fn covers_management_action(statement: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
+    if let Some(actions) = statement.get("Action") {
+        return string_values(actions)
+            .iter()
+            .any(|action| matches_pattern(action, POLICY_MANAGEMENT_ACTION));
+    }
+    if let Some(not_actions) = statement.get("NotAction") {
+        return !string_values(not_actions)
+            .iter()
+            .any(|action| matches_pattern(action, POLICY_MANAGEMENT_ACTION));
+    }
+    false
+}
+
+/// Whether the statement's `Resource` set covers the cluster the policy is being
+/// attached to. An absent `Resource` is the whole resource in a resource-based
+/// policy, which is this cluster.
+fn covers_every_resource(statement: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
+    match statement.get("Resource") {
+        None => true,
+        Some(resources) => string_values(resources)
+            .iter()
+            .any(|resource| resource.contains('*')),
+    }
+}
+
+/// Every string in a JSON value that IAM accepts as a string or a list of them.
+fn string_values(value: &::serde_json::Value) -> Vec<String> {
+    match value {
+        ::serde_json::Value::String(one) => vec![one.clone()],
+        ::serde_json::Value::Array(many) => many
+            .iter()
+            .filter_map(::serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether an IAM pattern (`*` matches any run of characters, `?` any one)
+/// matches `candidate`, case-insensitively as IAM matches action names.
+fn matches_pattern(pattern: &str, candidate: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let candidate: Vec<char> = candidate.to_ascii_lowercase().chars().collect();
+    // Classic two-cursor wildcard match: on a mismatch, fall back to the last
+    // `*` and let it consume one more character. Linear in the candidate.
+    let (mut p, mut c) = (0usize, 0usize);
+    let mut star: Option<usize> = None;
+    let mut resume = 0usize;
+    while c < candidate.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            p += 1;
+            resume = c;
+        } else if p < pattern.len() && (pattern[p] == '?' || pattern[p] == candidate[c]) {
+            p += 1;
+            c += 1;
+        } else if let Some(last_star) = star {
+            p = last_star + 1;
+            resume += 1;
+            c = resume;
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|symbol| *symbol == '*')
 }

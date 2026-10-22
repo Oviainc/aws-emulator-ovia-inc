@@ -6,6 +6,9 @@
 //! only the members the request carries, and moves it to `UPDATING` with the clock
 //! owing it `ACTIVE` again. Unknown identifier -> `ResourceNotFoundException` (404);
 //! a cluster in a status that does not accept a mutation -> `ConflictException` (409).
+//! A repeat of the same `clientToken` with the same parameters is the same request,
+//! so it answers from the cluster the first call acted on — ahead of that status
+//! gate; the same token with different parameters -> `ConflictException` (409).
 //!
 //! ## Shape of an operation
 //!
@@ -207,9 +210,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
+        if !state.clusters.contains_key(&input.identifier) {
+            return Err(UpdateClusterErrorModeled::ResourceNotFoundException(
+                crate::state::cluster_not_found(&region, &input.identifier),
+            )
+            .into());
+        }
+
+        // `@idempotencyToken`: a repeat of the SAME request is the same request,
+        // so it answers from the cluster the first call acted on — ahead of the
+        // status gate below, which would otherwise refuse the retry for the very
+        // `UPDATING` status the first call put the cluster into. The same token
+        // with DIFFERENT parameters is a conflict, and leaves the first request's
+        // setting in place.
+        let fingerprint = update_fingerprint(&input);
+        if let Some(token) = input.client_token.as_deref() {
+            match state
+                .tokens_of(crate::state::TokenScope::UpdateCluster)
+                .verdict(token, &fingerprint)
+            {
+                crate::state::TokenVerdict::Replay(identifier) => {
+                    if let Some(existing) = state.clusters.get(&identifier) {
+                        return Ok(updated_cluster_output(existing));
+                    }
+                }
+                crate::state::TokenVerdict::Mismatch => {
+                    return Err(UpdateClusterErrorModeled::ConflictException(ConflictException {
+                        message: crate::state::CLIENT_TOKEN_MISMATCH_MESSAGE.to_string(),
+                        resource_id: Some(input.identifier.clone()),
+                        resource_type: Some("cluster".to_string()),
+                    })
+                    .into());
+                }
+                crate::state::TokenVerdict::Unused => {}
+            }
+        }
+
         let Some(cluster) = state.clusters.get_mut(&input.identifier) else {
             return Err(UpdateClusterErrorModeled::ResourceNotFoundException(
-                crate::state::cluster_not_found(&input.identifier),
+                crate::state::cluster_not_found(&region, &input.identifier),
             )
             .into());
         };
@@ -252,11 +291,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_status: crate::state::STATUS_ACTIVE,
         });
 
-        Ok(UpdateClusterOutput {
-            identifier: cluster.identifier.clone(),
-            arn: cluster.arn.clone(),
-            status: cluster.status.clone(),
-            creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
-        })
+        let updated = updated_cluster_output(cluster);
+        if let Some(token) = input.client_token {
+            state
+                .tokens(crate::state::TokenScope::UpdateCluster)
+                .record(token, fingerprint, &input.identifier);
+        }
+        Ok(updated)
     }
+}
+
+/// `UpdateClusterOutput` read off the persisted cluster, so a replayed request
+/// renders the same answer from the same state.
+fn updated_cluster_output(cluster: &crate::state::Cluster) -> UpdateClusterOutput {
+    UpdateClusterOutput {
+        identifier: cluster.identifier.clone(),
+        arn: cluster.arn.clone(),
+        status: cluster.status.clone(),
+        creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
+    }
+}
+
+/// The parameters an `UpdateCluster` `clientToken` is bound to: the cluster it
+/// addresses plus every member it may change, so a retry carrying the same token
+/// is recognised only when it asks for the same change.
+fn update_fingerprint(input: &UpdateClusterInput) -> String {
+    crate::state::request_fingerprint(&[
+        input.identifier.clone(),
+        input
+            .deletion_protection_enabled
+            .map(|enabled| enabled.to_string())
+            .unwrap_or_default(),
+        input.kms_encryption_key.clone().unwrap_or_default(),
+        crate::state::fingerprint_multi_region(input.multi_region_properties.as_ref()),
+    ])
 }
