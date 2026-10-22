@@ -24,7 +24,9 @@ use smithy_server_runtime::MultiServiceRouter;
 ///
 /// This module's harness (`emulator`, `call`, `ok`, `error` and the small value
 /// helpers) is shared with the sibling suites in `tests/all/`, so every suite
-/// drives the same emulator over the same wire protocol.
+/// drives the same emulator over the same wire protocol. A suite that needs to
+/// call as a NAMED principal uses `crate::wire`, which signs with a given access
+/// key id over this same protocol.
 pub(crate) const REGION: &str = "us-west-2";
 
 /// Build the emulator the way the router does: one shared engine, this service
@@ -47,51 +49,19 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 }
 
 /// Send one awsJson1_1 request: `POST /` with `X-Amz-Target:
-/// CodeCommit_20150413.<Operation>` (the crate's OPERATIONS.md "Wire protocol").
+/// CodeCommit_20150413.<Operation>` (the crate's OPERATIONS.md "Wire protocol"),
+/// signed with the default access key id.
 pub(crate) async fn call(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("https://codecommit.us-west-2.amazonaws.com/")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("CodeCommit_20150413.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTKEY/20260101/{REGION}/codecommit/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let payload: Value = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or_else(|error| {
-            panic!(
-                "operation {operation}: response body is not JSON ({error}): {:?}",
-                String::from_utf8_lossy(response.body())
-            )
-        })
-    };
-    (status, payload)
+    crate::wire::call_as(router, crate::wire::DEFAULT_ACCESS_KEY_ID, operation, body).await
 }
 
 /// A successful call's payload, with the status asserted.
 pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
-    let (status, payload) = call(router, operation, body).await;
-    assert_eq!(
-        status, 200,
-        "operation {operation}: expected 200, got {status} with {payload}"
-    );
-    payload
+    crate::wire::ok_as(router, crate::wire::DEFAULT_ACCESS_KEY_ID, operation, body).await
 }
 
 /// The modeled error code of a failed call, with the status asserted. awsJson
@@ -102,31 +72,14 @@ pub(crate) async fn error(
     body: &Value,
     expected_status: u16,
 ) -> String {
-    let (status, payload) = call(router, operation, body).await;
-    assert_eq!(
-        status, expected_status,
-        "operation {operation}: expected HTTP {expected_status}, got {status} with {payload}"
-    );
-    payload
-        .get("__type")
-        .and_then(Value::as_str)
-        .map(|shape| shape.rsplit('#').next().unwrap_or(shape).to_string())
-        .unwrap_or_else(|| panic!("operation {operation}: no __type in {payload}"))
-}
-
-/// The object name of a blob — the git object encoding `"blob <len>\0<content>"`,
-/// hashed and truncated to the 20 bytes an object name is wide — computed here
-/// independently of the service, so `blobId` is checked against the rule rather
-/// than against itself.
-pub(crate) fn git_blob_id(content: &[u8]) -> String {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(format!("blob {}\0", content.len()).as_bytes());
-    hasher.update(content);
-    hex::encode(&hasher.finalize()[..20])
-}
-
-pub(crate) fn is_object_id(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+    crate::wire::error_as(
+        router,
+        crate::wire::DEFAULT_ACCESS_KEY_ID,
+        operation,
+        body,
+        expected_status,
+    )
+    .await
 }
 
 /// A UUID in its canonical textual form: 8-4-4-4-12 hex characters.
@@ -156,6 +109,21 @@ pub(crate) fn string_at(payload: &Value, pointer: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("expected a string at {pointer} in {payload}"))
         .to_string()
+}
+
+/// The object name of a blob — the git object encoding `"blob <len>\0<content>"`,
+/// hashed and truncated to the 20 bytes an object name is wide — computed here
+/// independently of the service, so `blobId` is checked against the rule rather
+/// than against itself.
+pub(crate) fn git_blob_id(content: &[u8]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(format!("blob {}\0", content.len()).as_bytes());
+    hasher.update(content);
+    hex::encode(&hasher.finalize()[..20])
+}
+
+pub(crate) fn is_object_id(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// One row of the lifecycle table: a repository and the single file written into it.
