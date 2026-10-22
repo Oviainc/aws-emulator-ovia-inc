@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TestIdentityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TestIdentityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TestIdentityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Resolves the `ServerId` against stored state and answers the refusal that server's
+//! configuration earns: an unknown server is not found, and a server that delegates
+//! authentication to NOTHING — its `IdentityProviderType` is Transfer's own
+//! `SERVICE_MANAGED` user store — has no identity provider for this call to test, so
+//! it is refused with the modelled `InvalidRequestException`.
+//!
+//! A server that DOES delegate authentication names a customer-run provider (an API
+//! Gateway endpoint, a Lambda function, a directory). Testing it means CALLING it,
+//! which this emulator cannot do, and `StatusCode`/`Response` are the provider's own
+//! answer — so that branch answers the scaffold's 501 rather than reporting a status
+//! for a call nothing made.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +185,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TestIdentityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TestIdentityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        use crate::state as st;
+
+        // This operation reads no request metadata; the engine comes from `self`.
+        let _ = ctx;
+        let state = st::service_state(&*self.engine).ok_or_else(|| {
+            TestIdentityProviderErrorModeled::InternalServiceError(InternalServiceError {
+                message: "the transfer service state is unavailable".to_string(),
+            })
+        })?;
+
+        let guard = state.lock();
+
+        // "If you enter a Server ID for the --server-id parameter that does not
+        // identify an actual Transfer server, you receive the following error: ...
+        // (ResourceNotFoundException) ... Unknown server."
+        let Some(server) = guard.servers.get(&input.server_id) else {
+            return Err(st::not_found(
+                TestIdentityProviderErrorModeled::ResourceNotFoundException(st::unknown_server(
+                    &input.server_id,
+                )),
+            ));
+        };
+
+        // The gate is the server's IdentityProviderType, and nothing else about the
+        // request: "You cannot use TestIdentityProvider if the IdentityProviderType of
+        // your server is SERVICE_MANAGED" — there is no customer identity provider to
+        // call — so every other member of the request is irrelevant to this refusal.
+        if !st::is_external_identity_provider(&server.identity_provider_type) {
+            return Err(TestIdentityProviderErrorModeled::InvalidRequestException(
+                st::not_configured_for_external_auth(&input.server_id),
+            )
+            .into());
+        }
+
+        // Past the gate the server delegates authentication to a customer-run provider,
+        // and this operation's whole answer — `Url`, `StatusCode`, `Response`,
+        // `Message` — is that provider's response to an authentication attempt. The
+        // emulator makes no outbound connection and runs no customer identity provider,
+        // so there is no such response to report: answering the 501 says exactly that,
+        // where a synthesised `StatusCode` would report a call nothing made.
         Err(crate::scaffolded::Scaffolded::not_implemented("TestIdentityProvider"))
     }
 }
