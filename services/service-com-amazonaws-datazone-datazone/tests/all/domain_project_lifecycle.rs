@@ -27,9 +27,8 @@ pub(crate) const SETTLED: std::time::Duration = std::time::Duration::from_millis
 /// One emulator: a single shared engine behind the DataZone service, driven over HTTP.
 ///
 /// `pub(crate)` because every suite in this test target drives the service the same
-/// way: the sibling suites (`tests/all/update_project.rs`,
-/// `tests/all/glossary_lifecycle.rs`, `tests/all/project_memberships.rs`) reuse this
-/// harness instead of copying it.
+/// way: the sibling suites declared in `tests/all.rs` reuse this harness instead of
+/// copying it (so adding one needs no edit here).
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
@@ -1093,15 +1092,20 @@ async fn each_store_is_bounded_and_refuses_with_the_modelled_quota_error() {
     );
 }
 
-/// Percent-encode a query-parameter value: only the characters the project-name cases
-/// use beyond the unreserved set need escaping.
-fn urlencode(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| match c {
-            ' ' => "%20".to_string(),
-            c if c.is_ascii_alphanumeric() || "-_.~".contains(c) => c.to_string(),
-            c => format!("%{:02X}", c as u32),
-        })
-        .collect()
+/// Percent-encode a value for use as one path segment or a query-parameter value:
+/// every byte outside RFC 3986's unreserved set is escaped, so the `:` and `/` of an
+/// ARN stay inside a single segment and a `+` in a tag key is never read as a space.
+///
+/// `pub(crate)` so the sibling suites in this test target share this one encoder.
+pub(crate) fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(*byte));
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }

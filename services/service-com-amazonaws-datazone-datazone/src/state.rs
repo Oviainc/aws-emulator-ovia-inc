@@ -388,6 +388,36 @@ pub const MAX_GLOSSARIES_PER_DOMAIN: usize = 500;
 /// with the same refusal (`CreateAssetType` models `ServiceQuotaExceededException` too).
 pub const MAX_ASSET_TYPES_PER_DOMAIN: usize = 500;
 
+/// The most tags this emulator keeps on one resource.
+///
+/// A CHOSEN ceiling, not a published quota: `TagResource` is a caller-driven growth
+/// site (the keys come from the request), so the per-resource tag set has to be
+/// bounded or a tag loop grows the emulator's heap without limit. The refusal once a
+/// request would cross it is `ValidationException`, the client-input error
+/// `TagResource` models.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The ARN namespace this service's resources live in: `arnNamespace` on the model's
+/// `aws.api#service` trait (`smithy_query(query="service_info")`).
+pub const ARN_NAMESPACE: &str = "datazone";
+
+/// Whether `candidate` has the shape of an ARN of THIS service —
+/// `arn:<partition>:datazone:<region>:<account>:<resource>`.
+///
+/// `resourceArn` is modelled as a plain `String` with no pattern, so the boundary
+/// validator passes any text at all and the handler is where a string that cannot
+/// name a DataZone resource is recognised. Region and account may be empty (an ARN
+/// is allowed to omit either), the partition and the resource part may not.
+pub fn is_service_arn(candidate: &str) -> bool {
+    let mut fields = candidate.splitn(6, ':');
+    fields.next() == Some("arn")
+        && fields.next().is_some_and(|partition| !partition.is_empty())
+        && fields.next() == Some(ARN_NAMESPACE)
+        && fields.next().is_some()
+        && fields.next().is_some()
+        && fields.next().is_some_and(|resource| !resource.is_empty())
+}
+
 /// The hard ceiling on remembered `@idempotencyToken`s.
 ///
 /// The token keys are CALLER-supplied, so the map is a caller-driven growth site and
@@ -609,6 +639,39 @@ impl ComAmazonawsDatazoneDatazoneState {
         self.domains
             .get(id)
             .filter(|d| d.status != DOMAIN_STATUS_DELETING)
+    }
+
+    /// The tag set of the resource `arn` names, when this emulator stores that
+    /// resource.
+    ///
+    /// The lookup is by the ARN the store itself minted for the resource, so every
+    /// stored resource that carries one is reachable by exactly the ARN its own
+    /// create/get reports — and a resource in a non-terminal status is still stored,
+    /// so it is still taggable until its delete completes. That is deliberately the
+    /// reach of `GetDomain`, which reports a `DELETING` domain and its tags rather
+    /// than 404ing on it, so the tagging operations and the resource's own reader
+    /// agree on which resources exist; [`Self::live_domain`] is the narrower lookup,
+    /// for operations that must not hang a NEW resource off a dying domain.
+    ///
+    /// Only the domain is reachable today, because it is the only resource this store
+    /// keeps an ARN for: [`Project`] and [`AssetType`] mint none, so no DataZone
+    /// resource ARN can name one. (A project's `resource_tags` field is the modelled
+    /// `resourceTags` member — project metadata, not the AWS resource tags these
+    /// operations manage.) A later resource that stores an `arn` and a tag set joins
+    /// this same lookup rather than getting a tag map of its own.
+    pub fn resource_tags(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
+        self.domains
+            .values()
+            .find(|domain| domain.arn == arn)
+            .map(|domain| &domain.tags)
+    }
+
+    /// The same lookup as [`Self::resource_tags`], for a tag write.
+    pub fn resource_tags_mut(&mut self, arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        self.domains
+            .values_mut()
+            .find(|domain| domain.arn == arn)
+            .map(|domain| &mut domain.tags)
     }
 }
 

@@ -19,6 +19,8 @@ mod domain_project_lifecycle;
 mod glossary_lifecycle;
 #[path = "all/project_memberships.rs"]
 mod project_memberships;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/update_project.rs"]

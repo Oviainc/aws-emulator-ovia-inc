@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the tags in the request are MERGED into the tag set of the resource
+//! `resourceArn` names, so a key already present takes the new value and every other
+//! stored key is left alone. The tag set lives on the stored resource itself
+//! (`ComAmazonawsDatazoneDatazoneState::resource_tags_mut`), which is the same set
+//! `ListTagsForResource`, `UntagResource` and `GetDomain` report.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +135,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        use crate::state::{is_service_arn, now_ms, MAX_TAGS_PER_RESOURCE};
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        store.settle_clock(now_ms());
+
+        // `resourceArn` carries no modelled pattern, so text that is not an ARN of
+        // this service reaches the handler: it names no resource whatever the store
+        // holds, which is a bad request rather than a missing resource.
+        if !is_service_arn(&input.resource_arn) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "resourceArn {} is not an Amazon DataZone resource ARN",
+                    input.resource_arn
+                ),
+            })
+            .into());
+        }
+
+        // AWS reserves tag keys beginning `aws:` for system tags across every
+        // service: a caller cannot set, change or remove one. The modelled `TagKey`
+        // pattern (`^[\w \.:/=+@-]+$`) admits the prefix, so the refusal lives here,
+        // and it is made BEFORE the resource is resolved so the whole request is
+        // refused without touching the store.
+        if let Some(reserved) = input
+            .tags
+            .keys()
+            .find(|key| key.to_ascii_lowercase().starts_with("aws:"))
+        {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!("tag key {reserved} uses the reserved prefix aws:"),
+            })
+            .into());
+        }
+
+        let stored = store.resource_tags_mut(&input.resource_arn).ok_or_else(|| {
+            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("Resource {} was not found", input.resource_arn),
+            })
+        })?;
+
+        // Merged into a copy first, so a request that would cross the per-resource
+        // bound is refused WHOLE and leaves the stored set exactly as it was.
+        let mut merged = stored.clone();
+        merged.extend(input.tags);
+        if merged.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "a resource carries at most {MAX_TAGS_PER_RESOURCE} tags in this emulator"
+                ),
+            })
+            .into());
+        }
+        *stored = merged;
+
+        Ok(TagResourceOutput {})
     }
 }
