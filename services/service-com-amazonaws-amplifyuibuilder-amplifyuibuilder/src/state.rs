@@ -26,10 +26,11 @@
 //!
 //! The form and the theme are the control plane's other app-environment
 //! resources, held the same way: `CreateForm` mints a form, `UpdateForm` merges
-//! into it and `GetForm` reports it from the single [`StoredForm`] record,
-//! `CreateTheme` mints a theme and `GetTheme` reports it from the single
-//! [`StoredTheme`] record, both keyed by the same (appId, environmentName) a
-//! component is keyed by and both with the projection the model asks for.
+//! into it, `GetForm` reports it from the single [`StoredForm`] record and
+//! `DeleteForm` removes that record; `CreateTheme` mints a theme and `GetTheme`
+//! reports it from the single [`StoredTheme`] record, both keyed by the same
+//! (appId, environmentName) a component is keyed by and both with the projection
+//! the model asks for.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -115,7 +116,9 @@ pub const METADATA_ENVIRONMENT_QUOTA: usize = 1_000;
 /// Amplify UI Builder publishes no form quota this emulator can quote, so — like
 /// [`COMPONENT_QUOTA`] — this is the emulator's OWN bound on the store rather
 /// than a claim about any account's limit, set far above any workflow an
-/// emulator serves.
+/// emulator serves. Every record it bounds is released by `DeleteForm`, which
+/// also forgets that form's client tokens, so neither the form map nor the token
+/// map can outgrow this bound.
 pub const FORM_QUOTA: usize = 1_000;
 
 /// How many themes the store holds before `CreateTheme` refuses with the
@@ -733,6 +736,41 @@ impl ComAmazonawsAmplifyuibuilderAmplifyuibuilderState {
     /// Remember that `token` created the form `id` in that app environment.
     pub fn remember_form_token(&mut self, key: EnvironmentKey, token: String, id: String) {
         self.form_tokens.insert((key, token), id);
+    }
+
+    /// Whether `id` names a form some OTHER app environment owns.
+    ///
+    /// A form is addressed by (appId, environmentName, id) exactly as a component
+    /// is, so an id that resolves outside the app environment the request named is
+    /// a request made in the wrong scope — told apart here from an id that names no
+    /// form at all, which is simply absent. The component counterpart is
+    /// [`Self::component_in_other_scope`].
+    pub fn form_in_other_scope(&self, app_id: &str, environment_name: &str, id: &str) -> bool {
+        self.forms
+            .iter()
+            .filter(|((app, environment), _)| app != app_id || environment != environment_name)
+            .any(|(_, forms)| forms.iter().any(|form| form.id == id))
+    }
+
+    /// Remove the form `id` names from the app environment the request addressed,
+    /// and forget every client token that named it so the token map cannot outlive
+    /// the record (the same bookkeeping [`Self::remove_component`] does).
+    pub fn remove_form(
+        &mut self,
+        app_id: &str,
+        environment_name: &str,
+        id: &str,
+    ) -> Option<StoredForm> {
+        let key = (app_id.to_string(), environment_name.to_string());
+        let forms = self.forms.get_mut(&key)?;
+        let index = forms.iter().position(|form| form.id == id)?;
+        let removed = forms.remove(index);
+        if forms.is_empty() {
+            self.forms.remove(&key);
+        }
+        self.form_tokens
+            .retain(|(token_key, _), token_id| !(*token_key == key && token_id == id));
+        Some(removed)
     }
 
     /// How many forms the whole store holds — what [`FORM_QUOTA`] bounds.

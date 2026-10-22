@@ -2,8 +2,9 @@
 
 //! @op GetForm
 //! Reports the form a create persisted: the record comes from [`crate::state`] and is
-//! reported unchanged, and an id that names no form in the app environment the request
-//! addressed is refused with the modelled `ResourceNotFoundException`.
+//! reported unchanged, an id that names no form anywhere is refused with the modelled
+//! `ResourceNotFoundException` (404) and an id a DIFFERENT app environment owns with the
+//! modelled `InvalidParameterException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -150,6 +151,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         let Some(form) = store.form(&input.app_id, &input.environment_name, &input.id) else {
+            // Two different failures, told apart by where the id resolves — the same
+            // two `GetComponent` tells apart, because a form is addressed by
+            // (appId, environmentName, id) exactly as a component is: an id a
+            // DIFFERENT app environment owns is a request made in the wrong scope
+            // (the modelled `InvalidParameterException`, 400), while an id that names
+            // no form anywhere is absent (the modelled `ResourceNotFoundException`,
+            // 404).
+            if store.form_in_other_scope(&input.app_id, &input.environment_name, &input.id) {
+                return Err(GetFormErrorModeled::InvalidParameterException(
+                    crate::state::item_wrong_scope(),
+                )
+                .into());
+            }
             return Err(GetFormErrorModeled::ResourceNotFoundException(
                 crate::state::item_not_found(),
             )
