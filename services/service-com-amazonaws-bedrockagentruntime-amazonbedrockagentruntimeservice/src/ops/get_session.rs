@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored session named by `sessionIdentifier` (a bare
+//! session UUID or a session ARN). Reporting only: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +161,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSession"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the session store is unavailable".to_string()),
+                    reason: None,
+                },
+            )
+            .into());
+        };
+
+        let guard = state.lock();
+        let key = crate::state::session_id_from_identifier(&input.session_identifier);
+        let Some(session) = guard.sessions.get(key) else {
+            return Err(GetSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Session with identifier {} was not found.",
+                        input.session_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetSessionOutput {
+            session_id: session.session_id.clone(),
+            session_arn: session.session_arn.clone(),
+            session_status: session.status.as_wire().to_string(),
+            created_at: session.created_at,
+            last_updated_at: session.last_updated_at,
+            // Reported exactly as stored: an absent member stays absent, a stored
+            // empty map is reported as an empty map.
+            session_metadata: session.session_metadata.as_ref().map(|metadata| {
+                metadata
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            }),
+            encryption_key_arn: session.encryption_key_arn.clone(),
+        })
     }
 }
