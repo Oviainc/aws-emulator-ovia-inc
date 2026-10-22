@@ -192,24 +192,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An image's identity is the sha256 digest of its manifest, so a digest the
         // caller supplied is a claim about the bytes it sent and is checked against them.
         let digest = crate::state::manifest_digest(&input.image_manifest);
-        if let Some(claimed) = input
-            .image_digest
-            .as_deref()
-            .filter(|claimed| !claimed.is_empty())
-        {
-            if claimed != digest {
-                return Err(PutImageErrorModeled::ImageDigestDoesNotMatchException(
-                    ImageDigestDoesNotMatchException {
-                        message: Some(format!(
-                            "The image digest '{claimed}' does not match the digest of the \
-                             supplied manifest ('{digest}')"
-                        )),
-                    },
-                )
-                .into());
-            }
-        }
-
         // The manifest carries its own media types: `mediaType` is the manifest's, and
         // `config.mediaType` is the artifact's. A request that declares
         // `imageManifestMediaType` overrides the former; neither is invented when the
@@ -232,19 +214,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pushed_at = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        if let Some(registry_id) = input.registry_id.as_deref() {
-            if !store.is_this_registry(registry_id) {
-                return Err(PutImageErrorModeled::RegistryNotFoundException(
-                    RegistryNotFoundException {
+        let registry_id = store.registry_id.clone();
+
+        // The claim is refused naming the digest, repository and registry the request
+        // itself carried; the digest the manifest actually hashes to is this registry's
+        // own computation and is not reported back.
+        if let Some(claimed) = input
+            .image_digest
+            .as_deref()
+            .filter(|claimed| !claimed.is_empty())
+        {
+            if claimed != digest {
+                return Err(PutImageErrorModeled::ImageDigestDoesNotMatchException(
+                    ImageDigestDoesNotMatchException {
                         message: Some(format!(
-                            "The registry with id or alias '{registry_id}' does not exist"
+                            "The image with digest '{claimed}' in repository '{}' and registry \
+                             ID '{registry_id}' does not match the image digest that Amazon ECR \
+                             has calculated.",
+                            input.repository_name
                         )),
                     },
                 )
                 .into());
             }
         }
-        let registry_id = store.registry_id.clone();
+
+        if let Some(requested_registry) = input.registry_id.as_deref() {
+            if !store.is_this_registry(requested_registry) {
+                return Err(PutImageErrorModeled::RegistryNotFoundException(
+                    RegistryNotFoundException {
+                        message: Some(format!(
+                            "The registry with id or alias '{requested_registry}' does not exist"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
         let Some(repository) = store.repositories.get_mut(&input.repository_name) else {
             return Err(PutImageErrorModeled::RepositoryNotFoundException(
                 RepositoryNotFoundException {

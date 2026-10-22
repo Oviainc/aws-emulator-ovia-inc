@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutMetadataFlag
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutMetadataFlag`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutMetadataFlag::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores one UI-builder metadata feature flag for an app environment: the value is
+//! persisted in [`crate::state`] and reported by `GetMetadata`. A `featureName` outside
+//! the feature catalogue the service holds is refused rather than stored.
 //!
 //! ## Shape of an operation
 //!
@@ -66,6 +60,12 @@
 //!   for the input parameter.
 //! * `UnauthorizedException` (HTTP 401) — You don't have permission to perform this
 //!   operation.
+//! * `ServiceQuotaExceededException` (HTTP 402) — widened in through `extra_errors` (see
+//!   below): the shape is this service's own, and it is how this emulator refuses a write
+//!   past its own bound on the metadata store.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   the shape is this service's own, and it is how an unreachable shared store is
+//!   reported, as in every sibling handler of this crate.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -105,10 +105,29 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutMetadataFlagOutput {
 // here — hence the `PutMetadataFlagError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.amplifyuibuilder#PutMetadataFlag")]
+// `InternalServerException` and `ServiceQuotaExceededException` are widened in
+// through `extra_errors`, both shapes this SERVICE models and both declared in
+// `types/shared_types.rs`:
+//
+// * `InternalServerException` (HTTP 500) — an unreachable shared store is a
+//   server-side condition, not a malformed request, so it is reported as the
+//   server failure every sibling handler in this crate reports it as
+//   (`CreateComponent`, `GetComponent`, `UpdateComponent` all list it).
+// * `ServiceQuotaExceededException` (HTTP 402) — `appId` and `environmentName`
+//   are request-supplied `@httpLabel` values, so the metadata store this
+//   operation writes is bounded like the component store
+//   (`crate::state::METADATA_ENVIRONMENT_QUOTA`), and past that bound the write is
+//   refused rather than growing the state without end. `CreateComponent`, which
+//   lists the shape, uses it for the same emulator bound.
+#[smithy_macros::operation_error(
+    "com.amazonaws.amplifyuibuilder#PutMetadataFlag",
+    extra_errors = ["InternalServerException", "ServiceQuotaExceededException"]
+)]
 #[derive(Debug)]
 pub enum PutMetadataFlagErrorModeled {
+    InternalServerException(InternalServerException),
     InvalidParameterException(InvalidParameterException),
+    ServiceQuotaExceededException(ServiceQuotaExceededException),
     UnauthorizedException(UnauthorizedException),
 }
 
@@ -163,18 +182,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutMetadataFlag` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutMetadataFlagErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutMetadataFlag"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable shared store is a server-side condition: it is
+            // reported as the server failure, not as a refusal of the request,
+            // which satisfied every constraint the model declares.
+            return Err(PutMetadataFlagErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the amplifyuibuilder metadata store is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `featureName` is an `@httpLabel` targeting a plain `String`, so the
+        // model cannot express which names exist: the service holds a fixed
+        // catalogue of feature flags (`crate::state::METADATA_FEATURES`, the set
+        // `GetMetadata` reports), and a name outside it is an invalid parameter
+        // rather than a new feature to store.
+        if !crate::state::is_known_metadata_feature(&input.feature_name) {
+            return Err(PutMetadataFlagErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!("Feature {} is not valid", input.feature_name)),
+                },
+            )
+            .into());
+        }
+
+        let key = (input.app_id, input.environment_name);
+        let mut store = state.lock();
+
+        // The store is bounded, the way the component store is: `appId` and
+        // `environmentName` come from the request, so without a bound every
+        // request naming a fresh pair would add an entry nothing releases. Past
+        // the bound a write that would START an app environment's metadata is
+        // refused; a write to one the store already holds always proceeds.
+        if !store.can_hold_metadata_for(&key) {
+            return Err(PutMetadataFlagErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this emulator already holds metadata for the maximum of {} app \
+                         environments",
+                        crate::state::METADATA_ENVIRONMENT_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.set_metadata_flag(key, input.feature_name, input.body.new_value);
+        // `PutMetadataFlag`'s response shape is `Unit`: the answer is the status
+        // alone, and the stored value is read back through `GetMetadata`.
+        Ok(PutMetadataFlagOutput)
     }
 }

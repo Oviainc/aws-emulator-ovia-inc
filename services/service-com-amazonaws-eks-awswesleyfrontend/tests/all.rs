@@ -15,5 +15,7 @@
 mod access_policy_catalog;
 #[path = "all/cluster_lifecycle.rs"]
 mod cluster_lifecycle;
+#[path = "all/encryption_config_association.rs"]
+mod encryption_config_association;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
