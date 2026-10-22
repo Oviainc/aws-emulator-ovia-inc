@@ -171,16 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
         if merged.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            // The refusal carries `TooManyTagsException`'s one fixed message and
+            // reports the resource at the limit in the modelled `resourceName`,
+            // so nothing of the request (the count, the offending key) is
+            // spliced into prose a client can only regex.
             return Err(TagResourceErrorModeled::TooManyTagsException(
-                TooManyTagsException {
-                    message: Some(format!(
-                        "the request would leave this resource with {} tags, over the limit of {}; \
-                         use UntagResource to remove existing tags",
-                        merged.len(),
-                        crate::state::MAX_TAGS_PER_RESOURCE
-                    )),
-                    resource_name: Some(input.resource_arn.clone()),
-                },
+                crate::ops::too_many_tags(&input.resource_arn),
             )
             .into());
         }

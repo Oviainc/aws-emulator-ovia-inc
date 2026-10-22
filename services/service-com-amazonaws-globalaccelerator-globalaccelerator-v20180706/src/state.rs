@@ -3,20 +3,24 @@
 //! Engine state for the com-amazonaws-globalaccelerator-globalaccelerator-v20180706 service.
 //!
 //! The accelerator control plane this emulator serves: accelerators, their
-//! listeners, their attributes, and the bookkeeping the create paths need
-//! (idempotency tokens and the static-IP pool). Every handler computes its
-//! response from these records; nothing is canned.
+//! listeners, those listeners' endpoint groups, their attributes, and the
+//! bookkeeping the create paths need (idempotency tokens and the static-IP
+//! pool). Every handler computes its response from these records; nothing is
+//! canned.
 //!
 //! Shared helpers live here rather than in a new top-level module because
 //! `src/lib.rs` is generated and declares the module list.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hasher;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Accelerator, IpSet, Listener, PortRange, Tag};
+use crate::ops::types::{
+    Accelerator, EndpointConfiguration, EndpointDescription, EndpointGroup, IpSet, Listener,
+    PortOverride, PortRange, Tag,
+};
 
 /// `AcceleratorStatus` values, from the model enum of the same name
 /// (`ACCELERATOR_STATUS_VALUES` in `ops::types`).
@@ -40,6 +44,46 @@ pub const IP_FAMILY_IPV6: &str = "IPv6";
 /// (`Listener$ClientAffinity` doc).
 pub const CLIENT_AFFINITY_NONE: &str = "NONE";
 
+/// `HealthCheckProtocol`'s documented default: "The default value is TCP"
+/// (`EndpointGroup$HealthCheckProtocol` doc). One of `HEALTH_CHECK_PROTOCOL_VALUES`
+/// in `ops::types`.
+pub const HEALTH_CHECK_PROTOCOL_TCP: &str = "TCP";
+/// See [`HEALTH_CHECK_PROTOCOL_TCP`]: the two protocols that health-check a path.
+pub const HEALTH_CHECK_PROTOCOL_HTTP: &str = "HTTP";
+/// See [`HEALTH_CHECK_PROTOCOL_HTTP`].
+pub const HEALTH_CHECK_PROTOCOL_HTTPS: &str = "HTTPS";
+
+/// The `HealthState` of an endpoint this emulator has not health-checked, from the
+/// model enum of the same name (`HEALTH_STATE_VALUES` in `ops::types`).
+pub const HEALTH_STATE_INITIAL: &str = "INITIAL";
+
+/// `TrafficDialPercentage`'s documented default: "The default value is 100"
+/// (`CreateEndpointGroup$TrafficDialPercentage` doc).
+pub const DEFAULT_TRAFFIC_DIAL_PERCENTAGE: f32 = 100.0;
+
+/// `ThresholdCount`'s documented default: "The default value is 3"
+/// (`CreateEndpointGroup$ThresholdCount` doc).
+pub const DEFAULT_THRESHOLD_COUNT: i32 = 3;
+
+/// `HealthCheckIntervalSeconds`'s documented default: "The default value is 30"
+/// (`CreateEndpointGroup$HealthCheckIntervalSeconds` doc).
+pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS: i32 = 30;
+
+/// The only two health-check intervals the service accepts: "The time—10 seconds or
+/// 30 seconds—between each health check for an endpoint"
+/// (`CreateEndpointGroup$HealthCheckIntervalSeconds` doc). The model's `@range`
+/// (10..30) admits every value in between, so the pair is enforced in the handler.
+pub const SUPPORTED_HEALTH_CHECK_INTERVALS: [i32; 2] = [10, 30];
+
+/// `HealthCheckPath`'s documented default: "The default value is slash (/)"
+/// (`CreateEndpointGroup$HealthCheckPath` doc).
+pub const DEFAULT_HEALTH_CHECK_PATH: &str = "/";
+
+/// The weight an endpoint carries when the caller names none: "By default, all
+/// endpoints have a weight of 128" (Endpoint weights, Global Accelerator Developer
+/// Guide — the page `EndpointConfiguration$Weight` links to).
+pub const DEFAULT_ENDPOINT_WEIGHT: i32 = 128;
+
 /// The documented maximum length of an accelerator name: "The name can have a
 /// maximum of 64 characters" (`CreateAccelerator$Name` doc).
 pub const ACCELERATOR_NAME_MAX_LEN: usize = 64;
@@ -55,13 +99,34 @@ pub const MAX_ACCELERATORS_PER_ACCOUNT: usize = 20;
 /// accelerator: 10", AWS Global Accelerator service quotas). Refused the same way.
 pub const MAX_LISTENERS_PER_ACCELERATOR: usize = 10;
 
+/// Endpoint groups one accelerator can hold, across every one of its listeners: the
+/// service's documented default quota ("Endpoint groups per accelerator: 10", AWS
+/// Global Accelerator service quotas). A create past it is refused with the modelled
+/// `LimitExceededException`, which is also what bounds this store: `EndpointGroupRegion`
+/// is a free string, so without this cap a caller could add endpoint groups without
+/// limit.
+pub const MAX_ENDPOINT_GROUPS_PER_ACCELERATOR: usize = 10;
+
+/// Endpoints one endpoint group can hold: the model's own `@length` on
+/// `EndpointConfigurations` (0..10), which is also the service's documented quota
+/// ("Endpoints per endpoint group: 10", AWS Global Accelerator service quotas). The
+/// boundary validator refuses a longer list before a handler runs; it is re-checked in
+/// [`endpoints_from_configurations`] so neither the work that helper does nor the vector
+/// the store holds is proportional to a length the caller chose.
+pub const MAX_ENDPOINTS_PER_ENDPOINT_GROUP: usize = 10;
+
+/// Port overrides one endpoint group can hold: the model's own `@length` on
+/// `PortOverrides` (0..10). Re-checked in [`port_overrides_to_pairs`] for the reason
+/// [`MAX_ENDPOINTS_PER_ENDPOINT_GROUP`] gives.
+pub const MAX_PORT_OVERRIDES_PER_ENDPOINT_GROUP: usize = 10;
+
 /// The most idempotency records the store can hold: one per resource that can exist.
 /// [`ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State::prune_idempotency`]
 /// keeps the invariant that every record points at a LIVE resource, so the map is
 /// bounded by the two quotas above rather than by how many tokens a caller has ever
 /// sent.
-pub const MAX_IDEMPOTENCY_RECORDS: usize =
-    MAX_ACCELERATORS_PER_ACCOUNT * (1 + MAX_LISTENERS_PER_ACCELERATOR);
+pub const MAX_IDEMPOTENCY_RECORDS: usize = MAX_ACCELERATORS_PER_ACCOUNT
+    * (1 + MAX_LISTENERS_PER_ACCELERATOR + MAX_ENDPOINT_GROUPS_PER_ACCELERATOR);
 
 /// The largest page any list returns, and the page it returns when the caller names
 /// no `MaxResults`: the model's own `MaxResults` upper bound (range 1..100). A request
@@ -186,9 +251,19 @@ pub struct StoredListener {
     pub protocol: String,
     /// A `ClientAffinity` value: `NONE` or `SOURCE_IP`.
     pub client_affinity: String,
+    /// The ARNs of this listener's endpoint groups, in creation order.
+    pub endpoint_group_arns: Vec<String>,
 }
 
 impl StoredListener {
+    /// The port a health check goes to when the caller names no `HealthCheckPort`:
+    /// "The default port is the port for the listener that this endpoint group is
+    /// associated with. If the listener port is a list, Global Accelerator uses the
+    /// first specified port in the list of ports." (`EndpointGroup$HealthCheckPort`.)
+    pub fn default_health_check_port(&self) -> Option<i32> {
+        self.port_ranges.first().map(|&(from, _)| from)
+    }
+
     /// This record as the modelled `Listener`.
     pub fn to_wire(&self) -> Listener {
         Listener {
@@ -204,6 +279,95 @@ impl StoredListener {
             ),
             protocol: Some(self.protocol.clone()),
             client_affinity: Some(self.client_affinity.clone()),
+        }
+    }
+}
+
+/// One endpoint of an endpoint group, as persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEndpoint {
+    /// `EndpointId` — the resource the endpoint names.
+    pub endpoint_id: String,
+    /// `Weight`, defaulted to [`DEFAULT_ENDPOINT_WEIGHT`] when the caller names none.
+    pub weight: i32,
+    /// `ClientIPPreservationEnabled`, only when the caller set it: the documented
+    /// default depends on the endpoint's own type ("true for Application Load
+    /// Balancer endpoints"), which this emulator cannot know, so an unset value stays
+    /// unset rather than being invented.
+    pub client_ip_preservation_enabled: Option<bool>,
+}
+
+impl StoredEndpoint {
+    /// This endpoint as the modelled `EndpointDescription`.
+    ///
+    /// `HealthState` is always [`HEALTH_STATE_INITIAL`], the state AWS reports before
+    /// an endpoint's first health checks complete: this emulator runs no health checks
+    /// against the named resource, so reporting `HEALTHY` or `UNHEALTHY` would report
+    /// the outcome of a check nothing performed. `HealthReason` is left unset — the
+    /// model's own `EndpointDescription$HealthReason` doc says it "Returns a null
+    /// result".
+    pub fn to_wire(&self) -> EndpointDescription {
+        EndpointDescription {
+            endpoint_id: Some(self.endpoint_id.clone()),
+            weight: Some(self.weight),
+            health_state: Some(HEALTH_STATE_INITIAL.to_string()),
+            health_reason: None,
+            client_ip_preservation_enabled: self.client_ip_preservation_enabled,
+        }
+    }
+}
+
+/// An endpoint group, as persisted.
+#[derive(Debug, Clone)]
+pub struct StoredEndpointGroup {
+    /// `EndpointGroupArn` — also this record's key in the state's `endpoint_groups`
+    /// map.
+    pub arn: String,
+    /// The ARN of the listener this endpoint group belongs to.
+    pub listener_arn: String,
+    /// `EndpointGroupRegion`: "A listener can have only one endpoint group in a
+    /// specific Region" (`CreateEndpointGroup$EndpointGroupRegion`).
+    pub endpoint_group_region: String,
+    /// The group's endpoints, in the order they were configured.
+    pub endpoints: Vec<StoredEndpoint>,
+    pub traffic_dial_percentage: f32,
+    /// Absent only when the listener it defaulted from names no port at all.
+    pub health_check_port: Option<i32>,
+    /// A `HealthCheckProtocol` value: `TCP`, `HTTP` or `HTTPS`.
+    pub health_check_protocol: String,
+    /// `HealthCheckPath`, which only an HTTP/HTTPS health check has.
+    pub health_check_path: Option<String>,
+    /// One of [`SUPPORTED_HEALTH_CHECK_INTERVALS`].
+    pub health_check_interval_seconds: i32,
+    pub threshold_count: i32,
+    /// `PortOverrides`, as `(ListenerPort, EndpointPort)` pairs.
+    pub port_overrides: Vec<(i32, i32)>,
+}
+
+impl StoredEndpointGroup {
+    /// This record as the modelled `EndpointGroup`.
+    pub fn to_wire(&self) -> EndpointGroup {
+        EndpointGroup {
+            endpoint_group_arn: Some(self.arn.clone()),
+            endpoint_group_region: Some(self.endpoint_group_region.clone()),
+            endpoint_descriptions: Some(
+                self.endpoints.iter().map(StoredEndpoint::to_wire).collect(),
+            ),
+            traffic_dial_percentage: Some(self.traffic_dial_percentage),
+            health_check_port: self.health_check_port,
+            health_check_protocol: Some(self.health_check_protocol.clone()),
+            health_check_path: self.health_check_path.clone(),
+            health_check_interval_seconds: Some(self.health_check_interval_seconds),
+            threshold_count: Some(self.threshold_count),
+            port_overrides: Some(
+                self.port_overrides
+                    .iter()
+                    .map(|&(listener_port, endpoint_port)| PortOverride {
+                        listener_port: Some(listener_port),
+                        endpoint_port: Some(endpoint_port),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -227,14 +391,18 @@ pub struct ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
     /// Listeners by `ListenerArn`; the parent's `listener_arns` holds the
     /// per-accelerator order.
     pub listeners: BTreeMap<String, StoredListener>,
+    /// Endpoint groups by `EndpointGroupArn`; the parent listener's
+    /// `endpoint_group_arns` holds the per-listener order.
+    pub endpoint_groups: BTreeMap<String, StoredEndpointGroup>,
     /// Flow-log attributes by `AcceleratorArn`.
     pub accelerator_attributes: BTreeMap<String, StoredAcceleratorAttributes>,
     /// `<kind>:<scope>:<IdempotencyToken>` -> the ARN that token already minted, so a
     /// repeated create returns the same resource instead of a second one. The scope is
     /// what the token identifies a create request WITHIN: an accelerator's token is
     /// account-scoped (`accelerator:<token>`), a listener's is scoped to its parent
-    /// accelerator (`listener:<AcceleratorArn>:<token>`), so one token cannot replay a
-    /// resource that hangs off a different parent.
+    /// accelerator (`listener:<AcceleratorArn>:<token>`) and an endpoint group's to its
+    /// parent listener (`endpoint-group:<ListenerArn>:<token>`), so one token cannot
+    /// replay a resource that hangs off a different parent.
     pub idempotency: HashMap<String, String>,
     /// Next offset into the static-IPv4 pool, so allocated addresses are unique.
     pub next_ipv4: u32,
@@ -281,6 +449,21 @@ impl ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
         format_uuid(mix(sequence, nanos, 0), mix(sequence, nanos, 1))
     }
 
+    /// How many endpoint groups an accelerator holds across every one of its
+    /// listeners — what [`MAX_ENDPOINT_GROUPS_PER_ACCELERATOR`] bounds.
+    pub fn endpoint_group_count(&self, accelerator_arn: &str) -> usize {
+        self.accelerators
+            .get(accelerator_arn)
+            .map_or(0, |accelerator| {
+                accelerator
+                    .listener_arns
+                    .iter()
+                    .filter_map(|listener_arn| self.listeners.get(listener_arn))
+                    .map(|listener| listener.endpoint_group_arns.len())
+                    .sum()
+            })
+    }
+
     /// Drop every idempotency record whose resource is gone.
     ///
     /// This is the release path for [`Self::idempotency`]: a record is only useful
@@ -293,11 +476,14 @@ impl ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
         let Self {
             accelerators,
             listeners,
+            endpoint_groups,
             idempotency,
             ..
         } = self;
         idempotency.retain(|_, minted| {
-            accelerators.contains_key(minted) || listeners.contains_key(minted)
+            accelerators.contains_key(minted)
+                || listeners.contains_key(minted)
+                || endpoint_groups.contains_key(minted)
         });
         debug_assert!(idempotency.len() <= MAX_IDEMPOTENCY_RECORDS);
     }
@@ -345,6 +531,14 @@ pub fn listener_idempotency_key(accelerator_arn: &str, token: &str) -> String {
     format!("listener:{accelerator_arn}:{token}")
 }
 
+/// An `IdempotencyToken` key for `CreateEndpointGroup`.
+///
+/// Scoped by the PARENT listener, for the reason [`listener_idempotency_key`] gives:
+/// the same token sent against a different listener is a different create request.
+pub fn endpoint_group_idempotency_key(listener_arn: &str, token: &str) -> String {
+    format!("endpoint-group:{listener_arn}:{token}")
+}
+
 /// Mint an accelerator ARN and the DNS label that goes with it.
 ///
 /// The DNS naming convention is the model's own (`Accelerator$DnsName`): "A
@@ -376,6 +570,14 @@ pub fn dual_stack_dns_name(label: &str) -> String {
 pub fn mint_listener_arn(accelerator_arn: &str, uuid: &str) -> String {
     let id: String = uuid.chars().filter(|c| *c != '-').take(8).collect();
     format!("{accelerator_arn}/listener/{id}")
+}
+
+/// Mint an endpoint group ARN under its parent listener, the form
+/// `<listener arn>/endpoint-group/<id>` — the shape the service's own ARNs have
+/// (`.../accelerator/<id>/listener/<id>/endpoint-group/<id>`).
+pub fn mint_endpoint_group_arn(listener_arn: &str, uuid: &str) -> String {
+    let id: String = uuid.chars().filter(|c| *c != '-').take(8).collect();
+    format!("{listener_arn}/endpoint-group/{id}")
 }
 
 /// Refuse a name the real service refuses.
@@ -434,6 +636,140 @@ pub fn validate_port_range(range: &PortRange) -> Result<(i32, i32), String> {
     Ok((from, to))
 }
 
+/// A caller-supplied `HealthCheckIntervalSeconds`, validated.
+///
+/// The rule is the model's own doc for `HealthCheckIntervalSeconds`: "The time—10
+/// seconds or 30 seconds—between each health check for an endpoint", so the only
+/// accepted values are [`SUPPORTED_HEALTH_CHECK_INTERVALS`]. The `@range` on the shape
+/// (10..30) is the enclosing interval, not the set, so every value strictly between the
+/// two reaches a handler and is refused here. Returns the message to put on an
+/// `InvalidArgumentException`.
+pub fn validate_health_check_interval(seconds: i32) -> Result<(), String> {
+    if SUPPORTED_HEALTH_CHECK_INTERVALS.contains(&seconds) {
+        return Ok(());
+    }
+    let supported = SUPPORTED_HEALTH_CHECK_INTERVALS
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(" or ");
+    Err(format!(
+        "HealthCheckIntervalSeconds {seconds} is not supported: the time between each health \
+         check is {supported} seconds"
+    ))
+}
+
+/// The health-check path an endpoint group ends up with.
+///
+/// A path only belongs to an HTTP/S health check — "If the protocol is HTTP/S, then
+/// this specifies the path that is the destination for health check targets. The
+/// default value is slash (/)" (`CreateEndpointGroup$HealthCheckPath`) — so a group
+/// the caller gave no path gets [`DEFAULT_HEALTH_CHECK_PATH`] under `HTTP`/`HTTPS` and
+/// no path at all under `TCP`, which pings a port rather than a path. A path the caller
+/// did supply is kept whatever the protocol.
+pub fn resolve_health_check_path(supplied: Option<String>, protocol: &str) -> Option<String> {
+    match supplied {
+        Some(path) => Some(path),
+        None => (protocol == HEALTH_CHECK_PROTOCOL_HTTP || protocol == HEALTH_CHECK_PROTOCOL_HTTPS)
+            .then(|| DEFAULT_HEALTH_CHECK_PATH.to_string()),
+    }
+}
+
+/// A `PortOverrides` list as the `(ListenerPort, EndpointPort)` pairs the store holds.
+///
+/// A port override maps one listener port to one endpoint port (`PortOverride` doc), so
+/// an entry missing either end maps nothing, a port outside the model's `PortNumber`
+/// range (1..65535) is not a port, and the same listener port named twice would map one
+/// arriving port to two endpoint ports. The list is refused past
+/// [`MAX_PORT_OVERRIDES_PER_ENDPOINT_GROUP`] BEFORE it is walked, so neither the work
+/// here nor the stored vector is proportional to a length the caller chose. Returns the
+/// message for an `InvalidArgumentException`.
+pub fn port_overrides_to_pairs(overrides: &[PortOverride]) -> Result<Vec<(i32, i32)>, String> {
+    if overrides.len() > MAX_PORT_OVERRIDES_PER_ENDPOINT_GROUP {
+        return Err(format!(
+            "PortOverrides holds {} entries; an endpoint group has at most \
+             {MAX_PORT_OVERRIDES_PER_ENDPOINT_GROUP} port overrides",
+            overrides.len()
+        ));
+    }
+    let mut seen_listener_ports: HashSet<i32> = HashSet::with_capacity(overrides.len());
+    let mut pairs: Vec<(i32, i32)> = Vec::with_capacity(overrides.len());
+    for entry in overrides {
+        let (Some(listener_port), Some(endpoint_port)) = (entry.listener_port, entry.endpoint_port)
+        else {
+            return Err(
+                "a PortOverride must carry both ListenerPort and EndpointPort".to_string()
+            );
+        };
+        for (member, port) in [
+            ("ListenerPort", listener_port),
+            ("EndpointPort", endpoint_port),
+        ] {
+            if !(1..=65535).contains(&port) {
+                return Err(format!(
+                    "PortOverride {member} {port} is outside the supported port range 1-65535"
+                ));
+            }
+        }
+        if !seen_listener_ports.insert(listener_port) {
+            return Err(format!(
+                "PortOverrides names ListenerPort {listener_port} more than once; a listener \
+                 port maps to one endpoint port"
+            ));
+        }
+        pairs.push((listener_port, endpoint_port));
+    }
+    Ok(pairs)
+}
+
+/// An `EndpointConfigurations` list as the endpoints the store holds.
+///
+/// An endpoint configuration identifies one resource to send traffic to ("A resource
+/// must be valid and active when you add it as an endpoint", `EndpointConfiguration`
+/// doc), so an entry naming no `EndpointId` names no resource and one resource cannot
+/// be named twice in the same group — two weights for one endpoint. An absent `Weight`
+/// takes [`DEFAULT_ENDPOINT_WEIGHT`].
+///
+/// The list is refused past [`MAX_ENDPOINTS_PER_ENDPOINT_GROUP`] BEFORE it is walked,
+/// and membership is tested through a set rather than by rescanning what has been
+/// accepted: `EndpointId` is a free string, so neither the work this helper does nor the
+/// vector the store ends up holding may be proportional to a length the caller chose.
+/// Returns the message for an `InvalidArgumentException`.
+pub fn endpoints_from_configurations(
+    configurations: &[EndpointConfiguration],
+) -> Result<Vec<StoredEndpoint>, String> {
+    if configurations.len() > MAX_ENDPOINTS_PER_ENDPOINT_GROUP {
+        return Err(format!(
+            "EndpointConfigurations holds {} endpoints; an endpoint group holds at most \
+             {MAX_ENDPOINTS_PER_ENDPOINT_GROUP}",
+            configurations.len()
+        ));
+    }
+    let mut seen_ids: HashSet<&str> = HashSet::with_capacity(configurations.len());
+    let mut endpoints: Vec<StoredEndpoint> = Vec::with_capacity(configurations.len());
+    for configuration in configurations {
+        let Some(endpoint_id) = configuration
+            .endpoint_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        else {
+            return Err("an EndpointConfiguration must carry an EndpointId".to_string());
+        };
+        if !seen_ids.insert(endpoint_id) {
+            return Err(format!(
+                "EndpointConfigurations names endpoint {endpoint_id:?} more than once; an \
+                 endpoint group holds each endpoint once"
+            ));
+        }
+        endpoints.push(StoredEndpoint {
+            endpoint_id: endpoint_id.to_string(),
+            weight: configuration.weight.unwrap_or(DEFAULT_ENDPOINT_WEIGHT),
+            client_ip_preservation_enabled: configuration.client_ip_preservation_enabled,
+        });
+    }
+    Ok(endpoints)
+}
+
 /// Validate a caller-supplied static IPv4 address (the BYOIP path of
 /// `CreateAccelerator$IpAddresses`). Returns the message for an
 /// `InvalidArgumentException`.
@@ -490,6 +826,12 @@ pub fn listener_not_found_message(listener_arn: &str) -> String {
     format!("Listener {listener_arn} not found.")
 }
 
+/// The message for a refusal that names an endpoint group the store does not hold. The
+/// same rule as [`accelerator_not_found_message`], one level further down.
+pub fn endpoint_group_not_found_message(endpoint_group_arn: &str) -> String {
+    format!("Endpoint group {endpoint_group_arn} not found.")
+}
+
 /// The message for deleting an accelerator that is still enabled.
 ///
 /// "Before you can delete an accelerator, you must disable it" (`DeleteAccelerator`
@@ -508,6 +850,18 @@ pub fn associated_listener_found_message(accelerator_arn: &str) -> String {
     format!(
         "Accelerator {accelerator_arn} has a listener associated with it; delete its \
          listeners before deleting it."
+    )
+}
+
+/// The message for deleting a listener that still has an endpoint group.
+///
+/// "You must remove all dependent resources from a listener before you can delete it"
+/// (`AssociatedEndpointGroupFoundException` doc) — the same rule as
+/// [`associated_listener_found_message`], one level down.
+pub fn associated_endpoint_group_found_message(listener_arn: &str) -> String {
+    format!(
+        "Listener {listener_arn} has an endpoint group associated with it; delete its \
+         endpoint groups before deleting it."
     )
 }
 

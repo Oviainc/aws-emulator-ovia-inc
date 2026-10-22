@@ -17,3 +17,5 @@ mod endpoint_agnostic_routing;
 mod portal_session;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unauthorized_rejection.rs"]
+mod unauthorized_rejection;

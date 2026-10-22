@@ -123,4 +123,9 @@ store.put_session("tok-1", "alice@example.com", ["111111111111"], std::time::Dur
 
 With nothing seeded there are no sessions, so every operation answers
 `UnauthorizedException` (401) — which is what a portal holding no sign-in sessions
-should say. `tests/all/portal_session.rs` drives the whole loop through HTTP.
+should say. That refusal is one constant for the whole service
+(`state::INVALID_SESSION_MESSAGE`, returned through `state::unauthorized_session`): the
+Portal API's authentication gate answers the same message on every operation and for
+every token, so no handler words it itself. `tests/all/portal_session.rs` drives the
+whole loop through HTTP, and `tests/all/unauthorized_rejection.rs` sweeps the gate over
+the operations × token classes × the rest of the request.

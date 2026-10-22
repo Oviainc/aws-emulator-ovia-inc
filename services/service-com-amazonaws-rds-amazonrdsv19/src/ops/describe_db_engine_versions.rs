@@ -974,6 +974,24 @@ const fn row(
 /// Rows are grouped by engine and, WITHIN an engine, listed in ascending version order:
 /// that order is the report's order (see [`page_key`]), and `valid_upgrade_targets` reads
 /// it to decide which versions an entry can be upgraded to.
+///
+/// Three rules decide which rows a family has, so the table is not a hand-picked sample:
+///
+/// * Each row's `EngineVersion` is in the form that ENGINE publishes its builds in: the
+///   Oracle release-update form (`19.0.0.0.ru-YYYY-MM.rur-YYYY-MM.rN`), the Microsoft SQL
+///   Server build form (`<release>.<minor>.<build>.<revision>.vN`), and the upstream
+///   dotted form for the MySQL, MariaDB, PostgreSQL and Db2 engines.
+/// * A major version past its COMMUNITY end of life is published through this service's
+///   own Amazon RDS Extended Support builds, named `<version>-rds.YYYYMMDD` ("Using
+///   Amazon RDS Extended Support", Amazon RDS User Guide) — the builds that family can
+///   still be created with. That is the MySQL 5.7 and PostgreSQL 11 families; the Aurora,
+///   Amazon DocumentDB and MariaDB families carry service-managed version numbers of their
+///   own and publish no such build line.
+/// * Two engines that are EDITIONS of one database product publish the same major-version
+///   families, because the edition is the engine and the family is the product release:
+///   the three Db2 editions, the Oracle single-tenant pair and its multi-tenant (CDB)
+///   pair, and the Microsoft SQL Server editions — Developer Edition excepted, which RDS
+///   offers from the 2019 (15.00) release on and so carries no 14.00 family.
 pub(crate) const CATALOG: &[CatalogVersion] = &[
     // --- Aurora MySQL -----------------------------------------------------
     row(
@@ -1270,6 +1288,30 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "5.7",
         "mysql5.7",
         STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &MYSQL_5_7,
+    ),
+    // The RDS-only builds of a major version past its COMMUNITY end of life: once the
+    // upstream project stops releasing a family, RDS keeps publishing builds of it under
+    // Amazon RDS Extended Support, named `<version>-rds.YYYYMMDD` after the day the build
+    // was cut ("Using Amazon RDS Extended Support", Amazon RDS User Guide). They are the
+    // builds the family can still be created and patched with, so they are the LATER
+    // entries of it and the last of them is the family's default.
+    row(
+        "mysql",
+        "5.7.44-rds.20240408",
+        "5.7",
+        "mysql5.7",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &MYSQL_5_7,
+    ),
+    row(
+        "mysql",
+        "5.7.44-rds.20250213",
+        "5.7",
+        "mysql5.7",
+        STATUS_DEPRECATED,
         DefaultLevel::Major,
         &MYSQL_5_7,
     ),
@@ -1357,6 +1399,19 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         DefaultLevel::Engine,
         &ORACLE_EE,
     ),
+    // The multi-tenant (CDB) engine of an Oracle edition offers the SAME release updates
+    // as the single-tenant engine of that edition — the CDB/non-CDB split is the database
+    // architecture, not the patch line — so the release-update chain of `oracle-ee` above
+    // is published here too.
+    row(
+        "oracle-ee-cdb",
+        "19.0.0.0.ru-2024-07.rur-2024-07.r1",
+        "19",
+        "oracle-ee-cdb-19",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &ORACLE_EE,
+    ),
     row(
         "oracle-ee-cdb",
         "19.0.0.0.ru-2024-10.rur-2024-10.r1",
@@ -1395,6 +1450,15 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "oracle-se2-cdb",
+        "19.0.0.0.ru-2024-07.rur-2024-07.r1",
+        "19",
+        "oracle-se2-cdb-19",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &ORACLE_SE2,
+    ),
+    row(
+        "oracle-se2-cdb",
         "19.0.0.0.ru-2024-10.rur-2024-10.r1",
         "19",
         "oracle-se2-cdb-19",
@@ -1415,6 +1479,27 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     row(
         "postgres",
         "11.22",
+        "11",
+        "postgres11",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    // PostgreSQL 11's RDS Extended Support builds, in the same `-rds.YYYYMMDD` form as
+    // the MySQL 5.7 ones above: the same rule, applied to the other family this service
+    // publishes past its community end of life.
+    row(
+        "postgres",
+        "11.22-rds.20240418",
+        "11",
+        "postgres11",
+        STATUS_DEPRECATED,
+        DefaultLevel::Neither,
+        &POSTGRES,
+    ),
+    row(
+        "postgres",
+        "11.22-rds.20241121",
         "11",
         "postgres11",
         STATUS_DEPRECATED,
@@ -1496,6 +1581,15 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
     row(
         "sqlserver-ee",
+        "14.00.3281.6.v1",
+        "14.00",
+        "sqlserver-ee-14.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &SQLSERVER_WITH_REPLICA,
+    ),
+    row(
+        "sqlserver-ee",
         "14.00.3465.1.v1",
         "14.00",
         "sqlserver-ee-14.0",
@@ -1521,6 +1615,29 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         DefaultLevel::Engine,
         &SQLSERVER_WITH_REPLICA,
     ),
+    // Every edition RDS offers a Microsoft SQL Server RELEASE in is offered the same
+    // builds of it: the edition is the engine and the release is the product version, so
+    // the 14.00 (2017) family below is published for Express and Web exactly as it is for
+    // Enterprise and Standard above. Developer Edition is the one exception and carries no
+    // 14.00 family: RDS offers it from the 2019 release on.
+    row(
+        "sqlserver-ex",
+        "14.00.3281.6.v1",
+        "14.00",
+        "sqlserver-ex-14.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &SQLSERVER,
+    ),
+    row(
+        "sqlserver-ex",
+        "14.00.3465.1.v1",
+        "14.00",
+        "sqlserver-ex-14.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER,
+    ),
     row(
         "sqlserver-ex",
         "15.00.4385.2.v1",
@@ -1538,6 +1655,15 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
         &SQLSERVER,
+    ),
+    row(
+        "sqlserver-se",
+        "14.00.3281.6.v1",
+        "14.00",
+        "sqlserver-se-14.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &SQLSERVER_WITH_REPLICA,
     ),
     row(
         "sqlserver-se",
@@ -1565,6 +1691,24 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         STATUS_AVAILABLE,
         DefaultLevel::Engine,
         &SQLSERVER_WITH_REPLICA,
+    ),
+    row(
+        "sqlserver-web",
+        "14.00.3281.6.v1",
+        "14.00",
+        "sqlserver-web-14.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &SQLSERVER,
+    ),
+    row(
+        "sqlserver-web",
+        "14.00.3465.1.v1",
+        "14.00",
+        "sqlserver-web-14.0",
+        STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &SQLSERVER,
     ),
     row(
         "sqlserver-web",
