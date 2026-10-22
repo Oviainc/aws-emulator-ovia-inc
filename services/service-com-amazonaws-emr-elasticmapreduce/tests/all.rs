@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/block_public_access.rs"]
 mod block_public_access;
+#[path = "all/emr_control_plane.rs"]
+mod emr_control_plane;
 #[path = "all/job_flow_lifecycle.rs"]
 mod job_flow_lifecycle;
 #[path = "all/managed_scaling_policy.rs"]

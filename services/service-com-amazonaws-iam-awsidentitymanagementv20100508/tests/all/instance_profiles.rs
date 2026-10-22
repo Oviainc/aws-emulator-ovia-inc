@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `CreateInstanceProfile` and its reporting half `GetInstanceProfile`, end to end over
-//! the awsQuery wire.
+//! `CreateInstanceProfile`, its reporting half `GetInstanceProfile`, and
+//! `AddRoleToInstanceProfile`, end to end over the awsQuery wire.
 //!
 //! Every assertion drives a `MultiServiceRouter` holding this service over one shared
 //! `InMemoryEngine`, exactly as the production router does, so what is under test is the
@@ -11,15 +11,22 @@
 //!
 //! The rule under test is that a create PERSISTS the profile and the read REPORTS what was
 //! persisted: the name and path the request chose, a minted id and an ARN derived from
-//! them, an empty role list, and the tags the request carried. Each suite is a TABLE whose
-//! rows differ along what that rule generalises over — the path's depth, which optional
-//! members are present, the tag count, the alphabet and case of the name — so no single
-//! request is the specification.
+//! them, an empty role list, and the tags the request carried; and that
+//! `AddRoleToInstanceProfile` binds the ONE role a profile may hold onto that same record.
+//! Each suite is a TABLE whose rows differ along what that rule generalises over — the
+//! path's depth, which optional members are present, the tag count, the alphabet and case
+//! of the name, how many roles the profile already holds — so no single request is the
+//! specification.
 
 use std::collections::BTreeMap;
 
 use crate::role_lifecycle::{borrowed, optional, param, reported_tags};
 use crate::user_lifecycle::{account_id, call, element, elements, error_code, router};
+
+/// A trust policy with a single statement, so `CreateRole` accepts the fixture roles the
+/// role-binding suites attach (the EC2 service principal is the one an instance profile's
+/// role carries).
+const TRUST_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
 
 /// One `CreateInstanceProfile` request, with the members the row exercises.
 struct CreateCase {
@@ -341,6 +348,189 @@ async fn reading_what_was_never_created_is_no_such_entity() {
             "case {name:?}: a refused read reports no profile, got {body}"
         );
     }
+}
+
+#[tokio::test]
+async fn add_role_to_instance_profile_puts_the_single_role_on_the_profile() {
+    let router = router();
+    // Two roles, so the one-role quota can be taken on a second, different role.
+    for role in ["EMR_EC2_DefaultRole", "EMR_EC2_OtherRole"] {
+        let (status, body) = call(
+            &router,
+            "CreateRole",
+            &[
+                ("RoleName", role),
+                ("AssumeRolePolicyDocument", TRUST_POLICY),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {role:?}: the fixture CreateRole must succeed, got {status}: {body}"
+        );
+    }
+
+    for case in create_cases() {
+        let params = case.params();
+        let (status, body) =
+            call(&router, "CreateInstanceProfile", &borrowed(&params)).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the fixture create must succeed, got {status}: {body}",
+            case.name
+        );
+
+        let (status, body) = call(
+            &router,
+            "AddRoleToInstanceProfile",
+            &[
+                ("InstanceProfileName", case.name),
+                ("RoleName", "EMR_EC2_DefaultRole"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: AddRoleToInstanceProfile must answer 200, got {status}: {body}",
+            case.name
+        );
+
+        // The association is visible through the profile's own reader, which is what
+        // makes it persisted rather than reported back from the request.
+        let (status, body) = call(
+            &router,
+            "GetInstanceProfile",
+            &[("InstanceProfileName", case.name)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: GetInstanceProfile must answer 200, got {status}: {body}",
+            case.name
+        );
+        let roles = elements(&body, "RoleName");
+        assert_eq!(
+            roles,
+            vec!["EMR_EC2_DefaultRole".to_string()],
+            "case {:?}: the profile must report the one role it holds, got {roles:?}",
+            case.name
+        );
+
+        // "An instance profile can contain only one role, and this quota cannot be
+        // increased." A repeat of the SAME role is a conflict; a DIFFERENT role is
+        // past the quota. Either way the profile still holds exactly the first role.
+        let (status, body) = call(
+            &router,
+            "AddRoleToInstanceProfile",
+            &[
+                ("InstanceProfileName", case.name),
+                ("RoleName", "emr_ec2_defaultrole"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 409,
+            "case {:?}: re-adding the held role must answer 409, got {status}: {body}",
+            case.name
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, "EntityAlreadyExists",
+            "case {:?}: expected EntityAlreadyExists, got {code:?}: {body}",
+            case.name
+        );
+
+        let (status, body) = call(
+            &router,
+            "AddRoleToInstanceProfile",
+            &[
+                ("InstanceProfileName", case.name),
+                ("RoleName", "EMR_EC2_OtherRole"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 409,
+            "case {:?}: a second role must answer 409, got {status}: {body}",
+            case.name
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, "LimitExceeded",
+            "case {:?}: expected LimitExceeded, got {code:?}: {body}",
+            case.name
+        );
+
+        let (_, body) = call(
+            &router,
+            "GetInstanceProfile",
+            &[("InstanceProfileName", case.name)],
+        )
+        .await;
+        let roles = elements(&body, "RoleName");
+        assert_eq!(
+            roles,
+            vec!["EMR_EC2_DefaultRole".to_string()],
+            "case {:?}: a refused add must leave the profile's role alone, got {roles:?}",
+            case.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn add_role_to_instance_profile_resolves_both_entities() {
+    let router = router();
+    let (status, body) = call(
+        &router,
+        "CreateRole",
+        &[
+            ("RoleName", "EMR_EC2_DefaultRole"),
+            ("AssumeRolePolicyDocument", TRUST_POLICY),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "the fixture CreateRole must succeed: {body}");
+    let cases = create_cases();
+    let first = &cases[0];
+    let params = first.params();
+    let (status, body) = call(&router, "CreateInstanceProfile", &borrowed(&params)).await;
+    assert_eq!(status, 200, "the fixture create must succeed: {body}");
+
+    // Either named entity may be the absent one, and either way nothing is created
+    // to satisfy the call.
+    for (profile, role) in [
+        ("no-such-profile", "EMR_EC2_DefaultRole"),
+        (first.name, "NoSuchRole"),
+        ("no-such-profile", "NoSuchRole"),
+    ] {
+        let (status, body) = call(
+            &router,
+            "AddRoleToInstanceProfile",
+            &[("InstanceProfileName", profile), ("RoleName", role)],
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {profile:?}/{role:?}: expected 404, got {status}: {body}"
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, "NoSuchEntity",
+            "case {profile:?}/{role:?}: expected NoSuchEntity, got {code:?}: {body}"
+        );
+    }
+
+    let (status, body) = call(
+        &router,
+        "GetInstanceProfile",
+        &[("InstanceProfileName", first.name)],
+    )
+    .await;
+    assert_eq!(status, 200, "the held profile must still read back: {body}");
+    assert!(
+        elements(&body, "RoleName").is_empty(),
+        "a refused add must associate nothing, got {body}"
+    );
 }
 
 /// A tag key in AWS's reserved `aws:` namespace is `InvalidInput` (HTTP 400), and — "if
