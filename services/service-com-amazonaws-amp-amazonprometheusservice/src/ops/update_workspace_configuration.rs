@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkspaceConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkspaceConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes one workspace's label set limits, retention period and sample
+//! windows, so every later `DescribeWorkspaceConfiguration` reports them.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkspaceConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +164,266 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateWorkspaceConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkspaceConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkspaceConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateWorkspaceConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // "You must specify at least one of limitsPerLabelSet or retentionPeriodInDays
+        // for the request to be valid" (the operation's own documentation) — a rule the
+        // model cannot express, so it is refused here rather than at the boundary.
+        if input.limits_per_label_set.is_none() && input.retention_period_in_days.is_none() {
+            return Err(field_validation(
+                "limitsPerLabelSet",
+                "you must specify at least one of limitsPerLabelSet or retentionPeriodInDays",
+            ));
+        }
+
+        // The label-set rules `LimitsPerLabelSet$labelSet` documents but `LabelValue`
+        // (length 1.. only) does not model.
+        if let Some(limits) = input.limits_per_label_set.as_deref() {
+            if let Some(message) = label_set_violation(limits) {
+                return Err(field_validation("limitsPerLabelSet", &message));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        let Some(workspace) = store.workspaces.get_mut(&input.workspace_id) else {
+            return Err(
+                UpdateWorkspaceConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!("Workspace not found: {}", input.workspace_id),
+                        resource_id: input.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `WorkspaceConfigurationStatusCode` documents the rule for both statuses:
+        // "Update is disallowed until workspace configuration is ACTIVE and workspace
+        // status is ACTIVE." A workspace still being created, or one whose previous
+        // configuration update has not settled, is an inconsistent state rather than a
+        // missing resource — so ConflictException (409).
+        if workspace.status_code != crate::state::STATUS_ACTIVE {
+            return Err(UpdateWorkspaceConfigurationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Workspace {} is {}; an update is disallowed until workspace \
+                         status is {}",
+                        workspace.workspace_id,
+                        workspace.status_code,
+                        crate::state::STATUS_ACTIVE,
+                    ),
+                    resource_id: workspace.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Replaying the SAME `clientToken` that started the update STILL PENDING is not
+        // a conflict: the operation is `@idempotent` and `clientToken` carries
+        // `@idempotencyToken`, so that call answers with the update it already started
+        // rather than starting a second one. The match is deliberately narrow — only
+        // while that update is in flight, which is the window the token identifies;
+        // `materialize_due` forgets the token when the update settles, so a later call
+        // reusing it is a new request and is applied like any other instead of being
+        // dropped behind a 202.
+        let replaying_pending_update = input.client_token.is_some()
+            && workspace.configuration.status_code == crate::state::CONFIG_STATUS_UPDATING
+            && workspace.configuration.update_token == input.client_token;
+        if replaying_pending_update {
+            return Ok(status_response(&workspace.configuration));
+        }
+
+        if workspace.configuration.status_code != crate::state::CONFIG_STATUS_ACTIVE {
+            return Err(UpdateWorkspaceConfigurationErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "the configuration of workspace {} is {}; an update is \
+                         disallowed until workspace configuration is {}",
+                        workspace.workspace_id,
+                        workspace.configuration.status_code,
+                        crate::state::CONFIG_STATUS_ACTIVE,
+                    ),
+                    resource_id: workspace.workspace_id.clone(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let stored_limits = input
+            .limits_per_label_set
+            .as_deref()
+            .map(crate::state::store_label_set_limits);
+
+        // The store is BOUNDED: a list longer than the quota is refused rather than
+        // stored, which is what stops one request growing the stored configuration
+        // without end.
+        if stored_limits
+            .as_ref()
+            .is_some_and(|limits| limits.len() > crate::state::LABEL_SET_LIMITS_PER_WORKSPACE)
+        {
+            return Err(
+                UpdateWorkspaceConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "a workspace configuration holds at most {} label sets",
+                            crate::state::LABEL_SET_LIMITS_PER_WORKSPACE
+                        ),
+                        resource_id: workspace.workspace_id.clone(),
+                        resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                        service_code: ctx.identity().signing_name().to_string(),
+                        // Named for what it bounds: a real quota code is an identifier
+                        // Service Quotas issues, which this emulator does not model and
+                        // so must not invent one of.
+                        quota_code: "LabelSetsPerWorkspace".to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A PATCH of the stored configuration: every member the request carries
+        // replaces the stored value, and a member it omits leaves the stored value
+        // alone — which is what lets one call set the retention period without
+        // dropping the label set limits another call established.
+        let configuration = &mut workspace.configuration;
+        if let Some(limits) = stored_limits {
+            configuration.limits_per_label_set = limits;
+        }
+        if let Some(retention) = input.retention_period_in_days {
+            configuration.retention_period_in_days = retention;
+        }
+        if let Some(window) = input.out_of_order_time_window_in_seconds {
+            configuration.out_of_order_time_window_in_seconds = window;
+        }
+        if let Some(offset) = input.rule_query_offset_in_seconds {
+            configuration.rule_query_offset_in_seconds = offset;
+        }
+
+        // The call is accepted (202) with the configuration UPDATING, and the clock owes
+        // the move back to ACTIVE at `status_due` — so a caller reading straight after
+        // this call still sees UPDATING, and one reading later sees ACTIVE.
+        configuration.status_code = crate::state::CONFIG_STATUS_UPDATING.to_string();
+        configuration.status_reason = None;
+        configuration.status_due = Some(now + crate::state::TRANSITION_DELAY);
+        configuration.update_token = input.client_token;
+
+        Ok(status_response(configuration))
     }
+}
+
+/// This operation's response: the configuration's status, read off the stored record.
+fn status_response(
+    configuration: &crate::state::WorkspaceConfiguration,
+) -> UpdateWorkspaceConfigurationOutput {
+    UpdateWorkspaceConfigurationOutput {
+        status: WorkspaceConfigurationStatus {
+            status_code: configuration.status_code.clone(),
+            status_reason: configuration.status_reason.clone(),
+        },
+    }
+}
+
+/// A modelled `ValidationException` (400) naming the member that failed and why, the
+/// way the boundary validator does.
+fn field_validation(field: &str, message: &str) -> UpdateWorkspaceConfigurationError {
+    UpdateWorkspaceConfigurationErrorModeled::ValidationException(ValidationException {
+        message: format!("{field}: {message}"),
+        reason: "FIELD_VALIDATION_FAILED".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: field.to_string(),
+            message: message.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// Why this `limitsPerLabelSet` is invalid, if it is.
+///
+/// `LimitsPerLabelSet$labelSet` documents the rules, and `LabelValue` models only a
+/// length bound, so they are enforced here: "Label values accept ASCII characters and
+/// must contain at least one character that isn't whitespace. ASCII control characters
+/// are not accepted. If the label name is metric name label `__name__`, then the metric
+/// part of the name must conform to the following pattern: `[a-zA-Z_:][a-zA-Z0-9_:]*`\".
+/// Label names are a map's keys, so "each label name in a label set must be unique"
+/// holds by construction.
+fn label_set_violation(limits: &[LimitsPerLabelSet]) -> Option<String> {
+    for entry in limits {
+        // Sorted, so one invalid label set is reported the same way however the
+        // request's map was iterated.
+        let labels: ::std::collections::BTreeMap<&str, &str> = entry
+            .label_set
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        for (name, value) in labels {
+            // `LabelName` is modelled `pattern("^[a-zA-Z_][a-zA-Z0-9_]*$")`, but the
+            // boundary validator does not apply a map KEY's constraints, so the modelled
+            // rule is enforced here rather than silently stored.
+            if !is_label_name(name) {
+                return Some(format!(
+                    "label name {name:?} must match ^[a-zA-Z_][a-zA-Z0-9_]*$"
+                ));
+            }
+            if !value.is_ascii() {
+                return Some(format!(
+                    "label {name} has a value that is not ASCII: label values accept ASCII characters"
+                ));
+            }
+            if value.bytes().any(|byte| byte.is_ascii_control()) {
+                return Some(format!(
+                    "label {name} has a value carrying an ASCII control character, which is not accepted"
+                ));
+            }
+            if value.chars().all(char::is_whitespace) {
+                return Some(format!(
+                    "label {name} has a value that is entirely whitespace: a label value must contain at least one character that isn't whitespace"
+                ));
+            }
+            if name == crate::state::METRIC_NAME_LABEL && !is_metric_name(value) {
+                return Some(format!(
+                    "label {name} carries a metric name, which must match [a-zA-Z_:][a-zA-Z0-9_:]*, got {value:?}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Whether `name` matches `^[a-zA-Z_][a-zA-Z0-9_]*$`, the pattern the model gives
+/// `LabelName`. Two character classes, so it is checked with character predicates
+/// rather than a pattern engine.
+fn is_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `value` matches `[a-zA-Z_:][a-zA-Z0-9_:]*`, the pattern
+/// `LimitsPerLabelSet$labelSet` documents for the metric name carried by the
+/// [`crate::state::METRIC_NAME_LABEL`] label. Two character classes, so it is checked
+/// with character predicates rather than a pattern engine.
+fn is_metric_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || matches!(first, '_' | ':'))
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':'))
 }
