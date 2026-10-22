@@ -844,17 +844,30 @@ async fn a_plan_arn_names_the_region_the_request_was_signed_for() {
 }
 
 #[tokio::test]
-async fn an_operation_this_slice_leaves_unimplemented_still_answers_501() {
+async fn no_operation_of_this_service_is_a_scaffold_any_more() {
     let router = emulator();
-    let plan = create_plan(&router, "untouched-plan").await;
+    let plan = create_plan(&router, "census-plan").await;
     let (_, described) =
         call(&router, "DescribeRescoreExecutionPlan", json!({ "Id": plan })).await;
     let arn = described["Arn"].as_str().unwrap_or_default().to_string();
 
-    // The tagging operations are out of scope for this slice and must keep saying so
-    // rather than answering a hollow 200. `UpdateRescoreExecutionPlan` is implemented —
-    // see `tests/all/plan_update.rs`.
+    // The stub census (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' src/ops/`) is now
+    // empty for this service — the tagging operations are implemented in
+    // `tests/all/resource_tags.rs`'s suites and `UpdateRescoreExecutionPlan` in
+    // `tests/all/plan_update.rs` — so no operation the service models may answer 501
+    // for a well-formed request. (What each one answers instead is its own suite's
+    // subject; this row only pins that nothing is a scaffold.)
     let cases: Vec<(&str, Value)> = vec![
+        (
+            "CreateRescoreExecutionPlan",
+            json!({ "Name": "census-created" }),
+        ),
+        ("DescribeRescoreExecutionPlan", json!({ "Id": plan })),
+        ("ListRescoreExecutionPlans", json!({})),
+        (
+            "UpdateRescoreExecutionPlan",
+            json!({ "Id": plan, "Name": "renamed" }),
+        ),
         (
             "TagResource",
             json!({ "ResourceARN": arn, "Tags": [{ "Key": "k", "Value": "v" }] }),
@@ -864,9 +877,21 @@ async fn an_operation_this_slice_leaves_unimplemented_still_answers_501() {
             "UntagResource",
             json!({ "ResourceARN": arn, "TagKeys": ["k"] }),
         ),
+        (
+            "Rescore",
+            json!({
+                "RescoreExecutionPlanId": plan,
+                "SearchQuery": "census",
+                "Documents": [{ "Id": "d", "OriginalScore": 0.5 }],
+            }),
+        ),
+        ("DeleteRescoreExecutionPlan", json!({ "Id": plan })),
     ];
     for (operation, body) in cases {
         let (status, answer) = call(&router, operation, body).await;
-        assert_eq!(status, 501, "case {operation}: got {answer}");
+        assert_ne!(
+            status, 501,
+            "case {operation}: a scaffold 501 is left, got {answer}"
+        );
     }
 }

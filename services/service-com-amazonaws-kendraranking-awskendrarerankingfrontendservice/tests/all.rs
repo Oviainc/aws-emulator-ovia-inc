@@ -19,5 +19,7 @@ mod harness;
 mod plan_update;
 #[path = "all/rescore_execution_plan_lifecycle.rs"]
 mod rescore_execution_plan_lifecycle;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -266,9 +266,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     now,
                 )),
                 error_message: None,
-                tags: input.tags.unwrap_or_default(),
+                tags: std::collections::BTreeMap::new(),
+                tags_written: 0,
             },
         );
+        // A tag key identifies at most one tag ("Keys are not case sensitive and must
+        // be unique." — `Tag$Key`), so the tags a create carries go in through the same
+        // upsert the tagging operations use rather than verbatim: a request naming one
+        // key twice persists one tag, holding its last value. `Tags` is modelled
+        // `@length 0..200`, which is `MAX_TAGS_PER_PLAN`, so a create can never take a
+        // plan past the ceiling `TagResource` enforces.
+        if let Some(tags) = input.tags {
+            if let Some(plan) = store.plans.get_mut(&id) {
+                for tag in tags {
+                    plan.put_tag(tag);
+                }
+            }
+        }
 
         Ok(CreateRescoreExecutionPlanOutput { id, arn })
     }

@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-kendraranking-awskendrarerankingfrontendservice service.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use smithy_server_runtime::{Violation, ViolationKind};
 
@@ -231,10 +231,81 @@ pub struct RescoreExecutionPlan {
     pub pending_status: Option<PendingStatus>,
     /// Set only for a plan whose status is `FAILED`; absent otherwise.
     pub error_message: Option<String>,
-    pub tags: Vec<Tag>,
+    /// This plan's tags, keyed by [`normalized_tag_key`] so one key holds at most one
+    /// tag and a lookup costs no scan of the set. Read it through
+    /// [`tag_list`](RescoreExecutionPlan::tag_list) and write it through
+    /// [`put_tag`](RescoreExecutionPlan::put_tag) /
+    /// [`remove_tag`](RescoreExecutionPlan::remove_tag), never directly: those keep the
+    /// key normalisation and the reported order. Bounded by [`MAX_TAGS_PER_PLAN`].
+    pub tags: BTreeMap<String, StoredTag>,
+    /// How many distinct tag keys this plan has ever taken; the sequence number
+    /// [`StoredTag::order`] comes from.
+    pub tags_written: u64,
+}
+
+/// One stored tag, with the position it holds in the order
+/// [`tag_list`](RescoreExecutionPlan::tag_list) reports.
+#[derive(Debug, Clone)]
+pub struct StoredTag {
+    /// The sequence number this key was first written under, so replacing a tag's
+    /// value keeps that key's place in the reported order.
+    pub order: u64,
+    /// The tag as the caller wrote it, with the key in the caller's own spelling.
+    pub tag: Tag,
 }
 
 impl RescoreExecutionPlan {
+    /// Add `tag`, replacing the value of a tag this plan already carries under the
+    /// same key: "A tag key and value ... Keys are not case sensitive and must be
+    /// unique." (`Tag$Key` in the model), so one key identifies at most one tag and a
+    /// repeated write is a replacement rather than a second entry.
+    ///
+    /// The replacement keeps the position of the tag it replaced, so the order
+    /// `ListTagsForResource` reports is the order the keys were first written.
+    ///
+    /// The caller bounds the set FIRST with
+    /// [`tag_count_after`](RescoreExecutionPlan::tag_count_after): this method only
+    /// writes.
+    pub fn put_tag(&mut self, tag: Tag) {
+        let key = normalized_tag_key(&tag.key);
+        match self.tags.get_mut(&key) {
+            Some(stored) => stored.tag = tag,
+            None => {
+                self.tags_written = self.tags_written.wrapping_add(1);
+                let order = self.tags_written;
+                self.tags.insert(key, StoredTag { order, tag });
+            }
+        }
+    }
+
+    /// Drop the tag held under `key`, if any, and report whether one was there. "If a
+    /// tag key does not exist on the resource, it is ignored."
+    /// (`UntagResourceRequest$TagKeys` in the model).
+    pub fn remove_tag(&mut self, key: &str) -> bool {
+        self.tags.remove(&normalized_tag_key(key)).is_some()
+    }
+
+    /// This plan's tags, in the order their keys were first written — the order
+    /// `ListTagsForResource` reports. At most [`MAX_TAGS_PER_PLAN`] entries.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        let mut stored: Vec<&StoredTag> = self.tags.values().collect();
+        stored.sort_by_key(|entry| entry.order);
+        stored.iter().map(|entry| entry.tag.clone()).collect()
+    }
+
+    /// How many distinct tag keys this plan would hold if `incoming` were written: the
+    /// keys it already holds plus the ones `incoming` introduces. A caller checks this
+    /// against [`MAX_TAGS_PER_PLAN`] BEFORE any [`put_tag`](Self::put_tag), so a
+    /// request past the ceiling is refused whole rather than half-applied.
+    pub fn tag_count_after(&self, incoming: &[Tag]) -> usize {
+        let introduced: BTreeSet<String> = incoming
+            .iter()
+            .map(|tag| normalized_tag_key(&tag.key))
+            .filter(|key| !self.tags.contains_key(key))
+            .collect();
+        self.tags.len().saturating_add(introduced.len())
+    }
+
     /// This plan's status as of `now_millis`: the pending status once the clock owes it,
     /// otherwise the stored one.
     ///
@@ -267,6 +338,28 @@ impl RescoreExecutionPlan {
     }
 }
 
+/// The form of a tag key two spellings of the same key share: its lowercasing.
+/// Case-insensitively equal keys are the same key ("Keys are not case sensitive and
+/// must be unique." — `Tag$Key` in the model); the lowercasing is Unicode-aware
+/// because a key "can consist of Unicode letters, digits, white space, and any of the
+/// following symbols: _ . : / = + - @" (`Tag`).
+pub fn normalized_tag_key(key: &str) -> String {
+    key.to_lowercase()
+}
+
+/// The number of tags one rescore execution plan may carry.
+///
+/// `TagResource` writes tags across calls, so without a ceiling a caller could grow
+/// one plan's tag set without bound — the modelled `TagList` `@length` caps one
+/// REQUEST at 200 tags, not the accumulated set. This ceiling is the same 200, so a
+/// plan holds no more tags than one request may carry; with
+/// [`MAX_RESCORE_EXECUTION_PLANS`] plans, each tag bounded by `TagKey` 1..128 and
+/// `TagValue` 0..256, the whole store is bounded. A write that would take a plan past
+/// it is refused whole with the modelled `ValidationException` (the only
+/// constraint-refusal error the tagging operations declare — they model no
+/// `ServiceQuotaExceededException`).
+pub const MAX_TAGS_PER_PLAN: usize = 200;
+
 /// The number of rescore execution plans this emulator holds.
 ///
 /// The service quotas these plans per account (the modelled
@@ -275,8 +368,10 @@ impl RescoreExecutionPlan {
 /// Quotas for more information"), so a create past the quota is refused with that
 /// error rather than stored. The model does not carry the published number, so the
 /// count here is the emulator's own; enforcing it is what keeps this store from
-/// growing without bound in a long-lived emulator, since each plan's size is already
-/// bounded by the modelled `@length` constraints on its members.
+/// growing without bound in a long-lived emulator, since each plan's size is bounded
+/// in turn — by the modelled `@length` constraints on the members a single call
+/// writes, and by [`MAX_TAGS_PER_PLAN`] for the tag set, which `TagResource` grows
+/// across calls.
 pub const MAX_RESCORE_EXECUTION_PLANS: usize = 100;
 
 /// The number of documents one `Rescore` request may carry.
@@ -306,6 +401,20 @@ pub struct ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState {
 }
 
 impl ComAmazonawsKendrarankingAwskendrarerankingfrontendserviceState {
+    /// The plan an ARN-addressed call names, or `None` when this store holds no plan
+    /// under that ARN. Resolved through [`arn_index`](Self::arn_index), so no caller
+    /// scans `plans`.
+    pub fn plan_by_arn(&self, resource_arn: &str) -> Option<&RescoreExecutionPlan> {
+        let id = self.arn_index.get(resource_arn)?;
+        self.plans.get(id)
+    }
+
+    /// [`plan_by_arn`](Self::plan_by_arn), for a call that writes the plan it resolves.
+    pub fn plan_by_arn_mut(&mut self, resource_arn: &str) -> Option<&mut RescoreExecutionPlan> {
+        let id = self.arn_index.get(resource_arn)?.clone();
+        self.plans.get_mut(&id)
+    }
+
     /// The next identifier this service hands out, in the 36-character `8-4-4-4-12`
     /// hexadecimal shape `RescoreExecutionPlanId` models (`length 36..36`, pattern
     /// `^[a-zA-Z0-9][a-zA-Z0-9-]*$`), also within `RescoreId`'s `1..36`.

@@ -86,16 +86,37 @@ pub fn error_code(body: &Value) -> String {
     raw.rsplit('#').next().unwrap_or(raw).to_string()
 }
 
+/// Create a plan named `name`, carrying `tags` (`Value::Null` for a plan created with
+/// no `Tags` member at all), and return its `(Id, Arn)`. The plan is `CREATING` when
+/// this returns: creation is asynchronous, and the clock owes it `ACTIVE`.
+pub async fn create_plan_with_tags(
+    router: &MultiServiceRouter,
+    name: &str,
+    tags: Value,
+) -> (String, String) {
+    let mut request = json!({ "Name": name });
+    if !tags.is_null() {
+        request["Tags"] = tags;
+    }
+    let (status, body) = call(router, "CreateRescoreExecutionPlan", request).await;
+    assert_eq!(status, 200, "create {name}: unexpected answer {body}");
+    (
+        body["Id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("create {name}: no Id in {body}"))
+            .to_string(),
+        body["Arn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("create {name}: no Arn in {body}"))
+            .to_string(),
+    )
+}
+
 /// Create a plan named `name` and return its id. The plan is `CREATING` when this
 /// returns: creation is asynchronous, and the clock owes it `ACTIVE`. Use
 /// [`create_active_plan`] where the test needs a plan ready to serve.
 pub async fn create_plan(router: &MultiServiceRouter, name: &str) -> String {
-    let (status, body) = call(router, "CreateRescoreExecutionPlan", json!({ "Name": name })).await;
-    assert_eq!(status, 200, "create {name}: unexpected answer {body}");
-    body["Id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("create {name}: no Id in {body}"))
-        .to_string()
+    create_plan_with_tags(router, name, Value::Null).await.0
 }
 
 /// Wait until the clock owes every plan created before this call its settled status
