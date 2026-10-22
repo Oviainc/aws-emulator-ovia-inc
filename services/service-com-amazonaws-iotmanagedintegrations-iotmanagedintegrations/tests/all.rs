@@ -15,3 +15,5 @@
 mod managed_thing_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_error_messages.rs"]
+mod validation_error_messages;
