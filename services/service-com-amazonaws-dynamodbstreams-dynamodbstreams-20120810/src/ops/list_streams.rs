@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStreams
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStreams`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStreams::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the streams registered in [`crate::state`] in stream-ARN
+//! order, filtered by `TableName` when one is given and paged by `Limit` /
+//! `ExclusiveStartStreamArn`. An account (or table) with no stream gets an empty
+//! `Streams` list, not an error.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +149,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStreams` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStreamsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStreams"))
+        // Reporting only: nothing here writes, so the page a caller sees is exactly
+        // what the publishing seam has registered.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListStreamsErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the DynamoDB Streams store is unavailable".to_string()),
+            })
+        })?;
+        let guard = state.lock();
+
+        // `Limit`'s declared range (1..) is enforced at the boundary; the documented
+        // ceiling of 100 is not modelled, so it is applied here.
+        let limit = usize::try_from(
+            input
+                .limit
+                .unwrap_or(crate::state::MAX_PAGE_LIMIT)
+                .clamp(1, crate::state::MAX_PAGE_LIMIT),
+        )
+        .unwrap_or(1);
+
+        // Streams are keyed by ARN in a `BTreeMap`, so the page boundary is a range
+        // bound rather than a scan: `ExclusiveStartStreamArn` need not still exist.
+        let start = match &input.exclusive_start_stream_arn {
+            Some(start) => std::ops::Bound::Excluded(start.as_str()),
+            None => std::ops::Bound::Unbounded,
+        };
+        // Lazily: one more entry than the page needs, which is exactly the evidence
+        // `LastEvaluatedStreamArn` requires — whether a further stream matched.
+        let mut matching = guard
+            .streams()
+            .range::<str, _>((start, std::ops::Bound::Unbounded))
+            .map(|(_, stream)| stream)
+            .filter(|stream| {
+                input
+                    .table_name
+                    .as_ref()
+                    .is_none_or(|table_name| &stream.table_name == table_name)
+            })
+            .take(limit + 1);
+
+        let mut streams: Vec<Stream> = Vec::new();
+        let mut truncated = false;
+        for stream in &mut matching {
+            if streams.len() == limit {
+                truncated = true;
+                break;
+            }
+            streams.push(Stream {
+                stream_arn: Some(stream.stream_arn.clone()),
+                table_name: Some(stream.table_name.clone()),
+                stream_label: Some(stream.stream_label.clone()),
+            });
+        }
+        // `LastEvaluatedStreamArn` is set only when `Limit` truncated the page.
+        let last_evaluated_stream_arn = truncated
+            .then(|| {
+                streams
+                    .last()
+                    .and_then(|stream| stream.stream_arn.clone())
+            })
+            .flatten();
+
+        Ok(ListStreamsOutput {
+            streams: Some(streams),
+            last_evaluated_stream_arn,
+        })
     }
 }

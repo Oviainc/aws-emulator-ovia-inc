@@ -45,6 +45,14 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The service key `::emulator_server::service_from_target` reads out of the
+/// `X-Amz-Target` header this service's awsJson1_0 operations carry: that reader
+/// takes the segment before the `.`, strips the `_<version>` suffix and
+/// lower-cases it, so `DynamoDBStreams_20120810.<OperationName>` (`OPERATIONS.md`,
+/// "Request routing") normalises to this key — and DynamoDB's own target
+/// normalises to `dynamodb` instead.
+const TARGET_SERVICE_KEY: &str = "dynamodbstreams";
+
 /// The `com-amazonaws-dynamodbstreams-dynamodbstreams-20120810` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,12 +82,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // This service and DynamoDB are two services behind ONE SigV4 signing name
+        // (`dynamodb`), which the model cannot express, so the default signing-name
+        // match makes BOTH claim every DynamoDB-signed request and the router answers
+        // `500 AmbiguousService` for all of it. On awsJson1_0 the request names its
+        // service in `X-Amz-Target` (`DynamoDBStreams_20120810.<Operation>`), so that
+        // prefix is the discriminator; DynamoDB's own `can_handle` declines this
+        // prefix for the same reason.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            Some(key) if key == self.entry.identity().signing_name() => {
+                ::emulator_server::service_from_target(&parts.headers).as_deref()
+                    == Some(TARGET_SERVICE_KEY)
+            }
+            _ => false,
         }
     }
 

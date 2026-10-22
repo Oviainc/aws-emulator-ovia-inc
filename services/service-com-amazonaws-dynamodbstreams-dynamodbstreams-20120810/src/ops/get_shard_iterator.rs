@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetShardIterator
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetShardIterator`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetShardIterator::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records a cursor against (stream, shard, absolute record position,
+//! issue instant) in [`crate::state`] and hands back the opaque token that resolves
+//! to it. The token is a digest, not an encoding of the input: the position lives
+//! only in the store, so it cannot be decoded or forged.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +170,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetShardIterator` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetShardIteratorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetShardIterator"))
+        // Minting and recording the cursor is what the spec says this call DOES:
+        // "Returns a shard iterator ... Use the shard iterator in a subsequent
+        // GetRecords request".
+        let _ = ctx;
+        let now = std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetShardIteratorErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the DynamoDB Streams store is unavailable".to_string()),
+            })
+        })?;
+        let mut guard = state.lock();
+        // Everything the clock already owes, before the cursor is placed: a trim that
+        // was due moves the trim horizon this iterator may be positioned at.
+        guard.materialize_due_expiries(now);
+
+        let next_position = {
+            let stream = guard.stream(&input.stream_arn).ok_or_else(|| {
+                GetShardIteratorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Requested resource not found: Stream: {} not found",
+                            input.stream_arn
+                        )),
+                    },
+                )
+            })?;
+            let shard = stream.shard(&input.shard_id).ok_or_else(|| {
+                GetShardIteratorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Requested resource not found: Shard: {} not found in stream {}",
+                            input.shard_id, input.stream_arn
+                        )),
+                    },
+                )
+            })?;
+
+            match input.shard_iterator_type.as_str() {
+                // "Start reading at the last (untrimmed) stream record, which is the
+                // oldest record in the shard."
+                "TRIM_HORIZON" => shard.trim_horizon(),
+                // "Start reading just after the most recent stream record in the shard."
+                "LATEST" => shard.appended(),
+                kind @ ("AT_SEQUENCE_NUMBER" | "AFTER_SEQUENCE_NUMBER") => {
+                    let Some(sequence_number) = input.sequence_number.as_deref() else {
+                        return Err(crate::scaffolded::Scaffolded::validation(format!(
+                            "SequenceNumber is required when ShardIteratorType is {kind}"
+                        )));
+                    };
+                    if !crate::state::is_sequence_number(sequence_number) {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "SequenceNumber must contain numeric characters only",
+                        ));
+                    }
+                    position_at_sequence_number(
+                        shard,
+                        sequence_number,
+                        kind == "AFTER_SEQUENCE_NUMBER",
+                    )
+                    .ok_or_else(|| {
+                        GetShardIteratorErrorModeled::TrimmedDataAccessException(
+                            TrimmedDataAccessException {
+                                message: Some(format!(
+                                    "SequenceNumber {sequence_number} is older than the trim \
+                                     point of shard {}",
+                                    input.shard_id
+                                )),
+                            },
+                        )
+                    })?
+                }
+                // "Start reading from the position denoted by a specific timestamp."
+                "AT_TIMESTAMP" => {
+                    let Some(timestamp) = input.timestamp else {
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "Timestamp is required when ShardIteratorType is AT_TIMESTAMP",
+                        ));
+                    };
+                    let target_millis = timestamp.secs().saturating_mul(1000).saturating_add(
+                        i64::from(timestamp.subsec_nanos() / 1_000_000),
+                    );
+                    shard
+                        .records
+                        .iter()
+                        .position(|record| {
+                            crate::state::epoch_millis(record.approximate_creation_date_time)
+                                >= target_millis
+                        })
+                        .map_or_else(
+                            || shard.appended(),
+                            |offset| shard.trim_horizon() + offset as u64,
+                        )
+                }
+                // The enum's membership is refused at the boundary, so this is
+                // unreachable for a modelled request; it stays a refusal rather than a
+                // silent default.
+                other => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "ShardIteratorType {other} is not one of {}",
+                        SHARD_ITERATOR_TYPE_VALUES.join(", ")
+                    )))
+                }
+            }
+        };
+
+        let shard_iterator =
+            guard.mint_iterator(&input.stream_arn, &input.shard_id, next_position, now);
+        Ok(GetShardIteratorOutput {
+            shard_iterator: Some(shard_iterator),
+        })
     }
+}
+
+/// The absolute position `AT_SEQUENCE_NUMBER` / `AFTER_SEQUENCE_NUMBER` names.
+///
+/// `None` when the sequence number is older than the shard's trim point, which is
+/// the `TrimmedDataAccessException` case. A sequence number past the newest record
+/// positions just past the end of the shard, the same place `LATEST` does.
+fn position_at_sequence_number(
+    shard: &crate::state::StoredShard,
+    sequence_number: &str,
+    after: bool,
+) -> Option<u64> {
+    use std::cmp::Ordering;
+
+    if crate::state::compare_sequence_numbers(sequence_number, &shard.starting_sequence_number)
+        == Ordering::Less
+    {
+        return None;
+    }
+    if shard.trim_horizon() > 0
+        && shard.records.front().is_some_and(|oldest| {
+            crate::state::compare_sequence_numbers(sequence_number, &oldest.sequence_number)
+                == Ordering::Less
+        })
+    {
+        return None;
+    }
+    let hit = shard.records.iter().position(|record| {
+        let ordering =
+            crate::state::compare_sequence_numbers(&record.sequence_number, sequence_number);
+        if after {
+            ordering == Ordering::Greater
+        } else {
+            ordering != Ordering::Less
+        }
+    });
+    Some(hit.map_or_else(
+        || shard.appended(),
+        |offset| shard.trim_horizon() + offset as u64,
+    ))
 }
