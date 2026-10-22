@@ -225,14 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(expected) = input.expected_policy_version.as_deref() {
             if expected != attached {
                 return Err(DeleteClusterPolicyErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "The policy version of cluster {} is not {expected}.",
-                            cluster.identifier
-                        ),
-                        resource_id: Some(cluster.identifier.clone()),
-                        resource_type: Some("policy".to_string()),
-                    },
+                    crate::state::cluster_policy_version_conflict(&input.identifier, expected),
                 )
                 .into());
             }

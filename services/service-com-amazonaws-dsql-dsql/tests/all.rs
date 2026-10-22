@@ -21,6 +21,8 @@ mod error_contract;
 mod harness;
 #[path = "all/policy_document_class.rs"]
 mod policy_document_class;
+#[path = "all/policy_version_conflict_and_lockout.rs"]
+mod policy_version_conflict_and_lockout;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

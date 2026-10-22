@@ -171,12 +171,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(now);
 
-        if !state.clusters.contains_key(&input.identifier) {
+        // The ARN of the cluster the policy is being attached to: the resource the
+        // document's `Resource` set is read against below.
+        let Some(cluster_arn) = state
+            .clusters
+            .get(&input.identifier)
+            .map(|cluster| cluster.arn.clone())
+        else {
             return Err(PutClusterPolicyErrorModeled::ResourceNotFoundException(
                 crate::state::cluster_not_found(&region, &input.identifier),
             )
             .into());
-        }
+        };
 
         // `@idempotencyToken`: a repeat of the SAME request answers with the
         // version the first call stored and attaches nothing further; the same
@@ -232,7 +238,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The lockout safety check: a document that denies every principal the
         // action that replaces it can never be replaced, so it is refused unless
         // the caller explicitly accepts that risk. Nothing is attached when it is.
-        if !input.bypass_policy_lockout_safety_check && locks_out_every_principal(&document) {
+        if !input.bypass_policy_lockout_safety_check
+            && locks_out_every_principal(&document, &cluster_arn)
+        {
             return Err(PutClusterPolicyErrorModeled::ValidationException(
                 ValidationException {
                     message: format!(
@@ -280,14 +288,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 Some(policy) if policy.version != expected => {
                     return Err(PutClusterPolicyErrorModeled::ConflictException(
-                        ConflictException {
-                            message: format!(
-                                "The policy version of cluster {} is not {expected}.",
-                                cluster.identifier
-                            ),
-                            resource_id: Some(cluster.identifier.clone()),
-                            resource_type: Some("policy".to_string()),
-                        },
+                        crate::state::cluster_policy_version_conflict(&input.identifier, expected),
                     )
                     .into());
                 }
@@ -333,20 +334,24 @@ fn parse_policy(document: &str) -> Option<::serde_json::Map<String, ::serde_json
     }
 }
 
-/// Whether `document` denies EVERY principal the action that replaces it, which
-/// is what the lockout safety check exists to catch.
+/// Whether `document` denies EVERY principal the action that replaces it on the
+/// cluster named by `resource_arn`, which is what the lockout safety check exists
+/// to catch.
 ///
 /// Read the way an IAM resource policy is read: an explicit `Deny` beats every
 /// `Allow`, so a `Deny` statement that covers all principals, covers
-/// [`POLICY_MANAGEMENT_ACTION`], covers this resource and carries no `Condition`
-/// narrowing it leaves nobody able to call that action again.
-fn locks_out_every_principal(document: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
+/// [`POLICY_MANAGEMENT_ACTION`], covers the cluster being protected and carries no
+/// `Condition` narrowing it leaves nobody able to call that action again.
+fn locks_out_every_principal(
+    document: &::serde_json::Map<String, ::serde_json::Value>,
+    resource_arn: &str,
+) -> bool {
     statements(document).iter().any(|statement| {
         effect_is(statement, "Deny")
             && !statement.contains_key("Condition")
             && covers_every_principal(statement)
             && covers_management_action(statement)
-            && covers_every_resource(statement)
+            && covers_this_resource(statement, resource_arn)
     })
 }
 
@@ -404,15 +409,30 @@ fn covers_management_action(statement: &::serde_json::Map<String, ::serde_json::
 }
 
 /// Whether the statement's `Resource` set covers the cluster the policy is being
-/// attached to. An absent `Resource` is the whole resource in a resource-based
-/// policy, which is this cluster.
-fn covers_every_resource(statement: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
-    match statement.get("Resource") {
-        None => true,
-        Some(resources) => string_values(resources)
+/// attached to, named by `resource_arn`.
+///
+/// An entry covers that cluster when the entry, read as an IAM resource pattern
+/// (`*` any run of characters, `?` any one), matches the cluster's own ARN: the
+/// literal ARN of the cluster being protected covers it exactly as a wildcard
+/// spanning it does, and an ARN naming any other resource covers nothing here. An
+/// absent `Resource` is the whole resource in a resource-based policy, which is
+/// this cluster; `NotResource` is the complement, so it covers this cluster unless
+/// it names it.
+fn covers_this_resource(
+    statement: &::serde_json::Map<String, ::serde_json::Value>,
+    resource_arn: &str,
+) -> bool {
+    if let Some(resources) = statement.get("Resource") {
+        return string_values(resources)
             .iter()
-            .any(|resource| resource.contains('*')),
+            .any(|resource| matches_pattern(resource, resource_arn));
     }
+    if let Some(not_resources) = statement.get("NotResource") {
+        return !string_values(not_resources)
+            .iter()
+            .any(|resource| matches_pattern(resource, resource_arn));
+    }
+    true
 }
 
 /// Every string in a JSON value that IAM accepts as a string or a list of them.

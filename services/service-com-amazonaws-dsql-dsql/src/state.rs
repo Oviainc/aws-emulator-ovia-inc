@@ -34,8 +34,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    EncryptionDetails, MultiRegionProperties, ResourceNotFoundException, TargetDefinition,
-    ValidationException, ValidationExceptionField,
+    ConflictException, EncryptionDetails, MultiRegionProperties, ResourceNotFoundException,
+    TargetDefinition, ValidationException, ValidationExceptionField,
 };
 
 /// The `ClusterStatus` values this service drives a cluster through, spelled as
@@ -986,6 +986,23 @@ pub fn cluster_policy_not_found(identifier: &str) -> ResourceNotFoundException {
     }
 }
 
+/// The sentence every refusal of a call whose `expectedPolicyVersion` does not
+/// name the version currently attached is worded with, BUILT FROM THE REQUEST: it
+/// names the version the caller claimed and the resource it claimed it for, which
+/// is how a caller learns which version was not found.
+///
+/// One sentence for the whole class, whatever status the refusal carries: a claim
+/// about a policy that is not attached at all is a `ResourceNotFoundException`
+/// ([`cluster_policy_version_not_found`]) and a claim about a version that is no
+/// longer the current one is a `ConflictException`
+/// ([`cluster_policy_version_conflict`]), so no handler words this case inline.
+pub fn cluster_policy_version_message(identifier: &str, expected_version: &str) -> String {
+    format!(
+        "Aurora DSQL can't find policy version {expected_version} for resource {identifier}. \
+         Verify that the policy exists and that the version is correct."
+    )
+}
+
 /// The modelled `ResourceNotFoundException` for a call that named a policy
 /// version the cluster does not hold (including the version of a policy that is
 /// already gone).
@@ -994,12 +1011,25 @@ pub fn cluster_policy_version_not_found(
     expected_version: &str,
 ) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: format!(
-            "Aurora DSQL can't find policy version {expected_version} for resource {identifier}. \
-             Verify that the policy exists and that the version is correct."
-        ),
+        message: cluster_policy_version_message(identifier, expected_version),
         resource_id: identifier.to_string(),
         resource_type: RESOURCE_TYPE_POLICY.to_string(),
+    }
+}
+
+/// The modelled `ConflictException` for a call whose `expectedPolicyVersion`
+/// names a version other than the one currently attached: the optimistic-
+/// concurrency refusal, worded with the same request-derived sentence as the
+/// sibling 404 ([`cluster_policy_version_message`]) so a client reading the text
+/// can tell a version conflict from any other conflict.
+pub fn cluster_policy_version_conflict(
+    identifier: &str,
+    expected_version: &str,
+) -> ConflictException {
+    ConflictException {
+        message: cluster_policy_version_message(identifier, expected_version),
+        resource_id: Some(identifier.to_string()),
+        resource_type: Some(RESOURCE_TYPE_POLICY.to_string()),
     }
 }
 

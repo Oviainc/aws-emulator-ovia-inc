@@ -44,18 +44,7 @@ fn allow(action: &str) -> String {
 /// One settled cluster per case, all created up front so the clock's
 /// `CREATING -> ACTIVE` transition is waited for once rather than per case.
 async fn settled_clusters(dsql: &Dsql, count: usize) -> Vec<String> {
-    let mut identifiers = Vec::with_capacity(count);
-    for _ in 0..count {
-        let created = dsql.create(json!({"deletionProtectionEnabled": false})).await;
-        assert_eq!(
-            created.status, 200,
-            "CreateCluster must succeed, got {} {:?}",
-            created.status, created.body
-        );
-        identifiers.push(created.str("identifier"));
-    }
-    wait_for_the_clock().await;
-    identifiers
+    dsql.create_settled_many(count).await
 }
 
 /// One replay of a policy write under a `clientToken` already used, and what the

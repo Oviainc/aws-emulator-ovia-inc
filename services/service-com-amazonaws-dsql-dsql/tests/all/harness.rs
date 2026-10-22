@@ -228,6 +228,24 @@ impl Dsql {
         wait_for_the_clock().await;
         created.str("identifier")
     }
+
+    /// `count` clusters that accept a mutation straight away, all created before the
+    /// one wait — so a table-driven suite waits for the clock once rather than per
+    /// case.
+    pub async fn create_settled_many(&self, count: usize) -> Vec<String> {
+        let mut identifiers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let created = self.create(json!({"deletionProtectionEnabled": false})).await;
+            assert_eq!(
+                created.status, 200,
+                "CreateCluster must succeed, got {} {:?}",
+                created.status, created.body
+            );
+            identifiers.push(created.str("identifier"));
+        }
+        wait_for_the_clock().await;
+        identifiers
+    }
 }
 
 /// Percent-encode the characters an ARN carries that a URI path segment does not.
