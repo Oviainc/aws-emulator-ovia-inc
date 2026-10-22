@@ -19,3 +19,5 @@ mod not_found_errors;
 mod server_user_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/user_state_persistence.rs"]
+mod user_state_persistence;

@@ -197,8 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .collect(),
             ),
-            // `Tags` is modelled `len 1..50`, so an untagged user reports it absent.
-            tags: Some(stored.tags.clone()).filter(|tags| !tags.is_empty()),
+            // `Tags` reports the stored tag list, EMPTY rather than absent when the
+            // user has none — the shape the recorded `DescribeUser` response carries
+            // (`SshPublicKeys []`, `Tags []` for a keyless, untagged user), same as
+            // `SshPublicKeys` above. `Tags`' modelled `len 1..50` bounds what a caller
+            // may SEND on a create or a tag call, where the framework enforces it; it
+            // is not a reason to drop the member a reader expects to find.
+            tags: Some(stored.tags.clone()),
             user_name: Some(stored.user_name.clone()),
         };
 

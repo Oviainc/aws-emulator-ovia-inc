@@ -267,7 +267,9 @@ async fn describe_user_reports_exactly_what_create_user_persisted() {
                 "HomeDirectoryMappings": null,
                 "Policy": null,
                 "PosixProfile": null,
-                "Tags": null,
+                // An untagged user reports `Tags` EMPTY, not absent — the shape the
+                // recorded AWS `DescribeUser` response carries, like `SshPublicKeys`.
+                "Tags": [],
                 "SshPublicKeys": [],
             }),
         ),
