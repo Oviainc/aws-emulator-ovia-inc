@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds tags to the named topic, writing them into this service's topic record — the
+//! same record `CreateTopic`'s `Tags` fills and `ListTagsForResource` reports. A tag
+//! whose key the topic already holds is OVERWRITTEN rather than duplicated.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +77,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{self, TagRefusal};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -95,17 +90,29 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sns-amazonsimplenotific
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sns#TagResource")]
+// `InternalErrorException` is widened in through `extra_errors`: the model's own
+// `errors` list for this operation omits it, but the SERVICE models it (`CreateTopic`
+// declares it) and it is the only modelled way to say "this emulator's own store could
+// not be reached" — a server fault, which must not be reported as a client's bad ARN or
+// as a topic that does not exist.
+#[smithy_macros::operation_error(
+    "com.amazonaws.sns#TagResource",
+    extra_errors = ["InternalErrorException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     AuthorizationErrorException(AuthorizationErrorException),
     ConcurrentAccessException(ConcurrentAccessException),
+    InternalErrorException(InternalErrorException),
     InvalidParameterException(InvalidParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
     StaleTagException(StaleTagException),
     TagLimitExceededException(TagLimitExceededException),
     TagPolicyException(TagPolicyException),
 }
+
+/// The input member a refusal of this operation names.
+const RESOURCE_ARN_MEMBER: &str = "ResourceArn";
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::tag_resource::TagResourceError`). Wrapping the modeled enum is what
@@ -156,20 +163,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Argument validation, BEFORE the store is consulted: a `ResourceArn` that is
+        // not a topic ARN at all is bad input, not a topic that does not exist.
+        if let Some(message) =
+            state::tagged_topic_arn_refusal(RESOURCE_ARN_MEMBER, &input.resource_arn)
+        {
+            return Err(TagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        let Some(topic) = store.topics.get(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The map the write WOULD leave the topic holding: "a new tag with a key
+        // identical to that of an existing tag overwrites the existing tag", so a key
+        // the topic already holds takes the new value instead of being added beside it.
+        // It is built and measured BEFORE anything is stored, so a refused write leaves
+        // the topic exactly as it was.
+        let mut would_hold = topic.tags.clone();
+        for tag in &input.tags {
+            would_hold.insert(tag.key.clone(), tag.value.clone());
+        }
+        match state::tag_map_refusal(&would_hold) {
+            Some(TagRefusal::TooMany(message)) => {
+                return Err(TagResourceErrorModeled::TagLimitExceededException(
+                    TagLimitExceededException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+            Some(TagRefusal::TooLarge(message)) => {
+                return Err(TagResourceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+            None => {}
+        }
+
+        store
+            .topics
+            .get_mut(&input.resource_arn)
+            .expect("the topic was just found under this ARN")
+            .tags = would_hold;
+
+        // TagResource answers an empty document: the tag set it wrote is read back
+        // through `ListTagsForResource`, not echoed here.
+        Ok(TagResourceOutput {})
     }
 }

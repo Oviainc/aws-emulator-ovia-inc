@@ -140,7 +140,11 @@ impl Sns {
 
 /// Decode the five XML entities the response envelope escapes (`xml_escape` in
 /// `vendor/smithy-schema-server/src/xml.rs`), so a JSON attribute value parses.
-fn xml_unescape(text: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite that reads a NESTED element out of the envelope
+/// (`<Tags><member><Key>…`, which [`Answer::elements`] cannot pair up) decodes it the
+/// same way rather than writing a second decoder.
+pub(crate) fn xml_unescape(text: &str) -> String {
     text.replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&lt;", "<")

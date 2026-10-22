@@ -105,8 +105,9 @@ const FIFO_TOPIC_ATTRIBUTE: &str = state::FIFO_TOPIC_ATTRIBUTE;
 /// ARN.
 const FIFO_SUFFIX: &str = state::FIFO_SUFFIX;
 
-/// "Can't add more than 50 tags to a topic" (`TagLimitExceededException` doc).
-const MAX_TAGS_PER_TOPIC: usize = 50;
+/// "Can't add more than 50 tags to a topic" (`TagLimitExceededException` doc) — shared
+/// with `TagResource`, which holds a topic's tag map to the same count.
+const MAX_TAGS_PER_TOPIC: usize = state::MAX_TAGS_PER_TOPIC;
 
 /// The refusal for a topic record whose attribute or tag map would cross the
 /// per-record byte ceiling, or `None` when it fits.

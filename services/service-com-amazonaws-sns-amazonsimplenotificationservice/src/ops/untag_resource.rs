@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes tags from the named topic by KEY, deleting them from this service's topic
+//! record — the same record `ListTagsForResource` reports. A key the topic does not
+//! hold leaves it unchanged: the request asks for a state the record is already in.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +71,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -89,17 +84,29 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sns-amazonsimplenotific
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sns#UntagResource")]
+// `InternalErrorException` is widened in through `extra_errors`: the model's own
+// `errors` list for this operation omits it, but the SERVICE models it (`CreateTopic`
+// declares it) and it is the only modelled way to say "this emulator's own store could
+// not be reached" — a server fault, which must not be reported as a client's bad ARN or
+// as a topic that does not exist.
+#[smithy_macros::operation_error(
+    "com.amazonaws.sns#UntagResource",
+    extra_errors = ["InternalErrorException"]
+)]
 #[derive(Debug)]
 pub enum UntagResourceErrorModeled {
     AuthorizationErrorException(AuthorizationErrorException),
     ConcurrentAccessException(ConcurrentAccessException),
+    InternalErrorException(InternalErrorException),
     InvalidParameterException(InvalidParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
     StaleTagException(StaleTagException),
     TagLimitExceededException(TagLimitExceededException),
     TagPolicyException(TagPolicyException),
 }
+
+/// The input member a refusal of this operation names.
+const RESOURCE_ARN_MEMBER: &str = "ResourceArn";
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::untag_resource::UntagResourceError`). Wrapping the modeled enum is what
@@ -150,20 +157,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        // Argument validation, BEFORE the store is consulted: a `ResourceArn` that is
+        // not a topic ARN at all is bad input, not a topic that does not exist.
+        if let Some(message) =
+            state::tagged_topic_arn_refusal(RESOURCE_ARN_MEMBER, &input.resource_arn)
+        {
+            return Err(UntagResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        let Some(topic) = store.topics.get_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Remove by key, and only by key: a key the topic does not hold is not an
+        // error — the request asks for a state the record is already in — and a removal
+        // can never cross a ceiling, so there is nothing to refuse here.
+        for key in &input.tag_keys {
+            topic.tags.remove(key);
+        }
+
+        // UntagResource answers an empty document: what the topic holds afterwards is
+        // read back through `ListTagsForResource`, not echoed here.
+        Ok(UntagResourceOutput {})
     }
 }

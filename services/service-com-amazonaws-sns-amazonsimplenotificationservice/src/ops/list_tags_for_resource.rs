@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tag set the named topic HOLDS, read from this service's topic records —
+//! the same records `CreateTopic` writes its `Tags` into. A REPORTING operation: it
+//! reads and writes nothing, so two reads of one topic answer alike and a read never
+//! changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +71,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -88,15 +84,27 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-sns-amazonsimplenotific
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.sns#ListTagsForResource")]
+// `InternalErrorException` is widened in through `extra_errors`: the model's own
+// `errors` list for this operation omits it, but the SERVICE models it (`CreateTopic`
+// and `GetTopicAttributes` both declare it) and it is the only modelled way to say
+// "this emulator's own store could not be reached" — a server fault, which must not be
+// reported as a client's bad ARN or as a topic that does not exist.
+#[smithy_macros::operation_error(
+    "com.amazonaws.sns#ListTagsForResource",
+    extra_errors = ["InternalErrorException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
     AuthorizationErrorException(AuthorizationErrorException),
     ConcurrentAccessException(ConcurrentAccessException),
+    InternalErrorException(InternalErrorException),
     InvalidParameterException(InvalidParameterException),
     ResourceNotFoundException(ResourceNotFoundException),
     TagPolicyException(TagPolicyException),
 }
+
+/// The input member a refusal of this operation names.
+const RESOURCE_ARN_MEMBER: &str = "ResourceArn";
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). Wrapping the modeled enum is what
@@ -147,20 +155,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // Argument validation, BEFORE the store is consulted: a `ResourceArn` that is
+        // not a topic ARN at all is bad input, not a topic that does not exist.
+        if let Some(message) =
+            state::tagged_topic_arn_refusal(RESOURCE_ARN_MEMBER, &input.resource_arn)
+        {
+            return Err(ListTagsForResourceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(ListTagsForResourceErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = store.lock();
+
+        let Some(topic) = store.topics.get(&input.resource_arn) else {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Every tag the topic holds, and nothing else. SNS documents no order for the
+        // list, and the record keeps its tags in a `HashMap` (whose entries come out in
+        // a different order on every call), so the list is ordered by KEY here: a client
+        // that diffs two reads of one topic, or compares a read against what it set,
+        // sees one stable document rather than a reshuffled one.
+        let mut tags: Vec<Tag> = topic
+            .tags
+            .iter()
+            .map(|(key, value)| Tag {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        tags.sort_by(|left, right| left.key.cmp(&right.key));
+
+        // `Some` even when the topic holds no tag: SNS answers an untagged topic with an
+        // EMPTY `Tags` list, which is a different document from one that omits the
+        // member, and a client reading `response["Tags"]` depends on the difference.
+        Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }
 }
