@@ -16,7 +16,11 @@
 //!   `GetRequestedServiceQuotaChange`,
 //!   `ListRequestedServiceQuotaChangeHistoryByQuota`) — append-only, with an
 //!   insertion-ordered index so a history listing is newest-first and a pagination
-//!   token keeps meaning the same position.
+//!   token keeps meaning the same position;
+//! * the **tags on an applied quota** (`TagResource`, `ListTagsForResource`,
+//!   `UntagResource`) — keyed by the quota's own ARN, the only thing a tagging
+//!   operation names its resource by, so one quota has exactly one tag set however
+//!   it is reached.
 //!
 //! The overlay and the requests are per region (Service Quotas is a regional service:
 //! an increase applied in one region does not change another's value), while the
@@ -31,12 +35,14 @@
 //! model allows (`MaxResults` 1..100) they genuinely run to many
 //! `NextToken`-chained pages.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 
-use crate::ops::types::{MetricInfo, QuotaPeriod, RequestedServiceQuotaChange, ServiceInfo, ServiceQuota};
+use crate::ops::types::{
+    MetricInfo, QuotaPeriod, RequestedServiceQuotaChange, ServiceInfo, ServiceQuota, Tag,
+};
 
 /// The region a request carries no SigV4 credential scope to name, and the one a
 /// scope naming a region this emulator does not know is served as.
@@ -155,6 +161,24 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// regions it is charged against are bounded by [`KNOWN_REGIONS`].
 pub const MAX_REQUESTS_PER_REGION: usize = 1_000;
 
+/// The most tags one applied quota can carry.
+///
+/// Source: the "Tag restrictions" section of the Service Quotas User Guide — the page
+/// the model's own `TooManyTagsException` links to — which publishes a maximum of 50
+/// tags per resource. It is well inside the model's `OutputTags` bound (len 0..200),
+/// so `ListTagsForResource` can always report the whole set.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The tag-key prefix AWS reserves for its own tags.
+///
+/// Source: AWS's tagging restrictions (shared by every taggable service and repeated
+/// in the Service Quotas User Guide's tag restrictions): the `aws:` prefix is
+/// reserved for AWS use, and a caller may neither create nor edit a tag whose key
+/// carries it. A key in this namespace is what this service's
+/// `TagPolicyViolationException` ("the specified tag is a reserved word and cannot be
+/// used") refuses.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
 /// One AWS-default quota, as `GetAWSDefaultServiceQuota` reports it.
 ///
 /// Seeded from AWS's published Service Quotas defaults (the per-service "Service
@@ -223,6 +247,33 @@ pub struct QuotaRequest {
     pub quota_requested_at_level: String,
 }
 
+/// Why a `ResourceARN` handed to a tagging operation names no applied quota.
+///
+/// The two cases are different refusals in the model: input this service cannot read
+/// as one of its own ARNs at all, and a readable ARN whose quota this account does
+/// not hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceArnError {
+    /// Not an applied-quota ARN: the wrong number of segments, a different service's
+    /// `arnNamespace`, or a resource part that is not `<service code>/<quota code>`.
+    /// The model's `IllegalArgumentException` ("Invalid input was provided").
+    Malformed,
+    /// A readable applied-quota ARN, but no quota of this account answers to it —
+    /// another account, a region this emulator does not serve, or a
+    /// `(ServiceCode, QuotaCode)` pair the catalog does not hold. The model's
+    /// `NoSuchResourceException` ("The specified resource does not exist").
+    NoSuchQuota,
+}
+
+/// A `TagResource` the tag ceiling refuses: the resource would have ended up holding
+/// [`TagCeilingExceeded::would_hold`] tags, past [`MAX_TAGS_PER_RESOURCE`]. The
+/// model's `TooManyTagsException`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagCeilingExceeded {
+    /// The number of tags the request would have left on the resource.
+    pub would_hold: usize,
+}
+
 /// The mutable, per-region half of this service's state.
 #[derive(Debug, Default)]
 struct RegionState {
@@ -251,6 +302,16 @@ pub struct ComAmazonawsServicequotasServicequotasv20190624State {
     global_applied_quotas: BTreeMap<(String, String), AppliedQuota>,
     /// The mutable state, per region.
     regions: BTreeMap<String, RegionState>,
+    /// The tags on an applied quota: the quota's CANONICAL ARN (what
+    /// [`quota_arn`] builds, so a global quota's regionless one) -> `TagKey` ->
+    /// `TagValue`, in tag-key order.
+    ///
+    /// Keyed by the ARN rather than per region because the ARN is what a tagging
+    /// operation names its resource by and already carries the region (or, for a
+    /// global quota, deliberately carries none) — so the same quota has one tag set
+    /// whichever regional endpoint reaches it, and a tag map is never minted for a
+    /// quota that does not exist.
+    quota_tags: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Default for ComAmazonawsServicequotasServicequotasv20190624State {
@@ -260,6 +321,7 @@ impl Default for ComAmazonawsServicequotasServicequotasv20190624State {
             default_quotas: seed_default_quotas(),
             global_applied_quotas: BTreeMap::new(),
             regions: BTreeMap::new(),
+            quota_tags: BTreeMap::new(),
         }
     }
 }
@@ -545,6 +607,125 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
         }
     }
 
+    /// The applied quota a tagging operation's `ResourceARN` names, as the ARN this
+    /// service reports for it — or why it names none.
+    ///
+    /// An applied quota's ARN is
+    /// `arn:<partition>:servicequotas:<region>:<account>:<service code>/<quota code>`,
+    /// and [`quota_arn`] is the one form of it this emulator reports (through
+    /// `GetServiceQuota`, `ListServiceQuotas` and every quota increase request):
+    /// one partition, one account, and no region for a `GlobalQuota`, which counts
+    /// account-wide. The rule here is therefore ONE rule, applied uniformly: the
+    /// string must be the ARN this service reports for an existing quota. That is
+    /// what makes one quota carry exactly one tag set — there is no second spelling
+    /// of a quota's ARN to tag it under.
+    ///
+    /// `Malformed` is the shape failing: not an ARN, a partition outside the form the
+    /// modelled `AmazonResourceName` declares (`^arn:aws(-[\w]+)*:…`), another
+    /// service's `arnNamespace`, or a resource part that is not
+    /// `<service code>/<quota code>`. `NoSuchQuota` is the shape holding but the
+    /// resource not existing here: another partition or account, a region outside
+    /// [`KNOWN_REGIONS`] (checked for the same reason [`request_region`] checks the
+    /// credential scope — the string is caller-supplied and a region this emulator
+    /// does not serve holds no quotas), or a `(ServiceCode, QuotaCode)` pair the
+    /// catalog does not hold.
+    pub fn resolve_quota_arn(&self, resource_arn: &str) -> Result<String, ResourceArnError> {
+        let segments: Vec<&str> = resource_arn.splitn(6, ':').collect();
+        let [prefix, partition, namespace, region, _account, resource] = segments[..] else {
+            return Err(ResourceArnError::Malformed);
+        };
+        if prefix != "arn" || !is_aws_partition(partition) || namespace != ARN_NAMESPACE {
+            return Err(ResourceArnError::Malformed);
+        }
+        let Some((service_code, quota_code)) = resource.split_once('/') else {
+            return Err(ResourceArnError::Malformed);
+        };
+        if service_code.is_empty() || quota_code.is_empty() || quota_code.contains('/') {
+            return Err(ResourceArnError::Malformed);
+        }
+        let Some(default) = self.default_quota(service_code, quota_code) else {
+            return Err(ResourceArnError::NoSuchQuota);
+        };
+        // A region this emulator does not serve is checked before the ARN is rebuilt,
+        // because rebuilding would otherwise echo the caller's own string back.
+        if !default.global_quota && !KNOWN_REGIONS.contains(&region) {
+            return Err(ResourceArnError::NoSuchQuota);
+        }
+        // Comparing against the reported ARN is what checks the partition, the account
+        // and (for a global quota, which carries none) the region in one place.
+        let reported = quota_arn(region, service_code, quota_code, default.global_quota);
+        if reported == resource_arn {
+            Ok(reported)
+        } else {
+            Err(ResourceArnError::NoSuchQuota)
+        }
+    }
+
+    /// The tags on the applied quota `canonical_arn` carries, in `TagKey` order —
+    /// empty when nothing has tagged it.
+    ///
+    /// `canonical_arn` is what [`Self::resolve_quota_arn`] returned, so a quota that
+    /// does not exist never reaches here.
+    pub fn resource_tags(&self, canonical_arn: &str) -> Vec<Tag> {
+        self.quota_tags
+            .get(canonical_arn)
+            .into_iter()
+            .flatten()
+            .map(|(key, value)| Tag {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+
+    /// Add `tags` to the applied quota `canonical_arn`, replacing the value of a key
+    /// it already carries.
+    ///
+    /// A tag set is keyed by `TagKey`, so tagging is an upsert and a repeated key
+    /// leaves one tag, not two — which is why the ceiling is charged against the
+    /// DISTINCT keys the request would add. Nothing is written when it would be
+    /// exceeded, so a refused call leaves exactly the set it found, and an untagged
+    /// quota keeps no entry.
+    pub fn put_resource_tags(
+        &mut self,
+        canonical_arn: &str,
+        tags: &[Tag],
+    ) -> Result<(), TagCeilingExceeded> {
+        let existing = self.quota_tags.get(canonical_arn);
+        let held = existing.map_or(0, BTreeMap::len);
+        let added: BTreeSet<&str> = tags
+            .iter()
+            .map(|tag| tag.key.as_str())
+            .filter(|key| existing.is_none_or(|set| !set.contains_key(*key)))
+            .collect();
+        let would_hold = held + added.len();
+        if would_hold > MAX_TAGS_PER_RESOURCE {
+            return Err(TagCeilingExceeded { would_hold });
+        }
+        let set = self.quota_tags.entry(canonical_arn.to_string()).or_default();
+        for tag in tags {
+            set.insert(tag.key.clone(), tag.value.clone());
+        }
+        Ok(())
+    }
+
+    /// Remove the tags `keys` names from the applied quota `canonical_arn`.
+    ///
+    /// Removal is idempotent: a key the resource does not carry is not an error, and
+    /// the tags it does carry under other keys are left alone. A quota left with no
+    /// tags keeps no entry, so an untagged quota costs nothing to store.
+    pub fn remove_resource_tags(&mut self, canonical_arn: &str, keys: &[String]) {
+        let Some(tags) = self.quota_tags.get_mut(canonical_arn) else {
+            return;
+        };
+        for key in keys {
+            tags.remove(key);
+        }
+        if tags.is_empty() {
+            self.quota_tags.remove(canonical_arn);
+        }
+    }
+
     /// The applied overlay in force for a quota, read from where that quota's scope
     /// keeps it: account-wide for a `GlobalQuota`, the caller's region otherwise.
     fn applied_entry(
@@ -636,6 +817,54 @@ pub fn default_quota_arn(
 ) -> String {
     let region = if global_quota { "" } else { region };
     format!("arn:aws:{ARN_NAMESPACE}:{region}::{service_code}/{quota_code}")
+}
+
+/// Whether `partition` is an AWS ARN partition, as the modelled
+/// `AmazonResourceName` pattern spells one: `aws(-[\w]+)*` — `aws`, `aws-cn`,
+/// `aws-us-gov`.
+fn is_aws_partition(partition: &str) -> bool {
+    let Some(suffix) = partition.strip_prefix("aws") else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(parts) = suffix.strip_prefix('-') else {
+        return false;
+    };
+    parts.split('-').all(|part| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '_')
+    })
+}
+
+/// Whether `key` is in the tag namespace AWS reserves for itself
+/// ([`RESERVED_TAG_KEY_PREFIX`]).
+///
+/// Matched case-insensitively, the way AWS states the restriction (the prefix is
+/// reserved, not one spelling of it), and on the key's leading bytes only, so a key
+/// that merely CONTAINS the prefix is a caller's own tag.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// How a tagging operation states that `resource_arn` is not one of its ARNs, for the
+/// modelled `IllegalArgumentException`. Built from the request, naming the member and
+/// the form it has to take.
+pub fn malformed_resource_arn_message(resource_arn: &str) -> String {
+    format!(
+        "ResourceARN '{resource_arn}' is not an applied quota ARN of the form \
+         arn:<partition>:{ARN_NAMESPACE}:<region>:<account>:<ServiceCode>/<QuotaCode>"
+    )
+}
+
+/// How a tagging operation states that `resource_arn` names no applied quota of this
+/// account, for the modelled `NoSuchResourceException`.
+pub fn no_such_resource_arn_message(resource_arn: &str) -> String {
+    format!("no applied quota with ResourceARN '{resource_arn}' exists")
 }
 
 /// The identity a request records as its `Requester`: this emulator's single
