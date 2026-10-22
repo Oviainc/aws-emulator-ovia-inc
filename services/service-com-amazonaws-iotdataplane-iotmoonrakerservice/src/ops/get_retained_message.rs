@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRetainedMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRetainedMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRetainedMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers with the retained message a `Publish` with `retain=true` stored for the
+//! topic: the payload byte-for-byte as published, its QoS, its user properties and
+//! when it was stored. A topic with no retained message is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +155,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRetainedMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRetainedMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRetainedMessage"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetRetainedMessageErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the retained-message store is unavailable".to_string()),
+            })
+        })?;
+
+        let guard = state.lock();
+        // Reporting only: reading a retained message does not consume it — MQTT keeps
+        // a retained message until it is overwritten or cleared.
+        let retained = guard.retained_messages.get(&input.topic).ok_or_else(|| {
+            GetRetainedMessageErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(format!(
+                    "no retained message exists for topic '{}'",
+                    input.topic
+                )),
+            })
+        })?;
+
+        Ok(GetRetainedMessageOutput {
+            topic: Some(retained.topic.clone()),
+            payload: Some(retained.payload.clone()),
+            qos: retained.qos,
+            last_modified_time: retained.last_modified_time_millis,
+            user_properties: retained.user_properties.clone(),
+        })
     }
 }

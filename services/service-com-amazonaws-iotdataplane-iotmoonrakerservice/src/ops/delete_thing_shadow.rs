@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteThingShadow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteThingShadow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteThingShadow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored shadow document and answers with the deletion
+//! acknowledgement: the `version` the document had when it was deleted, and the
+//! `timestamp` of the deletion. Deleting a shadow that is not stored is a 404.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +149,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteThingShadow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteThingShadowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteThingShadow"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteThingShadowErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the thing-shadow store is unavailable".to_string()),
+            })
+        })?;
+
+        let key = crate::state::shadow_key(&input.thing_name, input.shadow_name.as_deref());
+        let mut guard = state.lock();
+        let deleted = guard.shadows.remove(&key).ok_or_else(|| {
+            DeleteThingShadowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(match input.shadow_name.as_deref() {
+                    Some(name) => format!(
+                        "no shadow named '{name}' exists for thing '{}'",
+                        input.thing_name
+                    ),
+                    None => format!("no shadow exists for thing '{}'", input.thing_name),
+                }),
+            })
+        })?;
+        drop(guard);
+
+        // The deletion acknowledgement names the version that was deleted and when the
+        // deletion was accepted. The document is gone, so a later update of the same
+        // shadow starts again at version 1.
+        let mut acknowledgement = ::serde_json::Map::new();
+        acknowledgement.insert(
+            "version".to_string(),
+            ::serde_json::Value::from(deleted.version),
+        );
+        acknowledgement.insert(
+            "timestamp".to_string(),
+            ::serde_json::Value::from(crate::state::now_secs()),
+        );
+
+        Ok(DeleteThingShadowOutput {
+            payload: ::serde_json::to_vec(&::serde_json::Value::Object(acknowledgement))
+                .expect("a deletion acknowledgement serializes to JSON"),
+        })
     }
 }
