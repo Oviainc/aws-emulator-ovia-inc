@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendAgreementCancellationRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendAgreementCancellationRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendAgreementCancellationRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a cancellation request over a stored active agreement, in
+//! `PENDING_APPROVAL` status, which `ListAgreementCancellationRequests` then
+//! reports. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,6 +151,24 @@ impl<Eng> SendAgreementCancellationRequest<Eng> {
     }
 }
 
+/// The `SendAgreementCancellationRequest` answer for a stored cancellation request.
+///
+/// Every member is read from the record, so a replayed `clientToken` reports the
+/// request the first call created rather than its own input.
+fn to_output(
+    stored: &crate::state::AgreementCancellationRequest,
+) -> SendAgreementCancellationRequestOutput {
+    SendAgreementCancellationRequestOutput {
+        agreement_id: Some(stored.agreement_id.clone()),
+        agreement_cancellation_request_id: Some(stored.id.clone()),
+        status: Some(stored.status.clone()),
+        reason_code: Some(stored.reason_code.clone()),
+        description: stored.description.clone(),
+        created_at: Some(::aws_smithy_types::DateTime::from(stored.created_at)),
+        updated_at: Some(::aws_smithy_types::DateTime::from(stored.updated_at)),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for SendAgreementCancellationRequest<Eng>
 {
@@ -174,18 +186,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendAgreementCancellationRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendAgreementCancellationRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendAgreementCancellationRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                SendAgreementCancellationRequestErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `@idempotencyToken`: the same token names the same cancellation
+        // request, so a retried send reports the first one rather than asking
+        // the buyer to review a second.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, token));
+        let replayed = token
+            .as_deref()
+            .and_then(|key| store.idempotency.get(key).cloned())
+            .and_then(|id| store.agreement_cancellation_requests.get(&id));
+        if let Some(stored) = replayed {
+            return Ok(to_output(stored));
+        }
+
+        let Some(agreement) = store.agreements.get(&input.agreement_id) else {
+            return Err(
+                SendAgreementCancellationRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                )
+                .into(),
+            );
+        };
+
+        // "Allows sellers (proposers) to submit a cancellation request for an
+        // active agreement": an agreement that has already reached a terminal
+        // status has nothing left to cancel, which is the `INACTIVE_AGREEMENT`
+        // the model names among `ValidationExceptionReason`'s values.
+        if agreement.status != crate::state::STATUS_ACTIVE {
+            return Err(
+                SendAgreementCancellationRequestErrorModeled::ValidationException(
+                    crate::state::validation_exception("INACTIVE_AGREEMENT", "agreementId"),
+                )
+                .into(),
+            );
+        }
+
+        // "The type of agreement" and "the catalog in which the agreement was
+        // created" are the agreement's own, so the request carries what the
+        // agreement holds rather than anything of its own.
+        let agreement_type = agreement.agreement_type.clone();
+        let catalog = agreement.catalog.clone();
+
+        // The store is bounded: past its ceiling a send is refused rather than
+        // adding another record, so repeated calls cannot grow state without
+        // end. Checked after the idempotency replay, so a retried send is still
+        // answered from what is already stored, and after the request's own
+        // validity, so a send naming an unknown or inactive agreement still
+        // reads its modelled refusal rather than this one — and before anything
+        // is written.
+        if store.agreement_cancellation_requests.len()
+            >= crate::state::AGREEMENT_CANCELLATION_REQUEST_QUOTA
+        {
+            return Err(
+                SendAgreementCancellationRequestErrorModeled::ThrottlingException(
+                    crate::state::store_full(
+                        crate::state::RESOURCE_TYPE_AGREEMENT_CANCELLATION_REQUEST,
+                        crate::state::AGREEMENT_CANCELLATION_REQUEST_QUOTA,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_agreement_cancellation_request_id();
+        let stored = crate::state::AgreementCancellationRequest {
+            id: id.clone(),
+            agreement_id: input.agreement_id,
+            agreement_type,
+            catalog,
+            // "The cancellation request is created in PENDING_APPROVAL status,
+            // at which point the buyer can review it" — the buyer's own call is
+            // what moves it on, so nothing here is owed to the clock. The model
+            // documents no refusal of a second pending request over one
+            // agreement, so none is invented.
+            status: crate::state::CANCELLATION_STATUS_PENDING_APPROVAL.to_string(),
+            // Both already satisfy the model: `reasonCode` is a modelled enum
+            // and `description` is `@length(1, 2000)`, so the boundary
+            // validator refused anything else before this handler ran.
+            reason_code: input.reason_code,
+            description: input.description,
+            client_token: input.client_token,
+            created_at: now,
+            updated_at: now,
+        };
+        store
+            .agreement_cancellation_requests
+            .insert(id.clone(), stored.clone());
+        if let Some(key) = token {
+            store.idempotency.insert(key, id.clone());
+        }
+        crate::state::audit(Self::NAME, "created", &id, ctx.parts());
+
+        Ok(to_output(&stored))
     }
 }

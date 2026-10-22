@@ -41,15 +41,16 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AcceptedTerm, Acceptor, AgreementViewSummary, BatchCreateBillingAdjustmentRequestEntry,
-    BillingAdjustmentSummary, ByolPricingTerm, ChargeSummary, ConfigurableUpfrontPricingTerm,
-    ConflictException, DescribeAgreementOutput, EndTimeBehavior, EstimatedCharges, ExpectedCharge,
-    Filter, FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetBillingAdjustmentRequestOutput,
+    AcceptedTerm, Acceptor, AgreementCancellationRequestSummary, AgreementViewSummary,
+    BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary, ByolPricingTerm,
+    ChargeSummary, ConfigurableUpfrontPricingTerm, ConflictException, DescribeAgreementOutput,
+    EndTimeBehavior, EstimatedCharges, ExpectedCharge, Filter, FixedUpfrontPricingTerm,
+    FreeTrialPricingTerm, GetBillingAdjustmentRequestOutput,
     InternalServerException, ItemizedCharge, LegalTerm, NetPaymentTerm, PaymentScheduleTerm,
     ProposalSummary, Proposer, PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm,
     RequestedTermConfiguration, ResourceNotFoundException, SupportTerm, TaxConfiguration,
-    UsageBasedPricingTerm, ValidationException, ValidationExceptionField, ValidityTerm,
-    VariablePaymentTerm,
+    ThrottlingException, UsageBasedPricingTerm, ValidationException, ValidationExceptionField,
+    ValidityTerm, VariablePaymentTerm,
 };
 
 /// The `agreementType` every agreement this slice mints carries.
@@ -112,6 +113,23 @@ pub const AGREEMENT_REQUEST_QUOTA: usize = 1_000;
 /// quota code is an identifier Service Quotas issues, which this emulator does
 /// not model and so must not invent one of.
 pub const AGREEMENT_REQUEST_QUOTA_CODE: &str = "AgreementRequestsPerAccount";
+
+/// How many agreement cancellation requests the store holds before
+/// `SendAgreementCancellationRequest` refuses another.
+///
+/// Like [`AGREEMENT_REQUEST_QUOTA`] this is the emulator's OWN ceiling on the
+/// store rather than a claim about an account's quota: it is what stops state
+/// growing without end under repeated sends, and it is far above any workflow an
+/// emulator serves. `SendAgreementCancellationRequest` models no
+/// `ServiceQuotaExceededException`, so a send past the ceiling is refused with
+/// its modelled `ThrottlingException` ([`store_full`]) — the service declining
+/// to take more work — and nothing is stored.
+///
+/// This also bounds the [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::idempotency`]
+/// map, whose entries are only ever written beside a record a create stored: the
+/// map holds at most one key per stored resource, so every create's own ceiling
+/// bounds it too.
+pub const AGREEMENT_CANCELLATION_REQUEST_QUOTA: usize = 1_000;
 
 /// The sigv4 signing name of this service, reported as the `serviceCode` of a
 /// quota refusal.
@@ -276,6 +294,27 @@ pub const SEARCH_FILTER_NAMES: &[&str] = &[
 pub const PARTY_TYPE_ACCEPTOR: &str = "Acceptor";
 /// See [`PARTY_TYPE_ACCEPTOR`].
 pub const PARTY_TYPE_PROPOSER: &str = "Proposer";
+
+/// Every value a `partyType` admits. `PartyType` is modelled a plain string
+/// (`@length(1, 32)`, `^[A-Za-z]+$`), not an enum, so the boundary validator
+/// cannot refuse a party type that is neither of these — the handler does, with
+/// [`validation_exception`] and the modelled `INVALID_PARTY_TYPE` reason.
+pub const PARTY_TYPE_VALUES: &[&str] = &[PARTY_TYPE_PROPOSER, PARTY_TYPE_ACCEPTOR];
+
+/// The `AgreementCancellationRequestStatus` a cancellation request is created
+/// in: "The cancellation request is created in PENDING_APPROVAL status, at which
+/// point the buyer can review it"
+/// (`SendAgreementCancellationRequest`).
+///
+/// What moves it on is the buyer's own call
+/// (`AcceptAgreementCancellationRequest`, `RejectAgreementCancellationRequest`)
+/// or the seller's `CancelAgreementCancellationRequest` — never the clock, so a
+/// stored request stays `PENDING_APPROVAL` until one of those runs.
+pub const CANCELLATION_STATUS_PENDING_APPROVAL: &str = "PENDING_APPROVAL";
+
+/// `ResourceType` for a cancellation request, reported on a
+/// `ResourceNotFoundException` or a `ConflictException` about one.
+pub const RESOURCE_TYPE_AGREEMENT_CANCELLATION_REQUEST: &str = "AgreementCancellationRequest";
 
 // ---------------------------------------------------------------------------
 // Pagination tokens
@@ -736,6 +775,78 @@ impl Agreement {
     }
 }
 
+/// Whether the caller is the party `party_type` names on `agreement`.
+///
+/// A party type is "the party type of the caller", so it selects by the account
+/// the agreement records for that side. This emulator serves one account, which
+/// `AcceptAgreementRequest` records as the acceptor of every agreement it mints;
+/// the proposer is the seller who published the proposal, whose account the
+/// emulator holds no record of. So `Acceptor` selects the agreements this
+/// account accepted, and `Proposer` selects those it proposed — none, until a
+/// proposer account is ever stored. A party type that is neither value selects
+/// nothing; a handler refuses it where it is a request member, with
+/// [`validation_exception`] and the modelled `INVALID_PARTY_TYPE` reason.
+///
+/// Shared by `SearchAgreements`' `PartyType` filter and by every operation that
+/// takes a `partyType` of its own.
+pub fn caller_is_party(agreement: &Agreement, party_type: &str) -> bool {
+    let caller = Some(::engine::emulator_account_id());
+    match party_type {
+        PARTY_TYPE_ACCEPTOR => agreement.acceptor.account_id.as_deref() == caller,
+        PARTY_TYPE_PROPOSER => agreement.proposer.account_id.as_deref() == caller,
+        _ => false,
+    }
+}
+
+/// One agreement cancellation request, as this emulator persists it.
+///
+/// `SendAgreementCancellationRequest` creates it over an active agreement and
+/// every later report of it (`ListAgreementCancellationRequests`,
+/// `GetAgreementCancellationRequest`) is computed from this one record.
+#[derive(Debug, Clone)]
+pub struct AgreementCancellationRequest {
+    /// `^acr-[a-zA-Z0-9]+$`, minted by
+    /// [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::mint_agreement_cancellation_request_id`].
+    pub id: String,
+    /// The agreement the cancellation was asked for.
+    pub agreement_id: String,
+    /// The agreement's own `agreementType` and `catalog`, copied at create time:
+    /// a summary reports "the type of agreement" and "the catalog in which the
+    /// agreement was created", which are properties of that agreement and not of
+    /// the cancelling call.
+    pub agreement_type: String,
+    /// See [`AgreementCancellationRequest::agreement_type`].
+    pub catalog: String,
+    /// One of `AgreementCancellationRequestStatus`'s values; see
+    /// [`CANCELLATION_STATUS_PENDING_APPROVAL`].
+    pub status: String,
+    /// One of `AgreementCancellationRequestReasonCode`'s values, as the modelled
+    /// enum member the create call carried.
+    pub reason_code: String,
+    /// The optional free-text reason the create call carried.
+    pub description: Option<String>,
+    /// The `clientToken` the create call carried, if any.
+    pub client_token: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl AgreementCancellationRequest {
+    /// The `ListAgreementCancellationRequests` projection of this request.
+    pub fn to_summary(&self) -> AgreementCancellationRequestSummary {
+        AgreementCancellationRequestSummary {
+            agreement_cancellation_request_id: Some(self.id.clone()),
+            agreement_id: Some(self.agreement_id.clone()),
+            status: Some(self.status.clone()),
+            reason_code: Some(self.reason_code.clone()),
+            agreement_type: Some(self.agreement_type.clone()),
+            catalog: Some(self.catalog.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+        }
+    }
+}
+
 /// The kind of an accepted term, as its own `type` member spells it.
 pub fn accepted_term_kind(term: &AcceptedTerm) -> &str {
     let r#type = match term {
@@ -842,8 +953,9 @@ impl BillingAdjustmentRequest {
 /// The scope a `ListBillingAdjustmentRequests` page token belongs to: the whole
 /// query, so a token cannot resume a different listing.
 ///
-/// Every part is length-prefixed by [`counted`], so no value a caller supplies
-/// can imitate the delimiters and make two different listings hash alike.
+/// Every part is length-prefixed by [`query_scope`], so no value a caller
+/// supplies can imitate the delimiters and make two different listings hash
+/// alike.
 pub fn billing_adjustment_scope(
     agreement_id: Option<&str>,
     status: Option<&str>,
@@ -852,18 +964,15 @@ pub fn billing_adjustment_scope(
     created_after: Option<f64>,
     created_before: Option<f64>,
 ) -> String {
-    let instant = |bound: Option<f64>| {
-        counted(&bound.map(|secs| format!("{secs:?}")).unwrap_or_default())
-    };
-    format!(
-        "{}{}{}{}{}{}",
-        counted(agreement_id.unwrap_or_default()),
-        counted(status.unwrap_or_default()),
-        counted(catalog.unwrap_or_default()),
-        counted(agreement_type.unwrap_or_default()),
-        instant(created_after),
-        instant(created_before),
-    )
+    let instant = |bound: Option<f64>| bound.map(|secs| format!("{secs:?}")).unwrap_or_default();
+    query_scope(&[
+        agreement_id.unwrap_or_default(),
+        status.unwrap_or_default(),
+        catalog.unwrap_or_default(),
+        agreement_type.unwrap_or_default(),
+        &instant(created_after),
+        &instant(created_before),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -964,18 +1073,8 @@ fn matches_filter(agreement: &Agreement, name: &str, value: &str) -> bool {
             .flatten()
             .any(|resource| resource.r#type.as_deref() == Some(value)),
         // "The party type of the caller": the agreement matches when the
-        // caller's own account is the party the filter names. This emulator
-        // serves one account, so a search as the acceptor finds the agreements
-        // it accepted, and one as the proposer finds those it proposed — none,
-        // until a proposer account is ever stored.
-        "PartyType" => {
-            let caller = Some(::engine::emulator_account_id());
-            match value {
-                PARTY_TYPE_ACCEPTOR => agreement.acceptor.account_id.as_deref() == caller,
-                PARTY_TYPE_PROPOSER => agreement.proposer.account_id.as_deref() == caller,
-                _ => false,
-            }
-        }
+        // caller's own account is the party the filter names.
+        "PartyType" => caller_is_party(agreement, value),
         "AcceptorAccountId" => agreement.acceptor.account_id.as_deref() == Some(value),
         "OfferId" => agreement.proposal_summary.offer_id.as_deref() == Some(value),
         "OfferSetId" => agreement.proposal_summary.offer_set_id.as_deref() == Some(value),
@@ -1035,7 +1134,7 @@ pub fn validate_filters(filters: &[Filter]) -> Result<(), FilterRefusal> {
                 path: filter_member_path(index, "name"),
             });
         }
-        if name == "PartyType" && !matches!(value, PARTY_TYPE_ACCEPTOR | PARTY_TYPE_PROPOSER) {
+        if name == "PartyType" && !PARTY_TYPE_VALUES.contains(&value) {
             return Err(FilterRefusal {
                 reason: "INVALID_PARTY_TYPE",
                 path: filter_value_path(index),
@@ -1083,10 +1182,19 @@ pub fn matches_filters(agreement: &Agreement, filters: &[Filter]) -> bool {
     })
 }
 
+/// The scope a page token belongs to: every part of the query that selects what
+/// the page indexes into, each part length-prefixed by [`counted`] so no value a
+/// caller supplies can imitate the delimiters and make two different queries
+/// hash alike.
+///
+/// The one spelling of that rule: [`search_scope`] and
+/// [`billing_adjustment_scope`] both build their scope from it.
+pub fn query_scope(parts: &[&str]) -> String {
+    parts.iter().copied().map(counted).collect()
+}
+
 /// The scope a `SearchAgreements` page token belongs to: the whole query, so a
 /// token cannot resume a different search.
-/// Every part is length-prefixed, so no value a caller supplies can imitate the
-/// delimiters and make two different searches hash alike.
 pub fn search_scope(
     catalog: Option<&str>,
     filters: &[Filter],
@@ -1096,28 +1204,24 @@ pub fn search_scope(
     let mut pairs: Vec<String> = filters
         .iter()
         .map(|filter| {
-            format!(
-                "{}{}",
-                counted(filter.name.as_deref().unwrap_or_default()),
-                counted(
-                    filter
-                        .values
-                        .as_ref()
-                        .and_then(|values| values.first())
-                        .map(String::as_str)
-                        .unwrap_or_default()
-                )
-            )
+            query_scope(&[
+                filter.name.as_deref().unwrap_or_default(),
+                filter
+                    .values
+                    .as_ref()
+                    .and_then(|values| values.first())
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            ])
         })
         .collect();
     pairs.sort();
-    format!(
-        "{}{}{}{}",
-        counted(catalog.unwrap_or_default()),
-        counted(sort_by),
-        counted(sort_order),
-        counted(&pairs.join(""))
-    )
+    query_scope(&[
+        catalog.unwrap_or_default(),
+        sort_by,
+        sort_order,
+        &pairs.join(""),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -1384,6 +1488,19 @@ pub fn unsupported_filter_combination(path: impl Into<String>) -> ValidationExce
     }
 }
 
+/// The `ThrottlingException` a create answers when its store already holds the
+/// most records the emulator keeps: the request is declined, and nothing is
+/// stored, rather than letting state grow without end.
+pub fn store_full(resource_type: &str, quota: usize) -> ThrottlingException {
+    ThrottlingException {
+        request_id: None,
+        message: Some(format!(
+            "this emulator already holds the maximum of {quota} {resource_type} records; \
+             release some before creating another"
+        )),
+    }
+}
+
 /// The `ResourceNotFoundException` for an agreement id that names no agreement.
 pub fn agreement_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
@@ -1455,6 +1572,17 @@ pub fn store_unavailable() -> InternalServerException {
 // The store
 // ---------------------------------------------------------------------------
 
+/// The key [`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::idempotency`]
+/// holds an operation's `clientToken` under.
+///
+/// A `clientToken` is unique within the create that minted it, not across the
+/// service, so the operation's own name is part of the key. The separator is a
+/// character `ClientToken`'s `^[a-zA-Z0-9-]+$` forbids, so no token a caller
+/// supplies can forge another operation's key.
+pub fn idempotency_key(operation: &str, client_token: &str) -> String {
+    format!("{operation}#{client_token}")
+}
+
 /// Per-service state for com-amazonaws-marketplaceagreement-awsmpcommerceservice-v20200301. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
@@ -1464,14 +1592,23 @@ pub struct ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// `SearchAgreements` a stable total order to page over: ids are minted from
     /// a zero-padded counter, so they sort in creation order.
     pub agreements: BTreeMap<String, Agreement>,
+    /// Every agreement cancellation request, keyed by its
+    /// `^acr-[a-zA-Z0-9]+$` id. A `BTreeMap` is what gives
+    /// `ListAgreementCancellationRequests` a stable total order to page over:
+    /// ids are minted from a zero-padded counter, so they sort in creation
+    /// order.
+    pub agreement_cancellation_requests: BTreeMap<String, AgreementCancellationRequest>,
     /// Every billing adjustment request, keyed by its `^ba-[a-zA-Z0-9]+$` id.
     /// A `BTreeMap` is what gives `ListBillingAdjustmentRequests` a stable total
     /// order to page over: ids are minted from a zero-padded counter, so they
     /// sort in creation order.
     pub billing_adjustment_requests: BTreeMap<String, BillingAdjustmentRequest>,
-    /// A `CreateAgreementRequest` `clientToken` to the agreement request it
-    /// created, so a replayed create answers with the first request's id
-    /// instead of minting a second quote.
+    /// An `@idempotencyToken` `clientToken` to the resource it created, so a
+    /// replayed create answers with the first resource instead of minting a
+    /// second one. `CreateAgreementRequest` keys it by the token itself;
+    /// `SendAgreementCancellationRequest` keys it by [`idempotency_key`], which
+    /// no `ClientToken` (`^[a-zA-Z0-9-]+$`) can imitate, so the two creates
+    /// cannot collide on one token.
     pub idempotency: HashMap<String, String>,
     /// The counter every id this service mints is drawn from.
     pub id_sequence: u64,
@@ -1490,6 +1627,17 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
         loop {
             let id = format!("ar-{:016x}", self.next_sequence());
             if !self.agreement_requests.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Mint an unused cancellation request id matching
+    /// `AgreementCancellationRequestId`'s `^acr-[a-zA-Z0-9]+$`.
+    pub fn mint_agreement_cancellation_request_id(&mut self) -> String {
+        loop {
+            let id = format!("acr-{:016x}", self.next_sequence());
+            if !self.agreement_cancellation_requests.contains_key(&id) {
                 return id;
             }
         }

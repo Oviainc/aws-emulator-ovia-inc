@@ -71,9 +71,10 @@ pub(crate) fn is_next_token(value: &str) -> bool {
 
 /// One emulator: a router carrying only this service, over one shared engine.
 ///
-/// `pub(crate)` because the suites beside this one (the billing-adjustment one
-/// and `validation_messages`) drive the same emulator over the same wire
-/// helpers rather than building a second harness.
+/// `pub(crate)` because the suites beside this one (the billing-adjustment one,
+/// `validation_messages` and the agreement-cancellation-request one) drive the
+/// same emulator over the same wire helpers rather than building a second
+/// harness.
 pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -173,7 +174,7 @@ async fn search(router: &MultiServiceRouter, request: Value) -> Answer {
     call(router, "SearchAgreements", request).await
 }
 
-async fn cancel(router: &MultiServiceRouter, agreement_id: &str) -> Answer {
+pub(crate) async fn cancel(router: &MultiServiceRouter, agreement_id: &str) -> Answer {
     call(router, "CancelAgreement", json!({"agreementId": agreement_id})).await
 }
 

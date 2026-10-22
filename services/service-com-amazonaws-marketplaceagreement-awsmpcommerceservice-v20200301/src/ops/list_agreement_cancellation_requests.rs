@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgreementCancellationRequests
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgreementCancellationRequests`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgreementCancellationRequests::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored cancellation requests the caller is a party to, filtered and
+//! paginated as the request asks. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +158,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgreementCancellationRequests` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgreementCancellationRequestsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgreementCancellationRequests"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListAgreementCancellationRequestsErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // "PartyType is a required parameter. A ValidationException is returned
+        // if PartyType is not provided" — the model makes it required, so the
+        // boundary validator answers that case; what is left here is a party
+        // type that names neither party. `PartyType` is a pattern-constrained
+        // string rather than an enum, so nothing before this handler refuses it.
+        // Refused BEFORE the store is read, so the answer is the same whatever
+        // the store happens to hold, including nothing at all. The envelope is
+        // the service's own: the modelled `INVALID_PARTY_TYPE` reason, which
+        // `validation_exception` states as the sentence naming that member.
+        if !crate::state::PARTY_TYPE_VALUES.contains(&input.party_type.as_str()) {
+            return Err(
+                ListAgreementCancellationRequestsErrorModeled::ValidationException(
+                    crate::state::validation_exception("INVALID_PARTY_TYPE", "partyType"),
+                )
+                .into(),
+            );
+        }
+
+        // A pure report: it reads the stored cancellation requests and writes
+        // nothing.
+        let store = state.lock();
+        let mut matched: Vec<&crate::state::AgreementCancellationRequest> = Vec::new();
+        // Keyed by a zero-padded counter, so the map's order is creation order:
+        // a total order a page token can index into on every call.
+        for request in store.agreement_cancellation_requests.values() {
+            // "Lists agreement cancellation requests available to you as a
+            // seller or buyer… Use Proposer to list cancellation requests where
+            // you are the seller, or Acceptor to list cancellation requests
+            // where you are the buyer": a request is available to the caller
+            // when the agreement it belongs to names the caller's account as
+            // the party the call claims to be.
+            let available = store
+                .agreements
+                .get(&request.agreement_id)
+                .is_some_and(|agreement| {
+                    crate::state::caller_is_party(agreement, &input.party_type)
+                });
+            if !available {
+                continue;
+            }
+            // Every remaining input member is "an optional parameter to filter
+            // cancellation requests by" the member of the stored request it
+            // names; several are an AND.
+            if input
+                .agreement_id
+                .as_deref()
+                .is_some_and(|id| id != request.agreement_id)
+            {
+                continue;
+            }
+            if input
+                .status
+                .as_deref()
+                .is_some_and(|status| status != request.status)
+            {
+                continue;
+            }
+            if input
+                .agreement_type
+                .as_deref()
+                .is_some_and(|agreement_type| agreement_type != request.agreement_type)
+            {
+                continue;
+            }
+            if input
+                .catalog
+                .as_deref()
+                .is_some_and(|catalog| catalog != request.catalog)
+            {
+                continue;
+            }
+            matched.push(request);
+        }
+
+        // The token resumes THIS listing: a token minted for a different set of
+        // filters, or for a different party type, would index into a different
+        // sequence.
+        let scope = crate::state::query_scope(&[
+            &input.party_type,
+            input.agreement_id.as_deref().unwrap_or_default(),
+            input.status.as_deref().unwrap_or_default(),
+            input.agreement_type.as_deref().unwrap_or_default(),
+            input.catalog.as_deref().unwrap_or_default(),
+        ]);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::page_offset(&scope, token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(
+                        ListAgreementCancellationRequestsErrorModeled::ValidationException(
+                            crate::state::validation_exception(
+                                "INVALID_NEXT_TOKEN",
+                                "nextToken",
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let summaries: Vec<AgreementCancellationRequestSummary> = matched
+            .iter()
+            .map(|request| request.to_summary())
+            .collect();
+        // "The maximum number of cancellation requests to return in the
+        // response", and "the token used for pagination. The field is null if
+        // there are no more results."
+        let Some((items, next_token)) = crate::state::paginate(
+            &summaries,
+            &scope,
+            offset,
+            crate::state::page_size(input.max_results),
+        ) else {
+            // The offset is past the end of what this listing selects, which no
+            // token this operation minted for it ever named.
+            return Err(
+                ListAgreementCancellationRequestsErrorModeled::ValidationException(
+                    crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListAgreementCancellationRequestsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }
