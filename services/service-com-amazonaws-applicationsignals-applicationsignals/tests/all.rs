@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/grouping_configuration.rs"]
 mod grouping_configuration;
+#[path = "all/sli_metric_type.rs"]
+mod sli_metric_type;
 #[path = "all/slo_lifecycle.rs"]
 mod slo_lifecycle;
 #[path = "all/state_roundtrip.rs"]

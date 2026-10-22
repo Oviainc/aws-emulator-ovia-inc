@@ -28,7 +28,10 @@ const REGION: &str = "eu-west-2";
 const ACCOUNT: &str = "000000000000";
 
 /// A router with just this service mounted on a fresh engine.
-fn router() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the other suites in this test target drive the same mounted router
+/// rather than re-deriving a harness of their own.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -39,7 +42,7 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Send one request and return its status and parsed JSON body (`Value::Null` when empty).
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option<Value>) -> (u16, Value) {
     let payload = body.map_or_else(Vec::new, |body| {
         serde_json::to_vec(&body).expect("serialize the request body")
     });
@@ -76,7 +79,7 @@ fn sli_config(service_name: &str, operation: &str, threshold: f64) -> Value {
 }
 
 /// Create one SLO and return the `Slo` the service answers with.
-async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
+pub(crate) async fn create(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
     call(router, "POST", "/slo", Some(body)).await
 }
 
@@ -998,13 +1001,22 @@ async fn the_stored_sli_mirrors_the_config_with_its_documented_defaults() {
             sli["ComparisonOperator"]
         );
         // Every member the config and the indicator share round-trips unchanged.
-        for member in ["KeyAttributes", "OperationName", "MetricType", "MetricDataQueries"] {
+        for member in ["KeyAttributes", "OperationName", "MetricDataQueries"] {
             assert_eq!(
                 sli["SliMetric"][member], metric_config[member],
                 "case {:?}: expected Sli.SliMetric.{member} to mirror the config as {:?}, got {:?}",
                 case.name, metric_config[member], sli["SliMetric"][member]
             );
         }
+        // `MetricType` is NOT mirrored here: this config spells out its own
+        // `MetricDataQueries`, so it selects no Application Signals standard metric and the
+        // indicator reports no metric type (see `tests/all/sli_metric_type.rs`).
+        assert!(
+            sli["SliMetric"]["MetricType"].is_null(),
+            "case {:?}: a config that names its own MetricDataQueries must report no MetricType, got {:?}",
+            case.name,
+            sli["SliMetric"]["MetricType"]
+        );
         assert!(
             created["Slo"]["RequestBasedSli"].is_null(),
             "case {:?}: a period-based SLO must carry no RequestBasedSli, got {:?}",
@@ -1218,7 +1230,7 @@ async fn delete_removes_the_record_and_a_missing_id_is_not_found() {
 /// `-`, `.`, `_`, ` `. Every one of those but the space is in RFC 3986's unreserved set and
 /// is already legal in a path segment, so substituting the space is a COMPLETE escaping of
 /// any name the API accepts — a closed character class, not an encoding algorithm.
-fn name_path_segment(name: &str) -> String {
+pub(crate) fn name_path_segment(name: &str) -> String {
     name.replace(' ', "%20")
 }
 

@@ -289,10 +289,50 @@ pub fn goal_with_defaults(requested: Option<&Goal>) -> Goal {
     }
 }
 
+/// The `MetricType` the indicator of a stored SLO reports, from the config that built it.
+///
+/// Both indicator shapes document the member identically
+/// (`smithy_query(shape="ServiceLevelIndicatorMetric")`, member `MetricType`): "If the SLO
+/// monitors either the `LATENCY` or `AVAILABILITY` metric that Application Signals
+/// collects, this field displays which of those metrics is used." The member therefore
+/// reports the standard metric Application Signals SELECTED for this SLO, not whatever the
+/// request happened to carry, so it is reported only when the config actually made that
+/// selection:
+///
+/// * the config must name the Application Signals entity whose standard metrics are
+///   collected — its `KeyAttributes`, which the member's config-side doc requires for an
+///   SLO "related to a metric collected by Application Signals"; and
+/// * the config must not specify a metric of its OWN, since then that metric, not a
+///   standard one, is what the SLO monitors: CloudWatch metric or metric-math queries
+///   (`MetricDataQueries`, or a request-based config's request-count queries), a
+///   `MetricName` which the model defines as "the name of the CloudWatch metric to use for
+///   the SLO, when using a custom metric rather than Application Signals standard metrics",
+///   or a `MetricSource`, "the metric source for SLOs on resources other than Application
+///   Signals services".
+///
+/// Otherwise the member stays ABSENT: reporting it would tell a client the SLO tracks an
+/// Application Signals standard metric when the SLO's metric is the one the request spelled
+/// out, and would send that classification back on a Get-into-Update round trip.
+fn reported_metric_type(
+    requested: Option<&String>,
+    key_attributes: Option<&HashMap<String, String>>,
+    metric_name: Option<&str>,
+    metric_source: Option<&MetricSource>,
+    config_names_its_own_metric: bool,
+) -> Option<String> {
+    let selects_standard_metric = key_attributes.is_some()
+        && metric_name.is_none()
+        && metric_source.is_none()
+        && !config_names_its_own_metric;
+    requested.filter(|_| selects_standard_metric).cloned()
+}
+
 /// The `ServiceLevelIndicator` a period-based `SliConfig` describes.
 ///
 /// Every member of the indicator is the corresponding member of the config, with the
-/// config's own modelled defaults applied to `MetricThreshold` and `ComparisonOperator`.
+/// config's own modelled defaults applied to `MetricThreshold` and `ComparisonOperator`,
+/// except `MetricType`, which is reported only when the config selected an Application
+/// Signals standard metric (see [`reported_metric_type`]).
 /// `SliMetric.MetricDataQueries` is `@required` on the indicator but optional on the
 /// config: when the request supplies no queries it stays EMPTY rather than being filled
 /// with a synthesised CloudWatch query — the real service builds that query from its own
@@ -304,7 +344,16 @@ pub fn sli_from_config(config: &ServiceLevelIndicatorConfig) -> ServiceLevelIndi
         sli_metric: ServiceLevelIndicatorMetric {
             key_attributes: metric.key_attributes.clone(),
             operation_name: metric.operation_name.clone(),
-            metric_type: metric.metric_type.clone(),
+            metric_type: reported_metric_type(
+                metric.metric_type.as_ref(),
+                metric.key_attributes.as_ref(),
+                metric.metric_name.as_deref(),
+                metric.metric_source.as_ref(),
+                metric
+                    .metric_data_queries
+                    .as_ref()
+                    .is_some_and(|queries| !queries.is_empty()),
+            ),
             metric_data_queries: metric.metric_data_queries.clone().unwrap_or_default(),
             dependency_config: metric.dependency_config.clone(),
             metric_source: metric.metric_source.clone(),
@@ -324,7 +373,9 @@ pub fn sli_from_config(config: &ServiceLevelIndicatorConfig) -> ServiceLevelIndi
 ///
 /// `MetricThreshold`/`ComparisonOperator` carry no default on this config (the model
 /// declares them only "required if this SLO is tracking the Latency metric"), so they are
-/// stored exactly as supplied. `MonitoredRequestCountMetric` is `@required` on the
+/// stored exactly as supplied, and `MetricType` follows the same standard-metric rule as
+/// the period-based indicator (see [`reported_metric_type`]).
+/// `MonitoredRequestCountMetric` is `@required` on the
 /// indicator but optional on the config; as with the period-based queries it is kept at an
 /// empty good-count list rather than being filled with a synthesised query.
 pub fn request_based_sli_from_config(
@@ -335,7 +386,17 @@ pub fn request_based_sli_from_config(
         request_based_sli_metric: RequestBasedServiceLevelIndicatorMetric {
             key_attributes: metric.key_attributes.clone(),
             operation_name: metric.operation_name.clone(),
-            metric_type: metric.metric_type.clone(),
+            metric_type: reported_metric_type(
+                metric.metric_type.as_ref(),
+                metric.key_attributes.as_ref(),
+                metric.metric_name.as_deref(),
+                metric.metric_source.as_ref(),
+                metric
+                    .total_request_count_metric
+                    .as_ref()
+                    .is_some_and(|queries| !queries.is_empty())
+                    || metric.monitored_request_count_metric.is_some(),
+            ),
             total_request_count_metric: metric
                 .total_request_count_metric
                 .clone()
