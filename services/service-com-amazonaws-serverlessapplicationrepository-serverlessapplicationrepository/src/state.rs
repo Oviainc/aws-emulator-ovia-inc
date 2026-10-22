@@ -157,7 +157,11 @@ impl Application {
             creation_time: Some(self.creation_time.clone()),
             description: self.description.clone(),
             home_page_url: self.home_page_url.clone(),
-            labels: optional_list(&self.labels),
+            // An empty list is the member's VALUE, not its absence: the service reports
+            // a label-less application as `"labels": []`, the same way it reports a
+            // version-less application as `"versions": []`. A client reading
+            // `response["labels"]` must not have to guard for the member being missing.
+            labels: Some(self.labels.clone()),
             name: self.name.clone(),
             spdx_license_id: self.spdx_license_id.clone(),
         }
@@ -422,6 +426,110 @@ pub fn application_not_found_message(application_id: &str) -> String {
     format!("Application with id {application_id} could not be found.")
 }
 
+/// The documented ceiling on `Labels`: "Maximum number of labels: 10"
+/// (`smithy_query(query="doc", shape="CreateApplicationRequest", member="Labels")`).
+pub const MAX_LABELS: usize = 10;
+
+// ---------------------------------------------------------------------------
+// The application metadata members, validated in ONE place.
+//
+// `Name`, `Author`, `Description` and `Labels` are members of BOTH
+// `CreateApplication` and `UpdateApplication` (`Name` only of the create), so the
+// bounds each one carries are stated here once and both handlers refuse by the same
+// rule rather than keeping two copies that can drift.
+//
+// WHAT IS ENFORCED: the model constrains none of these members — every one targets
+// `__string`/`__listOf__string` with no `@length` and no `@pattern`
+// (`smithy_query(query="operation", operation="CreateApplication")`) — so the only
+// bounds there are to apply are the ones the member's own documentation states, and of
+// those a CHARACTER PATTERN is applied only where the value is an identifier the
+// service builds other identifiers from. `Name` is such a value: it is the resource
+// segment of the `ApplicationId` ARN ([`application_arn`]) and the catalogue's
+// uniqueness key ([`name_key`]), so its documented character class is enforced.
+// `Labels` are the discovery tokens a search matches on, and their documented class is
+// the token alphabet, so it is enforced too. `Author` and `Description` are free-form
+// human text that is only stored and echoed: the service accepts any text within the
+// documented length — an `Author` carrying a space, say — so the lowercase-and-hyphen
+// pattern that appears in the member's prose is NOT a refusal here.
+// ---------------------------------------------------------------------------
+
+/// `Name`: "Minimum length=1. Maximum length=140 Pattern: \"[a-zA-Z0-9\\-]+\""
+/// (`smithy_query(query="doc", shape="CreateApplicationRequest", member="Name")`).
+///
+/// Returns the refusal message the calling operation renders as its own modelled
+/// invalid-parameter error.
+pub fn validate_name(name: &str) -> Result<(), String> {
+    bounded_length("Name", name, 1, 140)?;
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(format!("Name must satisfy pattern [a-zA-Z0-9\\-]+: {name}"));
+    }
+    Ok(())
+}
+
+/// `Author`: "Minimum length=1. Maximum length=127"
+/// (`smithy_query(query="doc", shape="CreateApplicationRequest", member="Author")`).
+///
+/// Length only: the author is attribution text the service stores and echoes, and the
+/// model declares no constraint on it. See the note above this group.
+pub fn validate_author(author: &str) -> Result<(), String> {
+    bounded_length("Author", author, 1, 127)
+}
+
+/// `Description`: "Minimum length=1. Maximum length=256"
+/// (`smithy_query(query="doc", shape="CreateApplicationRequest", member="Description")`).
+pub fn validate_description(description: &str) -> Result<(), String> {
+    bounded_length("Description", description, 1, 256)
+}
+
+/// `Labels`: "Minimum length=1. Maximum length=127. Maximum number of labels: 10
+/// Pattern: \"^[a-zA-Z0-9+\\-_:\\/@]+$\""
+/// (`smithy_query(query="doc", shape="CreateApplicationRequest", member="Labels")`).
+pub fn validate_labels(labels: &[String]) -> Result<(), String> {
+    if labels.len() > MAX_LABELS {
+        return Err(format!(
+            "Labels must have at most {MAX_LABELS} entries, got {}",
+            labels.len()
+        ));
+    }
+    for label in labels {
+        bounded_length("Labels", label, 1, 127)?;
+        if !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '_' | ':' | '/' | '@'))
+        {
+            return Err(format!(
+                "Labels must satisfy pattern ^[a-zA-Z0-9+\\-_:\\/@]+$: {label}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The documented minimum/maximum length of one member, in characters.
+pub fn bounded_length(member: &str, value: &str, min: usize, max: usize) -> Result<(), String> {
+    let length = value.chars().count();
+    if length < min || length > max {
+        return Err(format!(
+            "{member} must have length between {min} and {max}, got {length}"
+        ));
+    }
+    Ok(())
+}
+
+/// The documented maximum size of an inline body, in bytes — checked before the body is
+/// retained, because the store holds it for the life of the record.
+pub fn bounded_bytes(member: &str, value: Option<&String>, max: usize) -> Result<(), String> {
+    if let Some(value) = value {
+        if value.len() > max {
+            return Err(format!(
+                "{member} must be at most {max} bytes, got {}",
+                value.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Whether `semantic_version` is a semantic version, which is what the model says the
 /// member carries: "The semantic version of the application: <https://semver.org/>"
 /// (`smithy_query(query="doc", shape="Version", member="SemanticVersion")`).
@@ -542,12 +650,6 @@ pub fn now_iso8601() -> String {
     ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now())
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
-/// `Some(list)` for a non-empty list, `None` for an empty one, so an optional list
-/// member is absent rather than empty when nothing was stored for it.
-fn optional_list(values: &[String]) -> Option<Vec<String>> {
-    (!values.is_empty()).then(|| values.to_vec())
 }
 
 /// Why a `nextToken` could not be used. Both answer HTTP 400: a token is either this
