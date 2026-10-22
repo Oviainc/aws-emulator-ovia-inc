@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Publishes the supported Grafana versions, oldest first:
+//! [`crate::state::SUPPORTED_GRAFANA_VERSIONS`] is the catalogue, and a request that
+//! names a workspace is answered with the versions that workspace can be UPGRADED to —
+//! the catalogue entries strictly newer than the version it persists.
+//! `@paginated(items: grafanaVersions)`, so a page is cut at `maxResults` and `nextToken`
+//! carries the version the next page resumes at.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +154,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVersions"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListVersionsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the grafana workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // The ordered set this call reports. With no workspace it is the whole
+        // supported catalogue ("lists all versions of Grafana that are supported
+        // for CreateWorkspace"); with one it is the versions that workspace "can
+        // be upgraded" to, computed from the version the store persists for it.
+        // This operation is `@readonly`, so it only reads that record.
+        let versions: Vec<String> = match input.workspace_id.as_deref() {
+            None => crate::state::SUPPORTED_GRAFANA_VERSIONS
+                .iter()
+                .map(|version| (*version).to_string())
+                .collect(),
+            Some(id) => {
+                let store = state.lock();
+                let Some(workspace) = store.workspaces.get(id) else {
+                    return Err(ListVersionsErrorModeled::ResourceNotFoundException(
+                        crate::state::workspace_not_found(id),
+                    )
+                    .into());
+                };
+                crate::state::upgrade_targets(&workspace.grafana_version)
+            }
+        };
+
+        // `maxResults` is modelled `@range(min: 1, max: 100)` and the boundary
+        // validator refused anything outside it before this handler ran, so the
+        // only case left is an absent value: serve the largest page the model
+        // allows. The `clamp` states that invariant rather than correcting a
+        // caller — a value reaching here outside the range is a validator bug,
+        // which the debug assertion surfaces instead of silently repairing.
+        let requested = input.max_results.unwrap_or(crate::state::VERSION_PAGE_LIMIT);
+        debug_assert!(
+            (1..=crate::state::VERSION_PAGE_LIMIT).contains(&requested),
+            "maxResults {requested} should have been refused at the boundary"
+        );
+        let page_size = usize::try_from(requested.clamp(1, crate::state::VERSION_PAGE_LIMIT))
+            .expect("a page size clamped into 1..=100 fits in usize");
+
+        // The token is the version the next page starts at, so the only tokens
+        // this operation issues — and accepts — are versions of the set it is
+        // serving. Anything else is a parameter value it cannot honour, which is
+        // what the modelled `ValidationException` reports.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(index) = versions.iter().position(|version| version == token) else {
+                    return Err(ListVersionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token:?} is not a token returned by ListVersions"
+                            ),
+                            reason: "FIELD_VALIDATION_FAILED".to_string(),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: "must be a token returned by a previous ListVersions \
+                                          call for the same workspace"
+                                    .to_string(),
+                            }]),
+                        },
+                    )
+                    .into());
+                };
+                index
+            }
+        };
+
+        let page: Vec<String> = versions[start..].iter().take(page_size).cloned().collect();
+        // A token only where a version is left to serve, so a client paginating
+        // until the token is absent sees each served version exactly once.
+        let next_token = versions.get(start + page.len()).cloned();
+
+        Ok(ListVersionsOutput {
+            grafana_versions: Some(page),
+            next_token,
+        })
     }
 }
+
