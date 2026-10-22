@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDistribution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDistribution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDistribution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces a distribution's stored configuration under an `If-Match` precondition:
+//! the new configuration becomes what a later read returns, the distribution is
+//! `InProgress` again until the clock owes it `Deployed`, and the mutation hands back a
+//! fresh version token.
 //!
 //! ## Shape of an operation
 //!
@@ -218,6 +214,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -352,18 +352,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDistribution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDistributionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDistribution"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        let Some(current) = store
+            .distribution(&input.id)
+            .map(|stored| (stored.etag.clone(), stored.config.caller_reference.clone()))
+        else {
+            return Err(UpdateDistributionErrorModeled::NoSuchDistribution(
+                crate::state::no_such_distribution(&input.id),
+            )
+            .into());
+        };
+        let (current_etag, current_caller_reference) = current;
+
+        // The precondition is checked against the stored version, so an update only
+        // lands on the configuration its caller actually read.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(UpdateDistributionErrorModeled::InvalidIfMatchVersion(
+                    InvalidIfMatchVersion {
+                        message: Some(
+                            "The If-Match version is missing or not valid: supply the ETag of \
+                             the distribution's current version"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(UpdateDistributionErrorModeled::PreconditionFailed(
+                    PreconditionFailed {
+                        message: Some(format!(
+                            "The If-Match version is not the distribution's current version \
+                             ({current_etag})"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "The value of Quantity and the size of Items don't match."
+        if let Some(message) = crate::state::config_quantity_mismatch(&input.distribution_config) {
+            return Err(UpdateDistributionErrorModeled::InconsistentQuantities(
+                InconsistentQuantities {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A distribution's caller reference identifies it for its whole life, so an
+        // update that renames it is not a modification CloudFront allows.
+        if input.distribution_config.caller_reference != current_caller_reference {
+            return Err(UpdateDistributionErrorModeled::IllegalUpdate(IllegalUpdate {
+                message: Some(format!(
+                    "The CallerReference of a distribution cannot be changed; it is \
+                     {current_caller_reference}"
+                )),
+            })
+            .into());
+        }
+
+        let Some(stored) = store.apply_config(&input.id, input.distribution_config, now) else {
+            return Err(UpdateDistributionErrorModeled::NoSuchDistribution(
+                crate::state::no_such_distribution(&input.id),
+            )
+            .into());
+        };
+
+        Ok(UpdateDistributionOutput {
+            distribution: Some(stored.to_distribution()),
+            // "The current version of the configuration" — a fresh token, so the version
+            // this caller just replaced no longer satisfies an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDistribution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDistribution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDistribution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a distribution: allocates its id, ARN, domain name and first version token,
+//! stores the submitted `DistributionConfig` whole, and reports the record it stored.
+//! The distribution starts `InProgress`, and the clock owes it `Deployed`.
 //!
 //! ## Shape of an operation
 //!
@@ -207,6 +202,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use crate::state::StoredDistribution;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -341,18 +341,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDistribution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDistributionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDistribution"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "The value of Quantity and the size of Items don't match." A malformed
+        // configuration is refused before any id or caller reference is claimed for it.
+        if let Some(message) = crate::state::config_quantity_mismatch(&input.distribution_config) {
+            return Err(CreateDistributionErrorModeled::InconsistentQuantities(
+                InconsistentQuantities {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // "The caller reference you attempted to create the distribution with is
+        // associated with another distribution": a caller reference identifies one
+        // distribution for its whole life, so a reference the store already holds
+        // cannot name a second one.
+        let caller_reference = input.distribution_config.caller_reference.clone();
+        if let Some(existing) = store.caller_references.get(&caller_reference) {
+            return Err(CreateDistributionErrorModeled::DistributionAlreadyExists(
+                DistributionAlreadyExists {
+                    message: Some(format!(
+                        "The caller reference {caller_reference} is already associated with \
+                         distribution {existing}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Processing your request would cause you to exceed the maximum number of
+        // distributions allowed." The store grows only here and a distribution cannot be
+        // evicted (a later Get has to answer with what this create returned), so the
+        // bound is an entry count refused BEFORE any id or caller reference is claimed.
+        if store.distributions.len() >= crate::state::MAX_DISTRIBUTIONS {
+            return Err(CreateDistributionErrorModeled::TooManyDistributions(
+                TooManyDistributions {
+                    message: Some(format!(
+                        "This emulator holds at most {} distributions; delete one before \
+                         creating another",
+                        crate::state::MAX_DISTRIBUTIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.allocate_distribution_id();
+        let domain_name = store.allocate_domain_name();
+        let etag = store.next_etag();
+        let stored = StoredDistribution {
+            arn: crate::state::distribution_arn(&id),
+            id: id.clone(),
+            domain_name,
+            // A distribution CloudFront has just accepted is not yet propagated to the
+            // edge locations, so it reports the transient status until the clock owes
+            // it the terminal one.
+            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            deployed_due: now + crate::state::PROPAGATION_DELAY,
+            last_modified_time: now,
+            etag: etag.clone(),
+            // Stored whole and verbatim: a later read answers from this, never from the
+            // request being served.
+            config: input.distribution_config,
+            invalidations: BTreeMap::new(),
+        };
+        let distribution = stored.to_distribution();
+        store.caller_references.insert(caller_reference, id.clone());
+        store.distributions.insert(id.clone(), stored);
+
+        Ok(CreateDistributionOutput {
+            distribution: Some(distribution),
+            // "The fully qualified URI of the new distribution resource just created."
+            location: Some(crate::state::location_uri(
+                ctx.parts(),
+                &crate::state::distribution_path(&id),
+            )),
+            // "The current version of the distribution created."
+            e_tag: Some(etag),
+        })
     }
 }
