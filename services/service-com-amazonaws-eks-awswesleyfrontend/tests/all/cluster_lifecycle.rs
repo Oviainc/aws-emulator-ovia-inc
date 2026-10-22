@@ -9,6 +9,11 @@
 //! request: the rows differ along what the rule generalises over (which optional
 //! members are supplied, name shape and length, page size, tag-merge shape, IP
 //! family), and each assertion names its case and prints the actual value.
+//!
+//! The request harness ([`Answer`], [`emulator`], [`call`], [`encode_label`],
+//! [`create`], [`describe`], [`minimal_request`]) is `pub(crate)` so the other
+//! suites in this test binary drive the same router the same way instead of each
+//! growing its own copy.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -33,7 +38,7 @@ pub(crate) struct Answer {
 }
 
 impl Answer {
-    fn cluster(&self) -> &serde_json::Value {
+    pub(crate) fn cluster(&self) -> &serde_json::Value {
         &self.body["cluster"]
     }
 }
@@ -58,7 +63,7 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 /// (`A-Za-z0-9`, which is a subset of RFC 3986's, so this is a superset of what
 /// must be escaped) and percent-encode every other byte; the server
 /// percent-decodes the segment either way.
-fn encode_label(value: &str) -> String {
+pub(crate) fn encode_label(value: &str) -> String {
     value
         .bytes()
         .map(|byte| {
@@ -119,11 +124,11 @@ pub(crate) async fn call(
 
 pub(crate) const REGION: &str = "us-west-2";
 
-async fn create(router: &MultiServiceRouter, body: &serde_json::Value) -> Answer {
+pub(crate) async fn create(router: &MultiServiceRouter, body: &serde_json::Value) -> Answer {
     call(router, REGION, "POST", "/clusters", &body.to_string()).await
 }
 
-async fn describe(router: &MultiServiceRouter, name: &str) -> Answer {
+pub(crate) async fn describe(router: &MultiServiceRouter, name: &str) -> Answer {
     call(
         router,
         REGION,
@@ -155,7 +160,7 @@ async fn list(router: &MultiServiceRouter, query: &str) -> Answer {
 }
 
 /// The smallest request `CreateCluster` accepts: just the three required members.
-fn minimal_request(name: &str) -> serde_json::Value {
+pub(crate) fn minimal_request(name: &str) -> serde_json::Value {
     serde_json::json!({
         "name": name,
         "roleArn": "arn:aws:iam::000000000000:role/eksClusterRole",
