@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Identifier minting: an instance's and an operation's ids are cut from a
+# SHA-256 of this store's counter plus a per-process seed, rendered as hex.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -28,6 +32,8 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `time` for the tests that wait on a clock-owed instance transition.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

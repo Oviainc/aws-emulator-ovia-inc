@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFunctions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFunctions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFunctions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through every function [`crate::state`] holds, in function-name order, so a
+//! marker always continues from where the previous page ended.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +152,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFunctions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFunctionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFunctions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFunctionsErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        // "Set to ALL to include entries for all published versions of each function."
+        // `ALL` is the only value the model's `FunctionVersion` enum carries, so the
+        // boundary validator has already refused any other.
+        let all_versions = input.function_version.as_deref() == Some(FUNCTION_VERSION_ALL);
+
+        // "For Lambda@Edge functions, the Amazon Web Services Region of the master
+        // function. [...] If specified, you must set FunctionVersion to ALL."
+        let master_region = input.master_region.as_deref();
+        if master_region.is_some() && !all_versions {
+            return Err(ListFunctionsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(
+                        "MasterRegion can only be set when FunctionVersion is ALL".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The model declares `MaxItems` as `@range(min: 1, max: 10000)`, so the
+        // boundary validator has already refused anything outside it; this handler
+        // enforces the same floor itself rather than letting a page size of zero reach
+        // the pagination arithmetic below.
+        if let Some(requested) = input.max_items.filter(|requested| *requested < 1) {
+            return Err(ListFunctionsErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(format!(
+                        "1 validation error detected: Value '{requested}' at 'maxItems' failed \
+                         to satisfy constraint: Member must have value greater than or equal to 1"
+                    )),
+                },
+            )
+            .into());
+        }
+        let page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+
+        let mut store = state.lock();
+        store.materialize_all(::std::time::SystemTime::now());
+
+        // This emulator holds no Lambda@Edge replica: no function it stores carries a
+        // `MasterArn`, so a request filtered to one master region matches none of them.
+        // `ALL` asks for no filtering at all.
+        let replicas_only =
+            master_region.is_some_and(|region| region != MASTER_REGION_ALL);
+
+        let entries = if replicas_only {
+            Vec::new()
+        } else {
+            store.listed_functions(all_versions)
+        };
+
+        // The marker is the key of the last entry the previous page returned, so the
+        // next page starts at the first entry ordered after it and no entry is ever
+        // reported twice.
+        let start = match input.marker.as_deref() {
+            Some(marker) => entries
+                .iter()
+                .position(|entry| entry.key.as_str() > marker)
+                .unwrap_or(entries.len()),
+            None => 0,
+        };
+
+        let page = match entries.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListFunctionsOutput {
+            functions: Some(page.iter().map(|entry| entry.configuration.clone()).collect()),
+            // "The pagination token that's included if more results are available" — so
+            // it is absent on the last page, and it is the key of the last entry THIS
+            // page reported, which is what the next page continues after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|entry| entry.key.clone()),
+        })
     }
 }
+
+/// The only `FunctionVersion` value the model declares, whose documentation reads "Set
+/// to ALL to include entries for all published versions of each function".
+const FUNCTION_VERSION_ALL: &str = "ALL";
+
+/// The `MasterRegion` value that asks for no master-region filtering, from the
+/// member's own pattern (`^ALL|<region>$`).
+const MASTER_REGION_ALL: &str = "ALL";
