@@ -39,9 +39,10 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     Block, BoundingBox, Document, DocumentLocation, DocumentMetadata, ExpenseCurrency,
-    ExpenseDetection, ExpenseDocument, ExpenseField, ExpenseType, Geometry, LineItemFields,
-    LineItemGroup, NotificationChannel, OutputConfig, Point, Relationship, Warning,
-    AUTO_UPDATE_VALUES, FEATURE_TYPE_VALUES,
+    ExpenseDetection, ExpenseDocument, ExpenseField, ExpenseType, Geometry,
+    InvalidParameterException, LineItemFields, LineItemGroup, NotificationChannel, OutputConfig,
+    Point, Relationship, ResourceNotFoundException, Warning, AUTO_UPDATE_VALUES,
+    FEATURE_TYPE_VALUES,
 };
 
 /// The value Textract reports as `DetectDocumentTextModelVersion`.
@@ -118,6 +119,27 @@ const ADAPTER_ID_LEN: usize = 32;
 /// carries nothing from the request: the id the caller sent is already in its own request.
 /// This is the sentence Amazon Textract itself answers for an unknown `AdapterId`.
 pub const ADAPTER_NOT_FOUND_MESSAGE: &str = "Adapter Id not found.";
+
+/// The service segment every Amazon Textract ARN carries, as `engine::emulator_arn`'s
+/// first argument.
+pub const ARN_SERVICE: &str = "textract";
+
+/// The resource-type segment of an adapter's ARN.
+///
+/// Amazon Textract writes an adapter's ARN
+/// `arn:{partition}:textract:{region}:{account}:/adapters/{AdapterId}` — a resource
+/// field of this type segment and the `AdapterId` after it, led by a `/`. No Textract
+/// operation RETURNS that ARN (an adapter is addressed by its `AdapterId` everywhere
+/// else), and the model puts no pattern on `AmazonResourceName`, so the form is the one
+/// the service itself accepts for a `ResourceARN`. See [`adapter_arn`].
+pub const ADAPTER_RESOURCE_TYPE: &str = "adapters";
+
+/// The most tags one resource may hold.
+///
+/// `TagMap`'s modelled `0..200` length (`smithy_query(query="shape", shape="TagMap")`),
+/// which bounds one REQUEST's map; the same ceiling bounds the resource, so a merge that
+/// would leave it holding more pairs than a `TagMap` can express is refused.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
 /// The `Confidence` every block reports.
 ///
@@ -307,6 +329,43 @@ impl ComAmazonawsTextractTextractState {
         Some(removed)
     }
 
+    /// The tags of the resource a tagging `ResourceARN` names, if this service holds it.
+    ///
+    /// The ONE place a parsed ARN becomes the tag map it addresses, so `TagResource`,
+    /// `UntagResource` and `ListTagsForResource` cannot disagree about which ARNs name
+    /// something here: the resource a tag write lands on is the resource a tag read
+    /// reports.
+    ///
+    /// Every resource this service holds that can carry tags is an adapter, keyed by its
+    /// `AdapterId`. `None` is a resource that is ABSENT rather than a request that is
+    /// malformed — an adapter id no create minted, an adapter already deleted, an ARN of
+    /// another Amazon Textract resource type, or an ARN carrying further path segments
+    /// after the `AdapterId` (a nested resource, which arrives with that whole path as
+    /// its identifier and so matches no stored adapter: an adapter VERSION is a resource
+    /// this service mints none of while `CreateAdapterVersion` is a stub).
+    pub fn resource_tags(&self, resource: &ArnResource) -> Option<&HashMap<String, String>> {
+        if resource.resource_type != ADAPTER_RESOURCE_TYPE {
+            return None;
+        }
+        self.adapters
+            .get(&resource.resource_id)
+            .map(|adapter| &adapter.tags)
+    }
+
+    /// [`Self::resource_tags`] for a caller that WRITES the tags — the same resolution,
+    /// so a tag write and a tag read never disagree about which ARNs name something.
+    pub fn resource_tags_mut(
+        &mut self,
+        resource: &ArnResource,
+    ) -> Option<&mut HashMap<String, String>> {
+        if resource.resource_type != ADAPTER_RESOURCE_TYPE {
+            return None;
+        }
+        self.adapters
+            .get_mut(&resource.resource_id)
+            .map(|adapter| &mut adapter.tags)
+    }
+
     /// Mint a `JobId`: 64 hex characters, within `JobId`'s `1..64` length and its
     /// `^[a-zA-Z0-9-_]+$` pattern.
     pub fn mint_job_id(&mut self, document_key: &str) -> String {
@@ -426,6 +485,115 @@ impl AdapterRecord {
 /// otherwise identical requests look different.
 fn feature_type_set(feature_types: &[String]) -> BTreeSet<&str> {
     feature_types.iter().map(String::as_str).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tagging: the ARN a tagging operation addresses its resource by
+// ---------------------------------------------------------------------------
+
+/// The resource an Amazon Textract ARN names: the region segment it carries, its
+/// resource-type segment and the identifier after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArnResource {
+    /// The region segment, as the ARN spells it (empty when the ARN carries none).
+    /// Reported rather than matched on — see [`parse_resource_arn`].
+    pub region: String,
+    /// The resource type, e.g. [`ADAPTER_RESOURCE_TYPE`].
+    pub resource_type: String,
+    /// The resource's own identifier: everything after the type segment.
+    pub resource_id: String,
+}
+
+/// The ARN of an adapter: `arn:aws:textract:{region}:{account}:/adapters/{AdapterId}`,
+/// built through the one ARN helper so the account segment is the emulator's canonical
+/// one.
+///
+/// No Amazon Textract operation RETURNS an adapter's ARN — an adapter is addressed by
+/// its `AdapterId` everywhere except the tagging operations — so this is the form a
+/// caller composes for a `ResourceARN` (see [`ADAPTER_RESOURCE_TYPE`]).
+pub fn adapter_arn(region: &str, adapter_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("/{ADAPTER_RESOURCE_TYPE}/{adapter_id}"),
+    )
+}
+
+/// The resource a tagging `ResourceARN` names, or `None` when the value is not an
+/// Amazon Textract resource ARN at all.
+///
+/// An ARN is the six colon-separated fields
+/// `arn:{partition}:{service}:{region}:{account}:{resource}`, and this service's
+/// resource field is `{type}/{id}`; anything else — too few fields, a service field
+/// that is not this service's, a resource field with no type segment — names nothing
+/// here. A leading `/` on the resource field is accepted and dropped: Amazon Textract
+/// spells an adapter's resource field `/adapters/{AdapterId}`, and the slash is a
+/// separator rather than part of the type, so both spellings address one resource.
+///
+/// The partition and account fields take no part in the lookup: this emulator serves a
+/// single account, and a resource id already names at most one stored resource, so the
+/// type and the id are what resolve it. The region is reported rather than matched on,
+/// for a caller that needs the region an ARN was written for.
+///
+/// This is a SYNTAX test only, kept separate from the lookup on purpose: a value that is
+/// not a Textract ARN at all is a bad parameter, which is a different answer from a
+/// well-formed ARN naming no resource this service holds (see
+/// [`ComAmazonawsTextractTextractState::resource_tags`]).
+pub fn parse_resource_arn(arn: &str) -> Option<ArnResource> {
+    // `splitn(6, ..)` keeps the resource field whole: it is the only field that may
+    // itself contain a colon or a slash.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    if fields.next()?.is_empty() {
+        return None;
+    }
+    if fields.next()? != ARN_SERVICE {
+        return None;
+    }
+    let region = fields.next()?;
+    let _account = fields.next()?;
+    let resource = fields.next()?;
+    let resource = resource.strip_prefix('/').unwrap_or(resource);
+    let (resource_type, resource_id) = resource.split_once('/')?;
+    if resource_type.is_empty() || resource_id.is_empty() {
+        return None;
+    }
+    Some(ArnResource {
+        region: region.to_string(),
+        resource_type: resource_type.to_string(),
+        resource_id: resource_id.to_string(),
+    })
+}
+
+/// The modelled refusal of a `ResourceARN` that is not an Amazon Textract resource ARN.
+///
+/// ONE sentence for the one failure, shared by all three tagging operations, and built
+/// from the request: it names the member, the form the member must take and the value
+/// that did not take it, so the caller can fix the request from this text alone.
+pub fn invalid_resource_arn(arn: &str) -> InvalidParameterException {
+    InvalidParameterException {
+        message: Some(format!(
+            "ResourceARN must be the ARN of an Amazon Textract resource \
+             (arn:<partition>:{ARN_SERVICE}:<region>:<account>:/{ADAPTER_RESOURCE_TYPE}/<AdapterId>), \
+             got {arn}"
+        )),
+        code: None,
+    }
+}
+
+/// The modelled refusal of a well-formed Amazon Textract ARN that names no resource
+/// this service holds.
+///
+/// Every resource this service can tag is an adapter, so this is the one sentence every
+/// adapter lookup answers with ([`ADAPTER_NOT_FOUND_MESSAGE`]), whichever operation did
+/// the looking up.
+pub fn tagged_resource_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(ADAPTER_NOT_FOUND_MESSAGE.to_string()),
+        code: None,
+    }
 }
 
 /// A document this service has read, and the text it holds.
