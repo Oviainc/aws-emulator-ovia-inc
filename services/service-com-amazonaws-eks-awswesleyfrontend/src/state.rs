@@ -6,6 +6,11 @@
 //! [`ClusterRecord`] here, and `DescribeCluster`, `ListClusters`, `TagResource`,
 //! `ListTagsForResource` and `DeleteCluster` all compute their responses from it.
 //! Nothing in `src/ops/` keeps a second copy of a cluster.
+//!
+//! An asynchronous cluster update lives ON the cluster it updates
+//! ([`ClusterRecord::updates`]), so `AssociateEncryptionConfig` writes one there
+//! and `DescribeUpdate` reads it back; deleting the cluster drops its updates
+//! with it rather than leaving them behind in a second map.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -16,8 +21,8 @@ use crate::ops::types::{
     AccessConfigResponse, Certificate, Cluster, ComputeConfigResponse, ControlPlaneScalingConfig,
     EncryptionConfig, Identity, KubeApiServerConfigResponse, KubeControllerManagerConfigResponse,
     KubeSchedulerConfigResponse, KubernetesNetworkConfigResponse, Logging, OutpostConfigResponse,
-    RemoteNetworkConfigResponse, StorageConfigResponse, UpgradePolicyResponse, VpcConfigResponse,
-    ZonalShiftConfigResponse,
+    RemoteNetworkConfigResponse, StorageConfigResponse, Update, UpdateParam, UpgradePolicyResponse,
+    VpcConfigResponse, ZonalShiftConfigResponse,
 };
 
 /// The `ClusterStatus` members this slice uses. The model's enum
@@ -29,6 +34,36 @@ pub const STATUS_CREATING: &str = "CREATING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
 /// See [`STATUS_CREATING`].
 pub const STATUS_DELETING: &str = "DELETING";
+/// See [`STATUS_CREATING`] — the status a cluster reports while one of its
+/// asynchronous updates is in flight.
+pub const STATUS_UPDATING: &str = "UPDATING";
+
+/// The `UpdateStatus` members this slice uses. The model's enum
+/// (`smithy_query query="shape" shape="UpdateStatus"`) is
+/// `InProgress | Failed | Cancelled | Successful`; `Update$status` deserialises
+/// to a plain string, so the status is stored as the wire token.
+pub const UPDATE_IN_PROGRESS: &str = "InProgress";
+/// See [`UPDATE_IN_PROGRESS`].
+pub const UPDATE_SUCCESSFUL: &str = "Successful";
+
+/// The `UpdateType` member an encryption association reports
+/// (`smithy_query query="shape" shape="UpdateType"`).
+pub const UPDATE_TYPE_ASSOCIATE_ENCRYPTION_CONFIG: &str = "AssociateEncryptionConfig";
+
+/// The `UpdateParamType` key an encryption association reports its requested
+/// configuration under (`smithy_query query="shape" shape="UpdateParamType"`).
+pub const UPDATE_PARAM_ENCRYPTION_CONFIG: &str = "EncryptionConfig";
+
+/// How long an asynchronous cluster update reports `InProgress` before the clock
+/// owes it `Successful` and the change it carries is applied to the cluster.
+///
+/// No duration is published for an EKS update — `DescribeUpdate` says only "When
+/// the status of the update is `Successful`, the update is complete" — so this
+/// span is CHOSEN rather than cited: non-zero, so a caller that describes the
+/// update straight after starting it still observes `InProgress` (and the
+/// `UPDATING` cluster it goes with), and short enough to be worth waiting for.
+/// The due instant is stored on the update record; nothing sleeps for it.
+pub const UPDATE_COMPLETION_DELAY: Duration = Duration::from_millis(500);
 
 /// How long a newly created cluster reports `CREATING` before the clock owes it
 /// `ACTIVE`.
@@ -206,19 +241,115 @@ pub struct ClusterRecord {
     pub kube_api_server_config: Option<KubeApiServerConfigResponse>,
     pub kube_scheduler_config: Option<KubeSchedulerConfigResponse>,
     pub kube_controller_manager_config: Option<KubeControllerManagerConfigResponse>,
+    /// The asynchronous updates started against this cluster, by update id.
+    ///
+    /// They live on the cluster because that is what scopes them: `DescribeUpdate`
+    /// and `ListUpdates` both name a cluster, and deleting the cluster must drop
+    /// its updates. A `BTreeMap` so a listing walks a stable, sorted order. Each
+    /// operation that mints an update refuses to start a second one while one is
+    /// in flight, and `AssociateEncryptionConfig` — the only writer in this slice
+    /// — is refused once encryption is enabled, so this map holds at most one
+    /// entry per cluster and [`MAX_STORED_CLUSTERS`] bounds it.
+    pub updates: BTreeMap<String, UpdateRecord>,
+}
+
+/// One asynchronous update of a cluster, as this service stores it.
+///
+/// Everything the modelled `Update` reports is held here, so `DescribeUpdate`
+/// returns what the call that started the update wrote rather than recomputing
+/// it. The two extra fields are not reported: `succeeds_at` is the instant the
+/// clock owes this update its `Successful` status, and
+/// `pending_encryption_config` is the change applied to the cluster at that same
+/// instant.
+#[derive(Debug, Clone)]
+pub struct UpdateRecord {
+    pub id: String,
+    pub r#type: String,
+    pub status: String,
+    pub created_at: SystemTime,
+    pub params: Vec<UpdateParam>,
+    pub client_request_token: Option<String>,
+    /// When set, the instant at which the clock owes this update the move from
+    /// `InProgress` to `Successful`. Cleared once the move is materialised.
+    pub succeeds_at: Option<SystemTime>,
+    /// The `encryptionConfig` this update puts on its cluster when it completes,
+    /// for an `AssociateEncryptionConfig` update. Taken when applied.
+    pub pending_encryption_config: Option<Vec<EncryptionConfig>>,
+}
+
+impl UpdateRecord {
+    /// This record as the modelled `Update` shape.
+    pub fn to_update(&self) -> Update {
+        Update {
+            id: Some(self.id.clone()),
+            status: Some(self.status.clone()),
+            r#type: Some(self.r#type.clone()),
+            params: Some(self.params.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            // `errors` carries "any errors associated with a `Failed` update" and
+            // `cancellation` "is present only if any cancellation is attempted",
+            // so neither is reported for an update that is running or succeeded.
+            // The slices that can fail or cancel an update (`CancelUpdate` and
+            // friends) fill them in; each is still 501 with its own gap issue.
+            errors: None,
+            cancellation: None,
+        }
+    }
 }
 
 impl ClusterRecord {
-    /// Materialise the status move the clock already owes at `now`.
+    /// Materialise the status moves the clock already owes at `now`.
     ///
-    /// This is the only write a reporting operation may make: the transition was
-    /// due at `active_at` whether or not anybody called, so applying it on read
-    /// does not change what a later caller sees.
+    /// This is the only write a reporting operation may make: each transition was
+    /// due at its stored instant whether or not anybody called, so applying it on
+    /// read does not change what a later caller sees. Two are owed here — a new
+    /// cluster's `CREATING` -> `ACTIVE` move, and the completion of an
+    /// asynchronous update, which flips the update to `Successful`, applies the
+    /// change it carries and hands the cluster back to `ACTIVE`.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
         if self.active_at.is_some_and(|due| now >= due) {
             self.status = STATUS_ACTIVE.to_string();
             self.active_at = None;
         }
+
+        let due: Vec<String> = self
+            .updates
+            .iter()
+            .filter(|(_, update)| update.succeeds_at.is_some_and(|due| now >= due))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            let Some(update) = self.updates.get_mut(&id) else {
+                continue;
+            };
+            update.status = UPDATE_SUCCESSFUL.to_string();
+            update.succeeds_at = None;
+            let encryption_config = update.pending_encryption_config.take();
+            if let Some(encryption_config) = encryption_config {
+                self.encryption_config = encryption_config;
+            }
+            // An update only starts from an `ACTIVE` cluster, so completing one
+            // hands the cluster back to the status it was taken from.
+            self.status = STATUS_ACTIVE.to_string();
+        }
+    }
+
+    /// The update this cluster is still running, if any.
+    ///
+    /// A cluster runs at most one update at a time, so this is what a mutating
+    /// operation checks before starting another.
+    pub fn in_flight_update(&self) -> Option<&UpdateRecord> {
+        self.updates
+            .values()
+            .find(|update| update.status == UPDATE_IN_PROGRESS)
+    }
+
+    /// The update this cluster already recorded for `client_request_token`, if
+    /// any — what makes a retry of the call that started it idempotent.
+    pub fn update_for_token(&self, token: &str) -> Option<&UpdateRecord> {
+        self.updates
+            .values()
+            .find(|update| update.client_request_token.as_deref() == Some(token))
     }
 
     /// This record as the modelled `Cluster` shape.
@@ -289,11 +420,16 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// call name a cluster in any region. It holds exactly one entry per stored
     /// cluster, so [`MAX_STORED_CLUSTERS`] bounds it too.
     pub arn_index: BTreeMap<String, (String, String)>,
-    // The nodegroup and update maps the next slices need are deliberately NOT
-    // declared yet: a field no operation reads is dead weight that every
-    // `Debug`/`Default` and every reviewer has to account for. Each is added by
-    // the slice that first writes it (`CreateNodegroup`, `UpdateClusterConfig`
-    // and friends, still 501 with their own gap issues).
+    /// How many update ids this store has minted. Mixed into the next one (see
+    /// [`new_update_id`]) so two updates minted in the same nanosecond cannot
+    /// collide.
+    pub minted_updates: u64,
+    // The nodegroup map the next slice needs is deliberately NOT declared yet: a
+    // field no operation reads is dead weight that every `Debug`/`Default` and
+    // every reviewer has to account for. It is added by the slice that first
+    // writes it (`CreateNodegroup`, still 501 with its own gap issue). An
+    // asynchronous update is not here either — it lives on the cluster it
+    // updates ([`ClusterRecord::updates`]).
 }
 
 impl ComAmazonawsEksAwswesleyfrontendState {
@@ -302,6 +438,13 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         for cluster in self.clusters.values_mut() {
             cluster.materialize_due_transitions(now);
         }
+    }
+
+    /// The next value to mix into a minted update id, counted from this store's
+    /// own total rather than from any one cluster's.
+    pub fn next_update_sequence(&mut self) -> u64 {
+        self.minted_updates = self.minted_updates.wrapping_add(1);
+        self.minted_updates
     }
 
     /// The `(region, name)` key of the cluster `arn` identifies, if this store
@@ -332,6 +475,44 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
     ::emulator_server::sigv4_credential_scope(&parts.headers)
         .map(|scope| scope.region)
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// A fresh identifier in the shape EKS gives an `Update$id`: "a UUID that is
+/// used to track the update" — a version-4 UUID, `8-4-4-4-12` lowercase hex with
+/// the version and variant bits RFC 4122 §4.4 fixes.
+///
+/// The 128 bits come from three sources hashed together with SHA-256 (the `sha2`
+/// crate) and hex-encoded (the `hex` crate): the OS-seeded randomness a
+/// `RandomState` draws, the system clock in nanoseconds, and `sequence` — a
+/// counter the store hands out ([`ComAmazonawsEksAwswesleyfrontendState::next_update_sequence`]),
+/// so two ids minted in the same nanosecond cannot collide. An update id names a
+/// resource for correlation, never a credential.
+pub fn new_update_id(sequence: u64) -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
+    let nanos = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let mut hasher = Sha256::new();
+    hasher.update(RandomState::new().hash_one(sequence).to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(sequence.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC 4122 §4.4: the version nibble is 4, and the variant's two top bits are `10`.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// The 32-hex-character resource identifier EKS gives a cluster, which appears in

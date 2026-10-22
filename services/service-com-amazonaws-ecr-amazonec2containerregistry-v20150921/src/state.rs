@@ -563,6 +563,11 @@ impl PreviewedImage {
 /// How an `imageIds` entry reads in a message: ECR renders the requested
 /// `ImageIdentifier` with both members spelled out and an absent one as `null`, so a
 /// caller sees the entry exactly as it sent it.
+///
+/// The public-registry service renders it identically
+/// (`service-com-amazonaws-ecrpublic-spencerfrontendservice`'s
+/// `state::identifier_description`); the two are separate functions only because
+/// `ImageIdentifier` is generated per service crate. Keep them in step.
 pub fn identifier_description(id: &ImageIdentifier) -> String {
     format!(
         "imageId {{imageDigest:'{}', imageTag:'{}'}}",

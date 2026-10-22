@@ -21,6 +21,8 @@ aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 # `validation`: the leaf types a `ShapeSerializer` is handed.
+# `addresses_modeled_route`: the empty body the request it asks a service's own protocol
+# to route is built with (that routing key reads the method, URI and headers only).
 aws-smithy-types = { workspace = true }
 # `stable_hex_id`'s mixing function: a maintained digest, so a derived id that
 # travels on the wire is reproducible across builds rather than tied to the

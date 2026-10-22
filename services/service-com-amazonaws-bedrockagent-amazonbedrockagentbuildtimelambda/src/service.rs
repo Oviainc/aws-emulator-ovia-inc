@@ -74,24 +74,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // This service signs as `bedrock` — a signing name it SHARES with every other
-        // emulated Bedrock-family service (the Bedrock control plane, Bedrock Runtime,
-        // Bedrock Agent Runtime, Bedrock Data Automation and Bedrock Data Automation
-        // Runtime), while its own endpoint is `bedrock-agent`. The router resolves the
-        // routing key from the SigV4 credential scope first, so all six see the key
-        // `bedrock`: claiming on the signing name ALONE makes each of them claim every
-        // sibling's traffic, and the router — which refuses rather than guesses —
-        // answers `500 AmbiguousService` for ALL of it.
+        // This service signs as `bedrock`, the signing name every Bedrock-family service
+        // shares while serving its own endpoint (`bedrock-agent` here). Claiming on that
+        // name alone makes all six claimants for every Bedrock request, which the router
+        // answers `500 AmbiguousService` — a code no AWS model carries — rather than
+        // serving one of them.
         //
-        // So the claim is narrowed to this service's own modelled wire surface, by the
-        // one rule `service-common` states for every service under a shared signing
-        // name. This model is `restJson1` and binds every operation to a URI whose
-        // first segment is a literal, so that surface is its path space (`agents`,
-        // `knowledgebases`, `flows`, `prompts`, …), which the generated
-        // `ROUTE_PATH_SEGMENTS` carries and the rule matches by EXACT segment equality.
-        service_common::claims_request(
+        // So the claim is this model's own path space (`agents`, `knowledgebases`,
+        // `flows`, `prompts`, `retrievalinstructions`, `resourcepolicy`, `tags`), through
+        // the one rule `service_common::bedrock` states for the family (which narrows
+        // `service_common::claims_request` with the family's shared-segment split). Four
+        // of those segments are also published by `bedrock-agent-runtime`, and the rule
+        // splits them there: under `agents`, `knowledgebases` and `flows` the two models
+        // bind DIFFERENT routes, so each service claims only a request its own model binds
+        // a route for; under `tags` they bind the identical three routes, so that segment
+        // has a declared owner — this service, which owns the resources being tagged.
+        // `None` for the RPC argument: every operation here is bound to a URI.
+        service_common::bedrock::claims_request(
             parts,
-            self.entry.identity().signing_name(),
+            self.definition(),
             crate::ROUTE_PATH_SEGMENTS,
             None,
         )

@@ -23,6 +23,8 @@ mod certificate_list_filters;
 mod certificate_not_found_message;
 #[path = "all/certificate_revocation.rs"]
 mod certificate_revocation;
+#[path = "all/certificate_search.rs"]
+mod certificate_search;
 #[path = "all/certificate_tag_removal.rs"]
 mod certificate_tag_removal;
 #[path = "all/certificate_validation_state_machine.rs"]
