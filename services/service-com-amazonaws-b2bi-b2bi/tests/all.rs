@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/onboarding_loop.rs"]
 mod onboarding_loop;
+#[path = "all/starter_mapping_template.rs"]
+mod starter_mapping_template;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging.rs"]

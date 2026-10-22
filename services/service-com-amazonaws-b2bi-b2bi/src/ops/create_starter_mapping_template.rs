@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateStarterMappingTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateStarterMappingTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Generates a starter mapping template — a JSONata (JSON) document or an XSLT 1.0
+//! stylesheet — for the X12 transaction set and version the request names, with the
+//! values the request determines filled in and a PLACEHOLDER everywhere the caller must
+//! supply an expression over its own input file.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateStarterMappingTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The operation mints no resource and persists nothing: its output is a single
+//! `mappingTemplate` string, and the model gives a template no id and no
+//! Get/List/Delete, so the template is a pure function of the request and two identical
+//! requests answer with the identical template.
+//!
+//! ## The generated document
+//!
+//! Both mapping types describe the same tree — an X12 interchange, holding a functional
+//! group, holding a transaction:
+//!
+//! ```text
+//! interchanges[0]                      ISA elements, then IEA elements
+//!   functional_groups[0]               GS elements, then GE elements
+//!     transactions[0]                  ST elements, the transaction set's beginning
+//!                                      segment, then SE elements
+//! ```
+//!
+//! Each segment's elements sit directly in the object that holds the segment. An envelope
+//! element is keyed `<SEGMENT>_<position>_<ElementName>`
+//! (`ST_01_TransactionSetIdentifierCode`); an element of a segment inside the transaction
+//! is keyed `<SEGMENT>_<position>` (`BEG_01`), with the element's name in the placeholder.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +145,816 @@ impl From<CreateStarterMappingTemplateErrorModeled> for CreateStarterMappingTemp
     }
 }
 
+/// The format of the document a request asks for, decoded from the modelled `MappingType`
+/// value — the crate's `MAPPING_TYPE_VALUES`, the member list of
+/// `smithy_query(query="shape",shape="MappingType")`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappingFormat {
+    /// A JSON document whose values the caller replaces with JSONata expressions.
+    Jsonata,
+    /// A stylesheet whose result tree is the file the EDI is generated from.
+    Xslt,
+}
+
+impl MappingFormat {
+    /// Every format this operation generates, by the modelled `MappingType` value that
+    /// asks for it. Kept beside [`MappingFormat::decode`] so a refusal lists exactly the
+    /// values `decode` accepts; the crate's integration test asserts this covers every
+    /// member of the model's own `MAPPING_TYPE_VALUES`.
+    const BY_MAPPING_TYPE: &'static [(&'static str, MappingFormat)] = &[
+        ("JSONATA", MappingFormat::Jsonata),
+        ("XSLT", MappingFormat::Xslt),
+    ];
+
+    /// The format `value` names, or `None` when it is not a modelled `MappingType`.
+    fn decode(value: &str) -> Option<Self> {
+        Self::BY_MAPPING_TYPE
+            .iter()
+            .find(|(mapping_type, _)| *mapping_type == value)
+            .map(|(_, format)| *format)
+    }
+
+    /// The `MappingType` values this operation accepts, for a refusal message.
+    fn accepted() -> String {
+        Self::BY_MAPPING_TYPE
+            .iter()
+            .map(|(mapping_type, _)| *mapping_type)
+            .collect::<Vec<&str>>()
+            .join(", ")
+    }
+
+    /// How a placeholder in this format's template names the expression language the
+    /// caller replaces it with.
+    fn language(self) -> &'static str {
+        match self {
+            Self::Jsonata => "JSONata",
+            Self::Xslt => "XSLT",
+        }
+    }
+}
+
+/// The XSLT namespace every generated stylesheet declares.
+const XSL_NAMESPACE: &str = "http://www.w3.org/1999/XSL/Transform";
+
+/// The stylesheet version every generated stylesheet declares: XSLT 1.0, the version
+/// every XSLT processor implements.
+const XSL_VERSION: &str = "1.0";
+
+/// GS07, the Responsible Agency Code carried by every X12 functional group: `X`, the
+/// Accredited Standards Committee X12. Fixed because this operation generates X12
+/// templates only — "currently, we only support generating a template that can generate
+/// the input to produce an Outbound X12 EDI file".
+const X12_RESPONSIBLE_AGENCY_CODE: &str = "X";
+
+/// The first X12 release whose interchange envelope reads ISA11 as the Repetition
+/// Separator; in the releases before it ISA11 is the Interchange Control Standards
+/// Identifier (ASC X12 interchange control header, element ISA11), so the element's name
+/// in a starter template follows the requested version.
+const FIRST_REPETITION_SEPARATOR_RELEASE: u32 = 4020;
+
+/// How every placeholder value begins, so a caller can tell a placeholder from a value
+/// the request determined.
+pub const PLACEHOLDER_PREFIX: &str = "replace with the";
+
+/// One node of a starter template's document tree, rendered to JSON for a `JSONATA`
+/// template and to XML for an `XSLT` one.
+///
+/// A map keeps its members in INSERTION order — the positional order of an X12 segment's
+/// elements — which a `serde_json::Value` (a sorted map) would lose.
+enum Node {
+    /// A leaf: either a value the request determines or a placeholder.
+    Text(String),
+    /// Named children, in order.
+    Map(Vec<(String, Node)>),
+    /// A repeatable child — an interchange, a functional group, a transaction set. `item`
+    /// is the element name each repetition takes in the XML rendering; JSON renders the
+    /// repetitions as an array.
+    List { item: String, items: Vec<Node> },
+}
+
+impl ::serde::Serialize for Node {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Node::Text(text) => serializer.serialize_str(text),
+            Node::Map(members) => {
+                serializer.collect_map(members.iter().map(|(key, child)| (key.as_str(), child)))
+            }
+            Node::List { items, .. } => serializer.collect_seq(items.iter()),
+        }
+    }
+}
+
+/// The modelled server error for a template that could not be rendered.
+fn render_failed<E: ::std::fmt::Display>(error: E) -> CreateStarterMappingTemplateError {
+    CreateStarterMappingTemplateErrorModeled::InternalServerException(InternalServerException {
+        message: format!("the starter mapping template could not be rendered: {error}"),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// An X12 element's key in a template: the segment id, the element's two-digit position
+/// within that segment and the element's name — `ST_01_TransactionSetIdentifierCode`, the
+/// naming B2BI's X12 documents use.
+///
+/// A segment's elements sit DIRECTLY in the object that holds the segment (an interchange
+/// carries its own ISA elements, a functional group its GS elements, a transaction its ST
+/// elements), so the segment and position prefix is also what keeps two same-named
+/// elements apart — ISA05 and ISA07 are both the Interchange ID Qualifier.
+fn element_key(segment: &str, position: usize, name: &str) -> String {
+    format!("{segment}_{position:02}_{name}")
+}
+
+/// A transaction set's beginning segment: the segment the X12 standard puts first in
+/// that transaction set's heading table, right after ST.
+struct BeginningSegment {
+    /// The X12 segment id — `BEG` for a purchase order.
+    id: &'static str,
+    /// The segment's leading elements, in positional order, by name.
+    elements: &'static [&'static str],
+}
+
+/// The beginning segment of each X12 transaction set a starter template carries a body
+/// for, by the transaction set code the request names.
+///
+/// Source: the heading table of each named transaction set in the ASC X12 standard — the
+/// segment that follows ST and its leading elements. A transaction set that is not listed
+/// gets the envelope and the ST/SE pair alone, because this emulator has no segment table
+/// for it; the template is a STARTER either way, so the segments it does not carry are
+/// the ones the caller adds.
+const BEGINNING_SEGMENTS: &[(&str, BeginningSegment)] = &[
+    (
+        // 850 Purchase Order
+        "850",
+        BeginningSegment {
+            id: "BEG",
+            elements: &[
+                "TransactionSetPurposeCode",
+                "PurchaseOrderTypeCode",
+                "PurchaseOrderNumber",
+                "ReleaseNumber",
+                "Date",
+                "ContractNumber",
+                "AcknowledgmentType",
+                "InvoiceTypeCode",
+                "PurchaseCategory",
+                "SecurityLevelCode",
+                "TransactionTypeCode",
+            ],
+        },
+    ),
+    (
+        // 855 Purchase Order Acknowledgment
+        "855",
+        BeginningSegment {
+            id: "BAK",
+            elements: &[
+                "TransactionSetPurposeCode",
+                "AcknowledgmentType",
+                "PurchaseOrderNumber",
+                "Date",
+                "ReleaseNumber",
+                "RequestReferenceNumber",
+                "ContractNumber",
+            ],
+        },
+    ),
+    (
+        // 860 Purchase Order Change Request
+        "860",
+        BeginningSegment {
+            id: "BCH",
+            elements: &[
+                "TransactionSetPurposeCode",
+                "PurchaseOrderTypeCode",
+                "PurchaseOrderNumber",
+                "ReleaseNumber",
+                "ChangeOrderSequenceNumber",
+                "Date",
+            ],
+        },
+    ),
+    (
+        // 865 Purchase Order Change Acknowledgment
+        "865",
+        BeginningSegment {
+            id: "BCA",
+            elements: &[
+                "TransactionSetPurposeCode",
+                "AcknowledgmentType",
+                "PurchaseOrderNumber",
+                "ReleaseNumber",
+                "ChangeOrderSequenceNumber",
+                "Date",
+            ],
+        },
+    ),
+    (
+        // 810 Invoice
+        "810",
+        BeginningSegment {
+            id: "BIG",
+            elements: &[
+                "Date",
+                "InvoiceNumber",
+                "PurchaseOrderDate",
+                "PurchaseOrderNumber",
+                "ReleaseNumber",
+                "ChangeOrderSequenceNumber",
+                "TransactionTypeCode",
+                "TransactionSetPurposeCode",
+            ],
+        },
+    ),
+    (
+        // 856 Ship Notice/Manifest
+        "856",
+        BeginningSegment {
+            id: "BSN",
+            elements: &[
+                "TransactionSetPurposeCode",
+                "ShipmentIdentification",
+                "Date",
+                "Time",
+                "HierarchicalStructureCode",
+                "TransactionTypeCode",
+            ],
+        },
+    ),
+    (
+        // 846 Inventory Inquiry/Advice
+        "846",
+        BeginningSegment {
+            id: "BIA",
+            elements: &[
+                "TransactionSetPurposeCode",
+                "ReportTypeCode",
+                "ReferenceIdentification",
+                "Date",
+                "Time",
+            ],
+        },
+    ),
+    (
+        // 852 Product Activity Data
+        "852",
+        BeginningSegment {
+            id: "XQ",
+            elements: &["ReportingCode", "Date", "Date"],
+        },
+    ),
+    (
+        // 864 Text Message
+        "864",
+        BeginningSegment {
+            id: "BMG",
+            elements: &["TransactionSetPurposeCode", "Description", "MessageTypeCode"],
+        },
+    ),
+    (
+        // 867 Product Transfer and Resale Report
+        "867",
+        BeginningSegment {
+            id: "BPT",
+            elements: &[
+                "TransactionSetPurposeCode",
+                "ReferenceIdentification",
+                "Date",
+                "TransactionTypeCode",
+            ],
+        },
+    ),
+    (
+        // 820 Payment Order/Remittance Advice
+        "820",
+        BeginningSegment {
+            id: "BPR",
+            elements: BPR_ELEMENTS,
+        },
+    ),
+    (
+        // 835 Health Care Claim Payment/Advice
+        "835",
+        BeginningSegment {
+            id: "BPR",
+            elements: BPR_ELEMENTS,
+        },
+    ),
+    (
+        // 824 Application Advice
+        "824",
+        BeginningSegment {
+            id: "BGN",
+            elements: BGN_ELEMENTS,
+        },
+    ),
+    (
+        // 834 Benefit Enrollment and Maintenance
+        "834",
+        BeginningSegment {
+            id: "BGN",
+            elements: BGN_ELEMENTS,
+        },
+    ),
+    (
+        // 270 Eligibility, Coverage or Benefit Inquiry
+        "270",
+        BeginningSegment {
+            id: "BHT",
+            elements: BHT_ELEMENTS,
+        },
+    ),
+    (
+        // 271 Eligibility, Coverage or Benefit Information
+        "271",
+        BeginningSegment {
+            id: "BHT",
+            elements: BHT_ELEMENTS,
+        },
+    ),
+    (
+        // 276 Health Care Claim Status Request
+        "276",
+        BeginningSegment {
+            id: "BHT",
+            elements: BHT_ELEMENTS,
+        },
+    ),
+    (
+        // 277 Health Care Claim Status Response
+        "277",
+        BeginningSegment {
+            id: "BHT",
+            elements: BHT_ELEMENTS,
+        },
+    ),
+    (
+        // 278 Health Care Services Review Information
+        "278",
+        BeginningSegment {
+            id: "BHT",
+            elements: BHT_ELEMENTS,
+        },
+    ),
+    (
+        // 837 Health Care Claim
+        "837",
+        BeginningSegment {
+            id: "BHT",
+            elements: BHT_ELEMENTS,
+        },
+    ),
+    (
+        // 214 Transportation Carrier Shipment Status Message
+        "214",
+        BeginningSegment {
+            id: "B10",
+            elements: &[
+                "ReferenceIdentification",
+                "ShipmentIdentificationNumber",
+                "StandardCarrierAlphaCode",
+            ],
+        },
+    ),
+    (
+        // 940 Warehouse Shipping Order
+        "940",
+        BeginningSegment {
+            id: "W05",
+            elements: &["ReportingCode", "DepositorOrderNumber", "PurchaseOrderNumber"],
+        },
+    ),
+    (
+        // 945 Warehouse Shipping Advice
+        "945",
+        BeginningSegment {
+            id: "W06",
+            elements: &[
+                "ReportingCode",
+                "DepositorOrderNumber",
+                "Date",
+                "ShipmentIdentificationNumber",
+            ],
+        },
+    ),
+    (
+        // 997 Functional Acknowledgment
+        "997",
+        BeginningSegment {
+            id: "AK1",
+            elements: AK1_ELEMENTS,
+        },
+    ),
+    (
+        // 999 Implementation Acknowledgment
+        "999",
+        BeginningSegment {
+            id: "AK1",
+            elements: AK1_ELEMENTS,
+        },
+    ),
+];
+
+/// BHT, the Beginning of Hierarchical Transaction segment the HIPAA transaction sets open
+/// with.
+const BHT_ELEMENTS: &[&str] = &[
+    "HierarchicalStructureCode",
+    "TransactionSetPurposeCode",
+    "ReferenceIdentification",
+    "Date",
+    "Time",
+    "TransactionTypeCode",
+];
+
+/// BGN, the Beginning Segment.
+const BGN_ELEMENTS: &[&str] = &[
+    "TransactionSetPurposeCode",
+    "ReferenceIdentification",
+    "Date",
+    "Time",
+    "TimeCode",
+    "OriginalReferenceNumber",
+    "TransactionTypeCode",
+    "ActionCode",
+    "SecurityLevelCode",
+];
+
+/// BPR, the Beginning Segment for Payment Order/Remittance Advice.
+const BPR_ELEMENTS: &[&str] = &[
+    "TransactionHandlingCode",
+    "MonetaryAmount",
+    "CreditDebitFlagCode",
+    "PaymentMethodCode",
+    "PaymentFormatCode",
+    "DfiIdNumberQualifier",
+    "DfiIdentificationNumber",
+    "AccountNumberQualifier",
+    "AccountNumber",
+    "OriginatingCompanyIdentifier",
+];
+
+/// AK1, the Functional Group Response Header an acknowledgment opens with.
+const AK1_ELEMENTS: &[&str] = &[
+    "FunctionalIdentifierCode",
+    "GroupControlNumber",
+    "VersionReleaseIndustryIdentifierCode",
+];
+
+/// The beginning segment [`BEGINNING_SEGMENTS`] holds for `transaction_set_code`, if any.
+fn beginning_segment(transaction_set_code: &str) -> Option<&'static BeginningSegment> {
+    BEGINNING_SEGMENTS
+        .iter()
+        .find(|(code, _)| *code == transaction_set_code)
+        .map(|(_, segment)| segment)
+}
+
+/// The value a starter template carries wherever the caller must supply the content:
+/// "the starter template contains placeholder values which you can replace with JSONata
+/// or XSLT expressions to take data from your input file", so a placeholder names the
+/// element it stands for and the language the replacement is written in.
+fn placeholder(language: &str, element: &str) -> Node {
+    Node::Text(format!(
+        "{PLACEHOLDER_PREFIX} {language} expression for {element}"
+    ))
+}
+
+/// `names` as the elements of `segment`, in positional order, each one a placeholder.
+fn placeholder_elements(language: &str, segment: &str, names: &[&str]) -> Vec<(String, Node)> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let key = element_key(segment, index + 1, name);
+            let value = placeholder(language, &key);
+            (key, value)
+        })
+        .collect()
+}
+
+/// The elements of a segment INSIDE the transaction — the transaction set's own body,
+/// which the X12 schema of that transaction set defines.
+///
+/// These are keyed by segment id and position alone (`BEG_01`), not by element name the
+/// way an envelope segment's elements are; the element's name is in the placeholder, so
+/// the caller still reads which element it is replacing.
+fn body_elements(language: &str, segment: &str, names: &[&str]) -> Vec<(String, Node)> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let key = format!("{segment}_{position:02}", position = index + 1);
+            let value = placeholder(language, &format!("{key} ({name})"));
+            (key, value)
+        })
+        .collect()
+}
+
+/// The interchange control header (ISA): sixteen positional elements, all of them the
+/// caller's to supply. ISA11's name follows `release` — see
+/// [`FIRST_REPETITION_SEPARATOR_RELEASE`].
+fn isa_elements(language: &str, release: u32) -> Vec<(String, Node)> {
+    let isa11 = if release < FIRST_REPETITION_SEPARATOR_RELEASE {
+        "InterchangeControlStandardsIdentifier"
+    } else {
+        "RepetitionSeparator"
+    };
+    placeholder_elements(
+        language,
+        "ISA",
+        &[
+            "AuthorizationInformationQualifier",
+            "AuthorizationInformation",
+            "SecurityInformationQualifier",
+            "SecurityInformation",
+            "InterchangeIdQualifier",
+            "InterchangeSenderId",
+            "InterchangeIdQualifier",
+            "InterchangeReceiverId",
+            "InterchangeDate",
+            "InterchangeTime",
+            isa11,
+            "InterchangeControlVersionNumber",
+            "InterchangeControlNumber",
+            "AcknowledgmentRequested",
+            "UsageIndicator",
+            "ComponentElementSeparator",
+        ],
+    )
+}
+
+/// The functional group header (GS). GS07 is fixed at [`X12_RESPONSIBLE_AGENCY_CODE`] and
+/// GS08 is the version/release/industry identifier code the request determines; the first
+/// six elements are the caller's.
+fn gs_elements(language: &str, version_release_industry_code: &str) -> Vec<(String, Node)> {
+    let mut members = placeholder_elements(
+        language,
+        "GS",
+        &[
+            "FunctionalIdentifierCode",
+            "ApplicationSendersCode",
+            "ApplicationReceiversCode",
+            "Date",
+            "Time",
+            "GroupControlNumber",
+        ],
+    );
+    members.push((
+        element_key("GS", 7, "ResponsibleAgencyCode"),
+        Node::Text(X12_RESPONSIBLE_AGENCY_CODE.to_string()),
+    ));
+    members.push((
+        element_key("GS", 8, "VersionReleaseIndustryIdentifierCode"),
+        Node::Text(version_release_industry_code.to_string()),
+    ));
+    members
+}
+
+/// The transaction set header (ST): ST01 is the transaction set code the request names,
+/// ST02 is the caller's control number, and ST03 — the implementation convention
+/// reference, an optional element — is present only when the requested transaction set
+/// names an implementation guide.
+fn st_elements(
+    language: &str,
+    transaction_set_code: &str,
+    implementation_convention: Option<&str>,
+) -> Vec<(String, Node)> {
+    let control_number = element_key("ST", 2, "TransactionSetControlNumber");
+    let mut members = vec![
+        (
+            element_key("ST", 1, "TransactionSetIdentifierCode"),
+            Node::Text(transaction_set_code.to_string()),
+        ),
+        (
+            control_number.clone(),
+            placeholder(language, &control_number),
+        ),
+    ];
+    if let Some(convention) = implementation_convention {
+        members.push((
+            element_key("ST", 3, "ImplementationConventionReference"),
+            Node::Text(convention.to_string()),
+        ));
+    }
+    members
+}
+
+/// The starter template's document tree: one interchange, holding one functional group,
+/// holding one transaction, in the X12 envelope the requested transaction set and version
+/// determine.
+///
+/// The transaction's own segments — the body between ST and SE, which differ with every
+/// transaction set — are what the caller adds to the template; this operation generates
+/// the envelope they sit in, with each element it does not determine left as a
+/// placeholder.
+fn starter_document(
+    language: &str,
+    transaction_set_code: &str,
+    implementation_convention: Option<&str>,
+    release: u32,
+    version_release_industry_code: &str,
+) -> Node {
+    let mut transaction = st_elements(language, transaction_set_code, implementation_convention);
+    if let Some(segment) = beginning_segment(transaction_set_code) {
+        transaction.extend(body_elements(language, segment.id, segment.elements));
+    }
+    transaction.extend(placeholder_elements(
+        language,
+        "SE",
+        &["NumberOfIncludedSegments", "TransactionSetControlNumber"],
+    ));
+
+    let mut functional_group = gs_elements(language, version_release_industry_code);
+    functional_group.push((
+        "transactions".to_string(),
+        Node::List {
+            item: "transaction".to_string(),
+            items: vec![Node::Map(transaction)],
+        },
+    ));
+    functional_group.extend(placeholder_elements(
+        language,
+        "GE",
+        &["NumberOfTransactionSetsIncluded", "GroupControlNumber"],
+    ));
+
+    let mut interchange = isa_elements(language, release);
+    interchange.push((
+        "functional_groups".to_string(),
+        Node::List {
+            item: "functional_group".to_string(),
+            items: vec![Node::Map(functional_group)],
+        },
+    ));
+    interchange.extend(placeholder_elements(
+        language,
+        "IEA",
+        &["NumberOfIncludedFunctionalGroups", "InterchangeControlNumber"],
+    ));
+
+    Node::Map(vec![(
+        "interchanges".to_string(),
+        Node::List {
+            item: "interchange".to_string(),
+            items: vec![Node::Map(interchange)],
+        },
+    )])
+}
+
+/// The `JSONATA` rendering: the document tree as a JSON document, whose values the caller
+/// replaces with JSONata expressions.
+fn jsonata_template(document: &Node) -> Result<String, CreateStarterMappingTemplateError> {
+    ::serde_json::to_string_pretty(document).map_err(render_failed)
+}
+
+/// The `XSLT` rendering: an XSLT 1.0 stylesheet whose single template emits the same
+/// document tree, so the two mapping types describe the SAME X12 envelope.
+fn xslt_template(
+    document: &Node,
+    transaction_set_code: &str,
+    version_release_industry_code: &str,
+) -> Result<String, CreateStarterMappingTemplateError> {
+    use ::quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
+
+    let Node::Map(roots) = document else {
+        return Err(render_failed("the template document is not a map"));
+    };
+
+    let mut writer = ::quick_xml::Writer::new_with_indent(Vec::new(), b' ', 2);
+    writer
+        .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
+        .map_err(render_failed)?;
+    let mut stylesheet = BytesStart::new("xsl:stylesheet");
+    stylesheet.push_attribute(("version", XSL_VERSION));
+    stylesheet.push_attribute(("xmlns:xsl", XSL_NAMESPACE));
+    writer
+        .write_event(Event::Start(stylesheet))
+        .map_err(render_failed)?;
+    let mut output = BytesStart::new("xsl:output");
+    output.push_attribute(("method", "xml"));
+    output.push_attribute(("indent", "yes"));
+    writer
+        .write_event(Event::Empty(output))
+        .map_err(render_failed)?;
+    writer
+        .write_event(Event::Comment(BytesText::new(&format!(
+            "starter mapping template for X12 transaction set {transaction_set_code}, \
+             version {version_release_industry_code}"
+        ))))
+        .map_err(render_failed)?;
+    let mut template = BytesStart::new("xsl:template");
+    template.push_attribute(("match", "/"));
+    writer
+        .write_event(Event::Start(template))
+        .map_err(render_failed)?;
+    for (key, child) in roots {
+        write_xml_node(&mut writer, key, child)?;
+    }
+    writer
+        .write_event(Event::End(BytesEnd::new("xsl:template")))
+        .map_err(render_failed)?;
+    writer
+        .write_event(Event::End(BytesEnd::new("xsl:stylesheet")))
+        .map_err(render_failed)?;
+    String::from_utf8(writer.into_inner()).map_err(render_failed)
+}
+
+/// One node of the document tree, as an XML element named `name`.
+fn write_xml_node(
+    writer: &mut ::quick_xml::Writer<Vec<u8>>,
+    name: &str,
+    node: &Node,
+) -> Result<(), CreateStarterMappingTemplateError> {
+    use ::quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+
+    match node {
+        Node::Text(text) => {
+            writer
+                .write_event(Event::Start(BytesStart::new(name)))
+                .map_err(render_failed)?;
+            writer
+                .write_event(Event::Text(BytesText::new(text)))
+                .map_err(render_failed)?;
+            writer
+                .write_event(Event::End(BytesEnd::new(name)))
+                .map_err(render_failed)?;
+        }
+        Node::Map(members) if members.is_empty() => {
+            writer
+                .write_event(Event::Empty(BytesStart::new(name)))
+                .map_err(render_failed)?;
+        }
+        Node::Map(members) => {
+            writer
+                .write_event(Event::Start(BytesStart::new(name)))
+                .map_err(render_failed)?;
+            for (key, child) in members {
+                write_xml_node(writer, key, child)?;
+            }
+            writer
+                .write_event(Event::End(BytesEnd::new(name)))
+                .map_err(render_failed)?;
+        }
+        Node::List { item, items } => {
+            writer
+                .write_event(Event::Start(BytesStart::new(name)))
+                .map_err(render_failed)?;
+            for child in items {
+                write_xml_node(writer, item, child)?;
+            }
+            writer
+                .write_event(Event::End(BytesEnd::new(name)))
+                .map_err(render_failed)?;
+        }
+    }
+    Ok(())
+}
+
+/// The X12 transaction set the request names, decoded from the modelled
+/// `X12TransactionSet` value: every value is `X12_<three-digit transaction set code>`,
+/// optionally followed by `_<implementation convention reference>` for the HIPAA
+/// implementation guides — `X12_850`, `X12_837_X222`
+/// (`smithy_query(query="shape",shape="X12TransactionSet")`).
+///
+/// The grammar is the secondary guard: the caller checks membership of the crate's
+/// `X12_TRANSACTION_SET_VALUES` first, so a value shaped like one of the model's but not
+/// declared by it is refused rather than generated for.
+fn decode_transaction_set(value: &str) -> Option<(String, Option<String>)> {
+    let rest = value.strip_prefix("X12_")?;
+    let (code, convention) = match rest.split_once('_') {
+        Some((code, convention)) => (code, Some(convention)),
+        None => (rest, None),
+    };
+    if code.len() != 3 || !code.chars().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    if convention.is_some_and(|convention| {
+        convention.is_empty()
+            || !convention
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+    }) {
+        return None;
+    }
+    Some((code.to_string(), convention.map(str::to_string)))
+}
+
+/// The X12 version the request names, decoded from the modelled `X12Version` value: every
+/// value is `VERSION_<four-digit release>`, optionally suffixed `_HIPAA` for the
+/// HIPAA-constrained release (`smithy_query(query="shape",shape="X12Version")`).
+///
+/// Answers the release as a number — which fixes the ISA11 element's name — and the
+/// six-digit version/release code X12 carries in GS08: the release zero-padded to six
+/// digits, so release 4010 is `004010`. As with the transaction set, the caller checks
+/// membership of the crate's `X12_VERSION_VALUES` first.
+fn decode_version(value: &str) -> Option<(u32, String)> {
+    let rest = value.strip_prefix("VERSION_")?;
+    let release = rest.strip_suffix("_HIPAA").unwrap_or(rest);
+    if release.len() != 4 || !release.chars().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    Some((release.parse().ok()?, format!("00{release}")))
+}
+
 /// The `CreateStarterMappingTemplate` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -162,20 +989,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateStarterMappingTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateStarterMappingTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateStarterMappingTemplate"))
+        // No state is touched: this operation mints no resource (its output is one
+        // `mappingTemplate` string, and the model gives a template no id and no
+        // Get/List/Delete), so the template is computed from the request alone. Writing
+        // state here would give a generator a side effect a later caller could observe,
+        // which the operation does not have. The engine is bound (and not used) so the
+        // constructor seam every operation shares stays visible here.
+        let _ = &self.engine;
+
+        let Some(format) = MappingFormat::decode(&input.mapping_type) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "mappingType value '{}' is not one of {}",
+                input.mapping_type,
+                MappingFormat::accepted()
+            )));
+        };
+        let language = format.language();
+
+        // `TemplateDetails` is a union with one member: X12 is the only EDI standard a
+        // starter template can be generated for.
+        let TemplateDetails::X12(details) = input.template_details;
+        let Some(transaction_set) = details.transaction_set else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "templateDetails.x12.transactionSet is required to generate a starter \
+                 mapping template",
+            ));
+        };
+        let Some(version) = details.version else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "templateDetails.x12.version is required to generate a starter mapping \
+                 template",
+            ));
+        };
+        let Some((transaction_set_code, implementation_convention)) =
+            decode_transaction_set(&transaction_set)
+                .filter(|_| X12_TRANSACTION_SET_VALUES.contains(&transaction_set.as_str()))
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "templateDetails.x12.transactionSet value '{transaction_set}' is not a \
+                 modelled X12 transaction set"
+            )));
+        };
+        let Some((release, version_code)) =
+            decode_version(&version).filter(|_| X12_VERSION_VALUES.contains(&version.as_str()))
+        else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "templateDetails.x12.version value '{version}' is not a modelled X12 version"
+            )));
+        };
+
+        // A sample EDI file is read from Amazon S3, and no S3 object is reachable from
+        // this service: rather than answer a template that only LOOKS as though it came
+        // from the sample, a request for one is refused with the modelled
+        // `ResourceNotFoundException` — the sample cannot be found. Without
+        // `outputSampleLocation` the template comes from `templateDetails`, which is what
+        // the operation documents for that case.
+        if let Some(sample) = input.output_sample_location.as_ref() {
+            let bucket = sample.bucket_name.as_deref().unwrap_or_default();
+            let key = sample.key.as_deref().unwrap_or_default();
+            return Err(
+                CreateStarterMappingTemplateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "the sample EDI file at outputSampleLocation \
+                             s3://{bucket}/{key} cannot be read, so no mapping template \
+                             can be generated from it; omit outputSampleLocation to \
+                             generate a template from templateDetails"
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // GS08, the version/release/industry identifier code: the six-digit X12 version,
+        // followed by the implementation convention reference when the requested
+        // transaction set names one (`005010X222`).
+        let version_release_industry_code = match implementation_convention.as_deref() {
+            Some(convention) => format!("{version_code}{convention}"),
+            None => version_code,
+        };
+        let document = starter_document(
+            language,
+            &transaction_set_code,
+            implementation_convention.as_deref(),
+            release,
+            &version_release_industry_code,
+        );
+        let mapping_template = match format {
+            MappingFormat::Jsonata => jsonata_template(&document)?,
+            MappingFormat::Xslt => xslt_template(
+                &document,
+                &transaction_set_code,
+                &version_release_industry_code,
+            )?,
+        };
+
+        Ok(CreateStarterMappingTemplateOutput { mapping_template })
     }
 }

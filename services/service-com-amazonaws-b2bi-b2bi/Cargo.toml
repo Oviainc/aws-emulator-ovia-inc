@@ -22,6 +22,12 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# `serde::Serialize` for the starter mapping template's document tree, so a segment's
+# elements keep their positional order (a `serde_json::Value` map would sort them).
+serde = { workspace = true }
+# XML writer for the XSLT starter mapping template: it escapes and indents the
+# stylesheet this service generates.
+quick-xml = "0.41"
 tracing = { workspace = true }
 
 [build-dependencies]
