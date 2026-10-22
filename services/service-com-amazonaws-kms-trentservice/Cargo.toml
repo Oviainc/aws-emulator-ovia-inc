@@ -21,13 +21,17 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# AES-256-GCM (and the OS CSPRNG) for the ciphertext envelope a SYMMETRIC_DEFAULT
+# KMS key seals and opens; `ring` is already in this workspace's lock file.
+ring = "0.17"
+# KeyMaterialId (64 lowercase hex characters) and the opaque ListKeys marker.
+sha2 = { workspace = true }
+hex = { workspace = true }
+# Version-4 UUIDs: the form a KMS key id takes.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

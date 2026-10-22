@@ -2,7 +2,8 @@
 
 //! Engine state for the com-amazonaws-vpclattice-mercurycontrolplane service.
 //!
-//! One store holds the service-network / service / service-association slice, and the
+//! One store holds the service-network / service / service-association / listener
+//! slice, and the
 //! helpers every handler in `src/ops/` shares live here too: identifier resolution
 //! (bare id or ARN), id and ARN minting, the request's region, and the clock-owed
 //! `CREATE_IN_PROGRESS -> ACTIVE` span. Handlers reach the store through
@@ -23,6 +24,9 @@ pub const KIND_SERVICE_NETWORK: &str = "servicenetwork";
 pub const KIND_SERVICE: &str = "service";
 /// The ARN resource kind of a service-network/service association.
 pub const KIND_SERVICE_ASSOCIATION: &str = "servicenetworkserviceassociation";
+/// The ARN resource kind of a listener. A listener ARN nests under its service's:
+/// `…:service/svc-…/listener/listener-…` (`ListenerArn`'s modelled pattern).
+pub const KIND_LISTENER: &str = "listener";
 
 /// The id prefix of a service network (`^sn-[0-9a-z]{17}$`).
 pub const PREFIX_SERVICE_NETWORK: &str = "sn-";
@@ -30,6 +34,8 @@ pub const PREFIX_SERVICE_NETWORK: &str = "sn-";
 pub const PREFIX_SERVICE: &str = "svc-";
 /// The id prefix of a service-network/service association (`^snsa-[0-9a-z]{17}$`).
 pub const PREFIX_SERVICE_ASSOCIATION: &str = "snsa-";
+/// The id prefix of a listener (`^listener-[0-9a-z]{17}$`).
+pub const PREFIX_LISTENER: &str = "listener-";
 
 /// Every modelled id of this service is its prefix plus 17 `[0-9a-z]` characters.
 const ID_SUFFIX_LEN: usize = 17;
@@ -72,6 +78,35 @@ pub const MAX_SERVICES: usize = 1_000;
 /// reasoning, and `CreateServiceNetworkServiceAssociation` models the same
 /// `ServiceQuotaExceededException`.
 pub const MAX_SERVICE_ASSOCIATIONS: usize = 1_000;
+
+/// How many listeners this emulator will hold for one service. Same reasoning as the
+/// ceilings above, and `CreateListener` models the same `ServiceQuotaExceededException`.
+pub const MAX_LISTENERS_PER_SERVICE: usize = 100;
+
+/// The listener port a create gets when it omits `port`, by protocol.
+///
+/// From the `port` member's own documentation: "The listener port. You can specify a
+/// value from 1 to 65535. For HTTP, the default is 80. For HTTPS, the default is 443."
+/// No default is documented for any other protocol, so [`default_port_for`] answers
+/// `None` there and the handler refuses a create that sends no port rather than
+/// inventing one.
+pub const DEFAULT_PORT_HTTP: i32 = 80;
+/// The documented default port of an `HTTPS` listener; see [`DEFAULT_PORT_HTTP`].
+pub const DEFAULT_PORT_HTTPS: i32 = 443;
+
+/// The weight a forward action's only target group gets when the caller sends none.
+///
+/// From `WeightedTargetGroup`'s `weight` documentation: "Only required if you specify
+/// multiple target groups for a forward action. … If there's only one target group
+/// specified, then the default value is 100."
+pub const DEFAULT_SINGLE_TARGET_GROUP_WEIGHT: i32 = 100;
+
+/// The HTTP status codes a fixed-response action may carry.
+///
+/// From `FixedResponseAction`'s `statusCode` documentation: "The HTTP response code.
+/// Only `404` and `500` status codes are supported." The modelled `@range(100, 599)` is
+/// wider than that, so this narrower catalog is enforced in the handlers.
+pub const FIXED_RESPONSE_STATUS_CODES: &[i32] = &[404, 500];
 
 /// How long after its create call a resource still reports `CREATE_IN_PROGRESS`.
 ///
@@ -184,6 +219,98 @@ impl ServiceNetworkServiceAssociation {
     }
 }
 
+/// A listener of one service: the process that checks for connection requests to it.
+///
+/// The model gives a listener no status member — AWS answers a created listener with
+/// nothing non-terminal — so there is no clock-owed transition here, only the
+/// timestamps `GetListener` and `ListListeners` report.
+#[derive(Debug, Clone)]
+pub struct Listener {
+    pub id: String,
+    pub arn: String,
+    pub name: String,
+    /// `ListenerProtocol`, exactly as the create sent it (the model constrains it to
+    /// `LISTENER_PROTOCOL_VALUES`).
+    pub protocol: String,
+    /// The port the create sent, or the protocol's documented default; see
+    /// [`default_port_for`].
+    pub port: i32,
+    pub service_id: String,
+    pub service_arn: String,
+    /// The default rule's action, stored as the modelled union after
+    /// [`normalized_rule_action`] filled in the documented weight default.
+    pub default_action: crate::ops::types::RuleAction,
+    pub tags: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub last_updated_at: SystemTime,
+    /// Creation order, so a listing pages deterministically. See [`encode_cursor`].
+    pub sequence: u64,
+}
+
+/// The default port of a listener speaking `protocol`, or `None` where the `port`
+/// member documents no default for it.
+pub fn default_port_for(protocol: &str) -> Option<i32> {
+    match protocol {
+        "HTTP" => Some(DEFAULT_PORT_HTTP),
+        "HTTPS" => Some(DEFAULT_PORT_HTTPS),
+        _ => None,
+    }
+}
+
+/// Refuse a rule action outside a constraint its own documentation states, with the
+/// offending member path and the reason; `Ok(())` when it satisfies them.
+///
+/// The modelled traits the boundary already enforces (`targetGroups`' `@length(1, 10)`,
+/// `weight`'s `@range(0, 999)`, `statusCode`'s `@range(100, 599)`) are not re-checked
+/// here; what is checked is the narrower documented catalog of fixed-response status
+/// codes ([`FIXED_RESPONSE_STATUS_CODES`]), which no modelled trait carries.
+pub fn check_rule_action(
+    member: &str,
+    action: &crate::ops::types::RuleAction,
+) -> Result<(), (String, String)> {
+    match action {
+        crate::ops::types::RuleAction::fixedResponse(fixed) => {
+            if !FIXED_RESPONSE_STATUS_CODES.contains(&fixed.status_code) {
+                let supported = FIXED_RESPONSE_STATUS_CODES
+                    .iter()
+                    .map(i32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err((
+                    format!("{member}.fixedResponse.statusCode"),
+                    format!(
+                        "must be one of the supported status codes {supported}, got {}",
+                        fixed.status_code
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        crate::ops::types::RuleAction::Forward(_) => Ok(()),
+    }
+}
+
+/// The action as it is PERSISTED: the caller's action with every value its
+/// documentation defaults filled in.
+///
+/// Today that is one default — a forward action whose single target group carries no
+/// `weight` gets [`DEFAULT_SINGLE_TARGET_GROUP_WEIGHT`]. A weight omitted beside other
+/// target groups is left absent: the member documents a default only for the
+/// single-target-group case.
+pub fn normalized_rule_action(
+    action: &crate::ops::types::RuleAction,
+) -> crate::ops::types::RuleAction {
+    let mut action = action.clone();
+    if let crate::ops::types::RuleAction::Forward(forward) = &mut action {
+        if forward.target_groups.len() == 1 {
+            if let Some(only) = forward.target_groups.first_mut() {
+                only.weight = Some(only.weight.unwrap_or(DEFAULT_SINGLE_TARGET_GROUP_WEIGHT));
+            }
+        }
+    }
+    action
+}
+
 /// The most `@idempotencyToken` -> resource-id entries this service remembers.
 ///
 /// Tokens are caller-supplied, so the map is caller-driven growth that holds no resource
@@ -258,6 +385,10 @@ pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
     pub services: HashMap<String, LatticeService>,
     /// Keyed by `snsa-…` id. At most [`MAX_SERVICE_ASSOCIATIONS`] entries.
     pub service_associations: HashMap<String, ServiceNetworkServiceAssociation>,
+    /// Keyed by `listener-…` id. At most [`MAX_LISTENERS_PER_SERVICE`] entries per
+    /// service, and every listener of a deleted service goes with it
+    /// ([`ComAmazonawsVpclatticeMercurycontrolplaneState::remove_listeners_of`]).
+    pub listeners: HashMap<String, Listener>,
     /// `<ARN resource kind>/<name>` -> id. A name must be unique to the account, so a
     /// second create under a taken name is a `ConflictException`. One key per stored
     /// resource, so the resource ceilings bound this map too.
@@ -300,6 +431,34 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
         .unwrap_or(i64::MAX)
     }
 
+    /// How many listeners `service_id` holds, counted from the listener records.
+    pub fn listener_count(&self, service_id: &str) -> usize {
+        self.listeners
+            .values()
+            .filter(|listener| listener.service_id == service_id)
+            .count()
+    }
+
+    /// Drop every listener of `service_id`, releasing its name and token records.
+    ///
+    /// `DeleteService`'s own documentation: "If you delete a service, all resources
+    /// related to the service, such as the resource policy, auth policy, listeners,
+    /// listener rules, and access log subscriptions, are also deleted."
+    pub fn remove_listeners_of(&mut self, service_id: &str) {
+        let doomed: Vec<Listener> = self
+            .listeners
+            .values()
+            .filter(|listener| listener.service_id == service_id)
+            .cloned()
+            .collect();
+        for listener in doomed {
+            self.listeners.remove(&listener.id);
+            self.name_index
+                .remove(&listener_name_key(service_id, &listener.name));
+            self.idempotency_tokens.forget_resource(&listener.id);
+        }
+    }
+
     /// The association of this exact (service network, service) pair, if there is one.
     pub fn association_of(
         &self,
@@ -315,6 +474,13 @@ impl ComAmazonawsVpclatticeMercurycontrolplaneState {
 /// The key [`ComAmazonawsVpclatticeMercurycontrolplaneState::name_index`] is read with.
 pub fn name_key(kind: &str, name: &str) -> String {
     format!("{kind}/{name}")
+}
+
+/// The [`ComAmazonawsVpclatticeMercurycontrolplaneState::name_index`] key of a listener
+/// name. A listener name is unique within its SERVICE, not within the account, so the
+/// owning service's id is part of the key.
+pub fn listener_name_key(service_id: &str, name: &str) -> String {
+    name_key(&format!("{KIND_SERVICE}/{service_id}/{KIND_LISTENER}"), name)
 }
 
 /// A `nextToken` no listing of this service ever minted.
@@ -366,6 +532,17 @@ pub fn account_id() -> &'static str {
 /// `arn:aws:vpc-lattice:<region>:<account>:<kind>/<id>`.
 pub fn arn_for(region: &str, kind: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("{kind}/{id}"))
+}
+
+/// A listener's ARN, which nests under its service's:
+/// `arn:aws:vpc-lattice:<region>:<account>:service/<service id>/listener/<listener id>`
+/// (`ListenerArn`'s modelled pattern).
+pub fn listener_arn(region: &str, service_id: &str, listener_id: &str) -> String {
+    arn_for(
+        region,
+        &format!("{KIND_SERVICE}/{service_id}/{KIND_LISTENER}"),
+        listener_id,
+    )
 }
 
 /// Mint a fresh resource id: `prefix` plus 17 `[0-9a-z]` characters, as the modelled

@@ -19,3 +19,5 @@ mod supported_resource_types;
 mod vault_and_backup_job;
 #[path = "all/vault_read_projection.rs"]
 mod vault_read_projection;
+#[path = "all/vault_read_visibility.rs"]
+mod vault_read_visibility;

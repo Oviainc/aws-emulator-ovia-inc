@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutOriginEndpointPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutOriginEndpointPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutOriginEndpointPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a resource policy to an origin endpoint, replacing whatever policy the
+//! endpoint carried. The document is validated before anything is stored (a document that
+//! is not an IAM policy is a 400 `ValidationException` with `ValidationExceptionType`
+//! `INVALID_POLICY`), and the group -> channel -> endpoint address is then resolved level
+//! by level, each missing level answering its own fixed `ResourceNotFoundException` (404)
+//! sentence.
 //!
 //! ## Shape of an operation
 //!
@@ -128,6 +126,29 @@ impl From<PutOriginEndpointPolicyErrorModeled> for PutOriginEndpointPolicyError 
     }
 }
 
+/// The sentence MediaPackage answers with when a channel group cannot be resolved —
+/// fixed per resource type, echoing none of the caller's identifiers. Worded exactly as
+/// the channel-scope policy handlers word it (`put_channel_policy`).
+const CHANNEL_GROUP_NOT_FOUND: &str = "MediaPackage can't process your request because \
+    we can't find your channel group. Verify your channel group name or add a channel \
+    group and then try again";
+
+/// The same fixed sentence at channel scope.
+const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because we \
+    can't find your channel. Verify your channel name or add a channel and then try \
+    again";
+
+/// The same fixed sentence at origin-endpoint scope.
+const ORIGIN_ENDPOINT_NOT_FOUND: &str = "MediaPackage can't process your request because \
+    we can't find your origin endpoint. Verify your origin endpoint name or add an origin \
+    endpoint and then try again";
+
+/// Why a policy document was refused — the same text `PutChannelPolicy` answers with, so
+/// one rule produces one message at both policy scopes.
+const INVALID_POLICY_MESSAGE: &str = "Validation error encountered at request.policy: \
+    The policy you provided isn't a valid policy document. Provide a JSON policy \
+    document with a Statement and then try again";
+
 /// The `PutOriginEndpointPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -164,18 +185,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutOriginEndpointPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutOriginEndpointPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutOriginEndpointPolicy"))
+        // A write needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutOriginEndpointPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the MediaPackageV2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The document is checked before the store is touched, so a refused policy leaves
+        // whatever policy the endpoint already had in place. `is_policy_document` is the
+        // crate's one definition of a valid policy, shared with `PutChannelPolicy`.
+        if !crate::state::is_policy_document(&input.policy) {
+            return Err(PutOriginEndpointPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(INVALID_POLICY_MESSAGE.to_string()),
+                    validation_exception_type: Some("INVALID_POLICY".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Each level of the address is resolved on its own, because the service words a
+        // not-found by the resource type that is missing.
+        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+            return Err(
+                PutOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(CHANNEL_GROUP_NOT_FOUND.to_string()),
+                        resource_type_not_found: Some("CHANNEL_GROUP".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(channel) = group.channels.get_mut(&input.channel_name) else {
+            return Err(
+                PutOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(CHANNEL_NOT_FOUND.to_string()),
+                        resource_type_not_found: Some("CHANNEL".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let Some(endpoint) = channel
+            .origin_endpoints
+            .get_mut(&input.origin_endpoint_name)
+        else {
+            return Err(
+                PutOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(ORIGIN_ENDPOINT_NOT_FOUND.to_string()),
+                        resource_type_not_found: Some("ORIGIN_ENDPOINT".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The policy replaces any policy the endpoint already carried, together with the
+        // CDN authorization settings submitted with it: the pair is one record, so a
+        // request that omits `CdnAuthConfiguration` leaves none behind.
+        endpoint.policy = Some(crate::state::EndpointPolicy {
+            policy: input.policy,
+            cdn_auth_configuration: input.cdn_auth_configuration,
+        });
+
+        Ok(PutOriginEndpointPolicyOutput {})
     }
 }

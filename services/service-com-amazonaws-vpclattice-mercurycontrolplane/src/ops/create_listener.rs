@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateListener
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateListener`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateListener::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the owning service, mints a listener under it, persists it in
+//! [`crate::state::ComAmazonawsVpclatticeMercurycontrolplaneState::listeners`] and
+//! answers from what was stored (`GetListener` reads the same record back).
 //!
 //! ## Shape of an operation
 //!
@@ -152,6 +147,34 @@ impl From<CreateListenerErrorModeled> for CreateListenerError {
     }
 }
 
+/// The response for a stored listener — every member read back out of state.
+fn output_of(listener: &crate::state::Listener) -> CreateListenerOutput {
+    CreateListenerOutput {
+        id: Some(listener.id.clone()),
+        arn: Some(listener.arn.clone()),
+        name: Some(listener.name.clone()),
+        protocol: Some(listener.protocol.clone()),
+        port: Some(listener.port),
+        service_id: Some(listener.service_id.clone()),
+        service_arn: Some(listener.service_arn.clone()),
+        default_action: Some(listener.default_action.clone()),
+    }
+}
+
+/// HTTP 400 for input outside a constraint the model or the member's documentation
+/// states, naming the member and the constraint it broke.
+fn invalid(member: &str, reason: &str) -> CreateListenerError {
+    CreateListenerErrorModeled::ValidationException(ValidationException {
+        message: format!("{member} {reason}"),
+        reason: "fieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: reason.to_string(),
+        }]),
+    })
+    .into()
+}
+
 /// The `CreateListener` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -188,18 +211,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateListener` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateListenerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateListener"))
+        // The modelled constraints the boundary CAN check (`@length`, `port`'s 1..65535
+        // range, `targetGroups`' 1..10, `statusCode`'s 100..599, the `ListenerProtocol`
+        // enum) are refused before this handler runs; `name`'s pattern is written with
+        // negative lookahead the boundary's regex engine cannot compile, and the
+        // documented narrower constraints below carry no modelled trait at all.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateListenerErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let region = crate::state::region_of(ctx.parts());
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `serviceIdentifier` is modelled as either the bare id or the service ARN; an
+        // identifier naming no persisted service is 404, never a listener under nothing.
+        let service = crate::state::id_from_identifier(
+            &input.service_identifier,
+            crate::state::PREFIX_SERVICE,
+        )
+        .and_then(|id| store.services.get(&id))
+        .cloned();
+        let Some(service) = service else {
+            return Err(CreateListenerErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("service {} not found", input.service_identifier),
+                    resource_id: input.service_identifier.clone(),
+                    resource_type: crate::state::KIND_SERVICE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        if let Err(reason) =
+            crate::state::check_resource_name(&input.name, Some(crate::state::PREFIX_LISTENER))
+        {
+            return Err(invalid("name", &reason));
+        }
+        if let Err(reason) = crate::state::check_tag_count(input.tags.as_ref()) {
+            return Err(invalid("tags", &reason));
+        }
+        if let Err((member, reason)) =
+            crate::state::check_rule_action("defaultAction", &input.default_action)
+        {
+            return Err(invalid(&member, &reason));
+        }
+
+        // The `port` member documents a default for `HTTP` (80) and `HTTPS` (443) only,
+        // so a create under any other protocol has to carry one: inventing a port the
+        // service documents nowhere would be worse than refusing the request.
+        let Some(port) = input
+            .port
+            .or_else(|| crate::state::default_port_for(&input.protocol))
+        else {
+            return Err(invalid(
+                "port",
+                &format!(
+                    "is required for a {} listener, which has no default port",
+                    input.protocol
+                ),
+            ));
+        };
+
+        // `clientToken` is an @idempotencyToken: a retry carrying the token of a
+        // completed create answers with that same listener.
+        let token = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::token_key(Self::NAME, token));
+        if let Some(existing) = token
+            .as_ref()
+            .and_then(|key| store.idempotency_tokens.get(key))
+            .and_then(|id| store.listeners.get(id))
+        {
+            if existing.name != input.name || existing.service_id != service.id {
+                return Err(CreateListenerErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "clientToken was already used to create listener {} with different parameters",
+                            existing.id
+                        ),
+                        resource_id: existing.id.clone(),
+                        resource_type: crate::state::KIND_LISTENER.to_string(),
+                    },
+                )
+                .into());
+            }
+            return Ok(output_of(existing));
+        }
+
+        // "A listener name must be unique within a service" (the `name` member's own
+        // documentation), so the key is scoped to the owning service.
+        let name_key = crate::state::listener_name_key(&service.id, &input.name);
+        if let Some(taken_by) = store.name_index.get(&name_key) {
+            return Err(CreateListenerErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a listener named {} already exists in service {}",
+                        input.name, service.id
+                    ),
+                    resource_id: taken_by.clone(),
+                    resource_type: crate::state::KIND_LISTENER.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The emulator's own ceiling on stored listeners, answered with the modelled 402
+        // so a caller looping on create cannot grow this process without bound.
+        if store.listener_count(&service.id) >= crate::state::MAX_LISTENERS_PER_SERVICE {
+            return Err(CreateListenerErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "service {} already holds the maximum of {} listeners",
+                        service.id,
+                        crate::state::MAX_LISTENERS_PER_SERVICE
+                    ),
+                    resource_id: Some(service.id.clone()),
+                    resource_type: crate::state::KIND_LISTENER.to_string(),
+                    service_code: crate::state::ARN_SERVICE.to_string(),
+                    quota_code: "listeners-per-service".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = crate::state::mint_id(crate::state::PREFIX_LISTENER);
+        let sequence = store.next_sequence();
+        let record = crate::state::Listener {
+            arn: crate::state::listener_arn(&region, &service.id, &id),
+            id: id.clone(),
+            name: input.name.clone(),
+            protocol: input.protocol.clone(),
+            port,
+            service_id: service.id.clone(),
+            service_arn: service.arn.clone(),
+            // Stored with the weight default the `weight` member documents filled in,
+            // so every later read reports the same action.
+            default_action: crate::state::normalized_rule_action(&input.default_action),
+            tags: input.tags.clone().unwrap_or_default(),
+            created_at: now,
+            last_updated_at: now,
+            sequence,
+        };
+
+        store.name_index.insert(name_key, id.clone());
+        if let Some(key) = token {
+            store.idempotency_tokens.record(key, id.clone());
+        }
+        store.listeners.insert(id.clone(), record);
+        let stored = store
+            .listeners
+            .get(&id)
+            .expect("the listener was just inserted under this id");
+        Ok(output_of(stored))
     }
 }
