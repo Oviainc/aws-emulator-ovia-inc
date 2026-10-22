@@ -41,7 +41,8 @@ use crate::ops::types::{
     ExperimentReportConfigurationDataSources, ExperimentReportConfigurationOutputs,
     ExperimentReportConfigurationOutputsS3Configuration, ExperimentS3LogConfiguration,
     ExperimentState, ExperimentStopCondition, ExperimentSummary, ExperimentTarget,
-    ExperimentTargetAccountConfiguration, ExperimentTargetFilter, ExperimentTemplate,
+    ExperimentTargetAccountConfiguration, ExperimentTargetAccountConfigurationSummary,
+    ExperimentTargetFilter, ExperimentTemplate,
     ExperimentTemplateAction,
     ExperimentTemplateCloudWatchLogsLogConfiguration,
     ExperimentTemplateCloudWatchLogsLogConfigurationInput, ExperimentTemplateExperimentOptions,
@@ -138,14 +139,16 @@ pub const TARGET_ACCOUNT_ID_FLOOR: usize = 12;
 /// `@length`.
 pub const TARGET_ACCOUNT_ID_CEILING: usize = 48;
 
-/// The marker every `nextToken` `ListTargetAccountConfigurations` issues starts with.
+/// The marker every `nextToken` a list of target account configurations issues starts
+/// with — `ListTargetAccountConfigurations` over a template's configurations and
+/// `ListExperimentTargetAccountConfigurations` over an experiment's snapshot of them.
 ///
 /// A target account configuration is named by its `accountId` rather than by an id this
 /// service mints, so there is no minted shape to recognise a page token by (the way
 /// [`is_minted_id`] recognises the token of a template or experiment page). The token
 /// therefore carries the account id the next page resumes at BEHIND this marker, which
-/// makes it self-describing: a value this operation never issued carries no marker and is
-/// refused as a `ValidationException` instead of being read as a resume point.
+/// makes it self-describing: a value these operations never issued carries no marker and
+/// is refused as a `ValidationException` instead of being read as a resume point.
 pub const TARGET_ACCOUNT_PAGE_TOKEN_PREFIX: &str = "targetAccountConfiguration.";
 
 /// The value FIS applies to `accountTargeting` when the request names none: the
@@ -326,6 +329,21 @@ impl TargetAccountConfigurationRecord {
     /// `description` staying absent.
     pub fn to_summary(&self) -> TargetAccountConfigurationSummary {
         TargetAccountConfigurationSummary {
+            role_arn: Some(self.role_arn.clone()),
+            account_id: Some(self.account_id.clone()),
+            description: self.description.clone(),
+        }
+    }
+
+    /// The `ExperimentTargetAccountConfigurationSummary` a page of
+    /// `ListExperimentTargetAccountConfigurations` carries.
+    ///
+    /// `ExperimentTargetAccountConfigurationSummary` declares the same three members as
+    /// `ExperimentTargetAccountConfiguration`, so a listed configuration of an experiment
+    /// reports exactly what a `GetExperimentTargetAccountConfiguration` of the same name
+    /// reports — including an absent `description` staying absent.
+    pub fn to_experiment_summary(&self) -> ExperimentTargetAccountConfigurationSummary {
+        ExperimentTargetAccountConfigurationSummary {
             role_arn: Some(self.role_arn.clone()),
             account_id: Some(self.account_id.clone()),
             description: self.description.clone(),

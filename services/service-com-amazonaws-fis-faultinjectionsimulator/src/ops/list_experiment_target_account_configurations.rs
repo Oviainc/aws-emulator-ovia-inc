@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExperimentTargetAccountConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExperimentTargetAccountConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExperimentTargetAccountConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists one experiment's target account configurations.
+//!
+//! An experiment's target account configurations are the snapshot its template held when
+//! `StartExperiment` ran, kept on the experiment record and keyed by `accountId`, so this
+//! operation enumerates that snapshot in `accountId` order. The model gives this
+//! operation no `maxResults`, so the caller cannot size the page: it is cut at the largest
+//! page this service serves ([`crate::state::PAGE_LIMIT`]) and is followed by a
+//! `nextToken` exactly when configurations remain. That token carries the `accountId` the
+//! next page resumes at behind the marker
+//! [`crate::state::TARGET_ACCOUNT_PAGE_TOKEN_PREFIX`], so a token this service never
+//! issued is refused as a `ValidationException` rather than read as a resume point.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +146,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExperimentTargetAccountConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExperimentTargetAccountConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExperimentTargetAccountConfigurations"))
+        // A listed configuration carries no ARN and no minted id, so nothing here reads
+        // the request's credential scope.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The token is the account id the next page starts at, behind the marker a page of
+        // target account configurations carries, so anything without that marker — or
+        // carrying a value no `accountId` could be — was never issued here.
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::target_account_page_token_account(token) {
+                Some(account_id) => Some(account_id.to_string()),
+                None => {
+                    return Err(
+                        ListExperimentTargetAccountConfigurationsErrorModeled::ValidationException(
+                            crate::state::invalid_input(
+                                "nextToken is not a token returned by \
+                                 ListExperimentTargetAccountConfigurations",
+                            ),
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        // This operation models no `maxResults`, so the page is the largest one this
+        // service serves rather than a size the caller chose.
+        let page_size = crate::state::page_size(None);
+
+        // Reporting only: the guard is taken immutably, so this read cannot change what a
+        // later caller sees. The experiment's status is not reported here, so there is no
+        // owed transition to materialise in order to answer.
+        let store = state.lock();
+
+        // The configurations belong to an experiment: with no such experiment there is
+        // nothing to enumerate.
+        let Some(experiment) = store.experiments.get(&input.experiment_id) else {
+            return Err(
+                ListExperimentTargetAccountConfigurationsErrorModeled::ResourceNotFoundException(
+                    crate::state::experiment_not_found(&input.experiment_id),
+                )
+                .into(),
+            );
+        };
+
+        let mut target_account_configurations =
+            Vec::with_capacity(page_size.min(experiment.target_account_configurations.len()));
+        let mut next_token = None;
+        for (account_id, record) in &experiment.target_account_configurations {
+            // Resume at the first account id at or after the token, so a page is still
+            // served when the configuration the token named is no longer there.
+            if resume_at
+                .as_deref()
+                .is_some_and(|from| account_id.as_str() < from)
+            {
+                continue;
+            }
+            if target_account_configurations.len() >= page_size {
+                next_token = Some(crate::state::target_account_page_token(account_id));
+                break;
+            }
+            target_account_configurations.push(record.to_experiment_summary());
+        }
+
+        Ok(ListExperimentTargetAccountConfigurationsOutput {
+            target_account_configurations: Some(target_account_configurations),
+            next_token,
+        })
     }
 }
+
