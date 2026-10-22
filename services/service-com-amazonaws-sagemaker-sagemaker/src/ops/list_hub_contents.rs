@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHubContents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHubContents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHubContents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the hub named by `HubName` in `crate::state`, then filters,
+//! sorts and pages that hub's stored contents. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -141,6 +135,39 @@ impl<Eng> ListHubContents<Eng> {
     }
 }
 
+/// `HubContentSortBy`'s members (`smithy_query(query="shape",shape="HubContentSortBy")`).
+const SORT_BY_MEMBERS: [&str; 3] = ["HubContentName", "CreationTime", "HubContentStatus"];
+
+/// `HubContentType`'s members (`smithy_query(query="shape",shape="HubContentType")`).
+const HUB_CONTENT_TYPE_MEMBERS: [&str; 5] =
+    ["Model", "Notebook", "ModelReference", "DataSet", "JsonDoc"];
+
+/// The sort key applied when the caller names none.
+///
+/// Neither `SortBy` nor `SortOrder` documents a default for this operation (their model
+/// docs say only what each one sorts by), so this is the service's own choice, and it is
+/// the one the other paginated listings of this crate apply — newest content first.
+const DEFAULT_SORT_BY: &str = "CreationTime";
+
+/// See [`DEFAULT_SORT_BY`].
+const DEFAULT_SORT_ORDER: &str = "Descending";
+
+/// A page boundary as an opaque `NextToken`: the hex of the last-returned
+/// `HubContentName`.
+///
+/// The token names the item the page stopped at rather than an offset, so resuming lands
+/// exactly after it even though the token is opaque to the caller. One content name
+/// appears at most once in a result set (the listing reports a content's latest version),
+/// so the name identifies the boundary.
+fn encode_token(hub_content_name: &str) -> String {
+    hex::encode(hub_content_name.as_bytes())
+}
+
+/// The `HubContentName` a `NextToken` names, or `None` when the token was not minted here.
+fn decode_token(token: &str) -> Option<String> {
+    String::from_utf8(hex::decode(token).ok()?).ok()
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListHubContents<Eng>
 {
@@ -158,18 +185,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHubContents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHubContentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHubContents"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        if !HUB_CONTENT_TYPE_MEMBERS.contains(&input.hub_content_type.as_str()) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "HubContentType must be one of {}; got \"{}\".",
+                HUB_CONTENT_TYPE_MEMBERS.join(", "),
+                input.hub_content_type,
+            )));
+        }
+        let sort_by = input.sort_by.as_deref().unwrap_or(DEFAULT_SORT_BY);
+        if !SORT_BY_MEMBERS.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                SORT_BY_MEMBERS.join(", "),
+            )));
+        }
+        let descending = match input.sort_order.as_deref().unwrap_or(DEFAULT_SORT_ORDER) {
+            "Descending" => true,
+            "Ascending" => false,
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "SortOrder must be one of Ascending, Descending; got \"{other}\"."
+                )))
+            }
+        };
+
+        // `HubName` is a `HubNameOrArn`, so either form addresses the same stored hub.
+        let hub_name = crate::state::name_from_arn_or_name(&input.hub_name).to_string();
+        let after = input.creation_time_after.map(crate::state::timestamp_key);
+        let before = input.creation_time_before.map(crate::state::timestamp_key);
+        let max_schema_version = input
+            .max_schema_version
+            .as_deref()
+            .map(crate::state::version_key);
+
+        let store = state.lock();
+        if !store.hubs.contains_key(&hub_name) {
+            // The one modelled error: there is no such hub to list the contents of.
+            let arn =
+                crate::state::resource_arn(&crate::state::request_region(ctx), "hub", &hub_name);
+            return Err(ListHubContentsErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(format!("Could not find hub \"{arn}\".")),
+            })
+            .into());
+        }
+
+        // One row per content NAME, carrying that content's LATEST version: enumerating a
+        // content's versions is `ListHubContentVersions`'s job, and the summary shape
+        // carries `OriginalCreationTime` ("when the hub content was originally created,
+        // before any updates or revisions") beside `CreationTime`, so a row is a
+        // content's current revision rather than one row per revision. (`SortBy`'s own doc
+        // says "sort hub content VERSIONS by either name or creation time", which reads
+        // the other way; the two members above, and the separate per-content versions
+        // listing, are the stronger evidence.) The store is keyed
+        // (hub, type, name, parsed version) ascending, so inserting in key order leaves
+        // the greatest version of every name behind.
+        let mut latest: ::std::collections::BTreeMap<&str, &crate::state::HubContent> =
+            ::std::collections::BTreeMap::new();
+        for (key, content) in &store.hub_contents {
+            if key.hub_name == hub_name && key.hub_content_type == input.hub_content_type {
+                latest.insert(key.hub_content_name.as_str(), content);
+            }
+        }
+
+        let mut matching: Vec<&crate::state::HubContent> = latest
+            .into_values()
+            .filter(|content| {
+                input
+                    .name_contains
+                    .as_deref()
+                    .is_none_or(|needle| content.name.contains(needle))
+            })
+            .filter(|content| {
+                // `MaxSchemaVersion` is "the upper bound of the hub content schema
+                // verion", so a content whose document schema is newer is left out.
+                max_schema_version.is_none_or(|bound| {
+                    crate::state::version_key(&content.document_schema_version) <= bound
+                })
+            })
+            .filter(|content| {
+                // Both bounds are inclusive, so a timestamp copied straight out of a
+                // prior response's `CreationTime` still selects that content.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(content.creation_time));
+                after.is_none_or(|bound| created >= bound)
+                    && before.is_none_or(|bound| created <= bound)
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `HubContentName`
+        // ascending in both directions, so two contents sharing a sort key keep one order
+        // whichever way the page is sorted — and a `NextToken` resolved against a freshly
+        // computed result set lands on the same boundary.
+        matching.sort_by(|left, right| {
+            let by_key = match sort_by {
+                "HubContentName" => left.name.cmp(&right.name),
+                "HubContentStatus" => left.status.cmp(&right.status),
+                _ => crate::state::timestamp_key(crate::state::timestamp(left.creation_time)).cmp(
+                    &crate::state::timestamp_key(crate::state::timestamp(right.creation_time)),
+                ),
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = decode_token(token)
+                    .and_then(|name| matching.iter().position(|content| content.name == name))
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::validation(
+                            "NextToken does not name a page boundary of this result set; \
+                             restart the listing without it.",
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page, and so does the service's own ceiling: an absent or
+        // larger `MaxResults` still cannot make one call serialise the whole store. The
+        // token below is emitted whenever anything is left, so a paginating client walks
+        // the full result set exactly once either way.
+        let start = start.min(matching.len());
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PAGE_SIZE, |max| {
+                max.clamp(1, crate::state::MAX_PAGE_SIZE)
+            })
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        let next_token = match page.last() {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end < matching.len() => Some(encode_token(&last.name)),
+            _ => None,
+        };
+
+        Ok(ListHubContentsOutput {
+            hub_content_summaries: page
+                .iter()
+                .map(|content| HubContentInfo {
+                    hub_content_name: content.name.clone(),
+                    hub_content_arn: content.arn.clone(),
+                    sage_maker_public_hub_content_arn: content
+                        .sage_maker_public_hub_content_arn
+                        .clone(),
+                    hub_content_version: content.version.clone(),
+                    hub_content_type: content.content_type.clone(),
+                    document_schema_version: content.document_schema_version.clone(),
+                    hub_content_display_name: content.display_name.clone(),
+                    hub_content_description: content.description.clone(),
+                    support_status: content.support_status.clone(),
+                    hub_content_search_keywords: content.search_keywords.clone(),
+                    hub_content_status: content.status.clone(),
+                    creation_time: crate::state::timestamp(content.creation_time),
+                    original_creation_time: content
+                        .original_creation_time
+                        .map(crate::state::timestamp),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

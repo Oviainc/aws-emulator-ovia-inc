@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSecurityConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSecurityConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSecurityConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +139,330 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSecurityConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSecurityConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSecurityConfiguration"))
+        use crate::state::AuditOutcome;
+
+        // Bounded, then checked, BEFORE the store is touched and BEFORE the document is
+        // parsed: a refused request neither persists anything nor allocates a parse of
+        // an unbounded body.
+        let submitted_bytes = input.security_configuration.len();
+        if submitted_bytes > crate::state::MAX_SECURITY_CONFIGURATION_BYTES {
+            crate::state::audit(
+                Self::NAME,
+                &input.name,
+                ctx,
+                AuditOutcome::ValidationRefused,
+            );
+            return Err(invalid_request(format!(
+                "SecurityConfiguration is {submitted_bytes} bytes, which exceeds the maximum of {} bytes.",
+                crate::state::MAX_SECURITY_CONFIGURATION_BYTES
+            )));
+        }
+        if let Err(reason) = validate_security_configuration(&input.security_configuration) {
+            crate::state::audit(
+                Self::NAME,
+                &input.name,
+                ctx,
+                AuditOutcome::ValidationRefused,
+            );
+            return Err(invalid_request(reason));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            crate::state::audit(Self::NAME, &input.name, ctx, AuditOutcome::StoreUnavailable);
+            return Err(CreateSecurityConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the EMR security configuration store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The name IS the identity of a security configuration, so a second create
+        // under a taken name is refused and leaves the stored document and its creation
+        // instant untouched — whether or not the new document is identical.
+        if store.security_configurations.contains_key(&input.name) {
+            crate::state::audit(Self::NAME, &input.name, ctx, AuditOutcome::Conflict);
+            return Err(invalid_request(format!(
+                "Security configuration with name '{}' already exists.",
+                input.name
+            )));
+        }
+
+        // A create that would take the store past the account's quota is refused, the
+        // way a quota is — not accepted into unbounded growth.
+        if store.security_configurations.len() >= crate::state::MAX_SECURITY_CONFIGURATIONS {
+            crate::state::audit(Self::NAME, &input.name, ctx, AuditOutcome::QuotaExceeded);
+            return Err(invalid_request(format!(
+                "The maximum number of security configurations ({}) has already been created; \
+                 delete one before creating another.",
+                crate::state::MAX_SECURITY_CONFIGURATIONS
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        store.security_configurations.insert(
+            input.name.clone(),
+            crate::state::SecurityConfigurationRecord {
+                name: input.name.clone(),
+                security_configuration: input.security_configuration,
+                creation_date_time: now,
+            },
+        );
+        crate::state::audit(
+            Self::NAME,
+            &input.name,
+            ctx,
+            AuditOutcome::SecurityConfigurationCreated,
+        );
+
+        Ok(CreateSecurityConfigurationOutput {
+            name: input.name,
+            creation_date_time: crate::state::timestamp(now),
+        })
     }
+}
+
+/// Refuse the request with this operation's modeled client error (HTTP 400).
+fn invalid_request(message: String) -> CreateSecurityConfigurationError {
+    CreateSecurityConfigurationErrorModeled::InvalidRequestException(InvalidRequestException {
+        error_code: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// `S3EncryptionConfiguration.EncryptionMode`, every value EMR accepts: server-side
+/// with S3- or KMS-managed keys, client-side with a KMS key or a custom key provider.
+/// (Amazon EMR Management Guide, "Encryption options" / the security configuration
+/// JSON reference.)
+const S3_ENCRYPTION_MODES: [&str; 4] = ["SSE-S3", "SSE-KMS", "CSE-KMS", "CSE-Custom"];
+
+/// `LocalDiskEncryptionConfiguration.EncryptionKeyProviderType`, every value EMR
+/// accepts (same reference): a KMS key, or a custom key provider supplied as a jar.
+const LOCAL_DISK_KEY_PROVIDER_TYPES: [&str; 2] = ["AwsKms", "Custom"];
+
+/// `TLSCertificateConfiguration.CertificateProviderType`, every value EMR accepts
+/// (same reference): a zip of PEM artifacts, or a custom provider supplied as a jar.
+const CERTIFICATE_PROVIDER_TYPES: [&str; 2] = ["PEM", "Custom"];
+
+/// Whether `document` is a security configuration EMR would store, answering why not.
+///
+/// A security configuration is "the security configuration details in JSON format"
+/// (`CreateSecurityConfiguration$SecurityConfiguration` doc), and its
+/// `EncryptionConfiguration` section has to hold together: a mode it switches on must
+/// carry the configuration that mode needs, a section it carries must be internally
+/// consistent whether or not the flags switch that section on, and a provider or
+/// encryption mode it names must be one EMR defines. Anything else is a client error,
+/// not something to store.
+fn validate_security_configuration(document: &str) -> Result<(), String> {
+    let parsed: ::serde_json::Value = ::serde_json::from_str(document)
+        .map_err(|error| format!("SecurityConfiguration is not valid JSON: {error}"))?;
+    let root = parsed
+        .as_object()
+        .ok_or_else(|| "SecurityConfiguration must be a JSON object.".to_string())?;
+
+    let Some(encryption) = root.get("EncryptionConfiguration") else {
+        // A document may configure authentication, authorization or the instance
+        // metadata service and no encryption at all; there is nothing here to check.
+        return Ok(());
+    };
+    let encryption = as_object(encryption, "EncryptionConfiguration")?;
+
+    // Encryption in transit: the section is mandatory when the flag switches it on, and
+    // is checked whenever the document carries it.
+    if flag(encryption, "EnableInTransitEncryption")? {
+        required_object(
+            encryption,
+            "InTransitEncryptionConfiguration",
+            "EnableInTransitEncryption is true",
+        )?;
+    }
+    if let Some(in_transit) = encryption.get("InTransitEncryptionConfiguration") {
+        let in_transit = as_object(in_transit, "InTransitEncryptionConfiguration")?;
+        let tls = required_object(
+            in_transit,
+            "TLSCertificateConfiguration",
+            "InTransitEncryptionConfiguration is present",
+        )?;
+        validate_tls_certificate(tls)?;
+    }
+
+    // Encryption at rest: likewise, and with at least one of the two stores named when
+    // the flag switches it on.
+    if flag(encryption, "EnableAtRestEncryption")? {
+        let at_rest = required_object(
+            encryption,
+            "AtRestEncryptionConfiguration",
+            "EnableAtRestEncryption is true",
+        )?;
+        if !at_rest.contains_key("S3EncryptionConfiguration")
+            && !at_rest.contains_key("LocalDiskEncryptionConfiguration")
+        {
+            return Err("AtRestEncryptionConfiguration must specify S3EncryptionConfiguration, \
+                 LocalDiskEncryptionConfiguration or both when EnableAtRestEncryption is true."
+                .to_string());
+        }
+    }
+    if let Some(at_rest) = encryption.get("AtRestEncryptionConfiguration") {
+        let at_rest = as_object(at_rest, "AtRestEncryptionConfiguration")?;
+        if let Some(s3) = at_rest.get("S3EncryptionConfiguration") {
+            validate_s3_encryption(as_object(s3, "S3EncryptionConfiguration")?)?;
+        }
+        if let Some(local) = at_rest.get("LocalDiskEncryptionConfiguration") {
+            validate_local_disk_encryption(as_object(local, "LocalDiskEncryptionConfiguration")?)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// `TLSCertificateConfiguration`: the certificate-provider type is one EMR defines, and
+/// it carries what that type needs — the artifacts in S3, plus a provider class for a
+/// custom provider.
+fn validate_tls_certificate(
+    tls: &::serde_json::Map<String, ::serde_json::Value>,
+) -> Result<(), String> {
+    let provider = required_string(tls, "CertificateProviderType")?;
+    match provider {
+        "PEM" => require_present(tls, "S3Object", "CertificateProviderType is PEM"),
+        "Custom" => {
+            require_present(tls, "S3Object", "CertificateProviderType is Custom")?;
+            require_present(
+                tls,
+                "CertificateProviderClass",
+                "CertificateProviderType is Custom",
+            )
+        }
+        other => Err(one_of_message(
+            "CertificateProviderType",
+            other,
+            &CERTIFICATE_PROVIDER_TYPES,
+        )),
+    }
+}
+
+/// `S3EncryptionConfiguration`: the mode is one EMR defines, and it carries what that
+/// mode needs — a KMS key for the KMS modes, a provider class and its jar for
+/// `CSE-Custom`.
+fn validate_s3_encryption(s3: &::serde_json::Map<String, ::serde_json::Value>) -> Result<(), String> {
+    let mode = required_string(s3, "EncryptionMode")?;
+    if !S3_ENCRYPTION_MODES.contains(&mode) {
+        return Err(one_of_message("EncryptionMode", mode, &S3_ENCRYPTION_MODES));
+    }
+    match mode {
+        "SSE-KMS" | "CSE-KMS" => {
+            require_present(s3, "AwsKmsKey", &format!("EncryptionMode is {mode}"))?;
+        }
+        "CSE-Custom" => {
+            require_present(s3, "EncryptionKeyProviderClass", "EncryptionMode is CSE-Custom")?;
+            require_present(s3, "S3Object", "EncryptionMode is CSE-Custom")?;
+        }
+        // SSE-S3 is managed by Amazon S3: it needs no key and no provider.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `LocalDiskEncryptionConfiguration`: the key-provider type is one EMR defines, and it
+/// carries what that type needs — a KMS key, or a provider class and its jar.
+fn validate_local_disk_encryption(
+    local: &::serde_json::Map<String, ::serde_json::Value>,
+) -> Result<(), String> {
+    let provider = required_string(local, "EncryptionKeyProviderType")?;
+    if !LOCAL_DISK_KEY_PROVIDER_TYPES.contains(&provider) {
+        return Err(one_of_message(
+            "EncryptionKeyProviderType",
+            provider,
+            &LOCAL_DISK_KEY_PROVIDER_TYPES,
+        ));
+    }
+    if provider == "AwsKms" {
+        require_present(local, "AwsKmsKey", "EncryptionKeyProviderType is AwsKms")?;
+    } else {
+        require_present(
+            local,
+            "EncryptionKeyProviderClass",
+            "EncryptionKeyProviderType is Custom",
+        )?;
+        require_present(local, "S3Object", "EncryptionKeyProviderType is Custom")?;
+    }
+    // `EnableEbsEncryption` is optional, but it is a flag when it is there.
+    flag(local, "EnableEbsEncryption")?;
+    Ok(())
+}
+
+/// `value` as a JSON object, or why it is not one.
+fn as_object<'a>(
+    value: &'a ::serde_json::Value,
+    member: &str,
+) -> Result<&'a ::serde_json::Map<String, ::serde_json::Value>, String> {
+    value
+        .as_object()
+        .ok_or_else(|| format!("{member} must be a JSON object."))
+}
+
+/// The object at `member`, which `because` makes mandatory.
+fn required_object<'a>(
+    parent: &'a ::serde_json::Map<String, ::serde_json::Value>,
+    member: &str,
+    because: &str,
+) -> Result<&'a ::serde_json::Map<String, ::serde_json::Value>, String> {
+    let value = parent
+        .get(member)
+        .ok_or_else(|| format!("{member} is required when {because}."))?;
+    as_object(value, member)
+}
+
+/// The non-empty string at `member`, which the section it sits in makes mandatory.
+fn required_string<'a>(
+    parent: &'a ::serde_json::Map<String, ::serde_json::Value>,
+    member: &str,
+) -> Result<&'a str, String> {
+    match parent.get(member) {
+        None => Err(format!("{member} is required.")),
+        Some(value) => value
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| format!("{member} must be a non-empty string.")),
+    }
+}
+
+/// A boolean member, absent meaning `false`. A non-boolean is a client error.
+fn flag(
+    parent: &::serde_json::Map<String, ::serde_json::Value>,
+    member: &str,
+) -> Result<bool, String> {
+    match parent.get(member) {
+        None | Some(::serde_json::Value::Null) => Ok(false),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("{member} must be true or false.")),
+    }
+}
+
+/// `member` must be there, and non-empty, because `because`.
+fn require_present(
+    parent: &::serde_json::Map<String, ::serde_json::Value>,
+    member: &str,
+    because: &str,
+) -> Result<(), String> {
+    let present = parent
+        .get(member)
+        .is_some_and(|value| value.as_str().is_some_and(|text| !text.is_empty()));
+    if present {
+        Ok(())
+    } else {
+        Err(format!(
+            "{member} is required, as a non-empty string, when {because}."
+        ))
+    }
+}
+
+/// Why `actual` is not one of the values EMR defines for `member`.
+fn one_of_message(member: &str, actual: &str, allowed: &[&str]) -> String {
+    format!(
+        "{member} '{actual}' is not valid; it must be one of {}.",
+        allowed.join(", ")
+    )
 }

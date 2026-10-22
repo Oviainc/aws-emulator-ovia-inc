@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEndpointGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEndpointGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEndpointGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one endpoint group under a listener and persists it in [`crate::state`], so
+//! the next `DescribeEndpointGroup` reports exactly what was stored. A listener holds at
+//! most one endpoint group per `EndpointGroupRegion`; a second create for a Region it
+//! already covers is `EndpointGroupAlreadyExistsException`, and a repeat of the SAME
+//! `IdempotencyToken` against the same listener replays the group that token minted.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +188,200 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEndpointGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEndpointGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEndpointGroup"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEndpointGroupErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Global Accelerator store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Everything that depends only on the request is checked before the store is
+        // touched, so a refused create writes nothing.
+        let invalid = |message: String| -> Self::Error {
+            CreateEndpointGroupErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // "An endpoint group is a collection of endpoints in one Amazon Web Services
+        // Region": a group with no Region names no collection.
+        if input.endpoint_group_region.is_empty() {
+            return Err(invalid(
+                "EndpointGroupRegion must name an Amazon Web Services Region".to_string(),
+            ));
+        }
+
+        let health_check_interval = input
+            .health_check_interval_seconds
+            .unwrap_or(crate::state::DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS);
+        if let Err(message) = crate::state::validate_health_check_interval(health_check_interval) {
+            return Err(invalid(message));
+        }
+
+        let port_overrides = match crate::state::port_overrides_to_pairs(
+            input.port_overrides.as_deref().unwrap_or(&[]),
+        ) {
+            Ok(pairs) => pairs,
+            Err(message) => return Err(invalid(message)),
+        };
+
+        let configurations = input.endpoint_configurations.as_deref().unwrap_or(&[]);
+        let endpoints = match crate::state::endpoints_from_configurations(configurations) {
+            Ok(endpoints) => endpoints,
+            Err(message) => return Err(invalid(message)),
+        };
+
+        let mut store = state.lock();
+
+        let Some(listener) = store.listeners.get(&input.listener_arn) else {
+            return Err(CreateEndpointGroupErrorModeled::ListenerNotFoundException(
+                ListenerNotFoundException {
+                    message: Some(crate::state::listener_not_found_message(
+                        &input.listener_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        let accelerator_arn = listener.accelerator_arn.clone();
+        let default_health_check_port = listener.default_health_check_port();
+        let group_arns = listener.endpoint_group_arns.clone();
+        if !store.accelerators.contains_key(&accelerator_arn) {
+            return Err(CreateEndpointGroupErrorModeled::AcceleratorNotFoundException(
+                AcceleratorNotFoundException {
+                    message: Some(crate::state::accelerator_not_found_message(
+                        &accelerator_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An `AttachmentArn` names the cross-account attachment that permits this
+        // endpoint. The attachment operations are not implemented in this emulator, so
+        // the store holds no attachment that could grant it and the permission the
+        // caller claims cannot be established: that is the modelled
+        // `AccessDeniedException`, not a silently dropped member. Raised after the
+        // listener and accelerator lookups, so a request that also names a resource the
+        // store does not hold still gets the not-found answer.
+        if let Some(endpoint) = configurations
+            .iter()
+            .find(|configuration| configuration.attachment_arn.is_some())
+        {
+            let attachment = endpoint.attachment_arn.clone().unwrap_or_default();
+            let endpoint_id = endpoint.endpoint_id.clone().unwrap_or_default();
+            return Err(CreateEndpointGroupErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(format!(
+                        "cross-account attachment {attachment} does not exist, so it grants no \
+                         permission to add endpoint {endpoint_id}"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The same token against the same listener is the same create request: replay
+        // the group it minted rather than minting a second one.
+        let token_key = crate::state::endpoint_group_idempotency_key(
+            &input.listener_arn,
+            &input.idempotency_token,
+        );
+        if let Some(minted) = store.idempotency.get(&token_key) {
+            if let Some(existing) = store.endpoint_groups.get(minted) {
+                return Ok(CreateEndpointGroupOutput {
+                    endpoint_group: Some(existing.to_wire()),
+                });
+            }
+        }
+
+        // "A listener can have only one endpoint group in a specific Region"
+        // (`CreateEndpointGroup$EndpointGroupRegion`).
+        if let Some(existing) = group_arns.iter().find(|arn| {
+            store
+                .endpoint_groups
+                .get(*arn)
+                .is_some_and(|group| group.endpoint_group_region == input.endpoint_group_region)
+        }) {
+            return Err(
+                CreateEndpointGroupErrorModeled::EndpointGroupAlreadyExistsException(
+                    EndpointGroupAlreadyExistsException {
+                        message: Some(format!(
+                            "endpoint group {existing} already covers Region {} for listener {}",
+                            input.endpoint_group_region, input.listener_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The per-accelerator quota bounds this store, the same way the per-account
+        // accelerator quota bounds the accelerators: an accelerator's endpoint groups
+        // are counted across every one of its listeners.
+        if store.endpoint_group_count(&accelerator_arn)
+            >= crate::state::MAX_ENDPOINT_GROUPS_PER_ACCELERATOR
+        {
+            return Err(CreateEndpointGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Accelerator {accelerator_arn} already holds the maximum of {} endpoint \
+                         groups.",
+                        crate::state::MAX_ENDPOINT_GROUPS_PER_ACCELERATOR
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Past every refusal, so a refused create still writes nothing: stale
+        // idempotency records are released as this one's is added.
+        store.prune_idempotency();
+
+        // "The default value is TCP" (`EndpointGroup$HealthCheckProtocol`); the enum's
+        // own values are refused by the boundary validator before this handler runs.
+        let health_check_protocol = input
+            .health_check_protocol
+            .unwrap_or_else(|| crate::state::HEALTH_CHECK_PROTOCOL_TCP.to_string());
+        let uuid = store.mint_uuid();
+        let arn = crate::state::mint_endpoint_group_arn(&input.listener_arn, &uuid);
+        let record = crate::state::StoredEndpointGroup {
+            arn: arn.clone(),
+            listener_arn: input.listener_arn.clone(),
+            endpoint_group_region: input.endpoint_group_region.clone(),
+            endpoints,
+            // "The default value is 100" (`CreateEndpointGroup$TrafficDialPercentage`).
+            traffic_dial_percentage: input
+                .traffic_dial_percentage
+                .unwrap_or(crate::state::DEFAULT_TRAFFIC_DIAL_PERCENTAGE),
+            health_check_port: input.health_check_port.or(default_health_check_port),
+            health_check_path: crate::state::resolve_health_check_path(
+                input.health_check_path,
+                &health_check_protocol,
+            ),
+            health_check_protocol,
+            health_check_interval_seconds: health_check_interval,
+            // "The default value is 3" (`CreateEndpointGroup$ThresholdCount`).
+            threshold_count: input
+                .threshold_count
+                .unwrap_or(crate::state::DEFAULT_THRESHOLD_COUNT),
+            port_overrides,
+        };
+        let endpoint_group = record.to_wire();
+
+        if let Some(parent) = store.listeners.get_mut(&input.listener_arn) {
+            parent.endpoint_group_arns.push(arn.clone());
+        }
+        store.idempotency.insert(token_key, arn.clone());
+        store.endpoint_groups.insert(arn, record);
+
+        Ok(CreateEndpointGroupOutput {
+            endpoint_group: Some(endpoint_group),
+        })
     }
 }

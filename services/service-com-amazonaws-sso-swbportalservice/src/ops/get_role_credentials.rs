@@ -172,14 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .visible_account(session, &input.account_id)
                 .is_some_and(|account| account.roles.contains(&input.role_name)),
             None => {
+                // One gate, one refusal (see `crate::state::unauthorized_session`).
                 return Err(GetRoleCredentialsErrorModeled::UnauthorizedException(
-                    UnauthorizedException {
-                        message: Some(
-                            "the access token presented in x-amz-sso_bearer_token is not a \
-                             valid IAM Identity Center sign-in session"
-                                .to_string(),
-                        ),
-                    },
+                    crate::state::unauthorized_session(),
                 )
                 .into());
             }

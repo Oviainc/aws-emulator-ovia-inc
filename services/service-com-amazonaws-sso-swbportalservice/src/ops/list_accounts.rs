@@ -171,13 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting only: a listing writes nothing, so an expired session is simply not
         // usable here rather than being swept.
         let Some(session) = state.session(&input.access_token, now) else {
-            return Err(ListAccountsErrorModeled::UnauthorizedException(UnauthorizedException {
-                message: Some(
-                    "the access token presented in x-amz-sso_bearer_token is not a valid \
-                     IAM Identity Center sign-in session"
-                        .to_string(),
-                ),
-            })
+            // One gate, one refusal: the message comes from `crate::state`, so it is the
+            // same constant every portal operation answers with.
+            return Err(ListAccountsErrorModeled::UnauthorizedException(
+                crate::state::unauthorized_session(),
+            )
             .into());
         };
 
