@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeOAuth2TokenWithIAM
+//! Acceptance of the token is this operation's own, not the generic constraint walk's:
+//! the model documents that "revoking an already-revoked, expired, or otherwise invalid
+//! token still returns 200 OK with an empty body" and that only the refresh-token kind
+//! is accepted, so a value outside the revocation shape — the empty string, an `ASOA`
+//! access token, anything else — revokes nothing and is still a success.
 //!
 //! ## Shape of an operation
 //!
@@ -159,16 +164,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // "Only the refresh_token type is accepted" is `RevocationToken`'s own
-        // pattern `^ASOR[A-Za-z0-9+/=_\-]+$`, which the boundary validator has
-        // already enforced, so an access token never reaches here.
+        // "Only the refresh_token type is accepted" is `RevocationToken`'s own pattern
+        // `^ASOR[A-Za-z0-9+/=_\-]+$` — but acceptance of this member belongs to this
+        // operation, not to the generic constraint walk (the member carries
+        // `skip_validation`), because revocation is idempotent-safe: a value outside
+        // that shape, the empty string included, revokes nothing and is still a 200.
+        // The shape test runs first, so such a value never probes the store at all.
         //
         // Revoking invalidates "the entire token chain", so every token minted
         // from this refresh token is revoked with it. Whether anything was
         // revoked changes NOTHING about the answer: "revoking an
         // already-revoked, expired, or otherwise invalid token still returns
         // 200 OK with an empty body".
-        state.lock().revoke_token_chain(&input.token);
+        if crate::state::is_revocation_token(&input.token) {
+            state.lock().revoke_token_chain(&input.token);
+        }
         Ok(RevokeOAuth2TokenWithIAMOutput {})
     }
 }

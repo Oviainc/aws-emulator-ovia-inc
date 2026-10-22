@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a connector: derives its `Type` from the request, stores a full record keyed by a
+//! freshly minted ARN, and answers that ARN. The connector starts `CREATING`; the clock
+//! owes it `ACTIVE` (see [`crate::state::TRANSITION_SPAN`]).
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +188,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnector"))
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        store.settle(now);
+
+        // The resource-defining inputs of this call, so a retry carrying the same
+        // `ClientToken` can be checked to be the same request.
+        let request = crate::state::connector_request(
+            &input.certificate_authority_arn,
+            input.mobile_device_management.as_ref(),
+            input.vpc_endpoint_id.as_deref(),
+        );
+
+        // `ClientToken` is how the caller says "this is a retry, not a second connector":
+        // within its five-minute window the same token answers with the connector it
+        // already created rather than minting another one. If that connector has since been
+        // deleted there is nothing to answer with, so the call falls through and creates one.
+        if let Some(existing) = store.connector_for_token(input.client_token.as_deref()) {
+            if store.connectors.contains_key(&existing.arn) {
+                // Same token, different request: the caller is not retrying the call this
+                // token stands for, so answering with that connector would answer for a
+                // request nobody made.
+                if existing.request != request {
+                    return Err(CreateConnectorErrorModeled::ConflictException(ConflictException {
+                        message: format!(
+                            "The ClientToken was already used to create connector {} with \
+                             different parameters",
+                            existing.arn
+                        ),
+                        resource_id: existing.arn,
+                        resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
+                    })
+                    .into());
+                }
+                return Ok(CreateConnectorOutput {
+                    connector_arn: Some(existing.arn),
+                });
+            }
+        }
+
+        // The emulator's own ceiling, which the real service expresses as a service quota
+        // and this operation models `ServiceQuotaExceededException` for.
+        if store.connectors.len() >= crate::state::MAX_CONNECTORS {
+            return Err(CreateConnectorErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The maximum number of connectors ({}) for this account in {region} has been reached",
+                        crate::state::MAX_CONNECTORS
+                    ),
+                    resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                    quota_code: crate::state::QUOTA_CODE_CONNECTORS.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // `Tags` carries no modelled `@length`, so the per-resource tag limit is enforced
+        // here, on the request's own entry count and BEFORE anything is collected, so an
+        // oversized map costs nothing and duplicate keys cannot collapse under the limit.
+        let tag_count = input.tags.as_ref().map(|tags| tags.len()).unwrap_or_default();
+        if tag_count > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateConnectorErrorModeled::ValidationException(ValidationException {
+                message: format!(
+                    "Tags carries {tag_count} entries; a resource may have at most {}",
+                    crate::state::MAX_TAGS_PER_RESOURCE
+                ),
+                reason: None,
+            })
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+
+        let connector_id = crate::state::new_uuid();
+        let arn = crate::state::connector_arn(&region, &connector_id);
+        let endpoint = crate::state::connector_endpoint(&region, &connector_id);
+
+        // `Type` follows from the request: absent `MobileDeviceManagement` means a
+        // general-purpose connector, an `IntuneConfiguration` means an Intune one — and only
+        // an Intune connector publishes OIDC parameters.
+        let (connector_type, open_id_configuration) = match input.mobile_device_management.as_ref() {
+            Some(MobileDeviceManagement::Intune(intune)) => (
+                crate::state::TYPE_INTUNE,
+                Some(crate::state::open_id_configuration(&arn, &endpoint, intune)),
+            ),
+            None => (crate::state::TYPE_GENERAL_PURPOSE, None),
+        };
+
+        let record = crate::state::StoredConnector {
+            arn: arn.clone(),
+            certificate_authority_arn: input.certificate_authority_arn,
+            connector_type: connector_type.to_string(),
+            mobile_device_management: input.mobile_device_management,
+            open_id_configuration,
+            vpc_endpoint_id: input.vpc_endpoint_id,
+            // A new connector is not serving yet: the clock owes it ACTIVE.
+            status: crate::state::STATUS_CREATING.to_string(),
+            // `StatusReason` says why creation FAILED, so a connector that is still being
+            // created carries none.
+            status_reason: None,
+            pending: Some(crate::state::PendingTransition {
+                to: crate::state::STATUS_ACTIVE.to_string(),
+                due_at: now + crate::state::TRANSITION_SPAN,
+            }),
+            endpoint,
+            created_at: now,
+            updated_at: now,
+            tags,
+            challenges: ::std::collections::BTreeMap::new(),
+        };
+        store.connectors.insert(arn.clone(), record);
+
+        if let Some(token) = input.client_token {
+            store.connector_tokens.insert(
+                token,
+                crate::state::IdempotencyRecord {
+                    arn: arn.clone(),
+                    created_at: now,
+                    request,
+                },
+            );
+        }
+
+        // `arn` is the key the record was just stored under, so this answers exactly what a
+        // later GetConnector / ListConnectors reads.
+        Ok(CreateConnectorOutput {
+            connector_arn: Some(arn),
+        })
     }
+}
+
+/// The store is unreachable — a server-side fault, which this operation models as
+/// `InternalServerException` (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> CreateConnectorError {
+    CreateConnectorErrorModeled::InternalServerException(InternalServerException {
+        message: "the Connector for SCEP connector store is unavailable".to_string(),
+    })
+    .into()
 }

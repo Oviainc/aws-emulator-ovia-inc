@@ -24,12 +24,12 @@ tracing = { workspace = true }
 # Encodes a listing's continuation key as the opaque `nextToken` the pagination
 # handlers hand out (and decodes it on resume).
 hex = { workspace = true }
+# Mints an `accessPreviewId`: the 128 unguessable bits a version-4 UUID carries are
+# taken from a digest over the process's entropy, a counter and the clock.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
 
 [lints]
 workspace = true

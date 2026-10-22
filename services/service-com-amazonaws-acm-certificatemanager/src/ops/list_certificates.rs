@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCertificates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCertificates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCertificates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: enumerates the stored certificate records as `CertificateSummary`
+//! values, honouring `CertificateStatuses`, `CertificateKeyPairOrigins` and
+//! `Includes` filtering — including the default key-algorithm and key-pair-origin
+//! filters the operation documents for a request that names neither —
+//! `SortBy`/`SortOrder` ordering, and `MaxItems` paging with a `NextToken` that
+//! resumes where the previous page stopped.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +162,294 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCertificates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCertificatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCertificates"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCertificatesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("the acm certificate store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // The sort members are documented as a pair: "If you specify SortBy, you must
+        // also specify SortOrder" (`ListCertificatesRequest$SortBy`) and "If you
+        // specify SortOrder, you must also specify SortBy"
+        // (`ListCertificatesRequest$SortOrder`). Either alone names no ordering — a
+        // key with no direction, or a direction with no key — so it is refused rather
+        // than completed with an order the caller did not ask for.
+        if input.sort_by.is_some() != input.sort_order.is_some() {
+            let missing = if input.sort_by.is_none() {
+                "SortBy"
+            } else {
+                "SortOrder"
+            };
+            return Err(ListCertificatesErrorModeled::InvalidArgsException(
+                InvalidArgsException {
+                    message: Some(format!(
+                        "SortBy and SortOrder must be specified together; {missing} is missing"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let resume_after = input
+            .next_token
+            .as_deref()
+            .map(decode_next_token)
+            .transpose()?;
+
+        let store = state.lock();
+
+        // The order this response is built in: `CREATED_AT` with the ARN as the
+        // tie-break when the request asked for it, else the store's own ARN order.
+        // The same value decides where a `NextToken` resumes, so the order a page is
+        // cut in and the order it is resumed in cannot drift apart.
+        let order = if input.sort_by.as_deref() == Some(crate::state::SORT_BY_CREATED_AT) {
+            PageOrder::CreatedAt {
+                descending: input.sort_order.as_deref()
+                    == Some(crate::state::SORT_ORDER_DESCENDING),
+            }
+        } else {
+            PageOrder::Arn
+        };
+
+        // Every live certificate the filters keep, in that order.
+        let mut matching: Vec<&crate::state::Certificate> = store
+            .certificates
+            .values()
+            .filter(|cert| matches_filters(cert, &input))
+            .collect();
+        if let PageOrder::CreatedAt { descending } = order {
+            // Ties on the creation instant keep the ARN order, so one page boundary
+            // resolves the same way on every call.
+            matching.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.arn.cmp(&b.arn))
+            });
+            if descending {
+                matching.reverse();
+            }
+        }
+
+        // `NextToken` carries the position of the last certificate the previous page
+        // emitted, so the next page starts at the first certificate that sorts
+        // strictly after it IN THIS ORDER — whether or not that certificate is still
+        // there. A caller paging while certificates are deleted therefore keeps the
+        // tail instead of losing it.
+        let start = match resume_after.as_ref() {
+            None => 0,
+            Some(cursor) => matching
+                .iter()
+                .position(|cert| order.is_after(cursor, cert))
+                .unwrap_or(matching.len()),
+        };
+        let page = &matching[start.min(matching.len())..];
+
+        // Page size: the caller's `MaxItems`, else the server-side default. Both are
+        // bounded by the model's own `MaxItems` maximum, so one request can never
+        // serialise the whole store however large it has grown.
+        let limit = input
+            .max_items
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+        let emitted = page.len().min(limit);
+
+        let summaries: Vec<CertificateSummary> = page[..emitted]
+            .iter()
+            .copied()
+            .map(crate::state::certificate_summary)
+            .collect();
+        // A token is issued only when this page stopped short of the matches, and it
+        // names the last certificate the page emitted.
+        let next_token = if emitted < page.len() {
+            page[..emitted].last().map(|cert| encode_next_token(cert))
+        } else {
+            None
+        };
+
+        Ok(ListCertificatesOutput {
+            next_token,
+            certificate_summary_list: Some(summaries),
+        })
     }
+}
+
+/// The most summaries one `ListCertificates` response carries, which is also the
+/// page size used when the caller names no `MaxItems`: the maximum the model allows
+/// for that member (`MaxItems`, `range 1..1000`).
+const MAX_PAGE_SIZE: usize = 1000;
+
+/// Whether a certificate passes every filter the request set.
+///
+/// A filter the request sets keeps a certificate only when the certificate's own
+/// stored value is one of the requested ones. A filter the request omits keeps
+/// everything, EXCEPT where the operation documents a default filter — the key
+/// algorithm and the key-pair origin both have one, so an omitted filter there falls
+/// back to the documented default set rather than to "everything".
+fn matches_filters(cert: &crate::state::Certificate, input: &ListCertificatesInput) -> bool {
+    let includes = input.includes.as_ref();
+
+    // Status has no documented default filter: a request that names no statuses lists
+    // a certificate in any status.
+    let excluded_by_status = input
+        .certificate_statuses
+        .as_ref()
+        .is_some_and(|statuses| !statuses.contains(&cert.status));
+    let excluded_by_origin = !selects(
+        input.certificate_key_pair_origins.as_deref(),
+        crate::state::DEFAULT_LISTED_KEY_PAIR_ORIGINS,
+        &cert.key_pair_origin,
+    );
+    let excluded_by_key_type = !selects(
+        includes.and_then(|includes| includes.key_types.as_deref()),
+        crate::state::DEFAULT_LISTED_KEY_ALGORITHMS,
+        &cert.key_algorithm,
+    );
+    if excluded_by_status || excluded_by_origin || excluded_by_key_type {
+        return false;
+    }
+
+    let Some(includes) = includes else {
+        return true;
+    };
+    let excluded_by_export = includes
+        .export_option
+        .as_ref()
+        .is_some_and(|wanted| *wanted != crate::state::export_option(cert));
+    let excluded_by_manager = includes
+        .managed_by
+        .as_ref()
+        .is_some_and(|wanted| cert.managed_by.as_ref() != Some(wanted));
+    // "Specify one or more KeyUsage extension values": a certificate is kept when it
+    // carries one of the named extensions. A certificate's X.509 key-usage extensions
+    // exist only once it has been issued, so a pending certificate carries none and
+    // any such filter keeps nothing — but that answer comes from the record, not from
+    // the filter being unimplemented.
+    let excluded_by_usage = includes.key_usage.as_ref().is_some_and(|wanted| {
+        !wanted.iter().any(|name| cert.key_usages.contains(name))
+    }) || includes.extended_key_usage.as_ref().is_some_and(|wanted| {
+        !wanted
+            .iter()
+            .any(|name| cert.extended_key_usages.contains(name))
+    });
+
+    !(excluded_by_export || excluded_by_manager || excluded_by_usage)
+}
+
+/// Whether a filter keeps `value`: the requested values when the request set the
+/// filter, else the values the operation documents as its default filter.
+fn selects(requested: Option<&[String]>, default: &[&str], value: &str) -> bool {
+    match requested {
+        Some(values) => values.iter().any(|requested| requested == value),
+        None => default.contains(&value),
+    }
+}
+
+/// The order one `ListCertificates` response is built in, and therefore the order a
+/// `NextToken` from it resumes against.
+///
+/// A cursor compared against the wrong key would land before or after the position
+/// the page actually stopped at, repeating or skipping certificates, so the two are
+/// decided once, together.
+#[derive(Debug, Clone, Copy)]
+enum PageOrder {
+    /// The store's own order: by certificate ARN, ascending. This is the order a
+    /// request that names no `SortBy` is answered in, and `SortOrder` cannot be given
+    /// without `SortBy`, so it has no descending form.
+    Arn,
+    /// `SortBy=CREATED_AT`, with the ARN as the tie-break so equal instants order the
+    /// same way on every call.
+    CreatedAt { descending: bool },
+}
+
+impl PageOrder {
+    /// Whether `cert` sorts strictly after `cursor` in this order, i.e. whether it
+    /// belongs on the page that resumes from it.
+    fn is_after(self, cursor: &Cursor, cert: &crate::state::Certificate) -> bool {
+        match self {
+            Self::Arn => cert.arn > cursor.arn,
+            Self::CreatedAt { descending } => {
+                let here = (cursor.created_at, cursor.arn.as_str());
+                let there = (cert.created_at, cert.arn.as_str());
+                if descending {
+                    there < here
+                } else {
+                    there > here
+                }
+            }
+        }
+    }
+}
+
+/// Where a page stopped: the position of the last certificate it emitted, which is
+/// everything the next page needs to resume even if that certificate is gone.
+///
+/// Both keys are carried because [`PageOrder`] has two forms: the ARN order uses the
+/// ARN alone, `CREATED_AT` uses the instant with the ARN as the tie-break.
+#[derive(Debug)]
+struct Cursor {
+    arn: String,
+    created_at: std::time::SystemTime,
+}
+
+/// The byte that separates a token's two keys. Outside the `Arn` pattern
+/// (`^arn:[\w+=/,.@-]+:acm:...`), so it cannot occur inside the ARN it follows.
+const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// The opaque `NextToken` for the last certificate a page emitted.
+///
+/// Hex-encoded so the token is opaque to the caller and satisfies the member's
+/// `^[\u0009\u000A\u000D\u0020-\u00FF]*$` pattern whatever the ARN contains.
+fn encode_next_token(cert: &crate::state::Certificate) -> String {
+    let since_epoch = cert
+        .created_at
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    hex::encode(format!(
+        "{}{CURSOR_SEPARATOR}{}.{:09}",
+        cert.arn,
+        since_epoch.as_secs(),
+        since_epoch.subsec_nanos()
+    ))
+}
+
+/// The [`Cursor`] inside a `NextToken`, or `InvalidArgsException` when the token did
+/// not come from [`encode_next_token`].
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so no value read
+/// out of it may panic the handler. In particular the instant is built with
+/// `checked_add`, since `SystemTime + Duration` panics on overflow and the seconds
+/// field of a forged token can name any `u64`.
+fn decode_next_token(token: &str) -> Result<Cursor, ListCertificatesError> {
+    let invalid = || {
+        ListCertificatesErrorModeled::InvalidArgsException(InvalidArgsException {
+            message: Some("NextToken is not a token this service issued".into()),
+        })
+    };
+    let bytes = hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    // A token this service issued always decodes to a certificate ARN and the
+    // creation instant of that certificate. Checking both here refuses a
+    // forged-but-well-encoded token instead of silently answering an empty page.
+    let (arn, created_at) = decoded.split_once(CURSOR_SEPARATOR).ok_or_else(invalid)?;
+    if crate::state::certificate_id_from_arn(arn).is_none() {
+        return Err(invalid().into());
+    }
+    let (secs, nanos) = created_at.split_once('.').ok_or_else(invalid)?;
+    let secs: u64 = secs.parse().map_err(|_| invalid())?;
+    let nanos: u32 = nanos.parse().map_err(|_| invalid())?;
+    if nanos >= 1_000_000_000 {
+        return Err(invalid().into());
+    }
+    let created_at = std::time::SystemTime::UNIX_EPOCH
+        .checked_add(std::time::Duration::new(secs, nanos))
+        .ok_or_else(invalid)?;
+    Ok(Cursor {
+        arn: arn.to_string(),
+        created_at,
+    })
 }

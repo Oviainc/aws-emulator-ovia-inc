@@ -3,7 +3,8 @@
 //! Engine state for the com-amazonaws-ecr-amazonec2containerregistry-v20150921 service.
 //!
 //! One registry (this emulator's account) holding repositories by name, each holding
-//! its images by digest plus a tag index. Everything an operation answers with is
+//! its images by digest plus a tag index, plus the registry-wide settings a caller can
+//! configure (today: its replication rules). Everything an operation answers with is
 //! derived from here; nothing is re-synthesised from a request.
 
 use std::collections::btree_map::Entry;
@@ -11,9 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    EncryptionConfiguration, ImageDetail, ImageIdentifier, ImageScanningConfiguration,
-    ImageTagMutabilityExclusionFilter, Repository, RepositoryScanningConfiguration,
-    SigningConfiguration, Tag,
+    EncryptionConfiguration, EncryptionConfigurationForRepositoryCreationTemplate, ImageDetail,
+    ImageIdentifier, ImageScanningConfiguration, ImageTagMutabilityExclusionFilter,
+    ReplicationConfiguration, ReplicationRule, Repository, RepositoryCreationTemplate,
+    RepositoryScanningConfiguration, SigningConfiguration, Tag,
 };
 
 /// `CreateRepository`'s documented default: "If this parameter is omitted, the default
@@ -53,6 +55,11 @@ pub const MAX_IMAGES_PER_REPOSITORY: usize = 1_000;
 /// See [`MAX_REPOSITORIES`]. This one bounds `tag_index`, which grows by one entry per
 /// push that introduces a tag the repository did not carry.
 pub const MAX_TAGS_PER_REPOSITORY: usize = 10_000;
+
+/// See [`MAX_REPOSITORIES`]. This one bounds `creation_templates`, which grows by one
+/// entry per `CreateRepositoryCreationTemplate` that introduces a new namespace prefix;
+/// past it the create is refused with the `LimitExceededException` that operation models.
+pub const MAX_REPOSITORY_CREATION_TEMPLATES: usize = 1_000;
 
 /// See [`MAX_REPOSITORIES`]. This one bounds `pull_time_update_exclusions`, which grows
 /// by one entry per `RegisterPullTimeUpdateExclusion` naming a principal the registry
@@ -379,12 +386,78 @@ impl Repo {
     }
 }
 
+/// One stored repository creation template: the settings a later repository creation in
+/// this namespace prefix is to be given, exactly as the create or the update left them.
+#[derive(Debug, Clone)]
+pub struct CreationTemplate {
+    pub prefix: String,
+    pub description: Option<String>,
+    pub encryption_config: Option<EncryptionConfigurationForRepositoryCreationTemplate>,
+    pub resource_tags: Vec<Tag>,
+    pub image_tag_mutability: String,
+    pub image_tag_mutability_exclusion_filters: Vec<ImageTagMutabilityExclusionFilter>,
+    pub repository_policy: Option<String>,
+    pub lifecycle_policy: Option<String>,
+    pub applied_for: Vec<String>,
+    pub custom_role_arn: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl CreationTemplate {
+    /// The `RepositoryCreationTemplate` every operation that reports this template
+    /// returns, derived from the stored record alone.
+    pub fn to_template(&self) -> RepositoryCreationTemplate {
+        RepositoryCreationTemplate {
+            prefix: Some(self.prefix.clone()),
+            description: self.description.clone(),
+            encryption_configuration: self.encryption_config.clone(),
+            // An empty list is reported as an absent member: nothing was applied.
+            resource_tags: if self.resource_tags.is_empty() {
+                None
+            } else {
+                Some(self.resource_tags.clone())
+            },
+            image_tag_mutability: Some(self.image_tag_mutability.clone()),
+            image_tag_mutability_exclusion_filters: if self
+                .image_tag_mutability_exclusion_filters
+                .is_empty()
+            {
+                None
+            } else {
+                Some(self.image_tag_mutability_exclusion_filters.clone())
+            },
+            repository_policy: self.repository_policy.clone(),
+            lifecycle_policy: self.lifecycle_policy.clone(),
+            applied_for: Some(self.applied_for.clone()),
+            custom_role_arn: self.custom_role_arn.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-ecr-amazonec2containerregistry-v20150921. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// Repositories by name. A `BTreeMap` so every listing — and therefore every
     /// pagination token — has one deterministic order.
     pub repositories: BTreeMap<String, Repo>,
+    /// Repository creation templates by namespace prefix, keyed the way
+    /// [`normalize_prefix`] spells that prefix. A `BTreeMap` for the same reason as
+    /// `repositories`: one deterministic listing order, so a pagination token means the
+    /// same thing on the next call.
+    pub creation_templates: BTreeMap<String, CreationTemplate>,
+    /// The registry's replication rules, exactly as the last
+    /// `PutReplicationConfiguration` persisted them, in the order that call listed
+    /// them. Empty until one is made: a registry nobody has configured replication for
+    /// reports an empty rule list, which is what `DescribeRegistry` answers with.
+    ///
+    /// Registry-wide, like the single registry this store models: a put made against
+    /// one Region's endpoint is the configuration every later read reports, while the
+    /// "a registry cannot replicate to itself" refusal is evaluated per call, against
+    /// the Region that call was made against.
+    pub replication_rules: Vec<ReplicationRule>,
     /// The registry permissions policy, as `PutRegistryPolicy` stored it: the document
     /// text exactly as it arrived, so a read returns it byte for byte. `None` is "this
     /// registry has no associated registry policy", which the registry-policy read and
@@ -419,6 +492,27 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
             .get_mut(name)
             .ok_or_else(|| Fault::RepositoryNotFound(repository_not_found_message(name)))
     }
+
+    /// The registry's replication configuration: the stored rules, which is the empty
+    /// list before any `PutReplicationConfiguration` call. ECR reports the
+    /// configuration either way — an unconfigured registry has no rules rather than no
+    /// configuration.
+    pub fn replication_configuration(&self) -> ReplicationConfiguration {
+        ReplicationConfiguration {
+            rules: self.replication_rules.clone(),
+        }
+    }
+}
+
+/// The identity of a repository creation template's namespace prefix.
+///
+/// `Prefix`'s own documentation: "There is always an assumed / applied to the end of the
+/// prefix. If you specify ecr-public as the prefix, Amazon ECR treats that as
+/// ecr-public/." That assumed separator is a single one, so exactly one trailing slash
+/// is not part of the namespace's identity: `prod` and `prod/` name the same template
+/// and the stored record spells it one way.
+pub fn normalize_prefix(prefix: &str) -> String {
+    prefix.strip_suffix('/').unwrap_or(prefix).to_string()
 }
 
 /// The wording ECR uses when a repository does not exist.

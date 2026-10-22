@@ -108,6 +108,15 @@ pub struct Channel {
     pub reset_at: Option<::aws_smithy_types::DateTime>,
     pub etag: String,
     pub tags: HashMap<String, String>,
+    /// The resource policy attached to this channel by `PutChannelPolicy`, or `None`
+    /// while none has ever been attached.
+    ///
+    /// The policy is a SUB-RESOURCE of the channel, not one of the channel's own
+    /// members: no `Channel*` shape in the model carries it, so it takes no part in the
+    /// channel's ETag, and because it is stored inside the channel record it disappears
+    /// with the channel. `None` is what makes `GetChannelPolicy` on a never-attached
+    /// policy a 404 rather than an empty success.
+    pub policy: Option<String>,
     pub origin_endpoints: BTreeMap<String, OriginEndpoint>,
 }
 
@@ -403,6 +412,21 @@ pub fn tag_fingerprint(tags: &HashMap<String, String>) -> String {
         .join("\u{1f}")
 }
 
+/// Whether `policy` is a policy document this service accepts.
+///
+/// A resource policy is an IAM policy document: a JSON OBJECT carrying a `Statement`.
+/// Anything else — text that is not JSON, a JSON array or scalar, an object with no
+/// `Statement` — is the model's `INVALID_POLICY` validation case, which is why the
+/// service's `ValidationExceptionType` enum names it. Shared by the policy writers
+/// (`PutChannelPolicy`, and `PutOriginEndpointPolicy` when it is implemented) so both
+/// decide validity the same way.
+pub fn is_policy_document(policy: &str) -> bool {
+    let Ok(::serde_json::Value::Object(document)) = ::serde_json::from_str(policy) else {
+        return false;
+    };
+    document.contains_key("Statement")
+}
+
 /// The pagination token for a list that stopped after `last` — opaque to the caller,
 /// and decoded by [`page_resume_after`].
 pub fn page_token(last: &str) -> String {
@@ -449,6 +473,33 @@ mod tests {
             page_resume_after("not-a-token").is_none(),
             "a non-hex token must be rejected, not silently treated as a name"
         );
+    }
+
+    #[test]
+    fn a_policy_document_is_a_json_object_with_a_statement() {
+        for accepted in [
+            r#"{"Statement":[]}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow"}]}"#,
+            "{\n  \"Statement\": {\"Effect\": \"Deny\"}\n}",
+        ] {
+            assert!(
+                is_policy_document(accepted),
+                "case {accepted:?}: expected a valid policy document"
+            );
+        }
+        for refused in [
+            "",
+            "not json at all",
+            r#"{"Statement":[]"#,
+            r#"[{"Statement":[]}]"#,
+            r#""{\"Statement\":[]}""#,
+            r#"{"Version":"2012-10-17"}"#,
+        ] {
+            assert!(
+                !is_policy_document(refused),
+                "case {refused:?}: expected to be refused as a policy document"
+            );
+        }
     }
 
     #[test]

@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DnsConfig, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties, Instance, Namespace,
-    NamespaceProperties, Operation, Service,
+    NamespaceProperties, Operation, Service, Tag,
 };
 
 /// The region an ARN carries when the request is unsigned, matching the region a
@@ -195,6 +195,22 @@ pub struct OperationRecord {
     pub error_message: Option<String>,
     /// `OperationTargetType` -> resource id (`NAMESPACE`, `SERVICE`, `INSTANCE`).
     pub targets: HashMap<String, String>,
+}
+
+/// A resource one of this service's tagging operations addresses, identified by the
+/// record that holds its tags.
+///
+/// Cloud Map's taggable resources are its namespaces and its services (`Tag` is "a
+/// custom key-value pair that's associated with a resource", and both carry a `Tags`
+/// member on creation), and `TagResource`, `UntagResource` and `ListTagsForResource`
+/// all address them the same way — by `ResourceARN` — so one resolution serves all
+/// three rather than each handler knowing the resource tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// The namespace with this `Id`.
+    Namespace(String),
+    /// The service with this `Id`.
+    Service(String),
 }
 
 /// Which call an idempotency token was first seen on, so one client's
@@ -386,6 +402,48 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
             .map(|service| service.id.clone())
     }
 
+    /// The stored resource an `AmazonResourceName` names, or `None` when no resource
+    /// in this store carries that ARN.
+    ///
+    /// The tagging operations are documented against a `ResourceARN`, so the match is
+    /// on the ARN the create minted — a resource id is not an ARN and names nothing
+    /// here.
+    pub fn resolve_tagged_resource(&self, resource_arn: &str) -> Option<TaggedResource> {
+        if let Some(namespace) = self
+            .namespaces
+            .values()
+            .find(|namespace| namespace.arn == resource_arn)
+        {
+            return Some(TaggedResource::Namespace(namespace.id.clone()));
+        }
+        self.services
+            .values()
+            .find(|service| service.arn == resource_arn)
+            .map(|service| TaggedResource::Service(service.id.clone()))
+    }
+
+    /// The tags stored on a resolved resource, in the order they were first set.
+    pub fn tags(&self, resource: &TaggedResource) -> Option<&[(String, String)]> {
+        match resource {
+            TaggedResource::Namespace(id) => {
+                self.namespaces.get(id).map(|record| record.tags.as_slice())
+            }
+            TaggedResource::Service(id) => {
+                self.services.get(id).map(|record| record.tags.as_slice())
+            }
+        }
+    }
+
+    /// The tags stored on a resolved resource, for a tagging call to write through.
+    pub fn tags_mut(&mut self, resource: &TaggedResource) -> Option<&mut Vec<(String, String)>> {
+        match resource {
+            TaggedResource::Namespace(id) => {
+                self.namespaces.get_mut(id).map(|record| &mut record.tags)
+            }
+            TaggedResource::Service(id) => self.services.get_mut(id).map(|record| &mut record.tags),
+        }
+    }
+
     /// The namespace `DiscoverInstances`' `NamespaceName` names.
     ///
     /// That member is documented as the namespace's `HttpName`, which "in most cases"
@@ -481,6 +539,31 @@ pub fn shuffle_key(nonce: u128, instance_id: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// The separator between a `NextToken`'s scope and its cursor.
+///
+/// A unit separator cannot appear in a resource id or in an operation name, so splitting
+/// a decoded token on it recovers exactly the two fields that were encoded.
+const NEXT_TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// An opaque `NextToken` that resumes a paginated read after `cursor`.
+///
+/// `scope` is the operation that issued it, so a token minted by one paginated read is
+/// not honoured as a page boundary by another. The payload is hex-encoded because the
+/// member is modelled as an opaque string the caller only ever echoes back.
+pub fn encode_next_token(scope: &str, cursor: &str) -> String {
+    ::hex::encode(format!("{scope}{NEXT_TOKEN_SEPARATOR}{cursor}"))
+}
+
+/// The cursor a `NextToken` carries for `scope`, or `None` when the token is not one
+/// this operation issued — which covers a token that is not hex, is not UTF-8, carries
+/// no separator, or names another operation's scope. A forged token is therefore
+/// refused rather than silently honoured as "start from the beginning".
+pub fn decode_next_token(scope: &str, token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let (encoded_scope, cursor) = decoded.split_once(NEXT_TOKEN_SEPARATOR)?;
+    (encoded_scope == scope).then(|| cursor.to_string())
+}
+
 /// A stored instant as the wire `timestamp` the modelled shapes carry.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     match at.duration_since(SystemTime::UNIX_EPOCH) {
@@ -538,6 +621,43 @@ pub fn service_view(record: &ServiceRecord) -> Service {
         creator_request_id: record.creator_request_id.clone(),
         created_by_account: None,
     }
+}
+
+/// The modelled `Tag` list for a stored tag list, in the stored order.
+pub fn tag_views(tags: &[(String, String)]) -> Vec<Tag> {
+    tags.iter()
+        .map(|(key, value)| Tag {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// Apply a `TagList` onto a resource's stored tags, returning the result.
+///
+/// A tag is "a custom key-value pair", so a key identifies at most one tag: setting a
+/// key that is already stored REPLACES its value in place (leaving every other tag
+/// alone and keeping the stored order stable for a reader), and a key that is not
+/// stored yet is appended. The incoming list is applied in order, so a key repeated
+/// within one request ends up carrying the last value given for it.
+///
+/// Returns the would-be tag set WITHOUT storing it, so a caller can refuse the whole
+/// call — with the modelled `TooManyTagsException` — before any of it is persisted.
+/// Both sides are bounded: the stored set by [`MAX_TAGS_PER_RESOURCE`] and the
+/// incoming list by the model's `TagList` maximum of 200 entries, which the request
+/// walk refuses before a handler runs.
+pub fn tags_after_applying(
+    stored: &[(String, String)],
+    incoming: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut merged = stored.to_vec();
+    for (key, value) in incoming {
+        match merged.iter_mut().find(|(stored_key, _)| *stored_key == key) {
+            Some(existing) => existing.1 = value,
+            None => merged.push((key, value)),
+        }
+    }
+    merged
 }
 
 /// The modelled `Instance` for a stored instance.

@@ -3,6 +3,11 @@
 //! @op IntrospectOAuth2TokenWithIAM
 //! Reports the claims of a token this service issued (RFC 7662 token introspection).
 //!
+//! Input rejection is this operation's own, not the generic constraint walk's: a request
+//! with no token value is refused "token is required" and one whose value is not shaped
+//! like a Sign-In token "token has invalid format" — one condition each, the way the
+//! service states it.
+//!
 //! ## What a call does
 //!
 //! The token value is opaque and carries nothing, so every claim comes from the record
@@ -194,6 +199,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+
+        // This operation's own acceptance rules, each stating the single condition the
+        // request failed rather than the generic constraint walk's report (`token`
+        // carries `skip_validation`, so this handler is what judges it): a request that
+        // carries no token value at all names the member, and a value that is not
+        // shaped like a Sign-In token (`IntrospectionToken`: an `ASOA` access token or
+        // an `ASOR` refresh token within 4096 characters) names the format.
+        if input.token.is_empty() {
+            return Err(
+                IntrospectOAuth2TokenWithIAMErrorModeled::ValidationException(
+                    crate::state::validation_failed(crate::state::TOKEN_REQUIRED_MESSAGE),
+                )
+                .into(),
+            );
+        }
+        if !crate::state::is_introspection_token(&input.token) {
+            return Err(
+                IntrospectOAuth2TokenWithIAMErrorModeled::ValidationException(
+                    crate::state::validation_failed(crate::state::TOKEN_INVALID_FORMAT_MESSAGE),
+                )
+                .into(),
+            );
+        }
 
         let now = ::std::time::SystemTime::now();
         // The account the caller speaks for; a token of any other account is

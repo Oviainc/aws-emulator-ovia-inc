@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectInvitation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RejectInvitation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RejectInvitation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: moves the stored invitation named by the request from `PENDING` to
+//! `REJECTED` in [`crate::state`], so a later `ListInvitations` reports it rejected.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +143,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RejectInvitation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RejectInvitationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RejectInvitation"))
+        // A MUTATION: the spec says this call rejects the invitation, so it moves the
+        // stored record's status. The settle() below it materialises only what the clock
+        // already owed.
+        let region = crate::state::request_region(ctx);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RejectInvitationErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        // "This action can be called by a principal in an Amazon Web Services account
+        // that has received an invitation": an invitation issued to another account is
+        // not this caller's to reject, so it is as good as absent.
+        let account = ::engine::emulator_account_id();
+        let Some(invitation) = guard
+            .invitations
+            .get_mut(&input.invitation_id)
+            .filter(|invitation| invitation.principal == account)
+        else {
+            return Err(RejectInvitationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "invitation {} does not exist on this account",
+                        input.invitation_id
+                    )),
+                    // `ResourceNotFoundException$ResourceName` is an `ArnString`
+                    // (`^arn:.+:.+:.+:.+:.+$`), so it names the requested resource in ARN
+                    // form rather than by bare id.
+                    resource_name: Some(crate::state::invitation_arn(
+                        &region,
+                        &input.invitation_id,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Only a `PENDING` invitation can still be rejected: once it is `ACCEPTED`,
+        // `ACCEPTING`, `REJECTED` or `EXPIRED`, rejecting it is an illegal action on the
+        // resource rather than a missing one.
+        if invitation.status != crate::state::INVITATION_STATUS_PENDING {
+            return Err(RejectInvitationErrorModeled::IllegalActionException(
+                IllegalActionException {
+                    message: Some(format!(
+                        "invitation {} is {} and can no longer be rejected",
+                        invitation.id, invitation.status
+                    )),
+                },
+            )
+            .into());
+        }
+
+        invitation.status = crate::state::INVITATION_STATUS_REJECTED.to_string();
+
+        Ok(RejectInvitationOutput {})
     }
 }

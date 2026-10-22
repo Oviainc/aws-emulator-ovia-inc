@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCliToken
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCliToken`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCliToken::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an Apache Airflow CLI token for the STORED environment the request names, and
+//! reports it with the web-server host that environment's record carries. A name that
+//! resolves to no stored environment is refused with the operation's one modeled error,
+//! `ResourceNotFoundException` (HTTP 404).
+//!
+//! The token is minted by the emulator's credential store and removed from it again (see
+//! [`crate::state::mint_airflow_token`]): it is a secret for the environment's Apache
+//! Airflow web server, not a credential of this emulator, so nothing here constructs it
+//! and nothing here would accept it.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +141,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCliToken` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCliTokenErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCliToken"))
+        let now = ::std::time::SystemTime::now();
+
+        // This operation models ONE error (`ResourceNotFoundException`), so there is no
+        // modeled server fault to report a missing store with: an engine this service was
+        // not mounted on cannot serve the operation at all, which is what the scaffold's
+        // 501 states. The router builds the one engine that does carry the store, so this
+        // is unreachable there.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateCliToken"));
+        };
+        let mut store = state.lock();
+        // The transition the clock already owes, materialised before anything is read.
+        store.settle(now);
+
+        // The web server a token is minted for is the one the STORED record names, so a
+        // name matching no environment has nothing to mint a token against.
+        let stored = store.environments.get(&input.name).ok_or_else(|| {
+            CreateCliTokenErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::environment_not_found_message(&input.name)),
+            })
+        })?;
+        let web_server_hostname = crate::state::webserver_hostname(&stored.webserver_url).to_string();
+        drop(store);
+
+        let Some(cli_token) = crate::state::mint_airflow_token(ctx.credential_store()) else {
+            // No secret was minted, and this operation will not invent one; it models no
+            // server fault, so the honest answer is "this emulator did not serve it".
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateCliToken"));
+        };
+        Ok(CreateCliTokenOutput {
+            cli_token: Some(cli_token),
+            web_server_hostname: Some(web_server_hostname),
+        })
     }
 }

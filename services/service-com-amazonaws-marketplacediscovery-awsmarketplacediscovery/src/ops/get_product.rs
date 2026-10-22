@@ -194,7 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             short_description: text.short_description.clone(),
             long_description: text.long_description.clone(),
             logo_thumbnail_url: product.logo_thumbnail_url.clone(),
-            fulfillment_option_summaries: product.fulfillment_option_summaries.clone(),
+            // Derived from the product's fulfillment options, the single record of how
+            // it is fulfilled, so this list and `ListFulfillmentOptions` cannot disagree.
+            fulfillment_option_summaries: product.fulfillment_option_summaries(),
             categories: product.categories.clone(),
             highlights: product.highlights.clone(),
             promotional_media: product.promotional_media.clone(),

@@ -10,8 +10,9 @@
 //!   `GetResourcePolicy` renders them as the account's SignIn resource-based
 //!   policy document and `DeleteResourcePermissionStatement` removes one;
 //! * the **console-authorization configuration** —
-//!   `PutConsoleAuthorizationConfiguration` persists one per target and
-//!   `GetConsoleAuthorizationConfiguration` reports it back.
+//!   `PutConsoleAuthorizationConfiguration` persists one per target,
+//!   `GetConsoleAuthorizationConfiguration` reports it back and
+//!   `DeleteConsoleAuthorizationConfiguration` releases it;
 //! * the **OAuth 2.0 token** — `CreateOAuth2TokenWithIAM` mints an access
 //!   token, `IntrospectOAuth2TokenWithIAM` reports the claims of an access or
 //!   refresh token the service issued and `RevokeOAuth2TokenWithIAM` revokes a
@@ -61,10 +62,10 @@ pub const PERMISSION_STATEMENT_QUOTA: usize = 100;
 /// store, not a claim about any account's limit: AWS publishes no maximum number
 /// of console-authorization targets and this emulator models neither Service
 /// Quotas nor an account's adjustments. It is what stops the map growing without
-/// end, since `TargetId`'s key space is effectively unlimited and the release
-/// path (`DeleteConsoleAuthorizationConfiguration`) is still a scaffold: a put
-/// naming a target the store already holds is an update and always allowed,
-/// while a put naming a NEW target past this bound is refused.
+/// end, since `TargetId`'s key space is effectively unlimited: a put naming a
+/// target the store already holds is an update and always allowed, while a put
+/// naming a NEW target past this bound is refused. Every record it holds is
+/// released by `DeleteConsoleAuthorizationConfiguration`.
 pub const CONSOLE_AUTHORIZATION_TARGET_QUOTA: usize = 100;
 
 /// The `error` code the model documents for `ValidationException`: "Will be
@@ -87,6 +88,64 @@ pub const RATE_LIMIT_ERROR_CODE: &str = "INVALID_REQUEST";
 /// SERVER_ERROR for internal server errors" — the enum member `SERVER_ERROR`
 /// carries the wire value `server_error`.
 pub const SERVER_ERROR_CODE: &str = "server_error";
+
+/// The description `ValidationException` carries when an OAuth 2.0 request is
+/// malformed.
+///
+/// Not chosen wording: it is what the model documents for the `INVALID_REQUEST`
+/// member of `OAuth2ErrorCode` — "The request is missing a required parameter,
+/// includes an invalid parameter value, or is otherwise malformed" — which is
+/// also RFC 6749 §5.2's description of the `invalid_request` error.
+pub const INVALID_REQUEST_MESSAGE: &str = "The request is missing a required parameter, \
+     includes an invalid parameter value, or is otherwise malformed.";
+
+/// `IntrospectOAuth2TokenWithIAM`'s own refusal of a request that carries no
+/// token value at all.
+pub const TOKEN_REQUIRED_MESSAGE: &str = "token is required";
+
+/// `IntrospectOAuth2TokenWithIAM`'s own refusal of a token value that is not
+/// shaped like a Sign-In token.
+pub const TOKEN_INVALID_FORMAT_MESSAGE: &str = "token has invalid format";
+
+/// The longest token value any Sign-In token member admits:
+/// `IntrospectionToken` and `RevocationToken` are both `@length(min: 1, max:
+/// 4096)`.
+pub const TOKEN_MAX_LENGTH: usize = 4096;
+
+/// Whether `value` is shaped like a token `IntrospectOAuth2TokenWithIAM`
+/// accepts: `IntrospectionToken`'s `^ASO[AR][A-Za-z0-9+/=_\-]+$` within its
+/// `@length(min: 1, max: 4096)`.
+///
+/// Spelled out here because this operation owns its own acceptance: the
+/// handler, not the generic constraint walk, is what answers a value outside
+/// it, so the handler needs the predicate.
+pub fn is_introspection_token(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix(ACCESS_TOKEN_PREFIX)
+        .or_else(|| value.strip_prefix(REFRESH_TOKEN_PREFIX))
+    else {
+        return false;
+    };
+    value.len() <= TOKEN_MAX_LENGTH && !rest.is_empty() && rest.chars().all(is_token_character)
+}
+
+/// Whether `value` is shaped like a token `RevokeOAuth2TokenWithIAM` revokes:
+/// `RevocationToken`'s `^ASOR[A-Za-z0-9+/=_\-]+$` within its `@length(min: 1,
+/// max: 4096)`. Anything else is a value revocation leaves alone — including an
+/// access-token-shaped `ASOA…` value, which the model documents as not accepted
+/// for revocation.
+pub fn is_revocation_token(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(REFRESH_TOKEN_PREFIX) else {
+        return false;
+    };
+    value.len() <= TOKEN_MAX_LENGTH && !rest.is_empty() && rest.chars().all(is_token_character)
+}
+
+/// One character of the token alphabet both token shapes share:
+/// `[A-Za-z0-9+/=_\-]`.
+fn is_token_character(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-')
+}
 
 /// The region a request is attributed to when it carries no SigV4 credential
 /// scope to read one from. `engine::emulator_arn`'s own documented default.
@@ -123,6 +182,20 @@ pub const REFRESH_TOKEN_PREFIX: &str = "ASOR";
 /// The `tokenType` `CreateOAuth2TokenWithIAM` answers with: `BearerTokenType`
 /// is modelled `^Bearer$` — "Always "Bearer" per OAuth 2.1 specification".
 pub const BEARER_TOKEN_TYPE: &str = "Bearer";
+
+/// The only grant `CreateOAuth2TokenWithIAMRequest$grantType` admits:
+/// `ClientCredentialsGrantType` is modelled `^client_credentials$`, documented
+/// 'OAuth 2.0 grant type. Must be "client_credentials"'.
+///
+/// `CreateOAuth2TokenWithIAM` judges this member itself (see its handler), so
+/// the value it accepts is named here rather than left to the generic
+/// constraint walk.
+pub const GRANT_TYPE_CLIENT_CREDENTIALS: &str = "client_credentials";
+
+/// `CreateOAuth2TokenWithIAMRequest$resource`'s modelled `@length(min: 1, max:
+/// 2048)` ceiling, likewise judged by that operation's own handler. Smithy bounds a
+/// string's length in CHARACTERS, so the handler counts characters, not bytes.
+pub const MAX_RESOURCE_LENGTH: usize = 2048;
 
 /// The lifetime, in seconds, of an access token minted by
 /// `CreateOAuth2TokenWithIAM`.

@@ -11,14 +11,20 @@
 //! The record is the stored half; the wire half (`AnalyzerSummary`,
 //! `ArchiveRuleSummary`) is PROJECTED from it by [`Analyzer::summary`] /
 //! [`ArchiveRule::summary`], so no handler assembles a response member by hand.
+//!
+//! Access previews are nested the same way: `CreateAccessPreview` stores an
+//! [`AccessPreviewRecord`] on the analyzer the request names, `GetAccessPreview`
+//! projects it back with [`AccessPreviewRecord::preview_at`], and deleting the analyzer
+//! takes its previews with it.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AnalyzerConfiguration, AnalyzerSummary, ArchiveRuleSummary, ConflictException, Criterion,
-    InternalServerException, ResourceNotFoundException, ServiceQuotaExceededException, StatusReason,
-    ValidationException, ValidationExceptionField,
+    AccessPreview, AccessPreviewStatusReason, AnalyzerConfiguration, AnalyzerSummary,
+    ArchiveRuleSummary, Configuration, ConflictException, Criterion, InternalServerException,
+    ResourceNotFoundException, ServiceQuotaExceededException, StatusReason, ValidationException,
+    ValidationExceptionField,
 };
 
 /// The status a customer-managed analyzer is in once `CreateAnalyzer` returns.
@@ -43,6 +49,48 @@ pub const ANALYZER_RESOURCE_TYPE: &str = "analyzer";
 
 /// The `resourceType` an archive-rule-scoped error reports.
 pub const ARCHIVE_RULE_RESOURCE_TYPE: &str = "archive-rule";
+
+/// The `resourceType` an access-preview-scoped `ResourceNotFoundException` reports.
+pub const ACCESS_PREVIEW_RESOURCE_TYPE: &str = "access-preview";
+
+/// The only `Type` an access preview can be created against: the account
+/// external-access analyzer. `CreateAccessPreview$analyzerArn` documents it — "You can
+/// only create an access preview for analyzers with an Account type and Active status"
+/// — so an organization analyzer, or an account analyzer that reports unused or
+/// internal access instead of external access, is refused.
+pub const ACCESS_PREVIEW_ANALYZER_TYPE: &str = "ACCOUNT";
+
+/// `AccessPreviewStatus` while the analysis of the proposed configuration is still
+/// running, from the model's [`crate::ops::types::ACCESS_PREVIEW_STATUS_VALUES`].
+pub const ACCESS_PREVIEW_STATUS_CREATING: &str = "CREATING";
+
+/// `AccessPreviewStatus` once the analysis finished and its findings can be previewed.
+pub const ACCESS_PREVIEW_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `AccessPreviewStatus` once the analysis gave up on the proposed configuration.
+pub const ACCESS_PREVIEW_STATUS_FAILED: &str = "FAILED";
+
+/// The `AccessPreviewStatusReasonCode` a `FAILED` preview reports when the proposed
+/// resource configuration is the reason, from the model's
+/// [`crate::ops::types::ACCESS_PREVIEW_STATUS_REASON_CODE_VALUES`].
+pub const ACCESS_PREVIEW_REASON_INVALID_CONFIGURATION: &str = "INVALID_CONFIGURATION";
+
+/// How long a created access preview stays `CREATING` before the clock owes it its
+/// terminal status.
+///
+/// AWS publishes no duration for the analysis, so this span is the emulator's own
+/// choice: non-zero, so a caller polling straight after `CreateAccessPreview` still
+/// observes `CREATING` (and the state it implies), and short enough that a caller
+/// waiting for the preview is not kept waiting. Nothing sleeps for it — the due
+/// instant is stored and every read compares the clock against it.
+pub const ACCESS_PREVIEW_ANALYSIS_SPAN: Duration = Duration::from_millis(500);
+
+/// How many access previews this emulator will hold under one analyzer.
+///
+/// Same reasoning as [`MAX_ANALYZERS`]: previews are caller-driven growth and
+/// `CreateAccessPreview` models `ServiceQuotaExceededException` (HTTP 402) for meeting
+/// a quota, so the ceiling is expressed with that error rather than with memory.
+pub const MAX_ACCESS_PREVIEWS_PER_ANALYZER: usize = 1_000;
 
 // ---------------------------------------------------------------------------
 // Resource-scoped refusals.
@@ -145,6 +193,40 @@ pub fn archive_rule_quota_exceeded(rule_name: &str) -> ServiceQuotaExceededExcep
         message: ARCHIVE_RULE_QUOTA_EXCEEDED_MESSAGE.to_string(),
         resource_id: rule_name.to_string(),
         resource_type: ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The fixed `message` of a `ResourceNotFoundException` for an access preview the named
+/// analyzer does not hold — an id that was never minted, one minted under a DIFFERENT
+/// analyzer, and one whose analyzer has been deleted are the same refusal, so they
+/// carry the same text. Same provenance as [`ARCHIVE_RULE_NOT_FOUND_MESSAGE`].
+pub const ACCESS_PREVIEW_NOT_FOUND_MESSAGE: &str = "Access preview not found";
+
+/// The fixed `message` of the `ServiceQuotaExceededException` (HTTP 402) that answers a
+/// preview create past this emulator's per-analyzer ceiling.
+pub const ACCESS_PREVIEW_QUOTA_EXCEEDED_MESSAGE: &str =
+    "Service quota met for access previews on this analyzer";
+
+/// The 404 for an access preview the analyzer does not hold: fixed text, the
+/// `accessPreviewId` in the modelled `resourceId`/`resourceType` members.
+pub fn access_preview_not_found(access_preview_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: ACCESS_PREVIEW_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: access_preview_id.to_string(),
+        resource_type: ACCESS_PREVIEW_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The 402 for a preview create past [`MAX_ACCESS_PREVIEWS_PER_ANALYZER`].
+///
+/// The create minted no id, so the refusal names the analyzer whose ceiling was met in
+/// `resourceId`; the ceiling is a property of that analyzer, not of the request, so the
+/// message names neither.
+pub fn access_preview_quota_exceeded(analyzer_arn: &str) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: ACCESS_PREVIEW_QUOTA_EXCEEDED_MESSAGE.to_string(),
+        resource_id: analyzer_arn.to_string(),
+        resource_type: ACCESS_PREVIEW_RESOURCE_TYPE.to_string(),
     }
 }
 
@@ -256,6 +338,27 @@ pub struct ComAmazonawsAccessanalyzerAccessanalyzerState {
     pub create_analyzer_tokens: ClientTokens<CreatedAnalyzerToken>,
 }
 
+impl ComAmazonawsAccessanalyzerAccessanalyzerState {
+    /// The analyzer an `analyzerArn` names, or `None` when this account and Region hold
+    /// no analyzer with that ARN.
+    ///
+    /// Analyzers are keyed by name, but the preview operations are scoped by ARN, and
+    /// the ARN pins the partition, Region and account as well as the name — so the
+    /// lookup compares the whole stored ARN rather than parsing a name out of it.
+    pub fn analyzer_by_arn(&self, arn: &str) -> Option<&Analyzer> {
+        self.analyzers
+            .values()
+            .find(|analyzer| analyzer.arn == arn)
+    }
+
+    /// [`Self::analyzer_by_arn`], for a caller that writes to the record it finds.
+    pub fn analyzer_by_arn_mut(&mut self, arn: &str) -> Option<&mut Analyzer> {
+        self.analyzers
+            .values_mut()
+            .find(|analyzer| analyzer.arn == arn)
+    }
+}
+
 /// What a recorded `CreateAnalyzer` `clientToken` resolves to.
 #[derive(Debug, Clone)]
 pub struct CreatedAnalyzerToken {
@@ -291,6 +394,18 @@ pub struct Analyzer {
     /// produced, so a retry of the SAME request answers success instead of a conflict.
     /// Bounded; see [`ClientTokens`].
     pub archive_rule_tokens: ClientTokens<String>,
+    /// The access previews created against this analyzer, keyed by their
+    /// `accessPreviewId`. Stored ON the analyzer record, the way `archive_rules` is,
+    /// because every preview-scoped operation (`GetAccessPreview`,
+    /// `ListAccessPreviews`, `ListAccessPreviewFindings`) is scoped by `analyzerArn`
+    /// too, so no preview outlives the analyzer it previews for. Ordered by id for the
+    /// same paging reason as `analyzers`.
+    pub access_previews: BTreeMap<String, AccessPreviewRecord>,
+    /// `CreateAccessPreview` idempotency, scoped to this analyzer: the `clientToken` of
+    /// a completed create mapped to the `accessPreviewId` it produced, so a retry of
+    /// the SAME request answers with the first id instead of previewing twice.
+    /// Bounded; see [`ClientTokens`].
+    pub access_preview_tokens: ClientTokens<String>,
 }
 
 impl Analyzer {
@@ -314,6 +429,203 @@ impl Analyzer {
             managed_by: None,
         }
     }
+}
+
+/// A stored access preview: the state the modelled `AccessPreview` is rebuilt from.
+///
+/// The analysis of a proposed configuration is not instantaneous, so the record keeps
+/// the instant the analysis is DUE and the terminal status it resolves to; the status a
+/// read reports is computed from the clock against that instant by
+/// [`AccessPreviewRecord::status_at`], so nothing sleeps and no read has to write.
+#[derive(Debug, Clone)]
+pub struct AccessPreviewRecord {
+    /// The `accessPreviewId` the create returned, in the model's `AccessPreviewId` form.
+    pub id: String,
+    /// The ARN of the analyzer the preview was created against.
+    pub analyzer_arn: String,
+    /// Exactly the `configurations` map the create carried.
+    pub configurations: HashMap<String, Configuration>,
+    pub created_at: SystemTime,
+    /// When the analysis is due to finish: before it the preview reads `CREATING`,
+    /// at or after it the preview reads its terminal status.
+    pub completes_at: SystemTime,
+    /// The status the analysis resolves to: `COMPLETED`, or `FAILED` when the proposed
+    /// configuration could not be analyzed.
+    pub terminal_status: String,
+    /// Why the terminal status is `FAILED`; `None` for a `COMPLETED` preview, since
+    /// `statusReason` explains a failure.
+    pub terminal_status_reason: Option<AccessPreviewStatusReason>,
+}
+
+impl AccessPreviewRecord {
+    /// The status, and the reason for it, this preview is in at `now`.
+    pub fn status_at(&self, now: SystemTime) -> (&str, Option<AccessPreviewStatusReason>) {
+        if now < self.completes_at {
+            // `statusReason` explains a failure, and an analysis still running has not
+            // failed.
+            (ACCESS_PREVIEW_STATUS_CREATING, None)
+        } else {
+            (
+                self.terminal_status.as_str(),
+                self.terminal_status_reason.clone(),
+            )
+        }
+    }
+
+    /// Project the stored preview onto the modelled `AccessPreview`, as of `now`.
+    pub fn preview_at(&self, now: SystemTime) -> AccessPreview {
+        let (status, status_reason) = self.status_at(now);
+        AccessPreview {
+            id: self.id.clone(),
+            analyzer_arn: self.analyzer_arn.clone(),
+            configurations: self.configurations.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            status: status.to_string(),
+            status_reason,
+        }
+    }
+}
+
+/// Why a proposed access-preview configuration cannot be analyzed, or `None` when it
+/// can.
+///
+/// A proposed configuration is analyzable when the resource it is keyed by is named by
+/// an ARN and every policy document it proposes is a JSON object (which is what a
+/// resource policy, a trust policy and a key policy all are). Anything else is the
+/// "invalid proposed resource configuration" the model's `AccessPreviewStatusReason`
+/// documents, which the preview reports by resolving to `FAILED` with
+/// [`ACCESS_PREVIEW_REASON_INVALID_CONFIGURATION`] rather than by refusing the create.
+pub fn configuration_defect(resource: &str, configuration: &Configuration) -> Option<String> {
+    if !is_resource_arn(resource) {
+        return Some(format!(
+            "{resource} is not the ARN of a resource to preview access for"
+        ));
+    }
+    for document in policy_documents(configuration) {
+        if !serde_json::from_str::<serde_json::Value>(document)
+            .is_ok_and(|parsed| parsed.is_object())
+        {
+            return Some(format!(
+                "the policy proposed for {resource} is not a JSON policy document"
+            ));
+        }
+    }
+    None
+}
+
+/// Whether `candidate` is an ARN: the six colon-separated segments of
+/// `arn:partition:service:region:account:resource`, the form every `configurations`
+/// key (`ConfigurationsMapKey`, documented as "a map of resource ARNs") takes.
+fn is_resource_arn(candidate: &str) -> bool {
+    let segments: Vec<&str> = candidate.splitn(6, ':').collect();
+    segments.len() == 6 && segments[0] == "arn" && !segments[5].is_empty()
+}
+
+/// Every policy document a proposed configuration carries, in no particular order.
+///
+/// One arm per `Configuration` union member (from
+/// `smithy_query(query="shape", shape="Configuration")`), so a member that proposes no
+/// policy — an EBS snapshot's share list, an RDS snapshot's attributes, a KMS grant —
+/// contributes nothing and a member that proposes several contributes all of them.
+pub fn policy_documents(configuration: &Configuration) -> Vec<&str> {
+    let mut documents: Vec<&str> = Vec::new();
+    match configuration {
+        // Shared through account ids and groups, not through a policy document.
+        Configuration::ebsSnapshot(_) => {}
+        Configuration::ecrRepository(config) => {
+            documents.extend(config.repository_policy.as_deref())
+        }
+        Configuration::iamRole(config) => documents.extend(config.trust_policy.as_deref()),
+        Configuration::efsFileSystem(config) => {
+            documents.extend(config.file_system_policy.as_deref())
+        }
+        Configuration::kmsKey(config) => documents.extend(
+            config
+                .key_policies
+                .iter()
+                .flatten()
+                .map(|(_, policy)| policy.as_str()),
+        ),
+        // Shared through snapshot attributes, not through a policy document.
+        Configuration::rdsDbClusterSnapshot(_) | Configuration::rdsDbSnapshot(_) => {}
+        Configuration::secretsManagerSecret(config) => {
+            documents.extend(config.secret_policy.as_deref())
+        }
+        Configuration::s3Bucket(config) => {
+            documents.extend(config.bucket_policy.as_deref());
+            documents.extend(
+                config
+                    .access_points
+                    .iter()
+                    .flatten()
+                    .filter_map(|(_, point)| point.access_point_policy.as_deref()),
+            );
+        }
+        Configuration::snsTopic(config) => documents.extend(config.topic_policy.as_deref()),
+        Configuration::sqsQueue(config) => documents.extend(config.queue_policy.as_deref()),
+        Configuration::s3ExpressDirectoryBucket(config) => {
+            documents.extend(config.bucket_policy.as_deref());
+            documents.extend(
+                config
+                    .access_points
+                    .iter()
+                    .flatten()
+                    .filter_map(|(_, point)| point.access_point_policy.as_deref()),
+            );
+        }
+        Configuration::dynamodbStream(config) => documents.extend(config.stream_policy.as_deref()),
+        Configuration::dynamodbTable(config) => documents.extend(config.table_policy.as_deref()),
+    }
+    documents
+}
+
+/// A fresh `accessPreviewId`: a version-4 UUID in the lowercase hyphenated form the
+/// model's `AccessPreviewId` pattern requires
+/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`; RFC 9562 §5.4 —
+/// version `4` in the high nibble of octet 6, variant `0b10` in the top bits of octet 8).
+///
+/// Its bits come from three independent sources, so an id is both unguessable and
+/// unique within the process: the OS entropy `std` seeds a fresh `RandomState` with on
+/// every call, a monotonic counter (so two ids minted in the same nanosecond on
+/// different threads differ by construction), and the wall clock in nanoseconds (so ids
+/// do not repeat across processes).
+pub fn new_access_preview_id() -> String {
+    use std::fmt::Write as _;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MINTED: AtomicU64 = AtomicU64::new(0);
+    let counter = MINTED.fetch_add(1, Ordering::Relaxed);
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(counter);
+    let entropy = hasher.finish();
+
+    let nanos = SystemTime::now()
+        .duration_since(::std::time::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_nanos())
+        .unwrap_or_default();
+
+    let mut digest = <::sha2::Sha256 as ::sha2::Digest>::new();
+    ::sha2::Digest::update(&mut digest, entropy.to_le_bytes());
+    ::sha2::Digest::update(&mut digest, counter.to_le_bytes());
+    ::sha2::Digest::update(&mut digest, nanos.to_le_bytes());
+    let hashed = ::sha2::Digest::finalize(digest);
+
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hashed[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let mut rendered = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            rendered.push('-');
+        }
+        // Infallible: writing to a String never fails.
+        let _ = write!(rendered, "{byte:02x}");
+    }
+    rendered
 }
 
 /// A stored archive rule: the state `ArchiveRuleSummary` is rebuilt from.

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTraceSegmentDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTraceSegmentDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTraceSegmentDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Configures where `PutTraceSegments` and OTLP data go, persisting the choice
+//! in this service's state so `GetTraceSegmentDestination` reports it, and
+//! answers the stored destination with the status of the change: `PENDING`
+//! until the switch the clock owes becomes effective, then `ACTIVE`.
+//!
+//! A request that names no destination, names one outside
+//! `TraceSegmentDestination`, or carries a `CloudWatchLogsConfiguration` with a
+//! destination other than `CloudWatchLogs` (which the member's documentation
+//! restricts it to) is refused with the modelled `InvalidRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -111,6 +112,26 @@ impl From<UpdateTraceSegmentDestinationErrorModeled> for UpdateTraceSegmentDesti
     }
 }
 
+/// Whether `value` is a KMS *key* ARN — the only form
+/// `CloudWatchLogsConfiguration$SpansLogGroupKmsKeyId` accepts, since its
+/// documentation
+/// (`smithy_query(query="doc",shape="CloudWatchLogsConfiguration",member="SpansLogGroupKmsKeyId")`)
+/// says "Key IDs and alias ARNs are not supported".
+fn is_kms_key_arn(value: &str) -> bool {
+    let mut fields = value.split(':');
+    fields.next() == Some("arn")
+        && fields.next().is_some_and(|partition| !partition.is_empty())
+        && fields.next() == Some("kms")
+        && fields.next().is_some_and(|region| !region.is_empty())
+        && fields.next().is_some_and(|account| !account.is_empty())
+        && fields.next().is_some_and(|resource| {
+            resource
+                .strip_prefix("key/")
+                .is_some_and(|key_id| !key_id.is_empty())
+        })
+        && fields.next().is_none()
+}
+
 /// The `UpdateTraceSegmentDestination` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -147,18 +168,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTraceSegmentDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTraceSegmentDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTraceSegmentDestination"))
+        let _ = ctx;
+        let invalid = |message: String| -> Self::Error {
+            UpdateTraceSegmentDestinationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // `Destination` is what this operation modifies, so a request naming
+        // none is missing a parameter the call needs — which is exactly what
+        // `InvalidRequestException` reports.
+        let Some(destination) = input.destination.as_deref() else {
+            return Err(invalid(format!(
+                "Destination is required and must be one of {}",
+                TRACE_SEGMENT_DESTINATION_VALUES.join(", ")
+            )));
+        };
+        if !TRACE_SEGMENT_DESTINATION_VALUES.contains(&destination) {
+            return Err(invalid(format!(
+                "Destination must be one of {}, not {destination:?}",
+                TRACE_SEGMENT_DESTINATION_VALUES.join(", ")
+            )));
+        }
+
+        let kms_key_id = match input.cloud_watch_logs_configuration.as_ref() {
+            None => None,
+            Some(_) if destination != crate::state::CLOUD_WATCH_LOGS_DESTINATION => {
+                return Err(invalid(format!(
+                    "CloudWatchLogsConfiguration may only be specified when Destination is {}, \
+                     not {destination:?}",
+                    crate::state::CLOUD_WATCH_LOGS_DESTINATION
+                )));
+            }
+            Some(configuration) => {
+                let key_id = configuration.spans_log_group_kms_key_id.as_deref();
+                if let Some(key_id) = key_id {
+                    if !is_kms_key_arn(key_id) {
+                        return Err(invalid(
+                            "CloudWatchLogsConfiguration.SpansLogGroupKmsKeyId must be the ARN of \
+                             a KMS key (arn:<partition>:kms:<region>:<account>:key/<key-id>); key \
+                             IDs and alias ARNs are not supported"
+                                .to_string(),
+                        ));
+                    }
+                }
+                key_id
+            }
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateTraceSegmentDestinationErrorModeled::ThrottledException(
+                ThrottledException {
+                    message: Some(
+                        "the X-Ray trace segment destination store is unavailable on this emulator engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        // Settle first, so a change still owed from an earlier call is in effect
+        // before this one decides whether it is switching anything.
+        store.settle_trace_segment_destination(now);
+        let record = store.set_trace_segment_destination(destination, kms_key_id, now);
+
+        Ok(UpdateTraceSegmentDestinationOutput {
+            status: Some(record.status().to_string()),
+            destination: Some(record.destination),
+        })
     }
 }

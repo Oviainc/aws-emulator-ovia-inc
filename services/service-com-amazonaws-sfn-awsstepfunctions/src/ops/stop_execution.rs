@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: stops a running execution — the stored record moves to `ABORTED`
+//! with the `error`/`cause` the caller gave and the `stopDate` this call set, which
+//! is what the response reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of the operation's own
+//! modelled errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +153,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopExecution"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        if crate::state::parse_execution_arn(&input.execution_arn).is_none() {
+            return Err(StopExecutionErrorModeled::InvalidArn(InvalidArn {
+                message: Some(format!(
+                    "'{}' is not an execution ARN of this service",
+                    input.execution_arn
+                )),
+            })
+            .into());
+        }
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+        // Settle first, so an execution whose own terminal status the clock already
+        // owed is not reported as stopped by this call.
+        store.settle(now);
+
+        let express = store
+            .executions
+            .get(&input.execution_arn)
+            .and_then(|execution| store.state_machines.get(&execution.state_machine_arn))
+            .is_some_and(|machine| machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS);
+        // "This API action is not supported by EXPRESS state machines."
+        if express {
+            return Err(StopExecutionErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "StopExecution does not support execution {}, which belongs to an \
+                         EXPRESS state machine",
+                        input.execution_arn
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // One state-level step does the whole stop: it moves a running execution to
+        // ABORTED with the caller's error and cause, discards the outcome the
+        // interpreter had computed along with its place in the settle queue, and
+        // reports the `stopDate` the execution carries — its own when it had already
+        // reached a terminal status.
+        let Some(stop_date) =
+            store.stop_execution(&input.execution_arn, now, input.error, input.cause)
+        else {
+            return Err(StopExecutionErrorModeled::ExecutionDoesNotExist(
+                ExecutionDoesNotExist {
+                    message: Some(format!("execution {} does not exist", input.execution_arn)),
+                },
+            )
+            .into());
+        };
+
+        Ok(StopExecutionOutput {
+            stop_date: crate::state::to_date_time(stop_date),
+        })
     }
 }

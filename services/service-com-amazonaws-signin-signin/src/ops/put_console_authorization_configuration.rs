@@ -196,8 +196,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let configuration = crate::state::ConsoleAuthorizationConfiguration {
             target_id,
             scope: scope.to_string(),
-            // The operation enables console authorization for the target; disabling it
-            // is `DeleteConsoleAuthorizationConfiguration`, filed as its own issue.
+            // The operation enables console authorization for the target;
+            // `DeleteConsoleAuthorizationConfiguration` releases it.
             console_authorization_enabled: true,
         };
 
@@ -205,11 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The store is bounded by `CONSOLE_AUTHORIZATION_TARGET_QUOTA`, and this check
-        // dominates the insert below: `TargetId`'s key space is effectively unlimited
-        // and this service's release path is not implemented yet, so a put naming a
-        // target the store does NOT already hold is refused once that many distinct
-        // targets are configured. A put naming a stored target is an update, grows
-        // nothing, and is always served.
+        // dominates the insert below: `TargetId`'s key space is effectively unlimited,
+        // so a put naming a target the store does NOT already hold is refused once that
+        // many distinct targets are configured. A put naming a stored target is an
+        // update, grows nothing, and is always served.
         if !store.console_auth_configs.contains_key(&key)
             && store.console_auth_configs.len() >= crate::state::CONSOLE_AUTHORIZATION_TARGET_QUOTA
         {

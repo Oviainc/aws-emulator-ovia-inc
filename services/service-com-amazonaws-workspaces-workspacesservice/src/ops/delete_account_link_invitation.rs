@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccountLinkInvitation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccountLinkInvitation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccountLinkInvitation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes an account-link invitation: the stored link is removed, and the
+//! response reports it with the status of a link that no longer exists. An
+//! established link is refused — only an invitation is deletable. The records
+//! live in [`crate::state`], which the other five account-link operations read
+//! and write too.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -110,6 +109,41 @@ impl From<DeleteAccountLinkInvitationErrorModeled> for DeleteAccountLinkInvitati
     }
 }
 
+/// Lift a store refusal into this operation's modelled errors.
+///
+/// Each kind maps to the shape the model declares for it: a link identifier that
+/// names no stored link to `ResourceNotFoundException` (which carries the
+/// identifier in its `ResourceId` member), a link whose current status forbids
+/// the deletion to `ConflictException`, and an invalid request to
+/// `ValidationException`.
+fn account_link_error(
+    failure: crate::state::AccountLinkFailure,
+) -> DeleteAccountLinkInvitationError {
+    use crate::state::AccountLinkFailure;
+    match failure {
+        AccountLinkFailure::Validation(message) => {
+            DeleteAccountLinkInvitationErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+        }
+        AccountLinkFailure::Conflict(message) => {
+            DeleteAccountLinkInvitationErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
+            })
+        }
+        AccountLinkFailure::NotFound {
+            resource_id,
+            message,
+        } => DeleteAccountLinkInvitationErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: Some(message),
+                resource_id: Some(resource_id),
+            },
+        ),
+    }
+    .into()
+}
+
 /// The `DeleteAccountLinkInvitation` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -146,18 +180,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAccountLinkInvitation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAccountLinkInvitationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccountLinkInvitation"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAccountLinkInvitationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the WorkSpaces state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let record = state
+            .lock()
+            .delete_account_link_invitation(&input.link_id)
+            .map_err(account_link_error)?;
+
+        Ok(DeleteAccountLinkInvitationOutput {
+            account_link: Some(record.to_account_link()),
+        })
     }
 }

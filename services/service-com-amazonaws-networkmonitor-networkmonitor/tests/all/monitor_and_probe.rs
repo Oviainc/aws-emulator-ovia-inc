@@ -925,8 +925,9 @@ async fn an_unstored_resource_is_reported_as_not_found() {
 /// The operations this slice implements answer from state; the ones still
 /// scaffolded must answer 501 rather than an empty 200.
 ///
-/// `UntagResource` is no longer among them: it is implemented, and
-/// `tests/all/resource_tags.rs` asserts what it does.
+/// `UpdateMonitor` and `UntagResource` are no longer among them: both are
+/// implemented, and `tests/all/update_monitor.rs` and
+/// `tests/all/resource_tags.rs` assert what they do.
 ///
 /// A fixer implementing one of the rows below deletes that row in the same
 /// change: the point of the case is that a not-yet-written operation never
@@ -941,12 +942,8 @@ async fn the_unimplemented_operations_still_answer_501() {
 
     // (case, method, path, body)
     let cases: Vec<(&str, &str, String, Option<String>)> = vec![
-        (
-            "UpdateMonitor",
-            "PATCH",
-            "/monitors/still-stubbed".to_string(),
-            Some(r#"{"aggregationPeriod":60}"#.to_string()),
-        ),
+        // `UpdateMonitor` used to be a row here; it is implemented now, and its
+        // behaviour is pinned by `tests/all/update_monitor.rs`.
         (
             "ListTagsForResource",
             "GET",

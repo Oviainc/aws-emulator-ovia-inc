@@ -21,13 +21,14 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Mixes the per-identifier counter and the clock into the UUID-format connector/challenge
+# ids and the challenge passwords the ARN patterns and the `Password` member's doc require.
+sha2 = { workspace = true }
+# Hex: the identifier bytes above, and the opaque `NextToken` both listings page with.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

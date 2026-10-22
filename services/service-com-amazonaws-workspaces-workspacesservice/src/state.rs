@@ -8,6 +8,17 @@
 //! transitions live here rather than in one of the operation files because all
 //! four batch operations apply the same rules to the same records.
 //!
+//! It also owns the account-link records the six account-link operations share
+//! (`CreateAccountLinkInvitation`, `AcceptAccountLinkInvitation`,
+//! `RejectAccountLinkInvitation`, `DeleteAccountLinkInvitation`,
+//! `GetAccountLink` and `ListAccountLinks`): one store, one status transition
+//! table, so the writers and the readers cannot disagree about a link.
+//!
+//! It also owns the account-wide Bring Your Own License (BYOL) configuration
+//! ([`AccountByolConfig`]) that `ModifyAccount` changes and `DescribeAccount`
+//! reports: account-scoped rather than per-WorkSpace, so it is one value on the
+//! state struct rather than a map.
+//!
 //! It also owns the WorkSpace BUNDLE store `DescribeWorkspaceBundles` reports:
 //! the Amazon-provided catalog every account can create WorkSpaces from, which
 //! exists before any caller arrives and so is seeded when the store is built,
@@ -17,8 +28,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    ComputeType, RootStorage, Tag, UserStorage, Workspace, WorkspaceBundle, WorkspaceProperties,
-    WorkspaceRequest, COMPUTE_VALUES,
+    AccountLink, ComputeType, RootStorage, Tag, UserStorage, Workspace, WorkspaceBundle,
+    WorkspaceProperties, WorkspaceRequest, COMPUTE_VALUES,
 };
 
 /// How long a lifecycle transition the clock owes stays in its transient state.
@@ -77,6 +88,76 @@ pub const MAX_STORED_WORKSPACES: usize = 2_000;
 /// Also the (code, message) pair the bundle store reports a refusal with, so a
 /// handler can lift it into the modelled error that code names.
 pub type ItemFailure = (&'static str, String);
+
+/// The `ENABLED` value of the model's `DedicatedTenancySupportResultEnum`
+/// (`ENABLED | DISABLED`), which also spells the SINGLE value of the input enum
+/// `DedicatedTenancySupportEnum` that `ModifyAccount` accepts.
+pub const BYOL_SUPPORT_ENABLED: &str = "ENABLED";
+
+/// The `DISABLED` value of `DedicatedTenancySupportResultEnum`.
+pub const BYOL_SUPPORT_DISABLED: &str = "DISABLED";
+
+/// The account-wide Bring Your Own License (BYOL) configuration.
+///
+/// `ModifyAccount` ("Modifies the configuration of Bring Your Own License (BYOL)
+/// for the specified account") is the only writer, and `DescribeAccount`
+/// ("Retrieves a list that describes the configuration of Bring Your Own License
+/// (BYOL) for the specified account") the reader. The fields are private so the
+/// only way to change them is [`ComAmazonawsWorkspacesWorkspacesserviceState::modify_byol`],
+/// which is where the rules about which combinations may be stored live.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AccountByolConfig {
+    /// Whether BYOL is turned on for this account.
+    enabled: bool,
+    /// The management network CIDR block, once one has been configured.
+    management_cidr_range: Option<String>,
+}
+
+impl AccountByolConfig {
+    /// The `DedicatedTenancySupportResultEnum` value this configuration reports.
+    ///
+    /// An account nobody has modified has BYOL off, so it reports `DISABLED`
+    /// rather than reporting nothing.
+    pub fn dedicated_tenancy_support(&self) -> &'static str {
+        if self.enabled {
+            BYOL_SUPPORT_ENABLED
+        } else {
+            BYOL_SUPPORT_DISABLED
+        }
+    }
+
+    /// The configured management network CIDR block, or `None` while no
+    /// `ModifyAccount` call has set one.
+    pub fn management_cidr_range(&self) -> Option<&str> {
+        self.management_cidr_range.as_deref()
+    }
+
+    /// Whether BYOL is turned on.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// A description of the BYOL status, for the `Message` member both
+    /// `DescribeAccount` ("The text message to describe the status of BYOL") and
+    /// `ModifyAccount` ("The text message to describe the status of BYOL
+    /// modification") carry.
+    ///
+    /// Computed from the stored configuration. AWS documents no wording for
+    /// either member, so this TEXT is this emulator's own; what is load-bearing
+    /// is that it describes the configuration this store holds.
+    pub fn status_message(&self) -> String {
+        match (self.enabled, self.management_cidr_range.as_deref()) {
+            (true, Some(range)) => format!(
+                "BYOL is enabled for this account; the management network interface uses the CIDR range {range}."
+            ),
+            (true, None) => "BYOL is enabled for this account.".to_string(),
+            (false, Some(range)) => format!(
+                "BYOL is not enabled for this account; the management network CIDR range {range} is reserved for it."
+            ),
+            (false, None) => "BYOL is not enabled for this account.".to_string(),
+        }
+    }
+}
 
 /// The `Owner` a bundle Amazon Web Services provides carries.
 ///
@@ -273,6 +354,113 @@ fn occupancy_key(directory_id: &str, user_name: &str, workspace_name: Option<&st
     }
 }
 
+/// The page size `ListAccountLinks` reports when the caller sends no
+/// `MaxResults`.
+///
+/// The model caps `ListAccountLinksRequest$MaxResults` at 25 (`range 1..25`), so
+/// a request without one cannot be served a larger page either.
+pub const DEFAULT_ACCOUNT_LINK_PAGE_SIZE: usize = 25;
+
+/// The most account links this emulator stores at once.
+///
+/// This is the emulator's OWN bound on an in-memory store, not an AWS quota: a
+/// caller that keeps inviting fresh target accounts would otherwise grow the
+/// store without end. It sits far above anything a test or a client script
+/// creates.
+pub const MAX_STORED_ACCOUNT_LINKS: usize = 500;
+
+/// The status of a stored account link.
+///
+/// Every variant renders to a value of the model's `AccountLinkStatusEnum` (see
+/// `ACCOUNT_LINK_STATUS_ENUM_VALUES` in `ops::types`), and every value of that
+/// enum has a variant here, so a `LinkStatusFilter` entry the model accepts can
+/// always be decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountLinkStatus {
+    /// The link is established.
+    Linked,
+    /// Establishing the link failed.
+    LinkingFailed,
+    /// No link exists — the status a deleted invitation reports.
+    LinkNotFound,
+    /// The invitation is waiting for the target account to accept it.
+    PendingAcceptanceByTargetAccount,
+    /// The target account rejected the invitation.
+    Rejected,
+}
+
+impl AccountLinkStatus {
+    /// The `AccountLinkStatusEnum` value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Linked => "LINKED",
+            Self::LinkingFailed => "LINKING_FAILED",
+            Self::LinkNotFound => "LINK_NOT_FOUND",
+            Self::PendingAcceptanceByTargetAccount => "PENDING_ACCEPTANCE_BY_TARGET_ACCOUNT",
+            Self::Rejected => "REJECTED",
+        }
+    }
+
+    /// The status a wire `AccountLinkStatusEnum` value names, or `None` when the
+    /// value is not one the model declares.
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "LINKED" => Some(Self::Linked),
+            "LINKING_FAILED" => Some(Self::LinkingFailed),
+            "LINK_NOT_FOUND" => Some(Self::LinkNotFound),
+            "PENDING_ACCEPTANCE_BY_TARGET_ACCOUNT" => Some(Self::PendingAcceptanceByTargetAccount),
+            "REJECTED" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+
+    /// Whether a link in this status holds its target account.
+    ///
+    /// `ConflictException` is documented as "The `TargetAccountId` is already
+    /// linked or invited", so exactly the invited and the linked statuses hold
+    /// the account; a rejected or failed link leaves it free to be invited again.
+    fn holds_target_account(self) -> bool {
+        matches!(self, Self::Linked | Self::PendingAcceptanceByTargetAccount)
+    }
+}
+
+/// One persisted account link.
+#[derive(Debug, Clone)]
+pub struct AccountLinkRecord {
+    /// Creation sequence number: the only ordering `ListAccountLinks`
+    /// paginates over, so a page boundary is stable across calls.
+    pub seq: u64,
+    pub account_link_id: String,
+    pub source_account_id: String,
+    pub target_account_id: String,
+    pub status: AccountLinkStatus,
+    /// The `ClientToken` the creating request carried, which is what makes
+    /// `CreateAccountLinkInvitation` idempotent.
+    pub client_token: Option<String>,
+}
+
+impl AccountLinkRecord {
+    /// This record as the modelled `AccountLink` structure.
+    pub fn to_account_link(&self) -> AccountLink {
+        AccountLink {
+            account_link_id: Some(self.account_link_id.clone()),
+            account_link_status: Some(self.status.as_wire().to_string()),
+            source_account_id: Some(self.source_account_id.clone()),
+            target_account_id: Some(self.target_account_id.clone()),
+        }
+    }
+
+    /// The account on the other side of this link from `account_id`'s point of
+    /// view, which is what `GetAccountLink`'s `LinkedAccountId` names.
+    pub fn linked_account_id(&self, account_id: &str) -> &str {
+        if self.source_account_id == account_id {
+            &self.target_account_id
+        } else {
+            &self.source_account_id
+        }
+    }
+}
+
 /// One persisted WorkSpace bundle.
 ///
 /// Volume sizes are held as GiB numbers and rendered into the modelled
@@ -324,6 +512,37 @@ impl WorkspaceBundleRecord {
             creation_time: Some(::aws_smithy_types::DateTime::from(self.created)),
             state: Some(self.state.to_string()),
             bundle_type: Some(self.bundle_type.to_string()),
+        }
+    }
+}
+
+/// Why an account-link request could not be served.
+///
+/// The six account-link operations model the same error shapes, so the store
+/// reports the KIND of refusal and each handler lifts it into its own modelled
+/// error enum.
+#[derive(Debug, Clone)]
+pub enum AccountLinkFailure {
+    /// The request is invalid: `ValidationException`.
+    Validation(String),
+    /// The link's current state forbids the change, or the target account is
+    /// already linked or invited: `ConflictException`.
+    Conflict(String),
+    /// No stored link answers to the identifier: `ResourceNotFoundException`.
+    /// Carries the identifier for that shape's `ResourceId` member.
+    NotFound {
+        resource_id: String,
+        message: String,
+    },
+}
+
+impl AccountLinkFailure {
+    /// The `ResourceNotFoundException` for a link identifier that names no
+    /// stored link.
+    fn not_found(resource_id: &str) -> Self {
+        Self::NotFound {
+            resource_id: resource_id.to_string(),
+            message: format!("The account link {resource_id} could not be found."),
         }
     }
 }
@@ -385,6 +604,22 @@ pub struct ComAmazonawsWorkspacesWorkspacesserviceState {
     /// Monotonic counter behind both the minted `WorkspaceId` and the creation
     /// order [`Self::ordered_workspaces`] reports.
     pub next_workspace_seq: u64,
+    /// Every stored account link by creation sequence: the stable order
+    /// [`Self::ordered_account_links`] reports, held sorted so no call has to
+    /// sort the store. Never larger than [`MAX_STORED_ACCOUNT_LINKS`].
+    account_links: BTreeMap<u64, AccountLinkRecord>,
+    /// Which creation sequence each `AccountLinkId` names, so a lookup by id
+    /// costs one map hit rather than a scan. Kept in step with
+    /// `account_links` by [`Self::insert_account_link`] /
+    /// [`Self::remove_account_link`].
+    account_link_ids: HashMap<String, u64>,
+    /// Monotonic counter behind both the minted `AccountLinkId` and the
+    /// creation order [`Self::ordered_account_links`] reports.
+    next_account_link_seq: u64,
+    /// The account-wide BYOL configuration. Account-scoped, so one value rather
+    /// than a map: `ModifyAccount` writes it through [`Self::modify_byol`] and
+    /// `DescribeAccount` reads it through [`Self::byol`].
+    byol: AccountByolConfig,
     /// Every stored bundle by sequence number: the stable order
     /// [`Self::ordered_bundles`] reports and `DescribeWorkspaceBundles`
     /// paginates over. Never larger than [`MAX_STORED_BUNDLES`].
@@ -406,12 +641,18 @@ impl Default for ComAmazonawsWorkspacesWorkspacesserviceState {
     /// are AWS's own and are describable in a brand-new account, so reporting
     /// them must not be a write. Its `CreationTime` is the instant the store was
     /// built, which is stable for the life of the emulator.
+    ///
+    /// BYOL starts off, which is what an account nobody has modified reports.
     fn default() -> Self {
         let mut state = Self {
             workspaces: HashMap::new(),
             occupancy: HashMap::new(),
             order: BTreeMap::new(),
             next_workspace_seq: 0,
+            account_links: BTreeMap::new(),
+            account_link_ids: HashMap::new(),
+            next_account_link_seq: 0,
+            byol: AccountByolConfig::default(),
             bundles: BTreeMap::new(),
             bundle_ids: HashMap::new(),
             next_bundle_seq: 0,
@@ -466,6 +707,36 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
     /// The stored WorkSpace `workspace_id` names, if any.
     pub fn workspace(&self, workspace_id: &str) -> Option<&WorkspaceRecord> {
         self.workspaces.get(workspace_id)
+    }
+
+    /// The account-wide BYOL configuration `DescribeAccount` reports.
+    pub fn byol(&self) -> &AccountByolConfig {
+        &self.byol
+    }
+
+    /// Apply a `ModifyAccount` change to the BYOL configuration and report what
+    /// is now stored.
+    ///
+    /// Every member the request omits LEAVES THE STORED VALUE ALONE — a
+    /// `ModifyAccount` request carries only the parts of the configuration it
+    /// changes. So `turn_on_byol` is "the request asked for BYOL to be ENABLED",
+    /// not "the request's support value": `false` means the request named no
+    /// support value and the stored flag is untouched, never that BYOL is turned
+    /// off. Nothing here can turn BYOL off, which matches the model's input enum
+    /// `DedicatedTenancySupportEnum` having the single value `ENABLED`. Which
+    /// combinations may be stored at all is decided before this is called.
+    pub fn modify_byol(
+        &mut self,
+        turn_on_byol: bool,
+        management_cidr_range: Option<&str>,
+    ) -> AccountByolConfig {
+        if turn_on_byol {
+            self.byol.enabled = true;
+        }
+        if let Some(range) = management_cidr_range {
+            self.byol.management_cidr_range = Some(range.to_string());
+        }
+        self.byol.clone()
     }
 
     /// Store `record` and point both indexes at it.
@@ -635,6 +906,213 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         self.next_workspace_seq
     }
 
+    // --- Account links ---------------------------------------------------
+
+    /// Every stored account link in creation order.
+    pub fn ordered_account_links(&self) -> Vec<&AccountLinkRecord> {
+        self.account_links.values().collect()
+    }
+
+    /// How many account links are stored.
+    pub fn account_link_count(&self) -> usize {
+        self.account_links.len()
+    }
+
+    /// The stored link `account_link_id` names, if any.
+    pub fn account_link(&self, account_link_id: &str) -> Option<&AccountLinkRecord> {
+        self.account_link_ids
+            .get(account_link_id)
+            .and_then(|seq| self.account_links.get(seq))
+    }
+
+    /// The stored link between `account_id` and `linked_account_id`.
+    ///
+    /// This is what `GetAccountLink`'s `LinkedAccountId` names: the account on
+    /// the other side of the link from the caller's. The earliest created
+    /// match is reported, so the answer does not depend on iteration order.
+    pub fn account_link_by_linked_account(
+        &self,
+        account_id: &str,
+        linked_account_id: &str,
+    ) -> Option<&AccountLinkRecord> {
+        self.account_links.values().find(|record| {
+            (record.source_account_id == account_id || record.target_account_id == account_id)
+                && record.linked_account_id(account_id) == linked_account_id
+        })
+    }
+
+    /// Invite `target_account_id` to link with `source_account_id`.
+    ///
+    /// The invitation is persisted awaiting the target account's own accept or
+    /// reject call, which is the status `CreateAccountLinkInvitation` reports.
+    pub fn create_account_link_invitation(
+        &mut self,
+        source_account_id: &str,
+        target_account_id: &str,
+        client_token: Option<&str>,
+    ) -> Result<AccountLinkRecord, AccountLinkFailure> {
+        // `ValidationException`: "You either haven't provided a TargetAccountId
+        // or are using the same value for TargetAccountId and SourceAccountId."
+        // (A missing `TargetAccountId` is refused before a handler runs — the
+        // member is `required`.)
+        if target_account_id == source_account_id {
+            return Err(AccountLinkFailure::Validation(format!(
+                "TargetAccountId {target_account_id} must not be the same value as SourceAccountId."
+            )));
+        }
+
+        // `ClientToken` is "a string of up to 64 ASCII characters that Amazon
+        // WorkSpaces uses to ensure idempotent creation", so a repeat of the
+        // same token from the same source account reports the link that token
+        // already created instead of creating a second one.
+        if let Some(token) = client_token {
+            if let Some(existing) = self.account_links.values().find(|record| {
+                record.source_account_id == source_account_id
+                    && record.client_token.as_deref() == Some(token)
+            }) {
+                if existing.target_account_id == target_account_id {
+                    return Ok(existing.clone());
+                }
+                return Err(AccountLinkFailure::Validation(format!(
+                    "ClientToken {token} was already used to invite TargetAccountId {}.",
+                    existing.target_account_id
+                )));
+            }
+        }
+
+        // `ConflictException`: "The TargetAccountId is already linked or invited."
+        if let Some(existing) = self.account_links.values().find(|record| {
+            record.source_account_id == source_account_id
+                && record.target_account_id == target_account_id
+                && record.status.holds_target_account()
+        }) {
+            return Err(AccountLinkFailure::Conflict(format!(
+                "The TargetAccountId {target_account_id} is already linked or invited by account link {}.",
+                existing.account_link_id
+            )));
+        }
+
+        // The store is bounded: refuse rather than grow without end.
+        if self.account_links.len() >= MAX_STORED_ACCOUNT_LINKS {
+            return Err(AccountLinkFailure::Conflict(format!(
+                "At most {MAX_STORED_ACCOUNT_LINKS} account links can exist."
+            )));
+        }
+
+        let seq = self.mint_account_link_seq();
+        let record = AccountLinkRecord {
+            seq,
+            // `LinkId` is `^link-.{8,24}$`; a fixed-width 16-hex rendering of
+            // the sequence number sits inside that, and is a function of the
+            // sequence alone, so no id repeats within one run.
+            account_link_id: format!("link-{seq:016x}"),
+            source_account_id: source_account_id.to_string(),
+            target_account_id: target_account_id.to_string(),
+            // The invitation waits for the target account to answer it; this is
+            // not a transition the clock owes, so nothing settles it.
+            status: AccountLinkStatus::PendingAcceptanceByTargetAccount,
+            client_token: client_token.map(str::to_string),
+        };
+        self.insert_account_link(record.clone());
+        Ok(record)
+    }
+
+    /// Accept the invitation `account_link_id` names: the link becomes `LINKED`.
+    pub fn accept_account_link_invitation(
+        &mut self,
+        account_link_id: &str,
+    ) -> Result<AccountLinkRecord, AccountLinkFailure> {
+        self.answer_invitation(account_link_id, AccountLinkStatus::Linked, "accepted")
+    }
+
+    /// Reject the invitation `account_link_id` names: the link becomes `REJECTED`.
+    pub fn reject_account_link_invitation(
+        &mut self,
+        account_link_id: &str,
+    ) -> Result<AccountLinkRecord, AccountLinkFailure> {
+        self.answer_invitation(account_link_id, AccountLinkStatus::Rejected, "rejected")
+    }
+
+    /// Delete the invitation `account_link_id` names.
+    ///
+    /// Only an invitation is deletable — the operation is documented as deleting
+    /// "the account link invitation" — so an established link is refused as a
+    /// conflict. The removed record is reported with `LINK_NOT_FOUND`, the only
+    /// value of the model's status enum that describes a link that no longer
+    /// exists.
+    pub fn delete_account_link_invitation(
+        &mut self,
+        account_link_id: &str,
+    ) -> Result<AccountLinkRecord, AccountLinkFailure> {
+        let record = self.account_link_mut(account_link_id)?;
+        if record.status == AccountLinkStatus::Linked {
+            return Err(AccountLinkFailure::Conflict(format!(
+                "The account link {account_link_id} is in status {} and cannot be deleted.",
+                record.status.as_wire()
+            )));
+        }
+        let mut removed = record.clone();
+        self.remove_account_link(account_link_id);
+        removed.status = AccountLinkStatus::LinkNotFound;
+        Ok(removed)
+    }
+
+    /// Move an invitation still awaiting the target account into `answered`.
+    ///
+    /// A link that already carries an answer is refused rather than answered a
+    /// second time: accepting or rejecting is the target account's one-time
+    /// response to an invitation.
+    fn answer_invitation(
+        &mut self,
+        account_link_id: &str,
+        answered: AccountLinkStatus,
+        action: &str,
+    ) -> Result<AccountLinkRecord, AccountLinkFailure> {
+        let record = self.account_link_mut(account_link_id)?;
+        if record.status != AccountLinkStatus::PendingAcceptanceByTargetAccount {
+            return Err(AccountLinkFailure::Conflict(format!(
+                "The account link {account_link_id} is in status {} and cannot be {action}.",
+                record.status.as_wire()
+            )));
+        }
+        record.status = answered;
+        Ok(record.clone())
+    }
+
+    fn account_link_mut(
+        &mut self,
+        account_link_id: &str,
+    ) -> Result<&mut AccountLinkRecord, AccountLinkFailure> {
+        let seq = *self
+            .account_link_ids
+            .get(account_link_id)
+            .ok_or_else(|| AccountLinkFailure::not_found(account_link_id))?;
+        self.account_links
+            .get_mut(&seq)
+            .ok_or_else(|| AccountLinkFailure::not_found(account_link_id))
+    }
+
+    /// Store `record` and point the id index at it.
+    fn insert_account_link(&mut self, record: AccountLinkRecord) {
+        self.account_link_ids
+            .insert(record.account_link_id.clone(), record.seq);
+        self.account_links.insert(record.seq, record);
+    }
+
+    /// Drop the record `account_link_id` names and its index entry.
+    fn remove_account_link(&mut self, account_link_id: &str) {
+        if let Some(seq) = self.account_link_ids.remove(account_link_id) {
+            self.account_links.remove(&seq);
+        }
+    }
+
+    /// The next account-link creation sequence number. Strictly increasing and
+    /// never reset, so no minted `AccountLinkId` repeats within one run.
+    fn mint_account_link_seq(&mut self) -> u64 {
+        self.next_account_link_seq += 1;
+        self.next_account_link_seq
+    }
+
     /// Every stored bundle in the order [`Self::ordered_bundles`] documents: the
     /// Amazon-provided catalog first, then the bundles this account created, in
     /// creation order.
@@ -794,12 +1272,14 @@ fn invalid_state(
 
 /// Encode "resume after this creation sequence number" as a `NextToken`.
 ///
-/// The token names the LAST WorkSpace a page reported, by the creation sequence
-/// that record carries, rather than an offset into the list: a WorkSpace
-/// terminated between two pages then shifts nothing, so a paginating client
-/// cannot skip an item. The encoding is a fixed-width lowercase-hex rendering of
-/// that sequence number — deterministic, so resuming needs no stored token, and
-/// 16 characters long, inside the model's `PaginationToken` length of 1..2048.
+/// The token names the LAST record a page reported, by the creation sequence
+/// that record carries, rather than an offset into the list: a record removed
+/// between two pages then shifts nothing, so a paginating client cannot skip an
+/// item. The encoding is a fixed-width lowercase-hex rendering of that sequence
+/// number — deterministic, so resuming needs no stored token, and 16 characters
+/// long, inside the model's `PaginationToken` length of 1..2048. Both paginated
+/// readers (`DescribeWorkspaces` over WorkSpaces, `ListAccountLinks` over
+/// account links) share it, so one token format covers the service.
 pub fn encode_page_token(after_seq: u64) -> String {
     format!("{after_seq:016x}")
 }

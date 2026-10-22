@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored connector `ConnectorArn` names, built entirely from state. A
+//! reporting operation: the one write it makes is materialising the status transition the
+//! clock already owes.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +151,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConnector"))
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        let mut store = state.lock();
+        // The only write a report may make: the transition the clock already owes.
+        store.settle(now);
+
+        let stored = store
+            .connectors
+            .get(&input.connector_arn)
+            .ok_or_else(|| not_found(&input.connector_arn))?;
+        Ok(GetConnectorOutput {
+            connector: Some(stored.to_connector()),
+        })
     }
+}
+
+/// No connector is stored under this ARN — HTTP 404 `ResourceNotFoundException`. A read
+/// after `DeleteConnector` lands here, because the delete removed the record.
+fn not_found(connector_arn: &str) -> GetConnectorError {
+    GetConnectorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("Connector {connector_arn} could not be found"),
+        resource_id: connector_arn.to_string(),
+        resource_type: crate::state::RESOURCE_TYPE_CONNECTOR.to_string(),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server-side fault, which this operation models as
+/// `InternalServerException` (HTTP 500). Never answered by constructing a private engine.
+fn store_unavailable() -> GetConnectorError {
+    GetConnectorErrorModeled::InternalServerException(InternalServerException {
+        message: "the Connector for SCEP connector store is unavailable".to_string(),
+    })
+    .into()
 }

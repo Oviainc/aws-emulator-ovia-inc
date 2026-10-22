@@ -1,11 +1,395 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-eks-awswesleyfrontend service.
+//!
+//! This holds the cluster lifecycle slice: `CreateCluster` writes a
+//! [`ClusterRecord`] here, and `DescribeCluster`, `ListClusters`, `TagResource`,
+//! `ListTagsForResource` and `DeleteCluster` all compute their responses from it.
+//! Nothing in `src/ops/` keeps a second copy of a cluster.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
+
+use sha2::{Digest, Sha256};
+
+use crate::ops::types::{
+    AccessConfigResponse, Certificate, Cluster, ComputeConfigResponse, ControlPlaneScalingConfig,
+    EncryptionConfig, Identity, KubeApiServerConfigResponse, KubeControllerManagerConfigResponse,
+    KubeSchedulerConfigResponse, KubernetesNetworkConfigResponse, Logging, OutpostConfigResponse,
+    RemoteNetworkConfigResponse, StorageConfigResponse, UpgradePolicyResponse, VpcConfigResponse,
+    ZonalShiftConfigResponse,
+};
+
+/// The `ClusterStatus` members this slice uses. The model's enum
+/// (`smithy_query query="shape" shape="ClusterStatus"`) is
+/// `CREATING | ACTIVE | DELETING | FAILED | UPDATING | PENDING`; `Cluster$status`
+/// is a plain string member, so the status is stored as the wire token.
+pub const STATUS_CREATING: &str = "CREATING";
+/// See [`STATUS_CREATING`].
+pub const STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`STATUS_CREATING`].
+pub const STATUS_DELETING: &str = "DELETING";
+
+/// How long a newly created cluster reports `CREATING` before the clock owes it
+/// `ACTIVE`.
+///
+/// CreateCluster's own documentation says only "In most cases, it takes several
+/// minutes to create a cluster" — no duration is published, so this span is
+/// CHOSEN rather than cited: long enough that a caller which describes the
+/// cluster straight after creating it still observes `CREATING` (and the state
+/// errors that go with it), short enough to be worth waiting for. The due
+/// instant is stored on the record; nothing sleeps for it.
+pub const CLUSTER_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The Kubernetes version a cluster gets when `CreateCluster` is called without
+/// `version`. The model documents the member as "The desired Kubernetes version
+/// for your cluster. If you don't specify a value here, the default version
+/// available in Amazon EKS is used" without naming it, so this emulator pins one
+/// recent minor version instead of inventing a value per request.
+pub const DEFAULT_KUBERNETES_VERSION: &str = "1.31";
+
+/// The platform version a freshly created cluster carries. EKS platform versions
+/// are `eks.<n>`, numbered from 1 within each Kubernetes minor version, so a
+/// cluster created now starts at the first one.
+pub const INITIAL_PLATFORM_VERSION: &str = "eks.1";
+
+/// The `ipFamily` a cluster gets when `kubernetesNetworkConfig.ipFamily` is
+/// absent: "If you don't specify a value, `ipv4` is used by default"
+/// (`KubernetesNetworkConfigRequest$ipFamily`).
+pub const IP_FAMILY_IPV4: &str = "ipv4";
+/// The other `IpFamily` member (`smithy_query query="shape" shape="IpFamily"`).
+pub const IP_FAMILY_IPV6: &str = "ipv6";
+
+/// The service CIDR Kubernetes assigns when `serviceIpv4Cidr` is absent on an
+/// `ipv4` cluster: "If you don't specify a block, Kubernetes assigns addresses
+/// from either the `10.100.0.0/16` or `172.20.0.0/16` CIDR blocks"
+/// (`KubernetesNetworkConfigRequest$serviceIpv4Cidr`). One of the two documented
+/// blocks is pinned so a read-back is stable.
+pub const DEFAULT_SERVICE_IPV4_CIDR: &str = "10.100.0.0/16";
+
+/// The `authenticationMode` a cluster gets when `accessConfig` does not name one:
+/// "If you create a cluster by using the EKS API, Amazon Web Services SDKs, or
+/// CloudFormation, the default is `CONFIG_MAP`"
+/// (`CreateAccessConfigRequest$authenticationMode`) — and this emulator is
+/// reached through the API.
+pub const DEFAULT_AUTHENTICATION_MODE: &str = "CONFIG_MAP";
+
+/// The `supportType` a cluster gets when `upgradePolicy` is absent: "New
+/// clusters, by default, have extended support enabled"
+/// (`CreateCluster$upgradePolicy`).
+pub const DEFAULT_SUPPORT_TYPE: &str = "EXTENDED";
+
+/// The CIDR allowed to reach the public endpoint when `publicAccessCidrs` is
+/// absent: "The default value is `0.0.0.0/0` and additionally `::/0` for
+/// dual-stack `IPv6` clusters" (`VpcConfigRequest$publicAccessCidrs`).
+pub const DEFAULT_PUBLIC_ACCESS_CIDR_V4: &str = "0.0.0.0/0";
+/// See [`DEFAULT_PUBLIC_ACCESS_CIDR_V4`] — added for an `ipv6` cluster.
+pub const DEFAULT_PUBLIC_ACCESS_CIDR_V6: &str = "::/0";
+
+/// The region used when a request carries no SigV4 credential scope to read one
+/// from. It matches the region the emulator writes into the shared AWS config it
+/// generates for clients.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The number of clusters this store holds before `CreateCluster` answers
+/// `ResourceLimitExceededException`.
+///
+/// AWS publishes an adjustable EKS service quota of 100 clusters per Region per
+/// account, and exceeding a service limit is exactly what that error reports. It
+/// also bounds the store, so a long-lived emulator cannot grow without limit on
+/// repeated creates.
+pub const MAX_CLUSTERS: usize = 100;
+
+/// The number of clusters this store holds ACROSS EVERY REGION before
+/// `CreateCluster` answers `ResourceLimitExceededException`.
+///
+/// [`MAX_CLUSTERS`] is the published per-Region quota, but the region a record
+/// is filed under comes from the caller's own SigV4 credential scope (see
+/// [`request_region`]), so the caller decides how many regions exist and a
+/// per-region cap alone does not bound the store. This ceiling does: it is the
+/// per-region quota times a small number of regions — enough for any realistic
+/// multi-region use, and a hard stop on how much a repeated create can retain.
+pub const MAX_STORED_CLUSTERS: usize = MAX_CLUSTERS * 10;
+
+/// The number of tags one resource may carry.
+///
+/// The model bounds a single request's map at 1..50 (`TagMap`), and the same
+/// 50-tag ceiling applies to the resource's ACCUMULATED map — so a merge that
+/// would push a record past it is refused rather than letting repeated
+/// `TagResource` calls grow the record without limit.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The number of clusters `ListClusters` returns when the caller gives no
+/// `maxResults`. The model bounds `maxResults` at 1..100, so the full page is the
+/// natural default.
+pub const DEFAULT_LIST_PAGE_SIZE: i32 = 100;
+
+/// One cluster, as this service stores it.
+///
+/// Everything a `Cluster` reports is held here — including the server-generated
+/// parts (`arn`, `createdAt`, `endpoint`, `platformVersion`, `identity`,
+/// `certificateAuthority`) — so `DescribeCluster` returns exactly what
+/// `CreateCluster` wrote rather than recomputing anything per request.
+#[derive(Debug, Clone)]
+pub struct ClusterRecord {
+    pub name: String,
+    pub arn: String,
+    pub created_at: SystemTime,
+    pub version: String,
+    pub platform_version: String,
+    pub endpoint: String,
+    pub role_arn: String,
+    pub resources_vpc_config: VpcConfigResponse,
+    pub kubernetes_network_config: Option<KubernetesNetworkConfigResponse>,
+    pub logging: Option<Logging>,
+    pub identity: Option<Identity>,
+    pub certificate_authority: Option<Certificate>,
+    pub status: String,
+    /// When set, the instant at which the clock owes this cluster the move from
+    /// `CREATING` to `ACTIVE`. Cleared once the move is materialised.
+    pub active_at: Option<SystemTime>,
+    pub tags: BTreeMap<String, String>,
+    pub encryption_config: Vec<EncryptionConfig>,
+    pub access_config: Option<AccessConfigResponse>,
+    pub deletion_protection: bool,
+    pub client_request_token: Option<String>,
+    pub outpost_config: Option<OutpostConfigResponse>,
+    pub upgrade_policy: Option<UpgradePolicyResponse>,
+    pub zonal_shift_config: Option<ZonalShiftConfigResponse>,
+    pub remote_network_config: Option<RemoteNetworkConfigResponse>,
+    pub compute_config: Option<ComputeConfigResponse>,
+    pub storage_config: Option<StorageConfigResponse>,
+    pub control_plane_scaling_config: Option<ControlPlaneScalingConfig>,
+    pub kube_api_server_config: Option<KubeApiServerConfigResponse>,
+    pub kube_scheduler_config: Option<KubeSchedulerConfigResponse>,
+    pub kube_controller_manager_config: Option<KubeControllerManagerConfigResponse>,
+}
+
+impl ClusterRecord {
+    /// Materialise the status move the clock already owes at `now`.
+    ///
+    /// This is the only write a reporting operation may make: the transition was
+    /// due at `active_at` whether or not anybody called, so applying it on read
+    /// does not change what a later caller sees.
+    pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        if self.active_at.is_some_and(|due| now >= due) {
+            self.status = STATUS_ACTIVE.to_string();
+            self.active_at = None;
+        }
+    }
+
+    /// This record as the modelled `Cluster` shape.
+    pub fn to_cluster(&self) -> Cluster {
+        Cluster {
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            version: Some(self.version.clone()),
+            endpoint: Some(self.endpoint.clone()),
+            role_arn: Some(self.role_arn.clone()),
+            resources_vpc_config: Some(self.resources_vpc_config.clone()),
+            kubernetes_network_config: self.kubernetes_network_config.clone(),
+            logging: self.logging.clone(),
+            identity: self.identity.clone(),
+            status: Some(self.status.clone()),
+            certificate_authority: self.certificate_authority.clone(),
+            client_request_token: self.client_request_token.clone(),
+            platform_version: Some(self.platform_version.clone()),
+            tags: Some(
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            encryption_config: (!self.encryption_config.is_empty())
+                .then(|| self.encryption_config.clone()),
+            access_config: self.access_config.clone(),
+            deletion_protection: Some(self.deletion_protection),
+            outpost_config: self.outpost_config.clone(),
+            upgrade_policy: self.upgrade_policy.clone(),
+            zonal_shift_config: self.zonal_shift_config.clone(),
+            remote_network_config: self.remote_network_config.clone(),
+            compute_config: self.compute_config.clone(),
+            storage_config: self.storage_config.clone(),
+            control_plane_scaling_config: self.control_plane_scaling_config.clone(),
+            kube_api_server_config: self.kube_api_server_config.clone(),
+            kube_scheduler_config: self.kube_scheduler_config.clone(),
+            kube_controller_manager_config: self.kube_controller_manager_config.clone(),
+            // Left unset by this slice, each with its own gap issue: `id` is the
+            // id of a local cluster on an Outpost, `health` is filled in by
+            // cluster insights, and `connector_config` only by `RegisterCluster`.
+            id: None,
+            health: None,
+            connector_config: None,
+        }
+    }
+}
 
 /// Per-service state for com-amazonaws-eks-awswesleyfrontend. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsEksAwswesleyfrontendState {
-    // TODO: add service-specific state fields
+    /// Clusters by `(region, name)`.
+    ///
+    /// A cluster name is unique per REGION, not globally — "The name must be
+    /// unique within the Amazon Web Services Region and Amazon Web Services
+    /// account that you're creating the cluster in" (`CreateCluster$name`) — and
+    /// every ARN and endpoint a record carries names one region, so the region a
+    /// request is signed for is part of the key. A `BTreeMap` so `ListClusters`
+    /// walks a stable, sorted order within a region and a page token can name the
+    /// key to resume after. The account is not part of the key: this emulator
+    /// serves a single account ([`::engine::mock_account_id`]). Its size is
+    /// bounded by [`MAX_STORED_CLUSTERS`], which `CreateCluster` enforces.
+    pub clusters: BTreeMap<(String, String), ClusterRecord>,
+    /// Cluster ARN -> the `(region, name)` key of the cluster it identifies, so
+    /// the tag operations resolve a `resourceArn` without scanning every record.
+    /// An EKS cluster ARN already carries the region, so this is what lets a tag
+    /// call name a cluster in any region. It holds exactly one entry per stored
+    /// cluster, so [`MAX_STORED_CLUSTERS`] bounds it too.
+    pub arn_index: BTreeMap<String, (String, String)>,
+    // The nodegroup and update maps the next slices need are deliberately NOT
+    // declared yet: a field no operation reads is dead weight that every
+    // `Debug`/`Default` and every reviewer has to account for. Each is added by
+    // the slice that first writes it (`CreateNodegroup`, `UpdateClusterConfig`
+    // and friends, still 501 with their own gap issues).
+}
+
+impl ComAmazonawsEksAwswesleyfrontendState {
+    /// Materialise every clock-owed status move across the store.
+    pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        for cluster in self.clusters.values_mut() {
+            cluster.materialize_due_transitions(now);
+        }
+    }
+
+    /// The `(region, name)` key of the cluster `arn` identifies, if this store
+    /// holds it.
+    pub fn cluster_key_for_arn(&self, arn: &str) -> Option<(String, String)> {
+        self.arn_index.get(arn).cloned()
+    }
+
+    /// The names of the clusters this store holds in `region`, in sorted order.
+    ///
+    /// The map is keyed `(region, name)`, so its iteration order already sorts
+    /// each region's names; this only drops the other regions.
+    pub fn cluster_names_in<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.clusters
+            .keys()
+            .filter(move |(key_region, _)| key_region == region)
+            .map(|(_, name)| name.as_str())
+    }
+}
+
+/// The region a request is signed for, read from its SigV4 credential scope.
+///
+/// Every ARN and endpoint this service mints is regional, so the region comes
+/// from the caller rather than from a constant. A request with no parseable
+/// scope (authentication off, no `Authorization` header) falls back to
+/// [`DEFAULT_REGION`].
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The 32-hex-character resource identifier EKS gives a cluster, which appears in
+/// the cluster's API server endpoint host and in its OIDC issuer URL.
+///
+/// Derived from the cluster ARN — which already carries the account, region and
+/// name — so it is distinct per cluster and stable for the record's whole life.
+/// It is computed once, when the cluster is created, and stored on the record;
+/// no read recomputes it.
+pub fn derive_cluster_resource_id(arn: &str) -> String {
+    let digest = Sha256::digest(arn.as_bytes());
+    hex::encode_upper(&digest[..16])
+}
+
+/// The cluster's Kubernetes API server endpoint, in the host form EKS publishes:
+/// `https://<resource id>.<shard>.<region>.eks.amazonaws.com`.
+pub fn derive_cluster_endpoint(resource_id: &str, region: &str) -> String {
+    let shard = resource_id
+        .get(..3)
+        .unwrap_or("eks")
+        .to_ascii_lowercase();
+    format!("https://{resource_id}.{shard}.{region}.eks.amazonaws.com")
+}
+
+/// The cluster's OIDC identity provider issuer URL, in the form EKS publishes:
+/// `https://oidc.eks.<region>.amazonaws.com/id/<resource id>`.
+pub fn derive_oidc_issuer(resource_id: &str, region: &str) -> String {
+    format!("https://oidc.eks.{region}.amazonaws.com/id/{resource_id}")
+}
+
+/// The IPv6 service CIDR a cluster gets when `ipFamily` is `ipv6`.
+///
+/// The model states the rule: "Kubernetes assigns services `IPv6` addresses from
+/// the unique local address range `(fc00::/7)`. You can't specify a custom
+/// `IPv6` CIDR block" (`KubernetesNetworkConfigRequest$ipFamily`) — so the block
+/// is always server-assigned. It is derived from the cluster's resource id, which
+/// puts it inside `fd00::/8`, and stored with the record.
+pub fn derive_service_ipv6_cidr(resource_id: &str) -> String {
+    let hextet = |range: std::ops::Range<usize>| {
+        resource_id
+            .get(range)
+            .unwrap_or("0000")
+            .to_ascii_lowercase()
+    };
+    format!("fd{}:{}:{}::/108", hextet(0..2), hextet(2..6), hextet(6..10))
+}
+
+/// The cluster's `certificateAuthority.data`.
+///
+/// A real cluster reports the base64 of the PEM bundle its API server is fronted
+/// by. This emulator runs no certificate authority, so rather than synthesise
+/// bytes that look like a certificate it stores an explicitly labelled
+/// placeholder: a caller that base64-decodes it reads, in plain text, that no CA
+/// exists here. It is written once at create time and read back unchanged.
+pub fn derive_certificate_authority_data(resource_id: &str) -> String {
+    let placeholder = format!(
+        "-----BEGIN CERTIFICATE-----\n\
+         EMULATOR PLACEHOLDER: this emulator runs no certificate authority, so this\n\
+         is not a usable certificate for cluster id {resource_id}.\n\
+         -----END CERTIFICATE-----\n"
+    );
+    ::aws_smithy_types::base64::encode(placeholder)
+}
+
+/// How many bytes of the name's own digest a page token carries, so a token this
+/// service did not mint is refused instead of being resumed from. Four bytes is
+/// the usual width for a checksum of this kind; it is a provenance check, not a
+/// secret (the name travels in the token, as AWS's own opaque-but-unsigned
+/// pagination tokens do).
+pub const PAGE_TOKEN_TAG_LEN: usize = 4;
+
+/// Encode a `ListClusters` page token that resumes AFTER `last_returned`.
+///
+/// Derived from the last key returned, not from an index into a transient list,
+/// so a token stays valid across creates and deletes. Hex rather than base64
+/// because the token travels in a query string (`@httpQuery nextToken`) and the
+/// standard base64 alphabet contains `+` and `/`, which a query parser may read
+/// as a space and a separator.
+///
+/// The name is prefixed with [`PAGE_TOKEN_TAG_LEN`] bytes of its digest, so only
+/// a token this service minted is honoured: an arbitrary hex string — including
+/// a well-formed encoding of some other listing's key — fails the check and is
+/// refused rather than silently resumed from.
+pub fn encode_page_token(last_returned: &str) -> String {
+    let digest = Sha256::digest(last_returned.as_bytes());
+    let mut token = Vec::with_capacity(PAGE_TOKEN_TAG_LEN + last_returned.len());
+    token.extend_from_slice(&digest[..PAGE_TOKEN_TAG_LEN]);
+    token.extend_from_slice(last_returned.as_bytes());
+    hex::encode(token)
+}
+
+/// The cluster name a page token resumes after, or `None` when the token is not
+/// one this service issued.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    let bytes = hex::decode(token).ok()?;
+    if bytes.len() <= PAGE_TOKEN_TAG_LEN {
+        return None;
+    }
+    let (tag, name) = bytes.split_at(PAGE_TOKEN_TAG_LEN);
+    let name = String::from_utf8(name.to_vec()).ok()?;
+    (Sha256::digest(name.as_bytes())[..PAGE_TOKEN_TAG_LEN] == *tag).then_some(name)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

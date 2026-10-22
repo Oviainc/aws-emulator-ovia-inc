@@ -753,8 +753,9 @@ async fn get_and_the_tag_operations_answer_404_for_an_unknown_resource() {
         );
         assert_eq!(
             answer.error_code(),
-            "ResourceNotFoundException",
-            "a tag operation on an unknown ARN must answer ResourceNotFoundException"
+            "NotFoundException",
+            "a tag operation on an unknown ARN must answer the wire code the service \
+             publishes for its tagging operations"
         );
     }
 }

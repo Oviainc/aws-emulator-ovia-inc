@@ -23,12 +23,11 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hashes the id counter into the opaque resource ids this service mints.
 sha2 = { workspace = true }
+# Encodes the opaque pagination cursor a `NextToken` carries.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-hex = { workspace = true }
 
 [lints]
 workspace = true

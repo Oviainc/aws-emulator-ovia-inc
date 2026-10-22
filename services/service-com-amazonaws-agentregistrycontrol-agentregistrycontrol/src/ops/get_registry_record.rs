@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetRegistryRecord
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetRegistryRecord`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetRegistryRecord::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored record of the stored registry, each named by a bare
+//! id or by its full ARN, after applying whatever transition the clock already owes.
 //!
 //! ## Shape of an operation
 //!
@@ -197,18 +190,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetRegistryRecord` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetRegistryRecordErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetRegistryRecord"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetRegistryRecordErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the agent registry store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        let registry_id = crate::state::identifier_to_id(&input.registry_id);
+        let record_id = crate::state::identifier_to_id(&input.record_id);
+        let record = state
+            .registries
+            .get(registry_id)
+            .and_then(|registry| registry.records.get(record_id));
+        let Some(record) = record else {
+            return Err(GetRegistryRecordErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "record {record_id} was not found in registry {registry_id}"
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetRegistryRecordOutput {
+            registry_arn: record.registry_arn.clone(),
+            record_arn: record.record_arn.clone(),
+            record_id: record.record_id.clone(),
+            name: record.name.clone(),
+            display_name: record.display_name.clone(),
+            description: record.description.clone(),
+            record_type: record.record_type.clone(),
+            descriptors: record.descriptors.clone(),
+            record_version: Some(record.record_version.clone()),
+            status: record.status.clone(),
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            status_reason: record.status_reason.clone(),
+            // An empty provenance list is reported as absent rather than as an empty
+            // list: the member is only populated for records with a lineage.
+            provenance: (!record.provenance.is_empty()).then(|| record.provenance.clone()),
+            created_by_auto_detection: record.created_by_auto_detection,
+            created_by: record.created_by.clone(),
+            custom_metadata: record.custom_metadata.clone(),
+            custom_metadata_schema_compliance_status: record
+                .custom_metadata_schema_compliance_status
+                .clone(),
+        })
     }
 }

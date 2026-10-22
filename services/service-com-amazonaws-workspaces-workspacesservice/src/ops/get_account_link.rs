@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAccountLink
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAccountLink`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAccountLink::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Retrieves account-link information by `LinkId`, or by the `LinkedAccountId`
+//! on the other side of the link from the caller's account. The records live in
+//! [`crate::state`], which the other five account-link operations read and write
+//! too.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -106,6 +104,19 @@ impl From<GetAccountLinkErrorModeled> for GetAccountLinkError {
     }
 }
 
+/// The `ResourceNotFoundException` for an identifier that names no stored link.
+///
+/// The shape carries a `ResourceId` ("The ID of the resource that could not be
+/// found"), so the identifier the caller sent is reported there as well as in the
+/// message.
+fn not_found(resource_id: &str) -> GetAccountLinkError {
+    GetAccountLinkErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("The account link {resource_id} could not be found.")),
+        resource_id: Some(resource_id.to_string()),
+    })
+    .into()
+}
+
 /// The `GetAccountLink` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -142,18 +153,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAccountLink` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAccountLinkErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAccountLink"))
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAccountLinkErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        let state = state.lock();
+
+        // Both members are optional in the model, but a lookup needs one of
+        // them: an identifier for the link, or the account on the other side of
+        // it. A request carrying neither names no resource at all, so it is
+        // refused rather than answered with some link.
+        let caller_account_id = ::engine::emulator_account_id();
+        let record = match (
+            input.link_id.as_deref(),
+            input.linked_account_id.as_deref(),
+        ) {
+            (None, None) => {
+                return Err(GetAccountLinkErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "Either LinkId or LinkedAccountId must be provided.".to_string(),
+                        ),
+                    },
+                )
+                .into())
+            }
+            // When both are sent they must describe the SAME link, otherwise the
+            // request names no stored resource.
+            (Some(link_id), linked_account_id) => state
+                .account_link(link_id)
+                .filter(|record| {
+                    linked_account_id.is_none_or(|account_id| {
+                        record.linked_account_id(caller_account_id) == account_id
+                    })
+                })
+                .ok_or_else(|| not_found(link_id))?,
+            (None, Some(linked_account_id)) => state
+                .account_link_by_linked_account(caller_account_id, linked_account_id)
+                .ok_or_else(|| not_found(linked_account_id))?,
+        };
+
+        Ok(GetAccountLinkOutput {
+            account_link: Some(record.to_account_link()),
+        })
     }
 }
