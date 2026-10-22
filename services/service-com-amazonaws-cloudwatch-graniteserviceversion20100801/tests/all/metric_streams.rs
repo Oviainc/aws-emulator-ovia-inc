@@ -1,0 +1,409 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end cover for the CloudWatch metric-stream configuration loop: `PutMetricStream`
+//! creating and updating a stream, and `GetMetricStream` reading back what it persisted.
+//!
+//! Every table row is a distinct input along what the rule under test generalises over (the
+//! output format, which namespace filter is used, the statistic forms a format accepts, the
+//! number of filters and configurations, whether the stream already exists), so the recorded
+//! happy path is one row among many rather than the specification.
+
+use crate::harness::{build_router, call, error_code, ok};
+use serde_json::{json, Value};
+
+/// A `PutMetricStream` request with only the members the model makes required.
+fn put_request(name: &str, output_format: &str) -> Value {
+    json!({
+        "Name": name,
+        "FirehoseArn": "arn:aws:firehose:us-east-1:000000000000:deliverystream/metrics",
+        "RoleArn": "arn:aws:iam::000000000000:role/MetricStreamRole",
+        "OutputFormat": output_format,
+    })
+}
+
+/// A string member of a body.
+fn text(value: &Value, member: &str) -> Option<String> {
+    value
+        .get(member)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+/// A timestamp member, which the awsJson protocols carry as epoch seconds.
+fn stamp(value: &Value, member: &str) -> Option<f64> {
+    value.get(member).and_then(Value::as_f64)
+}
+
+#[tokio::test]
+async fn every_configuration_form_round_trips_through_get_metric_stream() {
+    // Rows differ along the output format, which of the two mutually exclusive namespace
+    // filters is used (and with how many entries), whether additional statistics are
+    // configured, and whether source-account metrics are included. Each row's statistics
+    // are ones its own format accepts.
+    let cases: Vec<(&str, &str, Value)> = vec![
+        ("required members only", "json", json!({})),
+        (
+            "include filter with two namespaces",
+            "opentelemetry0.7",
+            json!({
+                "IncludeFilters": [
+                    {"Namespace": "AWS/EC2"},
+                    {"Namespace": "AWS/Lambda", "MetricNames": ["Invocations", "Errors"]},
+                ],
+            }),
+        ),
+        (
+            "exclude filter, linked-account metrics and percentiles",
+            "opentelemetry1.0",
+            json!({
+                "ExcludeFilters": [{"Namespace": "AWS/S3"}],
+                "IncludeLinkedAccountsMetrics": true,
+                "StatisticsConfigurations": [{
+                    "IncludeMetrics": [{"Namespace": "AWS/EC2", "MetricName": "CPUUtilization"}],
+                    "AdditionalStatistics": ["p99", "p99.9"],
+                }],
+            }),
+        ),
+        (
+            "json statistics beyond the percentiles, with tags",
+            "json",
+            json!({
+                "StatisticsConfigurations": [
+                    {
+                        "IncludeMetrics": [{"Namespace": "MyApp", "MetricName": "Latency"}],
+                        "AdditionalStatistics": ["Average", "tm98", "PR(:300)"],
+                    },
+                    {
+                        "IncludeMetrics": [{"Namespace": "MyApp", "MetricName": "Size"}],
+                        "AdditionalStatistics": ["IQM"],
+                    },
+                ],
+                "Tags": [{"Key": "team", "Value": "observability"}],
+            }),
+        ),
+        (
+            "empty filter lists select every namespace",
+            "json",
+            json!({"IncludeFilters": [], "ExcludeFilters": []}),
+        ),
+    ];
+
+    for (row, (case, format, extra)) in cases.into_iter().enumerate() {
+        let router = build_router();
+        let name = format!("round-trip-{row}");
+        let mut request = put_request(&name, format);
+        for (member, value) in extra.as_object().expect("the row is an object") {
+            request[member.as_str()] = value.clone();
+        }
+
+        let put = ok(&router, "PutMetricStream", &request).await;
+        let arn = text(&put, "Arn").unwrap_or_default();
+        assert_eq!(
+            arn,
+            format!("arn:aws:cloudwatch:us-east-1:000000000000:metric-stream/{name}"),
+            "case {case:?}: expected the metric stream's own ARN, got {put}"
+        );
+
+        let got = ok(&router, "GetMetricStream", &json!({"Name": &name})).await;
+        assert_eq!(
+            text(&got, "Arn"),
+            Some(arn),
+            "case {case:?}: GetMetricStream must report the ARN PutMetricStream returned, got {got}"
+        );
+        assert_eq!(
+            text(&got, "Name"),
+            Some(name.clone()),
+            "case {case:?}: expected the configured name, got {got}"
+        );
+        // "When you use PutMetricStream to create a new metric stream, the stream is created
+        // in the running state."
+        assert_eq!(
+            text(&got, "State"),
+            Some("running".to_string()),
+            "case {case:?}: a new stream must be running, got {got}"
+        );
+        for member in ["FirehoseArn", "RoleArn", "OutputFormat"] {
+            assert_eq!(
+                text(&got, member),
+                text(&request, member),
+                "case {case:?}: {member} must round-trip, got {got}"
+            );
+        }
+        // An empty filter list constrains nothing, which is what no filter at all means, so
+        // it is reported as absent rather than as an empty list.
+        for member in ["IncludeFilters", "ExcludeFilters", "StatisticsConfigurations"] {
+            let configured = request
+                .get(member)
+                .filter(|value| value.as_array().is_some_and(|list| !list.is_empty()));
+            assert_eq!(
+                got.get(member),
+                configured,
+                "case {case:?}: {member} must round-trip, got {got}"
+            );
+        }
+        assert_eq!(
+            got.get("IncludeLinkedAccountsMetrics").and_then(Value::as_bool),
+            request
+                .get("IncludeLinkedAccountsMetrics")
+                .and_then(Value::as_bool),
+            "case {case:?}: IncludeLinkedAccountsMetrics must round-trip, got {got}"
+        );
+        let created = stamp(&got, "CreationDate");
+        let updated = stamp(&got, "LastUpdateDate");
+        assert!(
+            created.is_some() && updated >= created,
+            "case {case:?}: expected a creation date and a later-or-equal update date, got {got}"
+        );
+
+        // Reading twice changes nothing a later caller sees.
+        let again = ok(&router, "GetMetricStream", &json!({"Name": &name})).await;
+        assert_eq!(
+            again, got,
+            "case {case:?}: a second GetMetricStream must report the same stream, got {again}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_update_overwrites_the_configuration_and_keeps_the_identity() {
+    let router = build_router();
+    let created = ok(
+        &router,
+        "PutMetricStream",
+        &json!({
+            "Name": "updated_stream",
+            "FirehoseArn": "arn:aws:firehose:us-east-1:000000000000:deliverystream/first",
+            "RoleArn": "arn:aws:iam::000000000000:role/First",
+            "OutputFormat": "json",
+            "IncludeFilters": [{"Namespace": "MyApp"}],
+            "Tags": [{"Key": "stage", "Value": "create"}],
+        }),
+    )
+    .await;
+    let before = ok(&router, "GetMetricStream", &json!({"Name": "updated_stream"})).await;
+
+    // Rows differ in what the update changes: the destination, the filter kind (an include
+    // filter replaced by an exclude filter), the output format, and the statistics.
+    let updates: Vec<(&str, Value)> = vec![
+        (
+            "exclude filter replaces include filter",
+            json!({
+                "Name": "updated_stream",
+                "FirehoseArn": "arn:aws:firehose:us-east-1:000000000000:deliverystream/second",
+                "RoleArn": "arn:aws:iam::000000000000:role/Second",
+                "OutputFormat": "opentelemetry1.0",
+                "ExcludeFilters": [{"Namespace": "AWS/S3"}],
+                "StatisticsConfigurations": [{
+                    "IncludeMetrics": [{"Namespace": "MyApp", "MetricName": "Latency"}],
+                    "AdditionalStatistics": ["p95"],
+                }],
+                "Tags": [{"Key": "stage", "Value": "update"}],
+            }),
+        ),
+        (
+            "back to the bare required members",
+            put_request("updated_stream", "json"),
+        ),
+    ];
+
+    for (case, update) in updates {
+        let put = ok(&router, "PutMetricStream", &update).await;
+        assert_eq!(
+            text(&put, "Arn"),
+            text(&created, "Arn"),
+            "case {case:?}: an update must keep the stream's ARN, got {put}"
+        );
+
+        let after = ok(&router, "GetMetricStream", &json!({"Name": "updated_stream"})).await;
+        assert_eq!(
+            stamp(&after, "CreationDate"),
+            stamp(&before, "CreationDate"),
+            "case {case:?}: CreationDate must survive an update, got {after}"
+        );
+        assert!(
+            stamp(&after, "LastUpdateDate") >= stamp(&before, "LastUpdateDate"),
+            "case {case:?}: LastUpdateDate must not move backwards, got {after}"
+        );
+        // "If you use it to update an existing stream, the state of the stream is not
+        // changed."
+        assert_eq!(
+            text(&after, "State"),
+            text(&before, "State"),
+            "case {case:?}: an update must not change the stream's state, got {after}"
+        );
+        // The update "completely overwrites" the configuration: what it does not carry is
+        // gone, what it carries is reported back.
+        for member in [
+            "FirehoseArn",
+            "RoleArn",
+            "OutputFormat",
+            "IncludeFilters",
+            "ExcludeFilters",
+            "StatisticsConfigurations",
+        ] {
+            assert_eq!(
+                after.get(member),
+                update.get(member),
+                "case {case:?}: {member} must be exactly what the update configured, got {after}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_additional_statistic_is_accepted_only_where_the_output_format_carries_it() {
+    // The rule: an OpenTelemetry stream carries percentile statistics only, while a json
+    // stream carries every statistic CloudWatch supports. Rows span the statistic forms the
+    // "CloudWatch statistics definitions" page lists — basic statistics, percentiles, the
+    // trimmed/Winsorized families in both their bare and spanned forms, the percentile rank
+    // family, the interquartile mean — plus values no family produces.
+    let statistics: Vec<(&str, bool, bool)> = vec![
+        // (statistic, valid for json, valid for an OpenTelemetry format)
+        ("p99", true, true),
+        ("p0", true, true),
+        ("p100", true, true),
+        ("p99.9", true, true),
+        ("p101", false, false),
+        ("Average", true, false),
+        ("SampleCount", true, false),
+        ("Minimum", true, false),
+        ("Maximum", true, false),
+        ("Sum", true, false),
+        ("IQM", true, false),
+        ("tm98", true, false),
+        ("wm90", true, false),
+        ("TM(10%:90%)", true, false),
+        ("ts(100:)", true, false),
+        ("PR(:300)", true, false),
+        ("Median", false, false),
+        ("tm110", false, false),
+    ];
+
+    for (statistic, valid_for_json, valid_for_otel) in statistics {
+        for (format, expected_ok) in [
+            ("json", valid_for_json),
+            ("opentelemetry0.7", valid_for_otel),
+            ("opentelemetry1.0", valid_for_otel),
+        ] {
+            let router = build_router();
+            let case = format!("{statistic} with {format}");
+            let mut request = put_request("statistics-stream", format);
+            request["StatisticsConfigurations"] = json!([{
+                "IncludeMetrics": [{"Namespace": "MyApp", "MetricName": "Latency"}],
+                "AdditionalStatistics": [statistic],
+            }]);
+
+            let (status, body) = call(&router, "PutMetricStream", &request).await;
+            if expected_ok {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the statistic to be accepted, got {status} {body}"
+                );
+                let got = ok(
+                    &router,
+                    "GetMetricStream",
+                    &json!({"Name": "statistics-stream"}),
+                )
+                .await;
+                assert_eq!(
+                    got.get("StatisticsConfigurations"),
+                    request.get("StatisticsConfigurations"),
+                    "case {case:?}: the configuration must round-trip, got {got}"
+                );
+            } else {
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (400, "InvalidParameterValueException"),
+                    "case {case:?}: expected a 400 InvalidParameterValueException, got {status} {body}"
+                );
+                // A refused request persists nothing.
+                let (get_status, get_body) = call(
+                    &router,
+                    "GetMetricStream",
+                    &json!({"Name": "statistics-stream"}),
+                )
+                .await;
+                assert_eq!(
+                    (get_status, error_code(&get_body).as_str()),
+                    (404, "ResourceNotFoundException"),
+                    "case {case:?}: a refused PutMetricStream must persist nothing, got {get_body}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_request_the_operation_forbids_is_refused_with_its_modelled_error() {
+    // Rows differ along the rule each one breaks: the two filters in one operation, and the
+    // characters a stream name may use.
+    let cases: Vec<(&str, Value, u16, &str)> = vec![
+        (
+            "both filter lists given",
+            json!({
+                "Name": "both-filters",
+                "FirehoseArn": "arn:aws:firehose:us-east-1:000000000000:deliverystream/metrics",
+                "RoleArn": "arn:aws:iam::000000000000:role/MetricStreamRole",
+                "OutputFormat": "json",
+                "IncludeFilters": [{"Namespace": "AWS/EC2"}],
+                "ExcludeFilters": [{"Namespace": "AWS/S3"}],
+            }),
+            400,
+            "InvalidParameterCombinationException",
+        ),
+        (
+            "a name with a space",
+            put_request("my stream", "json"),
+            400,
+            "InvalidParameterValueException",
+        ),
+        (
+            "a name with a slash",
+            put_request("team/stream", "json"),
+            400,
+            "InvalidParameterValueException",
+        ),
+        (
+            "a name with a dot",
+            put_request("stream.one", "json"),
+            400,
+            "InvalidParameterValueException",
+        ),
+        (
+            "every character the name rule allows",
+            put_request("Stream-9_name", "json"),
+            200,
+            "",
+        ),
+    ];
+
+    for (case, request, expected_status, expected_code) in cases {
+        let router = build_router();
+        let (status, body) = call(&router, "PutMetricStream", &request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (expected_status, expected_code),
+            "case {case:?}: expected HTTP {expected_status} {expected_code}, got {status} {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_metric_stream_reports_a_stream_that_was_never_configured_as_missing() {
+    let router = build_router();
+    ok(
+        &router,
+        "PutMetricStream",
+        &put_request("configured-stream", "json"),
+    )
+    .await;
+
+    for name in ["other-stream", "CONFIGURED-STREAM", "configured-stream-2"] {
+        let (status, body) = call(&router, "GetMetricStream", &json!({"Name": name})).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {name:?}: expected HTTP 404 ResourceNotFoundException, got {status} {body}"
+        );
+    }
+}

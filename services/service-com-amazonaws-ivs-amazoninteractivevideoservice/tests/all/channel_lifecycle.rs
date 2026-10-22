@@ -30,39 +30,39 @@ use service_com_amazonaws_ivs_amazoninteractivevideoservice::EmulatedService;
 /// A SigV4 `Authorization` header is how a request names the service and the region
 /// it is addressed to, so every call carries one. The signature itself is never
 /// checked here: request authentication is off unless a router turns it on.
-const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+pub(crate) const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDTESTIVS/20260101/us-east-1/ivs/aws4_request, \
      SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
 /// The ARN prefix every channel this emulator mints must carry, from the modelled
 /// `ChannelArn` pattern `^arn:aws:ivs:[a-z0-9-]+:[0-9]+:channel/[a-zA-Z0-9-]+$` plus
 /// the canonical emulator account id.
-const CHANNEL_ARN_PREFIX: &str = "arn:aws:ivs:us-east-1:000000000000:channel/";
+pub(crate) const CHANNEL_ARN_PREFIX: &str = "arn:aws:ivs:us-east-1:000000000000:channel/";
 /// The same, for the modelled `StreamKeyArn` pattern.
-const STREAM_KEY_ARN_PREFIX: &str = "arn:aws:ivs:us-east-1:000000000000:stream-key/";
+pub(crate) const STREAM_KEY_ARN_PREFIX: &str = "arn:aws:ivs:us-east-1:000000000000:stream-key/";
 
 /// One IVS emulator over one shared engine, reached the way the router reaches it.
-struct Ivs {
+pub(crate) struct Ivs {
     router: MultiServiceRouter,
 }
 
 /// One answer from the emulator: the status, the wire error code (the restJson1
 /// `__type` discriminator) and the parsed body.
-struct Reply {
-    status: u16,
-    error_code: String,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
 }
 
 impl Ivs {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(EmulatedService::new(engine));
         Self { router }
     }
 
-    async fn call(&self, operation: &str, body: &Value) -> Reply {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> Reply {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://ivs.us-east-1.amazonaws.com/{operation}"))
@@ -90,7 +90,7 @@ impl Ivs {
     }
 
     /// Call `operation` and require it to have succeeded, returning the body.
-    async fn ok(&self, operation: &str, body: Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: Value) -> Value {
         let reply = self.call(operation, &body).await;
         assert_eq!(
             reply.status, 200,
@@ -101,19 +101,19 @@ impl Ivs {
     }
 
     /// Create a channel and return the whole `CreateChannel` output.
-    async fn create(&self, request: Value) -> Value {
+    pub(crate) async fn create(&self, request: Value) -> Value {
         self.ok("CreateChannel", request).await
     }
 
     /// Create a channel and return just its ARN.
-    async fn create_arn(&self, request: Value) -> String {
+    pub(crate) async fn create_arn(&self, request: Value) -> String {
         text(&self.create(request).await["channel"], "arn")
     }
 }
 
 /// A string member, read as the empty string when absent — which is what a client
 /// sees for a member the wire omits.
-fn text(value: &Value, key: &str) -> String {
+pub(crate) fn text(value: &Value, key: &str) -> String {
     value
         .get(key)
         .and_then(Value::as_str)
@@ -139,7 +139,7 @@ fn hex_of(text: &str) -> String {
 /// Whether `arn` satisfies the modelled ARN pattern for `prefix`'s resource type:
 /// the fixed `arn:aws:ivs:<region>:<account>:<type>/` prefix followed by a non-empty
 /// `[a-zA-Z0-9-]+` id, within the modelled 128-character bound.
-fn arn_is_well_formed(arn: &str, prefix: &str) -> bool {
+pub(crate) fn arn_is_well_formed(arn: &str, prefix: &str) -> bool {
     let Some(id) = arn.strip_prefix(prefix) else {
         return false;
     };

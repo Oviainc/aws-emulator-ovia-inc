@@ -164,7 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
             return Err(DeleteWorkspaceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("workspace {} not found", input.workspace_id)),
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
                 },
             )
             .into());

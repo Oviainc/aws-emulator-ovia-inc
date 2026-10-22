@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAppsList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAppsList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAppsList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes a Firewall Manager applications list, so a later `GetAppsList` /
+//! `ListAppsLists` no longer reports it. A MUTATING operation.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: with no Firewall Manager default administrator association in this
+//! account/Region the call is refused by [`crate::state::require_administrator`]
+//! BEFORE the `ListId` is looked up, so a well-formed but nonexistent id gets
+//! the authorization refusal rather than `ResourceNotFoundException`. With an
+//! administrator associated, an id that names no stored list is
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +163,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAppsList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAppsListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAppsList"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteAppsListErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The authorization gate, BEFORE the ListId is looked up.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        let Some(removed) = store.apps_lists.remove(&input.list_id) else {
+            return Err(DeleteAppsListErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no Firewall Manager applications list with the id {}",
+                        input.list_id
+                    )),
+                },
+            )
+            .into());
+        };
+        // The ARN-keyed tag index is maintained from the record, so the deleted
+        // list's tags go with it.
+        store.tags_by_arn.remove(&removed.list_arn);
+        Ok(DeleteAppsListOutput)
     }
 }

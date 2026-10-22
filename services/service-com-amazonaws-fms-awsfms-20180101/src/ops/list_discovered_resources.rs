@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDiscoveredResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDiscoveredResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDiscoveredResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resources in the organisation's accounts that are available to be
+//! associated with a resource set. A REPORTING operation: it writes nothing.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation — and cross-account discovery is administrator-only, so with no
+//! Firewall Manager default administrator association in this account/Region the
+//! caller is refused by [`crate::state::require_administrator`] BEFORE the
+//! request's members are examined, rather than receiving `Items`.
+//!
+//! What it reports is the organisation's resource inventory
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::discovered_resources`]),
+//! filtered by the member account and the resource type the request names and
+//! served in bounded pages. The emulator has no member accounts to discover
+//! resources from, so that inventory is EMPTY unless something put a resource in
+//! it: an empty `Items` is the honest answer, never an invented resource.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +134,12 @@ impl From<ListDiscoveredResourcesErrorModeled> for ListDiscoveredResourcesError 
     }
 }
 
+/// The largest page `ListDiscoveredResources` serves, which is the maximum the
+/// model's `com.amazonaws.fms#PaginationMaxResults` declares for `MaxResults`
+/// (range 1..100). It bounds the response for EVERY caller, including one that
+/// sends no `MaxResults` at all.
+const MAX_PAGE_SIZE: usize = 100;
+
 /// The `ListDiscoveredResources` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,18 +176,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDiscoveredResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDiscoveredResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDiscoveredResources"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDiscoveredResourcesErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        // The authorization gate, BEFORE the request's members are examined.
+        crate::state::require_administrator(&store, &region)?;
+
+        // "Only one account is supported per request" — `MemberAccountIds`' own
+        // documentation. The modelled list carries no length constraint, so the
+        // boundary passes any number of accounts and the service decides.
+        let [account] = input.member_account_ids.as_slice() else {
+            return Err(ListDiscoveredResourcesErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "MemberAccountIds must name exactly one account; {} were sent",
+                        input.member_account_ids.len()
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // A token this service did not mint names no page boundary.
+        let start = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_key_token(token) {
+                Some(start) => Some(start),
+                None => {
+                    return Err(ListDiscoveredResourcesErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                "NextToken is not a pagination token issued by \
+                                 ListDiscoveredResources"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
+
+        // The inventory is keyed by resource URI, so the page boundary is a key
+        // in a total order: resume at the first URI at or after the token's.
+        let lower = start.unwrap_or_default();
+        let mut remaining = store
+            .discovered_resources
+            .range(lower..)
+            .filter(|(_, resource)| {
+                resource.account_id.as_deref() == Some(account.as_str())
+                    && resource.r#type.as_deref() == Some(input.resource_type.as_str())
+            });
+
+        // Bounded whether or not the caller asked for a bound, and clamped rather
+        // than only capped, for the reasons `ListPolicies` states.
+        let page_size = input
+            .max_results
+            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
+            .clamp(1, MAX_PAGE_SIZE);
+        let items: Vec<DiscoveredResource> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, resource)| resource.clone())
+            .collect();
+        // A token only when a resource is left AFTER this page, so the last page
+        // carries none.
+        let next_token = remaining
+            .next()
+            .map(|(uri, _)| crate::state::encode_key_token(uri));
+
+        Ok(ListDiscoveredResourcesOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

@@ -41,9 +41,39 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// The error code this service answers a malformed resource ARN with: its own
+/// modelled `BadRequestException` — "The request is invalid or malformed.",
+/// `@error("client")`, `@httpError(400)`
+/// (`smithy_query(query="shape",shape="BadRequestException")`). Restated here
+/// because `override_refusal` replaces the code and the message TOGETHER.
+pub(crate) const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
+
+/// What this service says when a resource ARN does not parse.
+///
+/// A CONSTANT, interpolating no part of the request: the ARN parser reports that the
+/// label was not an ARN, and nothing about which member or which rule it failed.
+/// Shared with the tagging handlers, so the refusal reads the same whether the
+/// boundary validator or the handler's own parse found it.
+pub(crate) const MALFORMED_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
+
+/// Whether `violation` is a value that failed the `@pattern` of this service's `Arn`
+/// shape — i.e. a resource ARN that is not an ARN at all.
+///
+/// Keyed on the pattern the value failed ([`crate::state::ARN_PATTERN`], the `Arn`
+/// shape's own), not on a member name or an operation: every member that targets
+/// `Arn` is a `resourceArn` label, and every other ARN-shaped member of this service
+/// targets a different shape with a different pattern, so none of them is caught
+/// here.
+fn is_malformed_resource_arn(violation: &Violation) -> bool {
+    matches!(
+        &violation.kind,
+        ViolationKind::Pattern(pattern) if pattern == crate::state::ARN_PATTERN
+    )
+}
 
 /// The `com-amazonaws-medicalimaging-ahigatewayservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -96,17 +126,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // AWS HealthImaging PARSES a resource ARN before it validates anything
+        // else, so a `resourceArn` that is not an ARN is a malformed REQUEST —
+        // answered with the modelled `BadRequestException` (HTTP 400) — and not a
+        // member that failed a constraint, which is what `ValidationException`
+        // reports. The status is 400 either way; the code is what a client
+        // branches on, so both it and the message are replaced together.
+        //
+        // `any`, not "every violation": the ARN parse runs first, so it decides
+        // the answer even when the same request also breaks another rule.
+        //
+        // Every other refusal — an absent required member, a `@length` or
+        // `@range` bound, a non-`Arn` pattern such as `kmsKeyArn`'s, an enum
+        // value, an authentication failure — keeps the framework's wording and
+        // its `ValidationException` code, which is the modelled error this
+        // service declares for a constraint failure.
+        match refusal {
+            Refusal::Invalid(violations) if violations.iter().any(is_malformed_resource_arn) => {
+                Some(Refused {
+                    code: BAD_REQUEST_EXCEPTION.to_string(),
+                    message: MALFORMED_ARN_MESSAGE.to_string(),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

@@ -37,9 +37,11 @@
 //! Keep the `#[operation_error]` enum, the alias and the `From` impl.
 //!
 //! An implemented operation stops needing the 501, but the wrapper is also the only
-//! place it can return an error its own model does not declare — `validation` above,
-//! for a service whose model carries no client-input error. Delete the wrapper and the
-//! handler has no way to refuse a bad request at all.
+//! place it can return an error its own model does not declare — `validation` and
+//! `access_denied` below, for a request this service refuses with an error code no
+//! operation of it lists (Firewall Manager answers the administrator-authorization
+//! refusal with `AccessDeniedException`, which the model never declares). Delete the
+//! wrapper and the handler has no way to refuse a bad request at all.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -219,7 +221,9 @@ impl AccessDeniedException {
     /// An `AccessDeniedException` carrying `message`.
     ///
     /// Say which principal is refused and what would authorize it: the caller has to
-    /// decide from this text alone whether to configure something or give up.
+    /// decide from this text alone whether to configure something or give up. Build it
+    /// from the account and Region the request addresses — never from the resource the
+    /// request names, which is not looked up before this refusal is answered.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -270,6 +274,10 @@ pub enum Scaffolded<E> {
     /// management account with precisely that code — so it lives here, beside
     /// `ValidationException`, rather than in a per-operation modeled enum that
     /// cannot name it.
+    ///
+    /// It is also the one refusal answered BEFORE any identifier is looked up or any
+    /// payload validated, so an unauthorized caller cannot learn from it whether the
+    /// resource it named exists.
     AccessDeniedException(AccessDeniedException),
 }
 
@@ -302,7 +310,10 @@ impl<E> Scaffolded<E> {
     /// Reach for this only where the SERVICE refuses the caller and models no error
     /// for it. It is NOT a signature check (the emulator verifies every signature
     /// before a handler runs) and NOT a stand-in for a modeled error: if the
-    /// operation declares one that fits, return that instead.
+    /// operation declares one that fits, return that instead. Answer it INSTEAD of a
+    /// modeled not-found or invalid-input error wherever the service decides
+    /// authorization before it looks the resource up: the refusal must say the same
+    /// thing whether or not the resource exists.
     pub fn access_denied(message: impl Into<String>) -> Self {
         Self::AccessDeniedException(AccessDeniedException::new(message))
     }

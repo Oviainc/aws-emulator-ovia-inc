@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/hosted_zone_records.rs"]
 mod hosted_zone_records;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

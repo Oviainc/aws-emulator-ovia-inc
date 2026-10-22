@@ -138,24 +138,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let store_not_found = || {
-            GetPolicyTemplateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "No policy store exists with the input ID: {}",
-                    input.policy_store_id
-                ),
-                resource_id: input.policy_store_id.clone(),
-                resource_type: "POLICY_STORE".to_string(),
-            })
+            GetPolicyTemplateErrorModeled::ResourceNotFoundException(
+                crate::ops::resource_not_found(&input.policy_store_id, "POLICY_STORE"),
+            )
         };
         let template_not_found = || {
-            GetPolicyTemplateErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "No policy template exists with the input ID: {}",
-                    input.policy_template_id
-                ),
-                resource_id: input.policy_template_id.clone(),
-                resource_type: "POLICY_TEMPLATE".to_string(),
-            })
+            GetPolicyTemplateErrorModeled::ResourceNotFoundException(
+                crate::ops::resource_not_found(&input.policy_template_id, "POLICY_TEMPLATE"),
+            )
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

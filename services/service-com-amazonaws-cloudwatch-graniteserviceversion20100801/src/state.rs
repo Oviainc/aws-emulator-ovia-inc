@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-cloudwatch-graniteserviceversion20100801 service.
 //!
-//! Two stores plus the helpers the metric and alarm handlers share:
+//! Three stores plus the helpers the metric, alarm and metric-stream handlers share:
 //!
 //! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::metrics`] — the ingested
 //!   time series, keyed by (namespace, metric name, normalised dimension set), exactly as
@@ -11,15 +11,18 @@
 //!   [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::alarm_history`] — the
 //!   metric-alarm lifecycle written by `PutMetricAlarm` / `SetAlarmState` / `DeleteAlarms`
 //!   and read by `DescribeAlarms`.
+//! * [`ComAmazonawsCloudwatchGraniteserviceversion20100801State::metric_streams`] — the
+//!   metric streams written by `PutMetricStream` and read back by `GetMetricStream`.
 //!
 //! An alarm is stored as the modelled [`MetricAlarm`] shape itself rather than a parallel
 //! record, so every member `PutMetricAlarm` accepts round-trips through `DescribeAlarms`
-//! without a field-by-field copy that can silently drop one.
+//! without a field-by-field copy that can silently drop one. A metric stream is stored the
+//! same way, as the modelled [`GetMetricStreamOutput`] its reader returns.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{AlarmHistoryItem, Dimension, MetricAlarm, Tag};
+use crate::ops::types::{AlarmHistoryItem, Dimension, GetMetricStreamOutput, MetricAlarm, Tag};
 
 /// A dimension set, normalised: dimension name to value, ordered by name, so the same set
 /// keys the same time series whatever order a request listed it in.
@@ -101,6 +104,16 @@ pub struct StoredAlarm {
     pub tags: Vec<Tag>,
 }
 
+/// A stored metric stream: the modelled shape `GetMetricStream` returns, plus the tags
+/// `PutMetricStream` accepted (no `GetMetricStreamOutput` member carries them).
+#[derive(Debug, Clone, Default)]
+pub struct StoredMetricStream {
+    /// The stream as `GetMetricStream` reports it.
+    pub stream: GetMetricStreamOutput,
+    /// The tags `PutMetricStream` was given when this stream was created.
+    pub tags: Vec<Tag>,
+}
+
 /// Per-service state for com-amazonaws-cloudwatch-graniteserviceversion20100801. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
@@ -111,6 +124,8 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     pub alarms: HashMap<String, StoredAlarm>,
     /// Alarm history by alarm name, in append order.
     pub alarm_history: HashMap<String, Vec<AlarmHistoryItem>>,
+    /// Metric streams by stream name.
+    pub metric_streams: HashMap<String, StoredMetricStream>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -177,6 +192,16 @@ pub fn alarm_arn(region: &str, alarm_name: &str) -> String {
     ::engine::emulator_arn("cloudwatch", region, &format!("alarm:{alarm_name}"))
 }
 
+/// A metric stream's ARN: `arn:aws:cloudwatch:<region>:<account>:metric-stream/<Name>`.
+pub fn metric_stream_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("cloudwatch", region, &format!("metric-stream/{name}"))
+}
+
+/// A running metric stream: "The state of the metric stream. The possible values are
+/// `running` and `stopped`." (`GetMetricStreamOutput$State`) — `PutMetricStream` creates a
+/// stream in this state, and only `StopMetricStreams` moves it out of it.
+pub const METRIC_STREAM_RUNNING: &str = "running";
+
 /// Encode a pagination cursor — the key the NEXT page starts at — as an opaque token.
 ///
 /// Hex keeps the token opaque to the caller and, unlike the bare key, makes a token the
@@ -212,6 +237,14 @@ pub const MAX_ALARMS: usize = 5_000;
 /// The largest number of history items retained per alarm. Reaching it evicts the OLDEST,
 /// so repeated configuration or state updates cannot grow memory without limit.
 pub const MAX_HISTORY_ITEMS_PER_ALARM: usize = 1_000;
+
+/// The largest number of metric streams this in-memory store holds.
+///
+/// A capacity bound, not an AWS quota: the stream records live in this process's memory, so
+/// their number has to be finite. `PutMetricStream` answers its modelled server fault rather
+/// than growing without limit once it is reached; updating a stream that already exists adds
+/// none, so it is unaffected.
+pub const MAX_METRIC_STREAMS: usize = 10_000;
 
 /// How long an alarm history item is retained: CloudWatch keeps alarm history for 14 days.
 pub const ALARM_HISTORY_RETENTION_SECS: f64 = 14.0 * 24.0 * 60.0 * 60.0;

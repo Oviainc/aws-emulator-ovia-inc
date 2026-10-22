@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::Workspace {
                 workspace_id: input.workspace_id.clone(),
                 arn: arn.clone(),
-                description: input.description,
+                description: input.description.unwrap_or_default(),
                 s3_location: input.s3_location,
                 role: input.role,
                 linked_services: Vec::new(),

@@ -121,14 +121,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let not_found = || {
-            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!(
-                    "No policy store exists with the input ARN: {}",
-                    input.resource_arn
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::ops::resource_not_found(
+                    &crate::state::resource_id_from_arn(&input.resource_arn),
+                    "POLICY_STORE",
                 ),
-                resource_id: crate::state::resource_id_from_arn(&input.resource_arn),
-                resource_type: "POLICY_STORE".to_string(),
-            })
+            )
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {

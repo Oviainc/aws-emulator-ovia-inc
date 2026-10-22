@@ -13,5 +13,7 @@
 // points it into `tests/all/`.
 #[path = "all/approval_team_lifecycle.rs"]
 mod approval_team_lifecycle;
+#[path = "all/authorization_gate.rs"]
+mod authorization_gate;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -178,7 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
-            return Err(invalid(format!("workspace {} not found", input.workspace_id)).into());
+            return Err(invalid(crate::state::workspace_not_found_message(
+                &input.workspace_id,
+            ))
+            .into());
         };
 
         // "Only one object is accepted as a valid input" — the `filters` member's
@@ -225,7 +228,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .min(crate::state::MAX_PAGE_SIZE),
         };
 
-        let now = ::std::time::SystemTime::now();
         // Built once per call: `hasChildEntities` is a membership test against
         // it, so the page costs O(page) lookups rather than one full scan of the
         // workspace per reported entity.
@@ -247,11 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 entity_name: entity.entity_name.clone(),
                 arn: entity.arn.clone(),
                 parent_entity_id: Some(entity.parent_entity_id.clone()),
-                status: Status {
-                    state: Some(entity.state_at(now).to_string()),
-                    error: None,
-                },
-                description: entity.description.clone(),
+                status: entity.status(),
+                // Present, not omitted: an entity always carries a description
+                // (the empty string when its create named none).
+                description: Some(entity.description.clone()),
                 has_child_entities: Some(parent_ids.contains(entity.entity_id.as_str())),
                 creation_date_time: crate::state::timestamp(entity.creation_date_time),
                 update_date_time: crate::state::timestamp(entity.update_date_time),

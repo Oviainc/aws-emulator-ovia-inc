@@ -295,12 +295,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => Vec::new(),
         };
 
+        let home_directory_mappings = input.home_directory_mappings.unwrap_or_default();
         let user = st::User {
             arn: st::user_arn(&region, &input.server_id, &input.user_name),
             role: input.role,
             home_directory: input.home_directory,
-            home_directory_type: input.home_directory_type,
-            home_directory_mappings: input.home_directory_mappings.unwrap_or_default(),
+            // The service resolves `HomeDirectoryType` at create time, so every
+            // stored user carries one and every reader projects the same value.
+            home_directory_type: Some(st::resolved_home_directory_type(
+                input.home_directory_type,
+            )),
+            home_directory_mappings,
             policy: input.policy,
             posix_profile: input.posix_profile,
             ssh_public_keys,

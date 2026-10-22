@@ -172,7 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
             return Err(DeleteEntityErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("workspace {} not found", input.workspace_id)),
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
                 },
             )
             .into());
@@ -180,9 +182,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !workspace.entities.contains_key(&input.entity_id) {
             return Err(DeleteEntityErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "entity {} not found in workspace {}",
-                        input.entity_id, input.workspace_id
+                    message: Some(crate::state::entity_not_found_message(
+                        &input.workspace_id,
+                        &input.entity_id,
                     )),
                 },
             )

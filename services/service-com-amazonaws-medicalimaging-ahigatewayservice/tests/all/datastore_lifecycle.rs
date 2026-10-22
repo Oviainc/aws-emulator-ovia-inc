@@ -31,20 +31,23 @@ use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
 const SIGV4: &str = "AWS4-HMAC-SHA256 Credential=AKIDTESTKEY/20260101/us-east-1/medical-imaging/aws4_request, SignedHeaders=host, Signature=abc";
 
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
+pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// One HTTP answer, reduced to what these cases assert on.
+///
+/// `pub(crate)` because the sibling suites in `tests/all/` drive the same front door
+/// and assert on the same three things; one harness, not one per suite.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
     /// The wire error code (`x-amzn-errortype`, else the body's `__type`), with any
     /// `namespace#` prefix stripped. Empty on a success.
-    error_code: String,
+    pub(crate) error_code: String,
 }
 
 impl Answer {
-    fn field(&self, path: &[&str]) -> &Value {
+    pub(crate) fn field(&self, path: &[&str]) -> &Value {
         let mut cursor = &self.body;
         for key in path {
             cursor = &cursor[*key];
@@ -52,18 +55,18 @@ impl Answer {
         cursor
     }
 
-    fn string(&self, path: &[&str]) -> String {
+    pub(crate) fn string(&self, path: &[&str]) -> String {
         self.field(path).as_str().unwrap_or_default().to_string()
     }
 }
 
 /// The emulator under test: one shared engine behind the production router.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -73,7 +76,7 @@ impl Emulator {
         Self { router }
     }
 
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
         let payload = body.map(|value| value.to_string()).unwrap_or_default();
         let request = http::Request::builder()
             .method(method)
@@ -116,16 +119,16 @@ impl Emulator {
         }
     }
 
-    async fn create_datastore(&self, body: Value) -> Answer {
+    pub(crate) async fn create_datastore(&self, body: Value) -> Answer {
         self.call("POST", "/datastore", Some(body)).await
     }
 
-    async fn get_datastore(&self, datastore_id: &str) -> Answer {
+    pub(crate) async fn get_datastore(&self, datastore_id: &str) -> Answer {
         self.call("GET", &format!("/datastore/{datastore_id}"), None)
             .await
     }
 
-    async fn delete_datastore(&self, datastore_id: &str) -> Answer {
+    pub(crate) async fn delete_datastore(&self, datastore_id: &str) -> Answer {
         self.call("DELETE", &format!("/datastore/{datastore_id}"), None)
             .await
     }
@@ -159,7 +162,7 @@ impl Emulator {
 
     /// Create a data store and wait out the activation the clock owes it, so a case
     /// that is not about the transition starts from an `ACTIVE` store.
-    async fn active_datastore(&self, datastore_name: &str, client_token: &str) -> String {
+    pub(crate) async fn active_datastore(&self, datastore_name: &str, client_token: &str) -> String {
         let created = self
             .create_datastore(json!({
                 "datastoreName": datastore_name,
@@ -185,7 +188,7 @@ impl Emulator {
 /// How many times the configured span a suite waits before asserting the state AFTER a
 /// clock-owed transition. Sleeping exactly one span would make the assertion race a
 /// scheduling hiccup; a multiple cannot.
-const SETTLE_MULTIPLE: u32 = 4;
+pub(crate) const SETTLE_MULTIPLE: u32 = 4;
 
 /// `DatastoreId` is `^[0-9a-z]{32}$`; `JobId` is `^[0-9a-z]+$`, 1..32
 /// (`smithy_query(query="operation",operation="CreateDatastore,StartDICOMImportJob")`).

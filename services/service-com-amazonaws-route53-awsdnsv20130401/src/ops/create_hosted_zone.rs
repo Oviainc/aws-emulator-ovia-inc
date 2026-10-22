@@ -431,6 +431,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name_servers,
             vpcs: vpc.cloned().into_iter().collect(),
             records,
+            // CreateHostedZone takes no tags; a zone is tagged afterwards,
+            // through ChangeTagsForResource.
+            tags: BTreeMap::new(),
         };
 
         let change = store.submit_change(None);

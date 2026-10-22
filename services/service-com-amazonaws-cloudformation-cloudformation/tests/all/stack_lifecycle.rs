@@ -7,6 +7,9 @@
 //! sees: `CreateStack` persists a stack, and `DescribeStacks`, `ListStacks`,
 //! `GetTemplate`, `UpdateStack`, `DeleteStack` and `DescribeStackEvents` read and mutate
 //! THAT stack rather than echoing the request back.
+//!
+//! The wire harness here (`call`, `member`, the XML readers, `router`) is this crate's
+//! one such harness: `stack_outputs.rs` drives its cases through these same helpers.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -20,9 +23,9 @@ use service_com_amazonaws_cloudformation_cloudformation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The emulator's canonical account id, as every ARN it emits carries.
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 /// The region the test's requests are signed for.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 pub(crate) fn router() -> MultiServiceRouter {
     router_with_engine().0
@@ -45,7 +48,7 @@ fn store(
 }
 
 /// Wait past the instant a stack operation's terminal status becomes due.
-async fn wait_for_the_transition() {
+pub(crate) async fn wait_for_the_transition() {
     tokio::time::sleep(STATUS_TRANSITION_DELAY + Duration::from_millis(250)).await;
 }
 
@@ -55,7 +58,7 @@ async fn wait_for_the_transition() {
 /// The guard is what keeps the case honest on a loaded machine: the emulator owes the
 /// in-progress status only until the due instant, so a read that lost the race to the
 /// clock must be held to the settled status instead of failing.
-fn expected_status(started: Instant, in_progress: &'static str, settled: &'static str) -> &'static str {
+pub(crate) fn expected_status(started: Instant, in_progress: &'static str, settled: &'static str) -> &'static str {
     if started.elapsed() < STATUS_TRANSITION_DELAY {
         in_progress
     } else {
@@ -120,7 +123,7 @@ pub(crate) fn member(key: &str, value: &str) -> (String, String) {
 
 /// Undo the XML text escaping the serializer applies, so a round-tripped value can be
 /// compared with what was sent.
-fn xml_unescape(text: &str) -> String {
+pub(crate) fn xml_unescape(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -159,7 +162,7 @@ pub(crate) async fn create_stack(
     call(router, "CreateStack", &members).await
 }
 
-async fn describe_stack(router: &MultiServiceRouter, name_or_id: &str) -> (u16, String) {
+pub(crate) async fn describe_stack(router: &MultiServiceRouter, name_or_id: &str) -> (u16, String) {
     call(
         router,
         "DescribeStacks",
@@ -253,13 +256,24 @@ fn template_cases() -> Vec<TemplateCase> {
             tags: kv(&[("team", "iam"), ("env", "prod")]),
         },
         TemplateCase {
-            case: "yaml body, which carries no json Description",
+            case: "yaml body with no Description section",
             stack_name: "yaml-body",
             template: "Resources:\n  T:\n    Type: AWS::CloudFormation::WaitConditionHandle\n"
                 .to_string(),
             description: None,
             parameters: vec![],
             tags: vec![],
+        },
+        TemplateCase {
+            // CloudFormation reads a template written in JSON *or* YAML, so the
+            // `Description` it reports comes from either spelling.
+            case: "yaml body declaring a Description",
+            stack_name: "yaml-described",
+            template: "Description: a yaml stack\nResources:\n  T:\n    Type: AWS::SNS::Topic\n"
+                .to_string(),
+            description: Some("a yaml stack"),
+            parameters: vec![],
+            tags: kv(&[("env", "dev")]),
         },
         TemplateCase {
             case: "unicode, quotes and angle brackets in the template",

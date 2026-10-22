@@ -118,25 +118,40 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// the service creates stores with.
 pub const DEFAULT_CEDAR_VERSION: &str = "CEDAR_4";
 
-/// The message `GetPolicyStore`'s `ResourceNotFoundException` carries for a
-/// reference that names no live store.
+/// The message EVERY `ResourceNotFoundException` this service raises carries.
 ///
 /// A CONSTANT, embedding no request or generated value: the model gives the
 /// exception its own `resourceId` ("the unique ID of the resource referenced in
 /// the failed request") and `resourceType` members, so the identity of what was
-/// not found is reported there rather than spliced into prose, and this is the
-/// text the corpus records for the `GetPolicyStore` 404 of fixture
-/// `verifiedpermissions-policy-store-lifecycle-and-tags` (steps task#2 and
-/// teardown#11).
+/// not found is reported there rather than spliced into prose. The corpus
+/// records this same text for three different operations' 404s — `GetPolicy`,
+/// `GetPolicyStore` (fixture `verifiedpermissions-policy-store-lifecycle-and-tags`,
+/// steps task#2 and teardown#11) and `ListTagsForResource` — which is what
+/// establishes it as one fixed sentence rather than per-operation prose.
 ///
-/// Used ONLY where a recording establishes it, never by generalisation: the
-/// corpus records an id-BEARING message for `IsAuthorized`'s 404, so no one
-/// message rule covers every operation of this service, and the remaining
-/// interpolated not-found messages (`GetPolicy`, `ListTagsForResource`,
-/// `UpdatePolicyStore`) are causes of the open issue
-/// `20261022T044921Z-verifiedpermissions-verified-permissions-error-messages-interpolate-request-and-generated.md`,
-/// which owns them.
+/// Every not-found path of this service fills it through the single builder
+/// [`crate::ops::resource_not_found`]. `IsAuthorized`'s recording expects an
+/// id-BEARING message, but no rule in the model or the corpus produces that
+/// text, so under the message rule it is an example rather than a requirement
+/// and that path answers this constant too.
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The refusal `DeletePolicyStore` answers when deletion protection is enabled.
+///
+/// A CONSTANT for the same reason: `InvalidStateException` models a single
+/// `message` member and documents exactly this refusal with no resource named
+/// in it, and `DeletePolicyStoreInput` carries nothing the service could report
+/// back — so no request value and no minted identifier belongs in the text, and
+/// a client, test or log rule that matches it matches identically for every
+/// store. The wording is the sentence pair the service emits ON THE WIRE, which
+/// is what a client reads; the shape's documentation states the same fixed
+/// refusal in slightly different prose ("The policy store can't be deleted
+/// because deletion protection is enabled. To delete this policy store, disable
+/// deletion protection."), so taking the doc's phrasing instead would diverge
+/// from the recorded bytes while asserting the same rule. Filled through
+/// [`crate::ops::deletion_protection_enabled`].
+pub const DELETION_PROTECTION_MESSAGE: &str = "The policy store cannot be deleted because deletion \
+     protection is enabled. Deletion protection must be disabled first.";
 
 /// How long a `clientToken` is remembered, from `CreatePolicyStore`'s own model
 /// documentation: "Verified Permissions recognizes a ClientToken for eight hours."

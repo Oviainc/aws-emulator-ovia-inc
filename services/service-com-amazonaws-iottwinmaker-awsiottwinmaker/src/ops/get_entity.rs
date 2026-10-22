@@ -4,12 +4,15 @@
 //! Reads a stored entity back. Every required output member comes from the
 //! stored record or is derived from it: `hasChildEntities` by scanning the
 //! workspace for entities that name this one as parent, and `status.state` from
-//! the instant the entity's `CREATING` -> `ACTIVE` transition fell due. The
+//! the state the stored record carries. The
 //! `components` map is truncated at the documented limits
 //! (`crate::state::MAX_COMPONENTS_RETURNED` components, and
 //! `crate::state::MAX_PROPERTIES_RETURNED` properties per component), with
 //! `areAllComponentsReturned` / `areAllPropertiesReturned` reporting whether it
-//! had to be. An unknown workspace or entity is a `ResourceNotFoundException`.
+//! had to be. The `status.error` structure and the `description` string are
+//! reported PRESENT-but-empty for an entity that carries no error and no
+//! description, rather than omitted. An unknown workspace or entity is a
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -191,7 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
             return Err(GetEntityErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("workspace {} not found", input.workspace_id)),
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
                 },
             )
             .into());
@@ -199,21 +204,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entity) = workspace.entities.get(&input.entity_id) else {
             return Err(GetEntityErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "entity {} not found in workspace {}",
-                        input.entity_id, input.workspace_id
+                    message: Some(crate::state::entity_not_found_message(
+                        &input.workspace_id,
+                        &input.entity_id,
                     )),
                 },
             )
             .into());
         };
 
-        let now = ::std::time::SystemTime::now();
-        let entity_state = entity.state_at(now);
-        let status = Status {
-            state: Some(entity_state.to_string()),
-            error: None,
-        };
+        // `status` carries BOTH its modelled members: the entity's stored
+        // state, and the `error` structure every reported status carries (empty
+        // while nothing has failed). See `crate::state::status`.
+        let status = entity.status();
 
         Ok(GetEntityOutput {
             entity_id: entity.entity_id.clone(),
@@ -221,7 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: entity.arn.clone(),
             status: status.clone(),
             workspace_id: entity.workspace_id.clone(),
-            description: entity.description.clone(),
+            // Present, not omitted: the entity carries a description (the
+            // empty string when its create named none), so the member is
+            // reported on every read.
+            description: Some(entity.description.clone()),
             components: Some(components_response(entity, &status)),
             parent_entity_id: entity.parent_entity_id.clone(),
             has_child_entities: workspace.has_child_entities(&entity.entity_id),

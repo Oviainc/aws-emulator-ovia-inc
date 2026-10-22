@@ -6,7 +6,9 @@
 //! version id. A following `GetApprovalTeam` reports the updated fields and the new
 //! version.
 //!
-//! * An ARN no stored team carries earns `ResourceNotFoundException` (404).
+//! * An ARN outside the caller's own account is refused with `AccessDeniedException`
+//!   (403) BEFORE the lookup ([`crate::state::authorize_resource_arn`]); an ARN inside
+//!   it that no stored team carries earns `ResourceNotFoundException` (404).
 //! * A team already in `DELETING` cannot be changed: `ConflictException` (409).
 //! * An `MofN` strategy asking for more approvals (M) than the team will have approvers
 //!   (N) earns `ValidationException` (400) — the same unsatisfiable combination
@@ -175,6 +177,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The account boundary is evaluated BEFORE the resource is resolved: an ARN
+        // outside the caller's account is refused with the modelled
+        // `AccessDeniedException` (403) whatever is stored under it, so a client never
+        // reads "the team is gone" for a team it simply cannot reach.
+        crate::state::authorize_resource_arn(Self::NAME, &input.arn)
+            .map_err(UpdateApprovalTeamErrorModeled::AccessDeniedException)?;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateApprovalTeamError::Modeled(
                 UpdateApprovalTeamErrorModeled::InternalServerException(InternalServerException {

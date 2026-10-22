@@ -11,19 +11,11 @@
 use serde_json::{json, Value};
 
 // The wire harness (`router`, `call`, `ok`, `store_with_mode`,
-// `store_with_validation_off`, `error_code`) lives once in `tests/all/harness.rs`
-// and is shared with every other suite in this crate.
-use super::harness::{call, error_code, ok, router, store_with_validation_off};
-
-/// The human-readable text an awsJson1_0 fault carries. The modeled member is
-/// `message`; some SDKs read the capitalized spelling, so both are accepted.
-fn error_message(body: &Value) -> String {
-    body["message"]
-        .as_str()
-        .or_else(|| body["Message"].as_str())
-        .unwrap_or_default()
-        .to_string()
-}
+// `store_with_validation_off`, `error_code`, `fault_message`) lives once in
+// `tests/all/harness.rs` and is shared with every other suite in this crate.
+use super::harness::{
+    call, error_code, fault_message as error_message, ok, router, store_with_validation_off,
+};
 
 /// `{entityType, entityId}` pairs, sorted, for order-insensitive comparison.
 fn pairs(value: &Value, type_key: &str, id_key: &str) -> Vec<(String, String)> {

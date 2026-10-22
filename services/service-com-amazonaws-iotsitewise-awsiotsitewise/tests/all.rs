@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/asset_lifecycle.rs"]
 mod asset_lifecycle;
+#[path = "all/asset_model_properties.rs"]
+mod asset_model_properties;
 #[path = "all/property_value_history.rs"]
 mod property_value_history;
 #[path = "all/state_roundtrip.rs"]

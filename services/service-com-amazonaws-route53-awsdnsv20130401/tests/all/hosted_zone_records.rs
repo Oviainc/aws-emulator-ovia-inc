@@ -26,7 +26,10 @@ use smithy_server_runtime::MultiServiceRouter;
 const ENDPOINT: &str = "route53.amazonaws.com";
 
 /// A router with just this service mounted on a fresh shared engine.
-fn router() -> MultiServiceRouter {
+///
+/// `pub(crate)` so a sibling suite in this test target drives the service
+/// through the SAME harness rather than growing a second copy of it.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(
@@ -36,24 +39,24 @@ fn router() -> MultiServiceRouter {
 }
 
 /// One HTTP exchange against the router.
-struct Reply {
-    status: u16,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
     location: Option<String>,
     /// Every element of the response body that carries text, as
     /// `(path from the root, text)` pairs in document order.
     doc: Vec<(String, String)>,
-    body: String,
+    pub(crate) body: String,
 }
 
 impl Reply {
     /// The text of the first element whose path ends with `suffix`
     /// (`"ChangeInfo/Status"`), or `None` when the response has no such element.
-    fn first(&self, suffix: &str) -> Option<&str> {
+    pub(crate) fn first(&self, suffix: &str) -> Option<&str> {
         self.all(suffix).into_iter().next()
     }
 
     /// The text of every element whose path ends with `suffix`, in document order.
-    fn all(&self, suffix: &str) -> Vec<&str> {
+    pub(crate) fn all(&self, suffix: &str) -> Vec<&str> {
         let tail = format!("/{suffix}");
         self.doc
             .iter()
@@ -63,13 +66,18 @@ impl Reply {
     }
 
     /// The wire error code (`<Error><Code>`) of a refusal.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.first("Error/Code").unwrap_or("")
     }
 }
 
 /// Send one request and read the reply.
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: &str) -> Reply {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> Reply {
     let request = http::Request::builder()
         .method(method)
         .uri(uri)
@@ -107,12 +115,23 @@ fn element_name(tag: &str) -> &str {
 
 /// Resolve the five XML predefined entities. `&amp;` is resolved LAST so an
 /// escaped `&amp;lt;` does not turn into `<`.
-fn unescape_xml(raw: &str) -> String {
+pub(crate) fn unescape_xml(raw: &str) -> String {
     raw.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+}
+
+/// Escape the five XML predefined entities, so a request body stays well-formed
+/// whatever text a table row puts in it. The inverse of [`unescape_xml`], and
+/// kept beside it so the pair cannot drift apart.
+pub(crate) fn escape_xml(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// Flatten an XML document into `(path, text)` pairs, so a test can assert on a
@@ -208,7 +227,11 @@ async fn create_zone(
 }
 
 /// Create a zone, assert it was created, and return its BARE id.
-async fn create_zone_ok(router: &MultiServiceRouter, name: &str, caller_reference: &str) -> String {
+pub(crate) async fn create_zone_ok(
+    router: &MultiServiceRouter,
+    name: &str,
+    caller_reference: &str,
+) -> String {
     let reply = create_zone(router, name, caller_reference, "").await;
     assert_eq!(
         reply.status, 201,

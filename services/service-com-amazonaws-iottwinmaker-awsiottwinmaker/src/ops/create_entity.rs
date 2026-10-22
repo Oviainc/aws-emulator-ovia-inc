@@ -3,6 +3,9 @@
 //! @op CreateEntity
 //! Creates an entity in a workspace and persists it in [`crate::state`] under
 //! that workspace, so `GetEntity` / `ListEntities` read back what was created.
+//! The create COMPLETES here: the entity is stored, and reported, in the
+//! terminal `ACTIVE` state, which is the state recorded traffic reads a
+//! just-created entity back in.
 //!
 //! Three refusals this handler owns, each a `ValidationException` (the model
 //! declares no `ResourceNotFoundException` for `CreateEntity`):
@@ -199,7 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
             return Err(CreateEntityErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(format!("workspace {} not found", input.workspace_id)),
+                    message: Some(crate::state::workspace_not_found_message(
+                        &input.workspace_id,
+                    )),
                 },
             )
             .into());
@@ -318,17 +323,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entity_name: input.entity_name,
             arn: arn.clone(),
             workspace_id: input.workspace_id.clone(),
-            description: input.description,
+            // Stored resolved rather than as an absent member: an entity
+            // carries a description, which is the empty string when the create
+            // names none, and every read reports it.
+            description: input.description.unwrap_or_default(),
             parent_entity_id,
             components: components_from_request(components),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             creation_date_time: now,
             update_date_time: now,
-            // The entity is returned CREATING and owes the clock its move to
-            // ACTIVE; nothing sleeps for it.
-            active_date_time: now + crate::state::ENTITY_ACTIVATION_SPAN,
+            // The create completes here: the entity is stored in the terminal
+            // ACTIVE state and every read reports that stored state. There is
+            // no provisioning window to emulate — recorded traffic reads a
+            // just-created entity back as ACTIVE.
+            state: crate::state::STATE_ACTIVE.to_string(),
         };
-        let state_at_creation = entity.state_at(now);
+        let created_state = entity.state.clone();
 
         // Store the entity BEFORE indexing its ARN, so the index can never name
         // an entity that was not stored: the workspace is re-borrowed mutably
@@ -355,7 +365,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             entity_id,
             arn,
             creation_date_time: crate::state::timestamp(now),
-            state: state_at_creation.to_string(),
+            state: created_state,
         })
     }
 }

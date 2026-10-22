@@ -77,6 +77,85 @@ pub const MAX_SUITE_DEFINITIONS: usize = 100;
 /// progress is never dropped.
 pub const MAX_RUNS_PER_DEFINITION: usize = 50;
 
+/// How many tags one resource carries at once.
+///
+/// `TagMap` is `len 0..50` (`smithy_query(query="shape",shape="TagMap")`), so a resource
+/// cannot end up holding more than 50 tags: `TagResource` refuses a merge that would leave
+/// more than this with the modelled client-input error, the way a real service refuses a
+/// tagging call past the per-resource tag limit.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// One of this service's two taggable resources, as a `resourceArn` names it.
+///
+/// `ListTagsForResource`/`TagResource`/`UntagResource` all document the same thing about
+/// their `resourceArn`: "This can be SuiteDefinition ARN or SuiteRun ARN".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// `…:suitedefinition/<suiteDefinitionId>`, as `CreateSuiteDefinition` mints it.
+    SuiteDefinition(String),
+    /// `…:suiterun/<suiteDefinitionId>/<suiteRunId>`, as `StartSuiteRun` mints it.
+    SuiteRun {
+        suite_definition_id: String,
+        suite_run_id: String,
+    },
+}
+
+/// Parse `arn` as the ARN of a taggable IoT Device Advisor resource.
+///
+/// The tagging operations address a resource ONLY by ARN, and the model constrains
+/// `AmazonResourceName` by length alone, so the ARN's shape is checked here:
+/// `arn:<partition>:iotdeviceadvisor:<region>:<account>:` followed by one of the two
+/// resource forms this service mints. `Err` carries why, for the modelled client-input
+/// error — a value that is not one of this service's ARNs is a bad request, never a
+/// missing resource, so it is refused before anything is looked up.
+pub fn parse_resource_arn(arn: &str) -> Result<TaggedResource, String> {
+    // The value is request-supplied and goes into the refusal text: `{arn:?}` quotes and
+    // escapes it, so no newline inside it can forge a second line of the message.
+    let malformed = || {
+        format!(
+            "resourceArn {arn:?} is not an IoT Device Advisor suite definition or suite run ARN"
+        )
+    };
+    // `splitn(6, ..)` so a `:` inside the resource portion stays in it.
+    let mut fields = arn.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(service),
+        Some(_region),
+        Some(account),
+        Some(resource),
+    ) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    )
+    else {
+        return Err(malformed());
+    };
+    if partition.is_empty() || account.is_empty() || service != ARN_NAMESPACE {
+        return Err(malformed());
+    }
+    let mut parts = resource.split('/');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("suitedefinition"), Some(id), None, None) if !id.is_empty() => {
+            Ok(TaggedResource::SuiteDefinition(id.to_string()))
+        }
+        (Some("suiterun"), Some(definition), Some(run), None)
+            if !definition.is_empty() && !run.is_empty() =>
+        {
+            Ok(TaggedResource::SuiteRun {
+                suite_definition_id: definition.to_string(),
+                suite_run_id: run.to_string(),
+            })
+        }
+        _ => Err(malformed()),
+    }
+}
+
 /// A stored suite definition: its identity, every configuration version, and its tags.
 #[derive(Debug, Clone)]
 pub struct SuiteDefinition {
@@ -337,6 +416,56 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect::<std::collections::HashMap<_, _>>()
         })
+    }
+
+    /// True when this store holds the resource `resource` names, UNDER THE ARN it was
+    /// named by.
+    ///
+    /// The ARN identifies the resource whole: an ARN carrying the right id but another
+    /// partition, region or account names a resource of that other scope, which this
+    /// store does not hold, so it is not found rather than silently treated as the local
+    /// one. A pure predicate — a tag read never advances anything.
+    pub fn holds_tagged_resource(&self, arn: &str, resource: &TaggedResource) -> bool {
+        match resource {
+            TaggedResource::SuiteDefinition(id) => self
+                .definitions
+                .get(id)
+                .is_some_and(|definition| definition.arn == arn),
+            TaggedResource::SuiteRun {
+                suite_definition_id,
+                suite_run_id,
+            } => self.runs.get(suite_run_id).is_some_and(|run| {
+                run.arn == arn && run.suite_definition_id == *suite_definition_id
+            }),
+        }
+    }
+
+    /// Add `tags` to `arn`'s row, overwriting the value of every key it already carries
+    /// and leaving the rest in place.
+    ///
+    /// `Err` is how many tags the merge would have left, when that is past `limit`: the
+    /// caller refuses with its own modelled error and the row is left untouched, so a
+    /// refused tagging call changes nothing. An empty row is dropped rather than kept, so
+    /// a resource with no tags has no row in either direction.
+    pub fn merge_tags(
+        &mut self,
+        arn: &str,
+        tags: BTreeMap<String, String>,
+        limit: usize,
+    ) -> Result<(), usize> {
+        let existing = self.tags.get(arn);
+        let would_hold = existing.map_or(tags.len(), |existing| {
+            existing.len() + tags.keys().filter(|key| !existing.contains_key(*key)).count()
+        });
+        if would_hold > limit {
+            return Err(would_hold);
+        }
+        if tags.is_empty() {
+            return Ok(());
+        }
+        let row = self.tags.entry(arn.to_string()).or_default();
+        row.extend(tags);
+        Ok(())
     }
 
     /// Retain at most `keep` runs of `suite_definition_id`, dropping the OLDEST ones that

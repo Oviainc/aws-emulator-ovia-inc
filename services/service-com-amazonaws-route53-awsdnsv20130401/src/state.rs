@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::shared_types::{
-    ChangeInfo, DelegationSet, HostedZone, HostedZoneConfig, ResourceRecordSet, VPC,
+    ChangeInfo, DelegationSet, HostedZone, HostedZoneConfig, ResourceRecordSet, Tag, VPC,
 };
 
 /// How long after a change is submitted it reaches `INSYNC`.
@@ -81,6 +81,19 @@ const MAX_RETAINED_CHANGES: usize = 10_000;
 /// it did; an hour past `INSYNC` is far longer than any client waits, and it
 /// gives the ledger a retention answer rather than unbounded growth.
 const CHANGE_RETENTION: Duration = Duration::from_secs(3_600);
+
+/// The most tags one taggable resource may carry.
+///
+/// `ChangeTagsForResource$AddTags`'s own documentation: "You can add a maximum
+/// of 10 tags to a health check or a hosted zone", and the modelled `TagList`
+/// behind `ResourceTagSet$Tags` is `len 1..10`, so a resource holding more than
+/// ten tags could not even be reported on the wire.
+pub const MAX_TAGS_PER_RESOURCE: usize = 10;
+
+/// The `TagResourceType` naming a hosted zone (`TagResourceType` enum).
+pub const TAG_RESOURCE_TYPE_HOSTED_ZONE: &str = "hostedzone";
+/// The `TagResourceType` naming a health check (`TagResourceType` enum).
+pub const TAG_RESOURCE_TYPE_HEALTH_CHECK: &str = "healthcheck";
 
 /// The `/hostedzone/` prefix the API wraps a hosted-zone id in.
 pub const HOSTED_ZONE_PREFIX: &str = "/hostedzone/";
@@ -186,6 +199,11 @@ pub struct StoredZone {
     pub vpcs: Vec<VPC>,
     /// This zone's record sets, keyed (and therefore ordered) by [`RecordKey`].
     pub records: BTreeMap<RecordKey, ResourceRecordSet>,
+    /// The zone's tags, keyed by tag key — the set `ChangeTagsForResource`
+    /// edits and `ListTagsForResource` reports. Held ON the zone, so deleting
+    /// the zone takes its tags with it and no second map can disagree about
+    /// them. Bounded by [`MAX_TAGS_PER_RESOURCE`].
+    pub tags: BTreeMap<String, String>,
 }
 
 impl StoredZone {
@@ -221,6 +239,12 @@ impl StoredZone {
             caller_reference: None,
             name_servers: self.name_servers.clone(),
         }
+    }
+
+    /// This zone's tag set as `ResourceTagSet$Tags` carries it; see
+    /// [`tags_to_list`].
+    pub fn to_tag_list(&self) -> Option<Vec<Tag>> {
+        tags_to_list(&self.tags)
     }
 
     /// Whether the zone still holds a record other than the default SOA and NS
@@ -387,6 +411,72 @@ pub fn name_is_in_zone(name: &str, zone_name: &str) -> bool {
     let name_key = dns_sort_key(name);
     let zone_key = dns_sort_key(zone_name);
     name_key == zone_key || name_key.starts_with(&zone_key)
+}
+
+/// A resource's tag set as the wire carries it, in tag-key order.
+///
+/// `ResourceTagSet$Tags` is a list of at least one member, so a resource with no
+/// tags reports the member ABSENT rather than as an empty list — the same rule
+/// `GetHostedZone` applies to `VPCs`.
+pub fn tags_to_list(tags: &BTreeMap<String, String>) -> Option<Vec<Tag>> {
+    (!tags.is_empty()).then(|| {
+        tags.iter()
+            .map(|(key, value)| Tag {
+                key: Some(key.clone()),
+                value: Some(value.clone()),
+            })
+            .collect()
+    })
+}
+
+/// Apply one `ChangeTagsForResource` batch to a resource's tag set.
+///
+/// A tag set is a MAP from key to value, which is what makes the operation
+/// "adds, edits, or deletes tags" (its own documentation): adding a key the
+/// resource already carries edits that key's value, and removing a key it does
+/// not carry leaves the set as it was. `RemoveTagKeys` is applied FIRST, so a
+/// key named in both lists ends up with the value `AddTags` gives it rather
+/// than being dropped.
+///
+/// The batch is applied to a COPY and committed only once it is wholly valid,
+/// so a refused batch leaves the resource's tags exactly as they were. `Err`
+/// carries the refusal text for the caller's `InvalidInput`.
+pub fn apply_tag_changes(
+    tags: &mut BTreeMap<String, String>,
+    add_tags: Option<&[Tag]>,
+    remove_tag_keys: Option<&[String]>,
+) -> Result<(), String> {
+    if add_tags.is_none() && remove_tag_keys.is_none() {
+        return Err(
+            "the request must specify AddTags, RemoveTagKeys, or both: it asks for no change"
+                .to_string(),
+        );
+    }
+
+    let mut updated = tags.clone();
+    for key in remove_tag_keys.unwrap_or_default() {
+        updated.remove(key);
+    }
+    for tag in add_tags.unwrap_or_default() {
+        // `Tag$Key` is not required by the model, but a tag with no key names
+        // nothing to add, edit or delete.
+        let key = tag
+            .key
+            .clone()
+            .ok_or_else(|| "every Tag in AddTags must carry a Key".to_string())?;
+        updated.insert(key, tag.value.clone().unwrap_or_default());
+    }
+
+    if updated.len() > MAX_TAGS_PER_RESOURCE {
+        return Err(format!(
+            "a resource can carry at most {MAX_TAGS_PER_RESOURCE} tags; this request would \
+             leave it with {}",
+            updated.len()
+        ));
+    }
+
+    *tags = updated;
+    Ok(())
 }
 
 /// A hosted-zone id with the `/hostedzone/` prefix stripped, so a caller may

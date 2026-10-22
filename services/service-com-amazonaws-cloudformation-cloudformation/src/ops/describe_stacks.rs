@@ -4,7 +4,9 @@
 //! IMPLEMENTED: reads the stacks this service persisted. With a `StackName` it answers
 //! exactly that stack (a stack id resolves a deleted stack too); with none it answers
 //! every live stack in creation order. A name no live stack carries is refused with
-//! `ValidationError`.
+//! `ValidationError`. A stack whose template declares outputs carries one `Output` per
+//! declared output, evaluated by `CreateStack`/`UpdateStack` when the template was
+//! deployed.
 //!
 //! ## Shape of an operation
 //!
@@ -81,10 +83,11 @@ use crate::state::{StoredStack, DRIFT_STATUS_NOT_CHECKED};
 ///
 /// * `ChangeSetId`, `ParentId`, `RootId` — change sets and nested stacks are not
 ///   implemented, so no stack here has any.
-/// * `Outputs` — a template's outputs come from the resources CloudFormation created and
-///   the intrinsic functions over them; this emulator creates no resources, so it has no
-///   output values to report and reports none.
 /// * `DetailedStatus`, `LastOperations` — nothing in this slice produces them.
+///
+/// `Outputs` is the stack's evaluated outputs: one entry per output the template that
+/// last finished deploying declares. A template declaring no outputs — and a stack whose
+/// create has not completed yet — reports the member absent rather than an empty list.
 ///
 /// `DriftInformation` is `NOT_CHECKED`, which is what it is for a stack drift detection
 /// has never run against.
@@ -108,7 +111,7 @@ fn stack_view(stored: &StoredStack) -> Stack {
         notification_ar_ns: crate::state::non_empty(stored.notification_arns.clone()),
         timeout_in_minutes: stored.timeout_in_minutes,
         capabilities: crate::state::non_empty(stored.capabilities.clone()),
-        outputs: None,
+        outputs: crate::state::output_views(&stored.outputs),
         role_arn: stored.role_arn.clone(),
         tags: crate::state::tag_views(&stored.tags),
         enable_termination_protection: Some(stored.enable_termination_protection),

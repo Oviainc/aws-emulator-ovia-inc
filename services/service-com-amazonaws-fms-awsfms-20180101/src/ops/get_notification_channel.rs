@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetNotificationChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetNotificationChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetNotificationChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the SNS notification channel `PutNotificationChannel` persisted. A
+//! REPORTING operation: it writes nothing.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: with no Firewall Manager default administrator association in this
+//! account/Region the read is refused by [`crate::state::require_administrator`]
+//! BEFORE the channel is looked up, so the refusal says the same thing whether or
+//! not a channel is configured. With an administrator associated and no channel
+//! configured there is no channel resource to report, which is
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +146,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetNotificationChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetNotificationChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetNotificationChannel"))
+        // `GetNotificationChannel` takes no members: the channel is the one the
+        // account/Region has.
+        let _ = &input;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetNotificationChannelErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // The authorization gate, BEFORE the channel is read.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        let Some(channel) = store.notification_channel.as_ref() else {
+            return Err(
+                GetNotificationChannelErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            "no Firewall Manager SNS notification channel is configured"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(GetNotificationChannelOutput {
+            sns_topic_arn: Some(channel.sns_topic_arn.clone()),
+            sns_role_name: Some(channel.sns_role_name.clone()),
+        })
     }
 }

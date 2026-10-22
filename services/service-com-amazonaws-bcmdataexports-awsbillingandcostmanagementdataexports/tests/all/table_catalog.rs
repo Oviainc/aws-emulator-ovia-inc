@@ -10,22 +10,22 @@
 //! publish, or a value outside a property's valid values.
 //!
 //! It is asserted over a TABLE of requests that differ along everything the rule
-//! generalises over: every catalog table (so property counts 0, 1 and 4 and schemas of
-//! 24 to 140-odd columns), an absent / empty / partial / complete `TableProperties` map,
-//! and — bounded and exhaustive — every combination of every published value of every
-//! property of each table. Each row's expectation is computed from the catalog, and a
-//! separate set of literal spot checks pins catalog entries (published column names and
-//! types, property defaults and valid values) so the end-to-end rows are not merely a
-//! restatement of `state.rs`.
+//! generalises over: every catalog table (so property counts 1, 2 and 6 and schemas of
+//! 11 to 140-odd columns), an absent / empty / partial / complete `TableProperties`
+//! map, enumerated and free-form property values, and — bounded and exhaustive — every
+//! combination of the values of every property of each table. Each row's expectation is
+//! computed from the catalog, and a separate set of literal spot checks pins catalog
+//! entries (published column names and types, property defaults and valid values) so
+//! the end-to-end rows are not merely a restatement of the catalog module.
 
 use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::{
-    TableSpec, PROPERTY_FALSE, PROPERTY_INCLUDE_ALL_RECOMMENDATIONS, PROPERTY_INCLUDE_RESOURCES,
-    PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA, PROPERTY_TIME_GRANULARITY, PROPERTY_TRUE,
-    TABLE_CATALOG,
+    TablePropertySpec, TableSpec, PROPERTY_FALSE, PROPERTY_INCLUDE_ALL_RECOMMENDATIONS,
+    PROPERTY_INCLUDE_RESOURCES, PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
+    PROPERTY_TIME_GRANULARITY, PROPERTY_TRUE, TABLE_CATALOG,
 };
 
 use super::export_lifecycle::{error_code, Client};
@@ -39,16 +39,34 @@ const COST_OPTIMIZATION_RECOMMENDATIONS: &str = "COST_OPTIMIZATION_RECOMMENDATIO
 /// The table the FOCUS 1.0 schema is published for.
 const FOCUS_1_0_AWS: &str = "FOCUS_1_0_AWS";
 
+/// A table the catalog publishes NO table properties for.
+const CARBON_EMISSIONS: &str = "CARBON_EMISSIONS";
+
+/// Values to exercise a FREE-FORM table property at — one whose value the caller writes
+/// rather than picks from a published list (a billing view ARN, a filter expression), so
+/// the catalog publishes no `ValidValues` for it and it accepts any value.
+const FREE_FORM_VALUES: &[&str] = &["{}", "arn:aws:billing::123456789012:billingview/primary"];
+
 /// One request's `TableProperties`, as `(property, value)` pairs.
 type Properties = Vec<(&'static str, &'static str)>;
 
+/// The values a row sets `property` to: the ones the catalog publishes for it, or — for
+/// a free-form property — [`FREE_FORM_VALUES`].
+fn exercised_values(property: &TablePropertySpec) -> &'static [&'static str] {
+    if property.valid_values.is_empty() {
+        FREE_FORM_VALUES
+    } else {
+        property.valid_values
+    }
+}
+
 /// The `TableProperties` requests to exercise for `table`: none at all, an empty map,
-/// each single property at each of its published values, and — bounded by the catalog's
-/// own value lists — every complete combination of them.
+/// each single property at each of the values it is exercised at, and — bounded by those
+/// value lists — every complete combination of them.
 fn property_requests(table: &TableSpec) -> Vec<Option<Properties>> {
     let mut requests: Vec<Option<Properties>> = vec![None, Some(Vec::new())];
     for property in table.properties {
-        for value in property.valid_values {
+        for value in exercised_values(property) {
             requests.push(Some(vec![(property.name, *value)]));
         }
     }
@@ -56,7 +74,7 @@ fn property_requests(table: &TableSpec) -> Vec<Option<Properties>> {
     for property in table.properties {
         let mut extended = Vec::new();
         for combination in &combinations {
-            for value in property.valid_values {
+            for value in exercised_values(property) {
                 let mut row = combination.clone();
                 row.push((property.name, *value));
                 extended.push(row);
@@ -96,8 +114,7 @@ fn expected_properties(
 /// order, less those whose gating property does not hold the value they need.
 fn expected_schema(table: &TableSpec, properties: &BTreeMap<String, String>) -> Vec<(String, String)> {
     table
-        .columns
-        .iter()
+        .columns()
         .filter(|column| match column.requires {
             None => true,
             Some((property, value)) => {
@@ -220,47 +237,62 @@ async fn every_catalog_table_reports_the_schema_its_properties_select() {
     }
 }
 
-/// Published Cost and Usage Report 2.0 columns and their types (AWS Data Exports table
-/// dictionary, `COST_AND_USAGE_REPORT`) — spot checks on catalog entries, so the
-/// computed rows above cannot pass on an empty or invented catalog.
+/// Published columns and the types the catalog publishes them with (AWS Data Exports
+/// table dictionary) — spot checks on catalog entries, so the computed rows above cannot
+/// pass on an empty or invented catalog.
 const KNOWN_COLUMNS: &[(&str, &[(&str, &str)])] = &[
     (
         COST_AND_USAGE_REPORT,
         &[
-            ("identity_line_item_id", "STRING"),
-            ("identity_time_interval", "STRING"),
-            ("bill_payer_account_id", "STRING"),
-            ("bill_billing_period_start_date", "TIMESTAMP"),
-            ("line_item_usage_amount", "DOUBLE"),
-            ("line_item_unblended_cost", "DOUBLE"),
-            ("line_item_usage_start_date", "TIMESTAMP"),
-            ("pricing_unit", "STRING"),
-            ("product", "MAP<STRING,STRING>"),
-            ("cost_category", "MAP<STRING,STRING>"),
-            ("savings_plan_savings_plan_effective_cost", "DOUBLE"),
+            ("identity_line_item_id", "String"),
+            ("identity_time_interval", "String"),
+            ("bill_payer_account_id", "String"),
+            ("bill_billing_period_start_date", "Timestamp"),
+            ("line_item_usage_amount", "Number"),
+            ("line_item_unblended_cost", "Number"),
+            ("line_item_usage_start_date", "Timestamp"),
+            ("pricing_unit", "String"),
+            ("product", "Map"),
+            ("cost_category", "Map"),
+            ("savings_plan_savings_plan_effective_cost", "Number"),
         ],
     ),
     (
         COST_OPTIMIZATION_RECOMMENDATIONS,
         &[
-            ("recommendation_id", "STRING"),
-            ("account_id", "STRING"),
-            ("estimated_monthly_savings_after_discount", "DOUBLE"),
-            ("last_refresh_timestamp", "TIMESTAMP"),
-            ("restart_needed", "BOOLEAN"),
-            ("tags", "MAP<STRING,STRING>"),
+            ("recommendation_id", "String"),
+            ("account_id", "String"),
+            ("account_name", "String"),
+            ("estimated_monthly_savings_after_discount", "Number"),
+            ("recommendation_lookback_period_in_days", "Number"),
+            ("last_refresh_timestamp", "Timestamp"),
+            ("restart_needed", "Boolean"),
+            ("tags", "Map"),
         ],
     ),
     (
         FOCUS_1_0_AWS,
         &[
-            ("BilledCost", "DOUBLE"),
-            ("EffectiveCost", "DOUBLE"),
-            ("BillingPeriodStart", "TIMESTAMP"),
-            ("ChargeCategory", "STRING"),
-            ("ResourceId", "STRING"),
-            ("Tags", "MAP<STRING,STRING>"),
-            ("x_ServiceCode", "STRING"),
+            ("BilledCost", "Number"),
+            ("EffectiveCost", "Number"),
+            ("BillingPeriodStart", "Timestamp"),
+            ("ChargeCategory", "String"),
+            ("ResourceId", "String"),
+            ("Tags", "Map"),
+            ("x_ServiceCode", "String"),
+        ],
+    ),
+    (
+        CARBON_EMISSIONS,
+        &[
+            ("payer_account_id", "String"),
+            ("usage_account_id", "String"),
+            ("usage_period_start", "Timestamp"),
+            ("usage_period_end", "Timestamp"),
+            ("last_refresh_timestamp", "Timestamp"),
+            ("product_code", "String"),
+            ("region_code", "String"),
+            ("location", "String"),
         ],
     ),
 ];
@@ -287,6 +319,8 @@ async fn published_columns_are_reported_with_their_published_types() {
 /// The default of every `COST_AND_USAGE_REPORT` table property (AWS Data Exports table
 /// dictionary), which a request naming no property must report.
 const COST_AND_USAGE_REPORT_DEFAULTS: &[(&str, &str)] = &[
+    ("BILLING_VIEW_ARN", ""),
+    ("INCLUDE_CAPACITY_RESERVATION_DATA", "FALSE"),
     ("INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY", "FALSE"),
     ("INCLUDE_RESOURCES", "FALSE"),
     ("INCLUDE_SPLIT_COST_ALLOCATION_DATA", "FALSE"),
@@ -310,14 +344,14 @@ async fn a_request_naming_no_property_reports_the_published_defaults() {
         "case \"defaults\": expected the published defaults {expected:?}, got {reported:?}"
     );
 
-    // A table the catalog publishes no properties for has no configuration to report.
-    let focus = client
-        .ok("GetTable", &json!({ "TableName": FOCUS_1_0_AWS }))
+    // A table the catalog publishes one property for reports exactly that one.
+    let carbon = client
+        .ok("GetTable", &json!({ "TableName": CARBON_EMISSIONS }))
         .await;
     assert_eq!(
-        reported_properties("no properties", &focus),
-        BTreeMap::new(),
-        "case \"no properties\": {FOCUS_1_0_AWS} publishes no table properties, got {focus}"
+        reported_properties("one property", &carbon),
+        BTreeMap::from([("BILLING_VIEW_ARN".to_string(), String::new())]),
+        "case \"one property\": {CARBON_EMISSIONS} publishes the billing view property alone, got {carbon}"
     );
 }
 
@@ -325,10 +359,7 @@ async fn a_request_naming_no_property_reports_the_published_defaults() {
 /// property holds its default, present while it holds `TRUE` (AWS Data Exports table
 /// dictionary).
 const GATED_COLUMNS: &[(&str, &[&str])] = &[
-    (
-        PROPERTY_INCLUDE_RESOURCES,
-        &["line_item_resource_id", "resource_tags"],
-    ),
+    (PROPERTY_INCLUDE_RESOURCES, &["line_item_resource_id"]),
     (
         PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
         &[
@@ -336,10 +367,6 @@ const GATED_COLUMNS: &[(&str, &[&str])] = &[
             "split_line_item_split_cost",
             "split_line_item_split_usage_ratio",
         ],
-    ),
-    (
-        "INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY",
-        &["discount_bundled_discount", "discount_total_discount"],
     ),
 ];
 
@@ -399,8 +426,7 @@ async fn a_table_property_changes_the_schema_it_gates_and_nothing_else() {
             .expect("the catalog publishes the Cost and Usage Report table");
         for column in &added {
             let requires = spec
-                .columns
-                .iter()
+                .columns()
                 .find(|candidate| candidate.name == *column)
                 .and_then(|candidate| candidate.requires);
             assert_eq!(
@@ -476,7 +502,13 @@ fn refusals() -> Vec<Refusal> {
             field: "TableProperties",
         },
         Refusal {
-            label: "a property on a table that publishes none",
+            label: "a cost and usage property on the carbon emissions table",
+            table: CARBON_EMISSIONS,
+            properties: Some(vec![(PROPERTY_INCLUDE_RESOURCES, PROPERTY_TRUE)]),
+            field: "TableProperties",
+        },
+        Refusal {
+            label: "a cost and usage property on a FOCUS table",
             table: FOCUS_1_0_AWS,
             properties: Some(vec![(PROPERTY_INCLUDE_RESOURCES, PROPERTY_TRUE)]),
             field: "TableProperties",

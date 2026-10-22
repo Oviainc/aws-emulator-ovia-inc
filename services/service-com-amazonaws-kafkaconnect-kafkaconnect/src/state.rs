@@ -2,11 +2,12 @@
 
 //! Engine state for the com-amazonaws-kafkaconnect-kafkaconnect service.
 //!
-//! Two resources live here — custom plugins and connectors — beside the
-//! conversions from the shapes a create request carries to the `*Description`
-//! shapes the read operations answer with, and the paging helper both list
-//! operations share. Every handler in `src/ops/` reaches this ONE struct through
-//! [`service_state`], so no two operations can read two copies of one resource.
+//! Three resources live here — custom plugins, connectors and worker
+//! configurations — beside the conversions from the shapes a create request
+//! carries to the `*Description` shapes the read operations answer with, and the
+//! paging helper the list operations share. Every handler in `src/ops/` reaches
+//! this ONE struct through [`service_state`], so no two operations can read two
+//! copies of one resource.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -49,6 +50,22 @@ pub const CUSTOM_PLUGIN_CREATING: &str = "CREATING";
 pub const CUSTOM_PLUGIN_ACTIVE: &str = "ACTIVE";
 /// `CustomPluginState` between `DeleteCustomPlugin` and the plugin's removal.
 pub const CUSTOM_PLUGIN_DELETING: &str = "DELETING";
+
+/// `WorkerConfigurationState` once the configuration can be referenced by a
+/// connector; one of [`WORKER_CONFIGURATION_STATE_VALUES`]. A worker
+/// configuration is nothing but stored properties, so
+/// `CreateWorkerConfiguration` answers with this state straight away — the
+/// model gives the shape no creating state at all (its two values are `ACTIVE`
+/// and `DELETING`), so there is no transition for the clock to owe.
+pub const WORKER_CONFIGURATION_ACTIVE: &str = "ACTIVE";
+/// `WorkerConfigurationState` between `DeleteWorkerConfiguration` and the
+/// configuration's removal.
+pub const WORKER_CONFIGURATION_DELETING: &str = "DELETING";
+
+/// The revision a freshly created worker configuration is at.
+/// `WorkerConfigurationRevisionSummary$revision` is modelled `__long`, and a
+/// configuration's first revision is one.
+pub const FIRST_WORKER_CONFIGURATION_REVISION: i64 = 1;
 
 /// `ConnectorState` while the connector's workers are being provisioned; one of
 /// [`CONNECTOR_STATE_VALUES`].
@@ -353,6 +370,48 @@ impl ConnectorRecord {
     }
 }
 
+/// One stored worker configuration: the whole `CreateWorkerConfiguration`
+/// request plus the identity and lifecycle the service assigned it.
+#[derive(Debug, Clone)]
+pub struct WorkerConfigurationRecord {
+    pub arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// The base64 `connect-distributed.properties` body the create request
+    /// carried, stored verbatim: the read operations hand back exactly what was
+    /// stored.
+    pub properties_file_content: String,
+    pub state: String,
+    pub revision: i64,
+    pub creation_time: SystemTime,
+    pub tags: HashMap<String, String>,
+    pub pending: Option<PendingChange>,
+}
+
+impl WorkerConfigurationRecord {
+    /// The summary of this configuration's latest (only) revision, as the create
+    /// and list operations report it. It carries no properties file: only the
+    /// `WorkerConfigurationRevisionDescription` a describe answers with does.
+    pub fn latest_revision(&self) -> WorkerConfigurationRevisionSummary {
+        WorkerConfigurationRevisionSummary {
+            creation_time: Some(date_time(self.creation_time)),
+            description: self.description.clone(),
+            revision: self.revision,
+        }
+    }
+
+    /// This configuration's latest revision as `DescribeWorkerConfiguration`
+    /// reports it: the summary plus the stored properties file.
+    pub fn revision_description(&self) -> WorkerConfigurationRevisionDescription {
+        WorkerConfigurationRevisionDescription {
+            creation_time: Some(date_time(self.creation_time)),
+            description: self.description.clone(),
+            properties_file_content: Some(self.properties_file_content.clone()),
+            revision: self.revision,
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-kafkaconnect-kafkaconnect. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKafkaconnectKafkaconnectState {
@@ -360,6 +419,8 @@ pub struct ComAmazonawsKafkaconnectKafkaconnectState {
     pub custom_plugins: HashMap<String, CustomPluginRecord>,
     /// Stored connectors, keyed by `connectorArn`.
     pub connectors: HashMap<String, ConnectorRecord>,
+    /// Stored worker configurations, keyed by `workerConfigurationArn`.
+    pub worker_configurations: HashMap<String, WorkerConfigurationRecord>,
     /// How many resources this service has minted an id for. Feeds the ARN
     /// suffix, so two resources of one name (one created after the other was
     /// deleted) never share an ARN.
@@ -395,6 +456,12 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
                 connector.pending = None;
             }
         }
+
+        // A worker configuration has no creating state to leave (the model gives
+        // `WorkerConfigurationState` only `ACTIVE` and `DELETING`), so the only
+        // change the clock can owe one is the end of a delete.
+        self.worker_configurations
+            .retain(|_, worker| !removal_due(worker.pending, now));
     }
 
     /// Whether this store already holds as many custom plugins as it may
@@ -419,11 +486,26 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
             .find(|plugin| plugin.name == name)
     }
 
+    /// Whether this store already holds as many worker configurations as it may
+    /// ([`RESOURCE_QUOTA`], counted over the whole store), so the next
+    /// `CreateWorkerConfiguration` must be refused.
+    pub fn worker_configuration_quota_reached(&self) -> bool {
+        self.worker_configurations.len() >= RESOURCE_QUOTA
+    }
+
     /// The stored connector of this name, if any.
     pub fn connector_named(&self, name: &str) -> Option<&ConnectorRecord> {
         self.connectors
             .values()
             .find(|connector| connector.name == name)
+    }
+
+    /// The stored worker configuration of this name, if any. A name identifies
+    /// at most one configuration, which is what makes a repeat of it a conflict.
+    pub fn worker_configuration_named(&self, name: &str) -> Option<&WorkerConfigurationRecord> {
+        self.worker_configurations
+            .values()
+            .find(|worker| worker.name == name)
     }
 
     /// Mint the random-looking suffix of a resource ARN: the UUID AWS gives a

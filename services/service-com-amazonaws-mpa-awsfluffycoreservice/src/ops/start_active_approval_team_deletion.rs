@@ -8,7 +8,10 @@
 //! gone, so `GetApprovalTeam` answers 404 and `ListApprovalTeams` omits it — see
 //! [`crate::state`] for who materialises that.
 //!
-//! * An ARN no stored team carries earns `ResourceNotFoundException` (404).
+//! * An ARN outside the caller's own account is refused with `AccessDeniedException`
+//!   (403) BEFORE the lookup ([`crate::state::authorize_resource_arn`]), so an
+//!   unauthorized deletion is never reported as a completed one; an ARN inside it that
+//!   no stored team carries earns `ResourceNotFoundException` (404).
 //! * A team that is not ACTIVE cannot have its ACTIVE deletion started:
 //!   `ConflictException` (409). An inactive team's versions go through
 //!   `DeleteInactiveApprovalTeamVersion` instead.
@@ -167,6 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The account boundary is evaluated BEFORE the resource is resolved: a
+        // destructive call on an ARN outside the caller's account is refused with the
+        // modelled `AccessDeniedException` (403) rather than reported as "already
+        // absent".
+        crate::state::authorize_resource_arn(Self::NAME, &input.arn)
+            .map_err(StartActiveApprovalTeamDeletionErrorModeled::AccessDeniedException)?;
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartActiveApprovalTeamDeletionError::Modeled(
                 StartActiveApprovalTeamDeletionErrorModeled::InternalServerException(
