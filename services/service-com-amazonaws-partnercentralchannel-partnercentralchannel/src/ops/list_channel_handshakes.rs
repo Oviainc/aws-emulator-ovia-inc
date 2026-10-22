@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannelHandshakes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannelHandshakes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannelHandshakes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: a pure READ — it pages over the channel handshakes in [`crate::state`],
+//! honouring the required catalog/handshakeType/participantType scope, the optional
+//! status, associated-resource and type-specific filters, the optional sort and
+//! `maxResults`, and hands out an opaque `nextToken` that resumes the same scan.
+//! A request whose filters select nothing is a SUCCESS: `items` is serialized as an
+//! empty list, never a `ResourceNotFoundException` — a list over a catalog names no
+//! single resource that could be missing.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +163,335 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannelHandshakes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelHandshakesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannelHandshakes"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListChannelHandshakesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service is not mounted on a state-bearing engine".into(),
+                },
+            )
+            .into());
+        };
+
+        // Enum-typed members are refused at the boundary, but a value outside the
+        // model's own set must never silently scope a scan, so each is checked.
+        for (member, value, values) in [
+            (
+                "handshakeType",
+                input.handshake_type.as_str(),
+                HANDSHAKE_TYPE_VALUES,
+            ),
+            (
+                "participantType",
+                input.participant_type.as_str(),
+                PARTICIPANT_TYPE_VALUES,
+            ),
+        ] {
+            if !values.contains(&value) {
+                return Err(enum_refusal(member, value, values));
+            }
+        }
+        if let Some(statuses) = input.statuses.as_ref() {
+            for status in statuses {
+                if !HANDSHAKE_STATUS_VALUES.contains(&status.as_str()) {
+                    return Err(enum_refusal(
+                        "statuses.member",
+                        status,
+                        HANDSHAKE_STATUS_VALUES,
+                    ));
+                }
+            }
+        }
+
+        // Each `associatedResourceIdentifiers` entry is a `pma-…`/`rs-…` id or the
+        // matching ARN; the filter compares bare ids, so each is resolved first and
+        // one that is neither is refused rather than silently dropped.
+        let mut associated_resource_ids: Option<Vec<String>> = None;
+        if let Some(identifiers) = input.associated_resource_identifiers.as_ref() {
+            let mut resolved = Vec::with_capacity(identifiers.len());
+            for identifier in identifiers {
+                let Some(resource) = crate::state::resolve_associated_resource(identifier) else {
+                    return Err(refusal(
+                        "associatedResourceIdentifiers",
+                        format!(
+                            "Value '{identifier}' at 'associatedResourceIdentifiers.member' \
+                             failed to satisfy constraint: Member must be a program management \
+                             account or relationship id or ARN"
+                        ),
+                    ));
+                };
+                resolved.push(resource.id);
+            }
+            associated_resource_ids = Some(resolved);
+        }
+
+        // `handshakeTypeFilters` is a type-specific union: the variant a request
+        // sends must be the one its `handshakeType` names, so a mismatch is refused
+        // rather than quietly ignored.
+        let mut service_period_types: Option<Vec<String>> = None;
+        let mut programs: Option<Vec<String>> = None;
+        if let Some(filters) = input.handshake_type_filters.as_ref() {
+            let variant = match filters {
+                ListChannelHandshakesTypeFilters::startServicePeriodTypeFilters(filters) => {
+                    service_period_types = filters.service_period_types.clone();
+                    "startServicePeriodTypeFilters"
+                }
+                ListChannelHandshakesTypeFilters::revokeServicePeriodTypeFilters(filters) => {
+                    service_period_types = filters.service_period_types.clone();
+                    "revokeServicePeriodTypeFilters"
+                }
+                ListChannelHandshakesTypeFilters::programManagementAccountTypeFilters(filters) => {
+                    programs = filters.programs.clone();
+                    "programManagementAccountTypeFilters"
+                }
+            };
+            let expected = filters_variant_for(&input.handshake_type);
+            if Some(variant) != expected {
+                return Err(type_variant_refusal(
+                    "handshakeTypeFilters",
+                    variant,
+                    &input.handshake_type,
+                    expected,
+                ));
+            }
+            for value in service_period_types.iter().flatten() {
+                if !SERVICE_PERIOD_TYPE_VALUES.contains(&value.as_str()) {
+                    return Err(enum_refusal(
+                        "handshakeTypeFilters.servicePeriodTypes.member",
+                        value,
+                        SERVICE_PERIOD_TYPE_VALUES,
+                    ));
+                }
+            }
+            for value in programs.iter().flatten() {
+                if !PROGRAM_VALUES.contains(&value.as_str()) {
+                    return Err(enum_refusal(
+                        "handshakeTypeFilters.programs.member",
+                        value,
+                        PROGRAM_VALUES,
+                    ));
+                }
+            }
+        }
+
+        // Every `…TypeSort` the model declares carries the same two members and
+        // every `sortBy` value set is `[UpdatedAt]`, so the sort is on `updatedAt`
+        // and only the order varies. The variant is type-specific too.
+        let mut descending = false;
+        if let Some(sort) = input.handshake_type_sort.as_ref() {
+            let (variant, sort_order, sort_by, sort_by_values) = match sort {
+                ListChannelHandshakesTypeSort::startServicePeriodTypeSort(sort) => (
+                    "startServicePeriodTypeSort",
+                    sort.sort_order.as_str(),
+                    sort.sort_by.as_str(),
+                    START_SERVICE_PERIOD_TYPE_SORT_NAME_VALUES,
+                ),
+                ListChannelHandshakesTypeSort::revokeServicePeriodTypeSort(sort) => (
+                    "revokeServicePeriodTypeSort",
+                    sort.sort_order.as_str(),
+                    sort.sort_by.as_str(),
+                    REVOKE_SERVICE_PERIOD_TYPE_SORT_NAME_VALUES,
+                ),
+                ListChannelHandshakesTypeSort::programManagementAccountTypeSort(sort) => (
+                    "programManagementAccountTypeSort",
+                    sort.sort_order.as_str(),
+                    sort.sort_by.as_str(),
+                    PROGRAM_MANAGEMENT_ACCOUNT_TYPE_SORT_NAME_VALUES,
+                ),
+            };
+            let expected = sort_variant_for(&input.handshake_type);
+            if Some(variant) != expected {
+                return Err(type_variant_refusal(
+                    "handshakeTypeSort",
+                    variant,
+                    &input.handshake_type,
+                    expected,
+                ));
+            }
+            if !sort_by_values.contains(&sort_by) {
+                return Err(enum_refusal(
+                    "handshakeTypeSort.sortBy",
+                    sort_by,
+                    sort_by_values,
+                ));
+            }
+            if !SORT_ORDER_VALUES.contains(&sort_order) {
+                return Err(enum_refusal(
+                    "handshakeTypeSort.sortOrder",
+                    sort_order,
+                    SORT_ORDER_VALUES,
+                ));
+            }
+            descending = sort_order == "Descending";
+        }
+        let sorted = input.handshake_type_sort.is_some();
+
+        let filters = crate::state::ChannelHandshakeFilters {
+            catalog: input.catalog.clone(),
+            handshake_type: input.handshake_type.clone(),
+            participant_type: input.participant_type.clone(),
+            caller_account_id: crate::state::caller_account_id(),
+            statuses: input.statuses.clone(),
+            associated_resource_ids,
+            service_period_types,
+            programs,
+        };
+
+        // The page token carries the filters and the sort it was taken with, so
+        // resuming a walk with different ones is refused instead of being answered
+        // with a page of a different result set.
+        let filter_fingerprint = crate::state::fingerprint(&(&filters, sorted, descending));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = crate::state::decode_page_token(token) else {
+                    return Err(refusal(
+                        "nextToken",
+                        format!(
+                            "Value '{token}' at 'nextToken' failed to satisfy constraint: Member \
+                             must be a token returned by a previous ListChannelHandshakes call"
+                        ),
+                    ));
+                };
+                if cursor.filter_fingerprint != filter_fingerprint {
+                    return Err(refusal(
+                        "nextToken",
+                        "Value at 'nextToken' failed to satisfy constraint: Member must be a \
+                         token returned for the same filters and sort"
+                            .to_string(),
+                    ));
+                }
+                cursor.offset
+            }
+        };
+
+        // `maxResults` is modelled `@default: 20` with `@range(min: 1, max: 100)`,
+        // so the boundary normally fills it in. Clamped to at least one here as
+        // well: a zero page would return nothing while still carrying a token
+        // whose offset never advances, so a walk would never terminate.
+        let max_results = if input.max_results == 0 {
+            crate::state::DEFAULT_MAX_RESULTS
+        } else {
+            input.max_results
+        };
+        let page_size = usize::try_from(max_results).unwrap_or(1).max(1);
+
+        let mut guard = state.lock();
+        // The only write a reporting operation may make: materialise what the
+        // clock already owed.
+        guard.advance_clock();
+
+        let mut matching: Vec<&crate::state::ChannelHandshake> = guard
+            .channel_handshakes
+            .iter_in_order()
+            .filter(|handshake| filters.matches(handshake))
+            .collect();
+        if sorted {
+            // The sort is stable, so handshakes sharing an `updatedAt` keep their
+            // creation order and a page boundary never duplicates or skips one.
+            matching.sort_by(|left, right| {
+                let key = |handshake: &crate::state::ChannelHandshake| {
+                    (
+                        handshake.updated_at.secs(),
+                        handshake.updated_at.subsec_nanos(),
+                    )
+                };
+                if descending {
+                    key(right).cmp(&key(left))
+                } else {
+                    key(left).cmp(&key(right))
+                }
+            });
+        }
+
+        // One extra record is taken: its presence is what says another page
+        // exists, and the token resumes exactly where this page stopped.
+        let window: Vec<ChannelHandshakeSummary> = matching
+            .into_iter()
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .map(crate::state::ChannelHandshake::to_summary)
+            .collect();
+        let has_more = window.len() > page_size;
+        let items: Vec<ChannelHandshakeSummary> = window.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: offset + items.len(),
+                filter_fingerprint,
+            })
+        });
+
+        // `items` is ALWAYS serialized, the empty list included: a list whose
+        // filters match nothing is a success with no items, not a missing member
+        // and not a `ResourceNotFoundException`.
+        Ok(ListChannelHandshakesOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }
+
+/// The `handshakeTypeFilters` variant that goes with `handshake_type`: the union
+/// declares one variant per `HandshakeType`, so the type fixes which one a
+/// request may send.
+fn filters_variant_for(handshake_type: &str) -> Option<&'static str> {
+    match handshake_type {
+        "START_SERVICE_PERIOD" => Some("startServicePeriodTypeFilters"),
+        "REVOKE_SERVICE_PERIOD" => Some("revokeServicePeriodTypeFilters"),
+        "PROGRAM_MANAGEMENT_ACCOUNT" => Some("programManagementAccountTypeFilters"),
+        // Not a modelled `HandshakeType`: no variant goes with it. The handler
+        // refuses such a value before it reaches here, so a type the model gains
+        // later is refused rather than silently read as one of these.
+        _ => None,
+    }
+}
+
+/// The `handshakeTypeSort` variant that goes with `handshake_type`.
+fn sort_variant_for(handshake_type: &str) -> Option<&'static str> {
+    match handshake_type {
+        "START_SERVICE_PERIOD" => Some("startServicePeriodTypeSort"),
+        "REVOKE_SERVICE_PERIOD" => Some("revokeServicePeriodTypeSort"),
+        "PROGRAM_MANAGEMENT_ACCOUNT" => Some("programManagementAccountTypeSort"),
+        _ => None,
+    }
+}
+
+/// Refuse `member` with the modelled `ValidationException` (HTTP 400).
+fn refusal(member: &str, message: String) -> ListChannelHandshakesError {
+    ListChannelHandshakesErrorModeled::ValidationException(crate::state::validation_exception(
+        member, message,
+    ))
+    .into()
+}
+
+/// Refuse `member` because `value` is outside the model's own value set.
+fn enum_refusal(member: &str, value: &str, values: &[&str]) -> ListChannelHandshakesError {
+    ListChannelHandshakesErrorModeled::ValidationException(
+        crate::state::enum_validation_exception(member, value, values),
+    )
+    .into()
+}
+
+/// Refuse a type-specific union whose variant is not the one the request's
+/// `handshakeType` names.
+fn type_variant_refusal(
+    member: &str,
+    sent: &str,
+    handshake_type: &str,
+    expected: Option<&str>,
+) -> ListChannelHandshakesError {
+    refusal(
+        member,
+        match expected {
+            Some(expected) => format!(
+                "Value '{sent}' at '{member}' failed to satisfy constraint: Member must be \
+                 '{expected}' for handshakeType '{handshake_type}'"
+            ),
+            None => format!(
+                "Value '{sent}' at '{member}' failed to satisfy constraint: no filter or sort \
+                 variant goes with handshakeType '{handshake_type}'"
+            ),
+        },
+    )
+}
+

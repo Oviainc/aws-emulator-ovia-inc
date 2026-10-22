@@ -5,7 +5,8 @@
 //! This module owns everything the handlers in `src/ops/` share: the stored form of a
 //! program management account and of a relationship (a relationship is modelled as a
 //! CHILD of a program management account, so its ARN hangs off the parent's), the
-//! client-token (idempotency) ledger, the opaque page token `ListRelationships` hands
+//! stored form of a channel handshake, the
+//! client-token (idempotency) ledger, the opaque page token the paginated lists hand
 //! out, and the identifier resolution every operation needs — each identifier member
 //! accepts either a bare id (`pma-…` / `rs-…`) or the full ARN.
 //!
@@ -20,8 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    RelationshipDetail, RelationshipSummary, SupportPlan, Tag, ValidationException,
-    ValidationExceptionField,
+    ChannelHandshakeSummary, HandshakeDetail, RelationshipDetail, RelationshipSummary, SupportPlan,
+    Tag, ValidationException, ValidationExceptionField,
 };
 
 /// The ARN namespace this service stamps on every ARN, from the model's
@@ -44,6 +45,9 @@ pub const PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX: &str = "pma-";
 /// The `RelationshipId` prefix, from the pattern `^rs-[a-z0-9]{13}$`.
 pub const RELATIONSHIP_ID_PREFIX: &str = "rs-";
 
+/// The `ChannelHandshakeId` prefix, from the pattern `^ch-[a-z0-9]{13}$`.
+pub const CHANNEL_HANDSHAKE_ID_PREFIX: &str = "ch-";
+
 /// How many `[a-z0-9]` characters follow an id prefix, from both id patterns.
 const ID_SUFFIX_LEN: usize = 13;
 
@@ -52,6 +56,16 @@ const ID_SUFFIX_LEN: usize = 13;
 /// `PENDING` the non-terminal state a create leaves the account in.
 pub const STATUS_PENDING: &str = "PENDING";
 pub const STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `HandshakeStatus` a freshly created channel handshake reports. The
+/// model's value set is `PENDING | ACCEPTED | REJECTED | CANCELED | EXPIRED`,
+/// and a handshake is a request to another account, so it starts `PENDING`.
+///
+/// `PENDING` is NOT a clock-owed state here: a handshake leaves it when the
+/// other participant accepts or rejects it, or the sender cancels it — a
+/// caller-driven transition, not one the clock owes. `EXPIRED` has no published
+/// window, so no expiry is invented.
+pub const HANDSHAKE_STATUS_PENDING: &str = "PENDING";
 
 /// How long a newly created program management account stays `PENDING` before the
 /// clock owes it `ACTIVE`.
@@ -82,16 +96,23 @@ pub const MAX_PROGRAM_MANAGEMENT_ACCOUNTS: usize = 100;
 /// same reason as [`MAX_PROGRAM_MANAGEMENT_ACCOUNTS`].
 pub const MAX_RELATIONSHIPS_PER_ACCOUNT: usize = 100;
 
+/// How many channel handshakes this store holds before
+/// `CreateChannelHandshake` answers `ServiceQuotaExceededException`. CHOSEN for
+/// the same reason as [`MAX_PROGRAM_MANAGEMENT_ACCOUNTS`].
+pub const MAX_CHANNEL_HANDSHAKES: usize = 100;
+
 /// The `quotaCode` the modelled `ServiceQuotaExceededException` carries. The model
 /// types it as a plain required `String` and documents no value set, so the quota
 /// is named after the resource it bounds.
 pub const PROGRAM_MANAGEMENT_ACCOUNT_QUOTA_CODE: &str = "ProgramManagementAccountsPerAccount";
 pub const RELATIONSHIP_QUOTA_CODE: &str = "RelationshipsPerProgramManagementAccount";
+pub const CHANNEL_HANDSHAKE_QUOTA_CODE: &str = "ChannelHandshakesPerAccount";
 
 /// The `resourceType` the modelled errors carry. The model types it as a plain
 /// required `String`, so these are the model's own shape names.
 pub const PROGRAM_MANAGEMENT_ACCOUNT_RESOURCE_TYPE: &str = "ProgramManagementAccount";
 pub const RELATIONSHIP_RESOURCE_TYPE: &str = "Relationship";
+pub const CHANNEL_HANDSHAKE_RESOURCE_TYPE: &str = "ChannelHandshake";
 
 /// The `ValidationExceptionReason` a malformed request carries, from the model's
 /// value set `BUSINESS_VALIDATION_FAILED | REQUEST_VALIDATION_FAILED`.
@@ -127,6 +148,18 @@ pub fn relationship_arn(parent_arn: &str, id: &str) -> String {
     format!("{parent_arn}/relationship/{id}")
 }
 
+/// The ARN of channel handshake `id` in `catalog`. `ChannelHandshakeSummary`'s
+/// `arn` is modelled as the unconstrained `Arn` shape (len 1..1011), so the
+/// handshake keeps this service's catalog-scoped ARN form, built through the
+/// engine's accessor rather than a literal account.
+pub fn channel_handshake_arn(region: &str, catalog: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("catalog/{catalog}/channel-handshake/{id}"),
+    )
+}
+
 /// Now, as the wire timestamp type. The ONE clock the handlers read, so a stored
 /// timestamp is always the real store time.
 pub fn now() -> ::aws_smithy_types::DateTime {
@@ -159,6 +192,38 @@ pub fn resolve_identifier<'a>(identifier: &'a str, prefix: &str) -> Option<&'a s
     .then_some(last)
 }
 
+/// Which kind of resource an `AssociatedResourceIdentifier` names. The modelled
+/// pattern accepts a program management account or a relationship, as a bare id
+/// or as the full ARN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssociatedResourceKind {
+    ProgramManagementAccount,
+    Relationship,
+}
+
+/// A resolved `AssociatedResourceIdentifier`: the bare id it names and which
+/// kind of resource that is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssociatedResource {
+    pub id: String,
+    pub kind: AssociatedResourceKind,
+}
+
+/// The resource an `AssociatedResourceIdentifier` names, or `None` when the
+/// value is neither a program management account nor a relationship identifier.
+pub fn resolve_associated_resource(identifier: &str) -> Option<AssociatedResource> {
+    if let Some(id) = resolve_identifier(identifier, PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX) {
+        return Some(AssociatedResource {
+            id: id.to_string(),
+            kind: AssociatedResourceKind::ProgramManagementAccount,
+        });
+    }
+    resolve_identifier(identifier, RELATIONSHIP_ID_PREFIX).map(|id| AssociatedResource {
+        id: id.to_string(),
+        kind: AssociatedResourceKind::Relationship,
+    })
+}
+
 /// A `ValidationException` (HTTP 400) naming the member that was refused and why.
 /// Built here so every handler refuses a request this service's own rules reject
 /// in the same shape: the message, the modelled `reason`, and a one-entry
@@ -174,6 +239,24 @@ pub fn validation_exception(member: &str, message: impl Into<String>) -> Validat
             message,
         }]),
     }
+}
+
+/// A `ValidationException` (HTTP 400) refusing `member` because `value` is
+/// outside the model's own value set. The one wording every handler uses for an
+/// enum it re-checks before storing or filtering on it.
+pub fn enum_validation_exception(
+    member: &str,
+    value: &str,
+    values: &[&str],
+) -> ValidationException {
+    validation_exception(
+        member,
+        format!(
+            "Value '{value}' at '{member}' failed to satisfy constraint: Member must satisfy \
+             enum value set: [{}]",
+            values.join(", ")
+        ),
+    )
 }
 
 /// A program management account as stored. Every response that reports one is
@@ -257,6 +340,121 @@ impl Relationship {
             updated_at: Some(self.updated_at),
             start_date: Some(self.start_date),
         }
+    }
+}
+
+/// A channel handshake as stored: a request one account makes to another about
+/// an associated resource (a program management account or a relationship).
+/// Every response that reports one is built from this, never from the request
+/// that created it.
+#[derive(Debug, Clone)]
+pub struct ChannelHandshake {
+    pub id: String,
+    pub arn: String,
+    pub catalog: String,
+    pub handshake_type: String,
+    /// The account that owns the handshake record: the one that created it.
+    pub owner_account_id: String,
+    pub sender_account_id: String,
+    pub receiver_account_id: String,
+    /// The bare id of the associated resource, from the model's
+    /// `AssociatedResourceId` (`^(pma|rs)-[a-z0-9]{13}$`).
+    pub associated_resource_id: String,
+    /// The type-specific detail, as the modelled `HandshakeDetail` union.
+    pub detail: Option<HandshakeDetail>,
+    pub status: String,
+    pub created_at: ::aws_smithy_types::DateTime,
+    pub updated_at: ::aws_smithy_types::DateTime,
+    pub tags: Vec<Tag>,
+}
+
+impl ChannelHandshake {
+    /// This handshake as the `ChannelHandshakeSummary` `ListChannelHandshakes`
+    /// returns.
+    ///
+    /// `senderDisplayName` is left absent: the model types it as the sender's
+    /// `PartnerProfileDisplayName` and this service models no partner profile —
+    /// no operation creates or updates one — so there is no stored value to
+    /// report and none is invented.
+    pub fn to_summary(&self) -> ChannelHandshakeSummary {
+        ChannelHandshakeSummary {
+            id: Some(self.id.clone()),
+            arn: Some(self.arn.clone()),
+            catalog: Some(self.catalog.clone()),
+            handshake_type: Some(self.handshake_type.clone()),
+            owner_account_id: Some(self.owner_account_id.clone()),
+            sender_account_id: Some(self.sender_account_id.clone()),
+            sender_display_name: None,
+            receiver_account_id: Some(self.receiver_account_id.clone()),
+            associated_resource_id: Some(self.associated_resource_id.clone()),
+            detail: self.detail.clone(),
+            created_at: Some(self.created_at),
+            updated_at: Some(self.updated_at),
+            status: Some(self.status.clone()),
+        }
+    }
+
+    /// The `servicePeriodType` this handshake's detail carries, for the
+    /// type-specific `servicePeriodTypes` filter. `None` for a handshake whose
+    /// detail is of another type or carries no service period type.
+    pub fn service_period_type(&self) -> Option<&str> {
+        match self.detail.as_ref()? {
+            HandshakeDetail::startServicePeriodHandshakeDetail(detail) => {
+                detail.service_period_type.as_deref()
+            }
+            HandshakeDetail::revokeServicePeriodHandshakeDetail(detail) => {
+                detail.service_period_type.as_deref()
+            }
+            HandshakeDetail::programManagementAccountHandshakeDetail(_) => None,
+        }
+    }
+
+    /// The `program` this handshake's detail carries, for the type-specific
+    /// `programs` filter.
+    pub fn program(&self) -> Option<&str> {
+        match self.detail.as_ref()? {
+            HandshakeDetail::programManagementAccountHandshakeDetail(detail) => {
+                detail.program.as_deref()
+            }
+            HandshakeDetail::startServicePeriodHandshakeDetail(_)
+            | HandshakeDetail::revokeServicePeriodHandshakeDetail(_) => None,
+        }
+    }
+}
+
+/// The channel handshakes of this service, keyed by id and kept in creation
+/// order so a paginated list walks a stable sequence.
+#[derive(Debug, Default)]
+pub struct ChannelHandshakeStore {
+    order: Vec<String>,
+    by_id: HashMap<String, ChannelHandshake>,
+}
+
+impl ChannelHandshakeStore {
+    pub fn insert(&mut self, handshake: ChannelHandshake) {
+        self.order.push(handshake.id.clone());
+        self.by_id.insert(handshake.id.clone(), handshake);
+    }
+
+    pub fn get(&self, id: &str) -> Option<&ChannelHandshake> {
+        self.by_id.get(id)
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.by_id.contains_key(id)
+    }
+
+    /// Every stored handshake, in creation order.
+    pub fn iter_in_order(&self) -> impl Iterator<Item = &ChannelHandshake> {
+        self.order.iter().filter_map(|id| self.by_id.get(id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
     }
 }
 
@@ -406,6 +604,8 @@ pub struct ComAmazonawsPartnercentralchannelPartnercentralchannelState {
     pub program_management_accounts: ProgramManagementAccountStore,
     /// Every relationship, in creation order.
     pub relationships: RelationshipStore,
+    /// Every channel handshake, in creation order.
+    pub channel_handshakes: ChannelHandshakeStore,
     /// `clientToken` -> what the call that first used it did. Bounded by
     /// [`MAX_IDEMPOTENCY_ENTRIES`] and [`IDEMPOTENCY_TTL`].
     idempotency: HashMap<String, IdempotencyRecord>,
@@ -452,7 +652,8 @@ impl ComAmazonawsPartnercentralchannelPartnercentralchannelState {
             let suffix: String = hex::encode(digest).chars().take(ID_SUFFIX_LEN).collect();
             let candidate = format!("{prefix}{suffix}");
             let taken = self.program_management_accounts.contains(&candidate)
-                || self.relationships.contains(&candidate);
+                || self.relationships.contains(&candidate)
+                || self.channel_handshakes.contains(&candidate);
             if !taken {
                 return candidate;
             }
@@ -584,6 +785,81 @@ impl RelationshipFilters {
     }
 }
 
+/// The filters `ListChannelHandshakes` accepts, already resolved: each is
+/// `None` when the request omitted it (no constraint) and `Some(values)`
+/// otherwise. Built by the handler and carried here so the matching rule and
+/// the token fingerprint read the same thing.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ChannelHandshakeFilters {
+    pub catalog: String,
+    pub handshake_type: String,
+    /// `SENDER` or `RECEIVER`: which side of the handshake the calling account
+    /// must be on.
+    pub participant_type: String,
+    /// The account making the call, compared against the side
+    /// `participant_type` selects.
+    pub caller_account_id: String,
+    pub statuses: Option<Vec<String>>,
+    /// Already resolved from identifiers (bare id or ARN) to bare
+    /// `pma-…`/`rs-…` ids.
+    pub associated_resource_ids: Option<Vec<String>>,
+    /// From the `startServicePeriodTypeFilters`/`revokeServicePeriodTypeFilters`
+    /// variant of `handshakeTypeFilters`.
+    pub service_period_types: Option<Vec<String>>,
+    /// From the `programManagementAccountTypeFilters` variant of
+    /// `handshakeTypeFilters`.
+    pub programs: Option<Vec<String>>,
+}
+
+impl ChannelHandshakeFilters {
+    /// Does `handshake` satisfy every filter?
+    ///
+    /// The catalog and the handshake type scope the list (both are required
+    /// members, and a handshake has exactly one of each) and `participantType`
+    /// selects the side the caller must be on; each remaining filter matches
+    /// when the handshake's corresponding field equals any of that filter's
+    /// values, and several filters are ANDed. An omitted filter constrains
+    /// nothing, and a type-specific filter never matches a handshake whose
+    /// detail carries no such field.
+    pub fn matches(&self, handshake: &ChannelHandshake) -> bool {
+        fn any_equals(values: &Option<Vec<String>>, field: &str) -> bool {
+            values
+                .as_ref()
+                .is_none_or(|values| values.iter().any(|value| value == field))
+        }
+        fn any_equals_opt(values: &Option<Vec<String>>, field: Option<&str>) -> bool {
+            match values {
+                None => true,
+                Some(values) => field.is_some_and(|field| values.iter().any(|v| v == field)),
+            }
+        }
+
+        let participant_account = match self.participant_type.as_str() {
+            PARTICIPANT_TYPE_SENDER => &handshake.sender_account_id,
+            PARTICIPANT_TYPE_RECEIVER => &handshake.receiver_account_id,
+            // Not a modelled `ParticipantType`: no handshake has such a side, so
+            // nothing matches. The handler refuses such a value before it reaches
+            // here, so this is the belt-and-braces arm rather than the live path.
+            _ => return false,
+        };
+
+        handshake.catalog == self.catalog
+            && handshake.handshake_type == self.handshake_type
+            && *participant_account == self.caller_account_id
+            && any_equals(&self.statuses, &handshake.status)
+            && any_equals(
+                &self.associated_resource_ids,
+                &handshake.associated_resource_id,
+            )
+            && any_equals_opt(&self.service_period_types, handshake.service_period_type())
+            && any_equals_opt(&self.programs, handshake.program())
+    }
+}
+
+/// The `ParticipantType` values, from the model's value set `SENDER | RECEIVER`.
+pub const PARTICIPANT_TYPE_SENDER: &str = "SENDER";
+pub const PARTICIPANT_TYPE_RECEIVER: &str = "RECEIVER";
+
 /// Where a page of a paginated list resumed from: how far into the filtered
 /// sequence the previous page stopped, and a fingerprint of the filters it was
 /// taken with, so resuming with different filters is refused instead of being
@@ -628,6 +904,15 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The account id the request is made by: the emulator's single canonical
+/// account (every ARN and account field it emits carries that one account), read
+/// through the engine's accessor rather than a literal. It is the sender and the
+/// owner of a handshake this emulator creates, and the side
+/// `ListChannelHandshakes`' `participantType` is resolved against.
+pub fn caller_account_id() -> String {
+    ::engine::emulator_account_id().to_string()
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

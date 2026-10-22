@@ -15,6 +15,17 @@ Issue-Commit: 09c29ed8e99ab10517eef5fd4d5c2097ded28d72
 
 > _Note: this issue was identified against the code base at commit `09c29ed8e99ab10517eef5fd4d5c2097ded28d72`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+Both reported causes are fixed, and one residual cause is DECLINED as a vendor-level gap.
+
+Fixed:
+* `ListChannelHandshakes` is implemented in `services/service-com-amazonaws-partnercentralchannel-partnercentralchannel/src/ops/list_channel_handshakes.rs`: it pages over the channel handshakes in `src/state.rs` and always serializes `items` — the empty list when the catalog/handshakeType/participantType scope and the optional filters select nothing — with `nextToken` omitted on the last page. `CreateChannelHandshake` is implemented as the store's writer, so the list reports persisted state.
+* The 404 itself was NOT the handler: the request was claimed by no service, so the ROUTER answered `404 UnknownService` in its own awsJson1_1 envelope — which is also where the wrong content-type came from (the framework already derives `application/x-amz-json-1.0` from the model's `aws.protocols#awsJson1_0`). `src/service.rs`'s `can_handle` now also claims a request whose `X-Amz-Target` resolves to this service's shape-name route key (`partnercentralchannel`), which its SigV4 signing name (`partnercentral-channel`) spells differently. Pinned by `tests/all/channel_handshakes.rs` and, in the assembled router, by `core/router/tests/all/partnercentral_channel_target_routing.rs`.
+* Replay confirms the `$headers.content-type` key fixed.
+
+Declined (vendor-level): the recorded request is **SigV4A-signed** (`Authorization: AWS4-ECDSA-P256-SHA256`), so with request authentication on it is now refused `403 AccessDenied` before any handler runs, and the `status` / `$.items` keys still diverge on replay for that reason alone. The emulator's only authenticator is `SigV4Authenticator` in `vendor/server/src/request_authentication.rs`, whose `recognizes` accepts `AWS4-HMAC-SHA256` only, registered in `vendor/smithy-server-runtime/src/multi_service_router.rs` (`MultiServiceRouter::new`); there is no service-level seam to add another, and `vendor/` is read-only here. Closing it needs a SigV4A authenticator in the core library (`AWS4-ECDSA-P256-SHA256`, `X-Amz-Region-Set`, `*` region scope) registered beside the SigV4 one, which would serve every `aws.auth#sigv4a` service, not just this one. With authentication off the same request is served 200 with `items: []`.
+
 ## Operation
 ListChannelHandshakes
 

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannelHandshake
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannelHandshake`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a channel handshake in [`crate::state`] against an existing
+//! associated resource (a program management account or a relationship) in the
+//! requested catalog, records the `clientToken` so a retry replays rather than
+//! creating a second one, and answers the stored id and ARN. The handshake starts
+//! `PENDING`; `ListChannelHandshakes` reads it back out of the same store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannelHandshake::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY writer of the handshake store, so it is what makes
+//! `ListChannelHandshakes` a report on persisted state rather than a constant.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +165,371 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannelHandshake` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelHandshakeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannelHandshake"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateChannelHandshakeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service is not mounted on a state-bearing engine".into(),
+                },
+            )
+            .into());
+        };
+
+        // Enum-typed members are refused at the boundary, but a value outside the
+        // model's own set must never be stored, so it is checked here too.
+        if !HANDSHAKE_TYPE_VALUES.contains(&input.handshake_type.as_str()) {
+            return Err(enum_refusal(
+                "handshakeType",
+                &input.handshake_type,
+                HANDSHAKE_TYPE_VALUES,
+            ));
+        }
+
+        // `associatedResourceIdentifier` names a program management account or a
+        // relationship, as a bare id or the full ARN.
+        let Some(resource) =
+            crate::state::resolve_associated_resource(&input.associated_resource_identifier)
+        else {
+            return Err(refusal(
+                "associatedResourceIdentifier",
+                format!(
+                    "Value '{}' at 'associatedResourceIdentifier' failed to satisfy constraint: \
+                     Member must be a program management account or relationship id or ARN",
+                    input.associated_resource_identifier
+                ),
+            ));
+        };
+
+        // `payload` is a type-specific union: `ChannelHandshakePayload` declares one
+        // variant per service-period handshake type and none for
+        // `PROGRAM_MANAGEMENT_ACCOUNT`, so the handshake type fixes which variant a
+        // request must carry.
+        let sent_variant = input.payload.as_ref().map(|payload| match payload {
+            ChannelHandshakePayload::startServicePeriodPayload(_) => "startServicePeriodPayload",
+            ChannelHandshakePayload::revokeServicePeriodPayload(_) => "revokeServicePeriodPayload",
+        });
+        let expected_variant = match input.handshake_type.as_str() {
+            "START_SERVICE_PERIOD" => Some("startServicePeriodPayload"),
+            "REVOKE_SERVICE_PERIOD" => Some("revokeServicePeriodPayload"),
+            // PROGRAM_MANAGEMENT_ACCOUNT: the union carries no variant for it.
+            _ => None,
+        };
+        if sent_variant != expected_variant {
+            return Err(refusal(
+                "payload",
+                match expected_variant {
+                    Some(expected) => format!(
+                        "Value at 'payload' failed to satisfy constraint: Member must be \
+                         '{expected}' for handshakeType '{}'",
+                        input.handshake_type
+                    ),
+                    None => format!(
+                        "Value at 'payload' failed to satisfy constraint: Member must be absent \
+                         for handshakeType '{}'",
+                        input.handshake_type
+                    ),
+                },
+            ));
+        }
+        // A service-period payload names the program management account the
+        // service period runs under; it is an identifier member like any other, so
+        // it is resolved here and checked against the store below rather than
+        // accepted unread.
+        let payload_parent_identifier = match input.payload.as_ref() {
+            Some(ChannelHandshakePayload::startServicePeriodPayload(payload)) => {
+                if !SERVICE_PERIOD_TYPE_VALUES.contains(&payload.service_period_type.as_str()) {
+                    return Err(enum_refusal(
+                        "payload.startServicePeriodPayload.servicePeriodType",
+                        &payload.service_period_type,
+                        SERVICE_PERIOD_TYPE_VALUES,
+                    ));
+                }
+                Some((
+                    "payload.startServicePeriodPayload.programManagementAccountIdentifier",
+                    payload.program_management_account_identifier.clone(),
+                ))
+            }
+            Some(ChannelHandshakePayload::revokeServicePeriodPayload(payload)) => Some((
+                "payload.revokeServicePeriodPayload.programManagementAccountIdentifier",
+                payload.program_management_account_identifier.clone(),
+            )),
+            None => None,
+        };
+        let payload_parent_id = match payload_parent_identifier.as_ref() {
+            None => None,
+            Some((member, identifier)) => {
+                let resolved = crate::state::resolve_identifier(
+                    identifier,
+                    crate::state::PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX,
+                );
+                let Some(id) = resolved else {
+                    return Err(refusal(
+                        member,
+                        format!(
+                            "Value '{identifier}' at '{member}' failed to satisfy constraint: \
+                             Member must be a program management account id or ARN"
+                        ),
+                    ));
+                };
+                Some(id.to_string())
+            }
+        };
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+        let region = crate::state::request_region(ctx);
+
+        let mut guard = state.lock();
+        guard.advance_clock();
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            crate::state::TokenOutcome::Replay(record) => {
+                if let Some(handshake) = record
+                    .resource_id
+                    .as_deref()
+                    .and_then(|id| guard.channel_handshakes.get(id))
+                {
+                    return Ok(output_for(handshake));
+                }
+                return Err(
+                    CreateChannelHandshakeErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: "The channel handshake created with this client token no \
+                                      longer exists."
+                                .into(),
+                            resource_id: record.resource_id,
+                            resource_type: Some(
+                                crate::state::CHANNEL_HANDSHAKE_RESOURCE_TYPE.into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::ParameterMismatch
+            | crate::state::TokenOutcome::TokenInUse => {
+                return Err(CreateChannelHandshakeErrorModeled::ConflictException(
+                    ConflictException {
+                        message: "The specified clientToken has already been used with different \
+                                  parameters."
+                            .into(),
+                        resource_id: client_token.unwrap_or_default().to_string(),
+                        resource_type: "ClientToken".to_string(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A handshake is about an existing resource, so that resource must be in
+        // the requested catalog before one can be created. The RECEIVER is the
+        // counterparty account that resource names — the account being enrolled for
+        // a program management account, the associated account for a relationship —
+        // and the `program` a `PROGRAM_MANAGEMENT_ACCOUNT` handshake reports is the
+        // one that resource's account is enrolled in.
+        let (receiver_account_id, program, resource_parent_id) = match resource.kind {
+            crate::state::AssociatedResourceKind::ProgramManagementAccount => {
+                let found = guard
+                    .program_management_accounts
+                    .get(&resource.id)
+                    .filter(|account| account.catalog == input.catalog);
+                let Some(account) = found else {
+                    return Err(not_found(&resource.id, &input.catalog));
+                };
+                (
+                    account.account_id.clone(),
+                    Some(account.program.clone()),
+                    account.id.clone(),
+                )
+            }
+            crate::state::AssociatedResourceKind::Relationship => {
+                let found = guard
+                    .relationships
+                    .get(&resource.id)
+                    .filter(|relationship| relationship.catalog == input.catalog);
+                let Some(relationship) = found else {
+                    return Err(not_found(&resource.id, &input.catalog));
+                };
+                let receiver = relationship.associated_account_id.clone();
+                let parent_id = relationship.program_management_account_id.clone();
+                let program = guard
+                    .program_management_accounts
+                    .get(&parent_id)
+                    .map(|account| account.program.clone());
+                (receiver, program, parent_id)
+            }
+        };
+
+        // The account a service-period payload names must exist in the same
+        // catalog, and must be the one the named resource hangs off: a service
+        // period is a property of that parent/child pair, so a payload naming
+        // another account describes a resource this request does not name.
+        if let Some((member, _)) = payload_parent_identifier.as_ref() {
+            let parent_id = payload_parent_id.as_deref().unwrap_or_default();
+            let known = guard
+                .program_management_accounts
+                .get(parent_id)
+                .is_some_and(|account| account.catalog == input.catalog);
+            if !known {
+                return Err(not_found(parent_id, &input.catalog));
+            }
+            if parent_id != resource_parent_id {
+                return Err(refusal(
+                    member,
+                    format!(
+                        "Value '{parent_id}' at '{member}' failed to satisfy constraint: Member \
+                         must be the program management account of resource '{}'",
+                        resource.id
+                    ),
+                ));
+            }
+        }
+
+        // The store is in memory and this is the only operation that grows it, so
+        // the handshake count is capped.
+        if guard.channel_handshakes.len() >= crate::state::MAX_CHANNEL_HANDSHAKES {
+            return Err(
+                CreateChannelHandshakeErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The request would exceed the quota of {} channel handshakes.",
+                            crate::state::MAX_CHANNEL_HANDSHAKES
+                        ),
+                        resource_id: resource.id.clone(),
+                        resource_type: crate::state::CHANNEL_HANDSHAKE_RESOURCE_TYPE.to_string(),
+                        quota_code: crate::state::CHANNEL_HANDSHAKE_QUOTA_CODE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = guard.mint_id(crate::state::CHANNEL_HANDSHAKE_ID_PREFIX);
+        let arn = crate::state::channel_handshake_arn(&region, &input.catalog, &id);
+        let created_at = crate::state::now();
+        let detail = detail_for(input.payload.clone(), program);
+        let caller = crate::state::caller_account_id();
+        guard
+            .channel_handshakes
+            .insert(crate::state::ChannelHandshake {
+                id: id.clone(),
+                arn,
+                catalog: input.catalog,
+                handshake_type: input.handshake_type,
+                // The caller creates the handshake, so it both owns and sends it.
+                owner_account_id: caller.clone(),
+                sender_account_id: caller,
+                receiver_account_id,
+                associated_resource_id: resource.id,
+                detail,
+                status: crate::state::HANDSHAKE_STATUS_PENDING.to_string(),
+                created_at,
+                updated_at: created_at,
+                tags: input.tags.unwrap_or_default(),
+            });
+        guard.record_token(
+            client_token,
+            Self::NAME,
+            &request_fingerprint,
+            Some(id.clone()),
+        );
+
+        // Answer from the store, not from the request struct.
+        let handshake = guard.channel_handshakes.get(&id).ok_or_else(|| {
+            CreateChannelHandshakeError::from(
+                CreateChannelHandshakeErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the channel handshake that was just stored could not be read \
+                                  back"
+                            .into(),
+                    },
+                ),
+            )
+        })?;
+        Ok(output_for(handshake))
     }
+}
+
+/// The stored `HandshakeDetail` for the request's payload.
+///
+/// A service-period handshake reports what its payload proposed. The detail
+/// members no payload carries are left ABSENT rather than filled with a guess —
+/// the request supplies no start date and this service stores no service period
+/// to read the rest from, so nothing is synthesised. A
+/// `PROGRAM_MANAGEMENT_ACCOUNT` handshake has no payload, so its detail is the
+/// program the associated resource is enrolled in.
+fn detail_for(
+    payload: Option<ChannelHandshakePayload>,
+    program: Option<String>,
+) -> Option<HandshakeDetail> {
+    match payload {
+        Some(ChannelHandshakePayload::startServicePeriodPayload(payload)) => Some(
+            HandshakeDetail::startServicePeriodHandshakeDetail(StartServicePeriodHandshakeDetail {
+                note: payload.note,
+                service_period_type: Some(payload.service_period_type),
+                minimum_notice_days: payload.minimum_notice_days,
+                start_date: None,
+                end_date: payload.end_date,
+            }),
+        ),
+        Some(ChannelHandshakePayload::revokeServicePeriodPayload(payload)) => Some(
+            HandshakeDetail::revokeServicePeriodHandshakeDetail(
+                RevokeServicePeriodHandshakeDetail {
+                    note: payload.note,
+                    service_period_type: None,
+                    minimum_notice_days: None,
+                    start_date: None,
+                    end_date: None,
+                },
+            ),
+        ),
+        None => Some(HandshakeDetail::programManagementAccountHandshakeDetail(
+            ProgramManagementAccountHandshakeDetail { program },
+        )),
+    }
+}
+
+/// The response for a stored handshake. The ONE place this operation's output is
+/// built, so a fresh create and an idempotent replay answer from the same stored
+/// fields.
+fn output_for(handshake: &crate::state::ChannelHandshake) -> CreateChannelHandshakeOutput {
+    CreateChannelHandshakeOutput {
+        channel_handshake_detail: Some(CreateChannelHandshakeDetail {
+            id: Some(handshake.id.clone()),
+            arn: Some(handshake.arn.clone()),
+        }),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an associated resource
+/// that is not in the requested catalog.
+fn not_found(resource_id: &str, catalog: &str) -> CreateChannelHandshakeError {
+    CreateChannelHandshakeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: format!("Resource {resource_id} was not found in catalog {catalog}."),
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(if resource_id.starts_with(crate::state::RELATIONSHIP_ID_PREFIX) {
+            crate::state::RELATIONSHIP_RESOURCE_TYPE.to_string()
+        } else {
+            crate::state::PROGRAM_MANAGEMENT_ACCOUNT_RESOURCE_TYPE.to_string()
+        }),
+    })
+    .into()
+}
+
+/// Refuse `member` with the modelled `ValidationException` (HTTP 400).
+fn refusal(member: &str, message: String) -> CreateChannelHandshakeError {
+    CreateChannelHandshakeErrorModeled::ValidationException(crate::state::validation_exception(
+        member, message,
+    ))
+    .into()
+}
+
+/// Refuse `member` because `value` is outside the model's own value set.
+fn enum_refusal(member: &str, value: &str, values: &[&str]) -> CreateChannelHandshakeError {
+    CreateChannelHandshakeErrorModeled::ValidationException(
+        crate::state::enum_validation_exception(member, value, values),
+    )
+    .into()
 }

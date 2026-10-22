@@ -27,6 +27,8 @@ mod iam_and_signer_signing_name_routing;
 mod ivs_signing_name_routing;
 #[path = "all/marketplace_signing_name_routing.rs"]
 mod marketplace_signing_name_routing;
+#[path = "all/partnercentral_channel_target_routing.rs"]
+mod partnercentral_channel_target_routing;
 #[path = "all/personalize_signing_name_routing.rs"]
 mod personalize_signing_name_routing;
 #[path = "all/shared_signing_name_routing.rs"]

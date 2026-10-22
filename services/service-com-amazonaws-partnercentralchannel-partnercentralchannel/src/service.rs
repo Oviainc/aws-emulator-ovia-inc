@@ -63,6 +63,28 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
         }
     }
+
+    /// Is `key` the route key an `X-Amz-Target` header on THIS service resolves
+    /// to?
+    ///
+    /// `X-Amz-Target` carries `<service shape name>.<operation>`, and
+    /// `emulator_server::service_from_target` reads the segment before the `.`,
+    /// strips any `_<version>` suffix and lower-cases it. That key is the
+    /// service's SHAPE name, which for this service is not its SigV4 signing
+    /// name (`PartnerCentralChannel` -> `partnercentralchannel` against
+    /// `partnercentral-channel`), so the key is derived here from the
+    /// model-supplied shape id rather than written out (the resolver already
+    /// trimmed and lower-cased the key, so the compare is case-insensitive).
+    fn target_route_key_matches(&self, key: &str) -> bool {
+        let shape_name = self
+            .entry
+            .identity()
+            .shape_id()
+            .rsplit('#')
+            .next()
+            .unwrap_or_default();
+        key.eq_ignore_ascii_case(shape_name)
+    }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -75,10 +97,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
         // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
+        // name — OR the key its `X-Amz-Target` resolves to. The resolver reads an
+        // `AWS4-HMAC-SHA256` credential scope first and falls back to
+        // `X-Amz-Target`, so a request with no such scope — unsigned, or signed
+        // with SigV4A (`AWS4-ECDSA-P256-SHA256`), the scheme this service's model
+        // lists FIRST — resolves to the service's shape name, which this
+        // service's signing name spells differently (`partnercentralchannel`
+        // against `partnercentral-channel`). Matching only the signing name
+        // leaves every such request unclaimed, which the router answers
+        // `404 UnknownService` in its own awsJson1_1 envelope — never this
+        // service's protocol, its operations or its modelled errors.
         match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
+            Some(key) if key == self.entry.identity().signing_name() => true,
+            // Only an `X-Amz-Target` may claim this service under its shape-name
+            // key: that header is where the key comes from, so a request that
+            // carries none (a host-style endpoint, say) is left to whichever
+            // service its own signal names.
+            Some(key) => {
+                self.target_route_key_matches(&key)
+                    && ::emulator_server::service_from_target(&parts.headers).as_deref()
+                        == Some(key.as_str())
+            }
             None => false,
         }
     }
