@@ -21,18 +21,24 @@
 //! matching workflow's `inputSourceConfig`" — so storing it would let a workflow
 //! create or delete leave a stale flag behind. It is derived on read by
 //! [`ComAmazonawsEntityresolutionAwsveniceserviceState::schema_has_workflows`].
+//!
+//! Beside the control-plane resources this module owns the MATCHING JOBS a workflow
+//! has been run with ([`MatchingJob`]), and the clock-driven status lifecycle every
+//! reader of one materialises ([`MatchingJob::materialize_due`]).
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use ::aws_smithy_types::Document;
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     IdMappingIncrementalRunConfig, IdMappingTechniques, IdMappingWorkflowInputSource,
-    IdMappingWorkflowOutputSource, IncrementalRunConfig, InputSource, OutputSource,
-    ProviderComponentSchema, ProviderEndpointConfiguration, ProviderIdNameSpaceConfiguration,
-    ProviderIntermediateDataAccessConfiguration, ProviderMarketplaceConfiguration,
-    ProviderSchemaAttribute, ResolutionTechniques, SchemaInputAttribute,
+    IdMappingWorkflowOutputSource, IncrementalRunConfig, InputSource, JobOutputSource,
+    OutputSource, ProviderComponentSchema, ProviderEndpointConfiguration,
+    ProviderIdNameSpaceConfiguration, ProviderIntermediateDataAccessConfiguration,
+    ProviderMarketplaceConfiguration, ProviderSchemaAttribute, ResolutionTechniques,
+    SchemaInputAttribute,
 };
 
 /// One schema mapping as this service persists it.
@@ -69,6 +75,168 @@ pub struct MatchingWorkflow {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
     pub tags: Option<HashMap<String, String>>,
+}
+
+/// The `JobStatus` values, as `smithy_query(query="shape",shape="JobStatus")` gives
+/// them: `RUNNING | SUCCEEDED | FAILED | QUEUED`.
+///
+/// A job's status is one of these strings and nothing else; the two terminal ones are
+/// listed again in [`TERMINAL_JOB_STATUSES`], which is the single definition of
+/// "nothing further is owed from here".
+pub mod job_status {
+    pub const QUEUED: &str = "QUEUED";
+    pub const RUNNING: &str = "RUNNING";
+    pub const SUCCEEDED: &str = "SUCCEEDED";
+    pub const FAILED: &str = "FAILED";
+}
+
+/// The `JobStatus` values no clock-owed transition leaves: a job in one of these keeps
+/// its status, its `endTime` and its `errorDetails` forever.
+pub const TERMINAL_JOB_STATUSES: &[&str] = &[job_status::SUCCEEDED, job_status::FAILED];
+
+/// True when `status` is one no clock-owed transition leaves.
+pub fn is_terminal_job_status(status: &str) -> bool {
+    TERMINAL_JOB_STATUSES.contains(&status)
+}
+
+/// How long a matching job spends in each non-terminal status before the clock owes it
+/// the next one.
+///
+/// A CHOSEN span — AWS documents no duration for a matching job, whose real runtime
+/// depends on the input size — inside the 250–750 ms window this emulator fixes for a
+/// clock-owed transition, so a caller that reads the job straight after
+/// `StartMatchingJob` still observes the `QUEUED` it was started in, and the span is
+/// never zero.
+pub const JOB_STATUS_TRANSITION: Duration = Duration::from_millis(500);
+
+/// Why a matching job cannot reach `SUCCEEDED` in this emulator, reported on the
+/// modelled `ErrorDetails$errorMessage` of the `FAILED` job.
+///
+/// A matching job reads the workflow's input records out of its `inputSourceConfig`
+/// (an S3 or Glue location), resolves entities across them with Entity Resolution's
+/// matching engine, and writes matched records to `outputSourceConfig`. This emulator
+/// has no such engine and no access to those locations, so the job is accepted,
+/// tracked and readable, and the execution it cannot perform ends in the service's own
+/// modelled failure status (`FAILED`, carrying this reason) rather than in a
+/// `SUCCEEDED` with record counts nothing computed.
+pub const JOB_NOT_EXECUTED_MESSAGE: &str =
+    "Entity Resolution matching is not available in this emulator: no matching engine is \
+     attached, so the job could not read the workflow's input sources or write matched \
+     records to its output source.";
+
+/// How many jobs the store retains per matching workflow.
+///
+/// A RETENTION policy rather than a refusal: a workflow can be run any number of
+/// times, so `StartMatchingJob` drops that workflow's OLDEST jobs that are no longer
+/// in progress once it would hold more than this, exactly as a real service ages out
+/// old job history, and the store cannot grow without limit however many starts a
+/// caller issues. A job still in progress is never dropped, and an aged-out job reads
+/// as the modelled "no such job" exactly as a job id that never existed does.
+pub const MAX_JOBS_PER_WORKFLOW: usize = 50;
+
+/// One run of a matching workflow as this service persists it.
+///
+/// Every timestamp is epoch MILLISECONDS, the same precision [`now`] truncates to, so
+/// a stored instant both compares against the clock and round-trips through the
+/// modelled `Timestamp` members unchanged.
+#[derive(Debug, Clone)]
+pub struct MatchingJob {
+    /// The `jobId` minted when the job was started: 32 lowercase hex characters, as
+    /// the modelled `JobId` (`^[a-f0-9]{32}$`) requires. See [`new_job_id`].
+    pub job_id: String,
+    /// The workflow this job runs, i.e. the `workflowName` the start call named.
+    pub workflow_name: String,
+    /// One of [`job_status`].
+    pub status: String,
+    /// `startTime`: the instant the job was started, in epoch milliseconds.
+    pub start_time: i64,
+    /// `endTime`: set only once the status is terminal.
+    pub end_time: Option<i64>,
+    /// `errorDetails.errorMessage`: set only on a `FAILED` job.
+    pub error_message: Option<String>,
+    /// `outputSourceConfig`, as it was derived from the workflow when the job started
+    /// (see [`job_output_source_config`]). It is kept ON THE JOB, not re-derived on
+    /// read, because a job reports where THAT RUN would write — a later
+    /// `UpdateMatchingWorkflow` must not rewrite the history of a job already started.
+    pub output_source_config: Option<Vec<JobOutputSource>>,
+    /// The instant the next status transition becomes due, while one is owed.
+    pub next_transition_at: Option<i64>,
+}
+
+impl MatchingJob {
+    /// Apply every status transition the clock has ALREADY made due at `now` (epoch
+    /// milliseconds).
+    ///
+    /// The lifecycle is clock-driven, so each reader materialises it before answering
+    /// and nothing sleeps: `QUEUED` -> `RUNNING` -> `FAILED`, the last carrying
+    /// [`JOB_NOT_EXECUTED_MESSAGE`]. A transition that is not due yet is left alone,
+    /// and a terminal job is never touched again — so a read only ever writes what was
+    /// already owed at the same instant had nobody called.
+    pub fn materialize_due(&mut self, now: i64) {
+        while let Some(due) = self.next_transition_at {
+            if is_terminal_job_status(&self.status) {
+                // Nothing is owed from a terminal status: drop any stale due instant.
+                self.next_transition_at = None;
+                return;
+            }
+            if due > now {
+                return;
+            }
+            let span = i64::try_from(JOB_STATUS_TRANSITION.as_millis()).unwrap_or(i64::MAX);
+            match self.status.as_str() {
+                job_status::QUEUED => {
+                    self.status = job_status::RUNNING.to_string();
+                    self.next_transition_at = Some(due.saturating_add(span));
+                }
+                _ => {
+                    // `RUNNING`, the only other non-terminal `JobStatus`.
+                    self.status = job_status::FAILED.to_string();
+                    self.error_message = Some(JOB_NOT_EXECUTED_MESSAGE.to_string());
+                    self.end_time = Some(due);
+                    self.next_transition_at = None;
+                }
+            }
+        }
+    }
+
+    /// True while this job holds its workflow's single run slot: any status that is not
+    /// terminal.
+    ///
+    /// This is what `StartMatchingJob` refuses a concurrent start on (the
+    /// "Workflow is currently running" conflict `ConflictException`'s own doc names),
+    /// and what the [`MAX_JOBS_PER_WORKFLOW`] retention never drops.
+    pub fn is_in_progress(&self) -> bool {
+        !is_terminal_job_status(&self.status)
+    }
+}
+
+/// The `outputSourceConfig` a job of `workflow` reports, derived from the workflow's
+/// own `outputSourceConfig`.
+///
+/// `JobOutputSourceConfig` is `length 1..1`
+/// (`smithy_query(query="shape",shape="JobOutputSourceConfig")`), so at most the
+/// workflow's FIRST output source becomes the job's. A `JobOutputSource` is
+/// `roleArn` + `outputS3Path` (both @required) + optional `KMSArn`: the role is the
+/// workflow's `roleArn` — the role Entity Resolution assumes for the run — and the
+/// path and KMS key are that output source's.
+///
+/// `OutputSource$outputS3Path` targets `OptionalS3Path`, whose pattern admits the
+/// EMPTY string and whose default IS the empty string, while the job member's
+/// `S3Path` is `length 1..1024` and must match `^s3://…`
+/// (`smithy_query(query="shape",shape="OutputSource")`). A workflow configured with
+/// no output path therefore yields no job output config at all, rather than an
+/// invented path or an empty one the job member cannot hold.
+pub fn job_output_source_config(workflow: &MatchingWorkflow) -> Option<Vec<JobOutputSource>> {
+    let first = workflow.output_source_config.first()?;
+    let output_s3_path = first
+        .output_s3_path
+        .clone()
+        .filter(|path| !path.is_empty())?;
+    Some(vec![JobOutputSource {
+        role_arn: workflow.role_arn.clone(),
+        output_s3_path,
+        kms_arn: first.kms_arn.clone(),
+    }])
 }
 
 /// One provider service as this service persists it: an entry of the AWS-managed
@@ -166,6 +334,10 @@ pub struct ComAmazonawsEntityresolutionAwsveniceserviceState {
     pub schema_mappings: BTreeMap<String, SchemaMapping>,
     /// Every matching workflow that exists, keyed by `workflowName`.
     pub matching_workflows: BTreeMap<String, MatchingWorkflow>,
+    /// Every matching job that exists, keyed by its `jobId`, which is unique across
+    /// workflows — the job's own `workflow_name` says which workflow it belongs to, so
+    /// one map serves both the per-job read and the per-workflow listing.
+    pub matching_jobs: BTreeMap<String, MatchingJob>,
     /// The Region's provider-service catalog, keyed by
     /// [`ProviderService::catalog_key`]. Seeded, never written by a handler.
     pub provider_services: BTreeMap<String, ProviderService>,
@@ -186,6 +358,7 @@ impl Default for ComAmazonawsEntityresolutionAwsveniceserviceState {
         Self {
             schema_mappings: BTreeMap::new(),
             matching_workflows: BTreeMap::new(),
+            matching_jobs: BTreeMap::new(),
             provider_services: provider_service_catalog(),
             id_mapping_workflows: BTreeMap::new(),
         }
@@ -593,6 +766,44 @@ pub mod messages {
     /// `ConflictException`'s doc names ("Workflow already exists").
     pub const CREATE_MATCHING_WORKFLOW_CONFLICT: &str = "MatchingWorkflow already exists.";
 
+    /// `StartMatchingJob`'s `ResourceNotFoundException$message` (HTTP 404) when no
+    /// matching workflow of the requested name exists — the condition this operation's
+    /// own doc describes ("The workflow must have previously been created using the
+    /// CreateMatchingWorkflow endpoint"). Not itself recorded; this operation's OWN
+    /// constant, spelled with the resource type the API uses and in the same constant
+    /// form as the recorded [`GET_MATCHING_WORKFLOW_NOT_FOUND`].
+    pub const START_MATCHING_JOB_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
+
+    /// `StartMatchingJob`'s `ConflictException$message` (HTTP 400) when a job of that
+    /// workflow is still in progress — the condition `ConflictException`'s own doc
+    /// gives as an example ("Workflow is currently running"). This operation's own
+    /// constant: no value from the request is composed into it.
+    pub const START_MATCHING_JOB_ALREADY_RUNNING: &str = "MatchingWorkflow is currently running";
+
+    /// `GetMatchingJob`'s `ResourceNotFoundException$message` (HTTP 404) when the
+    /// `workflowName` names no matching workflow. This reader's own constant, in the
+    /// same form as [`GET_MATCHING_WORKFLOW_NOT_FOUND`].
+    pub const GET_MATCHING_JOB_WORKFLOW_NOT_FOUND: &str = "MatchingWorkflow Not Found";
+
+    /// `GetMatchingJob`'s `ResourceNotFoundException$message` (HTTP 404) when the
+    /// workflow exists but holds no job of the requested `jobId` — including a job id
+    /// that belongs to ANOTHER workflow, which this workflow does not have. This
+    /// reader's own constant, naming the resource type that was not found.
+    pub const GET_MATCHING_JOB_NOT_FOUND: &str = "MatchingJob Not Found";
+
+    /// `DeleteMatchingWorkflow`'s `ConflictException$message` (HTTP 400) when the
+    /// workflow still has a matching job in progress — the condition
+    /// `ConflictException`'s own doc gives as an example ("Workflow is currently
+    /// running").
+    ///
+    /// Like [`delete_matching_workflow_not_found`], this delete path's text is a
+    /// TEMPLATE over the request: the `workflowName` @httpLabel the caller asked for
+    /// is substituted into it, so the refusal names the workflow whose run blocks the
+    /// delete. The template is the rule — any name goes through it unchanged.
+    pub fn delete_matching_workflow_running(workflow_name: &str) -> String {
+        format!("Job associated with workflow {workflow_name} is currently running, failed to delete")
+    }
+
     /// `CreateIdMappingWorkflow`'s `ConflictException$message` (HTTP 400) when the
     /// `workflowName` is already taken — the refusal its own doc describes ("Each
     /// IdMappingWorkflow must have a unique workflow name"). Not itself recorded; it is
@@ -741,6 +952,100 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
                 .any(|source| source.schema_name == schema_name)
         })
     }
+
+    /// Materialise the clock-owed transitions of the job named by
+    /// `(workflow_name, job_id)` and hand it back.
+    ///
+    /// A job of ANOTHER workflow is matched out first, so a call about one workflow
+    /// never reads — or advances — another workflow's job. The only write is the one
+    /// the clock had already made due at `now`, which is the state the caller would
+    /// have seen had nobody called at all.
+    pub fn matching_job_mut(
+        &mut self,
+        workflow_name: &str,
+        job_id: &str,
+        now: i64,
+    ) -> Option<&mut MatchingJob> {
+        let job = self.matching_jobs.get_mut(job_id)?;
+        if job.workflow_name != workflow_name {
+            return None;
+        }
+        job.materialize_due(now);
+        Some(job)
+    }
+
+    /// Every job OF ONE WORKFLOW, in `jobId` order, with its clock-owed transitions
+    /// materialised.
+    ///
+    /// The workflow filter runs before the materialisation, so a call about one
+    /// workflow never advances another workflow's jobs.
+    pub fn matching_jobs_of_mut(
+        &mut self,
+        workflow_name: &str,
+        now: i64,
+    ) -> impl Iterator<Item = &mut MatchingJob> {
+        let workflow_name = workflow_name.to_string();
+        self.matching_jobs.values_mut().filter_map(move |job| {
+            if job.workflow_name != workflow_name {
+                return None;
+            }
+            job.materialize_due(now);
+            Some(job)
+        })
+    }
+
+    /// Drop `workflow_name`'s oldest finished jobs until it holds at most `retain` of
+    /// them, and report how many were dropped.
+    ///
+    /// Oldest by `startTime` (ties broken by `jobId`, so the order is total and the
+    /// outcome does not depend on map iteration luck). A job still in progress is
+    /// never dropped — retention ages out HISTORY, it does not cancel work — so a
+    /// workflow whose jobs are all in progress keeps every one of them.
+    pub fn retain_newest_jobs(&mut self, workflow_name: &str, retain: usize) -> usize {
+        let mut finished: Vec<(i64, String)> = self
+            .matching_jobs
+            .values()
+            .filter(|job| job.workflow_name == workflow_name && !job.is_in_progress())
+            .map(|job| (job.start_time, job.job_id.clone()))
+            .collect();
+        let held = self
+            .matching_jobs
+            .values()
+            .filter(|job| job.workflow_name == workflow_name)
+            .count();
+        let excess = held.saturating_sub(retain).min(finished.len());
+        if excess == 0 {
+            return 0;
+        }
+        finished.sort_unstable();
+        for (_, job_id) in finished.into_iter().take(excess) {
+            self.matching_jobs.remove(&job_id);
+        }
+        excess
+    }
+
+    /// Remove EVERY job of `workflow_name`, in progress or not, and report how many
+    /// were removed.
+    ///
+    /// The cascade `DeleteMatchingWorkflow` performs: a job belongs to the workflow it
+    /// runs, so leaving its jobs behind would let a workflow recreated under the same
+    /// name inherit runs it never had. Unlike
+    /// [`retain_newest_jobs`](Self::retain_newest_jobs), which ages out HISTORY and
+    /// therefore never touches a job in progress, this says the workflow is GONE, so
+    /// nothing of it is kept.
+    pub fn remove_jobs_of(&mut self, workflow_name: &str) -> usize {
+        let doomed: Vec<String> = self
+            .matching_jobs
+            .values()
+            .filter(|job| job.workflow_name == workflow_name)
+            .map(|job| job.job_id.clone())
+            .collect();
+        let removed = doomed.len();
+        for job_id in doomed {
+            self.matching_jobs.remove(&job_id);
+        }
+        removed
+    }
 }
 
 /// The region every ARN this service mints is scoped to when the request carries no
@@ -765,12 +1070,37 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 /// and `createdAt` would differ between the create response and a later read.
 /// Milliseconds round-trip exactly, which keeps a stored timestamp stable across reads.
 pub fn now() -> ::aws_smithy_types::DateTime {
-    let millis = ::std::time::SystemTime::now()
+    ::aws_smithy_types::DateTime::from_millis(now_millis())
+}
+
+/// Now as epoch milliseconds: the stored form of every instant a job record keeps, so
+/// a due instant can be compared against the clock and still round-trip through a
+/// modelled `Timestamp` member exactly (see [`now`]).
+pub fn now_millis() -> i64 {
+    ::std::time::SystemTime::now()
         .duration_since(::std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {
             i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
-        });
-    ::aws_smithy_types::DateTime::from_millis(millis)
+        })
+}
+
+/// A freshly minted `jobId`: 32 lowercase hex characters, as the modelled `JobId`
+/// (`^[a-f0-9]{32}$`, `smithy_query(query="shape",shape="JobId")`) requires.
+///
+/// The entropy is a random v4 UUID's — the `uuid` crate's generator, reached through
+/// `emulator_telemetry`'s `BatchId::random()` constructor
+/// (`uuid::Uuid::new_v4().as_hyphenated()` verbatim, `vendor/emulator-telemetry/src/types.rs`)
+/// because `emulator-telemetry` is already one of this crate's dependencies, so
+/// nothing new enters the workspace lockfile for it. A hyphenated UUID is exactly 32
+/// lowercase hex digits plus four hyphens, so dropping the hyphens yields the modelled
+/// pattern; only the generator is borrowed, and the newtype's telemetry meaning is
+/// dropped here.
+pub fn new_job_id() -> String {
+    ::emulator_telemetry::BatchId::random()
+        .as_str()
+        .chars()
+        .filter(|ch| *ch != '-')
+        .collect()
 }
 
 /// The page size to serve for a `@paginated` operation whose `maxResults` member is
