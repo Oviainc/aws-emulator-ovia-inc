@@ -23,13 +23,16 @@ const TARGET_PREFIX: &str = "Route53AutoNaming_v20170314";
 const REGION: &str = "us-west-2";
 
 /// One emulator with this service mounted on a fresh shared engine.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because the suites in `tests/all/` share this one harness rather than
+/// each carrying a copy of the dispatch plumbing.
+pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
 
 /// The same emulator, plus the engine it was mounted on, so a test can seed the store
 /// to reach a boundary condition without thousands of round trips.
-fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // These tests drive the router directly rather than signing requests.
@@ -39,7 +42,7 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// Dispatch one operation and return its HTTP status and JSON body.
-async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{REGION}/servicediscovery/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=unsigned"
@@ -64,14 +67,18 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16
 }
 
 /// Dispatch an operation that must succeed, returning its output.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let (status, json) = call(router, operation, body).await;
     assert_eq!(status, 200, "{operation} must succeed, got {status}: {json}");
     json
 }
 
 /// Dispatch an operation that must fail, returning its status and wire error code.
-async fn failure(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, String) {
+pub(crate) async fn failure(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, String) {
     let (status, json) = call(router, operation, body).await;
     let code = json["__type"]
         .as_str()
@@ -85,7 +92,7 @@ async fn failure(router: &MultiServiceRouter, operation: &str, body: Value) -> (
 }
 
 /// Create a namespace and return `(operation id, namespace id)`.
-async fn namespace(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn namespace(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let created = ok(router, "CreateHttpNamespace", json!({ "Name": name })).await;
     let operation_id = created["OperationId"]
         .as_str()
@@ -105,7 +112,7 @@ async fn namespace(router: &MultiServiceRouter, name: &str) -> (String, String) 
 }
 
 /// Create a service in `namespace_id` and return its id.
-async fn service(router: &MultiServiceRouter, namespace_id: &str, name: &str) -> String {
+pub(crate) async fn service(router: &MultiServiceRouter, namespace_id: &str, name: &str) -> String {
     let created = ok(
         router,
         "CreateService",

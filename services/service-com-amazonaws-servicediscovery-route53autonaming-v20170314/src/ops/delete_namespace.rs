@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNamespace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNamespace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNamespace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the namespace the request names and files the asynchronous
+//! `DELETE_NAMESPACE` operation record `GetOperation` reads back. The namespace is
+//! addressed by its id or its ARN (the member is modelled as `Arn`), a namespace that
+//! still holds services is refused with `ResourceInUse`, and a delete still in progress
+//! for the same namespace is refused with `DuplicateRequest`.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +144,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNamespace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNamespaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNamespace"))
+        // Nothing in the answer depends on request metadata: the namespace is addressed
+        // by a value in the body and every id in the response comes from the store.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteNamespaceErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::UNREACHABLE_STATE_MESSAGE.to_string()),
+            })
+            .into());
+        };
+
+        let now = std::time::SystemTime::now();
+        let mut state = state.lock();
+
+        let Some(namespace_id) = state.resolve_namespace_id(&input.id) else {
+            // No record under this reference. While a delete already filed for it is
+            // still owed its terminal status, this request is the one the model calls
+            // `DuplicateRequest` ("the operation is already in progress"), and it
+            // carries the id of that operation so the caller polls it rather than
+            // filing a second delete. Once that operation settles the same request is
+            // a plain `NamespaceNotFound`.
+            if let Some(in_progress) =
+                delete_in_progress(&state, referenced_namespace_id(&input.id), now)
+            {
+                return Err(DeleteNamespaceErrorModeled::DuplicateRequest(
+                    DuplicateRequest {
+                        message: Some(format!(
+                            "The deletion of namespace {} is already in progress.",
+                            input.id
+                        )),
+                        duplicate_operation_id: Some(in_progress),
+                    },
+                )
+                .into());
+            }
+            return Err(DeleteNamespaceErrorModeled::NamespaceNotFound(
+                NamespaceNotFound {
+                    message: Some(format!(
+                        "No namespace exists with the specified ID {}.",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "If the namespace still contains one or more services, the request fails."
+        // The count is derived from the service map, so it can never disagree with the
+        // `ServiceCount` `GetNamespace` reports.
+        let service_count = state.service_count(&namespace_id);
+        if service_count > 0 {
+            return Err(DeleteNamespaceErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(format!(
+                    "The namespace {namespace_id} can't be deleted because it still contains \
+                     {service_count} service(s)."
+                )),
+            })
+            .into());
+        }
+
+        let removed = state
+            .namespaces
+            .remove(&namespace_id)
+            .expect("the resolved namespace id is present");
+        // The name index is maintained beside the record map, so the deleted name stops
+        // resolving here too: a later create of the same name is a create, not a
+        // conflict with a namespace nobody can read any more.
+        if state
+            .namespace_ids_by_name
+            .get(&removed.name)
+            .is_some_and(|indexed| *indexed == namespace_id)
+        {
+            state.namespace_ids_by_name.remove(&removed.name);
+        }
+
+        // Like every other mutating call in this service, the delete files an
+        // `Operation` record that starts `SUBMITTED` and reaches `SUCCESS` when the
+        // clock owes it; `GetOperation` reads it back.
+        let operation_id = state.record_operation(
+            "DELETE_NAMESPACE",
+            now,
+            [("NAMESPACE".to_string(), namespace_id)],
+        );
+
+        Ok(DeleteNamespaceOutput {
+            operation_id: Some(operation_id),
+        })
     }
+}
+
+/// The namespace id a reference names: an id is itself, and an ARN's resource id is the
+/// segment after its last `/` (`arn:…:servicediscovery:…:namespace/ns-…`).
+///
+/// Only needed once the record is gone, where `resolve_namespace_id` has no stored ARN
+/// left to match against.
+fn referenced_namespace_id(reference: &str) -> &str {
+    reference.rsplit('/').next().unwrap_or(reference)
+}
+
+/// The id of a `DELETE_NAMESPACE` operation for `namespace_id` that the clock has not
+/// yet owed its terminal status, if one is on file.
+fn delete_in_progress(
+    state: &crate::state::ComAmazonawsServicediscoveryRoute53autonamingV20170314State,
+    namespace_id: &str,
+    now: std::time::SystemTime,
+) -> Option<String> {
+    state
+        .operations
+        .values()
+        .find(|record| {
+            record.operation_type == "DELETE_NAMESPACE"
+                && record.status == crate::state::OPERATION_STATUS_SUBMITTED
+                && now < record.success_due_at
+                && record
+                    .targets
+                    .get("NAMESPACE")
+                    .is_some_and(|target| target == namespace_id)
+        })
+        .map(|record| record.id.clone())
 }

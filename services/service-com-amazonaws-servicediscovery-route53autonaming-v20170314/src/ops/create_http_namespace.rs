@@ -184,16 +184,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // A replayed `CreatorRequestId` for the SAME name returns the operation the
-        // first call filed rather than creating a second namespace.
-        if let Some(token) = input.creator_request_id.as_deref() {
-            if let Some(operation_id) = state.replayed(
-                crate::state::IdempotencyScope::CreateHttpNamespace,
-                token,
-                &input.name,
-            ) {
-                return Ok(CreateHttpNamespaceOutput {
-                    operation_id: Some(operation_id),
-                });
+        // first call filed rather than creating a second namespace — but ONLY while the
+        // namespace it created is still stored. Once `DeleteNamespace` has removed it
+        // the token is stale, and replaying it would answer success for a create this
+        // call never made, so the namespace is created again.
+        let still_stored = state.namespace_ids_by_name.contains_key(&input.name);
+        if still_stored {
+            if let Some(token) = input.creator_request_id.as_deref() {
+                if let Some(operation_id) = state.replayed(
+                    crate::state::IdempotencyScope::CreateHttpNamespace,
+                    token,
+                    &input.name,
+                ) {
+                    return Ok(CreateHttpNamespaceOutput {
+                        operation_id: Some(operation_id),
+                    });
+                }
             }
         }
 
