@@ -741,9 +741,33 @@ async fn an_omitted_member_takes_its_documented_default() {
             "case {member:?}: expected the documented default {expected:?}, got {actual:?}"
         );
     }
+    // The defaults the service RESOLVES rather than reads off one member: the engine
+    // version it provisioned (`postgres`'s default available catalogue version), the
+    // default parameter and option groups named after that version, the backup and
+    // maintenance windows it selected, and the CA its server certificate is issued
+    // under. `db_instance_envelope` asserts the rules behind these over a table of
+    // engines; here they pin that an instance created with nothing optional still
+    // reports them.
+    let resolved = [
+        ("EngineVersion", "17.2"),
+        ("DBParameterGroupName", "default.postgres17"),
+        ("OptionGroupName", "default:postgres-17"),
+        ("PreferredBackupWindow", "07:00-07:30"),
+        ("PreferredMaintenanceWindow", "mon:08:00-mon:08:30"),
+        ("CACertificateIdentifier", "rds-ca-rsa2048-g1"),
+        ("LicenseModel", "postgresql-license"),
+    ];
+    for (member, expected) in resolved {
+        let actual = optional_text(&read_back, member);
+        assert_eq!(
+            actual.as_deref(),
+            Some(expected),
+            "case {member:?}: expected the resolved default {expected:?}, got {actual:?}"
+        );
+    }
     // A member with no documented default and no supplied value is reported by no
     // member at all, rather than by an invented value.
-    for member in ["EngineVersion", "AllocatedStorage", "PreferredBackupWindow"] {
+    for member in ["AllocatedStorage", "MasterUsername", "DBName"] {
         assert_eq!(
             optional_text(&read_back, member),
             None,
@@ -1394,7 +1418,7 @@ async fn modify_writes_every_supplied_setting_through_to_the_store() {
             "DBInstanceClass",
         ),
         ("multi-AZ is turned on", "MultiAZ", "true", "MultiAZ"),
-        ("the engine version changes", "EngineVersion", "16.6", "EngineVersion"),
+        ("the engine version changes", "EngineVersion", "17.2", "EngineVersion"),
         ("the storage type changes", "StorageType", "io1", "StorageType"),
         (
             "the backup window changes",
