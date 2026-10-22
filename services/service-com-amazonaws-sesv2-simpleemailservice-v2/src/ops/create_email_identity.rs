@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEmailIdentity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEmailIdentity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEmailIdentity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts verifying an email identity and persists it in this service's state, so a
+//! later `GetEmailIdentity`, `ListEmailIdentities` or `SendEmail` sees exactly what
+//! was created. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +107,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{DkimState, EmailIdentityRecord, IdentityKind};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -187,18 +182,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEmailIdentity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEmailIdentityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEmailIdentity"))
+        // Request metadata is not needed: the identity is keyed by name within the
+        // one emulated account.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store to write to. That is not a modelled SES state: answer the
+            // scaffold's 501 rather than a modelled error that reads as one.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateEmailIdentity without the shared emulator state",
+            ));
+        };
+
+        let identity = input.email_identity;
+        // One identity per name, compared the way DNS compares a domain, and
+        // classified by the same addr-spec the key is built from.
+        let key = crate::state::identity_key(&identity);
+        let kind = IdentityKind::of(crate::state::addr_spec(&identity));
+        let dkim = dkim_configuration(
+            &identity,
+            &key,
+            kind,
+            input.dkim_signing_attributes.as_ref(),
+        )?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A read of the table reports settled statuses; do the same here so the
+        // AlreadyExists check and the stored neighbours are consistent.
+        store.settle(now);
+        if store.identities.contains_key(&key) {
+            return Err(CreateEmailIdentityErrorModeled::AlreadyExistsException(
+                AlreadyExistsException {
+                    message: Some(format!("Email identity {identity} already exists.")),
+                },
+            )
+            .into());
+        }
+        // SES's documented quota: 10,000 verified identities per account per Region.
+        if store.identities.len() >= crate::state::MAX_IDENTITIES {
+            return Err(CreateEmailIdentityErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account already holds the maximum of {} email identities.",
+                        crate::state::MAX_IDENTITIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut record = EmailIdentityRecord::new(&identity, kind, dkim, now);
+        // "The configuration set to use by default when sending from this
+        // identity" — stored as given; which configuration sets exist is
+        // `CreateConfigurationSet`'s half of the service, not this one's.
+        record.configuration_set_name = input.configuration_set_name;
+        record.tags = input
+            .tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let output = CreateEmailIdentityOutput {
+            identity_type: Some(record.identity_kind.as_str().to_string()),
+            verified_for_sending_status: record.verified_for_sending,
+            dkim_attributes: Some(record.dkim_attributes()),
+        };
+        store.identities.insert(key, record);
+        Ok(output)
+    }
+}
+
+/// Refuse the request with this service's input error.
+fn bad_request(message: impl Into<String>) -> CreateEmailIdentityError {
+    CreateEmailIdentityErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The DKIM configuration a new identity is created with.
+///
+/// Easy DKIM when the request carries no `DkimSigningAttributes` for a domain (SES
+/// generates the key pair and publishes the CNAME tokens), BYODKIM when the request
+/// supplies the selector and private key, and nothing at all for an address
+/// identity, where DKIM signing does not apply.
+///
+/// `identity` is the value the request carried, which the refusals name; `key` is
+/// its normalised form ([`crate::state::identity_key`]), which the Easy DKIM token
+/// set is derived from, so the tokens are a function of the identity rather than of
+/// how the request spelled it.
+fn dkim_configuration(
+    identity: &str,
+    key: &str,
+    kind: IdentityKind,
+    attributes: Option<&DkimSigningAttributes>,
+) -> Result<DkimState, CreateEmailIdentityError> {
+    let Some(attributes) = attributes else {
+        return Ok(match kind {
+            IdentityKind::Domain => DkimState::easy_dkim(key, None),
+            IdentityKind::EmailAddress => DkimState::not_started(),
+        });
+    };
+
+    // `DkimSigningAttributes`: "You can only specify this object if the email
+    // identity is a domain, as opposed to an address."
+    if kind != IdentityKind::Domain {
+        return Err(bad_request(format!(
+            "DkimSigningAttributes can only be specified for a domain identity, and {identity} is an email address."
+        )));
+    }
+
+    if let Some(origin) = attributes.domain_signing_attributes_origin.as_deref() {
+        // `DkimSigningAttributes$DomainSigningAttributesOrigin` documents that for
+        // CreateEmailIdentity the allowed values are "All values except AWS_SES and
+        // EXTERNAL" — the `AWS_SES_<REGION>` origins, which ask SES to replicate a
+        // parent identity's signing attributes from another Region.
+        if matches!(origin, "AWS_SES" | "EXTERNAL") {
+            return Err(bad_request(format!(
+                "DomainSigningAttributesOrigin {origin} is not allowed for CreateEmailIdentity."
+            )));
+        }
+        // Deterministic Easy-DKIM replication reads a parent identity that lives in
+        // another Region; this emulator serves one account's identities and has no
+        // cross-Region parent to replicate, so it is answered as unwritten rather
+        // than faked.
+        return Err(crate::scaffolded::Scaffolded::not_implemented(
+            "CreateEmailIdentity with DKIM signing attributes replicated from another Region",
+        ));
+    }
+
+    match (
+        attributes.domain_signing_selector.as_deref(),
+        attributes.domain_signing_private_key.as_deref(),
+    ) {
+        // BYODKIM. The private key is `@sensitive`: it selects the stored selector
+        // and is then dropped, never persisted and never echoed back.
+        // `NextSigningKeyLength` is documented as an Easy DKIM member ("[Easy DKIM]
+        // The key length of the future DKIM key pair to be generated"), and nothing
+        // documents a refusal when it arrives with a caller-owned key pair, so it
+        // has nothing to apply to here and is ignored rather than refused: SES
+        // reports no key length for a BYODKIM identity.
+        (Some(selector), Some(_private_key)) => Ok(DkimState::byo_dkim(selector)),
+        // "[Easy DKIM] The key length of the future DKIM key pair to be generated."
+        // Only a value of the member's own enum names a key SES can generate; the
+        // value set is the generated const, so it follows the model.
+        (None, None) => {
+            if let Some(length) = attributes.next_signing_key_length.as_deref() {
+                if !DKIM_SIGNING_KEY_LENGTH_VALUES.contains(&length) {
+                    return Err(bad_request(format!(
+                        "NextSigningKeyLength {length} is not one of {}.",
+                        DKIM_SIGNING_KEY_LENGTH_VALUES.join(", ")
+                    )));
+                }
+            }
+            Ok(DkimState::easy_dkim(
+                key,
+                attributes.next_signing_key_length.clone(),
+            ))
+        }
+        _ => Err(bad_request(
+            "Bring Your Own DKIM requires both DomainSigningSelector and DomainSigningPrivateKey.",
+        )),
     }
 }

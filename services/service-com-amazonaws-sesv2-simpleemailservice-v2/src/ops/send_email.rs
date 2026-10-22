@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendEmail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendEmail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendEmail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Accepts an outbound message from a verified identity, appends it to this
+//! service's outbound-message log with a fresh unique `MessageId`, and bumps the
+//! account's send counters. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +130,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::SentMessage;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -212,18 +207,226 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendEmail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendEmailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendEmail"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The engine is not the shared in-memory engine, so this service has no
+            // store at all. That is not a modelled SES state: answer the scaffold's
+            // 501 rather than a throttle an SDK would retry forever.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "SendEmail without the shared emulator state",
+            ));
+        };
+
+        // Members that select a resource this slice does not own: the sending
+        // authorization policies, tenants, multi-region endpoints and contact lists
+        // they name are kept by operations nobody has written yet. A request that
+        // names one is answered as unwritten, rather than accepted as if the member
+        // had not been sent.
+        for (present, member) in [
+            (
+                input.from_email_address_identity_arn.is_some(),
+                "FromEmailAddressIdentityArn",
+            ),
+            (
+                input
+                    .feedback_forwarding_email_address_identity_arn
+                    .is_some(),
+                "FeedbackForwardingEmailAddressIdentityArn",
+            ),
+            (input.endpoint_id.is_some(), "EndpointId"),
+            (input.tenant_name.is_some(), "TenantName"),
+            (
+                input.list_management_options.is_some(),
+                "ListManagementOptions",
+            ),
+            (
+                input.configuration_overrides.is_some(),
+                "ConfigurationOverrides",
+            ),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "SendEmail with {member}"
+                )));
+            }
+        }
+
+        // "You can send either a Simple message, Raw message, or a Templated
+        // message" — exactly one of the three.
+        let parts = message_parts(&input.content)?;
+
+        // The sending identity. SES takes it from the request's `FromEmailAddress`,
+        // or, for a raw message, from the MIME `From` header.
+        let Some(from) = input.from_email_address.clone() else {
+            if input.content.raw.is_some() {
+                // Reading the sender out of the MIME document is a capability this
+                // slice does not have, and the request is a valid one: answer it as
+                // unwritten rather than as the caller's mistake.
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "SendEmail with the sender only in the raw message's From header",
+                ));
+            }
+            return Err(bad_request("Missing required header 'From'."));
+        };
+
+        let destination = input.destination.unwrap_or_default();
+        let to = destination.to_addresses.unwrap_or_default();
+        let cc = destination.cc_addresses.unwrap_or_default();
+        let bcc = destination.bcc_addresses.unwrap_or_default();
+        if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+            if input.content.raw.is_some() {
+                // A raw message may address its recipients in the MIME document's
+                // own To/Cc/Bcc headers, which this slice does not read: a valid
+                // request answered as unwritten, like the raw sender above.
+                return Err(crate::scaffolded::Scaffolded::not_implemented(
+                    "SendEmail with the recipients only in the raw message's headers",
+                ));
+            }
+            return Err(bad_request(
+                "Destination must contain at least one of ToAddresses, CcAddresses or BccAddresses.",
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "The address that you specify has to be verified." An address identity
+        // authorises itself; a domain identity authorises every address in that
+        // domain and its subdomains.
+        let authorised = store
+            .sending_identity(&from)
+            .is_some_and(|identity| identity.verified_for_sending);
+        if !authorised {
+            return Err(SendEmailErrorModeled::MessageRejected(MessageRejected {
+                message: Some(format!(
+                    "Email address is not verified. The following identities failed the check: {from}"
+                )),
+            })
+            .into());
+        }
+
+        // The account's 24-hour sending quota, measured over the window rather
+        // than over all time: `settle` above recomputed the counter from the log, so
+        // this reads the one view of it rather than scanning the log again.
+        let recipients = (to.len() + cc.len() + bcc.len()) as f64;
+        let charged = store.send_counters.sent_last_24h;
+        let quota = store.send_counters.max_24h;
+        if charged + recipients > quota {
+            return Err(SendEmailErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "Daily message quota exceeded: {charged} of {quota} recipients already sent in the last 24 hours."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let message = SentMessage {
+            message_id: store.next_message_id(now),
+            from: Some(from),
+            to,
+            cc,
+            bcc,
+            subject: parts.subject,
+            // Each retained part is capped: a raw MIME document carries whatever
+            // the caller sent, and the log outlives the request.
+            body: parts.body.as_deref().map(
+                crate::state::ComAmazonawsSesv2SimpleemailserviceV2State::retained_body,
+            ),
+            body_html: parts.html.as_deref().map(
+                crate::state::ComAmazonawsSesv2SimpleemailserviceV2State::retained_body,
+            ),
+            configuration_set_name: input.configuration_set_name,
+            reply_to: input.reply_to_addresses.unwrap_or_default(),
+            // Recorded, not acted on: nothing in this slice delivers a bounce or a
+            // complaint, so the address the caller nominated is part of what was
+            // accepted and readable back from the log.
+            feedback_forwarding: input.feedback_forwarding_email_address,
+            email_tags: input
+                .email_tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.name, tag.value))
+                .collect(),
+            sent_at: now,
+        };
+        let message_id = message.message_id.clone();
+        // The log keeps its newest `MAX_SENT_MESSAGES` entries.
+        store.record_sent(message);
+        // Each recipient counts as one message against the account's sending quota.
+        // The counter is a view of the log the send just extended, so settling again
+        // recomputes it from the log rather than tallying: a tally would outlive the
+        // entries it counted.
+        store.settle(now);
+
+        Ok(SendEmailOutput {
+            message_id: Some(message_id),
+        })
+    }
+}
+
+/// Refuse the request with this service's input error.
+fn bad_request(message: impl Into<String>) -> SendEmailError {
+    SendEmailErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The subject and the body parts recorded for one message.
+struct MessageParts {
+    /// The subject, which only a simple message carries as its own member.
+    subject: Option<String>,
+    /// The text part of a simple message, or the whole raw MIME document.
+    body: Option<String>,
+    /// The HTML part of a simple message.
+    html: Option<String>,
+}
+
+/// The subject and body recorded for one message, by content form.
+///
+/// Exactly one of `Simple`, `Raw` and `Template` carries the message; a request
+/// that sets none or several of them names no single message to send.
+fn message_parts(content: &EmailContent) -> Result<MessageParts, SendEmailError> {
+    match (
+        content.simple.as_ref(),
+        content.raw.as_ref(),
+        content.template.as_ref(),
+    ) {
+        (Some(simple), None, None) => {
+            // `Body` carries an optional text part and an optional HTML part, so a
+            // body with neither has no content to send; one with both is recorded
+            // as both, which is what the caller sent.
+            let body = simple.body.text.as_ref().map(|part| part.data.clone());
+            let html = simple.body.html.as_ref().map(|part| part.data.clone());
+            if body.is_none() && html.is_none() {
+                return Err(bad_request(
+                    "Body must contain either a Text or an Html part.",
+                ));
+            }
+            Ok(MessageParts {
+                subject: Some(simple.subject.data.clone()),
+                body,
+                html,
+            })
+        }
+        // A raw message is already a MIME document: it is recorded as sent (up to
+        // the log's retained size), and its headers are the caller's business.
+        (None, Some(raw), None) => Ok(MessageParts {
+            subject: None,
+            body: Some(String::from_utf8_lossy(&raw.data).into_owned()),
+            html: None,
+        }),
+        // A templated message is rendered from a stored email template, which
+        // `CreateEmailTemplate` and `TestRenderEmailTemplate` own and nobody has
+        // written yet; rendering one here would invent the message body.
+        (None, None, Some(_template)) => Err(crate::scaffolded::Scaffolded::not_implemented(
+            "SendEmail with templated content",
+        )),
+        _ => Err(bad_request(
+            "Content must carry exactly one of Simple, Raw or Template.",
+        )),
     }
 }

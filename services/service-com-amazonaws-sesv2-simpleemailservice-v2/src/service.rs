@@ -96,17 +96,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // SES API v2 states a request it cannot read as `BadRequestException`
+        // ("The input you provided is invalid") — the model binds that error to
+        // every operation as a service-common error, and it is the code an SES
+        // client branches on for a malformed or incomplete request. The framework's
+        // own structured wording is kept: it names the member and the rule it
+        // broke, which is what the caller has to fix.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "The input you provided is invalid.".to_string()),
+            }),
+            // An unauthenticated caller is the emulator's own 403, not a modelled
+            // SES error: leave the framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
