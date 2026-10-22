@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAssetModelCompositeModel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAssetModelCompositeModel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAssetModelCompositeModel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one composite model — and everything nested inside it — from its
+//! asset model's stored record, so every reader of that model stops reporting
+//! it, and answers with the asset model's status as of the removal.
 //!
 //! ## Shape of an operation
 //!
@@ -105,6 +100,8 @@
 //!   the allowed number of messages per second, and so on. For more information, see Quotas
 //!   in the IoT SiteWise User Guide.
 
+use std::collections::HashSet;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -181,18 +178,267 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAssetModelCompositeModel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAssetModelCompositeModelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAssetModelCompositeModel"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(internal_failure)?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // Both id members are `CustomID` labels — a raw UUID or
+        // `externalId:<externalId>`. The asset model is resolved FIRST: a request
+        // that names no stored asset model is a 404 whatever else it asks for,
+        // and a composite model is addressable only within its asset model.
+        let asset_model_id = store
+            .resolve_asset_model_id(&input.asset_model_id)
+            .ok_or_else(|| {
+                not_found(crate::state::RESOURCE_ASSET_MODEL, &input.asset_model_id)
+            })?;
+        let record = store
+            .asset_models
+            .get(&asset_model_id)
+            .ok_or_else(internal_failure)?;
+        // The ARN the refusals name is the one STORED on the record, so it is
+        // the ARN every other reader of this model reports, whatever region the
+        // refused request was signed for.
+        let arn = record.arn.clone();
+        let composite_model_id = record
+            .resolve_composite_model_id(&input.asset_model_composite_model_id)
+            .ok_or_else(|| {
+                not_found(
+                    crate::state::RESOURCE_ASSET_MODEL_COMPOSITE_MODEL,
+                    &input.asset_model_composite_model_id,
+                )
+            })?;
+
+        // The conditional request headers are evaluated BEFORE anything is
+        // removed, the way HTTP preconditions are: one that fails leaves the
+        // asset model exactly as it was. They talk about the asset model, since
+        // that is the versioned resource this call writes to, and which version
+        // they target is the shared rule every asset-model write follows.
+        let target_e_tag = crate::state::asset_model_target_etag(
+            record,
+            input.match_for_version_type.as_deref(),
+            now,
+        );
+        // `If-Match`: delete only if the targeted version's ETag is the one the
+        // caller last read. A caller that read a different version — or that
+        // targets a version which does not exist — is refused 412.
+        if let Some(expected) = input.if_match.as_deref() {
+            if target_e_tag.as_deref() != Some(expected) {
+                return Err(precondition_failed(
+                    "Precondition failed for provided If-Match value.",
+                    &asset_model_id,
+                    &arn,
+                ));
+            }
+        }
+        // `If-None-Match: *` asks that the targeted version NOT exist, so an
+        // existing one is a 412 and the composite model stays. `*` is the ONLY
+        // value the member's modelled pattern `^\*$` admits, so the match is
+        // exact rather than a stand-in for "any value".
+        if input.if_none_match.as_deref() == Some(crate::state::SELECT_ALL)
+            && target_e_tag.is_some()
+        {
+            return Err(precondition_failed(
+                "Precondition failed for provided If-None-Match value.",
+                &asset_model_id,
+                &arn,
+            ));
+        }
+
+        // What goes: the composite model named, plus every composite model
+        // nested inside it at any depth — those are reachable only through it.
+        let doomed: HashSet<String> = record
+            .composite_model_subtree(&composite_model_id)
+            .into_iter()
+            .collect();
+
+        // "You must delete all assets created from a composite model before you
+        // can delete the model": an asset instantiates its asset model
+        // INCLUDING this composite model, so a live asset of the holding model
+        // is a dependent. Terminal for this request — the caller has to delete
+        // the asset first and no retry can succeed — so it is
+        // `InvalidRequestException` (400) and not the transient
+        // `ConflictingOperationException` (409), exactly as `DeleteAssetModel`
+        // refuses a model that still has assets.
+        if store
+            .assets
+            .values()
+            .any(|asset| asset.asset_model_id == asset_model_id)
+        {
+            return Err(invalid_request(format!(
+                "Asset model {asset_model_id} had assets when delete of composite model \
+                 {composite_model_id} was called"
+            )));
+        }
+
+        // "You can't delete a composite model if a parent asset model exists
+        // that contains a property formula expression that depends on" it: a
+        // surviving transform or metric whose variables name a property that is
+        // going away would be left dangling.
+        if let Some((referrer_model, referrer_property)) =
+            formula_dependent(&store, &asset_model_id, &doomed)
+        {
+            return Err(invalid_request(format!(
+                "Composite model {composite_model_id} is referenced by the formula expression of \
+                 property {referrer_property} of asset model {referrer_model} when delete was \
+                 called"
+            )));
+        }
+
+        let record = store
+            .asset_models
+            .get_mut(&asset_model_id)
+            .ok_or_else(internal_failure)?;
+        record.composite_models.retain(|composite| {
+            composite
+                .id
+                .as_deref()
+                .is_none_or(|id| !doomed.contains(id))
+        });
+        // The links of the removed composite models go with them, so no link
+        // names a composite model the record no longer holds.
+        record
+            .composite_model_links
+            .retain(|id, _| !doomed.contains(id));
+        // The asset model's definition changed, so it carries a new version and
+        // owes a transition back to ACTIVE — the rule every mutating call on a
+        // record follows, kept on the record itself. The status reported here is
+        // therefore the asset model's own (`UPDATING` until that transition
+        // falls due), not a state for the composite model, which is simply gone.
+        record.begin_update(now);
+        let asset_model_status = record.status(now);
+
+        Ok(DeleteAssetModelCompositeModelOutput {
+            asset_model_id: Some(asset_model_id),
+            asset_model_status,
+        })
     }
+}
+
+/// The first `(assetModelId, property name)` of a SURVIVING property whose
+/// formula expression depends on a composite model in `doomed`, if any stored
+/// asset model has one.
+///
+/// `doomed` names composite models of ONE asset model — `asset_model_id`, the
+/// one being written to — so the properties that are going away are collected
+/// from that record alone; a composite model id is never matched outside the
+/// model that owns it. The SCAN for a dependent formula then spans every stored
+/// asset model, because the dependency the rule forbids is an expression
+/// anywhere that reads a property which is about to stop existing.
+fn formula_dependent(
+    store: &crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
+    asset_model_id: &str,
+    doomed: &HashSet<String>,
+) -> Option<(String, String)> {
+    // The properties the doomed composite models define: the ones that go away,
+    // and so the ones no surviving expression may still read. A composite model
+    // may define none (it may have no properties of its own at all), which is
+    // not a reason to skip the scan: a `propertyPath` segment can name the
+    // composite model itself.
+    let doomed_properties: HashSet<&str> = store
+        .asset_models
+        .get(asset_model_id)
+        .into_iter()
+        .flat_map(|model| model.composite_models.iter())
+        .filter(|composite| {
+            composite
+                .id
+                .as_deref()
+                .is_some_and(|id| doomed.contains(id))
+        })
+        .flat_map(|composite| composite.properties.iter().flatten())
+        .filter_map(|property| property.id.as_deref())
+        .collect();
+
+    store.asset_models.values().find_map(|model| {
+        // Only the written model holds the doomed composite models, so only its
+        // own properties can sit inside one.
+        let owning = model.id == asset_model_id;
+        let direct = model.properties.iter().map(|property| (None, property));
+        let nested = model.composite_models.iter().flat_map(|composite| {
+            composite
+                .properties
+                .iter()
+                .flatten()
+                .map(move |property| (composite.id.as_deref(), property))
+        });
+        direct
+            .chain(nested)
+            // A property of a composite model that is itself going away takes
+            // its own dependencies with it.
+            .filter(|(owner, _)| {
+                !owning || owner.is_none_or(|owner| !doomed.contains(owner))
+            })
+            .find(|(_, property)| depends_on(property, &doomed_properties, doomed))
+            .map(|(_, property)| (model.id.clone(), property.name.clone()))
+    })
+}
+
+/// Whether `property`'s formula reads something that is going away: a variable
+/// naming one of `doomed_properties` directly, or a `propertyPath` segment
+/// naming one of them or one of the `doomed` composite models.
+fn depends_on(
+    property: &AssetModelProperty,
+    doomed_properties: &HashSet<&str>,
+    doomed: &HashSet<String>,
+) -> bool {
+    crate::state::formula_variables(property).any(|variable| {
+        variable
+            .value
+            .property_id
+            .as_deref()
+            .is_some_and(|id| doomed_properties.contains(id))
+            || variable
+                .value
+                .property_path
+                .iter()
+                .flatten()
+                .filter_map(|segment| segment.id.as_deref())
+                .any(|id| doomed_properties.contains(id) || doomed.contains(id))
+    })
+}
+
+/// HTTP 500 `InternalFailureException`: this service's store is not reachable.
+fn internal_failure() -> DeleteAssetModelCompositeModelError {
+    DeleteAssetModelCompositeModelErrorModeled::InternalFailureException(InternalFailureException {
+        message: "the IoT SiteWise store is unavailable".to_string(),
+    })
+    .into()
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> DeleteAssetModelCompositeModelError {
+    DeleteAssetModelCompositeModelErrorModeled::InvalidRequestException(InvalidRequestException {
+        message,
+    })
+    .into()
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the resource kind and the
+/// identifier the REQUEST supplied, as this service words every absence.
+fn not_found(resource: &str, requested: &str) -> DeleteAssetModelCompositeModelError {
+    DeleteAssetModelCompositeModelErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(resource, requested),
+        },
+    )
+    .into()
+}
+
+/// HTTP 412 `PreconditionFailedException` for a conditional header that
+/// evaluated to FALSE, naming the asset model it was evaluated on.
+fn precondition_failed(
+    message: &str,
+    asset_model_id: &str,
+    arn: &str,
+) -> DeleteAssetModelCompositeModelError {
+    DeleteAssetModelCompositeModelErrorModeled::PreconditionFailedException(
+        PreconditionFailedException {
+            message: message.to_string(),
+            resource_id: asset_model_id.to_string(),
+            resource_arn: arn.to_string(),
+        },
+    )
+    .into()
 }

@@ -42,7 +42,7 @@ const REGION: &str = "us-west-2";
 
 /// Long enough for the transition the clock owes (`ACTIVATION_DELAY`) to fall
 /// due, with room for a slow machine.
-const PAST_THE_OWED_TRANSITION: Duration = Duration::from_millis(900);
+pub(crate) const PAST_THE_OWED_TRANSITION: Duration = Duration::from_millis(900);
 
 /// Dispatch one request with `headers` and return `(status, parsed body, the
 /// response's own headers)`.
@@ -51,7 +51,7 @@ const PAST_THE_OWED_TRANSITION: Duration = Duration::from_millis(900);
 /// this operation's `If-Match` / `If-None-Match` / `Match-For-Version-Type`
 /// inputs and `DescribeAssetModel`'s `ETag` output are header-bound, so this
 /// suite needs both ends.
-async fn call_with_headers(
+pub(crate) async fn call_with_headers(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -114,13 +114,13 @@ async fn create_model(router: &MultiServiceRouter, name: &str, body: Value) -> S
 }
 
 /// A plain `ASSET_MODEL` with no properties.
-async fn plain_model(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn plain_model(router: &MultiServiceRouter, name: &str) -> String {
     create_model(router, name, json!({ "assetModelName": name })).await
 }
 
 /// The asset model's current entity tag, as `DescribeAssetModel` reports it in
 /// the `ETag` response header.
-async fn model_etag(router: &MultiServiceRouter, model_id: &str) -> String {
+pub(crate) async fn model_etag(router: &MultiServiceRouter, model_id: &str) -> String {
     let (status, body, headers) = call_with_headers(
         router,
         "GET",
@@ -143,7 +143,7 @@ async fn model_etag(router: &MultiServiceRouter, model_id: &str) -> String {
 }
 
 /// `POST /asset-models/{model_id}/composite-models` with `body`.
-async fn create_composite(
+pub(crate) async fn create_composite(
     router: &MultiServiceRouter,
     model_id: &str,
     body: Value,
@@ -158,7 +158,7 @@ async fn create_composite(
 }
 
 /// `GET /asset-models/{model_id}/composite-models/{composite_label}`.
-async fn describe_composite(
+pub(crate) async fn describe_composite(
     router: &MultiServiceRouter,
     model_id: &str,
     composite_label: &str,

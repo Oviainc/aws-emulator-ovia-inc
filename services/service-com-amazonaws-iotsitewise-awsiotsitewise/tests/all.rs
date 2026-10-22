@@ -32,6 +32,8 @@ mod asset_hierarchies;
 mod asset_lifecycle;
 #[path = "all/asset_model_composite_model.rs"]
 mod asset_model_composite_model;
+#[path = "all/asset_model_composite_model_delete.rs"]
+mod asset_model_composite_model_delete;
 #[path = "all/asset_model_properties.rs"]
 mod asset_model_properties;
 #[path = "all/asset_property_update.rs"]
