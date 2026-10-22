@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes tags from an Application Auto Scaling scalable target. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,20 +132,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        use crate::state::{
+            check_tag_key, check_tag_keys_unreserved, unknown_resource_arn_message,
+        };
+
+        // `TagKeyList` carries its own `@length(0..200)`, refused at the boundary, and a
+        // key the target does not carry is not an error — so there is no count to check
+        // here. What is not modelled is the reserved `aws:` namespace, which is not a
+        // caller's to remove either. Checked before the store is touched, so a batch
+        // holding one reserved key removes none of its keys.
+        check_tag_keys_unreserved("tagKeys", input.tag_keys.iter().map(String::as_str))
+            .map_err(validation)?;
+        // `TagKey`'s own length, the same bound `TagResource` writes under.
+        for key in &input.tag_keys {
+            check_tag_key("tagKeys", key).map_err(validation)?;
+        }
+
+        // An engine that holds no state holds no scalable target either: the same
+        // refusal as an ARN that names no registered target (see `tag_resource`).
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(validation(unknown_resource_arn_message(&input.resource_arn)));
+        };
+        let mut state = state.lock();
+
+        let resolved = state.arn_index.get(&input.resource_arn).cloned();
+        let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
+            return Err(validation(unknown_resource_arn_message(&input.resource_arn)));
+        };
+
+        // "To delete a tag, specify the tag key and the Application Auto Scaling
+        // scalable target": only the keys named are removed, and a key the target does
+        // not carry leaves the tag set as it was, so removal is idempotent.
+        for key in &input.tag_keys {
+            record.tags.remove(key);
+        }
+
+        Ok(UntagResourceOutput {})
     }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> UntagResourceError {
+    UntagResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
 }

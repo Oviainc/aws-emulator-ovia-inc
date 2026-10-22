@@ -434,3 +434,116 @@ pub fn check_dimension_namespace(
          Member must be a scalable dimension of the '{service_namespace}' service namespace"
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Tags
+// ---------------------------------------------------------------------------
+
+/// How many tags one scalable target holds.
+///
+/// `TagResource`'s own documentation points at "Tagging support for Application Auto
+/// Scaling" and at "User-defined tag restrictions" for "the rules that apply to tag keys
+/// and tag values"; those restrictions cap a resource at 50 tags. The model puts no
+/// `@length` on `TagMap`, so this bound is enforced by the handlers rather than at the
+/// boundary.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The tag-key prefix Amazon Web Services reserves for its own tags: a caller may
+/// neither set nor remove a key in it. `TagKey` carries no `@pattern`, so the reserved
+/// namespace is enforced by the handlers.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` is in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// The prefix is matched case-insensitively, which is deliberately a SUPERSET of the
+/// documented rule rather than a modelled constraint: tag keys themselves are
+/// case-sensitive ("both case-sensitive strings"), and AWS documents the reserved prefix
+/// in lower case only, so `AWS:`-prefixed keys are refused here on the conservative
+/// reading that a key cannot leave the reserved namespace by changing the case of the
+/// prefix alone.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// `Ok` when no key in `keys` is in the reserved namespace, else the
+/// `ValidationException` message naming `member` and the offending key.
+///
+/// The keys are judged BEFORE anything is written, so a batch holding one reserved key
+/// is refused whole and no key from it lands. The lowest offending key is reported, so a
+/// request whose keys arrive in any order is refused with the same message.
+pub fn check_tag_keys_unreserved<'a>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    let reserved = keys.into_iter().filter(|key| is_reserved_tag_key(key)).min();
+    match reserved {
+        None => Ok(()),
+        Some(key) => Err(format!(
+            "Value '{key}' at '{member}' failed to satisfy constraint: \
+             Member must not begin with the reserved prefix '{RESERVED_TAG_KEY_PREFIX}'"
+        )),
+    }
+}
+
+/// `Ok` when `member`'s entry count is within [`MAX_TAGS_PER_RESOURCE`], else the
+/// `ValidationException` message a request too large for ANY resource is refused with —
+/// input validation, independent of which resource the request addresses.
+pub fn check_tag_count(member: &str, count: usize) -> Result<(), String> {
+    if count <= MAX_TAGS_PER_RESOURCE {
+        return Ok(());
+    }
+    Err(format!(
+        "Value at '{member}' failed to satisfy constraint: Member must have at most \
+         {MAX_TAGS_PER_RESOURCE} entries, and {count} were supplied"
+    ))
+}
+
+/// `TagKey`'s own `@length(min: 1, max: 128)`, and `TagValue`'s `@length(min: 0, max:
+/// 256)` — the shapes `TagMap`'s key and value target.
+///
+/// A map's KEYS are not reached by the boundary validator (it judges a map's values, so
+/// an over-long tag VALUE never arrives here, while an over-long tag KEY does), so these
+/// two bounds are checked by the handlers. Lengths are in Unicode code points, as Smithy
+/// `@length` counts a string.
+pub const MIN_TAG_KEY_CHARS: usize = 1;
+/// See [`MIN_TAG_KEY_CHARS`].
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+/// See [`MIN_TAG_KEY_CHARS`].
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// `Ok` when `key` is within `TagKey`'s modelled length, else the `ValidationException`
+/// message naming `member`, the key and the bounds.
+pub fn check_tag_key(member: &str, key: &str) -> Result<(), String> {
+    let chars = key.chars().count();
+    if (MIN_TAG_KEY_CHARS..=MAX_TAG_KEY_CHARS).contains(&chars) {
+        return Ok(());
+    }
+    Err(format!(
+        "Value '{key}' at '{member}' failed to satisfy constraint: Member must have \
+         length between {MIN_TAG_KEY_CHARS} and {MAX_TAG_KEY_CHARS}, inclusive"
+    ))
+}
+
+/// `Ok` when `value` is within `TagValue`'s modelled length, else the
+/// `ValidationException` message naming the key it belongs to and the bound.
+pub fn check_tag_value(member: &str, key: &str, value: &str) -> Result<(), String> {
+    let chars = value.chars().count();
+    if chars <= MAX_TAG_VALUE_CHARS {
+        return Ok(());
+    }
+    Err(format!(
+        "Value at '{member}.{key}' failed to satisfy constraint: Member must have length \
+         less than or equal to {MAX_TAG_VALUE_CHARS}"
+    ))
+}
+
+/// The message a refusal of a `ResourceARN` that names no registered scalable target
+/// carries. AWS documents no wording for it, so this names the member and the value the
+/// way this service's other refusals do.
+pub fn unknown_resource_arn_message(resource_arn: &str) -> String {
+    format!(
+        "Value '{resource_arn}' at 'resourceARN' failed to satisfy constraint: \
+         Member must identify a registered scalable target"
+    )
+}

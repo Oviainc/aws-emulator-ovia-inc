@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or edits the tags on an Application Auto Scaling scalable target. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +148,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        use crate::state::{
+            check_tag_count, check_tag_key, check_tag_keys_unreserved, check_tag_value,
+            unknown_resource_arn_message, MAX_TAGS_PER_RESOURCE,
+        };
+
+        // Input validation first, so a request no resource could accept is refused the
+        // same way whichever `ResourceARN` it names. `TagMap` carries no `@length`, so
+        // the per-resource maximum is this operation's to enforce.
+        check_tag_count("tags", input.tags.len()).map_err(validation)?;
+        // "You cannot have more than one tag on an Application Auto Scaling scalable
+        // target with the same tag key" is already true of a map; what is not modelled
+        // is the reserved `aws:` namespace, which a caller may not write. Checked before
+        // the store is touched, so a batch holding one reserved key lands no key at all.
+        check_tag_keys_unreserved("tags", input.tags.keys().map(String::as_str))
+            .map_err(validation)?;
+        // `TagKey`'s and `TagValue`'s own lengths, for the same batch: the boundary
+        // validator does not reach a MAP's keys, so an over-long key arrives here. The
+        // lowest-ordered refusal is the one reported, so the same batch is always
+        // refused with the same message whatever order its keys arrive in.
+        let refusal = input
+            .tags
+            .iter()
+            .filter_map(|(key, value)| {
+                check_tag_key("tags", key)
+                    .and_then(|()| check_tag_value("tags", key, value))
+                    .err()
+            })
+            .min();
+        if let Some(message) = refusal {
+            return Err(validation(message));
+        }
+
+        // An engine that holds no state holds no scalable target either, so an ARN
+        // addressed to it resolves to nothing — the same refusal as an ARN that names no
+        // registered target, rather than a server error this operation does not model.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(validation(unknown_resource_arn_message(&input.resource_arn)));
+        };
+        let mut state = state.lock();
+
+        // `ResourceARN` "identifies the Application Auto Scaling scalable target that
+        // you want to apply tags to", and the only ARNs that identify one are those
+        // `RegisterScalableTarget` minted and `DeregisterScalableTarget` has not
+        // withdrawn. The recorded behaviour for a well-formed ARN naming no registered
+        // target is a 400 `ValidationException`, not the 404 `ResourceNotFoundException`.
+        let resolved = state.arn_index.get(&input.resource_arn).cloned();
+        let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
+            return Err(validation(unknown_resource_arn_message(&input.resource_arn)));
+        };
+
+        // The merge is computed before anything is stored: "To add a tag, specify a new
+        // tag key and a tag value. To edit a tag, specify an existing tag key and a new
+        // tag value" — so a key already present takes the request's value, and a key the
+        // request does not name keeps the value it had. A batch that would leave the
+        // target above the per-resource maximum is refused whole, so a refusal never
+        // leaves half of it applied.
+        let mut merged = record.tags.clone();
+        for (key, value) in &input.tags {
+            merged.insert(key.clone(), value.clone());
+        }
+        if merged.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::TooManyTagsException(
+                TooManyTagsException {
+                    message: Some(format!(
+                        "The request would leave the scalable target carrying {} tags; a \
+                         resource holds at most {MAX_TAGS_PER_RESOURCE}",
+                        merged.len()
+                    )),
+                    resource_name: Some(input.resource_arn.clone()),
+                },
+            )
+            .into());
+        }
+        record.tags = merged;
+
+        Ok(TagResourceOutput {})
     }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> TagResourceError {
+    TagResourceErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
 }
