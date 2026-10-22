@@ -60,17 +60,20 @@ impl Docdb {
         }
         let request = http::Request::builder()
             .method(http::Method::POST)
-            .uri("https://rds.us-east-1.amazonaws.com/")
+            .uri("https://docdb.us-east-1.amazonaws.com/")
             .header(
                 http::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
             )
             // The routing key every front door reads: the SigV4 credential scope, which
-            // names the signing name (`rds`) and the region.
+            // names the service and the region. DocumentDB SHARES the `rds` signing name
+            // with Amazon RDS and Amazon Neptune, and that shared name resolves to
+            // Amazon RDS, so a request for THIS service names it: `docdb` (see
+            // `ROUTE_KEY` in `src/service.rs`).
             .header(
                 http::header::AUTHORIZATION,
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDDOCDBTESTKEY/20260101/{REGION}/rds/\
+                    "AWS4-HMAC-SHA256 Credential=AKIDDOCDBTESTKEY/20260101/{REGION}/docdb/\
                      aws4_request, SignedHeaders=host, Signature=00"
                 ),
             )

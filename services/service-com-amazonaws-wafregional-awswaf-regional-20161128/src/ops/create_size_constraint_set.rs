@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSizeConstraintSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSizeConstraintSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSizeConstraintSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one `SizeConstraintSet` record in [`crate::state`] per accepted call: it
+//! consumes the request's change token, stores a set under a freshly minted
+//! `SizeConstraintSetId` with the requested `Name` and no `SizeConstraint`s, and
+//! answers the projection of the record it stored. `GetSizeConstraintSet` reads that
+//! same record back.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +178,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSizeConstraintSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSizeConstraintSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSizeConstraintSet"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSizeConstraintSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("The operation failed because of a system problem.".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // Every SizeConstraintSet is a stored record, so the number a caller can
+        // create is bounded, as it is on the real service.
+        if state.size_constraint_sets.len() >= crate::state::MAX_SIZE_CONSTRAINT_SETS {
+            return Err(
+                CreateSizeConstraintSetErrorModeled::WAFLimitsExceededException(
+                    WAFLimitsExceededException {
+                        // One fixed sentence per exception type, carrying nothing the
+                        // request supplied: AWS WAF Classic's error text does not vary
+                        // with the call that provoked it.
+                        message: Some("The operation exceeds a resource limit.".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The change-token protocol every mutating AWS WAF Classic call follows: the
+        // token must be one `GetChangeToken` minted and no other mutating call has
+        // used, since "each create, update, or delete request must use a unique change
+        // token".
+        if !state.consume_change_token(&input.change_token) {
+            return Err(CreateSizeConstraintSetErrorModeled::WAFStaleDataException(
+                WAFStaleDataException {
+                    // Fixed again — in particular the caller's change token is never
+                    // echoed back into the error body.
+                    message: Some("The input token is no longer current.".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A fresh id per call: `ResourceName` carries no uniqueness constraint, so two
+        // SizeConstraintSets created with the same `Name` are two distinct resources,
+        // each stored under its own `SizeConstraintSetId`.
+        let size_constraint_set_id = state.mint_id();
+        // A new set holds no constraints — this operation answers "a SizeConstraintSet
+        // that contains no SizeConstraint objects"; they arrive through
+        // `UpdateSizeConstraintSet`.
+        let entry =
+            crate::state::SizeConstraintSetEntry::new(size_constraint_set_id.clone(), input.name);
+        // The response is the projection of the record that was STORED, not of the
+        // request.
+        let size_constraint_set = entry.to_modelled();
+        state
+            .size_constraint_sets
+            .insert(size_constraint_set_id, entry);
+
+        Ok(CreateSizeConstraintSetOutput {
+            size_constraint_set: Some(size_constraint_set),
+            change_token: Some(input.change_token),
+        })
     }
 }

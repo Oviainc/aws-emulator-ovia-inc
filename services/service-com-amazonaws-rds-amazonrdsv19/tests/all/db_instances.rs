@@ -28,7 +28,7 @@ use service_com_amazonaws_rds_amazonrdsv19::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request below is signed for, unless it names another.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The canonical account id every generated emulator presents.
 const ACCOUNT: &str = "000000000000";
@@ -54,7 +54,10 @@ const NO_PARAMS: [(&str, &str); 0] = [];
 
 /// A router carrying only this service over one shared engine — what the production
 /// router does for every service at once.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` so the sibling suites of this one test target drive the service through
+/// the same front door rather than standing up their own.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Verifying signatures is the emulator's concern, not this service's; these tests
@@ -65,7 +68,7 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One awsQuery call against `region`, returning the HTTP status and the XML body.
-async fn call_in<N: AsRef<str>, V: AsRef<str>>(
+pub(crate) async fn call_in<N: AsRef<str>, V: AsRef<str>>(
     router: &MultiServiceRouter,
     region: &str,
     action: &str,
@@ -103,7 +106,7 @@ async fn call_in<N: AsRef<str>, V: AsRef<str>>(
 }
 
 /// One awsQuery call against [`REGION`].
-async fn call<N: AsRef<str>, V: AsRef<str>>(
+pub(crate) async fn call<N: AsRef<str>, V: AsRef<str>>(
     router: &MultiServiceRouter,
     action: &str,
     params: &[(N, V)],
@@ -143,7 +146,7 @@ async fn create_available_instance(
 }
 
 /// Assert a 200 and hand back the body.
-fn expect_ok(case: &str, response: (u16, String)) -> String {
+pub(crate) fn expect_ok(case: &str, response: (u16, String)) -> String {
     let (status, body) = response;
     assert_eq!(
         status, 200,
@@ -153,7 +156,7 @@ fn expect_ok(case: &str, response: (u16, String)) -> String {
 }
 
 /// Assert the modelled failure: its HTTP status and its wire error `<Code>`.
-fn expect_error(
+pub(crate) fn expect_error(
     case: &str,
     response: (u16, String),
     expected_status: u16,
@@ -238,7 +241,7 @@ fn unescape(text: &str) -> String {
 }
 
 /// The text of every `<tag>` element in `xml`, in document order.
-fn texts(xml: &str, tag: &str) -> Vec<String> {
+pub(crate) fn texts(xml: &str, tag: &str) -> Vec<String> {
     element_spans(xml, tag)
         .into_iter()
         .map(|(_, content_start, content_end, _)| unescape(&xml[content_start..content_end]))
@@ -246,7 +249,7 @@ fn texts(xml: &str, tag: &str) -> Vec<String> {
 }
 
 /// The text of the one `<tag>` element in `xml`.
-fn text(xml: &str, tag: &str) -> String {
+pub(crate) fn text(xml: &str, tag: &str) -> String {
     let found = texts(xml, tag);
     assert_eq!(
         found.len(),
@@ -258,7 +261,7 @@ fn text(xml: &str, tag: &str) -> String {
 }
 
 /// The text of the one `<tag>` element in `xml`, or `None` when it carries none.
-fn optional_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn optional_text(xml: &str, tag: &str) -> Option<String> {
     let found = texts(xml, tag);
     assert!(
         found.len() <= 1,
@@ -269,7 +272,7 @@ fn optional_text(xml: &str, tag: &str) -> Option<String> {
 }
 
 /// The XML of each `<tag>` subtree, in document order.
-fn subtrees(xml: &str, tag: &str) -> Vec<String> {
+pub(crate) fn subtrees(xml: &str, tag: &str) -> Vec<String> {
     element_spans(xml, tag)
         .into_iter()
         .map(|(start, _, _, end)| xml[start..end.max(start)].to_string())

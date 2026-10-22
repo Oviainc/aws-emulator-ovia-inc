@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Authentication, Cluster, Endpoint, EngineVersionInfo, Node, ParameterGroup,
+    Authentication, AuthenticationMode, Cluster, Endpoint, EngineVersionInfo, Node, ParameterGroup,
     SecurityGroupMembership, Shard, Tag, User, ACL,
 };
 
@@ -59,13 +59,31 @@ pub const MAX_SHARDS_PER_CLUSTER: i32 = 500;
 /// sized by an unbounded request field.
 pub const MAX_REPLICAS_PER_SHARD: i32 = 5;
 
-/// The most clusters, and the most ACLs, this emulator keeps.
+/// The most clusters, the most ACLs, and the most users this emulator keeps.
 ///
-/// A ceiling THIS EMULATOR chooses (AWS's own cluster/ACL quotas are per-account and
-/// adjustable) so that one caller cannot grow the store without bound; AWS answers its
-/// own exceeded quota with the same modelled faults
-/// (`ClusterQuotaForCustomerExceededFault`, `ACLQuotaExceededFault`).
+/// A ceiling THIS EMULATOR chooses (AWS's own cluster/ACL/user quotas are per-account
+/// and adjustable) so that one caller cannot grow the store without bound; AWS answers
+/// its own exceeded quota with the same modelled faults
+/// (`ClusterQuotaForCustomerExceededFault`, `ACLQuotaExceededFault`,
+/// `UserQuotaExceededFault`).
 pub const MAX_RESOURCES_PER_KIND: usize = 500;
+
+/// The most passwords one user may hold: `Authentication$PasswordCount` — "The number
+/// of passwords belonging to the user. The maximum is two."
+pub const MAX_PASSWORDS_PER_USER: usize = 2;
+
+/// The shortest password MemoryDB accepts for a user, from the password requirements
+/// AWS documents for RBAC users ("Authenticating users with Access Control Lists"):
+/// "must be at least 16 characters and no more than 128 characters in length".
+pub const MIN_PASSWORD_LEN: usize = 16;
+
+/// The longest password MemoryDB accepts, from the same documented requirement.
+pub const MAX_PASSWORD_LEN: usize = 128;
+
+/// The characters the same documented requirement excludes from a user password:
+/// "cannot contain any of the following characters: ',' '\"' '/' '@'". Everything else
+/// that is printable ASCII — including the rest of the punctuation — is accepted.
+pub const FORBIDDEN_PASSWORD_CHARS: &[char] = &[',', '"', '/', '@'];
 
 /// The number of hash slots a cluster spreads over its shards. Fixed by the Redis
 /// OSS / Valkey cluster protocol MemoryDB implements (slots `0..=16383`).
@@ -194,6 +212,15 @@ pub mod acl_status {
 /// \"deleting\"."
 pub mod user_status {
     pub const ACTIVE: &str = "active";
+}
+
+/// The two `InputAuthenticationType` tokens a request may ASK for, named so the
+/// handlers branch on a constant rather than a literal. The full accepted list stays
+/// the GENERATED catalog `crate::ops::types::INPUT_AUTHENTICATION_TYPE_VALUES`, which
+/// is what a refusal quotes, so neither can drift from the model.
+pub mod input_authentication_type {
+    pub const PASSWORD: &str = "password";
+    pub const IAM: &str = "iam";
 }
 
 /// The user every MemoryDB account already has: MemoryDB creates a user named
@@ -440,6 +467,10 @@ pub struct StoredAcl {
 /// A user as this emulator persists it. `ACLNames` is NOT stored: it is derived from
 /// the ACLs currently listing the user (see
 /// [`ComAmazonawsMemorydbAmazonmemorydbState::user_membership`]).
+///
+/// The user's PASSWORDS are deliberately absent too: `Authentication$PasswordCount` is
+/// the only thing AWS reports about them, so only the count is kept and the secrets
+/// themselves are never stored or returned.
 #[derive(Debug, Clone)]
 pub struct StoredUser {
     pub name: String,
@@ -604,6 +635,115 @@ impl StoredAcl {
             arn: Some(self.arn.clone()),
         }
     }
+}
+
+/// Why an `AuthenticationMode` cannot be accepted, in the two classes MemoryDB models
+/// separately: a member whose VALUE breaks a rule, and members that cannot be
+/// COMBINED. The caller maps each onto the modelled error its own operation declares
+/// (`InvalidParameterValueException` / `InvalidParameterCombinationException`), so one
+/// rule serves every operation that takes an `AuthenticationMode`.
+#[derive(Debug, Clone)]
+pub enum AuthenticationModeRejection {
+    /// A member's value is outside what the service accepts.
+    Value(String),
+    /// The members supplied cannot hold together.
+    Combination(String),
+}
+
+/// The `Authentication` a stored user gets from the `AuthenticationMode` a request
+/// supplies, or why the mode is refused.
+///
+/// The documented password requirements (AWS, "Authenticating users with Access
+/// Control Lists") are enforced here rather than per operation, because `CreateUser`
+/// and `UpdateUser` take the same member and so must refuse the same values:
+///
+/// * `Type` names an `InputAuthenticationType` (`password` or `iam`);
+/// * `password` requires between 1 and [`MAX_PASSWORDS_PER_USER`] passwords, `iam`
+///   accepts none at all;
+/// * each password is printable ASCII, [`MIN_PASSWORD_LEN`]..=[`MAX_PASSWORD_LEN`]
+///   characters long, and carries none of [`FORBIDDEN_PASSWORD_CHARS`].
+pub fn authentication_from_mode(
+    mode: &AuthenticationMode,
+) -> Result<(String, Option<i32>), AuthenticationModeRejection> {
+    let passwords = mode.passwords.as_deref().unwrap_or(&[]);
+    let mode_type = mode.r#type.as_deref().unwrap_or_default();
+    match mode_type {
+        input_authentication_type::PASSWORD => {
+            if passwords.is_empty() {
+                return Err(AuthenticationModeRejection::Combination(format!(
+                    "AuthenticationMode.Passwords is required when \
+                     AuthenticationMode.Type is {}.",
+                    input_authentication_type::PASSWORD
+                )));
+            }
+            if passwords.len() > MAX_PASSWORDS_PER_USER {
+                return Err(AuthenticationModeRejection::Value(format!(
+                    "A user can have at most {MAX_PASSWORDS_PER_USER} passwords."
+                )));
+            }
+            for password in passwords {
+                validate_password(password)?;
+            }
+            // At most `MAX_PASSWORDS_PER_USER` (2) — anything larger was refused just
+            // above — so the conversion is exact. The fallback is unreachable and is
+            // there only to keep the handler panic-free.
+            let count = i32::try_from(passwords.len()).unwrap_or(i32::MAX);
+            Ok((mode_type.to_string(), Some(count)))
+        }
+        input_authentication_type::IAM => {
+            if !passwords.is_empty() {
+                return Err(AuthenticationModeRejection::Combination(format!(
+                    "AuthenticationMode.Passwords cannot be supplied when \
+                     AuthenticationMode.Type is {}.",
+                    input_authentication_type::IAM
+                )));
+            }
+            // An IAM-authenticated user holds no passwords, so there is no count to
+            // report for it.
+            Ok((mode_type.to_string(), None))
+        }
+        other => Err(AuthenticationModeRejection::Value(format!(
+            "AuthenticationMode.Type must be one of {} — got {other:?}.",
+            // The GENERATED catalog, so the refusal cannot name a different set from
+            // the one the model declares.
+            crate::ops::types::INPUT_AUTHENTICATION_TYPE_VALUES.join(", ")
+        ))),
+    }
+}
+
+/// One password against the documented requirements. The message names the broken
+/// rule and never repeats the password itself.
+fn validate_password(password: &str) -> Result<(), AuthenticationModeRejection> {
+    if !(MIN_PASSWORD_LEN..=MAX_PASSWORD_LEN).contains(&password.chars().count()) {
+        return Err(AuthenticationModeRejection::Value(format!(
+            "A user password must be between {MIN_PASSWORD_LEN} and {MAX_PASSWORD_LEN} \
+             characters long."
+        )));
+    }
+    // "Must be only printable ASCII characters": the ASCII graphic range plus the
+    // space, so a control character or any non-ASCII character is refused.
+    if !password
+        .chars()
+        .all(|character| character.is_ascii_graphic() || character == ' ')
+    {
+        return Err(AuthenticationModeRejection::Value(
+            "A user password must contain only printable ASCII characters.".to_string(),
+        ));
+    }
+    if password
+        .chars()
+        .any(|character| FORBIDDEN_PASSWORD_CHARS.contains(&character))
+    {
+        return Err(AuthenticationModeRejection::Value(format!(
+            "A user password must not contain any of the characters {}.",
+            FORBIDDEN_PASSWORD_CHARS
+                .iter()
+                .map(|character| format!("{character:?}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )));
+    }
+    Ok(())
 }
 
 /// The region this request was signed for, or [`DEFAULT_REGION`] when it carries no
