@@ -513,7 +513,6 @@ impl ComAmazonawsDsqlDsqlState {
         // owed to a cluster that owes none itself.
         let identifiers: Vec<String> = self.clusters.keys().cloned().collect();
 
-
         for identifier in identifiers {
             let Some(cluster) = self.clusters.get_mut(&identifier) else {
                 continue;

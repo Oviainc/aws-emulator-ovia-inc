@@ -16,6 +16,10 @@
 //! resumes, which members an update replaces, and what an id the store does not hold
 //! answers.
 
+// The wire harness below (`Answer`, `emulator`, `call_in`, `call`, `ok`, `member`) is
+// `pub(crate)` so a sibling suite in this test target reuses it instead of writing a
+// second dispatch path; `create` and `list_all_ids` stay private to this suite.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -27,17 +31,17 @@ use service_com_amazonaws_securityagent_securityagent::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// One answer from the emulator.
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The wire error code: restJson1 carries it in the `x-amzn-errortype` header and
     /// in the body's `__type` discriminator. Empty on a success.
-    error_code: String,
-    body: Value,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
 }
 
 /// A router carrying only this service, over ONE shared engine — the same
 /// `EmulatedService::new(engine)` seam `core/router` mounts.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are the emulator front door's concern, not this service's; these
@@ -52,7 +56,7 @@ fn emulator() -> MultiServiceRouter {
 /// The `Authorization` credential scope names `securityagent`, the signing name
 /// `resolve_route_key` reads to pick this service, and the region inside it is what
 /// the service reads when it derives a region-bearing value.
-async fn call_in(
+pub(crate) async fn call_in(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -120,12 +124,12 @@ async fn call_in(
 }
 
 /// `call_in`, in the region every case that is not about the region uses.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
+pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Answer {
     call_in(router, "us-east-1", operation, body).await
 }
 
 /// `call`, requiring HTTP 200 and naming the case when it is not.
-async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &str) -> Value {
+pub(crate) async fn ok(router: &MultiServiceRouter, operation: &str, body: &Value, case: &str) -> Value {
     let answer = call(router, operation, body).await;
     assert_eq!(
         answer.status, 200,
@@ -148,7 +152,7 @@ async fn create(router: &MultiServiceRouter, body: &Value, case: &str) -> String
 }
 
 /// A string member of a payload, or `None` when it is absent.
-fn member(payload: &Value, name: &str) -> Option<String> {
+pub(crate) fn member(payload: &Value, name: &str) -> Option<String> {
     payload.get(name).and_then(Value::as_str).map(str::to_string)
 }
 

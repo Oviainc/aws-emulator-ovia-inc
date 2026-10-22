@@ -35,6 +35,9 @@ pub(crate) const ARN_PREFIX: &str = "arn:aws:ecr-public::000000000000:repository
 const URI_PREFIX: &str = "public.ecr.aws/emulator/";
 
 /// A router with just this service mounted on a fresh engine.
+///
+/// `pub(crate)` so a sibling suite in this test target drives the same front door
+/// rather than standing up a second harness.
 pub(crate) fn service() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -132,6 +135,24 @@ pub(crate) fn text(body: &Value, path: &[&str], case: &str) -> String {
 /// The `sha256:<hex>` digest of a manifest, computed independently of the emulator.
 pub(crate) fn digest_of(manifest: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(manifest.as_bytes()))
+}
+
+/// The URL a stored logo payload is reported under, computed independently of the
+/// emulator.
+///
+/// `RepositoryCatalogData$logoUrl` is "the URL that contains the logo that's associated
+/// with the repository", so it exists only once a payload has been stored, and its last
+/// segment is that payload's own sha256 digest: the same bytes always yield the same URL
+/// and different bytes never do. The host is the universal gallery prefix
+/// `public.ecr.aws` (`Registry$registryUri`, `crate::state::GALLERY_HOST`).
+///
+/// `pub(crate)` so the sibling catalog-data suite asserts the same derivation instead of
+/// keeping a second copy of it.
+pub(crate) fn logo_url(repository: &str, blob: &[u8]) -> String {
+    format!(
+        "https://public.ecr.aws/logos/{repository}/{:x}",
+        Sha256::digest(blob)
+    )
 }
 
 /// Every `repositoryName` form the modelled pattern
@@ -395,10 +416,7 @@ async fn create_repository_reports_the_catalog_data_it_stored() {
     );
     assert_eq!(
         catalog["logoUrl"].as_str().unwrap_or_default(),
-        format!(
-            "https://public.ecr.aws/logos/team/catalog/{:x}",
-            Sha256::digest(logo_bytes)
-        ),
+        logo_url("team/catalog", &logo_bytes),
         "expected the logo URL to be derived from the logo payload, got {catalog}"
     );
 
@@ -1463,10 +1481,6 @@ async fn the_operations_this_slice_does_not_cover_still_answer_501() {
     // `NotImplemented`, never an empty 200 that a client cannot tell from a real answer.
     for (operation, body) in [
         ("GetAuthorizationToken", json!({})),
-        (
-            "GetRepositoryCatalogData",
-            json!({"repositoryName": "team/app"}),
-        ),
         (
             "DescribeImageTags",
             json!({"repositoryName": "team/app"}),
