@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompleteSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompleteSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompleteSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: checks the number of blocks actually written against
+//! `ChangedBlocksCount`, seals the stored snapshot and answers with the status read back
+//! from that record.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +92,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::SnapshotStatus;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -170,18 +169,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompleteSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompleteSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompleteSnapshot"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(no_state)?;
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.expire_due_snapshots(now);
+
+        let Some(snapshot) = store.snapshots.get_mut(&input.snapshot_id) else {
+            return Err(not_found(format!(
+                "snapshot {} does not exist",
+                input.snapshot_id
+            )));
+        };
+
+        // DECLINED, deliberately: the optional aggregate `Checksum` /
+        // `ChecksumAlgorithm` / `ChecksumAggregationMethod` headers are NOT verified
+        // here. Their values are constrained by the model (`SHA256`, `LINEAR`) and the
+        // boundary validator already refuses anything else, but the rule that turns the
+        // per-block checksums into the aggregate is not in the model and the published
+        // prose does not pin the byte-level composition (whether the per-block
+        // checksums are concatenated as their Base64 text or as their raw digests).
+        // Refusing on a guessed composition would reject requests a real client builds
+        // correctly, which is worse than not checking; so the snapshot is sealed on the
+        // evidence this service does have — the blocks it actually stored, checksum-
+        // verified one by one as `PutSnapshotBlock` persisted them, and counted against
+        // `ChangedBlocksCount` below.
+        let _ = (
+            &input.checksum,
+            &input.checksum_algorithm,
+            &input.checksum_aggregation_method,
+        );
+
+        // "Seals and completes the snapshot after all of the required blocks of data
+        // have been written to it": the caller's count must agree with what was written.
+        let written = i32::try_from(snapshot.blocks.len()).unwrap_or(i32::MAX);
+        if written != input.changed_blocks_count {
+            return Err(validation(
+                "INVALID_PARAMETER_VALUE",
+                format!(
+                    "ChangedBlocksCount {} does not match the {written} blocks written to snapshot {}",
+                    input.changed_blocks_count, input.snapshot_id
+                ),
+            ));
+        }
+
+        match snapshot.status {
+            // "Completing the snapshot changes the status to completed."
+            SnapshotStatus::Pending => snapshot.status = SnapshotStatus::Completed,
+            // Already sealed: nothing left to change, so the stored status is the answer.
+            SnapshotStatus::Completed => {}
+            // A snapshot whose `Timeout` cancelled it can no longer be sealed.
+            SnapshotStatus::Error => {
+                return Err(validation(
+                    "INVALID_SNAPSHOT_ID",
+                    format!(
+                        "snapshot {} was cancelled and can no longer be completed",
+                        input.snapshot_id
+                    ),
+                ));
+            }
+        }
+
+        // The sealed snapshot no longer has a `Timeout` outstanding, so the store's
+        // expiry schedule is recomputed: `next_expiry_due` keeps naming a snapshot that
+        // really is still pending.
+        store.refresh_expiry_schedule();
+
+        // Read the status back off the stored record rather than returning a literal.
+        let stored = store.snapshots.get(&input.snapshot_id).ok_or_else(|| {
+            no_state_message(format!("snapshot {} is no longer stored", input.snapshot_id))
+        })?;
+        Ok(CompleteSnapshotOutput {
+            status: Some(stored.status.as_wire().to_string()),
+        })
     }
+}
+
+/// The modelled server error for an engine that holds no state for this service.
+fn no_state() -> CompleteSnapshotError {
+    no_state_message(
+        "the com-amazonaws-ebs-ebs service is mounted on an engine that holds no state"
+            .to_string(),
+    )
+}
+
+/// The modelled server error carrying `message`.
+fn no_state_message(message: String) -> CompleteSnapshotError {
+    CompleteSnapshotErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled `ValidationException` (HTTP 400) with one of `ValidationExceptionReason`'s
+/// values.
+fn validation(reason: &str, message: String) -> CompleteSnapshotError {
+    CompleteSnapshotErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+        reason: Some(reason.to_string()),
+    })
+    .into()
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) for an absent snapshot.
+fn not_found(message: String) -> CompleteSnapshotError {
+    CompleteSnapshotErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        reason: Some("SNAPSHOT_NOT_FOUND".to_string()),
+    })
+    .into()
 }

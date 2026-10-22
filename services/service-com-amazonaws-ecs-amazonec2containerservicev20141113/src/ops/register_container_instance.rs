@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterContainerInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterContainerInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterContainerInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers an EC2 or external instance into a cluster and PERSISTS it, so the cluster
+//! afterwards reports its capacity through `ListContainerInstances`,
+//! `DescribeContainerInstances` and `Cluster$registeredContainerInstancesCount`.
 //!
 //! ## Shape of an operation
 //!
@@ -106,6 +100,24 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The member of an EC2 instance identity document that carries the instance id. The
+/// `instanceIdentityDocument` doc points at
+/// `http://169.254.169.254/latest/dynamic/instance-identity/document/`, whose JSON
+/// document names the instance in `instanceId`.
+const IDENTITY_DOCUMENT_INSTANCE_ID: &str = "instanceId";
+
+/// The EC2 instance id an identity document names, or `None` when the document is not a
+/// JSON object carrying a non-empty `instanceId`.
+fn instance_id_from_identity_document(document: &str) -> Option<String> {
+    ::serde_json::from_str::<::serde_json::Value>(document)
+        .ok()?
+        .get(IDENTITY_DOCUMENT_INSTANCE_ID)?
+        .as_str()
+        .map(str::trim)
+        .filter(|instance_id| !instance_id.is_empty())
+        .map(str::to_string)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -178,18 +190,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterContainerInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterContainerInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterContainerInstance"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterContainerInstanceErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+
+        // "The instance identity document for the EC2 instance to register." When the
+        // agent sends one it is what names the instance, so a document that names no
+        // instance is a parameter this operation cannot act on.
+        let documented_instance_id = match input.instance_identity_document.as_deref() {
+            Some(document) => Some(instance_id_from_identity_document(document).ok_or_else(|| {
+                RegisterContainerInstanceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "instanceIdentityDocument must be a JSON document carrying a \
+                             non-empty {IDENTITY_DOCUMENT_INSTANCE_ID}"
+                        )),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.clusters.contains_key(&cluster_name) {
+            return Err(
+                RegisterContainerInstanceErrorModeled::ClusterNotFoundException(
+                    ClusterNotFoundException {
+                        message: Some(format!("cluster {cluster_name:?} was not found")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Which STORED instance this registration is about, if any: the one the request
+        // names as "previously registered", else the one already holding this EC2
+        // instance id — one instance identity document names one machine, so registering
+        // it again is the same container instance, not a second one.
+        let existing_arn = match input.container_instance_arn.as_deref() {
+            Some(reference) => {
+                let arn = crate::state::container_instance_arn_from_reference(
+                    &region,
+                    &cluster_name,
+                    reference,
+                );
+                if guard
+                    .container_instances
+                    .get(&arn)
+                    .is_some_and(|instance| instance.cluster_name == cluster_name)
+                {
+                    Some(arn)
+                } else {
+                    return Err(
+                        RegisterContainerInstanceErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(format!(
+                                    "containerInstanceArn {reference:?} names no container \
+                                     instance registered in cluster {cluster_name:?}"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            None => documented_instance_id.as_deref().and_then(|instance_id| {
+                guard
+                    .container_instances
+                    .values()
+                    .find(|instance| {
+                        instance.cluster_name == cluster_name
+                            && instance.ec2_instance_id == instance_id
+                    })
+                    .map(|instance| instance.arn.clone())
+            }),
+        };
+
+        let version_info = input.version_info.clone();
+        let registered_resources = input.total_resources.clone().unwrap_or_default();
+        let attributes = input.attributes.clone().unwrap_or_default();
+        let platform_devices = input.platform_devices.clone().unwrap_or_default();
+        let tags = input.tags.clone().unwrap_or_default();
+
+        // A re-registration reports the instance afresh, so what it carries REPLACES
+        // what was stored, the status returns to `ACTIVE` and the version counter moves
+        // — `ContainerInstance$version`: "Every time a container instance experiences a
+        // change ... the version counter is incremented."
+        if let Some(arn) = existing_arn {
+            let instance = guard
+                .container_instances
+                .get_mut(&arn)
+                .expect("the ARN was just read out of the map under this lock");
+            if let Some(instance_id) = documented_instance_id {
+                instance.ec2_instance_id = instance_id;
+            }
+            instance.status = crate::state::CONTAINER_INSTANCE_ACTIVE.to_string();
+            instance.status_reason = None;
+            instance.agent_connected = true;
+            instance.version_info = version_info;
+            instance.registered_resources = registered_resources;
+            instance.attributes = attributes;
+            instance.platform_devices = platform_devices;
+            instance.tags = tags;
+            instance.version += 1;
+            return Ok(RegisterContainerInstanceOutput {
+                container_instance: Some(
+                    instance.view(crate::state::ContainerInstanceFields::all()),
+                ),
+            });
+        }
+
+        if guard.container_instances.len() >= crate::state::MAX_CONTAINER_INSTANCES {
+            return Err(RegisterContainerInstanceErrorModeled::ClientException(
+                ClientException {
+                    message: Some(format!(
+                        "this emulator holds at most {} container instances; deregister one \
+                         before registering another",
+                        crate::state::MAX_CONTAINER_INSTANCES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let instance_id = guard.next_container_instance_id();
+        // "For Amazon EC2 instances, this value is the Amazon EC2 instance ID. For
+        // external instances, this value is the ... Systems Manager managed instance ID"
+        // — an instance that registers without an identity document is an external one.
+        let ec2_instance_id = match documented_instance_id {
+            Some(instance_id) => instance_id,
+            None => guard.next_managed_instance_id(),
+        };
+        let record = crate::state::ContainerInstanceRecord {
+            arn: crate::state::container_instance_arn(&region, &cluster_name, &instance_id),
+            instance_id,
+            cluster_name,
+            ec2_instance_id,
+            // Registration completes here: the trunk-interface provisioning that would
+            // hold an instance in `REGISTERING` only happens for an account opted in to
+            // `awsvpcTrunking`, which no account setting in this emulator turns on.
+            status: crate::state::CONTAINER_INSTANCE_ACTIVE.to_string(),
+            status_reason: None,
+            // The ECS agent is the caller of this operation, so the agent of a just
+            // registered instance is connected: "Only instances connected to an agent
+            // can accept task placement requests."
+            agent_connected: true,
+            version_info,
+            registered_resources,
+            attributes,
+            platform_devices,
+            tags,
+            registered_at: crate::state::now(),
+            version: 0,
+        };
+        let view = record.view(crate::state::ContainerInstanceFields::all());
+        guard.container_instances.insert(record.arn.clone(), record);
+
+        Ok(RegisterContainerInstanceOutput {
+            container_instance: Some(view),
+        })
     }
 }

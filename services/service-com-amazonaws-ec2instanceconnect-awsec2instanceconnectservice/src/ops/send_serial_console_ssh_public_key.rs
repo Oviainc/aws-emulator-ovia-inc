@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendSerialConsoleSSHPublicKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendSerialConsoleSSHPublicKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendSerialConsoleSSHPublicKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pushes an SSH public key at a registered EC2 instance's serial console and stores it
+//! against (instance id, serial port) for [`crate::state::PUSHED_KEY_TTL`]. Every answer is
+//! computed from
+//! [`crate::state::ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState`].
+//!
+//! ## Decision order
+//!
+//! 1. the account has serial-console access, else `SerialConsoleAccessDisabledException`
+//!    (403);
+//! 2. the instance is in the registry, else `EC2InstanceNotFoundException` (404);
+//! 3. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
+//!    still launching) or `EC2InstanceStateInvalidException` (400, going down, stopped or
+//!    terminated);
+//! 4. its instance type supports the serial console, else `EC2InstanceTypeInvalidException`
+//!    (400);
+//! 5. the key is stored against (instance id, serial port), replacing whatever was there and
+//!    restarting the 60-second lifetime, and `Success: true` comes back with a fresh
+//!    `RequestId`.
+//!
+//! `SerialConsoleSessionLimitExceededException`, `SerialConsoleSessionUnavailableException`
+//! and `SerialConsoleSessionUnsupportedException` report facts about an SSH serial-console
+//! SESSION and the instance's BIOS. Pushing a key opens no session (the session is
+//! established afterwards, over SSH, which this emulator does not serve) and the emulator
+//! holds no BIOS version, so nothing here can decide them and none of them is raised.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +199,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendSerialConsoleSSHPublicKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendSerialConsoleSSHPublicKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendSerialConsoleSSHPublicKey"))
+        // `ctx` carries request metadata only; this operation needs none of it — the request
+        // is fully described by its input members.
+        let _ = ctx;
+
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendSerialConsoleSSHPublicKeyErrorModeled::ServiceException(ServiceException {
+                message: Some(
+                    "the EC2 Instance Connect instance registry is unavailable".to_string(),
+                ),
+            })
+        })?;
+        let mut state = store.lock();
+
+        // One instant for the whole call, so the record's `pushed_at`, its expiry and the
+        // pruning cutoff cannot disagree with each other.
+        let now = ::std::time::Instant::now();
+
+        // The account-level toggle EC2's `EnableSerialConsoleAccess` sets, checked before the
+        // instance is looked up: an account without serial-console access may not ask about
+        // any instance. HTTP 403.
+        if !state.serial_console_access_enabled {
+            return Err(
+                SendSerialConsoleSSHPublicKeyErrorModeled::SerialConsoleAccessDisabledException(
+                    SerialConsoleAccessDisabledException {
+                        message: Some(
+                            "Your account is not authorized to use the EC2 Serial Console. To \
+                             authorize your account, run the EnableSerialConsoleAccess API."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The instance must be in the registry: `EC2InstanceNotFoundException`, HTTP 404.
+        let instance = state.instance(&input.instance_id).cloned().ok_or_else(|| {
+            SendSerialConsoleSSHPublicKeyErrorModeled::EC2InstanceNotFoundException(
+                EC2InstanceNotFoundException {
+                    message: Some(format!("Instance {} not found", input.instance_id)),
+                },
+            )
+        })?;
+
+        // ... and it must be in a state a connection can be made to. Same rule, and the same
+        // shared mapping, as `SendSSHPublicKey`.
+        if let Some(blocked) = instance.state.blocks_connect() {
+            return Err(match blocked {
+                crate::state::ConnectBlocked::NotYetAvailable => {
+                    SendSerialConsoleSSHPublicKeyErrorModeled::EC2InstanceUnavailableException(
+                        EC2InstanceUnavailableException {
+                            message: Some(format!(
+                                "Instance {} is {} and is currently unavailable. Wait a few \
+                                 minutes and try again.",
+                                instance.instance_id,
+                                instance.state.as_str()
+                            )),
+                        },
+                    )
+                }
+                crate::state::ConnectBlocked::InvalidState => {
+                    SendSerialConsoleSSHPublicKeyErrorModeled::EC2InstanceStateInvalidException(
+                        EC2InstanceStateInvalidException {
+                            message: Some(format!(
+                                "Instance {} is in state {}; connecting to a stopped or \
+                                 terminated instance is not supported",
+                                instance.instance_id,
+                                instance.state.as_str()
+                            )),
+                        },
+                    )
+                }
+            }
+            .into());
+        }
+
+        // Only an instance type that supports the serial console can take a serial-console
+        // key: `EC2InstanceTypeInvalidException`, HTTP 400.
+        if !instance.serial_console_supported {
+            return Err(
+                SendSerialConsoleSSHPublicKeyErrorModeled::EC2InstanceTypeInvalidException(
+                    EC2InstanceTypeInvalidException {
+                        message: Some(format!(
+                            "Instance type {} of instance {} is not supported for connecting \
+                             via the serial console. Only Nitro instance types are currently \
+                             supported.",
+                            instance.instance_type, instance.instance_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The model gives `SerialPort` the range 0..0, so the boundary validator has already
+        // refused any other port before this handler runs. Checked anyway, as the modelled
+        // `InvalidArgsException` rather than a panic, so the handler stands on its own.
+        if input.serial_port != crate::state::SERIAL_CONSOLE_PORT {
+            return Err(SendSerialConsoleSSHPublicKeyErrorModeled::InvalidArgsException(
+                InvalidArgsException {
+                    message: Some(format!(
+                        "SerialPort {} is not supported; only port {} is supported",
+                        input.serial_port,
+                        crate::state::SERIAL_CONSOLE_PORT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A fresh id per call, stored with the key it pushed and in the request log.
+        let request_id = state.next_request_id();
+        state.push_serial_console_key(
+            &input.instance_id,
+            input.serial_port,
+            &input.ssh_public_key,
+            &request_id,
+            now,
+        );
+        state.record_request(&request_id, Self::NAME, &input.instance_id, now);
+
+        Ok(SendSerialConsoleSSHPublicKeyOutput {
+            request_id: Some(request_id),
+            success: true,
+        })
     }
 }
