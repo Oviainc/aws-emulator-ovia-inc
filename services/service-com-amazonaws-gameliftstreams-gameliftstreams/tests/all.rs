@@ -17,3 +17,5 @@ mod resource_tags;
 mod state_roundtrip;
 #[path = "all/stream_workflow.rs"]
 mod stream_workflow;
+#[path = "all/tags.rs"]
+mod tags;

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns tags to one application or stream group, MERGING them into the tags that
+//! resource already carries: a key the request names takes the request's value, and
+//! a key it does not name is left as it was. That is what makes two taggings of the
+//! same resource compose instead of one losing the other's keys.
+//!
+//! Tags are metadata ABOUT a resource, not part of its configuration or status, so a
+//! tagging does not move the resource's `LastUpdatedAt`: a `Get*` of a resource whose
+//! only change was a tagging still reports the instant its state last moved.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +149,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the gameliftstreams emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // A resource whose deletion the clock had already completed is gone before
+        // this call looks for it, so tagging cannot resurrect it.
+        state.materialize(now);
+
+        // The whole merge happens under ONE lock, so concurrent taggings of the same
+        // resource serialize and neither loses the other's keys.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // `TagResource` models no `ResourceNotFoundException`, so an ARN that names
+        // no taggable resource this store holds is refused with the modelled
+        // client-input error instead — the same refusal `ListTagsForResource` makes.
+        let Some(tags) = state.tags_of_mut(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "no Amazon GameLift Streams resource matches ResourceArn {}",
+                        input.resource_arn
+                    ),
+                },
+            )
+            .into());
+        };
+        // The stored keys the request does not name, plus every key it does: what the
+        // resource would hold once merged.
+        let merged = tags
+            .keys()
+            .filter(|key| !input.tags.contains_key(key.as_str()))
+            .count()
+            + input.tags.len();
+        if merged > crate::state::TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Tags would take resource {} to {merged} tags, past the maximum \
+                         of {} tags per resource",
+                        input.resource_arn,
+                        crate::state::TAGS_PER_RESOURCE
+                    ),
+                },
+            )
+            .into());
+        }
+        for (key, value) in &input.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+        Ok(TagResourceOutput {})
     }
 }
