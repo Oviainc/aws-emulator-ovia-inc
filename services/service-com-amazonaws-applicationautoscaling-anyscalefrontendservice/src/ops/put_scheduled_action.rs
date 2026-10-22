@@ -421,7 +421,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// `Ok` when `name` satisfies the `ScheduledActionName` pattern.
+/// `Ok` when `name` is a name the service accepts.
 ///
 /// The model's own constraint:
 /// `^(?!((^[ ]+.*)|(.*([\u0000-\u001f]|[\u007f-\u009f]|[:/|])+.*)|(.*[ ]+$))).+$` — a
@@ -429,6 +429,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// character and no `:`, `/` or `|`. It is checked here because the name is a path segment
 /// of the action's own ARN: a name carrying one of those characters would not be
 /// recoverable from it.
+///
+/// The refusal states the rule the name breaks, in prose, and names the name: the pattern
+/// itself is not a sentence a caller can act on, so it is what the message does NOT carry.
 fn check_scheduled_action_name(name: &str) -> Result<(), String> {
     /// The characters the pattern's middle alternative forbids anywhere in the name.
     const FORBIDDEN: [char; 3] = [':', '/', '|'];
@@ -438,18 +441,30 @@ fn check_scheduled_action_name(name: &str) -> Result<(), String> {
             || character.is_control()
             || ('\u{7f}'..='\u{9f}').contains(&character)
     };
-    if !name.is_empty()
-        && !name.starts_with(' ')
-        && !name.ends_with(' ')
-        && !name.chars().any(forbidden)
-    {
-        return Ok(());
+    let reason = if name.is_empty() {
+        Some("must not be empty".to_string())
+    } else if name.starts_with(' ') || name.ends_with(' ') {
+        Some("must not begin or end with a space".to_string())
+    } else {
+        name.chars()
+            .find(|character| forbidden(*character))
+            .map(|character| {
+                if FORBIDDEN.contains(&character) {
+                    format!("must not contain '{character}'")
+                } else {
+                    format!(
+                        "must not contain the control character U+{:04X}",
+                        character as u32
+                    )
+                }
+            })
+    };
+    match reason {
+        None => Ok(()),
+        Some(reason) => Err(format!(
+            "Invalid scheduled action name: {name}. A scheduled action name {reason}"
+        )),
     }
-    Err(format!(
-        "Value '{name}' at 'scheduledActionName' failed to satisfy constraint: Member must \
-         satisfy regular expression pattern: \
-         ^(?!((^[ ]+.*)|(.*([\\u0000-\\u001f]|[\\u007f-\\u009f]|[:/|])+.*)|(.*[ ]+$))).+$"
-    ))
 }
 
 /// This operation's modelled `ValidationException`, carrying `message`.
@@ -477,7 +492,9 @@ pub use crate::state::CRON_FIELDS as SCHEDULE_CRON_FIELDS;
 ///
 /// The two bounds are checked against each other only. A window OUTSIDE the target's
 /// registered range is accepted on purpose: the registered range is what the action is
-/// measured against when it RUNS, not when it is stored.
+/// measured against when it RUNS, not when it is stored. An inverted window carries the
+/// same sentence every operation that takes one answers it with
+/// ([`crate::state::CAPACITY_RANGE_INVERTED_MESSAGE`]).
 fn check_scalable_target_action(action: &ScalableTargetAction) -> Result<(), String> {
     for (member, capacity) in [
         ("scalableTargetAction.minCapacity", action.min_capacity),
@@ -494,10 +511,7 @@ fn check_scalable_target_action(action: &ScalableTargetAction) -> Result<(), Str
     }
     if let (Some(min_capacity), Some(max_capacity)) = (action.min_capacity, action.max_capacity) {
         if min_capacity > max_capacity {
-            return Err(format!(
-                "MinCapacity ({min_capacity}) must be less than or equal to MaxCapacity \
-                 ({max_capacity})"
-            ));
+            return Err(crate::state::CAPACITY_RANGE_INVERTED_MESSAGE.to_string());
         }
     }
     Ok(())

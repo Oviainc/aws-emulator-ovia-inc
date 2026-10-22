@@ -18,11 +18,12 @@
 //!   policies.
 //!
 //! The refusal messages the suite pins are the ones built from the request: they name the
-//! member and the constraint, which is what a caller fixes the request from.
+//! resource the request asked to scale, which is what a caller fixes the request from. What
+//! each of them SAYS is pinned by the `refusal_messages` suite.
 
 use serde_json::json;
 
-use super::emulator::{error_code, error_message, Emulator};
+use super::emulator::{error_code, error_message, Emulator, REGION};
 
 /// What the backing service holds before the registration under test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,9 +274,16 @@ async fn a_target_is_registered_only_on_a_resource_that_can_carry_it() {
         );
         let message = error_message(&body);
         assert!(
-            message.contains(row.resource_id) && message.contains("resourceId"),
-            "case {case:?}: expected the message to name the member and its value, got \
-             {message:?}"
+            message.contains(row.resource_id),
+            "case {case:?}: expected the message to name the resource id the request \
+             supplied, got {message:?}"
+        );
+        // The refusal is the service's own sentence: never the boundary validator's
+        // constraint template, and never a value the caller did not supply (the region the
+        // request happens to be signed for).
+        assert!(
+            !message.contains("failed to satisfy constraint") && !message.contains(REGION),
+            "case {case:?}: expected the service's own refusal text, got {message:?}"
         );
         // And nothing was persisted.
         let (status, described) = emulator
