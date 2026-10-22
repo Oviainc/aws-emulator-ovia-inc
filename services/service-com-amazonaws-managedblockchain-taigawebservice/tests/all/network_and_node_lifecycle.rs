@@ -57,11 +57,6 @@ impl Answer {
     }
 }
 
-/// A router with only this service mounted, over a fresh engine.
-pub(crate) fn new_router() -> MultiServiceRouter {
-    router_over(Arc::new(engine::InMemoryEngine::new()))
-}
-
 /// A router with only this service mounted, over `engine` — so a caller that needs to
 /// reach the same store the handlers write to can keep a handle on it.
 pub(crate) fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
@@ -71,6 +66,11 @@ pub(crate) fn router_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRo
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
     router
+}
+
+/// A router with only this service mounted, over a fresh engine.
+pub(crate) fn new_router() -> MultiServiceRouter {
+    router_over(Arc::new(engine::InMemoryEngine::new()))
 }
 
 /// Send one request and return what the emulator answered.

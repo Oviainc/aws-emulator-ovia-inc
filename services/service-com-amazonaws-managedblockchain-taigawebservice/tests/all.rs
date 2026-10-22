@@ -15,6 +15,8 @@
 mod accessor_lifecycle;
 #[path = "all/invitations.rs"]
 mod invitations;
+#[path = "all/list_members.rs"]
+mod list_members;
 #[path = "all/network_and_node_lifecycle.rs"]
 mod network_and_node_lifecycle;
 #[path = "all/proposal_lifecycle.rs"]

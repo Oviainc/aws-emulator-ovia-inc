@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ScheduleKeyDeletion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ScheduleKeyDeletion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: moves a key into the `PendingDeletion` state for a waiting period and
+//! records when that period ends. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ScheduleKeyDeletion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A mutation: "KMS deletes the KMS key" only after the waiting period, and until then
+//! the key is unusable in cryptographic operations and reports the `DeletionDate` this
+//! call set. Scheduling a key that is already pending deletion is refused with
+//! `KMSInvalidStateException`.
 //!
 //! ## Shape of an operation
 //!
@@ -211,18 +209,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ScheduleKeyDeletion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ScheduleKeyDeletionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ScheduleKeyDeletion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ScheduleKeyDeletionErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "This value is optional. If you include a value, it must be between 7 and 30,
+        // inclusive. If you do not include a value, it defaults to 30."
+        // (`smithy_query(query="doc",shape="ScheduleKeyDeletionRequest",member="PendingWindowInDays")`)
+        // The modelled range on `PendingWindowInDaysType` is wider (1..365) because the
+        // shape is shared, so the documented window is enforced here.
+        let pending_window_in_days = input.pending_window_in_days.unwrap_or(DEFAULT_PENDING_WINDOW);
+        if !(MIN_PENDING_WINDOW..=MAX_PENDING_WINDOW).contains(&pending_window_in_days) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "PendingWindowInDays must be between {MIN_PENDING_WINDOW} and \
+                 {MAX_PENDING_WINDOW}, inclusive, but was {pending_window_in_days}"
+            )));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        let key = match state.resolve_mut(&region, &input.key_id) {
+            crate::state::KeyRefMut::Found(key) => key,
+            crate::state::KeyRefMut::MalformedArn => {
+                return Err(ScheduleKeyDeletionErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(format!(
+                            "The specified ARN is not valid: {}.",
+                            input.key_id
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRefMut::NotFound => {
+                return Err(ScheduleKeyDeletionErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(format!(
+                            "KMS cannot find the key with identifier {} in {region}.",
+                            input.key_id
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // A key already pending deletion has nothing left to schedule.
+        if key.key_state == crate::state::KEY_STATE_PENDING_DELETION {
+            return Err(ScheduleKeyDeletionErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(format!(
+                        "{} is not in a valid state for this operation. Its key state is {}.",
+                        key.arn, key.key_state
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Otherwise, the waiting period begins immediately": the deletion date is
+        // this instant plus the waiting period.
+        let deletion_date = ::std::time::SystemTime::now()
+            + ::std::time::Duration::from_secs(
+                u64::try_from(pending_window_in_days).unwrap_or(0) * SECONDS_PER_DAY,
+            );
+        key.key_state = crate::state::KEY_STATE_PENDING_DELETION.to_string();
+        key.enabled = false;
+        key.deletion_date = Some(deletion_date);
+        key.pending_window_in_days = Some(pending_window_in_days);
+
+        Ok(ScheduleKeyDeletionOutput {
+            key_id: Some(key.arn.clone()),
+            deletion_date: Some(crate::state::date_time(deletion_date)),
+            key_state: Some(key.key_state.clone()),
+            pending_window_in_days: Some(pending_window_in_days),
+        })
     }
 }
+
+/// The waiting period used when the request names none, and the documented bounds on
+/// one it does name: "If you include a value, it must be between 7 and 30, inclusive.
+/// If you do not include a value, it defaults to 30."
+/// (`smithy_query(query="doc",shape="ScheduleKeyDeletionRequest",member="PendingWindowInDays")`).
+const DEFAULT_PENDING_WINDOW: i32 = 30;
+/// See [`DEFAULT_PENDING_WINDOW`].
+const MIN_PENDING_WINDOW: i32 = 7;
+/// See [`DEFAULT_PENDING_WINDOW`].
+const MAX_PENDING_WINDOW: i32 = 30;
+
+/// The waiting period is counted in days.
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;

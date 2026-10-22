@@ -382,7 +382,34 @@ pub struct SortCriteria {
     pub order_by: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.accessanalyzer#AnalyzerSummary")]
+// `AnalyzerSummary` and `ArchiveRuleSummary` are the two shapes in this module written
+// out by hand rather than produced by `#[smithy_macros::smithy(shape = ...)]`, and the
+// reason is a single trait the macro does not read: `@timestampFormat`.
+//
+// Every `Timestamp` member of these two shapes carries `@timestampFormat("date-time")`
+// (`smithy_query(query="shape",shape="AnalyzerSummary,ArchiveRuleSummary")` reports
+// `"timestampFormat": "date-time"` on `createdAt`, `lastResourceAnalyzedAt` and
+// `updatedAt`). The vendored codegen captures `@length`/`@range`/`@pattern`/`@enum`/
+// `@uniqueItems` and never emits `with_timestamp_format`, so a macro-built member schema
+// reports NO format and the restJson1 JSON codec falls back to its protocol default,
+// epoch seconds (`vendor/smithy-schema-server/src/json.rs::timestamp_format`) — a NUMBER
+// where the model, and every AWS SDK's generated deserializer for a `date-time` member,
+// requires an ISO-8601 string. The hand-written member schemas below differ from the
+// macro's output in exactly that one chain call.
+//
+// Everything else mirrors the macro's output for a structure: one `M_<MEMBER>` member
+// schema per member (index = position in the model's member list), a `SCHEMA` naming them
+// in order, the `<SHAPE>_SCHEMA` alias, and the serialize/deserialize pair. Constraint
+// traits are deliberately absent: the validating walk runs on operation INPUTS only, and
+// both shapes are output-only, so the macro's captured constraints would be inert here
+// too.
+//
+// The codegen gap itself is filed as
+// `issues/things-that-do-not-work/20261022T000000Z-smithy-macros-drops-timestampformat-from-member-schemas.md`
+// (and ...-20261021T223000Z-scaffold-codegen-drops-timestampformat-from-member-schemas.md):
+// once `vendor/smithy-macros` emits `with_timestamp_format`, these two hand-written
+// shapes become two `#[smithy_macros::smithy(shape = ...)]` attributes again and
+// everything below them is deleted.
 #[derive(Debug, Clone)]
 pub struct AnalyzerSummary {
     pub arn: String,
@@ -398,19 +425,307 @@ pub struct AnalyzerSummary {
     pub managed_by: Option<String>,
 }
 
+/// One member schema of [`AnalyzerSummary`], named and indexed as the model orders it.
+macro_rules! analyzer_summary_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.accessanalyzer#AnalyzerSummary$", $name),
+                AnalyzerSummary::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+impl AnalyzerSummary {
+    const SHAPE_ID: &'static str = "com.amazonaws.accessanalyzer#AnalyzerSummary";
+    const NAMESPACE: &'static str = "com.amazonaws.accessanalyzer";
+
+    pub const M_ARN: ::aws_smithy_schema::Schema = analyzer_summary_member!("arn", String, 0);
+    pub const M_NAME: ::aws_smithy_schema::Schema = analyzer_summary_member!("name", String, 1);
+    pub const M_TYPE: ::aws_smithy_schema::Schema = analyzer_summary_member!("type", String, 2);
+    /// `@timestampFormat("date-time")` — the chain the macro cannot emit.
+    pub const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        analyzer_summary_member!("createdAt", Timestamp, 3)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_LAST_RESOURCE_ANALYZED: ::aws_smithy_schema::Schema =
+        analyzer_summary_member!("lastResourceAnalyzed", String, 4);
+    /// `@timestampFormat("date-time")`, as for `createdAt`.
+    pub const M_LAST_RESOURCE_ANALYZED_AT: ::aws_smithy_schema::Schema =
+        analyzer_summary_member!("lastResourceAnalyzedAt", Timestamp, 5)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    pub const M_TAGS: ::aws_smithy_schema::Schema = analyzer_summary_member!("tags", Map, 6);
+    pub const M_STATUS: ::aws_smithy_schema::Schema = analyzer_summary_member!("status", String, 7);
+    pub const M_STATUS_REASON: ::aws_smithy_schema::Schema =
+        analyzer_summary_member!("statusReason", Structure, 8);
+    pub const M_CONFIGURATION: ::aws_smithy_schema::Schema =
+        analyzer_summary_member!("configuration", Union, 9);
+    pub const M_MANAGED_BY: ::aws_smithy_schema::Schema =
+        analyzer_summary_member!("managedBy", String, 10);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "AnalyzerSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ARN,
+            &Self::M_NAME,
+            &Self::M_TYPE,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_RESOURCE_ANALYZED,
+            &Self::M_LAST_RESOURCE_ANALYZED_AT,
+            &Self::M_TAGS,
+            &Self::M_STATUS,
+            &Self::M_STATUS_REASON,
+            &Self::M_CONFIGURATION,
+            &Self::M_MANAGED_BY,
+        ],
+    );
+}
+
+pub static ANALYZER_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &AnalyzerSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for AnalyzerSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_string(&Self::M_ARN, self.arn.as_str())?;
+        s.write_string(&Self::M_NAME, self.name.as_str())?;
+        s.write_string(&Self::M_TYPE, self.r#type.as_str())?;
+        s.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        if let Some(v) = self.last_resource_analyzed.as_ref() {
+            s.write_string(&Self::M_LAST_RESOURCE_ANALYZED, v.as_str())?;
+        }
+        if let Some(v) = self.last_resource_analyzed_at.as_ref() {
+            s.write_timestamp(&Self::M_LAST_RESOURCE_ANALYZED_AT, v)?;
+        }
+        if let Some(v) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|sm| {
+                for (k, entry) in v.iter() {
+                    sm.write_string(&Self::M_TAGS, k.as_str())?;
+                    sm.write_string(&Self::M_TAGS, entry.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        s.write_string(&Self::M_STATUS, self.status.as_str())?;
+        if let Some(v) = self.status_reason.as_ref() {
+            s.write_struct(&Self::M_STATUS_REASON, v)?;
+        }
+        if let Some(v) = self.configuration.as_ref() {
+            s.write_struct(&Self::M_CONFIGURATION, v)?;
+        }
+        if let Some(v) = self.managed_by.as_ref() {
+            s.write_string(&Self::M_MANAGED_BY, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for AnalyzerSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut arn: Option<String> = None;
+        let mut name: Option<String> = None;
+        let mut r#type: Option<String> = None;
+        let mut created_at: Option<::aws_smithy_types::DateTime> = None;
+        let mut last_resource_analyzed: Option<String> = None;
+        let mut last_resource_analyzed_at: Option<::aws_smithy_types::DateTime> = None;
+        let mut tags: Option<std::collections::HashMap<String, String>> = None;
+        let mut status: Option<String> = None;
+        let mut status_reason: Option<StatusReason> = None;
+        let mut configuration: Option<AnalyzerConfiguration> = None;
+        let mut managed_by: Option<String> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => arn = Some(d.read_string(&Self::M_ARN)?),
+                Some(1) => name = Some(d.read_string(&Self::M_NAME)?),
+                Some(2) => r#type = Some(d.read_string(&Self::M_TYPE)?),
+                Some(3) => created_at = Some(d.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(4) => {
+                    last_resource_analyzed = Some(d.read_string(&Self::M_LAST_RESOURCE_ANALYZED)?)
+                }
+                Some(5) => {
+                    last_resource_analyzed_at =
+                        Some(d.read_timestamp(&Self::M_LAST_RESOURCE_ANALYZED_AT)?)
+                }
+                Some(6) => {
+                    let mut entries: std::collections::HashMap<String, String> =
+                        ::std::default::Default::default();
+                    d.read_map(&Self::M_TAGS, &mut |key, dm| {
+                        let value = dm.read_string(&Self::M_TAGS)?;
+                        entries.insert(key, value);
+                        Ok(())
+                    })?;
+                    tags = Some(entries);
+                }
+                Some(7) => status = Some(d.read_string(&Self::M_STATUS)?),
+                Some(8) => {
+                    status_reason = Some(
+                        <StatusReason as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    )
+                }
+                Some(9) => {
+                    configuration = Some(
+                        <AnalyzerConfiguration as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    )
+                }
+                Some(10) => managed_by = Some(d.read_string(&Self::M_MANAGED_BY)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            arn: arn.ok_or_else(|| ::aws_smithy_schema_server::missing_member("arn"))?,
+            name: name.ok_or_else(|| ::aws_smithy_schema_server::missing_member("name"))?,
+            r#type: r#type.ok_or_else(|| ::aws_smithy_schema_server::missing_member("type"))?,
+            created_at: created_at
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("createdAt"))?,
+            last_resource_analyzed,
+            last_resource_analyzed_at,
+            tags,
+            status: status.ok_or_else(|| ::aws_smithy_schema_server::missing_member("status"))?,
+            status_reason,
+            configuration,
+            managed_by,
+        })
+    }
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.accessanalyzer#StatusReason")]
 #[derive(Debug, Clone, Default)]
 pub struct StatusReason {
     pub code: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.accessanalyzer#ArchiveRuleSummary")]
+/// Hand-written for the same reason as [`AnalyzerSummary`]: `createdAt` and `updatedAt`
+/// are both `@timestampFormat("date-time")`.
 #[derive(Debug, Clone)]
 pub struct ArchiveRuleSummary {
     pub rule_name: String,
     pub filter: std::collections::HashMap<String, Criterion>,
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
+}
+
+/// One member schema of [`ArchiveRuleSummary`], named and indexed as the model orders it.
+macro_rules! archive_rule_summary_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.accessanalyzer#ArchiveRuleSummary$", $name),
+                ArchiveRuleSummary::NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+impl ArchiveRuleSummary {
+    const SHAPE_ID: &'static str = "com.amazonaws.accessanalyzer#ArchiveRuleSummary";
+    const NAMESPACE: &'static str = "com.amazonaws.accessanalyzer";
+
+    pub const M_RULE_NAME: ::aws_smithy_schema::Schema =
+        archive_rule_summary_member!("ruleName", String, 0);
+    pub const M_FILTER: ::aws_smithy_schema::Schema =
+        archive_rule_summary_member!("filter", Map, 1);
+    /// `@timestampFormat("date-time")` — the chain the macro cannot emit.
+    pub const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        archive_rule_summary_member!("createdAt", Timestamp, 2)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+    /// `@timestampFormat("date-time")`, as for `createdAt`.
+    pub const M_UPDATED_AT: ::aws_smithy_schema::Schema =
+        archive_rule_summary_member!("updatedAt", Timestamp, 3)
+            .with_timestamp_format(::aws_smithy_schema::traits::TimestampFormat::DateTime);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            Self::SHAPE_ID,
+            Self::NAMESPACE,
+            "ArchiveRuleSummary",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_RULE_NAME,
+            &Self::M_FILTER,
+            &Self::M_CREATED_AT,
+            &Self::M_UPDATED_AT,
+        ],
+    );
+}
+
+pub static ARCHIVE_RULE_SUMMARY_SCHEMA: &::aws_smithy_schema::Schema = &ArchiveRuleSummary::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ArchiveRuleSummary {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_string(&Self::M_RULE_NAME, self.rule_name.as_str())?;
+        s.write_map(&Self::M_FILTER, &|sm| {
+            for (k, entry) in self.filter.iter() {
+                sm.write_string(&Self::M_FILTER, k.as_str())?;
+                sm.write_struct(&Self::M_FILTER, entry)?;
+            }
+            Ok(())
+        })?;
+        s.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        s.write_timestamp(&Self::M_UPDATED_AT, &self.updated_at)?;
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ArchiveRuleSummary {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut rule_name: Option<String> = None;
+        let mut filter: Option<std::collections::HashMap<String, Criterion>> = None;
+        let mut created_at: Option<::aws_smithy_types::DateTime> = None;
+        let mut updated_at: Option<::aws_smithy_types::DateTime> = None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => rule_name = Some(d.read_string(&Self::M_RULE_NAME)?),
+                Some(1) => {
+                    let mut entries: std::collections::HashMap<String, Criterion> =
+                        ::std::default::Default::default();
+                    d.read_map(&Self::M_FILTER, &mut |key, dm| {
+                        let value =
+                            <Criterion as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(dm)
+                                .map_err(|e| ::aws_smithy_schema_server::within_map_entry(e, &key))?;
+                        entries.insert(key, value);
+                        Ok(())
+                    })?;
+                    filter = Some(entries);
+                }
+                Some(2) => created_at = Some(d.read_timestamp(&Self::M_CREATED_AT)?),
+                Some(3) => updated_at = Some(d.read_timestamp(&Self::M_UPDATED_AT)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            rule_name: rule_name
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("ruleName"))?,
+            filter: filter.ok_or_else(|| ::aws_smithy_schema_server::missing_member("filter"))?,
+            created_at: created_at
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("createdAt"))?,
+            updated_at: updated_at
+                .ok_or_else(|| ::aws_smithy_schema_server::missing_member("updatedAt"))?,
+        })
+    }
 }
 
 /// The values `AccessCheckPolicyType` accepts on the wire.
