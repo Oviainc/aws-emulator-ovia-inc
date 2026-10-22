@@ -31,3 +31,17 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the ivs emulator
 Call ImportPlaybackKeyPair and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+`ImportPlaybackKeyPair` is implemented: it decodes the PEM `publicKeyMaterial`,
+refuses anything that is not a DER `SubjectPublicKeyInfo` with the modelled
+`ValidationException` (400), fingerprints the key as the MD5 of its DER in
+colon-separated hex, refuses an already-imported key with the modelled
+`ConflictException` (409), and persists the pair under a minted
+`arn:aws:ivs:<region>:<account>:playback-key/<id>`. `GetPlaybackKeyPair` was
+implemented in the same change so the import reads back.
+
+Still blocked elsewhere: the unit `ivs.list-playback-key-pairs-reflects-imported`
+now gets past the import and fails on `ListPlaybackKeyPairs`, which is still a
+scaffold 501 and is owned by
+`issues/things-that-do-not-work/20261022T071923Z-ivs-listplaybackkeypairs-stub.md`.

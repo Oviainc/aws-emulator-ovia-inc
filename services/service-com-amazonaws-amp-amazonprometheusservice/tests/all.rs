@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/logging_configuration.rs"]
 mod logging_configuration;
+#[path = "all/query_logging_configuration.rs"]
+mod query_logging_configuration;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/workspace_lifecycle.rs"]

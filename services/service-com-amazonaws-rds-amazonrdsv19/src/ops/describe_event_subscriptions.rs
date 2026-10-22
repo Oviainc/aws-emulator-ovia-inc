@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEventSubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEventSubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the event notification subscriptions out of this
+//! service's store, narrowed by `SubscriptionName` and paged by `MaxRecords` / `Marker`.
+//! It is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEventSubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +147,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEventSubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEventSubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEventSubscriptions"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeEventSubscriptionsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeEventSubscriptionsError::validation)?;
+        // `Filters`: "This parameter isn't currently supported." A filter is refused
+        // rather than ignored — ignoring one would report subscriptions the caller meant
+        // to exclude.
+        if input.filters.is_some_and(|filters| !filters.is_empty()) {
+            return Err(DescribeEventSubscriptionsError::validation(
+                "Filters isn't currently supported by DescribeEventSubscriptions",
+            ));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. 501 is the honest answer, never a fabricated
+        // empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let store = state.lock();
+
+        // A subscription belongs to the region it was created in, so a request sees only
+        // that region's subscriptions. A `SubscriptionName` that names none of them is the
+        // modelled 404 rather than an empty page.
+        let candidates: Vec<&crate::state::EventSubscriptionRecord> =
+            match &input.subscription_name {
+                Some(requested) => {
+                    let found = store
+                        .event_subscriptions
+                        .get(&(region.clone(), requested.clone()));
+                    let Some(record) = found else {
+                        return Err(
+                            DescribeEventSubscriptionsErrorModeled::SubscriptionNotFoundFault(
+                                SubscriptionNotFoundFault {
+                                    message: Some(format!(
+                                        "Event Subscription {requested} not found."
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    };
+                    vec![record]
+                }
+                None => store.event_subscriptions_in(&region),
+            };
+
+        let listed: Vec<(String, EventSubscription)> = candidates
+            .into_iter()
+            .map(|record| (record.subscription_name.clone(), record.to_wire()))
+            .collect();
+
+        let page = crate::state::paginate(listed, input.marker.as_deref(), page_size);
+        Ok(DescribeEventSubscriptionsOutput {
+            marker: page.next_marker,
+            event_subscriptions_list: Some(page.items),
+        })
     }
 }

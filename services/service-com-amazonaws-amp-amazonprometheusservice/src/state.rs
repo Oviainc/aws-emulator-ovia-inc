@@ -59,6 +59,37 @@ pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
 /// the resource affected", so the emulator reports the resource's AWS type name.
 pub const WORKSPACE_RESOURCE_TYPE: &str = "AWS::APS::Workspace";
 
+/// `QueryLoggingConfigurationStatusCode` values a query logging configuration moves
+/// through here. Each is an entry of the modelled
+/// `com.amazonaws.amp#QueryLoggingConfigurationStatusCode` enum, whose own
+/// documentation names them: `CREATING` — "Query logging configuration is being
+/// created."; `ACTIVE` — "Query logging configuration is active."; `UPDATING` — "Query
+/// logging configuration is being updated."; `DELETING` — "Query logging configuration
+/// is being deleted." (`crate::ops::types::QUERY_LOGGING_CONFIGURATION_STATUS_CODE_VALUES`
+/// carries the full list, including the two failure codes nothing here reaches: this
+/// emulator runs no vended-log delivery that could fail.)
+pub const QUERY_LOGGING_STATUS_CREATING: &str = "CREATING";
+/// See [`QUERY_LOGGING_STATUS_CREATING`].
+pub const QUERY_LOGGING_STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`QUERY_LOGGING_STATUS_CREATING`].
+pub const QUERY_LOGGING_STATUS_UPDATING: &str = "UPDATING";
+/// See [`QUERY_LOGGING_STATUS_CREATING`].
+pub const QUERY_LOGGING_STATUS_DELETING: &str = "DELETING";
+
+/// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException`
+/// report for a query logging configuration — the resource's AWS type name, as
+/// [`WORKSPACE_RESOURCE_TYPE`] is for a workspace.
+pub const QUERY_LOGGING_RESOURCE_TYPE: &str = "AWS::APS::QueryLoggingConfiguration";
+
+/// The `message` the modelled `ResourceNotFoundException` reports for a workspace that
+/// holds no query logging configuration.
+///
+/// One CONSTANT sentence, as Amazon Managed Service for Prometheus answers it: it names
+/// the kind of resource that is missing and carries nothing from the request, which
+/// `resourceId` reports instead. The three operations that look a configuration up share
+/// it, so they cannot drift apart.
+pub const QUERY_LOGGING_NOT_FOUND_MESSAGE: &str = "Workspace logging configuration not found.";
+
 /// How many workspaces the store holds before `CreateWorkspace` refuses with the
 /// modelled `ServiceQuotaExceededException`.
 ///
@@ -157,11 +188,59 @@ impl LoggingConfiguration {
     }
 }
 
+/// One destination of a query logging configuration: the `LoggingDestination` members
+/// the service persists (`cloudWatchLogs.logGroupArn` and `filters.qspThreshold`), held
+/// as plain data so the wire shapes are built from the STORED record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryLoggingDestination {
+    /// `CloudWatchLogDestination$logGroupArn` — the log group the vended log data is
+    /// published to.
+    pub log_group_arn: String,
+    /// `LoggingFilter$qspThreshold` — the Query Samples Processed threshold above which
+    /// a query is logged (`@range(min: 0)`).
+    pub qsp_threshold: i64,
+}
+
+/// One workspace's query logging configuration: every member
+/// `QueryLoggingConfigurationMetadata` reports, plus the lifecycle bookkeeping.
+///
+/// A workspace holds at most one, which is why the store keys them by `workspaceId`
+/// (`DescribeQueryLoggingConfiguration` takes nothing else to find one by).
+#[derive(Debug, Clone)]
+pub struct QueryLoggingConfiguration {
+    pub workspace_id: String,
+    /// One of [`QUERY_LOGGING_STATUS_CREATING`], [`QUERY_LOGGING_STATUS_ACTIVE`],
+    /// [`QUERY_LOGGING_STATUS_UPDATING`], [`QUERY_LOGGING_STATUS_DELETING`].
+    pub status_code: String,
+    /// `QueryLoggingConfigurationStatus$statusReason` — "If there is a failure, the
+    /// reason for the failure", so it stays `None` while nothing failed.
+    pub status_reason: Option<String>,
+    /// `LoggingDestinations` is modelled `len 1..1`, so this holds exactly one entry.
+    pub destinations: Vec<QueryLoggingDestination>,
+    pub created_at: SystemTime,
+    pub modified_at: SystemTime,
+    /// When the clock owes this configuration's next transition, if one is pending:
+    /// `CREATING`/`UPDATING` become `ACTIVE`, `DELETING` is removed.
+    pub transition_due: Option<SystemTime>,
+    /// The `clientToken` of the `CreateQueryLoggingConfiguration` call that created
+    /// this configuration, never overwritten — so replaying that exact create still
+    /// answers from the stored record after later updates, which is what
+    /// `@idempotencyToken` asks for.
+    pub create_token: Option<String>,
+    /// The `clientToken` of the call that last CHANGED this configuration (an update or
+    /// the start of a deletion). Replaying that exact token is the SAME request, so a
+    /// handler answers from the stored record instead of applying the change twice.
+    pub client_token: Option<String>,
+}
+
 /// Per-service state for com-amazonaws-amp-amazonprometheusservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAmpAmazonprometheusserviceState {
     /// Every workspace this emulator holds, keyed by `workspaceId`.
     pub workspaces: HashMap<String, Workspace>,
+    /// Each workspace's query logging configuration, keyed by `workspaceId`. A
+    /// workspace holds at most one, and it is dropped with the workspace.
+    pub query_logging: HashMap<String, QueryLoggingConfiguration>,
     /// `workspaceArn -> workspaceId`, so the `/tags/{resourceArn}` operations
     /// resolve an ARN without scanning every workspace.
     pub arn_index: HashMap<String, String>,
@@ -205,6 +284,28 @@ impl ComAmazonawsAmpAmazonprometheusserviceState {
                 self.arn_index.remove(&workspace.arn);
             }
             self.client_tokens.retain(|_, id| id != &workspace_id);
+            // A query logging configuration belongs to its workspace, so it goes when
+            // the workspace does.
+            self.query_logging.remove(&workspace_id);
+        }
+
+        let mut dropped: Vec<String> = Vec::new();
+        for configuration in self.query_logging.values_mut() {
+            let Some(due) = configuration.transition_due else {
+                continue;
+            };
+            if now < due {
+                continue;
+            }
+            configuration.transition_due = None;
+            if configuration.status_code == QUERY_LOGGING_STATUS_DELETING {
+                dropped.push(configuration.workspace_id.clone());
+            } else {
+                configuration.status_code = QUERY_LOGGING_STATUS_ACTIVE.to_string();
+            }
+        }
+        for workspace_id in dropped {
+            self.query_logging.remove(&workspace_id);
         }
     }
 
@@ -339,4 +440,61 @@ pub fn tag_map(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect(),
     )
+}
+
+/// The query logging destinations to STORE for a request's `destinations` member: the
+/// two members `LoggingDestination` carries, kept as plain data.
+pub fn stored_query_logging_destinations(
+    destinations: &[crate::ops::types::LoggingDestination],
+) -> Vec<QueryLoggingDestination> {
+    destinations
+        .iter()
+        .map(|destination| QueryLoggingDestination {
+            log_group_arn: destination.cloud_watch_logs.log_group_arn.clone(),
+            qsp_threshold: destination.filters.qsp_threshold,
+        })
+        .collect()
+}
+
+/// The `LoggingDestinations` a query logging reader reports, rebuilt from the STORED
+/// record rather than from whatever the request carried.
+pub fn wire_query_logging_destinations(
+    destinations: &[QueryLoggingDestination],
+) -> Vec<crate::ops::types::LoggingDestination> {
+    destinations
+        .iter()
+        .map(|destination| crate::ops::types::LoggingDestination {
+            cloud_watch_logs: crate::ops::types::CloudWatchLogDestination {
+                log_group_arn: destination.log_group_arn.clone(),
+            },
+            filters: crate::ops::types::LoggingFilter {
+                qsp_threshold: destination.qsp_threshold,
+            },
+        })
+        .collect()
+}
+
+/// The `QueryLoggingConfigurationStatus` a stored configuration reports — the one
+/// derivation `CreateQueryLoggingConfiguration`, `UpdateQueryLoggingConfiguration` and
+/// `DescribeQueryLoggingConfiguration` all answer with.
+pub fn query_logging_status(
+    configuration: &QueryLoggingConfiguration,
+) -> crate::ops::types::QueryLoggingConfigurationStatus {
+    crate::ops::types::QueryLoggingConfigurationStatus {
+        status_code: configuration.status_code.clone(),
+        status_reason: configuration.status_reason.clone(),
+    }
+}
+
+/// The `QueryLoggingConfigurationMetadata` a stored configuration reports.
+pub fn query_logging_metadata(
+    configuration: &QueryLoggingConfiguration,
+) -> crate::ops::types::QueryLoggingConfigurationMetadata {
+    crate::ops::types::QueryLoggingConfigurationMetadata {
+        status: query_logging_status(configuration),
+        workspace: configuration.workspace_id.clone(),
+        destinations: wire_query_logging_destinations(&configuration.destinations),
+        created_at: ::aws_smithy_types::DateTime::from(configuration.created_at),
+        modified_at: ::aws_smithy_types::DateTime::from(configuration.modified_at),
+    }
 }
