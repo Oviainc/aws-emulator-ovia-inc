@@ -45,6 +45,16 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The error code this service answers an input-constraint refusal with.
+///
+/// Global Accelerator models exactly one client-input error — `InvalidArgumentException`
+/// (HTTP 400, "An argument that you specified is invalid.") — and declares it on every
+/// operation that takes a constrained member. The framework's own synthetic
+/// `ValidationException` is in NO Global Accelerator operation's error union, so a
+/// generated SDK dispatching on the modeled error union cannot match it. Restated here
+/// because [`Service::override_refusal`] replaces the code and the message together.
+const INVALID_ARGUMENT_EXCEPTION: &str = "InvalidArgumentException";
+
 /// The `com-amazonaws-globalaccelerator-globalaccelerator-v20180706` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -96,17 +106,30 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // The centralized walk calls this on a framework-level refusal — a member
+        // the model requires that the request omitted, or a value outside a
+        // declared `@range`/`@length`/`@pattern`/enum bound — before any handler
+        // runs.
+        //
+        // Global Accelerator states EVERY such refusal as its own modeled
+        // `InvalidArgumentException` (HTTP 400 — the status the framework answers
+        // too, so only the code and the wording change), carrying the
+        // `<N> validation error(s) detected: ` envelope over one clause per
+        // violated member: the rejected value, the member's path and the bound it
+        // failed, all taken from the request. That envelope is exactly what the
+        // framework renders, so the message is borrowed rather than restated —
+        // only the code, which a client branches on, is this service's own.
+        //
+        // An authentication refusal keeps the framework's wording: it is not an
+        // input-constraint failure, and the service models `AccessDeniedException`
+        // for it on the operations that can answer it.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: INVALID_ARGUMENT_EXCEPTION.to_string(),
+                message: ::aws_smithy_schema_server::envelope(violations)?,
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
