@@ -4,10 +4,14 @@
 //! Deletes a stored fleet, and with it the game sessions placed on it and the player
 //! slots reserved in those sessions.
 //!
-//! "During the deletion process, the fleet status is changed to DELETING": the call
-//! moves the fleet there and stamps its termination time, and the fleet leaves state
-//! when the deletion comes due (see `crate::state::WORKFLOW_DELAY`), after which a
-//! describe of it raises `NotFoundException`.
+//! "During the deletion process, the fleet status is changed to DELETING": a fleet whose
+//! instances Amazon GameLift Servers manages is moved there with its termination time
+//! stamped, and leaves state when the deletion comes due (see
+//! `crate::state::WORKFLOW_DELAY`). A fleet with no managed instances (an Anywhere fleet)
+//! has nothing to shut down, so its deletion is already complete when the call returns
+//! and it leaves state at once; either way a fleet that has left state is reported by no
+//! describe — `DescribeFleetAttributes` returns an empty page for it, since "attribute
+//! objects are returned only for fleets that currently exist".
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -206,13 +210,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(fleet_id) = state.resolve_fleet_id(&input.fleet_id) else {
             return Err(not_found());
         };
+        // "Deletes all resources and information related to a fleet and shuts down any
+        // currently running fleet instances": only a fleet whose compute the service
+        // owns has instances to shut down, so only that deletion takes time. "During the
+        // deletion process, the fleet status is changed to DELETING. When completed, the
+        // status switches to TERMINATED" — a fleet with no managed instances has nothing
+        // left to tear down when the call arrives, so its deletion is complete, and it
+        // and everything placed on it leave state before this call returns, which is why
+        // a describe that follows no longer reports it.
+        //
+        // A fleet already being deleted keeps the deletion it is in the middle of: the
+        // call neither fails nor restarts the clock.
         let Some(fleet) = state.fleets.get_mut(&fleet_id) else {
             return Err(not_found());
         };
-
-        // A fleet already being deleted keeps the deletion it is in the middle of: the
-        // call neither fails nor restarts the clock.
-        if fleet.status != FLEET_STATUS_DELETING {
+        if !fleet.hosts_managed_instances() {
+            state.remove_fleet(&fleet_id);
+        } else if fleet.status != FLEET_STATUS_DELETING {
             fleet.status = FLEET_STATUS_DELETING.to_string();
             fleet.active_at = None;
             fleet.termination_time = Some(now);

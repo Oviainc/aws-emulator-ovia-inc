@@ -337,8 +337,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            COMPUTE_TYPE_ANYWHERE, COMPUTE_TYPE_EC2, FLEET_STATUS_ACTIVE, FLEET_STATUS_NEW,
-            FLEET_TYPE_ON_DEMAND, PROTECTION_POLICY_NO_PROTECTION, WORKFLOW_DELAY,
+            CERTIFICATE_TYPE_DISABLED, COMPUTE_TYPE_ANYWHERE, COMPUTE_TYPE_EC2,
+            FLEET_STATUS_ACTIVE, FLEET_STATUS_NEW, FLEET_TYPE_ON_DEMAND,
+            PLAYER_GATEWAY_MODE_DISABLED, PROTECTION_POLICY_NO_PROTECTION, WORKFLOW_DELAY,
         };
 
         let invalid = |message: &str| -> Self::Error {
@@ -538,9 +539,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             log_paths: input.log_paths.clone(),
             runtime_configuration: input.runtime_configuration.clone(),
             resource_creation_limit_policy: input.resource_creation_limit_policy.clone(),
-            certificate_configuration: input.certificate_configuration.clone(),
+            // `CertificateType` doc: "DISABLED - (default) Do not generate a TLS/SSL
+            // certificate for this fleet." A fleet the request left without a
+            // certificate configuration still HAS one, so a client that reads
+            // `CertificateConfiguration.CertificateType` to decide whether to use TLS
+            // reads the decision the service made for it.
+            certificate_configuration: Some(input.certificate_configuration.clone().unwrap_or_else(
+                || CertificateConfiguration {
+                    certificate_type: CERTIFICATE_TYPE_DISABLED.to_string(),
+                },
+            )),
             anywhere_configuration: input.anywhere_configuration.clone(),
-            player_gateway_mode: input.player_gateway_mode.clone(),
+            // `PlayerGatewayMode` doc: "DISABLED (default) -- Game clients connect to
+            // the game server endpoint."
+            player_gateway_mode: Some(
+                input
+                    .player_gateway_mode
+                    .clone()
+                    .unwrap_or_else(|| PLAYER_GATEWAY_MODE_DISABLED.to_string()),
+            ),
             player_gateway_configuration: input.player_gateway_configuration.clone(),
             instance_role_arn: input.instance_role_arn.clone(),
             instance_role_credentials_provider: input.instance_role_credentials_provider.clone(),
@@ -551,7 +568,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .new_game_session_protection_policy
                 .clone()
                 .unwrap_or_else(|| PROTECTION_POLICY_NO_PROTECTION.to_string()),
-            metric_groups: input.metric_groups.clone().unwrap_or_default(),
+            // "A fleet can be included in only one metric group at a time": a fleet
+            // that named none is in the service's own group, not in no group at all, so
+            // the CloudWatch group a client reads off the fleet always resolves. A
+            // request that DOES name a group is honoured as it stands.
+            metric_groups: input
+                .metric_groups
+                .clone()
+                .unwrap_or_else(|| vec![crate::state::DEFAULT_METRIC_GROUP.to_string()]),
             locations,
             home_location: region.clone(),
             region,

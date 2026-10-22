@@ -18,7 +18,9 @@
 
 use serde_json::{json, Value};
 
-use crate::hosting_loop::{create_fleet, ec2_fleet, wait_for_due_transitions, GameLift, REGION};
+use crate::hosting_loop::{
+    create_fleet, ec2_fleet, gamelift_arn, wait_for_due_transitions, GameLift, REGION,
+};
 
 /// The `Message` member of a modelled error body. awsJson renders the member under its
 /// modelled name (`NotFoundException$Message`); the lower-case spelling is accepted too
@@ -55,13 +57,13 @@ async fn describing_unknown_fleets_reports_an_empty_page() {
     let second = create_fleet(&gamelift, ec2_fleet("lookup-two")).await;
     wait_for_due_transitions();
 
-    let first_arn = format!("arn:aws:gamelift:{REGION}::fleet/{first}");
+    let first_arn = gamelift_arn(&format!("fleet/{first}"));
     // Well-formed against the modelled `FleetIdOrArn` pattern
     // (`^[a-z]*fleet-[a-zA-Z0-9\-]+$|^arn:.*:[a-z]*fleet\/[a-z]*fleet-[a-zA-Z0-9\-]+$`),
     // and matching no stored fleet.
     let absent = "fleet-does-not-exist".to_string();
     let absent_uuid = "fleet-00000000-0000-0000-0000-000000000000".to_string();
-    let absent_arn = format!("arn:aws:gamelift:{REGION}::fleet/fleet-nope");
+    let absent_arn = gamelift_arn("fleet/fleet-nope");
 
     // Rows differ along the count of identifiers, their form (id or ARN), and how many
     // of them are stored; the expectation is always "the stored ones, once each".
@@ -192,7 +194,7 @@ async fn describing_sessions_of_an_unknown_selector_reports_an_empty_page() {
         .to_string();
     wait_for_due_transitions();
 
-    let fleet_arn = format!("arn:aws:gamelift:{REGION}::fleet/{fleet_id}");
+    let fleet_arn = gamelift_arn(&format!("fleet/{fleet_id}"));
     // Each row is a selector, and how many of the one stored session it picks out. The
     // identifiers are well formed against the modelled patterns (`FleetIdOrArn`,
     // `ArnStringModel` `^[a-zA-Z0-9:/-]+$`) and name nothing stored.
@@ -205,14 +207,14 @@ async fn describing_sessions_of_an_unknown_selector_reports_an_empty_page() {
         ),
         (
             "an unknown fleet ARN",
-            json!({"FleetId": format!("arn:aws:gamelift:{REGION}::fleet/fleet-absent")}),
+            json!({"FleetId": gamelift_arn("fleet/fleet-absent")}),
             0,
         ),
         (
             "an unknown game session on an unknown fleet",
             json!({
                 "GameSessionId":
-                    format!("arn:aws:gamelift:{REGION}::gamesession/fleet-absent/absent-session"),
+                    gamelift_arn("gamesession/fleet-absent/absent-session"),
             }),
             0,
         ),
@@ -220,7 +222,7 @@ async fn describing_sessions_of_an_unknown_selector_reports_an_empty_page() {
             "an unknown game session on the stored fleet",
             json!({
                 "GameSessionId":
-                    format!("arn:aws:gamelift:{REGION}::gamesession/{fleet_id}/absent-session"),
+                    gamelift_arn(&format!("gamesession/{fleet_id}/absent-session")),
             }),
             0,
         ),
@@ -228,7 +230,7 @@ async fn describing_sessions_of_an_unknown_selector_reports_an_empty_page() {
             "an unknown game session in the remote-location ARN form",
             json!({
                 "GameSessionId":
-                    format!("arn:aws:gamelift:{REGION}::gamesession/{fleet_id}/eu-west-1/absent"),
+                    gamelift_arn(&format!("gamesession/{fleet_id}/eu-west-1/absent")),
             }),
             0,
         ),
@@ -302,7 +304,7 @@ async fn not_found_messages_are_built_from_the_request() {
     for fleet in [
         "fleet-absent".to_string(),
         "fleet-00000000-0000-0000-0000-000000000000".to_string(),
-        format!("arn:aws:gamelift:{REGION}::fleet/fleet-absent-by-arn"),
+        gamelift_arn("fleet/fleet-absent-by-arn"),
     ] {
         cases.push(Case {
             label: format!("DeleteFleet on {fleet}"),
@@ -320,9 +322,9 @@ async fn not_found_messages_are_built_from_the_request() {
     // Game session identifiers in both documented ARN forms (home Region and remote
     // location), on a stored fleet and on an absent one.
     for session in [
-        format!("arn:aws:gamelift:{REGION}::gamesession/{fleet_id}/absent-session"),
-        format!("arn:aws:gamelift:{REGION}::gamesession/{fleet_id}/eu-west-1/absent-session"),
-        format!("arn:aws:gamelift:{REGION}::gamesession/fleet-absent/absent-session"),
+        gamelift_arn(&format!("gamesession/{fleet_id}/absent-session")),
+        gamelift_arn(&format!("gamesession/{fleet_id}/eu-west-1/absent-session")),
+        gamelift_arn("gamesession/fleet-absent/absent-session"),
     ] {
         cases.push(Case {
             label: format!("CreatePlayerSession in {session}"),
