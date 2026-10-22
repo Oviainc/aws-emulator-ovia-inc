@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEvent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEvent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEvent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Appends an event to a session of an actor in an AgentCore Memory container, in
+//! [`crate::state`]. The `eventId` is minted here (never taken from the request), and a
+//! replayed `clientToken` returns the event that token already created.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +186,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEvent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEvent"))
+        // Request metadata is not read by this operation: every member it needs is
+        // bound into `input` by the centralized request walk.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEventErrorModeled::ServiceException(ServiceException {
+                message: "the shared engine does not carry this service's state".to_string(),
+            })
+        })?;
+
+        let memory_id = crate::state::normalize_memory_id(&input.memory_id);
+        let mut store = state.lock();
+
+        // `CreateEvent` is `@idempotent`, and the model documents that a `clientToken`
+        // matching an earlier request is ignored rather than refused: return the event
+        // that token already created, so no second event is stored.
+        if let Some(token) = input.client_token.as_deref() {
+            let located = store
+                .memories
+                .get(&memory_id)
+                .and_then(|memory| memory.idempotency.get(token))
+                .cloned();
+            if let Some(at) = located {
+                if let Some(event) =
+                    store.find_event(&memory_id, &at.actor_id, &at.session_id, &at.event_id)
+                {
+                    return Ok(CreateEventOutput {
+                        event: event.to_event(true),
+                    });
+                }
+            }
+        }
+
+        // `extractionMode` / `extractionConfig` steer LONG-TERM memory extraction, whose
+        // records are reached through the `*MemoryRecord*` operations — every one of them
+        // still a 501 in this crate. They change nothing an implemented operation can
+        // report (`Event` models neither member), so this slice stores the event and
+        // leaves them to the issue that implements memory records: synthesising an
+        // extraction nothing performed would be worse than not performing it.
+        let seq = store.next_seq();
+        // A session the caller did not name is created for it, and reported back on the
+        // event so the caller can address that session afterwards.
+        let session_id = input
+            .session_id
+            .clone()
+            .unwrap_or_else(|| crate::state::mint_session_id(seq));
+        let stored = crate::state::StoredEvent {
+            event_id: crate::state::mint_event_id(seq),
+            memory_id: memory_id.clone(),
+            actor_id: input.actor_id.clone(),
+            session_id,
+            event_timestamp: input.event_timestamp,
+            payload: input.payload,
+            branch: input.branch,
+            metadata: input.metadata,
+            seq,
+        };
+        // Built from what is about to be stored, so the response and the store cannot
+        // disagree.
+        let event = stored.to_event(true);
+        // `insert_event` registers the memory container, the actor and the session, and
+        // holds every bound the store declares, so no caller can grow it without limit.
+        store.insert_event(stored, input.client_token);
+
+        Ok(CreateEventOutput { event })
     }
 }

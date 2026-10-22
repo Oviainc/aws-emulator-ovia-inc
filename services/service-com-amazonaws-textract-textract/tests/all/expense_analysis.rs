@@ -1,0 +1,712 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end coverage of `AnalyzeExpense` over the wire (`awsJson1_1`, `POST /` with
+//! `X-Amz-Target: Textract.AnalyzeExpense`).
+//!
+//! Each test asserts a RULE over a TABLE of documents rather than one recorded shape:
+//!
+//! * one `ExpenseDocument` per page of the text really read out of the document, in page
+//!   order, `ExpenseIndex` counting from 1;
+//! * every labelled line outside a table is a `SummaryField` whose `LabelDetection` and
+//!   `ValueDetection` are the two halves of that line and whose `Type` is the normalized
+//!   field the label names, or `OTHER`;
+//! * every table is a `LineItemGroup`, its rows are `LineItems` carrying the row in full
+//!   plus one field per populated cell, typed by the table's header row when it has one;
+//! * a monetary value's `Currency.Code` is the supported code it names, by code or by
+//!   symbol, and nothing when it names none;
+//! * the `Blocks` of the expense documents are exactly what `DetectDocumentText` reports
+//!   for the same document, so both read paths describe the same text;
+//! * a document whose text cannot be read is REFUSED with the modelled error for why.
+
+use serde_json::{json, Value};
+use service_com_amazonaws_textract_textract::state;
+
+use crate::document_extraction::{
+    assert_block_graph, blocks_of, call, error_code, harness, text_document,
+};
+
+fn docs_of(body: &Value) -> Vec<Value> {
+    body.get("ExpenseDocuments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn list_of(owner: &Value, member: &str) -> Vec<Value> {
+    owner
+        .get(member)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn str_at(owner: &Value, path: &[&str]) -> String {
+    let mut cursor = owner;
+    for step in path {
+        match cursor.get(step) {
+            Some(next) => cursor = next,
+            None => return String::new(),
+        }
+    }
+    cursor.as_str().unwrap_or_default().to_string()
+}
+
+/// `(Type, LabelDetection.Text, ValueDetection.Text)` as a case writes it.
+type ExpectedField = (&'static str, &'static str, &'static str);
+
+/// Per line item group, per row, the fields a case expects after the row's own field.
+type ExpectedGroups = Vec<Vec<Vec<ExpectedField>>>;
+
+/// A page-count case: name, document text, and per page the expected
+/// `(ExpenseIndex, summary field count, line item group count)`.
+type PageCase = (&'static str, &'static str, Vec<(u64, usize, usize)>);
+
+/// `(Type, LabelDetection.Text, ValueDetection.Text)` of one `ExpenseField`.
+fn triple(field: &Value) -> (String, String, String) {
+    (
+        str_at(field, &["Type", "Text"]),
+        str_at(field, &["LabelDetection", "Text"]),
+        str_at(field, &["ValueDetection", "Text"]),
+    )
+}
+
+fn triples(fields: &[Value]) -> Vec<(String, String, String)> {
+    fields.iter().map(triple).collect()
+}
+
+fn currency_code(field: &Value) -> String {
+    str_at(field, &["Currency", "Code"])
+}
+
+/// Every invariant one detected label or value holds.
+fn assert_detection(case: &str, what: &str, detection: Option<&Value>) {
+    let detection = detection
+        .unwrap_or_else(|| panic!("case {case:?}: {what} is missing from the expense field"));
+    let text = detection.get("Text").and_then(Value::as_str).unwrap_or("");
+    assert!(
+        !text.trim().is_empty(),
+        "case {case:?}: {what} must carry the text it detected, got {detection}"
+    );
+    let geometry = detection
+        .get("Geometry")
+        .unwrap_or_else(|| panic!("case {case:?}: {what} has no Geometry, got {detection}"));
+    let bbox = geometry
+        .get("BoundingBox")
+        .unwrap_or_else(|| panic!("case {case:?}: {what} has no BoundingBox, got {geometry}"));
+    for member in ["Left", "Top", "Width", "Height"] {
+        let value = bbox.get(member).and_then(Value::as_f64).unwrap_or(-1.0);
+        assert!(
+            (0.0..=1.0).contains(&value),
+            "case {case:?}: {what} BoundingBox.{member} is {value}, outside 0..=1"
+        );
+    }
+    let polygon = list_of(geometry, "Polygon");
+    assert_eq!(
+        polygon.len(),
+        4,
+        "case {case:?}: {what} Polygon must trace its bounding box, got {} points",
+        polygon.len()
+    );
+    let confidence = detection
+        .get("Confidence")
+        .and_then(Value::as_f64)
+        .unwrap_or(-1.0);
+    assert!(
+        (confidence - f64::from(state::EXTRACTED_TEXT_CONFIDENCE)).abs() < 0.001,
+        "case {case:?}: {what} must report the one documented confidence {}, got {confidence}",
+        state::EXTRACTED_TEXT_CONFIDENCE
+    );
+}
+
+/// Every invariant one `ExpenseField` holds, whatever the document.
+fn assert_field(case: &str, what: &str, field: &Value, page_number: u64) {
+    let kind = str_at(field, &["Type", "Text"]);
+    assert!(
+        !kind.is_empty()
+            && kind
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+        "case {case:?}: {what} Type must be a normalized field name, got {kind:?}"
+    );
+    assert_eq!(
+        field
+            .get("Type")
+            .and_then(|t| t.get("Confidence"))
+            .and_then(Value::as_f64),
+        Some(f64::from(state::EXTRACTED_TEXT_CONFIDENCE)),
+        "case {case:?}: {what} Type must carry the documented confidence, got {field}"
+    );
+    assert_eq!(
+        field.get("PageNumber").and_then(Value::as_u64),
+        Some(page_number),
+        "case {case:?}: {what} must report the page it was detected on ({page_number}), got {:?}",
+        field.get("PageNumber")
+    );
+    assert_detection(case, &format!("{what} ValueDetection"), field.get("ValueDetection"));
+    if field.get("LabelDetection").is_some() {
+        assert_detection(case, &format!("{what} LabelDetection"), field.get("LabelDetection"));
+    }
+    let code = currency_code(field);
+    if !code.is_empty() {
+        assert!(
+            // The codes `ExpenseCurrency$Code` documents.
+            state::EXPENSE_CURRENCY_CODES.contains(&code.as_str()),
+            "case {case:?}: {what} Currency.Code {code:?} is not a supported currency code"
+        );
+    }
+}
+
+/// Every invariant the whole answer holds, whatever the document.
+fn assert_expense_invariants(case: &str, body: &Value) {
+    let pages = body["DocumentMetadata"]["Pages"].as_u64().unwrap_or_default();
+    let documents = docs_of(body);
+    assert_eq!(
+        documents.len() as u64,
+        pages,
+        "case {case:?}: expected one expense document per page ({pages}), got {}",
+        documents.len()
+    );
+    for (index, document) in documents.iter().enumerate() {
+        let expected_index = index as u64 + 1;
+        assert_eq!(
+            document.get("ExpenseIndex").and_then(Value::as_u64),
+            Some(expected_index),
+            "case {case:?}: expense documents must be indexed from 1 in page order, got {:?} at position {index}",
+            document.get("ExpenseIndex")
+        );
+        for (position, field) in list_of(document, "SummaryFields").iter().enumerate() {
+            assert_field(
+                case,
+                &format!("summary field {position} of expense document {expected_index}"),
+                field,
+                expected_index,
+            );
+        }
+        for (group_position, group) in list_of(document, "LineItemGroups").iter().enumerate() {
+            assert_eq!(
+                group.get("LineItemGroupIndex").and_then(Value::as_u64),
+                Some(group_position as u64 + 1),
+                "case {case:?}: line item groups must be indexed from 1 in page order, got {:?}",
+                group.get("LineItemGroupIndex")
+            );
+            let items = list_of(group, "LineItems");
+            assert!(
+                !items.is_empty(),
+                "case {case:?}: a line item group must hold at least one line item, got {group}"
+            );
+            for (row, item) in items.iter().enumerate() {
+                let fields = list_of(item, "LineItemExpenseFields");
+                assert_eq!(
+                    fields.first().map(|field| str_at(field, &["Type", "Text"])),
+                    Some(state::EXPENSE_ROW_FIELD_TYPE.to_string()),
+                    "case {case:?}: row {row} must report the row in full first, got {item}"
+                );
+                for (position, field) in fields.iter().enumerate() {
+                    assert_field(
+                        case,
+                        &format!("line item field {position} of row {row}"),
+                        field,
+                        expected_index,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// One document of the summary-field table.
+struct SummaryCase {
+    name: &'static str,
+    text: &'static str,
+    /// `(Type, Label, Value)` of every summary field, in page-then-reading order.
+    expected: Vec<(&'static str, &'static str, &'static str)>,
+}
+
+#[tokio::test]
+async fn analyze_expense_reports_a_summary_field_for_every_labelled_line() {
+    let router = harness();
+
+    let cases = vec![
+        SummaryCase {
+            name: "a receipt's header fields",
+            text: "Vendor: Acme Supplies\nDate: 2026-10-21\nTotal: 42.50",
+            expected: vec![
+                ("VENDOR_NAME", "Vendor", "Acme Supplies"),
+                ("INVOICE_RECEIPT_DATE", "Date", "2026-10-21"),
+                ("TOTAL", "Total", "42.50"),
+            ],
+        },
+        SummaryCase {
+            name: "labels that normalize onto the same field",
+            text: "Invoice Number: INV-1024\nSub Total: 40.00\nSales Tax: 2.50\nBalance Due: 42.50",
+            expected: vec![
+                ("INVOICE_RECEIPT_ID", "Invoice Number", "INV-1024"),
+                ("SUBTOTAL", "Sub Total", "40.00"),
+                ("TAX", "Sales Tax", "2.50"),
+                ("AMOUNT_DUE", "Balance Due", "42.50"),
+            ],
+        },
+        SummaryCase {
+            // Catalog entries the issue never cited, including the receiver and vendor
+            // contact fields.
+            name: "the rest of the catalog",
+            text: "Ship To: 100 Main St\nBill To: Jane Roe\nPhone: 555-0100\nWebsite: acme.example\nPayment Terms: Net 30\nPurchase Order: PO-77\nTip: 5.00\nPrevious Balance: 1.00\nTax ID: 12-3456789\nShipping: 7.00",
+            expected: vec![
+                ("RECEIVER_ADDRESS", "Ship To", "100 Main St"),
+                ("RECEIVER_NAME", "Bill To", "Jane Roe"),
+                ("VENDOR_PHONE", "Phone", "555-0100"),
+                ("VENDOR_URL", "Website", "acme.example"),
+                ("PAYMENT_TERMS", "Payment Terms", "Net 30"),
+                ("PO_NUMBER", "Purchase Order", "PO-77"),
+                ("GRATUITY", "Tip", "5.00"),
+                ("PRIOR_BALANCE", "Previous Balance", "1.00"),
+                ("TAX_PAYER_ID", "Tax ID", "12-3456789"),
+                ("SHIPPING_HANDLING_CHARGE", "Shipping", "7.00"),
+            ],
+        },
+        SummaryCase {
+            name: "a label the service recognises nothing in",
+            text: "Table Number: 7\nServer: Alex",
+            expected: vec![
+                ("OTHER", "Table Number", "7"),
+                ("OTHER", "Server", "Alex"),
+            ],
+        },
+        SummaryCase {
+            name: "a value that itself holds a colon",
+            text: "Date: 2026-10-21 12:30",
+            expected: vec![("INVOICE_RECEIPT_DATE", "Date", "2026-10-21 12:30")],
+        },
+        SummaryCase {
+            name: "non-ascii label and value",
+            text: "Référence: ÀÉÎ-7",
+            expected: vec![("OTHER", "Référence", "ÀÉÎ-7")],
+        },
+        SummaryCase {
+            name: "lines that label nothing",
+            text: "Thank you for your business\nCome again",
+            expected: vec![],
+        },
+        SummaryCase {
+            name: "a colon with nothing on one side",
+            text: "Total:\n: 42.50\nVendor: Acme",
+            expected: vec![("VENDOR_NAME", "Vendor", "Acme")],
+        },
+    ];
+
+    for case in &cases {
+        let request = json!({ "Document": text_document(case.text) });
+        let (status, body) = call(&router, "AnalyzeExpense", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected HTTP 200, got {status} with {body}",
+            case.name
+        );
+        assert_expense_invariants(case.name, &body);
+
+        let documents = docs_of(&body);
+        let fields: Vec<Value> = documents
+            .iter()
+            .flat_map(|document| list_of(document, "SummaryFields"))
+            .collect();
+        let expected: Vec<(String, String, String)> = case
+            .expected
+            .iter()
+            .map(|(kind, label, value)| {
+                (kind.to_string(), label.to_string(), value.to_string())
+            })
+            .collect();
+        assert_eq!(
+            triples(&fields),
+            expected,
+            "case {:?}: summary fields must be the document's own labelled lines",
+            case.name
+        );
+
+        // The same document answers the same way: the result comes from stored text.
+        let (repeat_status, repeat) = call(&router, "AnalyzeExpense", &request).await;
+        assert_eq!(
+            repeat_status, 200,
+            "case {:?}: the repeat call must also succeed, got {repeat_status}",
+            case.name
+        );
+        assert_eq!(
+            docs_of(&repeat),
+            documents,
+            "case {:?}: the same document must answer with the same expense documents",
+            case.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn analyze_expense_reports_one_expense_document_per_page() {
+    let router = harness();
+
+    // (case, text, expected (ExpenseIndex, summary field count, line item group count))
+    let cases: Vec<PageCase> = vec![
+        ("one page", "Total: 1.00", vec![(1, 1, 0)]),
+        (
+            "two pages, a form feed apart",
+            "Vendor: Acme\n\u{c}Vendor: Globex\nTotal: 9.00",
+            vec![(1, 1, 0), (2, 2, 0)],
+        ),
+        (
+            "three pages, the middle one a table",
+            "Total: 1.00\n\u{c}Item\tQty\nWidget\t2\n\u{c}Thank you",
+            vec![(1, 1, 0), (2, 0, 1), (3, 0, 0)],
+        ),
+    ];
+
+    for (name, text, expected) in cases {
+        let (status, body) = call(
+            &router,
+            "AnalyzeExpense",
+            &json!({ "Document": text_document(text) }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected HTTP 200, got {status} with {body}"
+        );
+        assert_expense_invariants(name, &body);
+        let seen: Vec<(u64, usize, usize)> = docs_of(&body)
+            .iter()
+            .map(|document| {
+                (
+                    document
+                        .get("ExpenseIndex")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    list_of(document, "SummaryFields").len(),
+                    list_of(document, "LineItemGroups").len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "case {name:?}: expected (ExpenseIndex, summary fields, line item groups) {expected:?}, got {seen:?}"
+        );
+    }
+}
+
+/// One document of the line-item table.
+struct LineItemCase {
+    name: &'static str,
+    text: &'static str,
+    /// Per group, per row, the `(Type, Label, Value)` of every field after the row's own
+    /// `EXPENSE_ROW` field.
+    expected: ExpectedGroups,
+    /// Per group, per row, the text of the row's `EXPENSE_ROW` field.
+    expected_rows: Vec<Vec<&'static str>>,
+}
+
+#[tokio::test]
+async fn analyze_expense_reports_a_line_item_for_every_table_row() {
+    let router = harness();
+
+    let cases = vec![
+        LineItemCase {
+            name: "a table with a header row",
+            text: "Item\tQty\tUnit Price\tAmount\nWidget\t2\t5.00\t10.00\nGizmo\t1\t3.50\t3.50",
+            expected: vec![vec![
+                vec![
+                    ("ITEM", "Item", "Widget"),
+                    ("QUANTITY", "Qty", "2"),
+                    ("UNIT_PRICE", "Unit Price", "5.00"),
+                    ("PRICE", "Amount", "10.00"),
+                ],
+                vec![
+                    ("ITEM", "Item", "Gizmo"),
+                    ("QUANTITY", "Qty", "1"),
+                    ("UNIT_PRICE", "Unit Price", "3.50"),
+                    ("PRICE", "Amount", "3.50"),
+                ],
+            ]],
+            expected_rows: vec![vec!["Widget 2 5.00 10.00", "Gizmo 1 3.50 3.50"]],
+        },
+        LineItemCase {
+            name: "header aliases the issue did not cite",
+            text: "SKU\tDescription\tRate\nA-1\tBolt\t0.25",
+            expected: vec![vec![vec![
+                ("PRODUCT_CODE", "SKU", "A-1"),
+                ("ITEM", "Description", "Bolt"),
+                ("UNIT_PRICE", "Rate", "0.25"),
+            ]]],
+            expected_rows: vec![vec!["A-1 Bolt 0.25"]],
+        },
+        LineItemCase {
+            name: "a table with no header row",
+            text: "Widget\t10.00\nGizmo\t3.50",
+            expected: vec![vec![
+                vec![("OTHER", "", "Widget"), ("OTHER", "", "10.00")],
+                vec![("OTHER", "", "Gizmo"), ("OTHER", "", "3.50")],
+            ]],
+            expected_rows: vec![vec!["Widget 10.00", "Gizmo 3.50"]],
+        },
+        LineItemCase {
+            name: "two tables on one page",
+            text: "Item\tQty\nWidget\t2\nTotal: 10.00\nItem\tQty\nGizmo\t4",
+            expected: vec![
+                vec![vec![("ITEM", "Item", "Widget"), ("QUANTITY", "Qty", "2")]],
+                vec![vec![("ITEM", "Item", "Gizmo"), ("QUANTITY", "Qty", "4")]],
+            ],
+            expected_rows: vec![vec!["Widget 2"], vec!["Gizmo 4"]],
+        },
+        LineItemCase {
+            name: "a one-row table is data, not a header",
+            text: "Item\tQty",
+            expected: vec![vec![vec![("OTHER", "", "Item"), ("OTHER", "", "Qty")]]],
+            expected_rows: vec![vec!["Item Qty"]],
+        },
+        LineItemCase {
+            name: "a row with an empty cell",
+            text: "Item\tQty\nWidget\t\t3",
+            expected: vec![vec![vec![("ITEM", "Item", "Widget"), ("OTHER", "", "3")]]],
+            expected_rows: vec![vec!["Widget 3"]],
+        },
+        LineItemCase {
+            name: "no table at all",
+            text: "Total: 10.00",
+            expected: vec![],
+            expected_rows: vec![],
+        },
+    ];
+
+    for case in &cases {
+        let (status, body) = call(
+            &router,
+            "AnalyzeExpense",
+            &json!({ "Document": text_document(case.text) }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected HTTP 200, got {status} with {body}",
+            case.name
+        );
+        assert_expense_invariants(case.name, &body);
+
+        let groups: Vec<Value> = docs_of(&body)
+            .iter()
+            .flat_map(|document| list_of(document, "LineItemGroups"))
+            .collect();
+        assert_eq!(
+            groups.len(),
+            case.expected.len(),
+            "case {:?}: expected {} line item group(s), got {groups:?}",
+            case.name,
+            case.expected.len()
+        );
+        for (group_index, group) in groups.iter().enumerate() {
+            let rows = list_of(group, "LineItems");
+            assert_eq!(
+                rows.len(),
+                case.expected[group_index].len(),
+                "case {:?}: group {group_index} expected {} row(s), got {rows:?}",
+                case.name,
+                case.expected[group_index].len()
+            );
+            for (row_index, row) in rows.iter().enumerate() {
+                let fields = list_of(row, "LineItemExpenseFields");
+                assert_eq!(
+                    triple(&fields[0]).2,
+                    case.expected_rows[group_index][row_index],
+                    "case {:?}: group {group_index} row {row_index} must report the whole row",
+                    case.name
+                );
+                let expected: Vec<(String, String, String)> = case.expected[group_index]
+                    [row_index]
+                    .iter()
+                    .map(|(kind, label, value)| {
+                        (kind.to_string(), label.to_string(), value.to_string())
+                    })
+                    .collect();
+                assert_eq!(
+                    triples(&fields[1..]),
+                    expected,
+                    "case {:?}: group {group_index} row {row_index} cells must be the row's own",
+                    case.name
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn analyze_expense_reports_the_currency_a_value_names() {
+    let router = harness();
+
+    // Every code `ExpenseCurrency$Code` documents, named explicitly in the value.
+    let mut cases: Vec<(String, String, String)> = state::EXPENSE_CURRENCY_CODES
+        .iter()
+        .map(|code| {
+            (
+                format!("the explicit code {code}"),
+                format!("{code} 12.00"),
+                (*code).to_string(),
+            )
+        })
+        .collect();
+    // A symbol instead of a code; a qualified dollar sign names its own currency.
+    for (name, value, expected) in [
+        ("a bare dollar sign", "$42.50", "USD"),
+        ("a Canadian dollar sign", "CA$42.50", "CAD"),
+        ("a Canadian dollar sign, short", "C$42.50", "CAD"),
+        ("an Australian dollar sign", "A$9.99", "AUD"),
+        ("a Hong Kong dollar sign", "HK$1,000", "HKD"),
+        ("a Brazilian real sign", "R$10,00", "BZR"),
+        ("a euro sign", "12,00 €", "EUR"),
+        ("a pound sign", "£5.00", "GBP"),
+        ("a rupee sign", "₹250", "INR"),
+        ("a yen sign", "¥1200", "JPY"),
+        ("an explicit code beside a shared symbol", "¥1200 CNY", "CNY"),
+        ("a number with no currency at all", "42.50", ""),
+        ("a currency word with no number", "ten dollars", ""),
+        ("no number and no currency", "Net 30", ""),
+    ] {
+        cases.push((name.to_string(), value.to_string(), expected.to_string()));
+    }
+
+    for (name, value, expected) in &cases {
+        let text = format!("Total: {value}");
+        let (status, body) = call(
+            &router,
+            "AnalyzeExpense",
+            &json!({ "Document": text_document(&text) }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected HTTP 200, got {status} with {body}"
+        );
+        assert_expense_invariants(name, &body);
+        let fields = list_of(&docs_of(&body)[0], "SummaryFields");
+        assert_eq!(
+            fields.len(),
+            1,
+            "case {name:?}: expected one summary field, got {fields:?}"
+        );
+        assert_eq!(
+            currency_code(&fields[0]),
+            *expected,
+            "case {name:?}: value {value:?} must report Currency.Code {expected:?}, got {}",
+            fields[0]
+        );
+        if !expected.is_empty() {
+            assert_eq!(
+                fields[0]
+                    .get("Currency")
+                    .and_then(|c| c.get("Confidence"))
+                    .and_then(Value::as_f64),
+                Some(f64::from(state::EXTRACTED_TEXT_CONFIDENCE)),
+                "case {name:?}: a reported currency must carry a confidence, got {}",
+                fields[0]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn analyze_expense_blocks_are_the_same_text_detect_document_text_reports() {
+    let router = harness();
+
+    let texts = [
+        "Vendor: Acme Supplies\nTotal: $42.50",
+        "Item\tQty\tAmount\nWidget\t2\t10.00",
+        "Page one line\n\u{c}Page two line\nTotal: 1.00",
+        "Just some text",
+    ];
+
+    for text in texts {
+        let request = json!({ "Document": text_document(text) });
+        let (status, expense) = call(&router, "AnalyzeExpense", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {text:?}: expected HTTP 200, got {status} with {expense}"
+        );
+        let (detect_status, detected) = call(&router, "DetectDocumentText", &request).await;
+        assert_eq!(
+            detect_status, 200,
+            "case {text:?}: DetectDocumentText must also succeed, got {detect_status}"
+        );
+        assert_eq!(
+            expense["DocumentMetadata"], detected["DocumentMetadata"],
+            "case {text:?}: both read paths must report the same DocumentMetadata"
+        );
+
+        // Page by page, the expense documents carry exactly the text-detection blocks.
+        let joined: Vec<Value> = docs_of(&expense)
+            .iter()
+            .flat_map(|document| list_of(document, "Blocks"))
+            .collect();
+        assert_eq!(
+            joined,
+            blocks_of(&detected),
+            "case {text:?}: an expense document's Blocks must be the blocks DetectDocumentText reports for that page"
+        );
+        assert_block_graph(text, &expense, &joined);
+    }
+}
+
+#[tokio::test]
+async fn analyze_expense_refuses_a_document_it_cannot_read() {
+    let router = harness();
+
+    // A PNG signature followed by bytes that are not text: a real raster, which this
+    // emulator runs no OCR engine for.
+    let png = [
+        0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01, 0x02, 0xFF,
+    ];
+    let too_many_bytes = vec![b'a'; state::MAX_INLINE_DOCUMENT_BYTES + 1];
+
+    let cases: Vec<(&str, Value, &str)> = vec![
+        (
+            "a raster this emulator cannot OCR",
+            json!({ "Bytes": aws_smithy_types::base64::encode(png) }),
+            "UnsupportedDocumentException",
+        ),
+        (
+            "bytes that hold no text at all",
+            json!({ "Bytes": aws_smithy_types::base64::encode(b"  \n\t\n") }),
+            "UnsupportedDocumentException",
+        ),
+        (
+            "an S3 object, which this emulator cannot read",
+            json!({ "S3Object": { "Bucket": "docs", "Name": "receipt.pdf" } }),
+            "InvalidS3ObjectException",
+        ),
+        (
+            "more bytes than a synchronous call accepts",
+            json!({ "Bytes": aws_smithy_types::base64::encode(&too_many_bytes) }),
+            "DocumentTooLargeException",
+        ),
+        ("neither Bytes nor S3Object", json!({}), "InvalidParameterException"),
+        (
+            "both Bytes and S3Object",
+            json!({
+                "Bytes": aws_smithy_types::base64::encode(b"Total: 1.00"),
+                "S3Object": { "Bucket": "docs", "Name": "receipt.pdf" }
+            }),
+            "InvalidParameterException",
+        ),
+        (
+            "an S3 object without a Name",
+            json!({ "S3Object": { "Bucket": "docs" } }),
+            "InvalidParameterException",
+        ),
+    ];
+
+    for (name, document, expected) in cases {
+        let (status, body) = call(&router, "AnalyzeExpense", &json!({ "Document": document })).await;
+        assert_eq!(
+            status, 400,
+            "case {name:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            expected,
+            "case {name:?}: expected {expected}, got {body}"
+        );
+    }
+}

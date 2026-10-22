@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkflows
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkflows`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkflows::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: one `WorkflowSummary` per workflow persisted in this service's store
+//! (`crate::state`), in ARN order, at most `MaxResults` per page. A read NEVER changes
+//! what a later caller sees. The `NextToken` this operation returns is the only one it
+//! accepts back; anything else is refused as a `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +91,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The list this operation's pagination cursors belong to, so a cursor issued for
+/// another paginated list of this service is refused here.
+const PAGE_KIND: &str = "Workflows";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,18 +167,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkflows` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkflowsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkflows"))
+        // `ctx` carries only request metadata; a read needs none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListWorkflowsErrorModeled::InternalServerException(InternalServerException {
+                message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let store = state.lock();
+
+        // The cursor is the ARN of the last item on the previous page, so a workflow
+        // deleted between pages cannot restart or skip the walk.
+        let after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
+                    ListWorkflowsErrorModeled::ValidationException(ValidationException {
+                        message: "NextToken is not a token this service issued".to_string(),
+                        reason: "fieldValidationFailed".to_string(),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "NextToken".to_string(),
+                            message: "Pass back the NextToken from the previous ListWorkflows \
+                                      response unchanged"
+                                .to_string(),
+                        }]),
+                    })
+                })?,
+            ),
+        };
+
+        // `MaxResults` carries `@default: 20` and `@range(1..100)`, both applied before
+        // this handler runs, so the value is already a usable page size.
+        let page_size = usize::try_from(input.max_results).unwrap_or(0);
+
+        let lower = match after.as_deref() {
+            Some(last) => std::ops::Bound::Excluded(last),
+            None => std::ops::Bound::Unbounded,
+        };
+        let mut page = store
+            .workflows
+            .range::<str, _>((lower, std::ops::Bound::Unbounded));
+
+        let mut workflows: Vec<WorkflowSummary> = Vec::new();
+        for (_, workflow) in page.by_ref().take(page_size) {
+            let snapshot = workflow.current_snapshot();
+            workflows.push(WorkflowSummary {
+                workflow_arn: workflow.arn.clone(),
+                workflow_version: Some(workflow.current_version.clone()),
+                name: Some(workflow.name.clone()),
+                description: snapshot.and_then(|snap| snap.description.clone()),
+                created_at: Some(crate::state::timestamp(workflow.created_at)),
+                modified_at: Some(crate::state::timestamp(workflow.modified_at)),
+                workflow_status: Some(workflow.status.clone()),
+                trigger_mode: snapshot.and_then(|snap| snap.trigger_mode.clone()),
+            });
+        }
+
+        // A token only when a further page exists, so a client stops without an extra
+        // empty round trip.
+        let next_token = match workflows.last() {
+            Some(last) if page.next().is_some() => Some(crate::state::encode_page_token(
+                PAGE_KIND,
+                &last.workflow_arn,
+            )),
+            _ => None,
+        };
+
+        Ok(ListWorkflowsOutput {
+            workflows,
+            next_token,
+        })
     }
 }

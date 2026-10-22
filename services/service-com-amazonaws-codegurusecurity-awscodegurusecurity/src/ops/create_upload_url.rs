@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUploadUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUploadUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUploadUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an upload target for a code resource and RECORDS it, so `CreateScan` can
+//! resolve the `codeArtifactId` it hands back. The emulator has no S3 data plane, so
+//! the `s3Url` is minted (deterministically, from the recorded artifact) rather than
+//! served; see `crate::state::SCAN_NOT_ANALYSED_MESSAGE`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUploadUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUploadUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateUploadUrlErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("state unavailable".to_string()),
+                    message: Some(
+                        "the CodeGuru Security store is not reachable from this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let now = crate::state::now_millis();
+        // A fresh identifier per call: two uploads for one scan name are two distinct
+        // revisions of the resource, so they must not collide.
+        let code_artifact_id = crate::state::mint_uuid();
+        // The upload target, derived from the recorded artifact (never echoed from the
+        // request alone) and stable for that artifact's lifetime.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUploadUrl"))
+        // Deliberately NOT a real `s3.<region>.amazonaws.com` host: this emulator has no
+        // S3 data plane to receive the resource (see
+        // `crate::state::SCAN_NOT_ANALYSED_MESSAGE`), and a developer following the
+        // documented CreateUploadUrl workflow against an AWS-shaped target would PUT
+        // their source archive to real AWS. `.invalid` is reserved by RFC 2606 and never
+        // resolves, so the minted target is unmistakably the emulator's own and cannot
+        // send anything off the machine.
+        let s3_url = format!(
+            "https://codeguru-security-upload.{region}.emulator.invalid/{account}/{scan_name}/{code_artifact_id}",
+            account = ::engine::emulator_account_id(),
+            scan_name = input.scan_name,
+        );
+        // ONE lock for this call: the configured encryption key is read, the quota is
+        // measured and the artifact is recorded under the same guard, so two concurrent
+        // CreateUploadUrl calls cannot both pass a quota only one of them has room for.
+        let mut store = state.lock();
+        // "A set of key-value pairs that contain the required headers when uploading
+        // your resource" (`CreateUploadUrlResponse$requestHeaders`): the content type of
+        // the code archive, plus the server-side-encryption headers the account's
+        // `encryptionConfig.kmsKeyArn` requires. That configuration is reached through
+        // GetAccountConfiguration / UpdateAccountConfiguration, which are still
+        // scaffolded, so no customer-managed key is configured and the encryption
+        // headers are correctly absent until that slice lands; the set is built from the
+        // store rather than fixed.
+        let mut request_headers = std::collections::BTreeMap::from([(
+            "Content-Type".to_string(),
+            "application/zip".to_string(),
+        )]);
+        if let Some(kms_key_arn) = store.encryption_kms_key_arn.clone() {
+            request_headers.insert(
+                "x-amz-server-side-encryption".to_string(),
+                "aws:kms".to_string(),
+            );
+            request_headers.insert(
+                "x-amz-server-side-encryption-aws-kms-key-id".to_string(),
+                kms_key_arn,
+            );
+        }
+
+        let artifact = crate::state::UploadArtifact {
+            code_artifact_id: code_artifact_id.clone(),
+            scan_name: input.scan_name.clone(),
+            s3_url,
+            request_headers,
+            created_at_millis: now,
+            expires_at_millis: now.saturating_add(crate::state::UPLOAD_ARTIFACT_TTL_MILLIS),
+        };
+        {
+            // Release the targets whose lifetime the clock has already ended before the
+            // quota is measured, so an expired artifact never holds a slot.
+            store.expire_due_artifacts(now);
+            if store.upload_artifacts.len() >= crate::state::UPLOAD_ARTIFACT_QUOTA {
+                return Err(CreateUploadUrlErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        error_code: "ThrottlingException".to_string(),
+                        message: format!(
+                            "this account already holds the maximum of {quota} minted code \
+                             artifacts; scan one or wait for a minted target to expire",
+                            quota = crate::state::UPLOAD_ARTIFACT_QUOTA,
+                        ),
+                        service_code: Some(crate::state::SERVICE_CODE.to_string()),
+                        quota_code: Some(crate::state::QUOTA_CODE_UPLOAD_ARTIFACTS.to_string()),
+                    },
+                )
+                .into());
+            }
+            store.record_artifact(artifact.clone());
+        }
+
+        Ok(CreateUploadUrlOutput {
+            s3_url: artifact.s3_url,
+            request_headers: artifact.request_headers.into_iter().collect(),
+            code_artifact_id,
+        })
     }
 }

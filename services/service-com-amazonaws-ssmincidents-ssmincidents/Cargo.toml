@@ -21,13 +21,18 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Opaque `nextToken` encoding for ListIncidentRecords.
+hex = { workspace = true }
+# Incident-record ids: Incident Manager names each record with a UUID.
+uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
-hex = { workspace = true }
+# Percent-encoding for the `@httpQuery`-bound ARNs the integration tests send.
+percent-encoding = "2"
 
 [lints]
 workspace = true

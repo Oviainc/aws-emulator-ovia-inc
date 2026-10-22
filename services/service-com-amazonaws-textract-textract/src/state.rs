@@ -10,7 +10,8 @@
 //! synchronous and asynchronous answers for one document must agree. So a document is
 //! registered once (keyed by its identity: an S3 object, or the SHA-256 of its inline
 //! bytes), the text read out of it is stored, and every path derives its blocks from
-//! that stored content with [`blocks`].
+//! that stored content with [`blocks`]. `AnalyzeExpense`'s `ExpenseDocuments` come from
+//! that same stored text and the same line layout, with [`expense_documents`].
 //!
 //! ## What this emulator can read, and what it refuses
 //!
@@ -37,9 +38,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Block, BoundingBox, Document, DocumentLocation, DocumentMetadata, Geometry,
-    NotificationChannel, OutputConfig, Point, Relationship, Warning, AUTO_UPDATE_VALUES,
-    FEATURE_TYPE_VALUES,
+    Block, BoundingBox, Document, DocumentLocation, DocumentMetadata, ExpenseCurrency,
+    ExpenseDetection, ExpenseDocument, ExpenseField, ExpenseType, Geometry, LineItemFields,
+    LineItemGroup, NotificationChannel, OutputConfig, Point, Relationship, Warning,
+    AUTO_UPDATE_VALUES, FEATURE_TYPE_VALUES,
 };
 
 /// The value Textract reports as `DetectDocumentTextModelVersion`.
@@ -1064,13 +1066,9 @@ fn form_blocks(
     let mut out = Vec::new();
     let mut ids = Vec::new();
     for line in lines {
-        let Some(colon) = line.colon else { continue };
-        let key_words: Vec<&WordLayout> = line.words.iter().filter(|w| w.column <= colon).collect();
-        let value_words: Vec<&WordLayout> =
-            line.words.iter().filter(|w| w.column > colon).collect();
-        if key_words.is_empty() || value_words.is_empty() {
+        let Some((_, key_words, value_words)) = labelled_split(line) else {
             continue;
-        }
+        };
         let key_id = block_id(key, "KEY", &[page_index, line.index]);
         let value_id = block_id(key, "VALUE", &[page_index, line.index]);
 
@@ -1107,6 +1105,60 @@ fn word_boxes(line: &LineLayout, words: &[&WordLayout]) -> Vec<BoundingBox> {
         .collect()
 }
 
+/// The label and the value halves of a labelled line, with the column of the `:` that
+/// separates them, or `None` when the line labels nothing.
+///
+/// The ONE reader of a labelled line: the `FORMS` KEY/VALUE pairs and `AnalyzeExpense`'s
+/// summary fields both split a line here, so the two paths cannot disagree on which
+/// lines carry a field. A half with no text of its own labels nothing.
+fn labelled_split(line: &LineLayout) -> Option<(usize, Vec<&WordLayout>, Vec<&WordLayout>)> {
+    let colon = line.colon?;
+    let label: Vec<&WordLayout> = line.words.iter().filter(|w| w.column <= colon).collect();
+    let value: Vec<&WordLayout> = line.words.iter().filter(|w| w.column > colon).collect();
+    if label.is_empty() || value.is_empty() {
+        return None;
+    }
+    let chars = line.text.chars().count();
+    if char_span(&line.text, 0, colon).trim().is_empty()
+        || char_span(&line.text, colon + 1, chars).trim().is_empty()
+    {
+        return None;
+    }
+    Some((colon, label, value))
+}
+
+/// The page's tables: each one a contiguous run of tab-separated lines, in page order.
+///
+/// The ONE reader of where a table starts and ends, for both the `TABLE`/`CELL` blocks
+/// and `AnalyzeExpense`'s line-item groups.
+fn table_runs(lines: &[LineLayout]) -> Vec<&[LineLayout]> {
+    let mut runs = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < lines.len() {
+        if lines[cursor].cells.is_empty() {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor < lines.len() && !lines[cursor].cells.is_empty() {
+            cursor += 1;
+        }
+        runs.push(&lines[start..cursor]);
+    }
+    runs
+}
+
+/// The words of column `column` of a table row.
+fn cell_words(line: &LineLayout, column: usize) -> Vec<&WordLayout> {
+    let start: usize = line.cells.iter().take(column).sum();
+    let count = line.cells.get(column).copied().unwrap_or_default();
+    line.words
+        .get(start..start + count)
+        .unwrap_or_default()
+        .iter()
+        .collect()
+}
+
 /// `TABLE` and `CELL` blocks for the page's tab-separated rows, and the table ids.
 ///
 /// A contiguous run of tab-separated lines is one table; a cell's `RowIndex` and
@@ -1119,31 +1171,13 @@ fn table_blocks(
 ) -> (Vec<Block>, Vec<String>) {
     let mut out = Vec::new();
     let mut ids = Vec::new();
-    let mut table_index = 0usize;
-    let mut cursor = 0usize;
-    while cursor < lines.len() {
-        if lines[cursor].cells.is_empty() {
-            cursor += 1;
-            continue;
-        }
-        let start = cursor;
-        while cursor < lines.len() && !lines[cursor].cells.is_empty() {
-            cursor += 1;
-        }
-        let run = &lines[start..cursor];
+    for (table_index, run) in table_runs(lines).into_iter().enumerate() {
         let table_id = block_id(key, "TABLE", &[page_index, table_index]);
         let mut cell_blocks = Vec::new();
         let mut cell_ids = Vec::new();
         for (row, line) in run.iter().enumerate() {
-            let mut word_cursor = 0usize;
-            for (column, count) in line.cells.iter().copied().enumerate() {
-                let cell_words: Vec<&WordLayout> = line
-                    .words
-                    .get(word_cursor..word_cursor + count)
-                    .unwrap_or_default()
-                    .iter()
-                    .collect();
-                word_cursor += count;
+            for column in 0..line.cells.len() {
+                let cell_words = cell_words(line, column);
                 let cell_id = block_id(key, "CELL", &[page_index, table_index, row, column]);
                 let mut cell = new_block("CELL", cell_id.clone(), page_number);
                 cell.row_index = Some(i32::try_from(row + 1).unwrap_or(i32::MAX));
@@ -1179,9 +1213,402 @@ fn table_blocks(
         ids.push(table_id);
         out.push(table);
         out.extend(cell_blocks);
-        table_index += 1;
     }
     (out, ids)
+}
+
+// ---------------------------------------------------------------------------
+// Expense derivation
+// ---------------------------------------------------------------------------
+
+/// The normalized `ExpenseField.Type` each recognised label is reported under.
+///
+/// Source: AWS's Textract documentation for `AnalyzeExpense` — a summary field's `Type`
+/// is the IMPLIED label (`ExpenseField$Type`: "The implied label of a detected element.
+/// Present alongside LabelDetection for explicit elements."), drawn from the normalized
+/// invoice/receipt field names the Developer Guide lists ("Analyzing Invoices and
+/// Receipts"); a label the service does not recognise is reported as
+/// [`UNRECOGNISED_FIELD_TYPE`].
+///
+/// The left column is the label AS WRITTEN IN THE DOCUMENT, put through
+/// [`normalize_label`]; the right column is the normalized type. Listed alphabetically
+/// for readability; the lookup is a scan, so the order carries no meaning.
+const SUMMARY_FIELD_TYPES: &[(&str, &str)] = &[
+    ("ACCOUNT_NUMBER", "CUSTOMER_NUMBER"),
+    ("ADDRESS", "VENDOR_ADDRESS"),
+    ("AMOUNT_DUE", "AMOUNT_DUE"),
+    ("AMOUNT_PAID", "AMOUNT_PAID"),
+    ("BALANCE_DUE", "AMOUNT_DUE"),
+    ("BILL_TO", "RECEIVER_NAME"),
+    ("CUSTOMER", "RECEIVER_NAME"),
+    ("CUSTOMER_ID", "CUSTOMER_NUMBER"),
+    ("CUSTOMER_NUMBER", "CUSTOMER_NUMBER"),
+    ("DATE", "INVOICE_RECEIPT_DATE"),
+    ("DELIVERY_DATE", "DELIVERY_DATE"),
+    ("DISCOUNT", "DISCOUNT"),
+    ("DUE_DATE", "DUE_DATE"),
+    ("GRAND_TOTAL", "TOTAL"),
+    ("GRATUITY", "GRATUITY"),
+    ("INVOICE", "INVOICE_RECEIPT_ID"),
+    ("INVOICE_DATE", "INVOICE_RECEIPT_DATE"),
+    ("INVOICE_ID", "INVOICE_RECEIPT_ID"),
+    ("INVOICE_NO", "INVOICE_RECEIPT_ID"),
+    ("INVOICE_NUMBER", "INVOICE_RECEIPT_ID"),
+    ("MERCHANT", "VENDOR_NAME"),
+    ("ORDER_DATE", "ORDER_DATE"),
+    ("PAID", "AMOUNT_PAID"),
+    ("PAYMENT_TERMS", "PAYMENT_TERMS"),
+    ("PHONE", "VENDOR_PHONE"),
+    ("PO_NUMBER", "PO_NUMBER"),
+    ("PREVIOUS_BALANCE", "PRIOR_BALANCE"),
+    ("PRIOR_BALANCE", "PRIOR_BALANCE"),
+    ("PURCHASE_ORDER", "PO_NUMBER"),
+    ("RECEIPT_DATE", "INVOICE_RECEIPT_DATE"),
+    ("RECEIPT_ID", "INVOICE_RECEIPT_ID"),
+    ("RECEIPT_NUMBER", "INVOICE_RECEIPT_ID"),
+    ("RECEIVER_ADDRESS", "RECEIVER_ADDRESS"),
+    ("RECEIVER_NAME", "RECEIVER_NAME"),
+    ("RECEIVER_PHONE", "RECEIVER_PHONE"),
+    ("SALES_TAX", "TAX"),
+    ("SERVICE_CHARGE", "SERVICE_CHARGE"),
+    ("SHIPPING", "SHIPPING_HANDLING_CHARGE"),
+    ("SHIPPING_AND_HANDLING", "SHIPPING_HANDLING_CHARGE"),
+    ("SHIP_TO", "RECEIVER_ADDRESS"),
+    ("SOLD_TO", "RECEIVER_NAME"),
+    ("STORE", "VENDOR_NAME"),
+    ("SUBTOTAL", "SUBTOTAL"),
+    ("SUB_TOTAL", "SUBTOTAL"),
+    ("TAX", "TAX"),
+    ("TAX_ID", "TAX_PAYER_ID"),
+    ("TAX_PAYER_ID", "TAX_PAYER_ID"),
+    ("TELEPHONE", "VENDOR_PHONE"),
+    ("TERMS", "PAYMENT_TERMS"),
+    ("TIP", "GRATUITY"),
+    ("TOTAL", "TOTAL"),
+    ("TOTAL_DUE", "TOTAL"),
+    ("URL", "VENDOR_URL"),
+    ("VAT", "TAX"),
+    ("VENDOR", "VENDOR_NAME"),
+    ("VENDOR_ADDRESS", "VENDOR_ADDRESS"),
+    ("VENDOR_NAME", "VENDOR_NAME"),
+    ("VENDOR_PHONE", "VENDOR_PHONE"),
+    ("VENDOR_URL", "VENDOR_URL"),
+    ("WEBSITE", "VENDOR_URL"),
+];
+
+/// The normalized `ExpenseField.Type` each recognised TABLE COLUMN header is reported
+/// under, for a line item. Same source and same shape as [`SUMMARY_FIELD_TYPES`].
+const LINE_ITEM_FIELD_TYPES: &[(&str, &str)] = &[
+    ("AMOUNT", "PRICE"),
+    ("DESCRIPTION", "ITEM"),
+    ("ITEM", "ITEM"),
+    ("ITEM_CODE", "PRODUCT_CODE"),
+    ("LINE_TOTAL", "PRICE"),
+    ("PRICE", "PRICE"),
+    ("PRODUCT", "ITEM"),
+    ("PRODUCT_CODE", "PRODUCT_CODE"),
+    ("QTY", "QUANTITY"),
+    ("QUANTITY", "QUANTITY"),
+    ("RATE", "UNIT_PRICE"),
+    ("SKU", "PRODUCT_CODE"),
+    ("TOTAL", "PRICE"),
+    ("UNIT_PRICE", "UNIT_PRICE"),
+    ("UPC", "PRODUCT_CODE"),
+];
+
+/// The `Type` reported for a detected element whose label names no normalized field.
+pub const UNRECOGNISED_FIELD_TYPE: &str = "OTHER";
+
+/// The `Type` of the line-item field that carries a table row in full.
+pub const EXPENSE_ROW_FIELD_TYPE: &str = "EXPENSE_ROW";
+
+/// The currency codes `ExpenseCurrency$Code` documents: "the current supported codes
+/// are: USD, EUR, GBP, CAD, INR, JPY, CHF, AUD, CNY, BZR, SEK, HKD".
+pub const EXPENSE_CURRENCY_CODES: &[&str] = &[
+    "USD", "EUR", "GBP", "CAD", "INR", "JPY", "CHF", "AUD", "CNY", "BZR", "SEK", "HKD",
+];
+
+/// The currency symbol a value may carry instead of a code, and the
+/// [`EXPENSE_CURRENCY_CODES`] entry it denotes. Tried in order, so a qualified dollar
+/// sign is read before the bare one.
+///
+/// Compared against the UPPERCASED value text, hence the uppercase spellings. A symbol
+/// several supported currencies share and nothing qualifies (`¥`, written for both JPY
+/// and CNY) is read as the first of them; an explicit code in the value always wins over
+/// a symbol.
+const CURRENCY_SYMBOLS: &[(&str, &str)] = &[
+    ("R$", "BZR"),
+    ("CA$", "CAD"),
+    ("C$", "CAD"),
+    ("AU$", "AUD"),
+    ("A$", "AUD"),
+    ("HK$", "HKD"),
+    ("$", "USD"),
+    ("€", "EUR"),
+    ("£", "GBP"),
+    ("₹", "INR"),
+    ("¥", "JPY"),
+];
+
+/// A label as the field catalogs key it: uppercased, with every run of characters that
+/// is not a letter or a digit folded to one `_`.
+pub fn normalize_label(label: &str) -> String {
+    let mut out = String::new();
+    for ch in label.to_uppercase().chars() {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+/// The normalized summary-field type `label` is reported under, or
+/// [`UNRECOGNISED_FIELD_TYPE`].
+pub fn summary_field_type(label: &str) -> &'static str {
+    let normalized = normalize_label(label);
+    SUMMARY_FIELD_TYPES
+        .iter()
+        .find(|(alias, _)| *alias == normalized)
+        .map_or(UNRECOGNISED_FIELD_TYPE, |(_, kind)| *kind)
+}
+
+/// The normalized line-item type a table column headed `header` is reported under, or
+/// `None` when the header names no line-item field.
+pub fn line_item_field_type(header: &str) -> Option<&'static str> {
+    let normalized = normalize_label(header);
+    LINE_ITEM_FIELD_TYPES
+        .iter()
+        .find(|(alias, _)| *alias == normalized)
+        .map(|(_, kind)| *kind)
+}
+
+/// The supported currency code a detected value names, or `None`.
+///
+/// `ExpenseField$Currency` is "the kind of currency ... associated with any monatary
+/// value detected", so a value carries one only when it holds a number AND names a
+/// currency: an explicit [`EXPENSE_CURRENCY_CODES`] token, or a [`CURRENCY_SYMBOLS`]
+/// symbol.
+pub fn detect_currency(text: &str) -> Option<&'static str> {
+    if !text.chars().any(char::is_numeric) {
+        return None;
+    }
+    let upper = text.to_uppercase();
+    for token in upper.split_whitespace() {
+        let token = token.trim_matches(|c: char| !c.is_alphanumeric());
+        if let Some(code) = EXPENSE_CURRENCY_CODES.iter().find(|code| **code == token) {
+            return Some(code);
+        }
+    }
+    CURRENCY_SYMBOLS
+        .iter()
+        .find(|(symbol, _)| upper.contains(symbol))
+        .map(|(_, code)| *code)
+}
+
+/// An `ExpenseDetection` for text that was really read at `bbox`.
+fn detection(text: &str, bbox: BoundingBox) -> ExpenseDetection {
+    ExpenseDetection {
+        text: Some(text.to_string()),
+        geometry: Some(geometry(bbox)),
+        confidence: Some(EXTRACTED_TEXT_CONFIDENCE),
+    }
+}
+
+/// An `ExpenseField` of normalized type `kind`.
+fn expense_field(
+    kind: &str,
+    label: Option<ExpenseDetection>,
+    value: ExpenseDetection,
+    page_number: i32,
+) -> ExpenseField {
+    let currency = value
+        .text
+        .as_deref()
+        .and_then(detect_currency)
+        .map(|code| ExpenseCurrency {
+            code: Some(code.to_string()),
+            confidence: Some(EXTRACTED_TEXT_CONFIDENCE),
+        });
+    ExpenseField {
+        r#type: Some(ExpenseType {
+            text: Some(kind.to_string()),
+            confidence: Some(EXTRACTED_TEXT_CONFIDENCE),
+        }),
+        label_detection: label,
+        value_detection: Some(value),
+        page_number: Some(page_number),
+        currency,
+        // This emulator reads one flat text document, so it resolves no name/address
+        // groups to report; `GroupProperties` is optional and is left unset rather than
+        // filled with a grouping nothing computed.
+        group_properties: None,
+    }
+}
+
+/// The character-indexed span `[from, to)` of a line's text.
+fn char_span(text: &str, from: usize, to: usize) -> String {
+    text.chars()
+        .skip(from)
+        .take(to.saturating_sub(from))
+        .collect()
+}
+
+/// The box covering every one of `words`, or the line's own box when it has none.
+fn words_box(line: &LineLayout, words: &[&WordLayout]) -> BoundingBox {
+    let boxes = word_boxes(line, words);
+    if boxes.is_empty() {
+        bounding_box(line.index, 0, line.text.chars().count())
+    } else {
+        union(&boxes)
+    }
+}
+
+/// The summary fields of one page: every labelled line outside a table, in page order.
+///
+/// A labelled line is exactly what the `FORMS` path reads as a KEY/VALUE pair, so
+/// `AnalyzeExpense` and `AnalyzeDocument` agree on which lines carry a field.
+fn summary_fields(lines: &[LineLayout], page_number: i32) -> Vec<ExpenseField> {
+    let mut out = Vec::new();
+    for line in lines {
+        let Some((colon, label_words, value_words)) = labelled_split(line) else {
+            continue;
+        };
+        let chars = line.text.chars().count();
+        let label = char_span(&line.text, 0, colon).trim().to_string();
+        let value = char_span(&line.text, colon + 1, chars).trim().to_string();
+        out.push(expense_field(
+            summary_field_type(&label),
+            Some(detection(&label, words_box(line, &label_words))),
+            detection(&value, words_box(line, &value_words)),
+            page_number,
+        ));
+    }
+    out
+}
+
+/// The cells of a table row, one entry per tab-separated column.
+fn cell_texts(line: &LineLayout) -> Vec<String> {
+    line.text
+        .split('\t')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+/// The `LineItemFields` of one table row: the row in full, then one field per populated
+/// cell, typed by the table's header row when it has one.
+fn line_item(line: &LineLayout, header: Option<&LineLayout>, page_number: i32) -> LineItemFields {
+    let texts = cell_texts(line);
+    let row_words: Vec<&WordLayout> = line.words.iter().collect();
+    let row_text = texts
+        .iter()
+        .filter(|cell| !cell.is_empty())
+        .cloned()
+        .collect::<Vec<String>>()
+        .join(" ");
+    let mut fields = vec![expense_field(
+        EXPENSE_ROW_FIELD_TYPE,
+        None,
+        detection(&row_text, words_box(line, &row_words)),
+        page_number,
+    )];
+    let header_texts = header.map(cell_texts).unwrap_or_default();
+    for (column, text) in texts.iter().enumerate() {
+        if text.is_empty() {
+            continue;
+        }
+        let header_text = header_texts.get(column).filter(|t| !t.is_empty());
+        let kind = header_text
+            .and_then(|t| line_item_field_type(t))
+            .unwrap_or(UNRECOGNISED_FIELD_TYPE);
+        // A header row states the column's label explicitly, so it is reported as the
+        // field's `LabelDetection`; a headerless table has none to report.
+        let label = match (header, header_text) {
+            (Some(header), Some(header_text)) => Some(detection(
+                header_text,
+                words_box(header, &cell_words(header, column)),
+            )),
+            _ => None,
+        };
+        fields.push(expense_field(
+            kind,
+            label,
+            detection(text, words_box(line, &cell_words(line, column))),
+            page_number,
+        ));
+    }
+    LineItemFields {
+        line_item_expense_fields: Some(fields),
+    }
+}
+
+/// The line-item groups of one page: one group per table, as [`table_runs`] finds them,
+/// indexed from 1 in page order.
+fn line_item_groups(lines: &[LineLayout], page_number: i32) -> Vec<LineItemGroup> {
+    table_runs(lines)
+        .into_iter()
+        .enumerate()
+        .map(|(table_index, run)| {
+            // The first row is the table's header when it has rows under it and every one
+            // of its populated cells names a line-item field; otherwise the table is
+            // headerless and every row is a line item.
+            let header_row = run.first().filter(|first| {
+                run.len() > 1
+                    && cell_texts(first)
+                        .iter()
+                        .filter(|cell| !cell.is_empty())
+                        .all(|cell| line_item_field_type(cell).is_some())
+            });
+            let rows = if header_row.is_some() { &run[1..] } else { run };
+            let line_items: Vec<LineItemFields> = rows
+                .iter()
+                .map(|row| line_item(row, header_row, page_number))
+                .collect();
+            LineItemGroup {
+                line_item_group_index: Some(i32::try_from(table_index + 1).unwrap_or(i32::MAX)),
+                line_items: Some(line_items),
+            }
+        })
+        .collect()
+}
+
+/// Every `ExpenseDocument` for a document's stored text.
+///
+/// `ExpenseIndex` "denotes which invoice or receipt in the document the information is
+/// coming from. First document will be 1, the second 2, and so on" — one page of the
+/// submitted document is one invoice or receipt here, so page N answers as expense
+/// document N. Each one carries, per `ExpenseDocument$Blocks`, "the same [blocks] as
+/// reported when DetectDocumentText is run on a document", for that page.
+///
+/// Derived from the SAME stored text and the SAME line layout every other read path
+/// uses, so the fields only ever describe text that was really read out of the document;
+/// bounded by [`MAX_BLOCKS_PER_DOCUMENT`], which `read_content` already enforced.
+pub fn expense_documents(key: &str, content: &DocumentContent) -> Vec<ExpenseDocument> {
+    // Grouped in ONE pass: a per-page scan of the whole block list would cost
+    // pages x blocks for a single request.
+    let mut by_page: HashMap<i32, Vec<Block>> = HashMap::new();
+    for block in blocks(key, content, FeatureSet::default()) {
+        by_page
+            .entry(block.page.unwrap_or_default())
+            .or_default()
+            .push(block);
+    }
+    content
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(page_index, page_text)| {
+            let page_number = i32::try_from(page_index + 1).unwrap_or(i32::MAX);
+            let lines = layout_page(key, page_index, page_text);
+            ExpenseDocument {
+                expense_index: Some(page_number),
+                summary_fields: Some(summary_fields(&lines, page_number)),
+                line_item_groups: Some(line_item_groups(&lines, page_number)),
+                blocks: Some(by_page.remove(&page_number).unwrap_or_default()),
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

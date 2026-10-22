@@ -45,6 +45,38 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether this service serves the request these `parts` came from.
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
+/// owner of this rule, and it is CALLED here rather than re-implemented: the request's
+/// route key must match this service's signing name AND its first URI path segment
+/// must be one the generated, model-derived `ROUTE_PATH_SEGMENTS` declares, by exact
+/// segment equality. That path conjunct is what separates two services sharing one
+/// SigV4 signing name — the AppConfig control plane and the AppConfigData data plane
+/// both sign as `appconfig`, so the key alone matches both and the router would reject
+/// every such request as `500 AmbiguousService` — and their modelled path spaces are
+/// disjoint (`applications`, `deploymentstrategies`, `extensions`, … here;
+/// `configuration` and `configurationsessions` there).
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed
+/// only the request's parts, so the two things it reads — the URI and the headers —
+/// are re-presented to it as a bodiless request. It reads neither the body nor the
+/// method, so nothing it decides on is missing.
+fn can_handle_parts(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-appconfig-amazonappconfig` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +106,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // Delegated to the framework's own predicate — see [`can_handle_parts`]:
+        // this service's signing name (`appconfig`) is shared with the AppConfigData
+        // data plane, so the claim is the route key AND the model-derived first URI
+        // path segment. Matching on the signing name alone would have both services
+        // claim every `appconfig`-signed request, which the router answers with 500
+        // `AmbiguousService` instead of serving either one.
+        can_handle_parts(parts)
     }
 
     fn override_operation(

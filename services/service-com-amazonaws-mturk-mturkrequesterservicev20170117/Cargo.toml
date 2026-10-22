@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Derives a HITTypeId from the HIT-type fields, so identical definitions share one id.
+sha2 = { workspace = true }
+# Encodes/decodes the opaque `NextToken` that `ListHITs` mints, and renders digests.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

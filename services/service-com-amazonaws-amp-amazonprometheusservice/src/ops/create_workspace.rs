@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWorkspace
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWorkspace`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a workspace, persists it, and answers from the PERSISTED record.
+//! The workspace starts in `CREATING` and the clock owes its move to `ACTIVE`
+//! ([`crate::state::TRANSITION_DELAY`]); `clientToken` makes the call idempotent.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWorkspace::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +168,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWorkspace` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWorkspaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWorkspace"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateWorkspaceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+
+        // "Keys must not begin with aws:" (`TagResource$tags`) — the service's rule for
+        // its own tag keys, so it holds for the tags a workspace is created with too.
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(input.tags.iter().flat_map(|tags| tags.keys()))
+        {
+            return Err(CreateWorkspaceErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX,
+                    ),
+                    reason: "FIELD_VALIDATION_FAILED".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "tags".to_string(),
+                        message: format!(
+                            "keys must not begin with {}",
+                            crate::state::RESERVED_TAG_KEY_PREFIX
+                        ),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        // `clientToken` carries `@idempotencyToken`: replaying a token that already
+        // created a workspace answers with THAT workspace instead of a second one.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.client_tokens.get(token))
+            .and_then(|workspace_id| store.workspaces.get(workspace_id))
+        {
+            return Ok(response_for(existing));
+        }
+
+        // The store is BOUNDED: past its quota a create is refused rather than adding
+        // another record. `ServiceQuotaExceededException` is the modelled refusal for
+        // exactly this, and `WORKSPACE_QUOTA` is what stops the workspace, ARN-index and
+        // client-token maps growing without end.
+        if store.workspaces.len() >= crate::state::WORKSPACE_QUOTA {
+            return Err(CreateWorkspaceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} workspaces",
+                        crate::state::WORKSPACE_QUOTA
+                    ),
+                    // The bound is per account, so the account is the resource that
+                    // reached it.
+                    resource_id: ::engine::emulator_account_id().to_string(),
+                    resource_type: crate::state::WORKSPACE_RESOURCE_TYPE.to_string(),
+                    service_code: ctx.identity().signing_name().to_string(),
+                    // Named for what it bounds: a real quota code is an identifier
+                    // Service Quotas issues, which this emulator does not model and so
+                    // must not invent one of.
+                    quota_code: "WorkspacesPerAccount".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let workspace_id = crate::state::mint_workspace_id(&mut store.next_id);
+        let workspace = crate::state::Workspace {
+            arn: crate::state::workspace_arn(&region, &workspace_id),
+            prometheus_endpoint: crate::state::prometheus_endpoint(&region, &workspace_id),
+            alias: crate::state::normalize_alias(input.alias.as_deref()),
+            // "Immediately after you create the workspace, the status is usually
+            // CREATING" — and the clock owes the move to ACTIVE at `transition_due`.
+            status_code: crate::state::STATUS_CREATING.to_string(),
+            created_at: now,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            kms_key_arn: input.kms_key_arn,
+            transition_due: Some(now + crate::state::TRANSITION_DELAY),
+            delete_token: None,
+            workspace_id: workspace_id.clone(),
+        };
+
+        let response = response_for(&workspace);
+        store
+            .arn_index
+            .insert(workspace.arn.clone(), workspace_id.clone());
+        if let Some(token) = input.client_token {
+            store.client_tokens.insert(token, workspace_id.clone());
+        }
+        store.workspaces.insert(workspace_id, workspace);
+        Ok(response)
     }
 }
+
+/// The response for a stored workspace.
+///
+/// Every member is read back off the persisted record — so `tags` and `kmsKeyArn`
+/// report what the workspace HOLDS, not what the request carried.
+fn response_for(workspace: &crate::state::Workspace) -> CreateWorkspaceOutput {
+    CreateWorkspaceOutput {
+        workspace_id: workspace.workspace_id.clone(),
+        arn: workspace.arn.clone(),
+        status: WorkspaceStatus {
+            status_code: workspace.status_code.clone(),
+        },
+        tags: crate::state::tag_map(&workspace.tags),
+        kms_key_arn: workspace.kms_key_arn.clone(),
+    }
+}
+

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTranscriptionJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTranscriptionJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTranscriptionJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the stored transcription jobs, newest first ("Jobs are ordered by creation
+//! date, with the newest job first"), honouring the `Status` and `JobNameContains`
+//! filters, `MaxResults` and `NextToken` paging. Every summary is projected from the
+//! stored record, after the status transitions the clock has made due.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +165,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTranscriptionJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTranscriptionJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTranscriptionJobs"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListTranscriptionJobsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // A page cursor: the creation sequence of the last job of the previous page,
+        // so the next page resumes strictly past it even if that job was deleted
+        // meanwhile. The job's name travels with it, which is what makes the token
+        // readable in a trace; only the sequence is interpreted.
+        let resume_below = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(parse_next_token(token)?),
+        };
+
+        // `MaxResults` is modelled `@range(min: 1, max: 100)`, so the boundary
+        // validator has already refused anything outside it; the clamp states that
+        // dependency rather than relying on it silently.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_LIST_MAX_RESULTS),
+        )
+        .unwrap_or(crate::state::MAX_LIST_MAX_RESULTS)
+        .clamp(1, crate::state::MAX_LIST_MAX_RESULTS);
+
+        // "The search is not case sensitive" (model doc for
+        // `ListTranscriptionJobsRequest$JobNameContains`).
+        let name_contains = input
+            .job_name_contains
+            .as_deref()
+            .map(str::to_lowercase);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Reporting only: the sole write is each job's clock-owed status transition.
+        let records = store.jobs_newest_first(now);
+
+        let mut summaries: Vec<TranscriptionJobSummary> = Vec::new();
+        let mut next_token = None;
+        let mut last_on_page: Option<(u64, String)> = None;
+        for record in records {
+            if resume_below.is_some_and(|sequence| record.sequence >= sequence) {
+                continue;
+            }
+            if input
+                .status
+                .as_deref()
+                .is_some_and(|status| status != record.status)
+            {
+                continue;
+            }
+            if name_contains
+                .as_deref()
+                .is_some_and(|needle| !record.name.to_lowercase().contains(needle))
+            {
+                continue;
+            }
+            if summaries.len() == page_size {
+                // A further match exists, so the caller gets a cursor to it.
+                next_token = last_on_page
+                    .as_ref()
+                    .map(|(sequence, name)| format!("{sequence}|{name}"));
+                break;
+            }
+            summaries.push(record.to_summary());
+            last_on_page = Some((record.sequence, record.name.clone()));
+        }
+
+        Ok(ListTranscriptionJobsOutput {
+            // The filter is echoed back, so a paging caller can see which status
+            // this page was selected on.
+            status: input.status,
+            next_token,
+            transcription_job_summaries: Some(summaries),
+        })
     }
+}
+
+/// The creation sequence a `NextToken` resumes after.
+///
+/// The token is opaque to clients: this service writes `{sequence}|{job name}` and
+/// reads back the sequence. A token it did not write is refused rather than silently
+/// restarting the listing from the top.
+fn parse_next_token(token: &str) -> Result<u64, ListTranscriptionJobsError> {
+    token
+        .split('|')
+        .next()
+        .and_then(|sequence| sequence.parse::<u64>().ok())
+        // Creation sequences start at 1, so a cursor of 0 is one this service never
+        // handed out: refuse it rather than answer an empty page.
+        .filter(|sequence| *sequence > 0)
+        .ok_or_else(|| {
+            ListTranscriptionJobsErrorModeled::BadRequestException(BadRequestException {
+                message: Some(
+                    "The NextToken in your request is not valid. Use the NextToken returned \
+                     by your previous ListTranscriptionJobs request."
+                        .to_string(),
+                ),
+            })
+            .into()
+        })
 }

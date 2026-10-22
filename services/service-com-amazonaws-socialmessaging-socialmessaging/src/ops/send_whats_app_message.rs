@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendWhatsAppMessage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendWhatsAppMessage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Sends a WhatsApp message from a registered phone number.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendWhatsAppMessage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The origination number must be one a setup finalization registered; the call is
+//! recorded in the store and answered with a freshly minted, per-call `messageId`.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendWhatsAppMessage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendWhatsAppMessageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendWhatsAppMessage"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendWhatsAppMessageErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the social-messaging store is unavailable".to_string()),
+            })
+        })?;
+        let mut store = state.lock();
+
+        // The origination number must be one this account registered.
+        let Some(origination_phone_number_id) =
+            store.phone_number_id(&input.origination_phone_number_id)
+        else {
+            return Err(SendWhatsAppMessageErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "no WhatsApp phone number with id '{}'",
+                        input.origination_phone_number_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let message_id = store.mint_message_id();
+        store.record_sent_message(crate::state::SentMessage {
+            message_id: message_id.clone(),
+            origination_phone_number_id,
+            message: input.message,
+            meta_api_version: input.meta_api_version,
+            sent_at: std::time::SystemTime::now(),
+        });
+
+        Ok(SendWhatsAppMessageOutput {
+            message_id: Some(message_id),
+        })
     }
 }

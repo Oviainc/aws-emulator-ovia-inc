@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteHIT
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteHIT`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteHIT::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Disposes of a HIT: "you can only dispose of HITs that are in the `Reviewable`
+//! state", so a HIT whose lifetime has not elapsed is refused, and a disposed HIT is
+//! reported by neither `GetHIT` nor `ListHITs`.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +139,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteHIT` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteHITErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteHIT"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteHITErrorModeled::ServiceFault(ServiceFault {
+                message: Some(
+                    "mturk-requester is mounted on an engine that holds no state for it"
+                        .to_string(),
+                ),
+                turk_error_code: None,
+            })
+        })?;
+
+        let mut store = state.lock();
+        // The HIT's status is settled against the clock first: a HIT whose lifetime has
+        // just elapsed IS `Reviewable`, so it is disposable even though no call has
+        // looked at it since.
+        let now = ::std::time::SystemTime::now();
+        let stored = store.hits.get_mut(&input.hit_id).ok_or_else(|| {
+            // `@idempotent`, but a second delete still has nothing to dispose of: the
+            // real service answers an unknown id with an error rather than a success.
+            DeleteHITErrorModeled::RequestError(RequestError {
+                message: Some(format!("HIT {} does not exist.", input.hit_id)),
+                turk_error_code: None,
+            })
+        })?;
+        crate::state::settle_hit_against_clock(&mut stored.hit, now);
+        let status = stored.hit.hit_status.clone().unwrap_or_default();
+        let hit_type_id = stored.hit.hit_type_id.clone().unwrap_or_default();
+        // "If you call the DeleteHIT operation on a HIT that is not in the Reviewable
+        // state (for example, that has not expired, or still has active assignments) ...
+        // the service will return an error."
+        if status != crate::state::HIT_STATUS_REVIEWABLE {
+            return Err(DeleteHITErrorModeled::RequestError(RequestError {
+                message: Some(format!(
+                    "HIT {} is in state {status} and cannot be deleted; only a HIT in state {} \
+                     can be disposed of.",
+                    input.hit_id,
+                    crate::state::HIT_STATUS_REVIEWABLE
+                )),
+                turk_error_code: None,
+            })
+            .into());
+        }
+        store.hits.remove(&input.hit_id);
+        // Nothing else would ever reclaim what the disposed HIT was the last user of:
+        // its interned HIT type, and the idempotency records that can no longer replay
+        // anything.
+        store.release_hit_type(&hit_type_id);
+        store.forget_request_tokens_for(&input.hit_id);
+
+        Ok(DeleteHITOutput {})
     }
 }

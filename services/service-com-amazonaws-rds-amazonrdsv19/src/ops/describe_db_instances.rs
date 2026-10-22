@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports DB instances out of this service's store.
+//! This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records and their projection onto the modelled wire shapes live in
+//! [`crate::state`], shared with the other implemented DB-instance operations.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +154,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBInstances"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBInstancesError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBInstancesError::validation)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters).map_err(DescribeDBInstancesError::validation)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBInstancesError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones
+        // owed at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the instances of the region it was
+        // signed for.
+        let candidates: Vec<&crate::state::DbInstanceRecord> = match &input.db_instance_identifier {
+            Some(requested) => {
+                let identifier = requested.to_ascii_lowercase();
+                let record = store
+                    .db_instances
+                    .get(&(region.clone(), identifier.clone()))
+                    .ok_or_else(|| {
+                        DescribeDBInstancesError::from(
+                            DescribeDBInstancesErrorModeled::DBInstanceNotFoundFault(
+                                DBInstanceNotFoundFault {
+                                    message: Some(format!("DBInstance {identifier} not found")),
+                                },
+                            ),
+                        )
+                    })?;
+                vec![record]
+            }
+            None => store.instances_in(&region),
+        };
+
+        let matching: Vec<(String, DBInstance)> = candidates
+            .into_iter()
+            .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
+            .map(|record| (record.identifier.clone(), record.to_wire()))
+            .collect();
+
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size);
+        Ok(DescribeDBInstancesOutput {
+            marker: page.next_marker,
+            db_instances: Some(page.items),
+        })
     }
+}
+
+/// The filter names this operation's `Filters` member documents:
+/// "`db-cluster-id`", "`db-instance-id`", "`dbi-resource-id`", "`domain`" and
+/// "`engine`". RDS refuses any other name, and so does this operation — with a 400,
+/// because quietly ignoring a filter would report instances the caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 5] = [
+    "db-cluster-id",
+    "db-instance-id",
+    "dbi-resource-id",
+    "domain",
+    "engine",
+];
+
+/// Refuse a filter this operation does not support. "Filter names are
+/// case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` matches one filter: true when any of the filter's values matches
+/// the member that filter names. "Filter values are case-sensitive."
+fn matches_filter(record: &crate::state::DbInstanceRecord, filter: &Filter) -> bool {
+    filter.values.iter().any(|wanted| match filter.name.as_str() {
+        // "Accepts DB instance identifiers and DB instance Amazon Resource Names
+        // (ARNs)."
+        "db-instance-id" => *wanted == record.identifier || *wanted == record.arn(),
+        "dbi-resource-id" => *wanted == record.dbi_resource_id,
+        "engine" => *wanted == record.engine,
+        "db-cluster-id" => record
+            .db_cluster_identifier
+            .as_ref()
+            .is_some_and(|stored| stored == wanted),
+        "domain" => record.domain.as_ref().is_some_and(|stored| stored == wanted),
+        _ => false,
+    })
 }

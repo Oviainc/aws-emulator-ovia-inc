@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBackend
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBackend`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBackend::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the app record if absent, creates the named backend environment, records an
+//! async job for the call, and answers with that STORED job. Nothing here is canned:
+//! the job id is minted once and inserted into the app's job map, which is the same map
+//! `GetBackendJob` reads.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +150,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBackend` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBackendErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBackend"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBackendError::from(CreateBackendErrorModeled::GatewayTimeoutException(
+                crate::state::store_unavailable(),
+            ))
+        })?;
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // EVERY caller-supplied identifier this call stores is length-bounded, and every
+        // store it can grow is count-bounded, BEFORE anything is inserted: a caller must
+        // not be able to grow the emulator's state without limit. The app bound is
+        // checked first, then the environment bound for an app that already exists (a new
+        // app starts with no environments, so it cannot be over that one).
+        for (member, value) in [
+            ("appId", input.app_id.as_str()),
+            ("appName", input.app_name.as_str()),
+            ("backendEnvironmentName", input.backend_environment_name.as_str()),
+            // Stored on the environment rather than keying it, but bounded all the same.
+            ("resourceName", input.resource_name.as_deref().unwrap_or_default()),
+        ] {
+            if let Err(bad_request) = crate::state::bound_identifier(member, value) {
+                return Err(CreateBackendErrorModeled::BadRequestException(bad_request).into());
+            }
+        }
+        if !store.has_room_for_new_app(&input.app_id) {
+            return Err(CreateBackendErrorModeled::TooManyRequestsException(
+                crate::state::limit_exceeded(
+                    crate::state::LIMIT_TYPE_APPS,
+                    format!(
+                        "this emulator holds a backend for at most {} apps",
+                        crate::state::MAX_APPS
+                    ),
+                ),
+            )
+            .into());
+        }
+        if store.app(&input.app_id).is_some_and(|app| {
+            !app.has_room_for_new_environment(&input.backend_environment_name)
+        }) {
+            return Err(CreateBackendErrorModeled::TooManyRequestsException(
+                crate::state::limit_exceeded(
+                    crate::state::LIMIT_TYPE_ENVIRONMENTS,
+                    format!(
+                        "app {} may hold at most {} backend environments",
+                        input.app_id,
+                        crate::state::MAX_ENVIRONMENTS_PER_APP
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let app = store.app_or_create(&input.app_id, &input.app_name);
+        let app_id = app.app_id.clone();
+
+        // The environment is created on first `CreateBackend` for the name and kept
+        // otherwise, so a repeat call restates its configuration rather than losing the
+        // resources already created inside it.
+        let environment = app
+            .environments
+            .entry(input.backend_environment_name.clone())
+            .or_insert_with(|| {
+                crate::state::BackendEnvironment::new(&input.backend_environment_name, now)
+            });
+        if input.resource_config.is_some() {
+            environment.resource_config = input.resource_config.clone();
+        }
+        if input.resource_name.is_some() {
+            environment.resource_name = input.resource_name.clone();
+        }
+
+        // The third store this call grows — the app's job map — is bounded here, before
+        // the record is added: `reclaim_job_capacity` reclaims the app's OLDEST jobs
+        // until there is room for one more, so the map holds at most
+        // `MAX_RETAINED_JOBS_PER_APP` records however often this operation is called. A
+        // job is a receipt for work already accepted, so the bound reclaims rather than
+        // refuses: an app that has run many jobs must stay usable.
+        app.reclaim_job_capacity();
+        let job = app.record_job(
+            &input.backend_environment_name,
+            crate::state::OPERATION_CREATE_BACKEND,
+            now,
+        );
+        Ok(CreateBackendOutput {
+            app_id: Some(app_id),
+            backend_environment_name: Some(job.backend_environment_name.clone()),
+            error: job.error.clone(),
+            job_id: Some(job.job_id.clone()),
+            operation: Some(job.operation.clone()),
+            status: Some(job.status.clone()),
+        })
     }
 }

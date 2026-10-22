@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Digests the id counter into the modelled GuidString MeetingId/AttendeeId and the
+# opaque Attendee JoinToken.
+sha2 = { workspace = true }
+# Hex codec for the minted ids, the join token and the opaque ListAttendees NextToken.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

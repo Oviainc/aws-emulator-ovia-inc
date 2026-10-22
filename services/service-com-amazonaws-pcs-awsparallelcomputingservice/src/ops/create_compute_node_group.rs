@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateComputeNodeGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateComputeNodeGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateComputeNodeGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a compute node group id and ARN under its parent cluster, persists the record
+//! in [`crate::state`], and answers from the STORED record.
 //!
 //! ## Shape of an operation
 //!
@@ -226,18 +219,236 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateComputeNodeGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateComputeNodeGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateComputeNodeGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateComputeNodeGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PCS emulator holds no state on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `computeNodeGroupName` carries the same lookahead `@pattern` as every other
+        // PCS resource name, which the boundary validator cannot compile.
+        if let Some(message) = crate::state::resource_name_violation(
+            "computeNodeGroupName",
+            &input.compute_node_group_name,
+        ) {
+            return Err(CreateComputeNodeGroupErrorModeled::ValidationException(
+                crate::state::field_validation("computeNodeGroupName", message),
+            )
+            .into());
+        }
+
+        // The caller-sized lists this create would PERSIST. The model bounds neither
+        // `StringList` nor `InstanceList`, so one request could otherwise size one
+        // stored record arbitrarily. `tags` needs no entry: `RequestTagMap` is modelled
+        // `@length(min: 1, max: 200)` with bounded keys and values, enforced at the
+        // boundary.
+        let slurm = input.slurm_configuration.as_ref();
+        let stored_lists: [(&str, usize); 3] = [
+            ("subnetIds", input.subnet_ids.len()),
+            ("instanceConfigs", input.instance_configs.len()),
+            (
+                "slurmConfiguration.slurmCustomSettings",
+                slurm.map_or(0, |slurm| {
+                    slurm.slurm_custom_settings.as_ref().map_or(0, Vec::len)
+                }),
+            ),
+        ];
+        for (member, entries) in stored_lists {
+            if let Some(message) = crate::state::stored_list_violation(member, entries) {
+                return Err(CreateComputeNodeGroupErrorModeled::ValidationException(
+                    crate::state::field_validation(member, message),
+                )
+                .into());
+            }
+        }
+
+        // A scaling range the cluster could never satisfy. The model bounds each member
+        // on its own; that `minInstanceCount` must not exceed `maxInstanceCount` is a
+        // cross-member rule only the service can state.
+        let scaling = &input.scaling_configuration;
+        if scaling.min_instance_count > scaling.max_instance_count {
+            return Err(CreateComputeNodeGroupErrorModeled::ValidationException(
+                crate::state::field_validation(
+                    "scalingConfiguration",
+                    format!(
+                        "minInstanceCount ({}) must not exceed maxInstanceCount ({})",
+                        scaling.min_instance_count, scaling.max_instance_count
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+        state.settle();
+
+        let Some(cluster_id) = state.cluster_id_for(&input.cluster_identifier) else {
+            return Err(CreateComputeNodeGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no cluster identified by {}", input.cluster_identifier),
+                    resource_id: input.cluster_identifier.clone(),
+                    resource_type: "cluster".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // An `@idempotencyToken` retry returns the first call's result and has no
+        // further effect. The token is remembered with the cluster the first call
+        // created the group in, so a retry naming a DIFFERENT cluster cannot slip past
+        // the replay and create a second group: it conflicts.
+        if let Some(remembered) = state
+            .remembered_create(Self::NAME, input.client_token.as_ref())
+            .cloned()
+        {
+            let first = (remembered.cluster_id.as_deref() == Some(cluster_id.as_str()))
+                .then(|| {
+                    state
+                        .clusters
+                        .get(&cluster_id)
+                        .and_then(|cluster| cluster.compute_node_groups.get(&remembered.resource_id))
+                })
+                .flatten();
+            let Some(first) = first else {
+                return Err(CreateComputeNodeGroupErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "clientToken was already used to create compute node group {}",
+                            remembered.resource_id
+                        ),
+                        resource_id: remembered.resource_id,
+                        resource_type: "computenodegroup".to_string(),
+                    },
+                )
+                .into());
+            };
+            return Ok(CreateComputeNodeGroupOutput {
+                compute_node_group: Some(first.to_api()),
+            });
+        }
+
+        let Some(cluster) = state.clusters.get(&cluster_id) else {
+            return Err(CreateComputeNodeGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the cluster disappeared while it was being read".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // PCS adds a compute node group to a cluster that is ACTIVE; one that is still
+        // provisioning, or on its way out, cannot take one.
+        if cluster.status != crate::state::STATUS_ACTIVE {
+            return Err(CreateComputeNodeGroupErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "cluster {} is in {} status, not {}",
+                        cluster.id,
+                        cluster.status,
+                        crate::state::STATUS_ACTIVE
+                    ),
+                    resource_id: cluster.id.clone(),
+                    resource_type: "cluster".to_string(),
+                },
+            )
+            .into());
+        }
+
+        if let Some(existing) = cluster
+            .compute_node_groups
+            .values()
+            .find(|group| group.name == input.compute_node_group_name)
+        {
+            return Err(CreateComputeNodeGroupErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a compute node group named {} already exists in cluster {}",
+                        input.compute_node_group_name, cluster.id
+                    ),
+                    resource_id: existing.id.clone(),
+                    resource_type: "computenodegroup".to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The cluster's ceiling, answered the way PCS answers a reached compute node
+        // group quota for a cluster.
+        if cluster.compute_node_groups.len() >= crate::state::MAX_COMPUTE_NODE_GROUPS_PER_CLUSTER {
+            return Err(
+                CreateComputeNodeGroupErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        "computenodegroup",
+                        crate::state::MAX_COMPUTE_NODE_GROUPS_PER_CLUSTER,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let (seq, id) = state.mint_id();
+        let region = crate::state::request_region(ctx);
+        let now = crate::state::now_date_time();
+        let Some(cluster) = state.clusters.get_mut(&cluster_id) else {
+            return Err(CreateComputeNodeGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the cluster disappeared while it was being written".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let record = crate::state::ComputeNodeGroupRecord {
+            seq,
+            arn: crate::state::compute_node_group_arn(&region, &cluster.id, &id),
+            id: id.clone(),
+            name: input.compute_node_group_name,
+            cluster_id: cluster.id.clone(),
+            status: crate::state::STATUS_CREATING.to_string(),
+            created_at: now,
+            modified_at: now,
+            ami_id: input.ami_id,
+            subnet_ids: input.subnet_ids,
+            purchase_option: input.purchase_option,
+            custom_launch_template: input.custom_launch_template,
+            iam_instance_profile_arn: input.iam_instance_profile_arn,
+            scaling_configuration: input.scaling_configuration.into(),
+            instance_configs: input.instance_configs,
+            spot_options: input.spot_options,
+            slurm_configuration: input.slurm_configuration.map(Into::into),
+            node_lifecycle_actions: input.node_lifecycle_actions.map(Into::into),
+            error_info: Vec::new(),
+            tags: input.tags.unwrap_or_default(),
+            pending: Some(crate::state::Pending::in_a_span(
+                crate::state::PendingChange::Activate,
+            )),
+        };
+        cluster.compute_node_groups.insert(id.clone(), record);
+        state.remember_create(
+            Self::NAME,
+            input.client_token.as_ref(),
+            Some(&cluster_id),
+            &id,
+        );
+
+        // Answered from the STORED record, so a create and a later read cannot differ.
+        let Some(stored) = state
+            .clusters
+            .get(&cluster_id)
+            .and_then(|cluster| cluster.compute_node_groups.get(&id))
+        else {
+            return Err(CreateComputeNodeGroupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the compute node group was not persisted".to_string(),
+                },
+            )
+            .into());
+        };
+        Ok(CreateComputeNodeGroupOutput {
+            compute_node_group: Some(stored.to_api()),
+        })
     }
 }

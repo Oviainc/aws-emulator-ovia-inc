@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLinkedWhatsAppBusinessAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLinkedWhatsAppBusinessAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLinkedWhatsAppBusinessAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the linked WhatsApp Business Accounts in the store, one summary per
+//! account, ordered by id so a cursor is stable. `maxResults` bounds the page and
+//! `nextToken` resumes from where the previous page stopped. A reporting operation
+//! (`@readonly`): it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLinkedWhatsAppBusinessAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLinkedWhatsAppBusinessAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLinkedWhatsAppBusinessAccounts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLinkedWhatsAppBusinessAccountsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the social-messaging store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // Sorted, so the cursor below names a position every page agrees on.
+        let mut ids: Vec<&String> = store.linked_accounts.keys().collect();
+        ids.sort();
+
+        // The token IS the id the next page starts at, so a page resumes even if the
+        // account it named was unlinked in between.
+        let start = match input.next_token.as_deref() {
+            Some(token) => ids.partition_point(|id| id.as_str() < token),
+            None => 0,
+        };
+        // The model's `MaxResults` range is 1..100, so the boundary validator has
+        // already refused anything outside it and the conversion cannot fail; a page
+        // of one is the smallest the range allows, so that is what a value the
+        // compiler cannot rule out would fall back to.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::MAX_RESULTS_LIMIT),
+        )
+        .unwrap_or(1);
+
+        let remaining = &ids[start..];
+        let (page, next_token) = if remaining.len() > page_size {
+            (
+                &remaining[..page_size],
+                Some(remaining[page_size].to_string()),
+            )
+        } else {
+            (remaining, None)
+        };
+
+        let linked_accounts = page
+            .iter()
+            .filter_map(|id| store.linked_accounts.get(*id))
+            .map(crate::state::LinkedAccount::to_summary)
+            .collect();
+
+        Ok(ListLinkedWhatsAppBusinessAccountsOutput {
+            linked_accounts: Some(linked_accounts),
+            next_token,
+        })
     }
 }

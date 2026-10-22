@@ -20,8 +20,8 @@ use service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::state::MAX_DASH
 use service_com_amazonaws_bcmdashboards_awsbcmdashboardsservice::EmulatedService;
 
 /// A router serving this one service over a fresh engine, as `build_router` does
-/// in production.
-fn router() -> MultiServiceRouter {
+/// in production. Shared with the sibling audit suite.
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -30,7 +30,11 @@ fn router() -> MultiServiceRouter {
 }
 
 /// Call one operation and return `(http status, parsed body)`.
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -67,11 +71,19 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// Succeed-or-explain: the call must answer 200.
-async fn ok_call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+pub(crate) async fn ok_call(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
     let (status, parsed) = call(router, operation, body).await;
     assert_eq!(status, 200, "{operation} expected 200, got {status}: {parsed}");
     parsed
 }
+
+/// The access key id the requests [`call`] builds present, which an audit record must
+/// attribute the call to.
+pub(crate) const PRESENTED_AKID: &str = "AKIDEXAMPLE";
+
+/// The `Host` the requests [`call`] builds address, which an audit record reports as the
+/// request's source.
+pub(crate) const REQUEST_SOURCE: &str = "bcm-dashboards.us-east-1.amazonaws.com";
 
 /// The wire error code (`__type`) of an error body.
 fn error_code(body: &Value) -> String {

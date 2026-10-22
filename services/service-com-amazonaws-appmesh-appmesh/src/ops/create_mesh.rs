@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMesh
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMesh`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMesh::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: see the handler at the bottom of this file.
+//! The mesh is persisted in [`crate::state::ComAmazonawsAppmeshAppmeshState`] with a
+//! minted ARN and uid, `version` 1, `createdAt == lastUpdatedAt`, and status `ACTIVE`;
+//! the response is rendered from the record that was just stored, so `DescribeMesh` and
+//! `ListMeshes` report the same values. A name that is already taken is a
+//! `ConflictException`, except when the request replays the `clientToken` the stored
+//! mesh was created with: `CreateMesh` is `@idempotent`, so that replay is answered
+//! with the mesh the first call made.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +170,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMesh` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMeshErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMesh"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateMeshErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the App Mesh emulator state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        // Build the record the request asks for first, so the replay check below can
+        // compare the whole specification and not just the token.
+        let candidate = crate::state::Mesh::new(
+            &region,
+            input.mesh_name,
+            input.spec.unwrap_or_default(),
+            input.tags.unwrap_or_default(),
+            input.client_token,
+        );
+        let mut store = state.lock();
+
+        if let Some(existing) = store.meshes.get(&candidate.name) {
+            // `clientToken` is an `@idempotencyToken` on an `@idempotent` operation, so
+            // the same create call replayed answers with the mesh it already made.
+            // Anything else aimed at a name that is taken — including the same token
+            // with a different spec — is a conflict.
+            if existing.is_replay_of(&candidate) {
+                return Ok(CreateMeshOutput {
+                    mesh: existing.to_data(),
+                });
+            }
+            return Err(CreateMeshErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "A mesh named {} already exists in this account.",
+                    candidate.name
+                )),
+            })
+            .into());
+        }
+
+        // The store is bounded: past the meshes-per-account quota a create is refused
+        // rather than growing it further.
+        if store.meshes.len() >= crate::state::MAX_MESHES_PER_ACCOUNT {
+            return Err(CreateMeshErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the maximum number of meshes ({}) allowed for this \
+                         account.",
+                        crate::state::MAX_MESHES_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Render the response from the STORED record rather than from the value just
+        // built, so a create can never report something a later describe would not.
+        let name = candidate.name.clone();
+        let stored = store.meshes.entry(name).or_insert(candidate);
+        Ok(CreateMeshOutput {
+            mesh: stored.to_data(),
+        })
     }
 }

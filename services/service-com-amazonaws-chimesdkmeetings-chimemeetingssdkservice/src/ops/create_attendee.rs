@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAttendee
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAttendee`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAttendee::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds an attendee to a PERSISTED meeting: the meeting must be in the store, the
+//! `AttendeeId` is a fresh `GuidString`, the `JoinToken` is minted opaquely, absent
+//! `Capabilities` take the documented defaults, and the attendee is stored under its
+//! meeting so `GetAttendee` / `ListAttendees` read back exactly this record.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +166,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAttendee` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAttendeeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAttendee"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAttendeeErrorModeled::ServiceFailureException(crate::state::store_unavailable())
+        })?;
+        let mut store = state.lock();
+
+        // An attendee exists only inside a meeting, so a `MeetingId` that names none is
+        // the modelled `NotFoundException` — and nothing is minted for it.
+        let Some(meeting) = store.meetings.get(&input.meeting_id) else {
+            return Err(CreateAttendeeErrorModeled::NotFoundException(
+                crate::state::meeting_not_found(&input.meeting_id),
+            )
+            .into());
+        };
+        // The meeting's own features decide both the capability rules and the attendee
+        // ceiling, so they are read from the STORED meeting, not from this request.
+        let features = meeting.meeting.meeting_features.clone();
+        let attendee_count = meeting.attendees.len();
+
+        let capabilities = match input.capabilities {
+            Some(requested) => {
+                if let Some(problem) =
+                    crate::state::capability_problem(&requested, features.as_ref())
+                {
+                    return Err(CreateAttendeeErrorModeled::BadRequestException(
+                        crate::state::bad_request(problem),
+                    )
+                    .into());
+                }
+                requested
+            }
+            None => crate::state::default_capabilities(features.as_ref()),
+        };
+
+        let ceiling = crate::state::attendee_ceiling(features.as_ref());
+        if attendee_count >= ceiling {
+            return Err(CreateAttendeeErrorModeled::LimitExceededException(
+                crate::state::attendee_limit_reached(&input.meeting_id, ceiling),
+            )
+            .into());
+        }
+
+        let attendee_id = store.mint_attendee_id(&input.meeting_id);
+        let join_token = store.mint_join_token(&input.meeting_id, &attendee_id);
+        let attendee = Attendee {
+            // Server-owned: the id and the join token are minted here.
+            attendee_id: Some(attendee_id.clone()),
+            join_token: Some(join_token),
+            // Caller-owned, or the documented default.
+            external_user_id: Some(input.external_user_id),
+            capabilities: Some(capabilities),
+        };
+
+        let Some(meeting) = store.meetings.get_mut(&input.meeting_id) else {
+            return Err(CreateAttendeeErrorModeled::NotFoundException(
+                crate::state::meeting_not_found(&input.meeting_id),
+            )
+            .into());
+        };
+        meeting.attendees.insert(attendee_id.clone(), attendee);
+
+        // Project the response from the STORED record, so what the caller sees is exactly
+        // what a later `GetAttendee` reads back.
+        let created = store
+            .meetings
+            .get(&input.meeting_id)
+            .and_then(|meeting| meeting.attendees.get(&attendee_id));
+        let Some(created) = created else {
+            return Err(CreateAttendeeErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+        Ok(CreateAttendeeOutput {
+            attendee: Some(created.clone()),
+        })
     }
 }

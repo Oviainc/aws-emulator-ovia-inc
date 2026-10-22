@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSlackChannelConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSlackChannelConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: mints a `ChatConfigurationArn` for `ConfigurationName`, persists the
+//! whole configuration in [`crate::state`], and answers with the stored record
+//! projected through [`crate::state::SlackChannelConfigRecord::view`]. A second create
+//! for a `ConfigurationName` that already exists in the request's region is a 409
+//! `ConflictException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSlackChannelConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A create past [`crate::state::MAX_SLACK_CHANNEL_CONFIGURATIONS`] is refused with
+//! `LimitExceededException`, so repeated creates cannot grow the store without bound.
+//!
+//! It returns the created configuration read back out of the store, so a later
+//! `DescribeSlackChannelConfigurations` answers the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +173,94 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSlackChannelConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSlackChannelConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSlackChannelConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateSlackChannelConfigurationErrorModeled::CreateSlackChannelConfigurationException(
+                CreateSlackChannelConfigurationException {
+                    message: Some("the chatbot configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // Resources are regional, so a configuration name is unique per region and the
+        // minted ARN, which carries the region, is the store's key.
+        let region = crate::state::request_region(ctx.parts());
+        let chat_configuration_arn =
+            crate::state::slack_channel_configuration_arn(&region, &input.configuration_name);
+
+        let mut store = state.lock();
+        if store
+            .slack_channel_configurations
+            .contains_key(&chat_configuration_arn)
+        {
+            return Err(
+                CreateSlackChannelConfigurationErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "a chat configuration named {} already exists",
+                        input.configuration_name
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        // The store is bounded: past the cap a create is refused rather than grown. The
+        // count is the WHOLE store's, not the region's, so signing for another region
+        // does not hand the caller a fresh budget.
+        if store.slack_channel_configurations.len() >= crate::state::MAX_SLACK_CHANNEL_CONFIGURATIONS
+        {
+            return Err(
+                CreateSlackChannelConfigurationErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} Slack channel \
+                             configurations",
+                            crate::state::MAX_SLACK_CHANNEL_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = crate::state::SlackChannelConfigRecord {
+            chat_configuration_arn: chat_configuration_arn.clone(),
+            configuration_name: input.configuration_name,
+            region,
+            // The Slack workspace's display name is not in this request, and the
+            // workspace-authorization operations that would carry it are still
+            // scaffolded, so the stored record names the workspace by its id.
+            // TODO: take the real display name from the workspace record once
+            // `DescribeSlackWorkspaces` is implemented.
+            slack_team_name: input.slack_team_id.clone(),
+            slack_team_id: input.slack_team_id,
+            // `SlackChannelName` is optional on input but required on the
+            // configuration, so an omitted name leaves the channel named by its id.
+            slack_channel_name: input
+                .slack_channel_name
+                .unwrap_or_else(|| input.slack_channel_id.clone()),
+            slack_channel_id: input.slack_channel_id,
+            iam_role_arn: input.iam_role_arn,
+            sns_topic_arns: input.sns_topic_arns.unwrap_or_default(),
+            logging_level: input.logging_level,
+            guardrail_policy_arns: input.guardrail_policy_arns.unwrap_or_default(),
+            user_authorization_required: input.user_authorization_required,
+            state: crate::state::STATE_ENABLED.to_string(),
+            state_reason: None,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| (tag.tag_key, tag.tag_value))
+                .collect(),
+        };
+
+        let channel_configuration = record.view();
+        store
+            .slack_channel_configurations
+            .insert(chat_configuration_arn, record);
+
+        Ok(CreateSlackChannelConfigurationOutput {
+            channel_configuration: Some(channel_configuration),
+        })
     }
 }

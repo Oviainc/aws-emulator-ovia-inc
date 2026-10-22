@@ -33,7 +33,10 @@ use smithy_server_runtime::MultiServiceRouter;
 const PAST_JOB_COMPLETION: Duration = Duration::from_millis(900);
 
 /// The emulator, with this one service mounted on a shared engine.
-fn harness() -> MultiServiceRouter {
+///
+/// `pub(crate)` here and below: the other suites of this test target share this one
+/// harness rather than each standing up its own.
+pub(crate) fn harness() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -41,7 +44,11 @@ fn harness() -> MultiServiceRouter {
     router
 }
 
-async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -56,7 +63,7 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// The wire error code (`__type`), without its namespace.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -66,14 +73,14 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn blocks_of(body: &Value) -> Vec<Value> {
+pub(crate) fn blocks_of(body: &Value) -> Vec<Value> {
     body.get("Blocks")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
 }
 
-fn block_type(block: &Value) -> &str {
+pub(crate) fn block_type(block: &Value) -> &str {
     block
         .get("BlockType")
         .and_then(Value::as_str)
@@ -84,11 +91,11 @@ fn block_text(block: &Value) -> &str {
     block.get("Text").and_then(Value::as_str).unwrap_or_default()
 }
 
-fn block_id(block: &Value) -> &str {
+pub(crate) fn block_id(block: &Value) -> &str {
     block.get("Id").and_then(Value::as_str).unwrap_or_default()
 }
 
-fn of_type<'a>(blocks: &'a [Value], wanted: &str) -> Vec<&'a Value> {
+pub(crate) fn of_type<'a>(blocks: &'a [Value], wanted: &str) -> Vec<&'a Value> {
     blocks
         .iter()
         .filter(|block| block_type(block) == wanted)
@@ -129,7 +136,7 @@ fn collapse(text: &str) -> String {
 
 /// Every invariant a Textract block graph holds, whatever the document or the
 /// requested features.
-fn assert_block_graph(case: &str, body: &Value, blocks: &[Value]) {
+pub(crate) fn assert_block_graph(case: &str, body: &Value, blocks: &[Value]) {
     let pages = body
         .get("DocumentMetadata")
         .and_then(|m| m.get("Pages"))
@@ -333,7 +340,7 @@ fn line_texts(blocks: &[Value]) -> Vec<String> {
         .collect()
 }
 
-fn text_document(text: &str) -> Value {
+pub(crate) fn text_document(text: &str) -> Value {
     json!({ "Bytes": aws_smithy_types::base64::encode(text.as_bytes()) })
 }
 

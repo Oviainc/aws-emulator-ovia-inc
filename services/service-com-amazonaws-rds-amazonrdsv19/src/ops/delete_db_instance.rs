@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDBInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation removes the stored DB instance, taking the requested
+//! final snapshot first. This is the ONLY file to touch for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDBInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Its records and their projection onto the modelled wire shapes live in
+//! [`crate::state`], shared with the other implemented operations.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +194,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDBInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDBInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDBInstance"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DeleteDBInstanceError::validation)?;
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+        // `SkipFinalSnapshot`: "By default, skip isn't enabled, and the DB snapshot is
+        // created" — and "If you don't enable this parameter, you must specify the
+        // FinalDBSnapshotIdentifier parameter", while enabling both "results in an
+        // error". Neither combination has a modelled error, so both are refused as a
+        // 400 `ValidationException` naming the members.
+        let skip_final_snapshot = input.skip_final_snapshot.unwrap_or(false);
+        match (skip_final_snapshot, &input.final_db_snapshot_identifier) {
+            (true, Some(_)) => {
+                return Err(DeleteDBInstanceError::validation(
+                    "FinalDBSnapshotIdentifier can't be specified when SkipFinalSnapshot is enabled",
+                ));
+            }
+            (false, None) => {
+                return Err(DeleteDBInstanceError::validation(
+                    "FinalDBSnapshotIdentifier must be specified unless SkipFinalSnapshot is enabled",
+                ));
+            }
+            _ => {}
+        }
+        if let Some(snapshot_identifier) = &input.final_db_snapshot_identifier {
+            crate::state::check_identifier(
+                "FinalDBSnapshotIdentifier",
+                snapshot_identifier,
+                255,
+            )
+            .map_err(DeleteDBInstanceError::validation)?;
+        }
+
+        // No store means this service was mounted on an engine it has no state in,
+        // so it cannot serve the operation at all. Unreachable with the engine the
+        // router builds; 501 is the honest answer, never a fabricated success.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        if !store.db_instances.contains_key(&key) {
+            return Err(DeleteDBInstanceErrorModeled::DBInstanceNotFoundFault(
+                DBInstanceNotFoundFault {
+                    message: Some(format!("DBInstance {identifier} not found")),
+                },
+            )
+            .into());
+        }
+        // "The database can't be deleted when deletion protection is enabled."
+        if store.db_instances[&key].deletion_protection {
+            return Err(DeleteDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} can't be deleted because deletion protection is enabled"
+                    )),
+                },
+            )
+            .into());
+        }
+        // Nor can one that is still coming up or already on its way out: RDS answers
+        // the same state fault, and the state the clock has yet to settle is real.
+        let current_status = store.db_instances[&key].status.clone();
+        if current_status != "available" && current_status != "modifying" {
+            return Err(DeleteDBInstanceErrorModeled::InvalidDBInstanceStateFault(
+                InvalidDBInstanceStateFault {
+                    message: Some(format!(
+                        "DB instance {identifier} is not available for deletion (status {current_status})"
+                    )),
+                },
+            )
+            .into());
+        }
+        if let Some(snapshot_identifier) = &input.final_db_snapshot_identifier {
+            let snapshot_key = (region.clone(), snapshot_identifier.clone());
+            if store.db_snapshots.contains_key(&snapshot_key) {
+                return Err(DeleteDBInstanceErrorModeled::DBSnapshotAlreadyExistsFault(
+                    DBSnapshotAlreadyExistsFault {
+                        message: Some(format!(
+                            "DB snapshot already exists: {snapshot_identifier}"
+                        )),
+                    },
+                )
+                .into());
+            }
+            // The region's manual DB snapshot quota applies to the final snapshot too.
+            if store.snapshots_in(&region).len() >= crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
+                || !store.has_room_for_region(&region)
+            {
+                return Err(DeleteDBInstanceErrorModeled::SnapshotQuotaExceededFault(
+                    SnapshotQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of manual DB snapshots ({})",
+                            crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
+                        )),
+                    },
+                )
+                .into());
+            }
+            let source = &store.db_instances[&key];
+            let snapshot = crate::state::DbSnapshotRecord::from_instance(
+                source,
+                snapshot_identifier,
+                source.tags.clone(),
+            );
+            store.db_snapshots.insert(snapshot_key, snapshot);
+        }
+
+        let mut record = store
+            .db_instances
+            .remove(&key)
+            .expect("the instance was found above and the store is locked");
+        // The instance is gone from the store, so the next read of this identifier is
+        // a 404; the response reports the status the deletion leaves it in.
+        record.status = "deleting".to_string();
+        record.pending_status = None;
+
+        Ok(DeleteDBInstanceOutput {
+            db_instance: Some(record.to_wire()),
+        })
     }
 }

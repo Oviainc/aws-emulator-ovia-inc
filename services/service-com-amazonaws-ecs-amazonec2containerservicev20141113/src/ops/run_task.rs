@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RunTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RunTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RunTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Places `count` tasks of a stored task-definition revision into a stored cluster.
+//! Each task is persisted — ARN, containers derived from the STORED container
+//! definitions, timestamps — so `DescribeTasks`, `ListTasks` and the cluster counters
+//! all read the same record back. A task is answered in `PENDING`, the status AWS
+//! reports for a task that has not started yet; the move to `RUNNING` is owed by the
+//! clock (see `crate::state`).
 //!
 //! ## Shape of an operation
 //!
@@ -293,18 +290,221 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RunTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RunTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RunTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RunTaskErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let count = input.count.unwrap_or(1);
+        if !(1..=crate::state::MAX_RUN_TASK_COUNT).contains(&count) {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "count must be between 1 and {}; got {count}",
+                        crate::state::MAX_RUN_TASK_COUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A task can use either a launch type or a capacity provider strategy. If a
+        // launchType is specified, the capacityProviderStrategy parameter must be
+        // omitted."
+        let strategy = input.capacity_provider_strategy.clone().unwrap_or_default();
+        if !strategy.is_empty() && input.launch_type.is_some() {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "launchType must be omitted when capacityProviderStrategy is \
+                         specified"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "An error will be received if you specify the SERVICE option when running a
+        // task."
+        if input.propagate_tags.as_deref() == Some("SERVICE") {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        "propagateTags must not be SERVICE when running a task".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let Some((family, requested_revision)) =
+            crate::state::parse_task_definition_reference(&input.task_definition)
+        else {
+            return Err(RunTaskErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "taskDefinition must be a family, family:revision or task-definition \
+                     ARN; got {:?}",
+                    input.task_definition
+                )),
+            })
+            .into());
+        };
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        guard.advance_clock(now);
+
+        let Some(cluster) = guard.clusters.get(&cluster_name) else {
+            return Err(RunTaskErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                },
+            )
+            .into());
+        };
+        let cluster_arn = cluster.arn.clone();
+        let cluster_default_strategy = cluster.default_capacity_provider_strategy.clone();
+
+        // "If a revision isn't specified, the latest ACTIVE revision is used."
+        let definition = match requested_revision {
+            Some(revision) => guard.task_definitions.get(&(family.clone(), revision)),
+            None => guard.latest_active_revision(&family),
+        };
+        let Some(definition) = definition.cloned() else {
+            return Err(RunTaskErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "unable to describe task definition {:?}",
+                    input.task_definition
+                )),
+            })
+            .into());
+        };
+
+        let requested = usize::try_from(count).unwrap_or(usize::MAX);
+        if guard.tasks.len() + requested > crate::state::MAX_TASKS {
+            return Err(RunTaskErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "this emulator holds at most {} tasks; stop some before running more",
+                    crate::state::MAX_TASKS
+                )),
+            })
+            .into());
+        }
+
+        // "If no capacityProviderStrategy or launchType is specified, the
+        // defaultCapacityProviderStrategy for the cluster is used" — and when the
+        // cluster has none either, the task runs on the EC2 capacity registered to it.
+        let effective_strategy = if strategy.is_empty() {
+            cluster_default_strategy
+        } else {
+            strategy
+        };
+        let (launch_type, capacity_provider_name) = match input.launch_type.clone() {
+            Some(launch_type) => (Some(launch_type), None),
+            None => match effective_strategy.first() {
+                Some(item) => (None, Some(item.capacity_provider.clone())),
+                None => (Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string()), None),
+            },
+        };
+
+        // "The default value is the family name of the task definition (for example,
+        // family:my-family-name)."
+        let group = input
+            .group
+            .clone()
+            .unwrap_or_else(|| format!("family:{}", definition.family));
+
+        // "Specifies whether to propagate the tags from the task definition to the
+        // task. If no value is specified, the tags aren't propagated."
+        let mut tags = Vec::new();
+        if input.propagate_tags.as_deref() == Some("TASK_DEFINITION") {
+            tags.extend(definition.tags.iter().cloned());
+        }
+        for tag in input.tags.iter().flatten() {
+            if !tags.iter().any(|existing: &Tag| existing.key == tag.key) {
+                tags.push(tag.clone());
+            }
+        }
+
+        let created_at = crate::state::now();
+        let running_due_at = now + crate::state::TRANSITION_SPAN;
+        let mut created = Vec::with_capacity(requested);
+        for _ in 0..count {
+            let task_id = guard.next_task_id();
+            let task_arn = crate::state::task_arn(&region, &cluster_name, &task_id);
+            let containers = definition
+                .container_definitions
+                .iter()
+                .map(|container| {
+                    let container_id = guard.next_container_id();
+                    crate::state::ContainerRecord {
+                        container_arn: crate::state::container_arn(
+                            &region,
+                            &cluster_name,
+                            &task_id,
+                            &container_id,
+                        ),
+                        task_arn: task_arn.clone(),
+                        name: container.name.clone(),
+                        image: container.image.clone(),
+                        last_status: crate::state::STATUS_PENDING.to_string(),
+                        // `Container$cpu`: "The value is 0 if no value was specified in
+                        // the container definition" — which is what the modelled
+                        // non-optional `cpu` already holds.
+                        cpu: Some(container.cpu.to_string()),
+                        memory: container.memory.map(|memory| memory.to_string()),
+                        memory_reservation: container
+                            .memory_reservation
+                            .map(|memory| memory.to_string()),
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let record = crate::state::TaskRecord {
+                task_arn: task_arn.clone(),
+                task_id,
+                cluster_name: cluster_name.clone(),
+                cluster_arn: cluster_arn.clone(),
+                task_definition_arn: definition.arn.clone(),
+                family: definition.family.clone(),
+                last_status: crate::state::STATUS_PENDING.to_string(),
+                desired_status: crate::state::STATUS_RUNNING.to_string(),
+                containers,
+                cpu: definition.cpu.clone(),
+                memory: definition.memory.clone(),
+                overrides: input.overrides.clone(),
+                launch_type: launch_type.clone(),
+                capacity_provider_name: capacity_provider_name.clone(),
+                platform_version: input.platform_version.clone(),
+                started_by: input.started_by.clone(),
+                group: group.clone(),
+                tags: tags.clone(),
+                enable_execute_command: input.enable_execute_command,
+                created_at,
+                started_at: None,
+                stopping_at: None,
+                stopped_at: None,
+                execution_stopped_at: None,
+                stopped_reason: None,
+                stop_code: None,
+                version: 1,
+                running_due_at: Some(running_due_at),
+                stopped_due_at: None,
+            };
+            // `RunTask` has no `include` member to narrow the response with, so the
+            // task it just created is reported with the tags it was created with.
+            created.push(record.view(true));
+            guard.tasks.insert(task_arn, record);
+        }
+
+        Ok(RunTaskOutput {
+            tasks: Some(created),
+            failures: Some(Vec::new()),
+        })
     }
 }

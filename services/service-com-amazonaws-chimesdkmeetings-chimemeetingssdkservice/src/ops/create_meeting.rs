@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMeeting
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMeeting`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMeeting::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a meeting and PERSISTS it: the `MeetingId` is a fresh `GuidString`, the
+//! `MediaPlacement` and the `MeetingArn` are derived from that id (so every later read
+//! reports the same values), and the record the response carries is the one read back out
+//! of the store. A replayed `ClientRequestToken` returns the meeting the first call
+//! created rather than minting a second one.
 //!
 //! ## Shape of an operation
 //!
@@ -192,18 +188,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMeeting` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMeetingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMeeting"))
+        // `ctx` carries request metadata only; nothing about a meeting depends on it —
+        // the Region a meeting's ARN and media endpoints are scoped to is the request's
+        // own `MediaRegion` member, not the Region it was signed for.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateMeetingErrorModeled::ServiceFailureException(crate::state::store_unavailable())
+        })?;
+        let mut store = state.lock();
+
+        // `ClientRequestToken` is `@idempotencyToken`: a replay returns the meeting the
+        // first call created, so a client that retries does not accumulate meetings.
+        let replayed = store
+            .meeting_by_client_request_token
+            .get(&input.client_request_token)
+            .and_then(|meeting_id| store.meetings.get(meeting_id))
+            .map(|stored| stored.meeting.clone());
+        if let Some(meeting) = replayed {
+            return Ok(CreateMeetingOutput {
+                meeting: Some(meeting),
+            });
+        }
+
+        // The ceiling is checked BEFORE anything is minted or stored, so a refused create
+        // leaves the store exactly as it was.
+        if store.meetings.len() >= crate::state::MAX_MEETINGS {
+            return Err(CreateMeetingErrorModeled::LimitExceededException(
+                crate::state::meeting_limit_reached(),
+            )
+            .into());
+        }
+
+        let meeting_id = store.mint_meeting_id();
+        let meeting = Meeting {
+            // Server-owned: the media endpoints and the ARN are DERIVED from the minted
+            // id, never taken from the request.
+            media_placement: Some(crate::state::media_placement(
+                &meeting_id,
+                &input.media_region,
+            )),
+            meeting_arn: Some(crate::state::meeting_arn(&meeting_id, &input.media_region)),
+            meeting_id: Some(meeting_id.clone()),
+            // Caller-owned: stored as supplied, so a reader reports what was asked for.
+            // `MeetingFeatures` is NOT filled in with the resolution defaults the model
+            // documents — those are what an ABSENT member MEANS (see
+            // `crate::state::video_max_resolution`), and echoing a configuration the
+            // caller never sent would claim the meeting carries one.
+            meeting_host_id: input.meeting_host_id,
+            external_meeting_id: Some(input.external_meeting_id),
+            media_region: Some(input.media_region),
+            meeting_features: input.meeting_features,
+            primary_meeting_id: input.primary_meeting_id,
+            tenant_ids: input.tenant_ids,
+        };
+
+        store
+            .meeting_by_client_request_token
+            .insert(input.client_request_token.clone(), meeting_id.clone());
+        store.meetings.insert(
+            meeting_id.clone(),
+            crate::state::StoredMeeting {
+                meeting,
+                attendees: ::std::collections::BTreeMap::new(),
+                notifications_configuration: input.notifications_configuration,
+                media_placement_network_type: input.media_placement_network_type,
+                tags: input.tags.unwrap_or_default(),
+                client_request_token: input.client_request_token,
+            },
+        );
+
+        // Project the response from the STORED record, so what the caller sees is exactly
+        // what a later `GetMeeting` reads back.
+        let Some(created) = store.meetings.get(&meeting_id) else {
+            return Err(CreateMeetingErrorModeled::ServiceFailureException(
+                crate::state::store_unavailable(),
+            )
+            .into());
+        };
+        Ok(CreateMeetingOutput {
+            meeting: Some(created.meeting.clone()),
+        })
     }
 }

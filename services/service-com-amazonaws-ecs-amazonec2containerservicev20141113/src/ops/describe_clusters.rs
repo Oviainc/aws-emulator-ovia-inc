@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the STORED clusters named by `clusters`, and a `MISSING` failure for every
+//! name that names nothing. The counters it reports are derived from the stored tasks;
+//! the optional fields follow `include`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusters"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeClustersErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        let fields = crate::state::ClusterFields::from_include(input.include.as_ref());
+
+        // "If you do not specify a cluster, the default cluster is assumed."
+        let requested: Vec<String> = match input.clusters.clone() {
+            Some(clusters) if !clusters.is_empty() => clusters,
+            _ => vec![crate::state::DEFAULT_CLUSTER_NAME.to_string()],
+        };
+
+        // One request names at most `MAX_DESCRIBE_BATCH` clusters, so the task-map
+        // scans each described cluster costs are bounded however long the list is.
+        if requested.len() > crate::state::MAX_DESCRIBE_BATCH {
+            return Err(DescribeClustersErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "clusters must name at most {} clusters; got {}",
+                        crate::state::MAX_DESCRIBE_BATCH,
+                        requested.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        let mut clusters = Vec::new();
+        let mut failures = Vec::new();
+        // A cluster is reported once however many times the request names it, so one
+        // name repeated cannot multiply either the response or the scans behind it.
+        let mut seen = ::std::collections::HashSet::new();
+        for reference in &requested {
+            let name = crate::state::cluster_name_from_reference(Some(reference));
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            match guard.clusters.get(&name) {
+                Some(cluster) => clusters.push(guard.cluster_view(cluster, fields)),
+                None => failures.push(crate::state::missing_failure(
+                    &crate::state::cluster_arn(&region, &name),
+                )),
+            }
+        }
+
+        Ok(DescribeClustersOutput {
+            clusters: Some(clusters),
+            failures: Some(failures),
+        })
     }
 }

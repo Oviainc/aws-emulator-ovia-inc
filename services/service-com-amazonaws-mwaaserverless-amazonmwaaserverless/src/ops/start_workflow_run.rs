@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartWorkflowRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartWorkflowRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates and persists a run under a stored workflow in this service's
+//! store (`crate::state`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartWorkflowRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The run is accepted into the modelled non-terminal `QUEUED` status. This emulator
+//! has no Apache Airflow engine, so nothing executes the workflow definition: the clock
+//! owes the run its exit from `QUEUED` into the modelled failure status `FAILED`, with an
+//! `ErrorMessage` that says exactly that (`crate::state::NO_AIRFLOW_ENGINE`). No status
+//! is ever reported for work that ran.
 //!
 //! ## Shape of an operation
 //!
@@ -118,6 +117,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -194,18 +195,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartWorkflowRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartWorkflowRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartWorkflowRun"))
+        // `ctx` carries only request metadata; the run is identified by its workflow.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = SystemTime::now();
+        let fingerprint = request_fingerprint(&input);
+        let mut store = state.lock();
+
+        let workflow = store.workflows.get(&input.workflow_arn).ok_or_else(|| {
+            StartWorkflowRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("No workflow found for {}", input.workflow_arn),
+                resource_id: input.workflow_arn.clone(),
+                resource_type: "workflow".to_string(),
+            })
+        })?;
+        let run_count = workflow.runs.len();
+
+        // A repeated @idempotencyToken replays the run it already started. Checked
+        // before the version lookup, so a replay answers from the recorded run even
+        // when the version that request named has since been deleted.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(recorded) = store.idempotency.get(&token_key(token)).cloned() {
+                if recorded.request_fingerprint() != fingerprint {
+                    return Err(StartWorkflowRunErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "ClientToken {token} was already used for a StartWorkflowRun \
+                                 request with different parameters"
+                            ),
+                            resource_id: recorded.workflow_arn().to_string(),
+                            resource_type: "workflow-run".to_string(),
+                        },
+                    )
+                    .into());
+                }
+                let crate::state::IdempotentResult::StartWorkflowRun {
+                    workflow_arn,
+                    run_id,
+                    ..
+                } = &recorded
+                else {
+                    return Err(unavailable());
+                };
+                let run = store
+                    .workflows
+                    .get(workflow_arn)
+                    .and_then(|workflow| workflow.runs.get(run_id))
+                    .ok_or_else(unavailable)?;
+                return Ok(response_for(run));
+            }
+        }
+
+        // Run the requested version, defaulting to the workflow's latest.
+        let requested = input.workflow_version.as_deref();
+        let version = store
+            .workflows
+            .get(&input.workflow_arn)
+            .and_then(|workflow| workflow.version(requested))
+            .ok_or_else(|| {
+                StartWorkflowRunErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Workflow {} has no version {}",
+                            input.workflow_arn,
+                            requested.unwrap_or("<latest>")
+                        ),
+                        resource_id: input.workflow_arn.clone(),
+                        resource_type: "workflow-version".to_string(),
+                    },
+                )
+            })?
+            .version
+            .clone();
+
+        // The emulator's own ceiling on this workflow's run store, refused with the
+        // error the model already declares for exceeding a run quota.
+        if run_count >= crate::state::MAX_RUNS_PER_WORKFLOW {
+            return Err(StartWorkflowRunErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "This emulator holds at most {} runs for one workflow",
+                        crate::state::MAX_RUNS_PER_WORKFLOW
+                    ),
+                    resource_id: input.workflow_arn.clone(),
+                    resource_type: "workflow-run".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                    quota_code: "RunsPerWorkflow".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let nonce = store.next_nonce(now);
+        let run_id = crate::state::mint_run_id(&input.workflow_arn, &nonce);
+        let run = crate::state::WorkflowRun {
+            run_id: run_id.clone(),
+            workflow_arn: input.workflow_arn.clone(),
+            workflow_version: version,
+            // A run this operation starts is the caller's own, not the schedule's.
+            run_type: crate::state::RUN_TYPE_ON_DEMAND.to_string(),
+            status: crate::state::RUN_STATUS_QUEUED.to_string(),
+            override_parameters: input
+                .override_parameters
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<String, ::aws_smithy_types::Document>>(),
+            created_at: now,
+            started_on: now,
+            completed_on: None,
+            modified_at: now,
+            duration: None,
+            error_message: None,
+            task_instances: Vec::new(),
+            // The instant the run's exit from `QUEUED` falls due. Recorded, never
+            // waited on, so a caller reading the run straight back still sees `QUEUED`.
+            settles_at: now + crate::state::RUN_SETTLE_AFTER,
+        };
+
+        let workflow = store
+            .workflows
+            .get_mut(&input.workflow_arn)
+            .ok_or_else(unavailable)?;
+        workflow.runs.insert(run_id.clone(), run);
+
+        if let Some(token) = input.client_token.as_deref() {
+            store.idempotency.record(
+                token_key(token),
+                crate::state::IdempotentResult::StartWorkflowRun {
+                    request_fingerprint: fingerprint,
+                    workflow_arn: input.workflow_arn.clone(),
+                    run_id: run_id.clone(),
+                },
+            );
+        }
+
+        // Answer from the stored run, never from the values just computed.
+        let stored = store
+            .workflows
+            .get(&input.workflow_arn)
+            .and_then(|workflow| workflow.runs.get(&run_id))
+            .ok_or_else(unavailable)?;
+        Ok(response_for(stored))
     }
+}
+
+/// The idempotency-ledger key for a `ClientToken` of THIS operation.
+fn token_key(client_token: &str) -> String {
+    format!("StartWorkflowRun:{client_token}")
+}
+
+/// The modelled server error for a store this handler could not reach.
+fn unavailable() -> StartWorkflowRunError {
+    StartWorkflowRunErrorModeled::InternalServerException(InternalServerException {
+        message: "the com.amazonaws.mwaaserverless workflow store is unavailable".to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// The `StartWorkflowRunResponse` for a stored run.
+fn response_for(run: &crate::state::WorkflowRun) -> StartWorkflowRunOutput {
+    StartWorkflowRunOutput {
+        run_id: Some(run.run_id.clone()),
+        status: Some(run.status.clone()),
+        started_at: Some(crate::state::timestamp(run.started_on)),
+    }
+}
+
+/// A stable digest of the request, so a repeated `ClientToken` can be told apart
+/// from a token reused for a different request.
+fn request_fingerprint(input: &StartWorkflowRunInput) -> String {
+    let mut fields: Vec<String> = vec![
+        input.workflow_arn.clone(),
+        input.workflow_version.clone().unwrap_or_default(),
+    ];
+    // `OverrideParameters` is an unordered map on the wire, so digest it in key order.
+    let mut parameters: Vec<(String, String)> = input
+        .override_parameters
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| (key, format!("{value:?}")))
+        .collect();
+    parameters.sort();
+    for (key, value) in parameters {
+        fields.push(key);
+        fields.push(value);
+    }
+    let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
+    crate::state::digest(&borrowed)
 }

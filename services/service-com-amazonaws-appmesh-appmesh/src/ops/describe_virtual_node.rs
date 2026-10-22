@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVirtualNode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVirtualNode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVirtualNode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. A pure read (`@readonly`) of the virtual node stored under its mesh,
+//! rendered as `VirtualNodeData`. An unknown mesh, a `meshOwner` that is not the
+//! stored mesh's owner, or an unknown virtual node is a `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -156,20 +150,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVirtualNode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVirtualNodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVirtualNode"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeVirtualNodeErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the App Mesh emulator state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let store = state.lock();
+
+        let node = store
+            .meshes
+            .get(&input.mesh_name)
+            .filter(|mesh| mesh.owned_by(input.mesh_owner.as_deref()))
+            .and_then(|mesh| mesh.virtual_nodes.get(&input.virtual_node_name));
+        let Some(node) = node else {
+            return Err(DescribeVirtualNodeErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "There is no virtual node named {} in mesh {}.",
+                        input.virtual_node_name, input.mesh_name
+                    )),
+                },
+            )
+            .into());
+        };
+        Ok(DescribeVirtualNodeOutput {
+            virtual_node: node.to_data(),
+        })
     }
 }

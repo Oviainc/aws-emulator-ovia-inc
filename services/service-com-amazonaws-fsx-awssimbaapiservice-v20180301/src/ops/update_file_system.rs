@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFileSystem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFileSystem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFileSystem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the stored file-system record in place, so the response and every later
+//! `DescribeFileSystems` report the same values. Only the members the request carries
+//! change. The ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +123,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    apply_lustre_update, apply_ontap_update, apply_open_zfs_update, apply_windows_update,
+    route_table_merge_fits, PendingTransition, TransitionTarget, LIFECYCLE_AVAILABLE,
+    LIFECYCLE_MISCONFIGURED, LIFECYCLE_UPDATING, MAX_ROUTE_TABLE_IDS,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -205,17 +205,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFileSystem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFileSystemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFileSystem"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFileSystemErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the FSx file-system store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        let Some(record) = store.file_systems.get_mut(&input.file_system_id) else {
+            return Err(UpdateFileSystemErrorModeled::FileSystemNotFound(FileSystemNotFound {
+                message: Some(format!(
+                    "file system {} does not exist",
+                    input.file_system_id
+                )),
+            })
+            .into());
+        };
+
+        // A file system that is still coming up, going down or already updating is not
+        // updatable: AWS refuses the call rather than queueing it.
+        if record.lifecycle != LIFECYCLE_AVAILABLE && record.lifecycle != LIFECYCLE_MISCONFIGURED {
+            return Err(UpdateFileSystemErrorModeled::BadRequest(BadRequest {
+                message: Some(format!(
+                    "file system {} cannot be updated while it is {}",
+                    record.file_system_id, record.lifecycle
+                )),
+            })
+            .into());
+        }
+
+        // Pre-flight, BEFORE anything is mutated: a route-table merge must stay within the
+        // modelled maximum, so a refused update leaves the record exactly as it was. The
+        // count is a client-request problem the model gives no more specific error for, so
+        // it is `BadRequest`.
+        let route_tables_fit = |stored: Option<&Vec<String>>,
+                                add: Option<&Vec<String>>,
+                                remove: Option<&Vec<String>>| {
+            route_table_merge_fits(stored, add, remove)
+        };
+        let ontap_fits = input.ontap_configuration.as_ref().is_none_or(|update| {
+            route_tables_fit(
+                record
+                    .ontap_configuration
+                    .as_ref()
+                    .and_then(|config| config.route_table_ids.as_ref()),
+                update.add_route_table_ids.as_ref(),
+                update.remove_route_table_ids.as_ref(),
+            )
+        });
+        let open_zfs_fits = input.open_zfs_configuration.as_ref().is_none_or(|update| {
+            route_tables_fit(
+                record
+                    .open_zfs_configuration
+                    .as_ref()
+                    .and_then(|config| config.route_table_ids.as_ref()),
+                update.add_route_table_ids.as_ref(),
+                update.remove_route_table_ids.as_ref(),
+            )
+        });
+        if !ontap_fits || !open_zfs_fits {
+            return Err(route_table_limit_exceeded());
+        }
+
+        // Each member the request carries replaces the stored one; an absent member leaves
+        // the stored value alone.
+        if input.storage_capacity.is_some() {
+            record.storage_capacity = input.storage_capacity;
+        }
+        if let Some(storage_type) = input.storage_type.clone() {
+            record.storage_type = storage_type;
+        }
+        if input.file_system_type_version.is_some() {
+            record.file_system_type_version = input.file_system_type_version.clone();
+        }
+        if let Some(network_type) = input.network_type.clone() {
+            record.network_type = network_type;
+        }
+        if let Some(update) = input.windows_configuration.as_ref() {
+            apply_windows_update(
+                record
+                    .windows_configuration
+                    .get_or_insert_with(WindowsFileSystemConfiguration::default),
+                update,
+            );
+        }
+        if let Some(update) = input.lustre_configuration.as_ref() {
+            apply_lustre_update(
+                record
+                    .lustre_configuration
+                    .get_or_insert_with(LustreFileSystemConfiguration::default),
+                update,
+            );
+        }
+        if let Some(update) = input.ontap_configuration.as_ref() {
+            // Unreachable after the pre-flight above; the bound is re-checked here because
+            // `merged_route_table_ids` is the one place it is enforced.
+            if apply_ontap_update(
+                record
+                    .ontap_configuration
+                    .get_or_insert_with(OntapFileSystemConfiguration::default),
+                update,
+            )
+            .is_err()
+            {
+                return Err(route_table_limit_exceeded());
+            }
+        }
+        if let Some(update) = input.open_zfs_configuration.as_ref() {
+            if apply_open_zfs_update(
+                record
+                    .open_zfs_configuration
+                    .get_or_insert_with(OpenZFSFileSystemConfiguration::default),
+                update,
+            )
+            .is_err()
+            {
+                return Err(route_table_limit_exceeded());
+            }
+        }
+
+        // An update is a customer-initiated change, which the modelled lifecycle calls
+        // `UPDATING` ("The file system is undergoing a customer-initiated update"); the
+        // clock owes it the way back to `AVAILABLE`.
+        record.lifecycle = LIFECYCLE_UPDATING.to_string();
+        record.pending = Some(PendingTransition::due_now_plus_span(
+            TransitionTarget::Available,
+        ));
+
+        Ok(UpdateFileSystemOutput {
+            file_system: Some(record.to_file_system()),
+        })
     }
+}
+
+/// The modelled refusal for a route-table merge that would exceed
+/// [`MAX_ROUTE_TABLE_IDS`].
+///
+/// `BadRequest` ("A generic error indicating a failure with a client request") because the
+/// model gives this count no more specific error: `ServiceLimit` has no route-table member
+/// and `InvalidNetworkSettings` reports one invalid id rather than too many valid ones.
+fn route_table_limit_exceeded() -> UpdateFileSystemError {
+    UpdateFileSystemErrorModeled::BadRequest(BadRequest {
+        message: Some(format!(
+            "a file system can be associated with at most {MAX_ROUTE_TABLE_IDS} route tables"
+        )),
+    })
+    .into()
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateScan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateScan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateScan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a scan (and one run per revision) against the code artifact
+//! `CreateUploadUrl` minted, and answers from that record. `GetScan`, `ListScans`,
+//! `GetFindings` and `BatchGetFindings` all read what this writes.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +175,241 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateScan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateScan"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateScanErrorModeled::InternalServerException(
+                InternalServerException {
+                    error: Some("state unavailable".to_string()),
+                    message: Some(
+                        "the CodeGuru Security store is not reachable from this engine"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        store.settle_due_runs(now);
+        store.expire_due_artifacts(now);
+
+        // `clientToken` is `@idempotencyToken` and documented as preventing "the
+        // accidental creation of duplicate scans if there are failures and retries": a
+        // repeat answers with the run the first call created, and starts no revision.
+        // The ledger is keyed on the token AND the scan name, so a token reused for a
+        // different scan can never answer with the other scan's run.
+        if let Some(token) = input.client_token.as_deref() {
+            let ledger_key = (token.to_string(), input.scan_name.clone());
+            if let Some(run_id) = store.idempotency.get(&ledger_key).cloned() {
+                let recorded = store.scans.get(&input.scan_name).and_then(|scan| {
+                    scan.runs
+                        .iter()
+                        .find(|run| run.run_id == run_id)
+                        .map(|run| (scan.scan_name_arn.clone(), run.clone()))
+                });
+                let Some((scan_name_arn, run)) = recorded else {
+                    return Err(CreateScanErrorModeled::InternalServerException(
+                        InternalServerException {
+                            error: Some("idempotency record dangling".to_string()),
+                            message: Some(format!(
+                                "client token {token} names run {run_id} of scan {scan_name}, \
+                                 which is no longer recorded",
+                                scan_name = input.scan_name,
+                            )),
+                        },
+                    )
+                    .into());
+                };
+                return Ok(CreateScanOutput {
+                    scan_name: input.scan_name,
+                    run_id: run.run_id,
+                    resource_id: ResourceId::codeArtifactId(run.code_artifact_id),
+                    scan_state: run.scan_state,
+                    scan_name_arn: Some(scan_name_arn),
+                });
+            }
+        }
+
+        let code_artifact_id = match &input.resource_id {
+            ResourceId::codeArtifactId(id) => id.clone(),
+        };
+
+        // `ResourceId$codeArtifactId` is documented as "Returned by `CreateUploadUrl`",
+        // so an id this service never minted names no resource.
+        let Some(artifact) = store.upload_artifacts.get(&code_artifact_id).cloned() else {
+            return Err(CreateScanErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    error_code: "ResourceNotFoundException".to_string(),
+                    message: format!(
+                        "no code artifact {code_artifact_id}: a codeArtifactId must be one \
+                         returned by CreateUploadUrl"
+                    ),
+                    resource_id: code_artifact_id.clone(),
+                    resource_type: "codeArtifact".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `CreateUploadUrlRequest$scanName` is documented as "The name of the scan that
+        // will use the uploaded resource ... Use this scanName when you call CreateScan
+        // on the code resource you upload to this URL", so scanning an artifact under a
+        // different name is a request that cannot hold together.
+        if artifact.scan_name != input.scan_name {
+            return Err(CreateScanErrorModeled::ValidationException(ValidationException {
+                error_code: "ValidationException".to_string(),
+                message: format!(
+                    "code artifact {code_artifact_id} was created for scan {expected}, so it \
+                     cannot be scanned as {actual}",
+                    expected = artifact.scan_name,
+                    actual = input.scan_name,
+                ),
+                reason: "fieldValidationFailed".to_string(),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "scanName".to_string(),
+                    message: format!(
+                        "expected {expected}, the scanName the code artifact was created for",
+                        expected = artifact.scan_name,
+                    ),
+                }]),
+            })
+            .into());
+        }
+
+        // Documented defaults: "Defaults to Standard type if missing" (`scanType`) and
+        // "Defaults to Security type if missing" (`analysisType`).
+        let scan_type = input
+            .scan_type
+            .clone()
+            .unwrap_or_else(|| crate::state::SCAN_TYPE_STANDARD.to_string());
+        let analysis_type = input
+            .analysis_type
+            .clone()
+            .unwrap_or_else(|| crate::state::ANALYSIS_TYPE_SECURITY.to_string());
+
+        // A scan name tracks revisions of one resource one run at a time: while its
+        // latest run is still `InProgress` another revision cannot be started.
+        if let Some(scan) = store.scans.get(&input.scan_name) {
+            if let Some(run) = scan.latest_run() {
+                if run.scan_state == crate::state::SCAN_STATE_IN_PROGRESS {
+                    return Err(CreateScanErrorModeled::ConflictException(ConflictException {
+                        error_code: "ConflictException".to_string(),
+                        message: format!(
+                            "scan {scan_name} is already running revision {run_id}; wait for \
+                             it to finish before starting another",
+                            scan_name = input.scan_name,
+                            run_id = run.run_id,
+                        ),
+                        resource_id: input.scan_name.clone(),
+                        resource_type: "scan".to_string(),
+                    })
+                    .into());
+                }
+            }
+        }
+
+        // Both stores this call grows carry an explicit maximum (see `crate::state`), so
+        // no sequence of CreateScan calls can grow the emulator's heap without end.
+        match store.scans.get(&input.scan_name) {
+            Some(scan) if scan.runs.len() >= crate::state::RUNS_PER_SCAN_QUOTA => {
+                return Err(CreateScanErrorModeled::ThrottlingException(ThrottlingException {
+                    error_code: "ThrottlingException".to_string(),
+                    message: format!(
+                        "scan {scan_name} already holds the maximum of {quota} revisions",
+                        scan_name = input.scan_name,
+                        quota = crate::state::RUNS_PER_SCAN_QUOTA,
+                    ),
+                    service_code: Some(crate::state::SERVICE_CODE.to_string()),
+                    quota_code: Some(crate::state::QUOTA_CODE_RUNS.to_string()),
+                })
+                .into());
+            }
+            None if store.scans.len() >= crate::state::SCAN_QUOTA => {
+                return Err(CreateScanErrorModeled::ThrottlingException(ThrottlingException {
+                    error_code: "ThrottlingException".to_string(),
+                    message: format!(
+                        "this account already holds the maximum of {quota} scans",
+                        quota = crate::state::SCAN_QUOTA,
+                    ),
+                    service_code: Some(crate::state::SERVICE_CODE.to_string()),
+                    quota_code: Some(crate::state::QUOTA_CODE_SCANS.to_string()),
+                })
+                .into());
+            }
+            _ => {}
+        }
+
+        let run = crate::state::ScanRun {
+            run_id: crate::state::mint_uuid(),
+            code_artifact_id,
+            scan_type: scan_type.clone(),
+            analysis_type,
+            scan_state: crate::state::SCAN_STATE_IN_PROGRESS.to_string(),
+            created_at_millis: now,
+            updated_at_millis: None,
+            error_message: None,
+            settle_due_millis: now.saturating_add(crate::state::settle_span_millis(&scan_type)),
+        };
+        let settle_due_millis = run.settle_due_millis;
+
+        let (run_index, run_id, scan_state, scan_name_arn, stored_artifact_id) =
+            match store.scans.get_mut(&input.scan_name) {
+                Some(scan) => {
+                    // A re-run of the same scan name: one more revision of the resource.
+                    scan.updated_at_millis = Some(now);
+                    if let Some(tags) = &input.tags {
+                        scan.tags = tags.clone().into_iter().collect();
+                    }
+                    scan.runs.push(run);
+                    let index = scan.runs.len() - 1;
+                    let latest = &scan.runs[index];
+                    (
+                        index,
+                        latest.run_id.clone(),
+                        latest.scan_state.clone(),
+                        scan.scan_name_arn.clone(),
+                        latest.code_artifact_id.clone(),
+                    )
+                }
+                None => {
+                    let scan = crate::state::Scan {
+                        scan_name: input.scan_name.clone(),
+                        scan_name_arn: crate::state::scan_name_arn(&region, &input.scan_name),
+                        created_at_millis: now,
+                        updated_at_millis: None,
+                        tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+                        runs: vec![run],
+                    };
+                    let answer = (
+                        0usize,
+                        scan.runs[0].run_id.clone(),
+                        scan.runs[0].scan_state.clone(),
+                        scan.scan_name_arn.clone(),
+                        scan.runs[0].code_artifact_id.clone(),
+                    );
+                    store.scans.insert(input.scan_name.clone(), scan);
+                    answer
+                }
+            };
+
+        // The transition out of `InProgress` is owed at a stored instant; registering it
+        // on the due-queue is what lets a reader materialise it without walking the
+        // whole store.
+        store.track_pending_run(&input.scan_name, run_index, settle_due_millis);
+
+        if let Some(token) = input.client_token.clone() {
+            store
+                .idempotency
+                .insert((token, input.scan_name.clone()), run_id.clone());
+        }
+
+        Ok(CreateScanOutput {
+            scan_name: input.scan_name,
+            run_id,
+            resource_id: ResourceId::codeArtifactId(stored_artifact_id),
+            scan_state,
+            scan_name_arn: Some(scan_name_arn),
+        })
     }
 }

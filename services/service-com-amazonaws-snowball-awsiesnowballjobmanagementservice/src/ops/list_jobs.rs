@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the stored jobs in creation order, one `JobListEntry` per job.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +141,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobs"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        // `MaxResults` is modelled `range 0..100` and is the `@paginated` `pageSize`. A
+        // page of zero entries with a continuation token would never advance the walk,
+        // so the only reading of 0 under which the paginated contract terminates is
+        // "unspecified" — the same as omitting the member, which gets the largest page
+        // the member admits.
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .filter(|max| *max > 0)
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
+
+        let store = state.lock();
+        let jobs = store.jobs_in_creation_order();
+
+        // A `NextToken` is one this service minted on an earlier page, and it names the
+        // job that page stopped before. A token that decodes to nothing, or to a job the
+        // store no longer holds, cannot be resumed from.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resume_at = crate::state::decode_cursor(token)
+                    .and_then(|job_id| jobs.iter().position(|job| job.job_id == job_id));
+                match resume_at {
+                    Some(position) => position,
+                    None => {
+                        return Err(ListJobsErrorModeled::InvalidNextTokenException(
+                            InvalidNextTokenException {
+                                message: Some(
+                                    "The NextToken string was altered unexpectedly, and the \
+                                     operation has stopped. Run the operation without changing \
+                                     the NextToken string, and try again."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        let page: Vec<JobListEntry> = jobs[start..]
+            .iter()
+            .take(page_size)
+            .map(|job| job.to_job_list_entry())
+            .collect();
+        // Only a page with jobs after it carries a token; the last page carries none.
+        let next_token = jobs
+            .get(start + page.len())
+            .map(|job| crate::state::encode_cursor(&job.job_id));
+
+        Ok(ListJobsOutput {
+            job_list_entries: Some(page),
+            next_token,
+        })
     }
 }

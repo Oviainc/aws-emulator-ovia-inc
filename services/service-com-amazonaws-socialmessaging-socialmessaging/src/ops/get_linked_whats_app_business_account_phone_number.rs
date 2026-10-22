@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLinkedWhatsAppBusinessAccountPhoneNumber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLinkedWhatsAppBusinessAccountPhoneNumber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLinkedWhatsAppBusinessAccountPhoneNumber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one registered WhatsApp phone number back out of the store, with the id of
+//! the linked account that owns it. A reporting operation (`@readonly`): it writes
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +150,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLinkedWhatsAppBusinessAccountPhoneNumber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLinkedWhatsAppBusinessAccountPhoneNumberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLinkedWhatsAppBusinessAccountPhoneNumber"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLinkedWhatsAppBusinessAccountPhoneNumberErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the social-messaging store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // `id` accepts the `phone-number-id-...` short form and the number's ARN alike.
+        let Some(record) = store.resolve_phone_number(&input.id) else {
+            return Err(
+                GetLinkedWhatsAppBusinessAccountPhoneNumberErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no WhatsApp phone number with id '{}'",
+                            input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetLinkedWhatsAppBusinessAccountPhoneNumberOutput {
+            phone_number: Some(record.to_detail()),
+            linked_whats_app_business_account_id: Some(record.linked_account_id.clone()),
+            call_settings: record.call_settings.clone(),
+        })
     }
 }

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterTaskDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterTaskDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterTaskDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers the next revision of a task-definition family and stores it. The revision
+//! comes from a per-family counter (1, 2, 3 …) and every response member is read back
+//! out of the stored record, including the container definitions.
 //!
 //! ## Shape of an operation
 //!
@@ -190,6 +184,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The network mode a task definition takes when the request names none. The
+/// `TaskDefinition$networkMode` doc: "If no network mode is specified, the default is
+/// `bridge`."
+const DEFAULT_NETWORK_MODE: &str = "bridge";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -262,18 +261,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterTaskDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterTaskDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterTaskDefinition"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RegisterTaskDefinitionErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        if !crate::state::is_valid_name(&input.family) {
+            return Err(RegisterTaskDefinitionErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "family must be 1 to {} letters, numbers, underscores or hyphens; \
+                         got {:?}",
+                        crate::state::MAX_NAME_LENGTH, input.family
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "If no network mode is specified, the default is bridge."
+        let network_mode = input
+            .network_mode
+            .clone()
+            .unwrap_or_else(|| DEFAULT_NETWORK_MODE.to_string());
+        let requires_compatibilities = input.requires_compatibilities.clone().unwrap_or_default();
+        let wants_fargate = requires_compatibilities
+            .iter()
+            .any(|compatibility| compatibility == "FARGATE");
+
+        // "For Amazon ECS tasks on Fargate, the awsvpc network mode is required", and
+        // task-level `cpu`/`memory` are "required for Fargate".
+        if wants_fargate && network_mode != "awsvpc" {
+            return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(format!(
+                        "Fargate requires that 'networkMode' be set to 'awsvpc'; got \
+                         {network_mode:?}"
+                    )),
+                },
+            )
+            .into());
+        }
+        if wants_fargate && (input.cpu.is_none() || input.memory.is_none()) {
+            return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(
+                        "Fargate requires task-level 'cpu' and 'memory' to be specified"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Every container needs a name and an image to be runnable, and — unless the
+        // task itself reserves memory — its own `memory` or `memoryReservation`.
+        if input.container_definitions.is_empty() {
+            return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(
+                        "containerDefinitions must describe at least one container"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        // The list is caller-supplied, and everything downstream scales with it: the
+        // stored revision, the containers each task of it mints, and what every describe
+        // renders. It is bounded here, before any per-entry work, at the ECS service
+        // quota for containers per task definition.
+        if input.container_definitions.len() > crate::state::MAX_CONTAINER_DEFINITIONS {
+            return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(format!(
+                        "containerDefinitions must describe at most {} containers; got {}",
+                        crate::state::MAX_CONTAINER_DEFINITIONS,
+                        input.container_definitions.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let mut names = ::std::collections::HashSet::new();
+        for (index, definition) in input.container_definitions.iter().enumerate() {
+            let named = definition
+                .name
+                .as_deref()
+                .is_some_and(|name| !name.trim().is_empty());
+            if !named {
+                return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(format!(
+                            "Invalid setting for containerDefinitions[{index}]: 'name' is \
+                             required"
+                        )),
+                    },
+                )
+                .into());
+            }
+            let name = definition.name.clone().unwrap_or_default();
+            if definition
+                .image
+                .as_deref()
+                .is_none_or(|image| image.trim().is_empty())
+            {
+                return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(format!(
+                            "Invalid setting for container '{name}': 'image' is required"
+                        )),
+                    },
+                )
+                .into());
+            }
+            if input.memory.is_none()
+                && definition.memory.is_none()
+                && definition.memory_reservation.is_none()
+            {
+                return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(format!(
+                            "Invalid setting for container '{name}': at least one of \
+                             'memory' or 'memoryReservation' must be specified"
+                        )),
+                    },
+                )
+                .into());
+            }
+            // One pass, so the duplicate check costs the same as the rest of the loop.
+            if !names.insert(name.clone()) {
+                return Err(RegisterTaskDefinitionErrorModeled::ClientException(
+                    ClientException {
+                        message: Some(format!(
+                            "container names must be unique within a task definition; \
+                             '{name}' is repeated"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut guard = state.lock();
+
+        if guard.task_definitions.len() >= crate::state::MAX_TASK_DEFINITIONS {
+            return Err(RegisterTaskDefinitionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "this emulator holds at most {} task-definition revisions",
+                        crate::state::MAX_TASK_DEFINITIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "When you register a task definition for the first time, the revision is 1.
+        // Each time that you register a new revision of a task definition in the same
+        // family, the revision value always increases by one."
+        let revision = guard
+            .next_revision
+            .get(&input.family)
+            .copied()
+            .unwrap_or(1);
+        guard
+            .next_revision
+            .insert(input.family.clone(), revision + 1);
+
+        let record = crate::state::TaskDefinitionRecord {
+            arn: crate::state::task_definition_arn(&region, &input.family, revision),
+            family: input.family.clone(),
+            revision,
+            status: crate::state::TASK_DEFINITION_ACTIVE.to_string(),
+            container_definitions: input.container_definitions.clone(),
+            network_mode,
+            cpu: input.cpu.clone(),
+            memory: input.memory.clone(),
+            volumes: input.volumes.clone().unwrap_or_default(),
+            placement_constraints: input.placement_constraints.clone().unwrap_or_default(),
+            requires_compatibilities,
+            task_role_arn: input.task_role_arn.clone(),
+            execution_role_arn: input.execution_role_arn.clone(),
+            pid_mode: input.pid_mode.clone(),
+            ipc_mode: input.ipc_mode.clone(),
+            proxy_configuration: input.proxy_configuration.clone(),
+            ephemeral_storage: input.ephemeral_storage.clone(),
+            runtime_platform: input.runtime_platform.clone(),
+            enable_fault_injection: input.enable_fault_injection,
+            tags: input.tags.clone().unwrap_or_default(),
+            registered_at: crate::state::now(),
+            deregistered_at: None,
+        };
+        let view = record.view();
+        let tags = record.tags.clone();
+        guard
+            .task_definitions
+            .insert((input.family.clone(), revision), record);
+
+        Ok(RegisterTaskDefinitionOutput {
+            task_definition: Some(view),
+            tags: Some(tags),
+        })
     }
 }

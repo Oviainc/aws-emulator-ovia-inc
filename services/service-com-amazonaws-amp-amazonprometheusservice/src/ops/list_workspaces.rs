@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListWorkspaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListWorkspaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: lists the stored workspaces, filtered by the `alias` prefix and paged
+//! by `maxResults`/`nextToken`. @readonly — the only write it makes is
+//! [`crate::state::ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`],
+//! which applies the lifecycle transitions the clock already owed at this instant.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListWorkspaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +156,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListWorkspaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListWorkspacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListWorkspaces"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListWorkspacesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.materialize_due(::std::time::SystemTime::now());
+
+        // `alias` "filters the results to only the workspaces with names that start
+        // with the value that you specify here", and is trimmed the same way a stored
+        // alias is, so the filter compares like with like.
+        let alias_prefix = crate::state::normalize_alias(input.alias.as_deref());
+
+        // One stable order, so a page boundary means the same thing on every call.
+        let mut workspaces: Vec<&crate::state::Workspace> = store
+            .workspaces
+            .values()
+            .filter(|workspace| match alias_prefix.as_deref() {
+                Some(prefix) => workspace
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| alias.starts_with(prefix)),
+                None => true,
+            })
+            .collect();
+        workspaces.sort_by(|left, right| left.workspace_id.cmp(&right.workspace_id));
+
+        // `nextToken` is the page cursor this operation itself emitted: the id of the
+        // last summary of the previous page, so the next page starts after it.
+        if let Some(cursor) = input.next_token.as_deref() {
+            workspaces.retain(|workspace| workspace.workspace_id.as_str() > cursor);
+        }
+
+        // "The maximum number of workspaces to return per request. The default is 100."
+        // (`ListWorkspacesRequest$maxResults`, modelled `@range(min: 1, max: 1000)`.)
+        // Clamped here rather than trusted from the request, so the amount of work one
+        // call does is bounded by this service, not chosen by its caller.
+        let page_size = input.max_results.map_or(
+            crate::state::WORKSPACE_PAGE_DEFAULT,
+            |max| max.clamp(1, crate::state::WORKSPACE_PAGE_LIMIT),
+        ) as usize;
+
+        let has_more = workspaces.len() > page_size;
+        workspaces.truncate(page_size);
+        let next_token = if has_more {
+            workspaces
+                .last()
+                .map(|workspace| workspace.workspace_id.clone())
+        } else {
+            None
+        };
+
+        Ok(ListWorkspacesOutput {
+            workspaces: workspaces
+                .into_iter()
+                .map(|workspace| WorkspaceSummary {
+                    workspace_id: workspace.workspace_id.clone(),
+                    alias: workspace.alias.clone(),
+                    arn: workspace.arn.clone(),
+                    status: WorkspaceStatus {
+                        status_code: workspace.status_code.clone(),
+                    },
+                    created_at: ::aws_smithy_types::DateTime::from(workspace.created_at),
+                    tags: crate::state::tag_map(&workspace.tags),
+                    kms_key_arn: workspace.kms_key_arn.clone(),
+                })
+                .collect(),
+            next_token,
+        })
     }
 }

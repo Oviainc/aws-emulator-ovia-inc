@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHIT
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHIT`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHIT::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `HITId` and the `HITTypeId` of the HIT type the common parameters
+//! describe, persists the HIT with `Expiration = CreationTime + LifetimeInSeconds`
+//! and no assignments taken yet, and returns the stored structure — the same one
+//! `GetHIT` and `ListHITs` read back.
 //!
 //! ## Shape of an operation
 //!
@@ -214,18 +210,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHIT` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHITErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHIT"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateHITErrorModeled::ServiceFault(ServiceFault {
+                message: Some(
+                    "mturk-requester is mounted on an engine that holds no state for it"
+                        .to_string(),
+                ),
+                turk_error_code: None,
+            })
+        })?;
+
+        // The rules the documentation states but no constraint trait can express; every
+        // modelled constraint (the `Reward` pattern, the `UniqueRequestToken` length,
+        // the `HITLayoutId` pattern) was already refused upstream.
+        let max_assignments = input
+            .max_assignments
+            .unwrap_or(crate::state::DEFAULT_MAX_ASSIGNMENTS);
+        if max_assignments < 1 {
+            return Err(request_error(format!(
+                "MaxAssignments must be at least 1; {max_assignments} was supplied."
+            )));
+        }
+        // "Either a Question parameter or a HITLayoutId parameter must be provided"
+        // (`CreateHIT$Question` / `CreateHIT$HITLayoutId`). Without one of them there is
+        // nothing for a Worker to answer, so the HIT cannot be created.
+        if input.question.is_none() && input.hit_layout_id.is_none() {
+            return Err(request_error(
+                "Either a Question parameter or a HITLayoutId parameter must be provided."
+                    .to_string(),
+            ));
+        }
+        if input.lifetime_in_seconds <= 0 {
+            return Err(request_error(format!(
+                "LifetimeInSeconds must be greater than 0; {} was supplied.",
+                input.lifetime_in_seconds
+            )));
+        }
+        if input.assignment_duration_in_seconds <= 0 {
+            return Err(request_error(format!(
+                "AssignmentDurationInSeconds must be greater than 0; {} was supplied.",
+                input.assignment_duration_in_seconds
+            )));
+        }
+
+        let created = ::std::time::SystemTime::now();
+        let expiration = crate::state::expiration_from_lifetime(created, input.lifetime_in_seconds)
+            .ok_or_else(|| {
+                request_error(format!(
+                    "LifetimeInSeconds {} puts the HIT's expiration out of range.",
+                    input.lifetime_in_seconds
+                ))
+            })?;
+
+        let mut store = state.lock();
+
+        // "A unique identifier for this request which allows you to retry the call on
+        // error without creating duplicate HITs. ... If the HIT already exists in the
+        // system from a previous call using the same UniqueRequestToken, subsequent
+        // calls will return a AWS.MechanicalTurk.HitAlreadyExists error with a message
+        // containing the HITId" (`CreateHIT$UniqueRequestToken`). So a replay neither
+        // creates a second HIT nor reports success — until the documented 24-hour
+        // window on the token has passed, after which it creates another HIT.
+        if let Some(existing) = store.replayed_hit_id(input.unique_request_token.as_deref(), created)
+        {
+            let token = input.unique_request_token.unwrap_or_default();
+            return Err(CreateHITErrorModeled::RequestError(RequestError {
+                message: Some(format!(
+                    "The HIT {existing} already exists for UniqueRequestToken {token}."
+                )),
+                turk_error_code: Some("AWS.MechanicalTurk.HitAlreadyExists".to_string()),
+            })
+            .into());
+        }
+        if store.hits.len() >= crate::state::MAX_HITS_TOTAL {
+            return Err(request_error(format!(
+                "This emulator holds its maximum of {} HITs.",
+                crate::state::MAX_HITS_TOTAL
+            )));
+        }
+
+        let qualification_requirements = input.qualification_requirements.unwrap_or_default();
+        // The HIT type is the "common parameters such as the title, description and
+        // reward amount" this HIT is described by; its id is a function of exactly those,
+        // so a second, identically described HIT reports the same `HITTypeId`.
+        let mut hit_type = crate::state::HitType {
+            hit_type_id: String::new(),
+            title: input.title.clone(),
+            description: input.description.clone(),
+            keywords: input.keywords.clone(),
+            reward: input.reward.clone(),
+            assignment_duration_in_seconds: input.assignment_duration_in_seconds,
+            auto_approval_delay_in_seconds: input.auto_approval_delay_in_seconds,
+            qualification_requirements: qualification_requirements.clone(),
+        };
+        hit_type.hit_type_id = crate::state::derive_hit_type_id(&hit_type);
+        let hit_type_id = store.intern_hit_type(hit_type).map_err(|ceiling| {
+            request_error(format!(
+                "This emulator holds its maximum of {ceiling} HIT types."
+            ))
+        })?;
+
+        let sequence = store.next_id;
+        store.next_id += 1;
+        let hit_id = crate::state::entity_id(sequence);
+
+        let hit = HIT {
+            hit_id: Some(hit_id.clone()),
+            hit_type_id: Some(hit_type_id),
+            // `HITGroupId` is the id of the group MTurk shows a Worker this HIT in.
+            // Nothing in this slice forms groups, so no id is invented for one.
+            hit_group_id: None,
+            hit_layout_id: input.hit_layout_id,
+            creation_time: Some(::aws_smithy_types::DateTime::from(created)),
+            title: Some(input.title),
+            description: Some(input.description),
+            question: input.question,
+            keywords: input.keywords,
+            hit_status: Some(crate::state::HIT_STATUS_ASSIGNABLE.to_string()),
+            max_assignments: Some(max_assignments),
+            reward: Some(input.reward),
+            auto_approval_delay_in_seconds: input.auto_approval_delay_in_seconds,
+            expiration: Some(::aws_smithy_types::DateTime::from(expiration)),
+            assignment_duration_in_seconds: Some(input.assignment_duration_in_seconds),
+            requester_annotation: input.requester_annotation,
+            qualification_requirements: Some(qualification_requirements),
+            hit_review_status: Some(crate::state::HIT_REVIEW_STATUS_NOT_REVIEWED.to_string()),
+            // A brand-new HIT has had no assignment accepted or completed, so every one
+            // of its `MaxAssignments` is available.
+            number_of_assignments_pending: Some(0),
+            number_of_assignments_available: Some(max_assignments),
+            number_of_assignments_completed: Some(0),
+        };
+
+        store.hits.insert(
+            hit_id.clone(),
+            crate::state::StoredHit {
+                hit: hit.clone(),
+                sequence,
+            },
+        );
+        if let Some(token) = input.unique_request_token {
+            store.remember_request_token(Some(token.as_str()), &hit_id, created);
+        }
+
+        Ok(CreateHITOutput { hit: Some(hit) })
     }
+}
+
+/// `RequestError` ("Your request is invalid.", HTTP 400) carrying `message`.
+///
+/// `TurkErrorCode` is left unset: the model types it as a bare string and documents
+/// no code for these refusals, so none is invented. The one code the model does
+/// quote, `AWS.MechanicalTurk.HitAlreadyExists`, is set where it belongs above.
+fn request_error(message: String) -> CreateHITError {
+    CreateHITErrorModeled::RequestError(RequestError {
+        message: Some(message),
+        turk_error_code: None,
+    })
+    .into()
 }

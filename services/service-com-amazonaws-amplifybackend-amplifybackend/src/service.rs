@@ -96,17 +96,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        match refusal {
+            // AmplifyBackend declares ONE client-input error on every operation:
+            // `BadRequestException` (400), documented as "An error returned if a
+            // request is not formed properly". A request the framework refused before
+            // any handler ran — an absent required member, or a value outside a
+            // declared bound — is exactly that, so this service states it in its own
+            // modelled shape instead of the framework's generic `ValidationException`.
+            // Both the code and the message are replaced together; the status stays
+            // with the protocol, which already answers 400 for this refusal.
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: aws_smithy_schema_server::constraints::envelope(violations)
+                    .unwrap_or_else(|| "the request is not formed properly".to_string()),
+            }),
+            // Everything else keeps this crate's default wording: an unauthenticated
+            // caller is the emulator's refusal, not this service's. `Refusal` is
+            // `#[non_exhaustive]`, so the catch-all is what covers it.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

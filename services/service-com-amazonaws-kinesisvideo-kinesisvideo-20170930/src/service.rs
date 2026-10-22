@@ -96,17 +96,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Kinesis Video Streams states a bad input value as
+        // `InvalidArgumentException` — "The value for this input parameter is
+        // invalid." — which `smithy_query(query="service_info")` lists among this
+        // service's common errors, so every operation declares it. The framework
+        // would otherwise answer the synthetic `ValidationException`, a code no
+        // kinesisvideo client branches on. The code and the message move together:
+        // the message stays the framework's envelope, which names the member and the
+        // constraint it failed, so the caller can fix the request from it.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidArgumentException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations).unwrap_or_else(|| {
+                    "The value for this input parameter is invalid.".to_string()
+                }),
+            }),
+            // Every other refusal class keeps the framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCodeReview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCodeReview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCodeReview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +139,41 @@ impl<Eng> CreateCodeReview<Eng> {
     }
 }
 
+/// Why a code review this service accepts ends in the modelled `Failed` state.
+///
+/// `CreateCodeReview` starts an asynchronous `RepositoryAnalysis` — CodeGuru Reviewer's own
+/// analysis of every file under a branch, which produces the recommendations
+/// `ListRecommendations` later serves. No engine in this emulator performs that analysis, so
+/// answering `Completed` (or any `Metrics`/findings count) would report a result for work
+/// nothing ran. The run is therefore ended in the service's own modelled failure state with
+/// the reason below, while the control plane around it stays real: the review is persisted,
+/// resolved against its association, and read back by `DescribeCodeReview`.
+const ANALYSIS_NOT_AVAILABLE: &str = "This emulator does not run CodeGuru Reviewer's \
+     repository analysis, so no recommendations were produced for this code review.";
+
+/// The `SourceCodeType` a `RepositoryAnalysis` request names.
+///
+/// `RepositoryAnalysis` carries either an explicit `SourceCodeType` or just the branch to
+/// analyse (`RepositoryHead`); the stored code review always reports the full
+/// `SourceCodeType`, so the branch form is widened into one here.
+fn source_code_type_of(
+    analysis: &RepositoryAnalysis,
+) -> Result<SourceCodeType, CreateCodeReviewError> {
+    if let Some(explicit) = &analysis.source_code_type {
+        return Ok(explicit.clone());
+    }
+    if let Some(head) = &analysis.repository_head {
+        return Ok(SourceCodeType {
+            repository_head: Some(head.clone()),
+            ..SourceCodeType::default()
+        });
+    }
+    // The model cannot express "one of these two", so the service refuses it here.
+    Err(crate::scaffolded::Scaffolded::validation(
+        "Type.RepositoryAnalysis must set either RepositoryHead or SourceCodeType",
+    ))
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateCodeReview<Eng>
 {
@@ -165,18 +191,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCodeReview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCodeReviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCodeReview"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateCodeReviewError::Modeled(CreateCodeReviewErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the code-review store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let source_code_type = source_code_type_of(&input.r#type.repository_analysis)?;
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // A retry carrying an earlier call's ClientRequestToken is the SAME code review, and
+        // only for the request the token was first used for: the same token naming a
+        // different review or a different association is a conflict, not a success for the
+        // first one.
+        if let Some(existing) = input
+            .client_request_token
+            .as_deref()
+            .and_then(|token| store.code_review_for_token(token))
+        {
+            if existing.name != input.name
+                || existing.association_arn != input.repository_association_arn
+            {
+                return Err(CreateCodeReviewErrorModeled::ConflictException(ConflictException {
+                    message: Some(format!(
+                        "ClientRequestToken was already used to create code review {} ({}); \
+                         it cannot be reused for a different code review",
+                        existing.name, existing.code_review_arn
+                    )),
+                })
+                .into());
+            }
+            return Ok(CreateCodeReviewOutput {
+                code_review: Some(existing.to_wire()),
+            });
+        }
+
+        // "A code review can only be created on an associated repository."
+        let association = store
+            .association(&input.repository_association_arn)
+            .ok_or_else(|| {
+                CreateCodeReviewError::Modeled(
+                    CreateCodeReviewErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "no repository association with ARN {}",
+                                input.repository_association_arn
+                            )),
+                        },
+                    ),
+                )
+            })?;
+        // Only a state that still holds the repository can be reviewed; one that is leaving
+        // (or has left) conflicts with the state it is in. `Associating` counts as holding
+        // it: the clock has not yet finished the association, and refusing it would make
+        // whether a review can be created depend on how fast the caller's second request
+        // arrives, which no caller can control.
+        if !matches!(association.state.as_str(), "Associating" | "Associated") {
+            return Err(CreateCodeReviewErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "repository association {} is in state {} and cannot be reviewed",
+                    association.association_arn, association.state
+                )),
+            })
+            .into());
+        }
+        let repository_name = association.name.clone();
+        let owner = association.owner.clone();
+        let provider_type = association.provider_type.clone();
+        let association_arn = association.association_arn.clone();
+
+        // "The name of each code review in your Amazon Web Services account must be unique."
+        if let Some(clash) = store.code_review_named(&input.name) {
+            return Err(CreateCodeReviewErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a code review named {} already exists ({})",
+                    input.name, clash.code_review_arn
+                )),
+            })
+            .into());
+        }
+
+        // The store is capacity-bounded, so a caller cannot grow it without limit: at the
+        // cap the service declines the request rather than accepting work it would then
+        // have to keep.
+        if store.code_reviews_at_capacity() {
+            return Err(CreateCodeReviewErrorModeled::ThrottlingException(ThrottlingException {
+                message: Some(format!(
+                    "this emulator holds at most {} code reviews",
+                    crate::state::MAX_CODE_REVIEWS
+                )),
+            })
+            .into());
+        }
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let review_id = store.mint_resource_id();
+        let code_review_arn = crate::state::code_review_arn(&region, &review_id);
+        let review = crate::state::CodeReviewRecord {
+            // Assigned by the store on insert.
+            seq: 0,
+            name: input.name,
+            code_review_arn,
+            association_arn,
+            repository_name,
+            owner,
+            provider_type,
+            // CodeGuru Reviewer answers this call with the NON-terminal `Pending`; the clock
+            // owes the move to a terminal state.
+            state: "Pending".to_string(),
+            state_reason: None,
+            // CreateCodeReview creates reviews of this type only — see `TYPE_VALUES`.
+            r#type: "RepositoryAnalysis".to_string(),
+            // Set only on a PullRequest review, which this operation cannot create.
+            pull_request_id: None,
+            analysis_types: input.r#type.analysis_types.unwrap_or_default(),
+            source_code_type: Some(source_code_type),
+            // No analysis ran, so there are no metrics and no config-file verdict to report.
+            metrics: None,
+            config_file_state: None,
+            created_time_stamp: now,
+            last_updated_time_stamp: now,
+            client_request_token: input.client_request_token,
+            pending: Some(crate::state::PendingTransition::to_state(
+                "Failed",
+                Some(ANALYSIS_NOT_AVAILABLE.to_string()),
+            )),
+        };
+
+        // `insert_code_review` answers with the STORED record, so this call and a later
+        // DescribeCodeReview cannot differ.
+        let stored = store.insert_code_review(review);
+        Ok(CreateCodeReviewOutput {
+            code_review: Some(stored.to_wire()),
+        })
     }
 }

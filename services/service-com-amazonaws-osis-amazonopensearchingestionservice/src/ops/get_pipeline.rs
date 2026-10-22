@@ -152,7 +152,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = store
             .pipelines
             .get(&input.pipeline_name)
-            .ok_or_else(|| not_found(&input.pipeline_name))?;
+            .ok_or_else(not_found)?;
         Ok(GetPipelineOutput {
             pipeline: Some(stored.to_pipeline()),
         })
@@ -160,9 +160,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// No pipeline of this name is stored — HTTP 404 `ResourceNotFoundException`.
-fn not_found(pipeline_name: &str) -> GetPipelineError {
+///
+/// The message is this read's own, and it states only that the pipeline was not
+/// found: the recorded service answers a constant here and does NOT echo the
+/// requested name back, so neither does this. A not-found message is
+/// per-operation, not one template shared across the service.
+fn not_found() -> GetPipelineError {
     GetPipelineErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Pipeline {pipeline_name} could not be found")),
+        message: Some("The pipeline could not be found".to_string()),
     })
     .into()
 }

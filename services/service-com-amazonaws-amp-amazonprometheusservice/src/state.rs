@@ -1,11 +1,150 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-amp-amazonprometheusservice service.
+//!
+//! Besides the state struct itself this module holds the few derivations every
+//! workspace handler needs (the ARN, the Prometheus endpoint, the request's region,
+//! a fresh workspace id), so `src/ops/*.rs` share ONE copy of each rule.
+
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// `WorkspaceStatusCode` values a workspace moves through here. Each is an entry of
+/// the modelled `com.amazonaws.amp#WorkspaceStatusCode` enum, whose own
+/// documentation states the lifecycle rules this crate enforces:
+/// `CREATING` — "Workspace is being created. Deletion is disallowed until status is
+/// ACTIVE."; `ACTIVE` — "Workspace has been created and is usable."; `DELETING` —
+/// "Workspace is being deleted. Deletions are allowed only when status is ACTIVE."
+/// (`crate::ops::types::WORKSPACE_STATUS_CODE_VALUES` carries the full list.)
+pub const STATUS_CREATING: &str = "CREATING";
+/// See [`STATUS_CREATING`].
+pub const STATUS_ACTIVE: &str = "ACTIVE";
+/// See [`STATUS_CREATING`].
+pub const STATUS_DELETING: &str = "DELETING";
+
+/// How long a workspace stays in a transient status before the clock owes the next
+/// transition (`CREATING` -> `ACTIVE`, `DELETING` -> removed).
+///
+/// CHOSEN, not documented: Amazon Managed Service for Prometheus publishes no
+/// duration for either transition, so this is the emulator's own span — long enough
+/// that a caller acting straight after `CreateWorkspace`/`DeleteWorkspace` still
+/// observes the transient status and the state errors that go with it, short enough
+/// that a workflow does not wait on it. Nothing sleeps for it: the due instant is
+/// stored and applied by [`ComAmazonawsAmpAmazonprometheusserviceState::materialize_due`].
+pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
+
+/// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException`
+/// report for a workspace. The member is a free-form `String` documented as "Type of
+/// the resource affected", so the emulator reports the resource's AWS type name.
+pub const WORKSPACE_RESOURCE_TYPE: &str = "AWS::APS::Workspace";
+
+/// How many workspaces the store holds before `CreateWorkspace` refuses with the
+/// modelled `ServiceQuotaExceededException`.
+///
+/// Amazon Managed Service for Prometheus publishes an adjustable quota on workspaces
+/// per account per Region, and this emulator models neither Service Quotas nor an
+/// account's adjustments — so this is the emulator's OWN bound on the store, not a
+/// claim about any account's limit. It sits far above any workflow an emulator serves,
+/// and it is what stops the state growing without end: every record it bounds is
+/// released by `DeleteWorkspace`, which also drops that workspace's ARN index entry
+/// and forgets its client tokens, so neither of those maps can outgrow it either.
+pub const WORKSPACE_QUOTA: usize = 1_000;
+
+/// The largest page `ListWorkspaces` serves, and the page size it uses when the request
+/// names no `maxResults`: `ListWorkspacesRequest$maxResults` is modelled
+/// `@range(min: 1, max: 1000)` and documented "The maximum number of workspaces to
+/// return per request. The default is 100." The handler clamps into `1..=MAX` itself
+/// rather than trusting the boundary validator, so a caller cannot choose the amount of
+/// work one request does.
+pub const WORKSPACE_PAGE_LIMIT: i32 = 1_000;
+/// See [`WORKSPACE_PAGE_LIMIT`].
+pub const WORKSPACE_PAGE_DEFAULT: i32 = 100;
+
+/// This service's ARN namespace (`OPERATIONS.md`: "ARN namespace: `aps`").
+const ARN_SERVICE: &str = "aps";
+
+/// Region used when a request carries no SigV4 credential scope to read one from —
+/// the region the emulator's own generated client config defaults to.
+const DEFAULT_REGION: &str = "us-east-1";
+
+/// One stored workspace: every member `WorkspaceDescription` / `WorkspaceSummary`
+/// report, plus the bookkeeping the lifecycle needs.
+#[derive(Debug, Clone)]
+pub struct Workspace {
+    pub workspace_id: String,
+    pub arn: String,
+    /// `None` when the workspace carries no alias (none given, or one that was all
+    /// blank space — see [`normalize_alias`]).
+    pub alias: Option<String>,
+    /// One of [`STATUS_CREATING`], [`STATUS_ACTIVE`], [`STATUS_DELETING`].
+    pub status_code: String,
+    pub prometheus_endpoint: String,
+    pub created_at: SystemTime,
+    /// Sorted so a listing and a describe report the tags in one stable order.
+    pub tags: BTreeMap<String, String>,
+    pub kms_key_arn: Option<String>,
+    /// When the clock owes this workspace's next lifecycle transition, if one is
+    /// pending: `CREATING` becomes `ACTIVE`, `DELETING` is removed.
+    pub transition_due: Option<SystemTime>,
+    /// The `clientToken` of the `DeleteWorkspace` call that started a pending
+    /// deletion, so replaying that exact call stays idempotent rather than
+    /// conflicting with the deletion it already started.
+    pub delete_token: Option<String>,
+}
 
 /// Per-service state for com-amazonaws-amp-amazonprometheusservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsAmpAmazonprometheusserviceState {
-    // TODO: add service-specific state fields
+    /// Every workspace this emulator holds, keyed by `workspaceId`.
+    pub workspaces: HashMap<String, Workspace>,
+    /// `workspaceArn -> workspaceId`, so the `/tags/{resourceArn}` operations
+    /// resolve an ARN without scanning every workspace.
+    pub arn_index: HashMap<String, String>,
+    /// `clientToken -> workspaceId`, which is what makes `CreateWorkspace`
+    /// idempotent per its `@idempotencyToken`.
+    pub client_tokens: HashMap<String, String>,
+    /// Counts the ids this store has minted; see [`mint_workspace_id`].
+    pub next_id: u64,
+}
+
+impl ComAmazonawsAmpAmazonprometheusserviceState {
+    /// Apply every lifecycle transition the clock already owes at `now`.
+    ///
+    /// Each pending transition was due at an instant recorded when the call that
+    /// started it ran, so it is owed whether or not anybody calls again; applying it
+    /// here is materialising a change the clock made, not a side effect of the read.
+    /// Call it FIRST in every handler, so each one sees the same state a caller
+    /// would after any other.
+    pub fn materialize_due(&mut self, now: SystemTime) {
+        let mut deleted: Vec<String> = Vec::new();
+        for workspace in self.workspaces.values_mut() {
+            let Some(due) = workspace.transition_due else {
+                continue;
+            };
+            if now < due {
+                continue;
+            }
+            workspace.transition_due = None;
+            if workspace.status_code == STATUS_DELETING {
+                deleted.push(workspace.workspace_id.clone());
+            } else {
+                workspace.status_code = STATUS_ACTIVE.to_string();
+            }
+        }
+        for workspace_id in deleted {
+            if let Some(workspace) = self.workspaces.remove(&workspace_id) {
+                self.arn_index.remove(&workspace.arn);
+            }
+            self.client_tokens.retain(|_, id| id != &workspace_id);
+        }
+    }
+
+    /// The `workspaceId` the stored ARN `resource_arn` belongs to, if any.
+    pub fn workspace_id_of_arn(&self, resource_arn: &str) -> Option<String> {
+        self.arn_index.get(resource_arn).cloned()
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -17,4 +156,109 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsAmpAmazonprometheusserviceState>)
+}
+
+/// The region this request was signed for, defaulting to [`DEFAULT_REGION`] when it
+/// carries no SigV4 credential scope (an anonymous or host-routed request).
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// A workspace ARN: `arn:aws:aps:<region>:<account>:workspace/<workspaceId>`, as
+/// `WorkspaceArn`'s pattern `^arn:aws[-a-z]*:aps:[-a-z0-9]+:[0-9]{12}:workspace/.+$`
+/// requires. The account segment comes from the engine, never from a literal.
+pub fn workspace_arn(region: &str, workspace_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("workspace/{workspace_id}"))
+}
+
+/// The workspace's Prometheus endpoint, in the form
+/// `WorkspaceDescription$prometheusEndpoint` documents: "For example,
+/// `https://aps-workspaces.<region>.amazonaws.com/workspaces/ws-.../api/v1/`".
+pub fn prometheus_endpoint(region: &str, workspace_id: &str) -> String {
+    format!("https://aps-workspaces.{region}.amazonaws.com/workspaces/{workspace_id}/api/v1/")
+}
+
+/// A fresh workspace id of the shape the service mints: `ws-` followed by a UUID,
+/// which `WorkspaceId`'s pattern (`[0-9A-Za-z][-.0-9A-Z_a-z]*`, length 1..64)
+/// accepts and `WorkspaceDescription$workspaceId` shows ("For example,
+/// `ws-example1-1234-abcd-5678-ef90abcd1234`").
+///
+/// The UUID is a digest of this store's id counter (unique within the process) folded
+/// with a per-process seed (so two emulator processes do not mint the same ids), hashed
+/// so the id discloses neither. It takes the counter rather than `&mut self` so a
+/// handler holding a stored record borrowed can still mint — which is what lets it mint
+/// only AFTER every refusal has been answered.
+pub fn mint_workspace_id(counter: &mut u64) -> String {
+    *counter += 1;
+    let mut hasher = Sha256::new();
+    hasher.update(b"workspace");
+    hasher.update(counter.to_be_bytes());
+    hasher.update(process_seed().to_be_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let hex = hex::encode(digest);
+    format!(
+        "ws-{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// A seed drawn once per process, so ids minted by two emulator processes from the same
+/// counter still differ.
+fn process_seed() -> u128 {
+    static SEED: OnceLock<u128> = OnceLock::new();
+    *SEED.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default()
+    })
+}
+
+/// The alias to STORE for a given `alias` member.
+///
+/// `CreateWorkspace$alias` and `UpdateWorkspaceAlias$alias` both document that
+/// "blank spaces at the beginning or end of the alias that you specify will be
+/// trimmed from the value used", so the stored value is the trimmed one. An alias
+/// that is nothing but blank space trims to the empty string, which `WorkspaceAlias`
+/// (length 1..100) cannot hold, so it leaves the workspace with no alias at all.
+pub fn normalize_alias(alias: Option<&str>) -> Option<String> {
+    alias
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty())
+        .map(ToString::to_string)
+}
+
+/// How many tags one resource holds. `TagMap` is modelled `len ..50` — which bounds a
+/// single request — and 50 is also the service's documented per-resource tag limit, so
+/// `TagResource` enforces it on the ACCUMULATED map. That is both the fidelity rule and
+/// what stops a stored tag map growing without end as a caller repeats the operation
+/// with fresh keys.
+pub const TAGS_PER_RESOURCE_LIMIT: usize = 50;
+
+/// The tag-key prefix the service reserves: `TagResource$tags` documents "Keys must
+/// not begin with aws:".
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The reserved tag key a request carries, if any — the lowest one, so the refusal
+/// names the same key however the request's map was iterated.
+pub fn reserved_tag_key<'a, I: IntoIterator<Item = &'a String>>(keys: I) -> Option<&'a str> {
+    keys.into_iter()
+        .map(String::as_str)
+        .filter(|key| key.starts_with(RESERVED_TAG_KEY_PREFIX))
+        .min()
+}
+
+/// The stored tags as the `TagMap` the wire shapes carry. Always a map, empty when
+/// the resource has no tags, so a reader sees `{}` rather than an absent member.
+pub fn tag_map(tags: &BTreeMap<String, String>) -> Option<HashMap<String, String>> {
+    Some(
+        tags.iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
 }

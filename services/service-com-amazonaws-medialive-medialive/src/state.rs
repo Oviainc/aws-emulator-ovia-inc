@@ -5,10 +5,13 @@
 //! The channel lifecycle lives here: one [`ChannelRecord`] per created channel,
 //! the monotonic id counter that mints its `Id`, and the idempotency-token map
 //! that makes a retried `CreateChannel` return the channel it already created.
+//! The input lifecycle lives beside it: one [`InputRecord`] per created input,
+//! its own id counter and its own token map.
 //!
-//! Every value a channel-shaped response carries is either stored verbatim from
-//! the request that created the channel or derived from the stored state
-//! ([`ComAmazonawsMedialiveMedialiveState::channel_description`]) — no operation
+//! Every value a channel- or input-shaped response carries is either stored
+//! verbatim from the request that created the resource or derived from the stored
+//! state ([`ComAmazonawsMedialiveMedialiveState::channel_description`],
+//! [`ComAmazonawsMedialiveMedialiveState::input_description`]) — no operation
 //! builds a response out of its own request.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -18,9 +21,14 @@ use crate::ops::types::{
     AnywhereSettings, CdiInputSpecification, Channel, ChannelSummary,
     DescribeAnywhereSettings, DescribeFollowerChannelSettings, DescribeInferenceSettings,
     DescribeLinkedChannelSettings, DescribePrimaryChannelSettings, EncoderSettings,
-    InferenceSettings, InputAttachment, InputSpecification, LinkedChannelSettings,
-    MaintenanceStatus, OutputDestination, PipelineDetail, VpcOutputSettings,
-    VpcOutputSettingsDescription,
+    InferenceSettings, Input, InputAttachment, InputDestination, InputDestinationRequest,
+    InputDestinationRoute, InputDeviceSettings, InputSource, InputSourceRequest,
+    InputSpecification, InputVpcRequest, LinkedChannelSettings, MaintenanceStatus,
+    MediaConnectFlow, MediaConnectFlowRequest, MulticastSettings,
+    MulticastSettingsCreateRequest, MulticastSource, OutputDestination, PipelineDetail,
+    RouterDestination, RouterInputSettings, RouterSettings, Smpte2110ReceiverGroupSettings,
+    SrtCallerDecryption, SrtCallerSource, SrtListenerDecryption, SrtListenerSettings,
+    SrtSettings, SrtSettingsRequest, VpcOutputSettings, VpcOutputSettingsDescription,
 };
 
 /// The `ChannelState` enum values this slice uses, spelled exactly as the model
@@ -44,6 +52,51 @@ pub mod channel_class {
     pub const STANDARD: &str = "STANDARD";
     pub const SINGLE_PIPELINE: &str = "SINGLE_PIPELINE";
 }
+
+/// The `InputState` enum values this slice uses, spelled exactly as the model
+/// declares them (`smithy_query(query="shape", shape="InputState")`: CREATING |
+/// DETACHED | ATTACHED | DELETING | DELETED).
+///
+/// `CREATING` is NOT one of them: the real service answers `CreateInput` with an
+/// input that is already `DETACHED` (the recorded create carries
+/// `State=DETACHED`), so an input is returned ready and owes the clock no
+/// transition. `DELETING` and `DELETED` are the deletion half of the lifecycle,
+/// which `DeleteInput` owns (still a scaffold stub).
+pub mod input_state {
+    pub const DETACHED: &str = "DETACHED";
+    pub const ATTACHED: &str = "ATTACHED";
+}
+
+/// The `InputClass` enum values (`smithy_query(query="shape",
+/// shape="InputClass")`: STANDARD | SINGLE_PIPELINE).
+pub mod input_class {
+    pub const STANDARD: &str = "STANDARD";
+    pub const SINGLE_PIPELINE: &str = "SINGLE_PIPELINE";
+}
+
+/// The `InputSourceType` enum values (`smithy_query(query="shape",
+/// shape="InputSourceType")`: STATIC | DYNAMIC).
+pub mod input_source_type {
+    pub const STATIC: &str = "STATIC";
+    pub const DYNAMIC: &str = "DYNAMIC";
+}
+
+/// The `InputNetworkLocation` an input that names none gets: the
+/// `InputNetworkLocation` doc says "By default all inputs will continue to be
+/// AWS inputs" (`smithy_query(query="shape", shape="InputNetworkLocation")`).
+pub const DEFAULT_INPUT_NETWORK_LOCATION: &str = "AWS";
+
+/// The `InputType` values whose sources can carry a dynamic URL: the
+/// `Input$InputSourceType` doc — "Certain pull input sources can be dynamic,
+/// meaning that they can have their URL's dynamically changes during input switch
+/// actions. Presently, this functionality only works with MP4_FILE and TS_FILE
+/// inputs."
+const DYNAMIC_CAPABLE_INPUT_TYPES: [&str; 2] = ["MP4_FILE", "TS_FILE"];
+
+/// The variable a source URL carries to make a pull input dynamic, per the
+/// MediaLive user guide's "Creating a dynamic input" ("in the URL, include the
+/// string `$urlPath$` in place of the part of the path that will change").
+const DYNAMIC_URL_VARIABLE: &str = "$urlPath$";
 
 /// How long a channel stays in a transient state (`CREATING`, `STARTING`,
 /// `STOPPING`, `DELETING`) before the clock makes the next state due.
@@ -75,6 +128,22 @@ pub const MAX_CHANNELS: usize = 100;
 /// enforced anyway, by evicting the oldest token, so the map cannot accumulate
 /// caller-chosen strings independently of the channels they name.
 pub const MAX_IDEMPOTENCY_TOKENS: usize = MAX_CHANNELS;
+
+/// The id the first input of a process gets. AWS input ids are numeric strings,
+/// so they are minted from a counter at a fixed seven-digit width, which keeps
+/// the `BTreeMap` key order equal to the mint order.
+const FIRST_INPUT_ID: u64 = 1_000_000;
+
+/// The most inputs this emulator stores for one account.
+///
+/// A ceiling, not a guess at AWS's published quota: it exists so a create loop
+/// cannot grow the emulator's heap without bound. `CreateInput` models
+/// `TooManyRequestsException`, which is the refusal once the store is full.
+pub const MAX_INPUTS: usize = 100;
+
+/// The most `RequestId` entries kept for `CreateInput` idempotency — the same
+/// bound, for the same reason, as [`MAX_IDEMPOTENCY_TOKENS`] on channels.
+pub const MAX_INPUT_IDEMPOTENCY_TOKENS: usize = MAX_INPUTS;
 
 /// The page size `ListChannels` uses when the request names no `MaxResults`, and
 /// the ceiling it clamps a larger `MaxResults` to. Finite, so one request cannot
@@ -216,6 +285,64 @@ impl ChannelRecord {
     }
 }
 
+/// A bounded map from a caller-chosen `@idempotencyToken` to the id of the
+/// resource that token created, so a retried create returns the resource the
+/// first attempt made instead of a second one.
+///
+/// One implementation for every resource kind that models an idempotency token
+/// (channels, inputs), so the cap and the eviction order cannot drift between
+/// them. The fields are PRIVATE: the only way in is [`Self::record`], which
+/// enforces the cap by evicting the oldest token.
+#[derive(Debug, Default)]
+pub struct IdempotencyTokens {
+    /// token -> the id of the resource it created.
+    tokens: HashMap<String, String>,
+    /// The order [`Self::tokens`] was written in, so the cap evicts the oldest
+    /// token rather than an arbitrary one.
+    order: VecDeque<String>,
+}
+
+impl IdempotencyTokens {
+    /// Record `token` as having created `resource_id`, evicting the oldest token
+    /// first if that would push the map past `cap`.
+    fn record(&mut self, token: String, resource_id: &str, cap: usize) {
+        while self.tokens.len() >= cap {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.tokens.remove(&oldest);
+                }
+                // The order queue and the map are written together, so this is
+                // unreachable; clearing rather than looping forever keeps the cap
+                // an invariant even if they ever drift.
+                None => {
+                    self.tokens.clear();
+                    break;
+                }
+            }
+        }
+        if self
+            .tokens
+            .insert(token.clone(), resource_id.to_string())
+            .is_none()
+        {
+            self.order.push_back(token);
+        }
+    }
+
+    /// The id `token` created, whether or not that resource still exists.
+    fn created(&self, token: &str) -> Option<&str> {
+        self.tokens.get(token).map(String::as_str)
+    }
+
+    /// Drop every token that created `resource_id`, so a token never outlives
+    /// the resource it minted.
+    fn forget(&mut self, resource_id: &str) {
+        self.tokens.retain(|_, created| created != resource_id);
+        let live = &self.tokens;
+        self.order.retain(|token| live.contains_key(token));
+    }
+}
+
 /// Per-service state for com-amazonaws-medialive-medialive. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMedialiveMedialiveState {
@@ -231,10 +358,14 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     /// PRIVATE, so the cap and the eviction order are invariants the type
     /// enforces: it is written only by [`Self::record_idempotency_token`] and
     /// read only through [`Self::channel_for_token`].
-    idempotency_tokens: HashMap<String, String>,
-    /// The order [`Self::idempotency_tokens`] was written in, so the cap evicts
-    /// the oldest token rather than an arbitrary one.
-    idempotency_token_order: VecDeque<String>,
+    channel_tokens: IdempotencyTokens,
+    /// Every input that exists, keyed by its minted `Id`, in id order for the
+    /// same reason as [`Self::channels`].
+    pub inputs: BTreeMap<String, InputRecord>,
+    /// Mint counter behind [`Self::mint_input_id`].
+    pub next_input_id: u64,
+    /// `CreateInput`'s `RequestId` (`@idempotencyToken`) -> the input it created.
+    input_tokens: IdempotencyTokens,
 }
 
 impl ComAmazonawsMedialiveMedialiveState {
@@ -256,7 +387,7 @@ impl ComAmazonawsMedialiveMedialiveState {
         });
         // A token never outlives the channel it minted.
         for id in removed {
-            self.forget_idempotency_tokens_for(&id);
+            self.channel_tokens.forget(&id);
         }
     }
 
@@ -269,36 +400,8 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// Record `token` as having created `channel_id`, evicting the oldest token
     /// first if that would push the map past [`MAX_IDEMPOTENCY_TOKENS`].
     pub fn record_idempotency_token(&mut self, token: String, channel_id: &str) {
-        while self.idempotency_tokens.len() >= MAX_IDEMPOTENCY_TOKENS {
-            match self.idempotency_token_order.pop_front() {
-                Some(oldest) => {
-                    self.idempotency_tokens.remove(&oldest);
-                }
-                // The order queue and the map are written together, so this is
-                // unreachable; clearing rather than looping forever keeps the cap
-                // an invariant even if they ever drift.
-                None => {
-                    self.idempotency_tokens.clear();
-                    break;
-                }
-            }
-        }
-        if self
-            .idempotency_tokens
-            .insert(token.clone(), channel_id.to_string())
-            .is_none()
-        {
-            self.idempotency_token_order.push_back(token);
-        }
-    }
-
-    /// Drop every idempotency token that created `channel_id`.
-    fn forget_idempotency_tokens_for(&mut self, channel_id: &str) {
-        self.idempotency_tokens
-            .retain(|_, created| created != channel_id);
-        let live = &self.idempotency_tokens;
-        self.idempotency_token_order
-            .retain(|token| live.contains_key(token));
+        self.channel_tokens
+            .record(token, channel_id, MAX_IDEMPOTENCY_TOKENS);
     }
 
     /// The next channel id, as AWS shapes them: a numeric string.
@@ -310,7 +413,7 @@ impl ComAmazonawsMedialiveMedialiveState {
 
     /// The channel a stored `RequestId` created, if that channel still exists.
     pub fn channel_for_token(&self, request_id: &str) -> Option<&str> {
-        let id = self.idempotency_tokens.get(request_id)?;
+        let id = self.channel_tokens.created(request_id)?;
         self.channels.get(id).map(|channel| channel.id.as_str())
     }
 
@@ -392,11 +495,131 @@ impl ComAmazonawsMedialiveMedialiveState {
         }
     }
 
+    /// Whether the input store is full, so `CreateInput` must refuse rather than
+    /// mint another input.
+    pub fn inputs_are_full(&self) -> bool {
+        self.inputs.len() >= MAX_INPUTS
+    }
+
+    /// The next input id, as AWS shapes them: a numeric string.
+    pub fn mint_input_id(&mut self) -> String {
+        let id = FIRST_INPUT_ID + self.next_input_id;
+        self.next_input_id += 1;
+        id.to_string()
+    }
+
+    /// Record `token` as having created `input_id`, under the same bounded,
+    /// evicting discipline as the channel tokens.
+    pub fn record_input_idempotency_token(&mut self, token: String, input_id: &str) {
+        self.input_tokens
+            .record(token, input_id, MAX_INPUT_IDEMPOTENCY_TOKENS);
+    }
+
+    /// The input a stored `RequestId` created, if that input still exists.
+    pub fn input_for_token(&self, request_id: &str) -> Option<&str> {
+        let id = self.input_tokens.created(request_id)?;
+        self.inputs.get(id).map(|input| input.id.as_str())
+    }
+
+    /// An input's `AttachedChannels`: "A list of channel IDs that that input is
+    /// attached to". Derived from the channels' own `InputAttachments`, so it
+    /// tracks every channel created or deleted after this input.
+    pub fn attached_channels(&self, input_id: &str) -> Vec<String> {
+        self.channels
+            .values()
+            .filter(|channel| {
+                channel.input_attachments.iter().any(|attachment| {
+                    attachment.input_id.as_deref() == Some(input_id)
+                })
+            })
+            .map(|channel| channel.id.clone())
+            .collect()
+    }
+
+    /// An input's `InputPartnerIds`: "A list of IDs for all Inputs which are
+    /// partners of this one". A partner pair names each other, so this is both
+    /// the inputs created as a partner OF this one and, if this input is itself
+    /// a partner, the input it was created for.
+    fn input_partner_ids(&self, input_id: &str) -> Vec<String> {
+        let mut partners: Vec<String> = self
+            .inputs
+            .values()
+            .filter(|input| input.partner_of.as_deref() == Some(input_id))
+            .map(|input| input.id.clone())
+            .collect();
+        if let Some(primary) = self
+            .inputs
+            .get(input_id)
+            .and_then(|input| input.partner_of.clone())
+            .filter(|primary| self.inputs.contains_key(primary))
+        {
+            partners.push(primary);
+        }
+        partners.sort();
+        partners
+    }
+
+    /// The `InputState` of one stored input: `ATTACHED` exactly while some
+    /// channel attaches it, and `DETACHED` while none does.
+    pub fn input_state(&self, input: &InputRecord) -> &'static str {
+        if self.attached_channels(&input.id).is_empty() {
+            input_state::DETACHED
+        } else {
+            input_state::ATTACHED
+        }
+    }
+
+    /// The full `Input` description of one stored input, or `None` when no input
+    /// has that id.
+    pub fn input_description(&self, id: &str) -> Option<Input> {
+        let input = self.inputs.get(id)?;
+        Some(Input {
+            arn: Some(input.arn.clone()),
+            attached_channels: Some(self.attached_channels(id)),
+            destinations: Some(
+                input
+                    .destinations
+                    .iter()
+                    .map(described_input_destination)
+                    .collect(),
+            ),
+            id: Some(input.id.clone()),
+            input_class: Some(input.input_class().to_string()),
+            input_devices: Some(input.input_devices.clone()),
+            input_partner_ids: Some(self.input_partner_ids(id)),
+            input_source_type: Some(input.input_source_type().to_string()),
+            media_connect_flows: Some(
+                input
+                    .media_connect_flows
+                    .iter()
+                    .map(|flow| MediaConnectFlow {
+                        flow_arn: flow.flow_arn.clone(),
+                    })
+                    .collect(),
+            ),
+            name: input.name.clone(),
+            role_arn: input.role_arn.clone(),
+            security_groups: Some(input.security_groups.clone()),
+            sources: Some(input.sources.iter().map(described_input_source).collect()),
+            state: Some(self.input_state(input).to_string()),
+            tags: Some(input.tags.clone()),
+            r#type: input.input_type.clone(),
+            srt_settings: input.srt_settings.as_ref().map(described_srt_settings),
+            input_network_location: Some(input.input_network_location.clone()),
+            multicast_settings: input
+                .multicast_settings
+                .as_ref()
+                .map(described_multicast_settings),
+            smpte2110_receiver_group_settings: input.smpte2110_receiver_group_settings.clone(),
+            sdi_sources: Some(input.sdi_sources.clone()),
+            router_settings: input.router_settings.as_ref().map(described_router_settings),
+        })
+    }
+
     /// A primary channel's `FollowingChannelArns`: the ARNs of the channels
     /// whose own follower settings name this channel as their primary. Derived
     /// from state, so it tracks every later create and delete.
-    fn following_channel_arns(&self, primary_arn: &str) -> Vec<String> {
-        self.channels
+    fn following_channel_arns(&self, primary_arn: &str) -> Vec<String> {        self.channels
             .values()
             .filter(|channel| {
                 channel
@@ -429,6 +652,252 @@ impl ComAmazonawsMedialiveMedialiveState {
                 }
             }),
         }
+    }
+}
+
+/// One created input, as `CreateInput` stored it plus its lifecycle state.
+///
+/// The REQUEST shapes are what is stored (`InputSourceRequest`,
+/// `InputDestinationRequest`, …), and the `Input` response shape is projected
+/// out of them by [`ComAmazonawsMedialiveMedialiveState::input_description`], so
+/// nothing a request supplied is dropped and no response is built from the
+/// request that happens to be in flight. Members the real service computes from
+/// infrastructure it owns (a push endpoint's IP, port and URL, a VPC network
+/// interface, a MediaConnect router output ARN) are NOT invented here.
+#[derive(Debug, Clone)]
+pub struct InputRecord {
+    pub id: String,
+    pub arn: String,
+    pub name: Option<String>,
+    /// The `InputType` the request named, stored under a non-reserved name.
+    pub input_type: Option<String>,
+    pub input_network_location: String,
+    pub role_arn: Option<String>,
+    /// The `InputSecurityGroups` the request attached, reported as the input's
+    /// `SecurityGroups`.
+    pub security_groups: Vec<String>,
+    pub sources: Vec<InputSourceRequest>,
+    pub destinations: Vec<InputDestinationRequest>,
+    pub media_connect_flows: Vec<MediaConnectFlowRequest>,
+    pub input_devices: Vec<InputDeviceSettings>,
+    pub sdi_sources: Vec<String>,
+    pub srt_settings: Option<SrtSettingsRequest>,
+    pub multicast_settings: Option<MulticastSettingsCreateRequest>,
+    pub smpte2110_receiver_group_settings: Option<Smpte2110ReceiverGroupSettings>,
+    pub router_settings: Option<RouterSettings>,
+    /// The private-VPC settings the request asked for. The `Input` shape has no
+    /// member that reports them back, but they are what makes this a VPC input,
+    /// so they are kept with the record rather than discarded.
+    pub vpc: Option<InputVpcRequest>,
+    pub tags: HashMap<String, String>,
+    /// The input this one was created as a partner of (`CreatePartnerInput`),
+    /// which is what makes the pair name each other in `InputPartnerIds`.
+    pub partner_of: Option<String>,
+}
+
+impl InputRecord {
+    /// How many ingest endpoints the create request named: the widest of the
+    /// per-pipeline lists, since one entry in any of them is one pipeline's
+    /// worth of ingest.
+    fn ingest_endpoint_count(&self) -> usize {
+        let multicast_sources = self
+            .multicast_settings
+            .as_ref()
+            .and_then(|settings| settings.sources.as_ref())
+            .map_or(0, Vec::len);
+        let receiver_groups = self
+            .smpte2110_receiver_group_settings
+            .as_ref()
+            .and_then(|settings| settings.smpte2110_receiver_groups.as_ref())
+            .map_or(0, Vec::len);
+        let srt_caller_sources = self
+            .srt_settings
+            .as_ref()
+            .and_then(|settings| settings.srt_caller_sources.as_ref())
+            .map_or(0, Vec::len);
+        [
+            self.sources.len(),
+            self.destinations.len(),
+            self.media_connect_flows.len(),
+            self.input_devices.len(),
+            self.sdi_sources.len(),
+            multicast_sources,
+            receiver_groups,
+            srt_caller_sources,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+    }
+
+    /// This input's `InputClass`, per the `InputClass` doc: "A standard input has
+    /// two sources and a single pipeline input only has one" — so an input whose
+    /// create request named exactly one ingest endpoint is `SINGLE_PIPELINE`,
+    /// and any other is the two-pipeline `STANDARD` class MediaLive defaults to.
+    pub fn input_class(&self) -> &'static str {
+        if self.ingest_endpoint_count() == 1 {
+            input_class::SINGLE_PIPELINE
+        } else {
+            input_class::STANDARD
+        }
+    }
+
+    /// This input's `InputSourceType`: `DYNAMIC` when it is one of the types
+    /// whose pull sources may carry a dynamic URL and a source URL carries the
+    /// `$urlPath$` variable, otherwise `STATIC` ("By default all input sources
+    /// are static", `InputSourceType`'s doc).
+    pub fn input_source_type(&self) -> &'static str {
+        let dynamic_capable = self
+            .input_type
+            .as_deref()
+            .is_some_and(|input_type| DYNAMIC_CAPABLE_INPUT_TYPES.contains(&input_type));
+        let dynamic_url = self.sources.iter().any(|source| {
+            source
+                .url
+                .as_deref()
+                .is_some_and(|url| url.contains(DYNAMIC_URL_VARIABLE))
+        });
+        if dynamic_capable && dynamic_url {
+            input_source_type::DYNAMIC
+        } else {
+            input_source_type::STATIC
+        }
+    }
+}
+
+/// Build a new input record from the ids. Every modelled member starts at the
+/// empty value the request then fills in.
+///
+/// There is no transient state to owe: the real service answers `CreateInput`
+/// with an input that is already `DETACHED`, so this one is usable from the
+/// instant it is stored.
+pub fn new_input(id: String, arn: String) -> InputRecord {
+    InputRecord {
+        id,
+        arn,
+        name: None,
+        input_type: None,
+        input_network_location: DEFAULT_INPUT_NETWORK_LOCATION.to_string(),
+        role_arn: None,
+        security_groups: Vec::new(),
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        media_connect_flows: Vec::new(),
+        input_devices: Vec::new(),
+        sdi_sources: Vec::new(),
+        srt_settings: None,
+        multicast_settings: None,
+        smpte2110_receiver_group_settings: None,
+        router_settings: None,
+        vpc: None,
+        tags: HashMap::new(),
+        partner_of: None,
+    }
+}
+
+/// `InputSourceRequest` -> `InputSource`: the same three members, so a pull
+/// input reports the sources it was created with.
+fn described_input_source(source: &InputSourceRequest) -> InputSource {
+    InputSource {
+        password_param: source.password_param.clone(),
+        url: source.url.clone(),
+        username: source.username.clone(),
+    }
+}
+
+/// `InputDestinationRequest` -> `InputDestination`.
+///
+/// `Ip` is the request's `StaticIpAddress` when it named one (the address an
+/// ON-PREM push input takes on the customer network); `Port`, `Url` and `Vpc`
+/// describe the push endpoint and the VPC network interface the real service
+/// provisions, which this emulator does not, so it claims none of them.
+fn described_input_destination(destination: &InputDestinationRequest) -> InputDestination {
+    InputDestination {
+        ip: destination.static_ip_address.clone(),
+        port: None,
+        url: None,
+        vpc: None,
+        network: destination.network.clone(),
+        network_routes: destination.network_routes.as_ref().map(|routes| {
+            routes
+                .iter()
+                .map(|route| InputDestinationRoute {
+                    cidr: route.cidr.clone(),
+                    gateway: route.gateway.clone(),
+                })
+                .collect()
+        }),
+    }
+}
+
+/// `SrtSettingsRequest` -> `SrtSettings`.
+fn described_srt_settings(settings: &SrtSettingsRequest) -> SrtSettings {
+    SrtSettings {
+        srt_caller_sources: settings.srt_caller_sources.as_ref().map(|sources| {
+            sources
+                .iter()
+                .map(|source| SrtCallerSource {
+                    decryption: source.decryption.as_ref().map(|decryption| {
+                        SrtCallerDecryption {
+                            algorithm: decryption.algorithm.clone(),
+                            passphrase_secret_arn: decryption.passphrase_secret_arn.clone(),
+                        }
+                    }),
+                    minimum_latency: source.minimum_latency,
+                    srt_listener_address: source.srt_listener_address.clone(),
+                    srt_listener_port: source.srt_listener_port.clone(),
+                    stream_id: source.stream_id.clone(),
+                })
+                .collect()
+        }),
+        srt_listener_settings: settings.srt_listener_settings.as_ref().map(|listener| {
+            SrtListenerSettings {
+                decryption: Some(SrtListenerDecryption {
+                    algorithm: listener.decryption.algorithm.clone(),
+                    passphrase_secret_arn: listener.decryption.passphrase_secret_arn.clone(),
+                }),
+                minimum_latency: Some(listener.minimum_latency),
+                stream_id: listener.stream_id.clone(),
+            }
+        }),
+    }
+}
+
+/// `MulticastSettingsCreateRequest` -> `MulticastSettings`.
+fn described_multicast_settings(
+    settings: &MulticastSettingsCreateRequest,
+) -> MulticastSettings {
+    MulticastSettings {
+        sources: settings.sources.as_ref().map(|sources| {
+            sources
+                .iter()
+                .map(|source| MulticastSource {
+                    source_ip: source.source_ip.clone(),
+                    url: source.url.clone(),
+                })
+                .collect()
+        }),
+    }
+}
+
+/// `RouterSettings` (request) -> `RouterInputSettings` (response).
+///
+/// `RouterOutputArn` names the MediaConnect router output the real service
+/// associates with the input, which this emulator does not create, so it stays
+/// absent rather than being invented.
+fn described_router_settings(settings: &RouterSettings) -> RouterInputSettings {
+    RouterInputSettings {
+        destinations: settings.destinations.as_ref().map(|destinations| {
+            destinations
+                .iter()
+                .map(|destination| RouterDestination {
+                    availability_zone_name: Some(destination.availability_zone_name.clone()),
+                    router_output_arn: None,
+                })
+                .collect()
+        }),
+        encryption_type: settings.encryption_type.clone(),
+        secret_arn: settings.secret_arn.clone(),
     }
 }
 
@@ -539,9 +1008,9 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 const DEFAULT_REGION: &str = "us-east-1";
 
 /// The message for the one failure that is not about the request: this service
-/// was mounted on an engine that holds no store for it. One constant, so the six
-/// channel operations cannot word it six ways.
-pub const NO_STORE: &str = "medialive channel state is unavailable";
+/// was mounted on an engine that holds no store for it. One constant, so the
+/// service's operations cannot word it several ways.
+pub const NO_STORE: &str = "medialive service state is unavailable";
 
 /// Project a `Channel` onto one of the structurally identical per-operation
 /// channel-description output shapes (`DescribeChannelOutput`,
@@ -581,6 +1050,44 @@ macro_rules! channel_description_output {
 }
 
 pub(crate) use channel_description_output;
+
+/// Project an `Input` onto one of the structurally identical per-operation
+/// input-description output shapes (`DescribeInputOutput` today;
+/// `DeleteInputOutput` and the rest when their own issues land).
+///
+/// One macro rather than a hand-written copy of the same 22-member move per
+/// operation, so those operations cannot drift from each other.
+macro_rules! input_description_output {
+    ($out:ident, $input:expr) => {{
+        let input: $crate::ops::types::Input = $input;
+        $out {
+            arn: input.arn,
+            attached_channels: input.attached_channels,
+            destinations: input.destinations,
+            id: input.id,
+            input_class: input.input_class,
+            input_devices: input.input_devices,
+            input_partner_ids: input.input_partner_ids,
+            input_source_type: input.input_source_type,
+            media_connect_flows: input.media_connect_flows,
+            name: input.name,
+            role_arn: input.role_arn,
+            security_groups: input.security_groups,
+            sources: input.sources,
+            state: input.state,
+            tags: input.tags,
+            r#type: input.r#type,
+            srt_settings: input.srt_settings,
+            input_network_location: input.input_network_location,
+            multicast_settings: input.multicast_settings,
+            smpte2110_receiver_group_settings: input.smpte2110_receiver_group_settings,
+            sdi_sources: input.sdi_sources,
+            router_settings: input.router_settings,
+        }
+    }};
+}
+
+pub(crate) use input_description_output;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

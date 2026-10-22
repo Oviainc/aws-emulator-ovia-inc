@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateWhatsAppBusinessAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateWhatsAppBusinessAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateWhatsAppBusinessAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Unlinks a WhatsApp Business Account: removes the account, the phone numbers
+//! registered under it and their ARN index entries from the store, so a later read
+//! or list no longer finds it. `@idempotent` in the sense the model gives it — the
+//! call leaves the same state however often it runs — and an id that names no
+//! linked account is the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +139,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateWhatsAppBusinessAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateWhatsAppBusinessAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateWhatsAppBusinessAccount"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateWhatsAppBusinessAccountErrorModeled::DependencyException(
+                DependencyException {
+                    message: Some("the social-messaging store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `id` accepts the `waba-...` short form and the account ARN alike.
+        let Some(account_id) = store.linked_account_id(&input.id) else {
+            return Err(
+                DisassociateWhatsAppBusinessAccountErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no linked WhatsApp Business Account with id '{}'",
+                            input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let Some(account) = store.linked_accounts.remove(&account_id) else {
+            // `linked_account_id` resolved the id against this same map, so the
+            // removal always finds the record; answering the modelled not-found
+            // rather than panicking keeps the handler total.
+            return Err(
+                DisassociateWhatsAppBusinessAccountErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no linked WhatsApp Business Account with id '{}'",
+                            input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        store.arn_index.remove(&account.arn);
+        for phone_number_id in &account.phone_number_ids {
+            if let Some(record) = store.phone_numbers.remove(phone_number_id) {
+                store.arn_index.remove(&record.arn);
+            }
+        }
+
+        Ok(DisassociateWhatsAppBusinessAccountOutput {})
     }
 }

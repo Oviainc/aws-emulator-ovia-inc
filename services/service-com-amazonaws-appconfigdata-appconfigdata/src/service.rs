@@ -45,6 +45,38 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// Whether this service serves the request these `parts` came from.
+///
+/// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
+/// owner of this rule, and it is CALLED here rather than re-implemented: the request's
+/// route key must match this service's signing name AND its first URI path segment
+/// must be one the generated, model-derived `ROUTE_PATH_SEGMENTS` declares, by exact
+/// segment equality. That path conjunct is what separates two services sharing one
+/// SigV4 signing name — AppConfigData and the AppConfig control plane both sign as
+/// `appconfig`, so the key alone matches both and the router would reject every such
+/// request as `500 AmbiguousService` — and their modelled path spaces are disjoint
+/// (`configuration`, `configurationsessions` here; `applications`,
+/// `deploymentstrategies`, `extensions`, … there).
+///
+/// The helper takes a whole `http::Request` while [`Service::can_handle`] is handed
+/// only the request's parts, so the two things it reads — the URI and the headers —
+/// are re-presented to it as a bodiless request. It reads neither the body nor the
+/// method, so nothing it decides on is missing.
+fn can_handle_parts(parts: &http::request::Parts) -> bool {
+    let Ok(mut request) = http::Request::builder()
+        .uri(parts.uri.clone())
+        .body(bytes::Bytes::new())
+    else {
+        return false;
+    };
+    *request.headers_mut() = parts.headers.clone();
+    emulator_server::can_handle_based_on_route_key_and_path(
+        &request,
+        crate::ROUTE_KEY,
+        crate::ROUTE_PATH_SEGMENTS,
+    )
+}
+
 /// The `com-amazonaws-appconfigdata-appconfigdata` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -74,13 +106,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {
-        // Claim a request whose resolved route key is this service's signing
-        // name. Edit this for anything the model does not express — a signing
-        // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
-        }
+        // Delegated to the framework's own predicate — see [`can_handle_parts`]:
+        // this service's signing name (`appconfig`) is shared with the AppConfig
+        // control plane, so the claim is the route key AND the model-derived first
+        // URI path segment. Matching on the signing name alone would have both
+        // services claim every `appconfig`-signed request, which the router answers
+        // with 500 `AmbiguousService` instead of serving either one.
+        can_handle_parts(parts)
     }
 
     fn override_operation(
@@ -96,17 +128,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // Both operations model `BadRequestException` (HTTP 400) as the answer to
+        // input that "fails to satisfy the constraints specified by the service",
+        // and that is exactly what the framework refused here — an absent required
+        // identifier, an identifier outside 1..128, or a
+        // `RequiredMinimumPollIntervalInSeconds` outside 15..86400. So this service
+        // names its own modelled error code rather than the framework's generic
+        // `ValidationException`; the status (400) belongs to the protocol and is the
+        // same either way. The message keeps the framework's validation envelope,
+        // which names the member and the constraint it failed.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "BadRequestException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations).unwrap_or_else(|| {
+                    "The input fails to satisfy the constraints specified by the service."
+                        .to_string()
+                }),
+            }),
+            // An authentication refusal is not a modelled input error: leave the
+            // framework's 403 wording alone.
+            _ => None,
+        }
     }
 
     fn override_routing_error(

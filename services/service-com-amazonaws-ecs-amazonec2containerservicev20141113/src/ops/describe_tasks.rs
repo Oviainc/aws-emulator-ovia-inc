@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the STORED task records named by `tasks`, and a `MISSING` failure for every
+//! id that names nothing. A reporting operation: the only write it performs is
+//! materialising the lifecycle transitions the clock has already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTasks"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeTasksErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
+        let region = crate::state::request_region(ctx);
+        // "If TAGS is specified, the tags are included in the response. If this field is
+        // omitted, tags aren't included in the response."
+        let include_tags = input
+            .include
+            .iter()
+            .flatten()
+            .any(|field| field == "TAGS");
+
+        // One request names at most `MAX_DESCRIBE_BATCH` tasks, so the work it does and
+        // the bytes it answers with are bounded however long its `tasks` list is.
+        if input.tasks.len() > crate::state::MAX_DESCRIBE_BATCH {
+            return Err(DescribeTasksErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "tasks must name at most {} tasks; got {}",
+                        crate::state::MAX_DESCRIBE_BATCH,
+                        input.tasks.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.clusters.contains_key(&cluster_name) {
+            return Err(DescribeTasksErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(format!("cluster {cluster_name:?} was not found")),
+                },
+            )
+            .into());
+        }
+
+        let mut tasks = Vec::new();
+        let mut failures = Vec::new();
+        // A task is reported once however many times the request names it: the same id
+        // repeated names the same task, so it is one answer, not one answer per entry.
+        let mut seen = ::std::collections::HashSet::new();
+        for reference in &input.tasks {
+            let arn = crate::state::task_arn_from_reference(&region, &cluster_name, reference);
+            if !seen.insert(arn.clone()) {
+                continue;
+            }
+            match guard
+                .tasks
+                .get(&arn)
+                .filter(|task| task.cluster_name == cluster_name)
+            {
+                Some(task) => tasks.push(task.view(include_tags)),
+                None => failures.push(crate::state::missing_failure(&arn)),
+            }
+        }
+
+        Ok(DescribeTasksOutput {
+            tasks: Some(tasks),
+            failures: Some(failures),
+        })
     }
 }

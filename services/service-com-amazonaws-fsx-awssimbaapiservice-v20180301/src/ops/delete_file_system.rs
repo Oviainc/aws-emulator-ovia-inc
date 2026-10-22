@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFileSystem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFileSystem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFileSystem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Marks the stored file system `DELETING` and leaves the clock owing its removal, so a
+//! caller sees the transient state first and `FileSystemNotFound` afterwards. The ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +120,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    PendingTransition, TransitionTarget, LIFECYCLE_CREATING, LIFECYCLE_DELETING,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -199,17 +197,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFileSystem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFileSystemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFileSystem"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFileSystemErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the FSx file-system store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        let Some(record) = store.file_systems.get_mut(&input.file_system_id) else {
+            return Err(DeleteFileSystemErrorModeled::FileSystemNotFound(FileSystemNotFound {
+                message: Some(format!(
+                    "file system {} does not exist",
+                    input.file_system_id
+                )),
+            })
+            .into());
+        };
+
+        // A file system that is still being created cannot be deleted yet.
+        if record.lifecycle == LIFECYCLE_CREATING {
+            return Err(DeleteFileSystemErrorModeled::BadRequest(BadRequest {
+                message: Some(format!(
+                    "file system {} cannot be deleted while it is {}",
+                    record.file_system_id, record.lifecycle
+                )),
+            })
+            .into());
+        }
+
+        // `@idempotent`: a delete of a file system already on its way out reports the same
+        // lifecycle again and does not restart the removal the clock already owes.
+        if record.lifecycle != LIFECYCLE_DELETING {
+            record.lifecycle = LIFECYCLE_DELETING.to_string();
+            record.pending = Some(PendingTransition::due_now_plus_span(
+                TransitionTarget::Removed,
+            ));
+        }
+
+        Ok(DeleteFileSystemOutput {
+            file_system_id: Some(record.file_system_id.clone()),
+            lifecycle: Some(record.lifecycle.clone()),
+            // The final-backup responses belong to `CreateBackup` / `DescribeBackups`,
+            // which are still 501: no backup is taken, so none is reported.
+            windows_response: None,
+            lustre_response: None,
+            open_zfs_response: None,
+        })
     }
 }

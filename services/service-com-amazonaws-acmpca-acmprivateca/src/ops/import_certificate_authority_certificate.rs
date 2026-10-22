@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportCertificateAuthorityCertificate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportCertificateAuthorityCertificate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportCertificateAuthorityCertificate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -216,18 +207,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportCertificateAuthorityCertificate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportCertificateAuthorityCertificateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportCertificateAuthorityCertificate"))
+        let _ = ctx;
+        let arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(
+                ImportCertificateAuthorityCertificateErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(format!(
+                            "'{arn}' does not refer to a certificate authority in this service"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The certificate (and the chain, when one is supplied) has to be a PEM
+        // certificate block before anything is persisted: a body that is not one is
+        // malformed, whatever the CA's state.
+        let certificate = pem_certificate(&input.certificate, "Certificate")?;
+        let chain = match input.certificate_chain.as_deref() {
+            // An empty chain blob is modelled (`CertificateChainBlob` has min length 0)
+            // and carries no certificate, so it is the same as supplying none.
+            None => None,
+            Some([]) => None,
+            Some(bytes) => Some(pem_certificate_chain(bytes)?),
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ImportCertificateAuthorityCertificateErrorModeled::RequestFailedException(
+                    RequestFailedException {
+                        message: Some("the private CA store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        let Some(record) = state.certificate_authority_mut(&arn, now) else {
+            return Err(
+                ImportCertificateAuthorityCertificateErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("the certificate authority {arn} was not found")),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A CA takes its certificate exactly once, while it waits for one. A CA whose
+        // creation has not settled yet is answered "already in progress"; any other
+        // status (it already holds a certificate, say) is a state error.
+        match record.status.as_str() {
+            crate::state::STATUS_PENDING_CERTIFICATE => {}
+            crate::state::STATUS_CREATING => {
+                return Err(
+                    ImportCertificateAuthorityCertificateErrorModeled::RequestInProgressException(
+                        RequestInProgressException {
+                            message: Some(format!(
+                                "the certificate authority {arn} is still being created"
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            status => {
+                return Err(
+                    ImportCertificateAuthorityCertificateErrorModeled::InvalidStateException(
+                        InvalidStateException {
+                            message: Some(format!(
+                                "the certificate authority {arn} is in state {status}, which \
+                                 cannot import a certificate authority certificate"
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        }
+
+        record.ca_certificate_pem = Some(certificate);
+        record.ca_certificate_chain_pem = chain;
+        record.status = crate::state::STATUS_ACTIVE.to_string();
+        record.last_state_change_at = now;
+        record.not_before = Some(now);
+        record.not_after = crate::state::add_months(
+            now,
+            crate::state::IMPORTED_CA_CERTIFICATE_VALIDITY_MONTHS,
+        );
+
+        Ok(ImportCertificateAuthorityCertificateOutput)
     }
+}
+
+/// The one PEM certificate block `bytes` carries, or `MalformedCertificateException`.
+fn pem_certificate(
+    bytes: &[u8],
+    member: &str,
+) -> Result<String, ImportCertificateAuthorityCertificateError> {
+    ::std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| crate::state::parse_pem_block(text, crate::state::PEM_LABEL_CERTIFICATE))
+        .ok_or_else(|| malformed_certificate(member))
+}
+
+/// Every PEM certificate block `bytes` carries, or `MalformedCertificateException`.
+fn pem_certificate_chain(
+    bytes: &[u8],
+) -> Result<String, ImportCertificateAuthorityCertificateError> {
+    ::std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| crate::state::parse_pem_blocks(text, crate::state::PEM_LABEL_CERTIFICATE))
+        .ok_or_else(|| malformed_certificate("CertificateChain"))
+}
+
+/// "One or more fields in the certificate are invalid."
+fn malformed_certificate(member: &str) -> ImportCertificateAuthorityCertificateError {
+    ImportCertificateAuthorityCertificateErrorModeled::MalformedCertificateException(
+        MalformedCertificateException {
+            message: Some(format!(
+                "{member} must be a PEM-encoded CERTIFICATE block whose body is base64"
+            )),
+        },
+    )
+    .into()
 }

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConnectionInvitations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConnectionInvitations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConnectionInvitations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored invitations of one catalog, in creation order, honouring each
+//! declared filter and capped at `MaxResults`, with an opaque `NextToken` that
+//! resumes exactly where the page stopped.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConnectionInvitations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConnectionInvitationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConnectionInvitations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListConnectionInvitationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PartnerCentralAccount store is unavailable".to_string(),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        // Reporting an invitation whose `ExpiresAt` has passed as `PENDING` would
+        // report a state the clock already left, so the due expiries are applied
+        // first — including for a `Status` filter, which then selects on the status
+        // the invitation actually has.
+        state.materialise_due_transitions(::std::time::SystemTime::now());
+
+        // The cursor is an inclusive start key: the page begins at the first stored
+        // invitation at or after the id the token names, so an invitation created or
+        // removed between pages shifts nothing already reported. A token this service
+        // did not mint names no position, so it is refused rather than silently read
+        // as "from the beginning".
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListConnectionInvitationsErrorModeled::ValidationException(ValidationException {
+                    message: "The specified NextToken is not valid.".to_string(),
+                    reason: crate::state::REASON_REQUEST_VALIDATION_FAILED.to_string(),
+                    error_details: Some(vec![ValidationError::FieldValidationError(
+                        FieldValidationError {
+                            name: "NextToken".to_string(),
+                            message: "NextToken must be a token returned by a previous ListConnectionInvitations call."
+                                .to_string(),
+                            code: crate::state::FIELD_CODE_INVALID_VALUE.to_string(),
+                        },
+                    )]),
+                })
+            })?),
+        };
+
+        // `MaxResults` carries the model's `@default` of 20, which the framework has
+        // already filled in for a caller that sent none; the page is clamped to the
+        // modelled maximum here too, so the response stays bounded whatever reaches
+        // the handler.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|size| *size > 0)
+            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+
+        // The `OtherParticipantIdentifiers` filter is matched against every stored
+        // invitation of the catalog, so the list's own modelled maximum is enforced
+        // here before the scan starts: the work a request can ask for is the product
+        // of the two, and both factors are bounded.
+        if let Some(identifiers) = input.other_participant_identifiers.as_ref() {
+            if identifiers.len() > crate::state::MAX_FILTER_IDENTIFIERS {
+                return Err(ListConnectionInvitationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "OtherParticipantIdentifiers carries {} identifiers; at most {} may be filtered on.",
+                            identifiers.len(),
+                            crate::state::MAX_FILTER_IDENTIFIERS
+                        ),
+                        reason: crate::state::REASON_REQUEST_VALIDATION_FAILED.to_string(),
+                        error_details: Some(vec![ValidationError::FieldValidationError(
+                            FieldValidationError {
+                                name: "OtherParticipantIdentifiers".to_string(),
+                                message: format!(
+                                    "OtherParticipantIdentifiers must carry at most {} identifiers.",
+                                    crate::state::MAX_FILTER_IDENTIFIERS
+                                ),
+                                code: crate::state::FIELD_CODE_TOO_MANY_VALUES.to_string(),
+                            },
+                        )]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Built once, so matching one stored invitation against the filter is a single
+        // lookup rather than a walk of the caller's list.
+        let wanted_identifiers: Option<::std::collections::HashSet<&str>> = input
+            .other_participant_identifiers
+            .as_ref()
+            .map(|identifiers| identifiers.iter().map(String::as_str).collect());
+
+        let mut matching = state
+            .invitations
+            .iter()
+            .filter(|((catalog, _), _)| *catalog == input.catalog)
+            .filter(|((_, id), _)| start_at.as_ref().is_none_or(|from| id >= from))
+            .filter(|(_, record)| {
+                input
+                    .connection_type
+                    .as_ref()
+                    .is_none_or(|wanted| record.connection_type == *wanted)
+                    && input
+                        .participant_type
+                        .as_ref()
+                        .is_none_or(|wanted| record.participant_type == *wanted)
+                    && input
+                        .status
+                        .as_ref()
+                        .is_none_or(|wanted| record.status == *wanted)
+                    && wanted_identifiers.as_ref().is_none_or(|wanted| {
+                        wanted.contains(record.other_participant_identifier.as_str())
+                    })
+            });
+
+        let page: Vec<ConnectionInvitationSummary> = matching
+            .by_ref()
+            .take(page_size)
+            .map(|(_, record)| record.summary())
+            .collect();
+
+        // A `NextToken` is returned only when a further page exists, so a caller that
+        // follows the tokens stops exactly once every matching invitation was
+        // reported.
+        let next_token = matching
+            .next()
+            .map(|((_, id), _)| crate::state::encode_page_token(id));
+
+        Ok(ListConnectionInvitationsOutput {
+            connection_invitation_summaries: page,
+            next_token,
+        })
     }
 }

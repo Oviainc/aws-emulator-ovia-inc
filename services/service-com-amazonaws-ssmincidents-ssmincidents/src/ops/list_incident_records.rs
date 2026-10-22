@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListIncidentRecords
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListIncidentRecords`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListIncidentRecords::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +111,113 @@ impl From<ListIncidentRecordsErrorModeled> for ListIncidentRecordsError {
     }
 }
 
+/// The keys `ListIncidentRecordsInput$filters` documents as filterable:
+/// `creationTime`, `impact`, `status` and `createdBy`. Source:
+/// `smithy_query(query="doc",shape="ListIncidentRecordsInput",member="filters")`.
+const FILTER_KEY_CREATION_TIME: &str = "creationTime";
+/// See [`FILTER_KEY_CREATION_TIME`].
+const FILTER_KEY_IMPACT: &str = "impact";
+/// See [`FILTER_KEY_CREATION_TIME`].
+const FILTER_KEY_STATUS: &str = "status";
+/// See [`FILTER_KEY_CREATION_TIME`].
+const FILTER_KEY_CREATED_BY: &str = "createdBy";
+
+/// Check the key/condition pair ONE filter carries, independent of any record.
+///
+/// Run over every filter BEFORE the scan, so a key the service does not filter on, or
+/// a condition that cannot apply to that key's type, is refused whatever the store
+/// holds — including an empty store, where a per-record check would never run.
+fn validate_filter(filter: &Filter) -> Result<(), String> {
+    match (filter.key.as_str(), &filter.condition) {
+        (FILTER_KEY_CREATION_TIME, Condition::Before(_) | Condition::After(_))
+        | (FILTER_KEY_IMPACT, Condition::Equals(AttributeValueList::integerValues(_)))
+        | (
+            FILTER_KEY_STATUS | FILTER_KEY_CREATED_BY,
+            Condition::Equals(AttributeValueList::stringValues(_)),
+        ) => Ok(()),
+        (
+            key @ (FILTER_KEY_CREATION_TIME
+            | FILTER_KEY_IMPACT
+            | FILTER_KEY_STATUS
+            | FILTER_KEY_CREATED_BY),
+            condition,
+        ) => Err(format!(
+            "filters: the {key} key does not support the {} condition",
+            condition_name(condition)
+        )),
+        (key, _) => Err(format!(
+            "filters: {key} is not a filterable key; supported keys are \
+             {FILTER_KEY_CREATION_TIME}, {FILTER_KEY_IMPACT}, {FILTER_KEY_STATUS} and \
+             {FILTER_KEY_CREATED_BY}"
+        )),
+    }
+}
+
+/// Does `record` satisfy one filter [`validate_filter`] accepted?
+///
+/// A pair `validate_filter` rejects matches nothing, so this cannot be the place a bad
+/// filter is discovered — that decision is made once, before the scan.
+fn record_matches_filter(record: &crate::state::IncidentRecordEntry, filter: &Filter) -> bool {
+    let created_at = crate::state::timestamp_key(&record.creation_time);
+    match (filter.key.as_str(), &filter.condition) {
+        (FILTER_KEY_CREATION_TIME, Condition::Before(at)) => {
+            created_at < crate::state::timestamp_key(at)
+        }
+        (FILTER_KEY_CREATION_TIME, Condition::After(at)) => {
+            created_at > crate::state::timestamp_key(at)
+        }
+        // A filter with several values matches a record matching ANY of them.
+        (FILTER_KEY_IMPACT, Condition::Equals(AttributeValueList::integerValues(values))) => {
+            values.contains(&record.impact)
+        }
+        (FILTER_KEY_STATUS, Condition::Equals(AttributeValueList::stringValues(values))) => {
+            values.contains(&record.status)
+        }
+        (FILTER_KEY_CREATED_BY, Condition::Equals(AttributeValueList::stringValues(values))) => {
+            values.contains(&record.incident_record_source.created_by)
+        }
+        _ => false,
+    }
+}
+
+/// The wire name of a `Condition` member, for the refusal message above.
+fn condition_name(condition: &Condition) -> &'static str {
+    match condition {
+        Condition::Before(_) => "before",
+        Condition::After(_) => "after",
+        Condition::Equals(AttributeValueList::stringValues(_)) => "equals (stringValues)",
+        Condition::Equals(AttributeValueList::integerValues(_)) => "equals (integerValues)",
+    }
+}
+
+/// The version tag every pagination token this service issues carries, so a token from
+/// anywhere else — including a bare number — is recognisably not one of ours.
+const PAGE_TOKEN_VERSION: &str = "ssmi1";
+
+/// An opaque `nextToken` naming the record a page ended on: its creation instant and
+/// its ARN, which together are its position in the list order.
+fn encode_page_token(record: &crate::state::IncidentRecordEntry) -> String {
+    let (secs, nanos) = crate::state::timestamp_key(&record.creation_time);
+    hex::encode(format!(
+        "{PAGE_TOKEN_VERSION}|{secs}|{nanos}|{}",
+        record.arn
+    ))
+}
+
+/// The position [`encode_page_token`] encoded, or `None` for anything this service did
+/// not issue.
+fn decode_page_token(token: &str) -> Option<((i64, u32), String)> {
+    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
+    let mut fields = decoded.splitn(4, '|');
+    if fields.next()? != PAGE_TOKEN_VERSION {
+        return None;
+    }
+    let secs = fields.next()?.parse::<i64>().ok()?;
+    let nanos = fields.next()?.parse::<u32>().ok()?;
+    let arn = fields.next()?;
+    (!arn.is_empty()).then(|| ((secs, nanos), arn.to_string()))
+}
+
 /// The `ListIncidentRecords` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +254,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListIncidentRecords` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListIncidentRecordsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListIncidentRecords"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListIncidentRecordsErrorModeled::InternalServerException(InternalServerException {
+                message: "the ssm-incidents state store is unavailable".to_string(),
+            })
+        })?;
+        let state = state.lock();
+
+        let filters = input.filters.unwrap_or_default();
+        // The model's `FilterList` is `length ..5`; re-checked here so the
+        // records x filters work one request can ask for is bounded in this layer too.
+        // With `MAX_INCIDENT_RECORDS` bounding the store, that product has a ceiling.
+        if filters.len() > crate::state::MAX_LIST_FILTERS {
+            return Err(ListIncidentRecordsErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "filters: at most {} filters may be supplied, got {}",
+                        crate::state::MAX_LIST_FILTERS,
+                        filters.len()
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // Every filter's key/condition pair is judged ONCE, before any record is
+        // looked at, so a key this service does not filter on is refused whatever the
+        // store holds — an empty store included.
+        for filter in &filters {
+            validate_filter(filter).map_err(|message| {
+                ListIncidentRecordsErrorModeled::ValidationException(ValidationException {
+                    message,
+                })
+            })?;
+        }
+
+        // @readonly: every summary is projected from the same stored record
+        // `GetIncidentRecord` serves. Several filters in one request intersect, so a
+        // record must match all of them.
+        let mut matching: Vec<&crate::state::IncidentRecordEntry> = state
+            .incident_records
+            .values()
+            .filter(|record| {
+                filters
+                    .iter()
+                    .all(|filter| record_matches_filter(record, filter))
+            })
+            .collect();
+        matching.sort_by_key(|record| record.list_order_key());
+
+        // `maxResults` is CLAMPED to the modelled ceiling, not merely defaulted from
+        // it, so no number a request carries can size this page or its allocation.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // A page resumes strictly AFTER the record the previous page ended on, named
+        // by its own sort key rather than by an index — so a record created or deleted
+        // between two pages cannot make the next page skip or repeat an unrelated one.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListIncidentRecordsErrorModeled::ValidationException(ValidationException {
+                    message: format!(
+                        "nextToken is not a pagination token this service issued: {token}"
+                    ),
+                })
+            })?),
+        };
+
+        let remaining = matching.iter().skip_while(|record| match &resume_after {
+            None => false,
+            Some((at, arn)) => record.list_order_key() <= (std::cmp::Reverse(*at), arn.as_str()),
+        });
+        let mut page: Vec<&crate::state::IncidentRecordEntry> = Vec::new();
+        let mut more = false;
+        for record in remaining {
+            if page.len() == page_size {
+                more = true;
+                break;
+            }
+            page.push(record);
+        }
+
+        // The token names the record this page ended on, and is absent on the last page
+        // so a client's paging loop terminates.
+        let next_token = page
+            .last()
+            .filter(|_| more)
+            .map(|record| encode_page_token(record));
+
+        Ok(ListIncidentRecordsOutput {
+            incident_record_summaries: page
+                .iter()
+                .map(|record| record.to_summary())
+                .collect(),
+            next_token,
+        })
     }
 }

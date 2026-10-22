@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartTranscriptionJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartTranscriptionJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a transcription job: refuses the request combinations the model's own
+//! constraint traits cannot express, stores one record per job name, and answers
+//! with that record projected onto the modelled `TranscriptionJob`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartTranscriptionJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Re-using the name of a stored job is a `ConflictException`; the job's own
+//! lifecycle (status, timestamps, transcript location) lives in
+//! [`crate::state::TranscriptionJobRecord`], which `GetTranscriptionJob` and
+//! `ListTranscriptionJobs` read back.
 //!
 //! ## Shape of an operation
 //!
@@ -291,18 +290,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartTranscriptionJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartTranscriptionJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartTranscriptionJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartTranscriptionJobErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `Media` is required but every member of it is optional, so the boundary
+        // validator cannot refuse a `Media` that names no media file. The service
+        // documents `Media (MediaFileUri)` as a required request parameter.
+        if input
+            .media
+            .media_file_uri
+            .as_deref()
+            .is_none_or(|uri| uri.trim().is_empty())
+        {
+            return Err(bad_request(
+                "The required parameter Media.MediaFileUri is missing from your request. \
+                 Specify the Amazon S3 location of your media file and try your request again.",
+            ));
+        }
+
+        // "you must include one of LanguageCode, IdentifyLanguage, or
+        // IdentifyMultipleLanguages in your request. If you include more than one of
+        // these parameters, your transcription job fails."
+        let language_specifiers = usize::from(input.language_code.is_some())
+            + usize::from(input.identify_language == Some(true))
+            + usize::from(input.identify_multiple_languages == Some(true));
+        if language_specifiers != 1 {
+            return Err(bad_request(
+                "Your request must include exactly one of LanguageCode, IdentifyLanguage, or \
+                 IdentifyMultipleLanguages. Correct your request and try again.",
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        if store
+            .transcription_jobs
+            .contains_key(&input.transcription_job_name)
+        {
+            return Err(StartTranscriptionJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "The requested job name {} already exists. Use a different job name \
+                         and try your request again.",
+                        input.transcription_job_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's job quota: the store holds at most
+        // `MAX_TRANSCRIPTION_JOBS` jobs, and a start beyond that is refused with
+        // the error this operation models for an exceeded quota rather than
+        // growing the store without bound.
+        if store.transcription_jobs.len() >= crate::state::MAX_TRANSCRIPTION_JOBS {
+            return Err(StartTranscriptionJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} transcription jobs for this account. \
+                         Delete a job you no longer need and try your request again.",
+                        crate::state::MAX_TRANSCRIPTION_JOBS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        // Job queueing is what `JobExecutionSettings.AllowDeferredExecution` asks
+        // for, so such a job starts QUEUED and begins processing when the clock says
+        // it did; every other job is processing from the moment it is started.
+        let queued = input
+            .job_execution_settings
+            .as_ref()
+            .and_then(|settings| settings.allow_deferred_execution)
+            .unwrap_or(false);
+        let (status, start_time, queued_until, completion_due) = if queued {
+            let starts_at = now + crate::state::JOB_TRANSITION_DELAY;
+            (
+                crate::state::STATUS_QUEUED.to_string(),
+                None,
+                Some(starts_at),
+                starts_at + crate::state::JOB_TRANSITION_DELAY,
+            )
+        } else {
+            (
+                crate::state::STATUS_IN_PROGRESS.to_string(),
+                Some(now),
+                None,
+                now + crate::state::JOB_TRANSITION_DELAY,
+            )
+        };
+
+        let record = crate::state::TranscriptionJobRecord {
+            name: input.transcription_job_name.clone(),
+            sequence,
+            status,
+            language_code: input.language_code,
+            media: input.media,
+            media_format: input.media_format,
+            media_sample_rate_hertz: input.media_sample_rate_hertz,
+            output_location_type: if input.output_bucket_name.is_some() {
+                crate::state::OUTPUT_LOCATION_CUSTOMER_BUCKET.to_string()
+            } else {
+                crate::state::OUTPUT_LOCATION_SERVICE_BUCKET.to_string()
+            },
+            output_bucket_name: input.output_bucket_name,
+            output_key: input.output_key,
+            region,
+            settings: input.settings,
+            model_settings: input.model_settings,
+            job_execution_settings: input.job_execution_settings,
+            content_redaction: input.content_redaction,
+            identify_language: input.identify_language,
+            identify_multiple_languages: input.identify_multiple_languages,
+            language_options: input.language_options,
+            language_id_settings: input.language_id_settings,
+            toxicity_detection: input.toxicity_detection,
+            subtitles: input.subtitles.map(|subtitles| SubtitlesOutput {
+                formats: subtitles.formats,
+                // "The default start index for Amazon Transcribe is 0" (model doc
+                // for `Subtitles$OutputStartIndex`).
+                output_start_index: Some(subtitles.output_start_index.unwrap_or(0)),
+                // Filled in when the job completes and the files exist.
+                subtitle_file_uris: None,
+            }),
+            transcript: None,
+            failure_reason: None,
+            creation_time: now,
+            start_time,
+            completion_time: None,
+            queued_until,
+            completion_due,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        // The response is the record just stored, never the request echoed back.
+        let job = record.to_job();
+        ::tracing::info!(
+            operation = "StartTranscriptionJob",
+            job = %record.name,
+            status = %record.status,
+            region = %record.region,
+            "transcription job started"
+        );
+        store.transcription_jobs.insert(record.name.clone(), record);
+
+        Ok(StartTranscriptionJobOutput {
+            transcription_job: Some(job),
+        })
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> StartTranscriptionJobError {
+    StartTranscriptionJobErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

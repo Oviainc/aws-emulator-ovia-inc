@@ -15,5 +15,7 @@
 mod adapters;
 #[path = "all/document_extraction.rs"]
 mod document_extraction;
+#[path = "all/expense_analysis.rs"]
+mod expense_analysis;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

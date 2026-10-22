@@ -174,9 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// No pipeline of this name is stored — HTTP 404 `ResourceNotFoundException`. A second
 /// delete of the same name lands here, because the first one removed the record.
+///
+/// The message is this delete's own: it states the operation that could not be
+/// carried out and names the pipeline the request named, which is what a caller
+/// has to act on. A not-found message is per-operation, not one template shared
+/// across the service.
 fn not_found(pipeline_name: &str) -> DeletePipelineError {
     DeletePipelineErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Pipeline {pipeline_name} could not be found")),
+        message: Some(format!(
+            "The pipeline {pipeline_name} could not be deleted because it does not exist"
+        )),
     })
     .into()
 }

@@ -1,0 +1,1582 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! The ECS cluster / task-definition / task lifecycle, driven end to end over HTTP.
+//!
+//! Every case here goes through the same front door a client uses: `POST /` with
+//! `X-Amz-Target: AmazonEC2ContainerServiceV20141113.<Operation>` and an `awsJson1_1`
+//! body, dispatched by the multi-service router. Nothing reaches into the state struct,
+//! so a response that is not computed from persisted state cannot pass.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
+
+/// The region every request in this suite signs for. Deliberately NOT the emulator's
+/// default, so an ARN that carries it proves the region came from the request's SigV4
+/// credential scope.
+const SIGNED_REGION: &str = "us-west-2";
+
+/// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
+const ACCOUNT: &str = "000000000000";
+
+/// Long enough for one clock-owed task transition (`state::TRANSITION_SPAN` is 500 ms)
+/// to fall due, with margin for a loaded test machine.
+const ONE_SPAN: Duration = Duration::from_millis(900);
+
+/// A router with just this service mounted on a fresh engine.
+fn service() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// One `awsJson1_1` call, returning the HTTP status and the parsed response body.
+async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", "application/x-amz-json-1.1")
+        .header(
+            "x-amz-target",
+            format!("AmazonEC2ContainerServiceV20141113.{operation}"),
+        )
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDECSTEST/20260101/{SIGNED_REGION}\
+                 /ecs/aws4_request, SignedHeaders=host;x-amz-target, Signature=00"
+            ),
+        )
+        .body(bytes::Bytes::from(
+            serde_json::to_vec(&body).expect("the request body serializes"),
+        ))
+        .expect("a well-formed request");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = response.into_body();
+    let parsed = if payload.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&payload)
+            .unwrap_or_else(|_| json!({ "__unparsed": String::from_utf8_lossy(&payload) }))
+    };
+    (status, parsed)
+}
+
+/// A call that must succeed, returning its body.
+async fn ok(router: &MultiServiceRouter, operation: &str, body: Value, case: &str) -> Value {
+    let (status, parsed) = call(router, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected {operation} to answer 200, got {status} with {parsed}"
+    );
+    parsed
+}
+
+/// A call that must be refused with HTTP 400 and the named modelled error code.
+async fn refused(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    expected_code: &str,
+    case: &str,
+) {
+    let (status, parsed) = call(router, operation, body).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected {operation} to answer 400, got {status} with {parsed}"
+    );
+    let wire_type = parsed["__type"].as_str().unwrap_or_default();
+    assert!(
+        wire_type.contains(expected_code),
+        "case {case:?}: expected a {expected_code} from {operation}, got {parsed}"
+    );
+}
+
+/// A required string member of a response body.
+fn string(body: &Value, member: &str, case: &str) -> String {
+    body[member]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a string {member}, got {body}"))
+        .to_string()
+}
+
+/// An integer member whose modelled default is `0`, so an absent member reads as zero.
+fn count(body: &Value, member: &str, case: &str) -> i64 {
+    match &body[member] {
+        Value::Null => 0,
+        value => value
+            .as_i64()
+            .unwrap_or_else(|| panic!("case {case:?}: expected an integer {member}, got {body}")),
+    }
+}
+
+/// A list member of a response body, absent reading as empty.
+fn list(body: &Value, member: &str, case: &str) -> Vec<Value> {
+    match &body[member] {
+        Value::Null => Vec::new(),
+        Value::Array(items) => items.clone(),
+        other => panic!("case {case:?}: expected a list {member}, got {other}"),
+    }
+}
+
+/// A minimal, valid container definition.
+fn container(name: &str, image: &str) -> Value {
+    json!({ "name": name, "image": image, "memory": 128 })
+}
+
+/// Create a cluster and return its ARN.
+async fn create_cluster(router: &MultiServiceRouter, name: &str, case: &str) -> String {
+    let body = ok(router, "CreateCluster", json!({ "clusterName": name }), case).await;
+    string(&body["cluster"], "clusterArn", case)
+}
+
+/// Register one revision of `family` with a single container and return
+/// `(taskDefinitionArn, revision)`.
+async fn register(
+    router: &MultiServiceRouter,
+    family: &str,
+    container_name: &str,
+    case: &str,
+) -> (String, i64) {
+    let body = ok(
+        router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": family,
+            "containerDefinitions": [container(container_name, "public.ecr.aws/nginx/nginx:latest")],
+        }),
+        case,
+    )
+    .await;
+    let definition = &body["taskDefinition"];
+    (
+        string(definition, "taskDefinitionArn", case),
+        count(definition, "revision", case),
+    )
+}
+
+#[tokio::test]
+async fn cluster_create_read_and_delete_round_trip() {
+    let router = service();
+
+    // The rule generalises over the cluster NAME, so the table spans the forms the
+    // `clusterName` doc allows ("Up to 255 letters (uppercase and lowercase), numbers,
+    // underscores, and hyphens") plus the documented default when the member is absent.
+    let long_name = "c".repeat(255);
+    let cases: [(&str, Option<&str>, &str); 5] = [
+        ("absent name defaults", None, "default"),
+        ("plain", Some("demo"), "demo"),
+        ("mixed case and digits", Some("Prod2Cluster"), "Prod2Cluster"),
+        ("underscores and hyphens", Some("a_b-c"), "a_b-c"),
+        ("255 characters", Some(long_name.as_str()), long_name.as_str()),
+    ];
+
+    for (case, requested, expected_name) in cases {
+        let mut request = json!({
+            "tags": [{ "key": "env", "value": "test" }],
+            "settings": [{ "name": "containerInsights", "value": "enabled" }],
+        });
+        if let Some(name) = requested {
+            request["clusterName"] = json!(name);
+        }
+
+        let created = ok(&router, "CreateCluster", request, case).await;
+        let cluster = &created["cluster"];
+        assert_eq!(
+            string(cluster, "clusterName", case),
+            expected_name,
+            "case {case:?}: expected clusterName {expected_name:?}, got {cluster}"
+        );
+        assert_eq!(
+            string(cluster, "clusterArn", case),
+            format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:cluster/{expected_name}"),
+            "case {case:?}: unexpected clusterArn in {cluster}"
+        );
+        assert_eq!(
+            string(cluster, "status", case),
+            "ACTIVE",
+            "case {case:?}: expected a new cluster to be ACTIVE, got {cluster}"
+        );
+        for counter in [
+            "registeredContainerInstancesCount",
+            "runningTasksCount",
+            "pendingTasksCount",
+            "activeServicesCount",
+        ] {
+            assert_eq!(
+                count(cluster, counter, case),
+                0,
+                "case {case:?}: expected {counter} to be 0 on a new cluster, got {cluster}"
+            );
+        }
+
+        // Read back through DescribeClusters: the stored record, not the request.
+        let described = ok(
+            &router,
+            "DescribeClusters",
+            json!({ "clusters": [expected_name], "include": ["TAGS", "SETTINGS"] }),
+            case,
+        )
+        .await;
+        assert!(
+            list(&described, "failures", case).is_empty(),
+            "case {case:?}: expected no failures describing a stored cluster, got {described}"
+        );
+        let read = &list(&described, "clusters", case)[0];
+        assert_eq!(
+            string(read, "clusterArn", case),
+            string(cluster, "clusterArn", case),
+            "case {case:?}: describe returned a different ARN than create: {read}"
+        );
+        assert_eq!(
+            list(read, "tags", case),
+            vec![json!({ "key": "env", "value": "test" })],
+            "case {case:?}: expected the stored tags back, got {read}"
+        );
+        assert_eq!(
+            list(read, "settings", case),
+            vec![json!({ "name": "containerInsights", "value": "enabled" })],
+            "case {case:?}: expected the stored settings back, got {read}"
+        );
+
+        // `include` gates the optional fields: "If this field is omitted, this
+        // information isn't included."
+        let narrow = ok(
+            &router,
+            "DescribeClusters",
+            json!({ "clusters": [expected_name] }),
+            case,
+        )
+        .await;
+        let narrow_cluster = &list(&narrow, "clusters", case)[0];
+        for gated in ["tags", "settings", "statistics", "configuration"] {
+            assert!(
+                narrow_cluster[gated].is_null(),
+                "case {case:?}: expected {gated} to be absent without include, got \
+                 {narrow_cluster}"
+            );
+        }
+
+        // A second create of the same name is the same cluster, not a duplicate.
+        let again = ok(
+            &router,
+            "CreateCluster",
+            json!({ "clusterName": expected_name }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            string(&again["cluster"], "clusterArn", case),
+            string(cluster, "clusterArn", case),
+            "case {case:?}: a repeated create must return the stored cluster, got {again}"
+        );
+        let after_repeat = ok(
+            &router,
+            "DescribeClusters",
+            json!({ "clusters": [expected_name] }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            list(&after_repeat, "clusters", case).len(),
+            1,
+            "case {case:?}: a repeated create must not add a second entry, got \
+             {after_repeat}"
+        );
+
+        // Delete reports the cluster INACTIVE and takes it out of the store.
+        let deleted = ok(
+            &router,
+            "DeleteCluster",
+            json!({ "cluster": expected_name }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            string(&deleted["cluster"], "status", case),
+            "INACTIVE",
+            "case {case:?}: expected a deleted cluster to be INACTIVE, got {deleted}"
+        );
+        let gone = ok(
+            &router,
+            "DescribeClusters",
+            json!({ "clusters": [expected_name] }),
+            case,
+        )
+        .await;
+        let failures = list(&gone, "failures", case);
+        assert_eq!(
+            failures.len(),
+            1,
+            "case {case:?}: expected one MISSING failure after delete, got {gone}"
+        );
+        assert_eq!(
+            string(&failures[0], "reason", case),
+            "MISSING",
+            "case {case:?}: expected reason MISSING, got {gone}"
+        );
+        assert_eq!(
+            string(&failures[0], "arn", case),
+            string(cluster, "clusterArn", case),
+            "case {case:?}: expected the failure to name the cluster ARN, got {gone}"
+        );
+        refused(
+            &router,
+            "DeleteCluster",
+            json!({ "cluster": expected_name }),
+            "ClusterNotFoundException",
+            case,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn cluster_requests_outside_the_documented_rules_are_refused() {
+    let router = service();
+
+    // The name rule is "Up to 255 letters (uppercase and lowercase), numbers,
+    // underscores, and hyphens are allowed" — tested on each bound and one past it.
+    let too_long = "c".repeat(256);
+    let name_cases: [(&str, &str); 5] = [
+        ("empty", ""),
+        ("slash", "demo/one"),
+        ("space", "demo one"),
+        ("dot", "demo.one"),
+        ("256 characters", too_long.as_str()),
+    ];
+    for (case, name) in name_cases {
+        refused(
+            &router,
+            "CreateCluster",
+            json!({ "clusterName": name }),
+            "InvalidParameterException",
+            case,
+        )
+        .await;
+    }
+
+    // "The supported values are enhanced, enabled, and disabled."
+    for value in ["enhanced", "enabled", "disabled"] {
+        let case = format!("setting {value}");
+        let body = ok(
+            &router,
+            "CreateCluster",
+            json!({
+                "clusterName": format!("settings-{value}"),
+                "settings": [{ "name": "containerInsights", "value": value }],
+            }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            string(&body["cluster"], "status", &case),
+            "ACTIVE",
+            "case {case:?}: expected the documented setting value to be accepted, got {body}"
+        );
+    }
+    for value in ["", "ENABLED", "on"] {
+        refused(
+            &router,
+            "CreateCluster",
+            json!({
+                "clusterName": "settings-bad",
+                "settings": [{ "name": "containerInsights", "value": value }],
+            }),
+            "InvalidParameterException",
+            &format!("setting {value:?}"),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn task_definition_revisions_increment_per_family() {
+    let router = service();
+
+    // The rule generalises over the FAMILY, so several families are interleaved: each
+    // one's revisions must count from 1 independently.
+    let families = ["web", "worker-2", "batch_job"];
+    for round in 1..=3_i64 {
+        for family in families {
+            let case = format!("{family} round {round}");
+            let body = ok(
+                &router,
+                "RegisterTaskDefinition",
+                json!({
+                    "family": family,
+                    "containerDefinitions": [container("app", "nginx")],
+                }),
+                &case,
+            )
+            .await;
+            let definition = &body["taskDefinition"];
+            assert_eq!(
+                count(definition, "revision", &case),
+                round,
+                "case {case:?}: expected revision {round}, got {definition}"
+            );
+            assert_eq!(
+                string(definition, "taskDefinitionArn", &case),
+                format!(
+                    "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task-definition/{family}:{round}"
+                ),
+                "case {case:?}: unexpected taskDefinitionArn in {definition}"
+            );
+            assert_eq!(
+                string(definition, "status", &case),
+                "ACTIVE",
+                "case {case:?}: expected a registered revision to be ACTIVE, got {definition}"
+            );
+            assert!(
+                definition["registeredAt"].is_number(),
+                "case {case:?}: expected a registeredAt timestamp, got {definition}"
+            );
+            assert_eq!(
+                list(definition, "containerDefinitions", &case).len(),
+                1,
+                "case {case:?}: expected the stored container definitions back, got \
+                 {definition}"
+            );
+        }
+    }
+
+    // Reading back: a bare family resolves to the latest revision, `family:revision`
+    // and the full ARN to exactly that one.
+    for family in families {
+        let latest = ok(
+            &router,
+            "DescribeTaskDefinition",
+            json!({ "taskDefinition": family }),
+            family,
+        )
+        .await;
+        assert_eq!(
+            count(&latest["taskDefinition"], "revision", family),
+            3,
+            "case {family:?}: a bare family must resolve to the latest revision, got {latest}"
+        );
+        for revision in 1..=3_i64 {
+            let case = format!("{family}:{revision}");
+            for reference in [
+                format!("{family}:{revision}"),
+                format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task-definition/{family}:{revision}"),
+            ] {
+                let body = ok(
+                    &router,
+                    "DescribeTaskDefinition",
+                    json!({ "taskDefinition": reference }),
+                    &case,
+                )
+                .await;
+                assert_eq!(
+                    count(&body["taskDefinition"], "revision", &case),
+                    revision,
+                    "case {case:?}: reference {reference:?} resolved wrong: {body}"
+                );
+            }
+        }
+    }
+
+    for reference in ["web:99", "nosuchfamily", "web:0"] {
+        refused(
+            &router,
+            "DescribeTaskDefinition",
+            json!({ "taskDefinition": reference }),
+            "ClientException",
+            reference,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn task_definition_compatibilities_follow_network_mode_and_task_size() {
+    let router = service();
+
+    // The rule: a revision is compatible with EC2 always, with FARGATE only when the
+    // network mode is `awsvpc` AND task-level cpu and memory are set ("For Amazon ECS
+    // tasks on Fargate, the awsvpc network mode is required"; cpu/memory "required for
+    // Fargate"), and with EXTERNAL only when the network mode is not `awsvpc`.
+    // `networkMode` is the closed `NetworkMode` enum (bridge, host, awsvpc, none) plus
+    // the documented default: "If no network mode is specified, the default is bridge."
+    /// One row of the compatibilities table.
+    struct Row {
+        case: &'static str,
+        network_mode: Option<&'static str>,
+        task_size: bool,
+        expected_mode: &'static str,
+        expected: &'static [&'static str],
+    }
+
+    let cases = [
+        Row {
+            case: "absent defaults to bridge",
+            network_mode: None,
+            task_size: false,
+            expected_mode: "bridge",
+            expected: &["EC2", "EXTERNAL"],
+        },
+        Row {
+            case: "bridge",
+            network_mode: Some("bridge"),
+            task_size: false,
+            expected_mode: "bridge",
+            expected: &["EC2", "EXTERNAL"],
+        },
+        Row {
+            case: "host",
+            network_mode: Some("host"),
+            task_size: false,
+            expected_mode: "host",
+            expected: &["EC2", "EXTERNAL"],
+        },
+        Row {
+            case: "none",
+            network_mode: Some("none"),
+            task_size: false,
+            expected_mode: "none",
+            expected: &["EC2", "EXTERNAL"],
+        },
+        Row {
+            case: "awsvpc without task size",
+            network_mode: Some("awsvpc"),
+            task_size: false,
+            expected_mode: "awsvpc",
+            expected: &["EC2"],
+        },
+        Row {
+            case: "awsvpc with task size",
+            network_mode: Some("awsvpc"),
+            task_size: true,
+            expected_mode: "awsvpc",
+            expected: &["EC2", "FARGATE"],
+        },
+    ];
+
+    for (index, row) in cases.into_iter().enumerate() {
+        let Row {
+            case,
+            network_mode,
+            task_size,
+            expected_mode,
+            expected,
+        } = row;
+        let mut request = json!({
+            "family": format!("compat{index}"),
+            "containerDefinitions": [container("app", "nginx")],
+        });
+        if let Some(mode) = network_mode {
+            request["networkMode"] = json!(mode);
+        }
+        if task_size {
+            request["cpu"] = json!("256");
+            request["memory"] = json!("512");
+        }
+
+        let body = ok(&router, "RegisterTaskDefinition", request, case).await;
+        let definition = &body["taskDefinition"];
+        assert_eq!(
+            string(definition, "networkMode", case),
+            expected_mode,
+            "case {case:?}: expected networkMode {expected_mode:?}, got {definition}"
+        );
+        let actual: Vec<String> = list(definition, "compatibilities", case)
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected compatibilities {expected:?}, got {actual:?} in \
+             {definition}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn task_definition_requests_outside_the_documented_rules_are_refused() {
+    let router = service();
+
+    let too_long = "f".repeat(256);
+    for (case, family) in [
+        ("empty family", ""),
+        ("slash in family", "web/one"),
+        ("256 characters", too_long.as_str()),
+    ] {
+        refused(
+            &router,
+            "RegisterTaskDefinition",
+            json!({ "family": family, "containerDefinitions": [container("app", "nginx")] }),
+            "InvalidParameterException",
+            case,
+        )
+        .await;
+    }
+
+    // Each row is a container-definition or launch-type rule the real service enforces.
+    let cases: [(&str, Value); 7] = [
+        (
+            "no containers",
+            json!({ "family": "bad", "containerDefinitions": [] }),
+        ),
+        (
+            "container without a name",
+            json!({ "family": "bad", "containerDefinitions": [{ "image": "nginx", "memory": 128 }] }),
+        ),
+        (
+            "container without an image",
+            json!({ "family": "bad", "containerDefinitions": [{ "name": "app", "memory": 128 }] }),
+        ),
+        (
+            "container with no memory and no task memory",
+            json!({ "family": "bad", "containerDefinitions": [{ "name": "app", "image": "nginx" }] }),
+        ),
+        (
+            "duplicate container names",
+            json!({
+                "family": "bad",
+                "containerDefinitions": [container("app", "nginx"), container("app", "redis")],
+            }),
+        ),
+        (
+            "FARGATE without awsvpc",
+            json!({
+                "family": "bad",
+                "containerDefinitions": [container("app", "nginx")],
+                "requiresCompatibilities": ["FARGATE"],
+                "networkMode": "bridge",
+                "cpu": "256",
+                "memory": "512",
+            }),
+        ),
+        (
+            "FARGATE without task size",
+            json!({
+                "family": "bad",
+                "containerDefinitions": [container("app", "nginx")],
+                "requiresCompatibilities": ["FARGATE"],
+                "networkMode": "awsvpc",
+            }),
+        ),
+    ];
+    for (case, request) in cases {
+        refused(
+            &router,
+            "RegisterTaskDefinition",
+            request,
+            "ClientException",
+            case,
+        )
+        .await;
+    }
+
+    // The task-level `memory` satisfies the per-container requirement, so this is the
+    // accepted counterpart of the "no memory" row above.
+    let body = ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": "tasklevelmemory",
+            "memory": "512",
+            "containerDefinitions": [{ "name": "app", "image": "nginx" }],
+        }),
+        "task-level memory",
+    )
+    .await;
+    assert_eq!(
+        count(&body["taskDefinition"], "revision", "task-level memory"),
+        1,
+        "expected task-level memory to satisfy the container memory rule, got {body}"
+    );
+
+    // "Containers per task definition" is 10 — the bound tested on itself and one past
+    // it.
+    let containers: Vec<Value> = (0..10)
+        .map(|index| container(&format!("c{index}"), "nginx"))
+        .collect();
+    let at_bound = ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({ "family": "tencontainers", "containerDefinitions": containers.clone() }),
+        "ten containers",
+    )
+    .await;
+    assert_eq!(
+        list(&at_bound["taskDefinition"], "containerDefinitions", "ten containers").len(),
+        10,
+        "expected all ten stored container definitions back, got {at_bound}"
+    );
+    let mut too_many = containers;
+    too_many.push(container("c10", "nginx"));
+    refused(
+        &router,
+        "RegisterTaskDefinition",
+        json!({ "family": "elevencontainers", "containerDefinitions": too_many }),
+        "ClientException",
+        "eleven containers",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn run_describe_stop_and_delete_is_one_consistent_story() {
+    let router = service();
+    let cluster_arn = create_cluster(&router, "demo", "lifecycle").await;
+    let (definition_arn, revision) = register(&router, "web", "app", "lifecycle").await;
+    assert_eq!(revision, 1, "the first revision of a family is 1");
+
+    // The rule generalises over `count`: 1, 2 and the documented maximum of 10.
+    for requested in [1_i64, 2, 10] {
+        let case = format!("count {requested}");
+        let run = ok(
+            &router,
+            "RunTask",
+            json!({
+                "cluster": "demo",
+                "taskDefinition": "web",
+                "count": requested,
+                "startedBy": "suite",
+                "tags": [{ "key": "owner", "value": "suite" }],
+            }),
+            &case,
+        )
+        .await;
+        let tasks = list(&run, "tasks", &case);
+        assert_eq!(
+            tasks.len() as i64,
+            requested,
+            "case {case:?}: expected {requested} tasks, got {run}"
+        );
+        assert!(
+            list(&run, "failures", &case).is_empty(),
+            "case {case:?}: expected no failures, got {run}"
+        );
+
+        let mut arns = Vec::new();
+        for task in &tasks {
+            let arn = string(task, "taskArn", &case);
+            assert!(
+                arn.starts_with(&format!(
+                    "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/demo/"
+                )),
+                "case {case:?}: unexpected taskArn {arn:?}"
+            );
+            assert_eq!(
+                string(task, "clusterArn", &case),
+                cluster_arn,
+                "case {case:?}: expected the stored cluster ARN, got {task}"
+            );
+            assert_eq!(
+                string(task, "taskDefinitionArn", &case),
+                definition_arn,
+                "case {case:?}: expected the stored task-definition ARN, got {task}"
+            );
+            assert_eq!(
+                string(task, "desiredStatus", &case),
+                "RUNNING",
+                "case {case:?}: a run task is desired RUNNING, got {task}"
+            );
+            assert_eq!(
+                string(task, "lastStatus", &case),
+                "PENDING",
+                "case {case:?}: a freshly placed task has not started yet, got {task}"
+            );
+            assert_eq!(
+                string(task, "launchType", &case),
+                "EC2",
+                "case {case:?}: expected the default launch type, got {task}"
+            );
+            assert_eq!(
+                string(task, "group", &case),
+                "family:web",
+                "case {case:?}: expected the documented default group, got {task}"
+            );
+            assert_eq!(
+                string(task, "startedBy", &case),
+                "suite",
+                "case {case:?}: expected startedBy back, got {task}"
+            );
+            let containers = list(task, "containers", &case);
+            assert_eq!(
+                containers.len(),
+                1,
+                "case {case:?}: expected one container per stored definition, got {task}"
+            );
+            assert_eq!(
+                string(&containers[0], "name", &case),
+                "app",
+                "case {case:?}: container name must come from the stored definition, got {task}"
+            );
+            assert_eq!(
+                string(&containers[0], "taskArn", &case),
+                arn,
+                "case {case:?}: the container must name its own task, got {task}"
+            );
+            assert!(
+                string(&containers[0], "containerArn", &case).starts_with(&format!(
+                    "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:container/demo/"
+                )),
+                "case {case:?}: unexpected containerArn in {task}"
+            );
+            arns.push(arn);
+        }
+        assert_eq!(
+            arns.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            arns.len(),
+            "case {case:?}: every task must get its own ARN, got {arns:?}"
+        );
+
+        // The counters the cluster reports are the tasks that exist.
+        let pending_view = ok(
+            &router,
+            "DescribeClusters",
+            json!({ "clusters": ["demo"] }),
+            &case,
+        )
+        .await;
+        let cluster = &list(&pending_view, "clusters", &case)[0];
+        assert_eq!(
+            count(cluster, "pendingTasksCount", &case),
+            requested,
+            "case {case:?}: expected {requested} pending tasks, got {cluster}"
+        );
+        assert_eq!(
+            count(cluster, "runningTasksCount", &case),
+            0,
+            "case {case:?}: nothing has started yet, got {cluster}"
+        );
+
+        // A cluster holding tasks that have not stopped cannot be deleted.
+        refused(
+            &router,
+            "DeleteCluster",
+            json!({ "cluster": "demo" }),
+            "ClusterContainsTasksException",
+            &case,
+        )
+        .await;
+
+        // The clock, not a reader, is what starts the tasks.
+        std::thread::sleep(ONE_SPAN);
+        let described = ok(
+            &router,
+            "DescribeTasks",
+            json!({ "cluster": "demo", "tasks": arns.clone(), "include": ["TAGS"] }),
+            &case,
+        )
+        .await;
+        let read = list(&described, "tasks", &case);
+        assert_eq!(
+            read.len(),
+            arns.len(),
+            "case {case:?}: expected every stored task back, got {described}"
+        );
+        for task in &read {
+            assert_eq!(
+                string(task, "lastStatus", &case),
+                "RUNNING",
+                "case {case:?}: the owed transition must have fallen due, got {task}"
+            );
+            assert!(
+                task["startedAt"].is_number(),
+                "case {case:?}: a started task records startedAt, got {task}"
+            );
+            assert_eq!(
+                list(task, "tags", &case),
+                vec![json!({ "key": "owner", "value": "suite" })],
+                "case {case:?}: expected the stored tags with include TAGS, got {task}"
+            );
+            assert_eq!(
+                string(&list(task, "containers", &case)[0], "lastStatus", &case),
+                "RUNNING",
+                "case {case:?}: the containers follow the task, got {task}"
+            );
+        }
+
+        // Without `include`, tags are absent.
+        let untagged = ok(
+            &router,
+            "DescribeTasks",
+            json!({ "cluster": "demo", "tasks": [arns[0].clone()] }),
+            &case,
+        )
+        .await;
+        assert!(
+            list(&untagged, "tasks", &case)[0]["tags"].is_null(),
+            "case {case:?}: tags must be absent without include TAGS, got {untagged}"
+        );
+
+        let running_view = ok(
+            &router,
+            "DescribeClusters",
+            json!({ "clusters": ["demo"], "include": ["STATISTICS"] }),
+            &case,
+        )
+        .await;
+        let cluster = &list(&running_view, "clusters", &case)[0];
+        assert_eq!(
+            count(cluster, "runningTasksCount", &case),
+            requested,
+            "case {case:?}: expected {requested} running tasks, got {cluster}"
+        );
+        let statistics = list(cluster, "statistics", &case);
+        let running_ec2 = statistics
+            .iter()
+            .find(|entry| entry["name"] == json!("runningEC2TasksCount"))
+            .unwrap_or_else(|| panic!("case {case:?}: expected runningEC2TasksCount in {cluster}"));
+        assert_eq!(
+            running_ec2["value"],
+            json!(requested.to_string()),
+            "case {case:?}: statistics must agree with the stored tasks, got {cluster}"
+        );
+
+        // ListTasks sees them, and its default filter is desiredStatus RUNNING.
+        let listed = ok(&router, "ListTasks", json!({ "cluster": "demo" }), &case).await;
+        let mut listed_arns: Vec<String> = list(&listed, "taskArns", &case)
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_string())
+            .collect();
+        listed_arns.sort();
+        let mut expected_arns = arns.clone();
+        expected_arns.sort();
+        assert_eq!(
+            listed_arns, expected_arns,
+            "case {case:?}: ListTasks must report exactly the stored tasks"
+        );
+
+        // Stop them: desiredStatus moves at once, lastStatus follows the clock.
+        for arn in &arns {
+            let stopped = ok(
+                &router,
+                "StopTask",
+                json!({ "cluster": "demo", "task": arn, "reason": "done" }),
+                &case,
+            )
+            .await;
+            let task = &stopped["task"];
+            assert_eq!(
+                string(task, "desiredStatus", &case),
+                "STOPPED",
+                "case {case:?}: StopTask must record the desired stop, got {stopped}"
+            );
+            assert_eq!(
+                string(task, "lastStatus", &case),
+                "DEACTIVATING",
+                "case {case:?}: a stopping task has not stopped yet, got {stopped}"
+            );
+            assert_eq!(
+                string(task, "stoppedReason", &case),
+                "done",
+                "case {case:?}: expected the given reason, got {stopped}"
+            );
+            assert_eq!(
+                string(task, "stopCode", &case),
+                "UserInitiated",
+                "case {case:?}: expected the user-initiated stop code, got {stopped}"
+            );
+            assert!(
+                task["stoppingAt"].is_number(),
+                "case {case:?}: expected a stoppingAt timestamp, got {stopped}"
+            );
+        }
+
+        std::thread::sleep(ONE_SPAN);
+        let after_stop = ok(
+            &router,
+            "DescribeTasks",
+            json!({ "cluster": "demo", "tasks": arns.clone() }),
+            &case,
+        )
+        .await;
+        for task in list(&after_stop, "tasks", &case) {
+            assert_eq!(
+                string(&task, "lastStatus", &case),
+                "STOPPED",
+                "case {case:?}: a later describe must show STOPPED, got {task}"
+            );
+            assert!(
+                task["stoppedAt"].is_number(),
+                "case {case:?}: a stopped task records stoppedAt, got {task}"
+            );
+        }
+
+        // The default ListTasks filter is desiredStatus RUNNING, so the stopped tasks
+        // drop out of it and appear under the STOPPED filter instead.
+        let still_running = ok(&router, "ListTasks", json!({ "cluster": "demo" }), &case).await;
+        assert!(
+            list(&still_running, "taskArns", &case).is_empty(),
+            "case {case:?}: stopped tasks must leave the default filter, got {still_running}"
+        );
+        let stopped_list = ok(
+            &router,
+            "ListTasks",
+            json!({ "cluster": "demo", "desiredStatus": "STOPPED" }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            list(&stopped_list, "taskArns", &case).len(),
+            arns.len(),
+            "case {case:?}: expected the stopped tasks under the STOPPED filter, got \
+             {stopped_list}"
+        );
+
+        // "Although you can filter results based on a desired status of PENDING, this
+        // doesn't return any results."
+        let pending_filter = ok(
+            &router,
+            "ListTasks",
+            json!({ "cluster": "demo", "desiredStatus": "PENDING" }),
+            &case,
+        )
+        .await;
+        assert!(
+            list(&pending_filter, "taskArns", &case).is_empty(),
+            "case {case:?}: a PENDING desiredStatus filter returns nothing, got \
+             {pending_filter}"
+        );
+
+        // Drain the cluster for the next row.
+        ok(
+            &router,
+            "DeleteCluster",
+            json!({ "cluster": "demo" }),
+            &case,
+        )
+        .await;
+        create_cluster(&router, "demo", &case).await;
+    }
+}
+
+#[tokio::test]
+async fn run_task_resolves_every_documented_task_definition_reference() {
+    let router = service();
+    create_cluster(&router, "demo", "references").await;
+    let (first_arn, _) = register(&router, "web", "app", "references").await;
+    let (second_arn, second_revision) = register(&router, "web", "sidecar", "references").await;
+    assert_eq!(second_revision, 2, "the second revision of a family is 2");
+
+    // "The family and revision (family:revision) or full ARN of the task definition to
+    // run. If a revision isn't specified, the latest ACTIVE revision is used."
+    let cases: [(&str, &str, &str); 5] = [
+        ("bare family", "web", second_arn.as_str()),
+        ("family:1", "web:1", first_arn.as_str()),
+        ("family:2", "web:2", second_arn.as_str()),
+        ("full ARN", second_arn.as_str(), second_arn.as_str()),
+        ("wildcard revision", "web:*", second_arn.as_str()),
+    ];
+    for (case, reference, expected) in cases {
+        let run = ok(
+            &router,
+            "RunTask",
+            json!({ "cluster": "demo", "taskDefinition": reference }),
+            case,
+        )
+        .await;
+        let task = &list(&run, "tasks", case)[0];
+        assert_eq!(
+            string(task, "taskDefinitionArn", case),
+            expected,
+            "case {case:?}: reference {reference:?} resolved wrong: {run}"
+        );
+    }
+
+    // A reference that names nothing, or is not a task-definition reference at all.
+    for (case, reference) in [
+        ("unknown family", "nosuchfamily"),
+        ("unknown revision", "web:9"),
+        ("not a reference", "web/one"),
+    ] {
+        refused(
+            &router,
+            "RunTask",
+            json!({ "cluster": "demo", "taskDefinition": reference }),
+            "ClientException",
+            case,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn run_and_stop_requests_outside_the_documented_rules_are_refused() {
+    let router = service();
+    create_cluster(&router, "demo", "refusals").await;
+    register(&router, "web", "app", "refusals").await;
+
+    // "An unknown cluster must fail" — on the operations that take one.
+    for operation in ["RunTask", "ListTasks", "DescribeTasks", "StopTask"] {
+        let mut request = json!({ "cluster": "nosuchcluster" });
+        request["taskDefinition"] = json!("web");
+        request["tasks"] = json!(["0".repeat(32)]);
+        request["task"] = json!("0".repeat(32));
+        refused(
+            &router,
+            operation,
+            request,
+            "ClusterNotFoundException",
+            operation,
+        )
+        .await;
+    }
+
+    // "You can specify up to 10 tasks for each call" — each bound and one past it.
+    for (case, requested) in [("zero", 0_i64), ("negative", -1), ("eleven", 11)] {
+        refused(
+            &router,
+            "RunTask",
+            json!({ "cluster": "demo", "taskDefinition": "web", "count": requested }),
+            "InvalidParameterException",
+            case,
+        )
+        .await;
+    }
+
+    // "If a launchType is specified, the capacityProviderStrategy parameter must be
+    // omitted."
+    refused(
+        &router,
+        "RunTask",
+        json!({
+            "cluster": "demo",
+            "taskDefinition": "web",
+            "launchType": "FARGATE",
+            "capacityProviderStrategy": [{ "capacityProvider": "FARGATE", "weight": 1 }],
+        }),
+        "InvalidParameterException",
+        "launchType with a capacity provider strategy",
+    )
+    .await;
+
+    // "An error will be received if you specify the SERVICE option when running a
+    // task."
+    refused(
+        &router,
+        "RunTask",
+        json!({ "cluster": "demo", "taskDefinition": "web", "propagateTags": "SERVICE" }),
+        "InvalidParameterException",
+        "propagateTags SERVICE",
+    )
+    .await;
+
+    // An unknown task cannot be stopped.
+    for (case, reference) in [
+        ("short id", "0".repeat(32)),
+        (
+            "full ARN",
+            format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/demo/{}", "f".repeat(32)),
+        ),
+    ] {
+        refused(
+            &router,
+            "StopTask",
+            json!({ "cluster": "demo", "task": reference }),
+            "InvalidParameterException",
+            case,
+        )
+        .await;
+    }
+
+    // "This value can be between 1 and 100" — each bound, and one past each.
+    for (case, max_results) in [("zero", 0_i64), ("101", 101)] {
+        refused(
+            &router,
+            "ListTasks",
+            json!({ "cluster": "demo", "maxResults": max_results }),
+            "InvalidParameterException",
+            case,
+        )
+        .await;
+    }
+    for (case, max_results) in [("one", 1_i64), ("hundred", 100)] {
+        let body = ok(
+            &router,
+            "ListTasks",
+            json!({ "cluster": "demo", "maxResults": max_results }),
+            case,
+        )
+        .await;
+        assert!(
+            list(&body, "taskArns", case).is_empty(),
+            "case {case:?}: an empty cluster lists no tasks, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn describe_tasks_reports_missing_for_ids_that_name_nothing() {
+    let router = service();
+    create_cluster(&router, "demo", "missing").await;
+    create_cluster(&router, "other", "missing").await;
+    register(&router, "web", "app", "missing").await;
+    let run = ok(
+        &router,
+        "RunTask",
+        json!({ "cluster": "demo", "taskDefinition": "web" }),
+        "missing",
+    )
+    .await;
+    let known = string(&list(&run, "tasks", "missing")[0], "taskArn", "missing");
+
+    // The rule generalises over the FORM of the id: a short id, a full ARN, and an ARN
+    // of a task that lives in a different cluster are all "not in this cluster".
+    let unknown_id = "9".repeat(32);
+    let unknown_arn = format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/demo/{unknown_id}");
+    let cases: [(&str, String); 4] = [
+        ("bogus short id", "bogus".to_string()),
+        ("unknown id", unknown_id.clone()),
+        ("unknown ARN", unknown_arn.clone()),
+        ("task of another cluster", known.clone()),
+    ];
+    for (case, reference) in cases {
+        let cluster = if case == "task of another cluster" {
+            "other"
+        } else {
+            "demo"
+        };
+        let body = ok(
+            &router,
+            "DescribeTasks",
+            json!({ "cluster": cluster, "tasks": [reference.clone()] }),
+            case,
+        )
+        .await;
+        assert!(
+            list(&body, "tasks", case).is_empty(),
+            "case {case:?}: expected no task back, got {body}"
+        );
+        let failures = list(&body, "failures", case);
+        assert_eq!(
+            failures.len(),
+            1,
+            "case {case:?}: expected one failure, got {body}"
+        );
+        assert_eq!(
+            string(&failures[0], "reason", case),
+            "MISSING",
+            "case {case:?}: expected reason MISSING, got {body}"
+        );
+        let expected_arn = if reference.starts_with("arn:") {
+            reference.clone()
+        } else {
+            format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:task/{cluster}/{reference}")
+        };
+        assert_eq!(
+            string(&failures[0], "arn", case),
+            expected_arn,
+            "case {case:?}: expected the failure to name the task ARN, got {body}"
+        );
+    }
+
+    // A mixed request answers both halves from the same state.
+    let mixed = ok(
+        &router,
+        "DescribeTasks",
+        json!({ "cluster": "demo", "tasks": [known.clone(), unknown_arn.clone()] }),
+        "mixed",
+    )
+    .await;
+    assert_eq!(
+        list(&mixed, "tasks", "mixed").len(),
+        1,
+        "expected the one stored task back, got {mixed}"
+    );
+    assert_eq!(
+        list(&mixed, "failures", "mixed").len(),
+        1,
+        "expected one MISSING failure beside it, got {mixed}"
+    );
+}
+
+#[tokio::test]
+async fn describe_batches_are_bounded_and_deduplicated() {
+    let router = service();
+    create_cluster(&router, "demo", "batches").await;
+    register(&router, "web", "app", "batches").await;
+    let run = ok(
+        &router,
+        "RunTask",
+        json!({ "cluster": "demo", "taskDefinition": "web" }),
+        "batches",
+    )
+    .await;
+    let known = string(&list(&run, "tasks", "batches")[0], "taskArn", "batches");
+
+    // One request names at most 100 ids — the bound tested on itself and one past it,
+    // for both describe batches. The ids are deliberately outside the range the store
+    // mints, so every one of them is MISSING.
+    let hundred_tasks: Vec<String> = (0..100).map(|index| format!("f{index:031x}")).collect();
+    let hundred_clusters: Vec<String> = (0..100).map(|index| format!("c{index}")).collect();
+    for (case, operation, member, ids) in [
+        ("100 tasks", "DescribeTasks", "tasks", hundred_tasks.clone()),
+        (
+            "100 clusters",
+            "DescribeClusters",
+            "clusters",
+            hundred_clusters.clone(),
+        ),
+    ] {
+        let mut request = json!({ "cluster": "demo" });
+        request[member] = json!(ids);
+        let body = ok(&router, operation, request, case).await;
+        assert_eq!(
+            list(&body, "failures", case).len(),
+            100,
+            "case {case:?}: expected a MISSING failure per distinct id, got {body}"
+        );
+    }
+    for (case, operation, member, mut ids) in [
+        ("101 tasks", "DescribeTasks", "tasks", hundred_tasks.clone()),
+        (
+            "101 clusters",
+            "DescribeClusters",
+            "clusters",
+            hundred_clusters.clone(),
+        ),
+    ] {
+        ids.push("one-too-many".to_string());
+        let mut request = json!({ "cluster": "demo" });
+        request[member] = json!(ids);
+        refused(
+            &router,
+            operation,
+            request,
+            "InvalidParameterException",
+            case,
+        )
+        .await;
+    }
+
+    // The same id repeated names the same resource, so it is answered once: a request
+    // cannot be multiplied into a larger response than the ids it distinctly names.
+    let repeated = ok(
+        &router,
+        "DescribeTasks",
+        json!({ "cluster": "demo", "tasks": vec![known.clone(); 50] }),
+        "repeated task",
+    )
+    .await;
+    assert_eq!(
+        list(&repeated, "tasks", "repeated task").len(),
+        1,
+        "a repeated task id is answered once, got {repeated}"
+    );
+    let repeated_clusters = ok(
+        &router,
+        "DescribeClusters",
+        json!({ "clusters": vec!["demo".to_string(); 50] }),
+        "repeated cluster",
+    )
+    .await;
+    assert_eq!(
+        list(&repeated_clusters, "clusters", "repeated cluster").len(),
+        1,
+        "a repeated cluster name is answered once, got {repeated_clusters}"
+    );
+    let repeated_missing = ok(
+        &router,
+        "DescribeTasks",
+        json!({ "cluster": "demo", "tasks": vec!["9".repeat(32); 50] }),
+        "repeated missing",
+    )
+    .await;
+    assert_eq!(
+        list(&repeated_missing, "failures", "repeated missing").len(),
+        1,
+        "a repeated unknown id yields one MISSING failure, got {repeated_missing}"
+    );
+}
+
+#[tokio::test]
+async fn list_tasks_filters_and_pages_over_stored_tasks() {
+    let router = service();
+    create_cluster(&router, "demo", "filters").await;
+    create_cluster(&router, "other", "filters").await;
+    register(&router, "web", "app", "filters").await;
+    register(&router, "worker", "app", "filters").await;
+
+    // Three tasks that differ along every filter the slice supports, plus one in a
+    // different cluster that must never appear.
+    let rows: [(&str, &str, &str, &str); 3] = [
+        ("web-ci", "web", "ci", "EC2"),
+        ("web-cron", "web", "cron", "FARGATE"),
+        ("worker-ci", "worker", "ci", "EC2"),
+    ];
+    let mut arns = std::collections::HashMap::new();
+    for (case, family, started_by, launch_type) in rows {
+        let run = ok(
+            &router,
+            "RunTask",
+            json!({
+                "cluster": "demo",
+                "taskDefinition": family,
+                "startedBy": started_by,
+                "launchType": launch_type,
+            }),
+            case,
+        )
+        .await;
+        arns.insert(
+            case,
+            string(&list(&run, "tasks", case)[0], "taskArn", case),
+        );
+    }
+    ok(
+        &router,
+        "RunTask",
+        json!({ "cluster": "other", "taskDefinition": "web" }),
+        "other cluster",
+    )
+    .await;
+
+    let filters: [(&str, Value, Vec<&str>); 6] = [
+        ("no filter", json!({}), vec!["web-ci", "web-cron", "worker-ci"]),
+        ("family web", json!({ "family": "web" }), vec!["web-ci", "web-cron"]),
+        ("family worker", json!({ "family": "worker" }), vec!["worker-ci"]),
+        ("startedBy ci", json!({ "startedBy": "ci" }), vec!["web-ci", "worker-ci"]),
+        ("launchType FARGATE", json!({ "launchType": "FARGATE" }), vec!["web-cron"]),
+        ("family and startedBy", json!({ "family": "web", "startedBy": "cron" }), vec!["web-cron"]),
+    ];
+    for (case, filter, expected) in filters {
+        let mut request = json!({ "cluster": "demo" });
+        for (key, value) in filter.as_object().expect("the filter is an object") {
+            request[key] = value.clone();
+        }
+        let body = ok(&router, "ListTasks", request, case).await;
+        let mut actual: Vec<String> = list(&body, "taskArns", case)
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_string())
+            .collect();
+        actual.sort();
+        let mut want: Vec<String> = expected
+            .iter()
+            .map(|row| arns[*row].clone())
+            .collect();
+        want.sort();
+        assert_eq!(
+            actual, want,
+            "case {case:?}: expected {expected:?} for this filter, got {body}"
+        );
+    }
+
+    // Paging walks every task exactly once, whatever the page size.
+    for page_size in [1_i64, 2, 3] {
+        let case = format!("page size {page_size}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = json!({ "cluster": "demo", "maxResults": page_size });
+            if let Some(next) = &token {
+                request["nextToken"] = json!(next);
+            }
+            let body = ok(&router, "ListTasks", request, &case).await;
+            let page = list(&body, "taskArns", &case);
+            assert!(
+                page.len() as i64 <= page_size,
+                "case {case:?}: a page must hold at most {page_size} entries, got {body}"
+            );
+            seen.extend(
+                page.iter()
+                    .map(|value| value.as_str().unwrap_or_default().to_string()),
+            );
+            match body["nextToken"].as_str() {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        seen.sort();
+        let mut want: Vec<String> = arns.values().cloned().collect();
+        want.sort();
+        assert_eq!(
+            seen, want,
+            "case {case:?}: paging must visit every stored task exactly once"
+        );
+    }
+
+    // Services and container instances cannot exist yet, so a filter naming one is
+    // naming something absent.
+    refused(
+        &router,
+        "ListTasks",
+        json!({ "cluster": "demo", "serviceName": "nosuchservice" }),
+        "ServiceNotFoundException",
+        "serviceName filter",
+    )
+    .await;
+    refused(
+        &router,
+        "ListTasks",
+        json!({ "cluster": "demo", "containerInstance": "nosuchinstance" }),
+        "InvalidParameterException",
+        "containerInstance filter",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cluster_and_task_references_accept_a_name_or_an_arn() {
+    let router = service();
+    let cluster_arn = create_cluster(&router, "demo", "references").await;
+    register(&router, "web", "app", "references").await;
+
+    // Every `cluster` member's doc: "The short name or full Amazon Resource Name (ARN)
+    // of the cluster". The rule generalises over the reference FORM, so both forms are
+    // exercised on each operation that takes one.
+    for (case, reference) in [("name", "demo".to_string()), ("ARN", cluster_arn.clone())] {
+        let run = ok(
+            &router,
+            "RunTask",
+            json!({ "cluster": reference, "taskDefinition": "web" }),
+            case,
+        )
+        .await;
+        let task = &list(&run, "tasks", case)[0];
+        let arn = string(task, "taskArn", case);
+        let task_id = arn
+            .rsplit('/')
+            .next()
+            .expect("a task ARN ends in its id")
+            .to_string();
+
+        // The same task, reached by id and by ARN.
+        for (inner, task_reference) in [("id", task_id.clone()), ("ARN", arn.clone())] {
+            let described = ok(
+                &router,
+                "DescribeTasks",
+                json!({ "cluster": reference, "tasks": [task_reference] }),
+                inner,
+            )
+            .await;
+            assert_eq!(
+                string(&list(&described, "tasks", inner)[0], "taskArn", inner),
+                arn,
+                "case {case:?}/{inner:?}: expected the same stored task back, got {described}"
+            );
+        }
+
+        let stopped = ok(
+            &router,
+            "StopTask",
+            json!({ "cluster": reference, "task": task_id }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            string(&stopped["task"], "stoppedReason", case),
+            "Task stopped by user",
+            "case {case:?}: expected the default stopped reason, got {stopped}"
+        );
+        assert!(
+            list(&stopped["task"], "tags", case).is_empty(),
+            "case {case:?}: StopTask deletes the task's tags, got {stopped}"
+        );
+    }
+}

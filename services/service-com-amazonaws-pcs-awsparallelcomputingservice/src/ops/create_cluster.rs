@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a cluster id and ARN, persists the record in [`crate::state`], and answers
+//! from the STORED record — `GetCluster` and `ListClusters` read the same one back.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +183,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCluster"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the PCS emulator holds no state on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `clusterName`'s `@pattern` carries a negative lookahead the boundary validator
+        // cannot compile, so the character rule is enforced here. Its `@length` bounds
+        // compile and were already enforced before this handler ran.
+        if let Some(message) =
+            crate::state::resource_name_violation("clusterName", &input.cluster_name)
+        {
+            return Err(CreateClusterErrorModeled::ValidationException(
+                crate::state::field_validation("clusterName", message),
+            )
+            .into());
+        }
+
+        // The caller-sized lists this create would PERSIST. The model bounds none of
+        // them, so one request could otherwise size one stored record arbitrarily.
+        // `tags` needs no entry: `RequestTagMap` is modelled `@length(min: 1, max: 200)`
+        // with bounded keys and values, all enforced at the boundary.
+        let slurm = input.slurm_configuration.as_ref();
+        let stored_lists: [(&str, usize); 5] = [
+            (
+                "networking.subnetIds",
+                input.networking.subnet_ids.as_ref().map_or(0, Vec::len),
+            ),
+            (
+                "networking.securityGroupIds",
+                input
+                    .networking
+                    .security_group_ids
+                    .as_ref()
+                    .map_or(0, Vec::len),
+            ),
+            (
+                "slurmConfiguration.slurmCustomSettings",
+                slurm.map_or(0, |slurm| {
+                    slurm.slurm_custom_settings.as_ref().map_or(0, Vec::len)
+                }),
+            ),
+            (
+                "slurmConfiguration.slurmdbdCustomSettings",
+                slurm.map_or(0, |slurm| {
+                    slurm.slurmdbd_custom_settings.as_ref().map_or(0, Vec::len)
+                }),
+            ),
+            (
+                "slurmConfiguration.cgroupCustomSettings",
+                slurm.map_or(0, |slurm| {
+                    slurm.cgroup_custom_settings.as_ref().map_or(0, Vec::len)
+                }),
+            ),
+        ];
+        for (member, entries) in stored_lists {
+            if let Some(message) = crate::state::stored_list_violation(member, entries) {
+                return Err(CreateClusterErrorModeled::ValidationException(
+                    crate::state::field_validation(member, message),
+                )
+                .into());
+            }
+        }
+
+        let mut state = state.lock();
+        state.settle();
+
+        // An `@idempotencyToken` retry returns the first call's result and has no
+        // further effect, rather than creating a second cluster or conflicting on the
+        // name that call took. The remembered entry is never overwritten, so the token
+        // names the FIRST call's cluster for as long as it is remembered.
+        if let Some(remembered) = state
+            .remembered_create(Self::NAME, input.client_token.as_ref())
+            .cloned()
+        {
+            let Some(first) = state.clusters.get(&remembered.resource_id) else {
+                return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "clientToken was already used to create cluster {}",
+                        remembered.resource_id
+                    ),
+                    resource_id: remembered.resource_id,
+                    resource_type: "cluster".to_string(),
+                })
+                .into());
+            };
+            return Ok(CreateClusterOutput {
+                cluster: Some(first.to_api()),
+            });
+        }
+
+        if let Some(existing) = state.cluster_ids_by_name.get(&input.cluster_name) {
+            return Err(CreateClusterErrorModeled::ConflictException(ConflictException {
+                message: format!("a cluster named {} already exists", input.cluster_name),
+                resource_id: existing.clone(),
+                resource_type: "cluster".to_string(),
+            })
+            .into());
+        }
+
+        // The store's ceiling, answered the way PCS answers a reached cluster quota.
+        if state.clusters.len() >= crate::state::MAX_CLUSTERS {
+            return Err(CreateClusterErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded("cluster", crate::state::MAX_CLUSTERS),
+            )
+            .into());
+        }
+
+        let (seq, id) = state.mint_id();
+        let now = crate::state::now_date_time();
+        let record = crate::state::ClusterRecord {
+            seq,
+            arn: crate::state::cluster_arn(&crate::state::request_region(ctx), &id),
+            id: id.clone(),
+            name: input.cluster_name.clone(),
+            // PCS reports a new cluster as CREATING; the clock owes it ACTIVE.
+            status: crate::state::STATUS_CREATING.to_string(),
+            created_at: now,
+            modified_at: now,
+            scheduler: input.scheduler.into(),
+            size: input.size,
+            networking: input.networking.into(),
+            slurm_configuration: input.slurm_configuration.map(Into::into),
+            endpoints: Vec::new(),
+            error_info: Vec::new(),
+            tags: input.tags.unwrap_or_default(),
+            compute_node_groups: std::collections::HashMap::new(),
+            queues: std::collections::HashMap::new(),
+            pending: Some(crate::state::Pending::in_a_span(
+                crate::state::PendingChange::Activate,
+            )),
+        };
+
+        state
+            .cluster_ids_by_name
+            .insert(record.name.clone(), id.clone());
+        state.clusters.insert(id.clone(), record);
+        state.remember_create(Self::NAME, input.client_token.as_ref(), None, &id);
+
+        // Answered from the STORED record, so a create and a later read cannot differ.
+        let Some(stored) = state.clusters.get(&id) else {
+            return Err(CreateClusterErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the cluster was not persisted".to_string(),
+                },
+            )
+            .into());
+        };
+        Ok(CreateClusterOutput {
+            cluster: Some(stored.to_api()),
+        })
     }
 }

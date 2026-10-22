@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStreamSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStreamSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStreamSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers from the stored stream session record. Both identifiers accept a bare
+//! id or an ARN, and the status is whatever the clock had already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -256,18 +249,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStreamSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStreamSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStreamSession"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetStreamSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the gameliftstreams emulator holds no state on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // Reporting only: materialise the transitions the clock had already made
+        // due at `now`, which were owed whether or not anybody read.
+        state.materialize(now);
+
+        let Some(group) = state.stream_group(&input.identifier) else {
+            return Err(GetStreamSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no stream group matches identifier {}", input.identifier),
+                },
+            )
+            .into());
+        };
+        let session = crate::state::identifier_id(
+            &input.stream_session_identifier,
+            crate::state::STREAM_SESSION_RESOURCE,
+        )
+        .and_then(|session_id| group.sessions.get(&session_id));
+        let Some(session) = session else {
+            return Err(GetStreamSessionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no stream session matches identifier {} in stream group {}",
+                        input.stream_session_identifier, group.id
+                    ),
+                },
+            )
+            .into());
+        };
+        Ok(GetStreamSessionOutput {
+            arn: Some(session.arn.clone()),
+            description: session.description.clone(),
+            stream_group_id: Some(session.stream_group_id.clone()),
+            user_id: session.user_id.clone(),
+            status: Some(session.status.clone()),
+            status_reason: session.status_reason.clone(),
+            protocol: Some(session.protocol.clone()),
+            location: Some(session.location.clone()),
+            signal_request: Some(session.signal_request.clone()),
+            signal_response: session.signal_response.clone(),
+            connection_timeout_seconds: session.connection_timeout_seconds,
+            session_length_seconds: session.session_length_seconds,
+            additional_launch_args: Some(session.additional_launch_args.clone()),
+            additional_environment_variables: Some(
+                session.additional_environment_variables.clone(),
+            ),
+            performance_stats_configuration: session.performance_stats_configuration.clone(),
+            log_file_location_uri: session.log_file_location_uri.clone(),
+            web_sdk_protocol_url: session.web_sdk_protocol_url.clone(),
+            last_updated_at: Some(crate::state::timestamp(session.last_updated_at)),
+            created_at: Some(crate::state::timestamp(session.created_at)),
+            application_arn: Some(session.application_arn.clone()),
+            export_files_metadata: None,
+            role_arn: session.role_arn.clone(),
+            display_configuration: session.display_configuration.clone(),
+        })
     }
 }

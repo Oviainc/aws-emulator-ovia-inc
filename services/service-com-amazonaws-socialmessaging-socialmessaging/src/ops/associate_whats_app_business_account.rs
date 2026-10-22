@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateWhatsAppBusinessAccount
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateWhatsAppBusinessAccount`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Links a WhatsApp Business Account (WABA) to this account.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateWhatsAppBusinessAccount::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `signupCallback` records a signup that is still in progress and hands back the
+//! `associateInProgressToken` that finalizes it. A `setupFinalization` finalizes
+//! exactly such a signup — a token no callback issued, or one already finalized or
+//! past its lifetime, is refused with the modelled `InvalidParametersException` —
+//! and then MINTS and PERSISTS the linked account (or finds the existing one named
+//! by `phoneNumberParent`) plus one phone-number record per entry it carries, so
+//! `GetLinkedWhatsAppBusinessAccount`, `ListLinkedWhatsAppBusinessAccounts`,
+//! `GetLinkedWhatsAppBusinessAccountPhoneNumber` and `SendWhatsAppMessage` all
+//! resolve what this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +154,239 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateWhatsAppBusinessAccount` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateWhatsAppBusinessAccountErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateWhatsAppBusinessAccount"))
+        use crate::state::{self as st, LinkedAccount, PendingSignup, PhoneNumberRecord};
+        use std::time::SystemTime;
+
+        let invalid = |message: String| -> Self::Error {
+            AssociateWhatsAppBusinessAccountErrorModeled::InvalidParametersException(
+                InvalidParametersException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+        let limit_exceeded = |message: String| -> Self::Error {
+            AssociateWhatsAppBusinessAccountErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateWhatsAppBusinessAccountErrorModeled::DependencyException(
+                DependencyException {
+                    message: Some("the social-messaging store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = st::request_region(ctx);
+
+        if input.signup_callback.is_none() && input.setup_finalization.is_none() {
+            return Err(invalid(
+                "one of signupCallback or setupFinalization must be present".to_string(),
+            ));
+        }
+        if let Some(setup) = input.setup_finalization.as_ref() {
+            // The model's `phoneNumberParent` doc: "This field can't be used when
+            // the waba field is present."
+            if setup.waba.is_some() && setup.phone_number_parent.is_some() {
+                return Err(invalid(
+                    "setupFinalization.phoneNumberParent can't be used when \
+                     setupFinalization.waba is present"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let mut store = state.lock();
+        // An abandoned signup stops being finalizable once its lifetime is up; the
+        // removal was due at that instant whether or not anyone called.
+        store.expire_pending_signups(SystemTime::now());
+
+        // EVERY refusal comes first, so a request this handler rejects leaves the
+        // store exactly as it found it: no partly linked account, no consumed
+        // signup, and no signup recorded for a callback whose token the caller
+        // never received.
+        if let Some(setup) = input.setup_finalization.as_ref() {
+            // Every registration grows the store, so the account's capacity is
+            // checked for the whole finalization rather than part way through it.
+            let already_registered = setup
+                .phone_number_parent
+                .as_deref()
+                .and_then(|parent| store.resolve_linked_account(parent))
+                .map_or(0, |account| account.phone_number_ids.len());
+            if already_registered + setup.phone_numbers.len() > st::MAX_PHONE_NUMBERS_PER_ACCOUNT {
+                return Err(limit_exceeded(format!(
+                    "a linked WhatsApp Business Account holds at most {} phone numbers, \
+                     and this one already holds {already_registered}",
+                    st::MAX_PHONE_NUMBERS_PER_ACCOUNT
+                )));
+            }
+
+            if setup.phone_number_parent.is_none() && store.linked_accounts_full() {
+                return Err(limit_exceeded(format!(
+                    "this account already has the maximum of {} linked WhatsApp \
+                     Business Accounts",
+                    st::MAX_LINKED_ACCOUNTS
+                )));
+            }
+
+            // A corrected `phoneNumberParent` must still be retryable, so the
+            // parent is resolved before the token is consumed.
+            if let Some(parent) = setup.phone_number_parent.as_deref() {
+                if store.linked_account_id(parent).is_none() {
+                    return Err(invalid(format!(
+                        "setupFinalization.phoneNumberParent '{parent}' is not a linked \
+                         WhatsApp Business Account"
+                    )));
+                }
+            }
+
+            // The token must name a signup THIS service started and has not yet
+            // finalized: the model's own doc says it is "generated by
+            // `WhatsAppSignupCallback` and used by `WhatsAppSetupFinalization`".
+            // `expire_pending_signups` above already dropped the ones past their
+            // lifetime, so an expired token is refused here too. The value is never
+            // echoed back — it is `@sensitive`.
+            if !store
+                .pending_signups
+                .contains_key(&setup.associate_in_progress_token)
+            {
+                return Err(invalid(
+                    "setupFinalization.associateInProgressToken does not name a WhatsApp \
+                     signup in progress; call AssociateWhatsAppBusinessAccount with a \
+                     signupCallback to start one"
+                        .to_string(),
+                ));
+            }
+        }
+        if input.signup_callback.is_some() && store.pending_signups_full() {
+            return Err(limit_exceeded(format!(
+                "this account already has {} WhatsApp signups in progress",
+                st::MAX_PENDING_SIGNUPS
+            )));
+        }
+
+        let mut signup_callback_result = None;
+        if let Some(callback) = input.signup_callback.as_ref() {
+            let token = store.mint_signup_token();
+            store.pending_signups.insert(
+                token.clone(),
+                PendingSignup {
+                    access_token: callback.access_token.clone(),
+                    callback_url: callback.callback_url.clone(),
+                    created_at: SystemTime::now(),
+                },
+            );
+            let incomplete = store.accounts_with_incomplete_setup();
+            signup_callback_result = Some(WhatsAppSignupCallbackResult {
+                associate_in_progress_token: Some(token),
+                linked_accounts_with_incomplete_setup: Some(incomplete),
+            });
+        }
+
+        let mut linked_id = None;
+        if let Some(setup) = input.setup_finalization.as_ref() {
+
+            // Finalizing consumes the signup, so the same token cannot finalize twice.
+            store
+                .pending_signups
+                .remove(&setup.associate_in_progress_token);
+
+            let account_id = match setup.phone_number_parent.as_deref() {
+                // `phoneNumberParent` adds numbers to an account already linked.
+                Some(parent) => store.linked_account_id(parent).ok_or_else(|| {
+                    invalid(format!(
+                        "setupFinalization.phoneNumberParent '{parent}' is not a linked \
+                         WhatsApp Business Account"
+                    ))
+                })?,
+                // Otherwise this links a new account.
+                None => {
+                    let (id, arn) = store.mint_linked_account_id(&region);
+                    // The Meta account id — and the only name the service holds for
+                    // the account — come from the `waba` setup block; with none
+                    // supplied the minted id stands in for both.
+                    let waba_id = setup
+                        .waba
+                        .as_ref()
+                        .and_then(|waba| waba.id.clone())
+                        .unwrap_or_else(|| id.clone());
+                    let event_destinations = setup
+                        .waba
+                        .as_ref()
+                        .and_then(|waba| waba.event_destinations.clone())
+                        .unwrap_or_default();
+                    let tags = setup
+                        .waba
+                        .as_ref()
+                        .and_then(|waba| waba.tags.clone())
+                        .map(st::tag_map)
+                        .unwrap_or_default();
+                    store.arn_index.insert(arn.clone(), id.clone());
+                    store.linked_accounts.insert(
+                        id.clone(),
+                        LinkedAccount {
+                            id: id.clone(),
+                            arn,
+                            waba_name: waba_id.clone(),
+                            waba_id,
+                            registration_status: st::registration_status_for(0).to_string(),
+                            link_date: SystemTime::now(),
+                            event_destinations,
+                            phone_number_ids: Vec::new(),
+                            dataset_id: None,
+                            marketing_messages_onboarding_status: None,
+                            tags,
+                        },
+                    );
+                    id
+                }
+            };
+
+            // A number's display name defaults to the business account's name.
+            let display_name = store
+                .linked_accounts
+                .get(&account_id)
+                .map(|account| account.waba_name.clone())
+                .unwrap_or_default();
+            let mut registered = Vec::with_capacity(setup.phone_numbers.len());
+            for entry in &setup.phone_numbers {
+                let (phone_number_id, arn) = store.mint_phone_number_id(&region);
+                let (phone_number, display_phone_number) = st::derive_phone_number(&entry.id);
+                store.arn_index.insert(arn.clone(), phone_number_id.clone());
+                store.phone_numbers.insert(
+                    phone_number_id.clone(),
+                    PhoneNumberRecord {
+                        phone_number_id: phone_number_id.clone(),
+                        arn,
+                        linked_account_id: account_id.clone(),
+                        phone_number,
+                        meta_phone_number_id: entry.id.clone(),
+                        display_phone_number,
+                        display_phone_number_name: display_name.clone(),
+                        quality_rating: st::QUALITY_RATING_UNKNOWN.to_string(),
+                        data_localization_region: entry.data_localization_region.clone(),
+                        call_settings: None,
+                        tags: entry.tags.clone().map(st::tag_map).unwrap_or_default(),
+                    },
+                );
+                registered.push(phone_number_id);
+            }
+            if let Some(account) = store.linked_accounts.get_mut(&account_id) {
+                account.phone_number_ids.extend(registered);
+                account.registration_status =
+                    st::registration_status_for(account.phone_number_ids.len()).to_string();
+            }
+            linked_id = Some(account_id);
+        }
+
+        Ok(AssociateWhatsAppBusinessAccountOutput {
+            signup_callback_result,
+            status_code: Some(i32::from(Self::SUCCESS_STATUS)),
+            linked_whats_app_business_account_id: linked_id,
+        })
     }
 }
