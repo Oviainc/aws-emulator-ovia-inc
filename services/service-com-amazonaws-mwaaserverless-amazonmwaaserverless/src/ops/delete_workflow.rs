@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes versions of a persisted workflow from this service's store
+//! (`crate::state`), and echoes the identity of what it removed. `WorkflowVersion` is
+//! documented as optional, and "if not specified, all versions of the workflow are
+//! deleted" — so a named version removes that one version (promoting the newest one
+//! left when it was the latest) and the workflow record itself goes only when no
+//! version of it remains, taking its runs with it. An ARN (or a version) the store does
+//! not hold is a `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -99,6 +97,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,18 +172,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkflow"))
+        // `ctx` carries only request metadata; the workflow is named by its input.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteWorkflowErrorModeled::InternalServerException(InternalServerException {
+                message: "the com.amazonaws.mwaaserverless workflow store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+
+        let workflow = store.workflows.get(&input.workflow_arn).ok_or_else(|| {
+            DeleteWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: format!("No workflow found for {}", input.workflow_arn),
+                resource_id: input.workflow_arn.clone(),
+                resource_type: "workflow".to_string(),
+            })
+        })?;
+
+        // `WorkflowVersion` is documented as "Optional. The specific version of the
+        // workflow to delete. If not specified, all versions of the workflow are
+        // deleted." So a named version removes THAT version, and the workflow record
+        // only goes when no version of it is left.
+        let requested = input.workflow_version.as_deref();
+        let deleted_version = workflow
+            .version(requested)
+            .ok_or_else(|| {
+                DeleteWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: format!(
+                        "Workflow {} has no version {}",
+                        input.workflow_arn,
+                        requested.unwrap_or("<latest>")
+                    ),
+                    resource_id: input.workflow_arn.clone(),
+                    resource_type: "workflow-version".to_string(),
+                })
+            })?
+            .version
+            .clone();
+        let name = workflow.name.clone();
+        let arn = workflow.arn.clone();
+
+        let remove_the_workflow = match requested {
+            // No version named: every version goes, so the whole record goes.
+            None => true,
+            Some(version) => {
+                let workflow = store.workflows.get_mut(&arn).ok_or_else(|| {
+                    DeleteWorkflowErrorModeled::InternalServerException(InternalServerException {
+                        message: "the workflow being deleted could not be read back".to_string(),
+                        retry_after_seconds: None,
+                    })
+                })?;
+                workflow.versions.retain(|rec| rec.version != version);
+                // The last version of a workflow is also all of them.
+                if workflow.versions.is_empty() {
+                    true
+                } else {
+                    // Deleting the latest version promotes the newest one left, which
+                    // is what the workflow then reports as its current configuration.
+                    if !workflow.versions.iter().any(|rec| rec.is_latest) {
+                        let newest = workflow
+                            .versions
+                            .iter()
+                            .map(|rec| rec.created_at)
+                            .max()
+                            .unwrap_or(workflow.created_at);
+                        for record in &mut workflow.versions {
+                            record.is_latest = record.created_at == newest;
+                        }
+                        if let Some(latest) = workflow.versions.iter().find(|rec| rec.is_latest) {
+                            workflow.current_version = latest.version.clone();
+                            workflow.code_snapshotted_at = latest.created_at;
+                            workflow.revision_id =
+                                crate::state::mint_revision_id(&arn, &latest.version);
+                        }
+                    }
+                    workflow.modified_at = SystemTime::now();
+                    false
+                }
+            }
+        };
+
+        if remove_the_workflow {
+            // Remove the record itself, the name it held, and every token that replayed
+            // onto it; its versions and runs live inside the record and go with it.
+            store.workflows.remove(&arn);
+            store.workflow_names.remove(&name);
+            store.forget_tokens_for(&arn);
+        }
+
+        Ok(DeleteWorkflowOutput {
+            workflow_arn: arn,
+            workflow_version: Some(deleted_version),
+        })
     }
 }
