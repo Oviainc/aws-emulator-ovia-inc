@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSpaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSpaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the spaces this emulator holds, from [`crate::state`]. The API models no
+//! `CreateSpace`, so the spaces are the ambient ones the state seeds; this operation
+//! never creates or modifies one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSpaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ListSpaces` declares no `maxResults`, so a page carries up to the service's own
+//! published maximum (`crate::state::MAX_PAGE_SIZE`) and emits a `nextToken` only when
+//! spaces remain after it; a `nextToken` the caller supplies resumes strictly after
+//! the space it names.
 //!
 //! ## Shape of an operation
 //!
@@ -76,9 +75,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codecatalyst-codecataly
 // here — hence the `ListSpacesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codecatalyst#ListSpaces")]
+//
+// CodeCatalyst declares its errors on the SERVICE shape, not per operation, so the
+// ones this handler answers with are widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codecatalyst#ListSpaces",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum ListSpacesErrorModeled {
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -132,18 +138,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSpaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSpacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSpaces"))
+        // `ctx` carries request metadata only; this operation reads none of it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Not a service behaviour: the engine this service was constructed with
+            // holds no state store, so the operation cannot be served at all.
+            crate::scaffolded::Scaffolded::not_implemented(
+                "ListSpaces (the engine this service was built with provides no state store)",
+            )
+        })?;
+        let state = state.lock();
+
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_cursor(token).ok_or_else(|| {
+                ListSpacesErrorModeled::ValidationException(invalid_input(
+                    "nextToken is not a pagination token issued by this service",
+                ))
+            })?),
+            None => None,
+        };
+
+        let page = crate::state::page(&state.spaces, after.as_deref(), None);
+        let items: Vec<SpaceSummary> = page
+            .items
+            .iter()
+            .map(|space| SpaceSummary {
+                name: space.name.clone(),
+                region_name: space.region_name.clone(),
+                display_name: space.display_name.clone(),
+                description: space.description.clone(),
+            })
+            .collect();
+        let next_token = page.next_token;
+        // Release the shared-state guard before returning: the response is built
+        // from owned values, so no other caller waits on this one's serialization.
+        drop(state);
+
+        Ok(ListSpacesOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored application a request names — by `ApplicationId`,
+//! `ApplicationArn` or `AppRegistryArn` — together with the tags held for its ARN.
+//! A reference that resolves to nothing is refused with the modelled
+//! `ValidationException`; this operation never synthesises an application.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +141,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetApplication"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetApplicationErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let mut state = state.lock();
+        // A status change the clock already owed is materialised before anything is
+        // reported, so this read reports what the application already is. It is the only
+        // write a reporting operation makes.
+        state.settle(::std::time::SystemTime::now());
+
+        // Every member is optional in the model, but the operation cannot name an
+        // application without one of them.
+        if input.application_id.is_none()
+            && input.application_arn.is_none()
+            && input.app_registry_arn.is_none()
+        {
+            return Err(GetApplicationErrorModeled::ValidationException(
+                crate::state::validation(
+                    "One of ApplicationId, ApplicationArn or AppRegistryArn must be specified",
+                ),
+            )
+            .into());
+        }
+
+        let resolved = state.resolve_application_id(
+            input.application_id.as_deref(),
+            input.application_arn.as_deref(),
+            input.app_registry_arn.as_deref(),
+        );
+        let Some(id) = resolved else {
+            // No application answers the reference. This operation models no
+            // `ResourceNotFoundException`, so the reference itself is what is refused —
+            // and nothing is fabricated in its place.
+            let reference = input
+                .application_id
+                .or(input.application_arn)
+                .or(input.app_registry_arn)
+                .unwrap_or_default();
+            return Err(GetApplicationErrorModeled::ValidationException(
+                crate::state::validation(format!(
+                    "No SAP application is registered for {reference} in this account and Region"
+                )),
+            )
+            .into());
+        };
+
+        let application = state
+            .applications
+            .get(&id)
+            .expect("the resolved id names a stored application");
+        let view = application.view();
+        let tags = state.tags_for(&application.arn);
+
+        Ok(GetApplicationOutput {
+            application: Some(view),
+            tags,
+        })
     }
 }

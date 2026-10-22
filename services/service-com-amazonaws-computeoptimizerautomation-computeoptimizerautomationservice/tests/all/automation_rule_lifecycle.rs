@@ -82,7 +82,7 @@ pub(crate) async fn call_ok(
 }
 
 /// The awsJson error code an error body carries in `__type`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()

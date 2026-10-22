@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the stored application: its `Status` becomes `STOPPING` now and `STOPPED` one
+//! [`crate::state::TRANSITION_SPAN`] later, and the `OperationId` returned names a
+//! persisted `STOP_APPLICATION` operation record that `GetOperation` reads back. The
+//! two optional switches the call carries are recorded as that operation's
+//! `Properties`.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +147,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopApplication"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopApplicationErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+        state.settle(now);
+
+        if let Some(entity) = input.stop_connected_entity.as_deref() {
+            // `StopConnectedEntity` is an enum in the model, so the boundary validator
+            // has already refused anything outside it; this re-states the refusal
+            // against the model's own catalogue.
+            if !CONNECTED_ENTITY_TYPE_VALUES.contains(&entity) {
+                return Err(StopApplicationErrorModeled::ValidationException(
+                    crate::state::validation(format!(
+                        "StopConnectedEntity must be one of {}, but was {entity}",
+                        CONNECTED_ENTITY_TYPE_VALUES.join(", ")
+                    )),
+                )
+                .into());
+            }
+        }
+
+        let Some(application) = state.applications.get(&input.application_id) else {
+            return Err(StopApplicationErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(format!(
+                    "No SAP application is registered with ID {} in this account and Region",
+                    input.application_id
+                )),
+            )
+            .into());
+        };
+
+        // A change the clock still owes this application is an operation already under
+        // way on it, which is what `ConflictException` reports.
+        if application.pending.is_some() {
+            return Err(StopApplicationErrorModeled::ConflictException(
+                crate::state::conflict(format!(
+                    "Application {} is {} and cannot be stopped until that completes",
+                    application.id, application.status
+                )),
+            )
+            .into());
+        }
+
+        let mut application = application.clone();
+        application.status = crate::state::APPLICATION_STATUS_STOPPING.to_string();
+        application.last_updated = now;
+        application.pending = Some(crate::state::PendingTransition {
+            due_at: now + crate::state::TRANSITION_SPAN,
+            status: crate::state::APPLICATION_STATUS_STOPPED.to_string(),
+            // Stopping an application does not re-run discovery, so the discovery
+            // status it already reached is the one it keeps.
+            discovery_status: application.discovery_status.clone(),
+        });
+
+        // The operation's `Properties` are the parameters of the call that filed it, so
+        // a client reading the record back learns how the stop was asked for.
+        let mut properties = ::std::collections::HashMap::new();
+        if let Some(entity) = input.stop_connected_entity {
+            properties.insert("StopConnectedEntity".to_string(), entity);
+        }
+        if let Some(shutdown) = input.include_ec2_instance_shutdown {
+            properties.insert(
+                "IncludeEc2InstanceShutdown".to_string(),
+                shutdown.to_string(),
+            );
+        }
+
+        let operation_id = state.record_operation(
+            crate::state::OPERATION_TYPE_STOP_APPLICATION,
+            &application,
+            properties,
+            now,
+        );
+        state
+            .applications
+            .insert(input.application_id, application);
+
+        Ok(StopApplicationOutput {
+            operation_id: Some(operation_id),
+        })
     }
 }

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProjects
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProjects`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProjects::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the names of the stored build projects: this is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +147,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProjects` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProjectsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProjects"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ListProjects (this engine carries no CodeBuild state)",
+            ));
+        };
+        let _ = ctx;
+
+        let guard = state.lock();
+        // Sorted by the requested criterion. The model documents no default for
+        // either member, so this service lists by name ascending — the store's own
+        // stable order — when the request names neither.
+        let mut ordered: Vec<&crate::state::StoredProject> = guard.projects.values().collect();
+        match input.sort_by.as_deref() {
+            Some("CREATED_TIME") => ordered.sort_by_key(|stored| stored.created_millis),
+            Some("LAST_MODIFIED_TIME") => {
+                ordered.sort_by_key(|stored| stored.last_modified_millis);
+            }
+            // NAME, or absent: the map is already keyed by name, so it is in name
+            // order already.
+            _ => {}
+        }
+        let mut names: Vec<String> = ordered
+            .into_iter()
+            .filter_map(|stored| stored.project.name.clone())
+            .collect();
+        if input.sort_order.as_deref() == Some("DESCENDING") {
+            names.reverse();
+        }
+
+        let Some((page, next_token)) = crate::state::page(&names, input.next_token.as_deref())
+        else {
+            return Err(ListProjectsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some("Invalid nextToken".to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(ListProjectsOutput {
+            // The model bounds `projects` at 1..100 entries, so an account with no
+            // projects answers with the member absent rather than an empty list.
+            projects: (!page.is_empty()).then_some(page),
+            next_token,
+        })
     }
 }

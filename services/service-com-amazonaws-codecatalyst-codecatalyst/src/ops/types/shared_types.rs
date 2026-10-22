@@ -43,6 +43,73 @@ pub struct IdeConfiguration {
 pub struct WorkflowRunStatusReason {
 }
 
+// The service's common error shapes. CodeCatalyst declares them on the SERVICE
+// shape rather than on each operation, so every operation lists them through
+// `extra_errors = [..]` on its `#[operation_error]` enum and constructs them
+// from here. `message` is `@required` in the model, hence a bare `String`.
+
+#[smithy_macros::smithy(shape = "com.amazonaws.codecatalyst#ResourceNotFoundException")]
+#[derive(Debug, Clone)]
+pub struct ResourceNotFoundException {
+    pub message: String,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.codecatalyst#ConflictException")]
+#[derive(Debug, Clone)]
+pub struct ConflictException {
+    pub message: String,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.codecatalyst#ValidationException")]
+#[derive(Debug, Clone)]
+pub struct ValidationException {
+    pub message: String,
+}
+
+#[smithy_macros::smithy(shape = "com.amazonaws.codecatalyst#ServiceQuotaExceededException")]
+#[derive(Debug, Clone)]
+pub struct ServiceQuotaExceededException {
+    pub message: String,
+}
+
+/// The `ResourceNotFoundException` the service answers when a request names a
+/// space, project or source repository that does not exist. The wording follows
+/// the model's own documentation for the shape ("the specified resource was not
+/// found") and names the resource the request asked for.
+pub fn not_found(resource: &str, name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "The request was denied because the specified resource was not found: \
+             {resource} {name}. Verify that the spelling is correct and that you have \
+             access to the resource."
+        ),
+    }
+}
+
+/// The `ValidationException` the service answers when an input fails a
+/// constraint the model cannot express (an opaque pagination cursor this
+/// service did not issue, say). Names the member at fault, as the boundary
+/// validator does.
+pub fn invalid_input(message: impl Into<String>) -> ValidationException {
+    ValidationException {
+        message: message.into(),
+    }
+}
+
+/// The `ServiceQuotaExceededException` the service answers when a create would
+/// take a container past the most resources it holds. The wording follows the
+/// model's own documentation for the shape ("one or more resources has reached
+/// its limits") and names the container and the limit reached.
+pub fn quota_exceeded(resource: &str, container: &str, limit: usize) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: format!(
+            "The request was denied because one or more resources has reached its limits: \
+             {container} already holds the maximum of {limit} {resource}. Either reduce the \
+             number of resources, or change the tier if applicable."
+        ),
+    }
+}
+
 /// The values `ComparisonOperator` accepts on the wire.
 pub const COMPARISON_OPERATOR_VALUES: &[&str] = &["BEGINS_WITH", "EQ", "GE", "GT", "LE", "LT"];
 
