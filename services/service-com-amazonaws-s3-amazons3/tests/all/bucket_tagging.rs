@@ -140,7 +140,11 @@ pub(crate) fn tag_set_of(answer: &Answer) -> Vec<(String, String)> {
 }
 
 /// `text` with its predefined entities and numeric character references resolved.
-fn unescaped(text: &str) -> String {
+///
+/// `pub(crate)`, like the readers above it: the object-storage harness in this same test
+/// crate reads a listing body with the same resolution rather than a second copy of this
+/// wrapper.
+pub(crate) fn unescaped(text: &str) -> String {
     unescape(text)
         .unwrap_or_else(|error| panic!("the response body must unescape: {error}"))
         .into_owned()

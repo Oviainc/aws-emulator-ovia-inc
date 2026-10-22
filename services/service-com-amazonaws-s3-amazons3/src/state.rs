@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Engine state for the com-amazonaws-s3-amazons3 service.
+//!
+//! The bucket map is the only place a bucket or an object exists: CreateBucket /
+//! HeadBucket answer from a bucket's own record, and the object-storage loop
+//! (PutObject / GetObject / ListObjectsV2 / DeleteObject / DeleteBucket) computes
+//! every response from the objects stored inside it.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -300,6 +305,26 @@ impl Bucket {
         self.objects.get(key)
     }
 
+    /// Every object the bucket holds, keyed by object key.
+    ///
+    /// A `BTreeMap`, so iterating it IS the ascending UTF-8 byte order S3 lists keys in
+    /// (`String`'s `Ord` compares bytes) and a listing needs no sort step. Read-only:
+    /// an object is recorded only through
+    /// [`ComAmazonawsS3Amazons3State::put_object`], which is the only place that sees
+    /// every ceiling.
+    pub fn objects(&self) -> &BTreeMap<String, Object> {
+        &self.objects
+    }
+
+    /// Remove the object at `key`, reporting whether the bucket held one.
+    ///
+    /// PRIVATE, so a delete goes through
+    /// [`ComAmazonawsS3Amazons3State::remove_object`] and cannot name a bucket that does
+    /// not exist.
+    fn remove_object(&mut self, key: &str) -> bool {
+        self.objects.remove(key).is_some()
+    }
+
     /// Store `object` at `key`, replacing any object already there, and report what that
     /// did.
     ///
@@ -554,6 +579,24 @@ impl ComAmazonawsS3Amazons3State {
         );
         BucketCreation::Created
     }
+
+    /// Remove the object at `key` from the bucket named `bucket`, reporting whether an
+    /// object was there — or `None` when this emulator holds no such bucket, so a delete
+    /// can tell "no such bucket" from "no such key".
+    ///
+    /// Everything the removed object retained is released with it, which is what lets a
+    /// later write back into the byte budgets [`Self::put_object`] checks.
+    pub fn remove_object(&mut self, bucket: &str, key: &str) -> Option<bool> {
+        self.buckets
+            .get_mut(bucket)
+            .map(|held| held.remove_object(key))
+    }
+
+    /// Remove the bucket named `bucket_name`, releasing everything it still held.
+    /// `false` when this emulator holds no such bucket.
+    pub fn remove_bucket(&mut self, bucket_name: &str) -> bool {
+        self.buckets.remove(bucket_name).is_some()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -659,4 +702,150 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsS3Amazons3State>)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The store side of the object loop: what a listing iterates, what a delete
+    //! releases, and that a removal is reported precisely enough for `DeleteObject` to
+    //! tell "no such bucket" from "no such key".
+
+    use super::*;
+
+    /// An object of `size` bytes, with everything else at its empty value.
+    fn object(size: usize) -> Object {
+        let body = vec![b'x'; size];
+        Object {
+            etag: object_etag(&body),
+            body,
+            last_modified: SystemTime::now(),
+            storage_class: DEFAULT_STORAGE_CLASS.to_string(),
+            content_type: None,
+            cache_control: None,
+            content_disposition: None,
+            content_encoding: None,
+            content_language: None,
+            expires: None,
+            website_redirect_location: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_bucket_lists_its_objects_in_ascending_key_order() {
+        let mut store = ComAmazonawsS3Amazons3State::default();
+        assert_eq!(
+            store.create_bucket("one", DEFAULT_BUCKET_REGION),
+            BucketCreation::Created
+        );
+
+        // Written out of order, and with keys whose order differs between byte-wise and
+        // case-insensitive comparison, so the assertion pins the byte order S3 lists in.
+        for key in ["b/second", "a/first", "B/upper", "a/first/deeper"] {
+            assert_eq!(
+                store.put_object("one", key, object(3)),
+                Some(ObjectWrite::Created),
+                "case {key:?}: a fresh key in an existing bucket is recorded"
+            );
+        }
+
+        let listed: Vec<&str> = store
+            .bucket("one")
+            .expect("bucket one exists")
+            .objects()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["B/upper", "a/first", "a/first/deeper", "b/second"],
+            "objects iterate in ascending UTF-8 byte order, got {listed:?}"
+        );
+    }
+
+    #[test]
+    fn a_removal_reports_what_it_released_and_frees_the_byte_budget() {
+        let mut store = ComAmazonawsS3Amazons3State::default();
+        assert_eq!(
+            store.create_bucket("one", DEFAULT_BUCKET_REGION),
+            BucketCreation::Created
+        );
+        assert_eq!(
+            store.put_object("one", "kept", object(4)),
+            Some(ObjectWrite::Created),
+            "a fresh key is recorded"
+        );
+        assert_eq!(
+            store.put_object("one", "doomed", object(4)),
+            Some(ObjectWrite::Created),
+            "a second fresh key is recorded"
+        );
+
+        assert_eq!(
+            store.remove_object("one", "doomed"),
+            Some(true),
+            "removing a stored key reports that an object was there"
+        );
+        assert_eq!(
+            store.remove_object("one", "doomed"),
+            Some(false),
+            "removing it again reports that nothing was there"
+        );
+        assert_eq!(
+            store.remove_object("absent", "doomed"),
+            None,
+            "naming a bucket this store does not hold reports no bucket at all"
+        );
+        assert!(
+            store
+                .bucket("one")
+                .expect("bucket one exists")
+                .object("kept")
+                .is_some(),
+            "a delete releases only the key it named"
+        );
+
+        // The bytes the removed object retained are released with it: the per-bucket
+        // budget is over what the bucket WOULD hold, so a write that fills it succeeds
+        // after a delete that freed room for it. An object retains its payload AND the
+        // strings kept beside it, so the room left is the budget less what "kept" holds
+        // and less the empty object's own overhead.
+        let overhead = object(0).retained_bytes();
+        let held = object(4).retained_bytes();
+        let fills_the_bucket = MAX_OBJECT_BYTES_PER_BUCKET - held - overhead;
+        assert_eq!(
+            store.put_object("one", "large", object(fills_the_bucket)),
+            Some(ObjectWrite::Created),
+            "a write that exactly fits the per-bucket budget is recorded"
+        );
+        assert!(
+            matches!(
+                store.put_object("one", "one-too-many", object(8)),
+                Some(ObjectWrite::ByteBudgetReached { .. })
+            ),
+            "a write past the per-bucket budget is refused"
+        );
+        assert_eq!(
+            store.remove_object("one", "large"),
+            Some(true),
+            "the large object was stored"
+        );
+        assert_eq!(
+            store.put_object("one", "one-too-many", object(8)),
+            Some(ObjectWrite::Created),
+            "the delete released the bytes the refused write needed"
+        );
+
+        assert!(store.remove_bucket("one"), "bucket one exists");
+        assert!(
+            store.bucket("one").is_none(),
+            "a removed bucket is no longer held"
+        );
+        assert!(!store.remove_bucket("one"), "bucket one is already gone");
+        assert_eq!(
+            store.remove_object("one", "kept"),
+            None,
+            "a removed bucket holds no objects to delete"
+        );
+    }
 }

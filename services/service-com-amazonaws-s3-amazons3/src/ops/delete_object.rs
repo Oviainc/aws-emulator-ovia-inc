@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteObject
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteObject`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes the (bucket, key) entry from the store, idempotently.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! S3's delete is idempotent: deleting a key that is not there is the same 204 success
+//! as deleting one that is, so a caller retrying a delete sees one outcome.
 //!
 //! ## Shape of an operation
 //!
@@ -161,14 +156,54 @@ use super::types::*;
 // `DeleteObjectError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
+/// This operation's output, as the wire carries it: NOTHING.
+///
+/// A successful delete answers "204 No Content", and an HTTP 204 response has no body,
+/// so the modelled output's three members — `x-amz-delete-marker` and `x-amz-version-id`
+/// (both bucket versioning, which this emulator does not keep) and `x-amz-request-charged`
+/// (a Requester Pays charge it does not model) — have nothing to report and the generated
+/// output shape would still serialize an empty `DeleteObjectOutput` document into that
+/// 204. The local empty structure is what keeps the body empty, the way `DeleteBucket`'s
+/// does; `with_http` carries the modelled 204, without which the status falls back to the
+/// protocol default of 200.
+#[derive(Debug, Clone, Default)]
+pub struct DeleteObjectNoContent;
+
+impl DeleteObjectNoContent {
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[],
+    )
+    .with_http(::aws_smithy_schema::traits::HttpTrait::new(
+        "DELETE",
+        "/{Bucket}/{Key+}",
+        Some(204u16),
+    ));
+}
+
+pub static DELETE_OBJECT_NO_CONTENT_SCHEMA: &::aws_smithy_schema::Schema =
+    &DeleteObjectNoContent::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DeleteObjectNoContent {
+    fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
+}
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `DeleteObjectError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#DeleteObject")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#DeleteObject",
+    // `NoSuchBucket` (404) is what S3 answers a delete addressed to a bucket that does
+    // not exist; the model declares the shape but lists no error for this operation,
+    // so it is widened in here rather than invented.
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum DeleteObjectErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -209,31 +244,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for DeleteObject<Eng>
 {
     type Input = DeleteObjectInput;
-    type Output = DeleteObjectOutput;
+    type Output = DeleteObjectNoContent;
     type Error = DeleteObjectError;
 
     const NAME: &'static str = "DeleteObject";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_OBJECT_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_OBJECT_OUTPUT_SCHEMA;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_OBJECT_NO_CONTENT_SCHEMA;
     const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteObject"))
+        // A conditional delete answers 412 when the condition fails, and a versioned
+        // delete acts on one version of an object this store does not keep versions of.
+        if input.if_match.is_some()
+            || input.if_match_last_modified_time.is_some()
+            || input.if_match_size.is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteObject with a conditional If-Match / x-amz-if-match-* header",
+            ));
+        }
+        if input.version_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteObject with a versionId (S3 Versioning)",
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                "InternalError",
+                500,
+                "the shared S3 store is unreachable from this engine",
+            )
+        })?;
+        let mut store = state.lock();
+
+        // Deleting a key that is not there is a success — "Removes an object from a
+        // bucket… if there isn't a null version, Amazon S3 does not remove anything" —
+        // so what the answer turns on is only whether the BUCKET exists: `None` is the
+        // bucket this emulator does not hold. The removal releases everything the
+        // object retained, which is what lets a later write back into the store's
+        // byte budgets.
+        if store.remove_object(&input.bucket, &input.key).is_none() {
+            return Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        }
+
+        // No versioning on this bucket, so no delete marker is created and there is no
+        // version id to report.
+        Ok(DeleteObjectNoContent)
     }
 }

@@ -23,6 +23,10 @@ mod head_object_read_back;
 mod object_and_policy;
 #[path = "all/object_and_tagging_roundtrip.rs"]
 mod object_and_tagging_roundtrip;
+#[path = "all/object_listing_and_deletion.rs"]
+mod object_listing_and_deletion;
+#[path = "all/object_storage.rs"]
+mod object_storage;
 #[path = "all/object_write_and_read_back.rs"]
 mod object_write_and_read_back;
 #[path = "all/objects.rs"]
