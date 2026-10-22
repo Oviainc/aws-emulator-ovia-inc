@@ -831,7 +831,19 @@ async fn a_create_past_the_ceiling_is_refused_with_the_modelled_quota_error() {
     };
 
     let router = new_router();
-    let application_id = created_application_id(&router, "ceiling").await;
+    // Created with a clientToken, so the replay-at-the-ceiling case below has a token
+    // whose application already exists.
+    let first = create_application(
+        &router,
+        json!({ "displayName": "ceiling", "clientToken": "ceiling-token" }),
+    )
+    .await;
+    assert_eq!(
+        first.status, 200,
+        "expected 200 from the first CreateApplication, got {} / {:?}",
+        first.status, first.body
+    );
+    let application_id = first.text("applicationId");
 
     // Fill the index ceiling of one application, then the application ceiling of the
     // account; each row below asserts the refusal at its own site.
@@ -893,4 +905,23 @@ async fn a_create_past_the_ceiling_is_refused_with_the_modelled_quota_error() {
             refused.field("resourceType")
         );
     }
+
+    // A replay creates nothing, so the ceiling does not apply to it: the idempotent
+    // retry still answers with the application its token minted.
+    let replayed = create_application(
+        &router,
+        json!({ "displayName": "ceiling", "clientToken": "ceiling-token" }),
+    )
+    .await;
+    assert_eq!(
+        replayed.status, 200,
+        "case \"replay at the ceiling\": expected 200, got {} / {:?}",
+        replayed.status, replayed.body
+    );
+    assert_eq!(
+        replayed.text("applicationId"),
+        application_id,
+        "case \"replay at the ceiling\": expected the application the token minted ({application_id}), got {:?}",
+        replayed.field("applicationId")
+    );
 }

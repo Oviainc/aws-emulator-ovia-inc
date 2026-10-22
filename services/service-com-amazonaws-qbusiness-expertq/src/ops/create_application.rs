@@ -213,23 +213,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // The real service caps applications per account per Region, and this operation
-        // models ServiceQuotaExceededException for exceeding it. The emulator's own
-        // ceiling is what keeps a create loop from growing this process without bound.
-        if store.applications.len() >= crate::state::MAX_APPLICATIONS {
-            return Err(CreateApplicationErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: format!(
-                        "You have reached the maximum number of Amazon Q Business applications ({})",
-                        crate::state::MAX_APPLICATIONS
-                    ),
-                    resource_id: ::engine::emulator_account_id().to_string(),
-                    resource_type: "APPLICATION".to_string(),
-                },
-            )
-            .into());
-        }
-
         // `clientToken` is an @idempotencyToken: a replay returns the application the
         // first request minted instead of creating a second one.
         let client_token = input.client_token.clone();
@@ -240,6 +223,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let application_id = match replayed {
             Some(application_id) => application_id,
             None => {
+                // The real service caps applications per account per Region, and this
+                // operation models ServiceQuotaExceededException for exceeding it. The
+                // emulator's own ceiling is what keeps a create loop from growing this
+                // process without bound. Checked only on the mint path: a replay creates
+                // nothing, so it cannot exceed a quota.
+                if store.applications.len() >= crate::state::MAX_APPLICATIONS {
+                    return Err(CreateApplicationErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "You have reached the maximum number of Amazon Q Business \
+                                 applications ({})",
+                                crate::state::MAX_APPLICATIONS
+                            ),
+                            resource_id: ::engine::emulator_account_id().to_string(),
+                            resource_type: "APPLICATION".to_string(),
+                        },
+                    )
+                    .into());
+                }
                 let application_id = crate::state::mint_resource_id();
                 let sequence = store.next_sequence();
                 let record = crate::state::StoredApplication {
