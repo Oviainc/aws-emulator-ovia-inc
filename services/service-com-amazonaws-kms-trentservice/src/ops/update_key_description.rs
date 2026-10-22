@@ -201,10 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::KeyRefMut::MalformedArn => {
                 return Err(UpdateKeyDescriptionErrorModeled::InvalidArnException(
                     InvalidArnException {
-                        message: Some(format!(
-                            "The specified ARN is not valid: {}.",
-                            input.key_id
-                        )),
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
                     },
                 )
                 .into());
@@ -227,10 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if key.key_state == crate::state::KEY_STATE_PENDING_DELETION {
             return Err(UpdateKeyDescriptionErrorModeled::KMSInvalidStateException(
                 KMSInvalidStateException {
-                    message: Some(format!(
-                        "{} is not in a valid state for this operation. Its key state is {}.",
-                        key.arn, key.key_state
-                    )),
+                    message: Some(crate::state::invalid_state_message(key)),
                 },
             )
             .into());
@@ -241,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the member is required and its length is modelled, so what arrives here
         // REPLACES the stored description, whatever it was — including with the empty
         // string, which the modelled `@length(0..8192)` allows.
-        key.description = input.description.clone();
+        key.description = input.description;
 
         Ok(UpdateKeyDescriptionOutput)
     }

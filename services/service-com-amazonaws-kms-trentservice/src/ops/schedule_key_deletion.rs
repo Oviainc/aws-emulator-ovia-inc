@@ -238,10 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::KeyRefMut::MalformedArn => {
                 return Err(ScheduleKeyDeletionErrorModeled::InvalidArnException(
                     InvalidArnException {
-                        message: Some(format!(
-                            "The specified ARN is not valid: {}.",
-                            input.key_id
-                        )),
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
                     },
                 )
                 .into());

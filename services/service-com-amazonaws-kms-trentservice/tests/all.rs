@@ -15,6 +15,8 @@
 mod client_error_status;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/key_deletion_cancellation.rs"]
+mod key_deletion_cancellation;
 #[path = "all/key_lifecycle.rs"]
 mod key_lifecycle;
 #[path = "all/key_specs.rs"]
