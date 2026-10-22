@@ -238,6 +238,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+
+        // "A message can include only XML, JSON, and unformatted text. The following
+        // Unicode characters are allowed ... If a message contains characters outside
+        // the allowed set, Amazon SQS rejects the message and returns an
+        // InvalidMessageContents error." Refused before the store is touched, so a
+        // rejected body is never stored.
+        if let Some(character) = sqs::invalid_body_character(&input.message_body) {
+            return Err(SendMessageErrorModeled::InvalidMessageContents(
+                InvalidMessageContents {
+                    message: Some(format!(
+                        "MessageBody holds U+{:04X}, which is outside the allowed set \
+                         #x9 | #xA | #xD | #x20 to #xD7FF | #xE000 to #xFFFD | #x10000 to #x10FFFF.",
+                        character as u32
+                    )),
+                },
+            )
+            .into());
+        }
+
         let store = sqs::service_state(&*self.engine).ok_or_else(|| {
             SendMessageErrorModeled::UnsupportedOperation(sqs::store_unavailable())
         })?;

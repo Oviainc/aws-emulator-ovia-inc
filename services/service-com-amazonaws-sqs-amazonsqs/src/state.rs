@@ -49,6 +49,23 @@ pub const ARN_SERVICE: &str = "sqs";
 /// characters" (`CreateQueueRequest$QueueName` docs).
 pub const MAX_QUEUE_NAME_LENGTH: usize = 80;
 
+/// The first character of `body` that a message body may not hold, if any.
+///
+/// The accepted set is `SendMessage`'s own: "The following Unicode characters are
+/// allowed ... #x9 | #xA | #xD | #x20 to #xD7FF | #xE000 to #xFFFD | #x10000 to
+/// #x10FFFF". A Rust `char` can never be a surrogate, so the #xD800–#xDFFF gap between
+/// the third and fourth range needs no arm of its own. A body holding anything else is
+/// what `SendMessage` answers with the modelled `InvalidMessageContents`.
+pub fn invalid_body_character(body: &str) -> Option<char> {
+    body.chars().find(|character| {
+        !matches!(*character,
+            '\u{9}' | '\u{A}' | '\u{D}'
+            | '\u{20}'..='\u{D7FF}'
+            | '\u{E000}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{10FFFF}')
+    })
+}
+
 /// The suffix a FIFO queue's name must carry: "A FIFO queue name must end with the
 /// .fifo suffix" (`CreateQueueRequest$QueueName` docs).
 pub const FIFO_QUEUE_NAME_SUFFIX: &str = ".fifo";

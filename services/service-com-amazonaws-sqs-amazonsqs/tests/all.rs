@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/message_lifecycle.rs"]
 mod message_lifecycle;
+#[path = "all/message_plane.rs"]
+mod message_plane;
 #[path = "all/queue_configuration.rs"]
 mod queue_configuration;
 #[path = "all/queue_tags.rs"]
