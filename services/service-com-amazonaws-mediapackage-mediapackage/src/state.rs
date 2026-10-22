@@ -806,16 +806,34 @@ impl ComAmazonawsMediapackageMediapackageState {
         (0..INGEST_ENDPOINT_COUNT)
             .map(|_| {
                 let id = self.mint_hex("ingest-endpoint", INGEST_GENERATED_BYTES);
+                let (username, password) = self.mint_ingest_credentials();
                 IngestEndpoint {
                     url: Some(format!(
                         "https://{account_label}.mediapackage.{region}.amazonaws.com/in/v2/{channel_label}/{id}/channel"
                     )),
                     id: Some(id),
-                    username: Some(self.mint_hex("ingest-username", INGEST_GENERATED_BYTES)),
-                    password: Some(self.mint_hex("ingest-password", INGEST_GENERATED_BYTES)),
+                    username: Some(username),
+                    password: Some(password),
                 }
             })
             .collect()
+    }
+
+    /// One freshly minted ingest credential pair — `(username, password)` — for an ingest
+    /// endpoint to carry.
+    ///
+    /// The generator and the width are the ones a brand-new endpoint's credentials are
+    /// minted with ([`INGEST_GENERATED_BYTES`]), because a rotated credential is a
+    /// system-generated ingest credential like any other: the model documents `Username`
+    /// and `Password` as "system generated" and constrains neither. Minting goes through
+    /// [`Self::mint_hex`], so a rotation can never hand back the pair it replaced.
+    ///
+    /// Shared by the credential-rotating operations, so a rotated endpoint is
+    /// indistinguishable from a newly provisioned one.
+    pub fn mint_ingest_credentials(&mut self) -> (String, String) {
+        let username = self.mint_hex("ingest-username", INGEST_GENERATED_BYTES);
+        let password = self.mint_hex("ingest-password", INGEST_GENERATED_BYTES);
+        (username, password)
     }
 
     /// The stored tag set of the resource a tagging operation's `ResourceArn` named, for
