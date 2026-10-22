@@ -40,10 +40,63 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// Reword a boundary constraint violation on a member whose OPERATION admits only a
+/// proper subset of the enum shape it targets.
+///
+/// The boundary validator can only check the shape, so its report enumerates the shape's
+/// whole value set — which, for such a member, advertises values the operation refuses.
+/// Cost Explorer answers those members with a fixed, operation-scoped sentence naming the
+/// values it does admit, echoing neither the rejected value nor the enum. One row per
+/// narrowed member; everything else keeps the framework's wording.
+///
+/// A row matches on the member path AND on the narrowing itself — the value set the
+/// member was checked against must strictly contain the operation's admissible set (see
+/// [`narrows`]). The path alone would be enough today (`context` is the only
+/// `Context`-typed member in the whole service, `GetDimensionValuesRequest$Context`), but
+/// a same-named member of an UNRELATED enum added later would then silently inherit this
+/// operation's sentence; the narrowing test declines it instead.
+fn narrowed_enum_refusal(violation: &Violation) -> Option<Refused> {
+    let (code, message) = match (violation.path.as_str(), &violation.kind) {
+        // `GetDimensionValuesRequest$Context`: documented as "This can be RESERVATIONS or
+        // COST_AND_USAGE", while the `Context` enum also carries `SAVINGS_PLANS`. A value
+        // in the enum but outside the operation's set never reaches here (the shape
+        // accepts it); the handler refuses that one with the SAME sentence.
+        ("context", ViolationKind::EnumValue(checked))
+            if narrows(
+                &crate::ops::get_dimension_values::ADMISSIBLE_CONTEXTS,
+                checked,
+            ) =>
+        {
+            (
+                "ValidationException",
+                crate::ops::get_dimension_values::CONTEXT_REJECTION_MESSAGE,
+            )
+        }
+        // Every other refusal — including an enum member whose operation admits the whole
+        // shape — keeps the framework's generic constraint report.
+        _ => return None,
+    };
+    Some(Refused {
+        code: code.to_string(),
+        message: message.to_string(),
+    })
+}
+
+/// Whether `admissible` is a PROPER subset of the `checked` value set the boundary
+/// validator reported — i.e. whether the member really is one whose operation narrows the
+/// enum shape it was validated against.
+fn narrows(admissible: &[&str], checked: &[String]) -> bool {
+    checked.len() > admissible.len()
+        && admissible
+            .iter()
+            .all(|value| checked.iter().any(|checked| checked == value))
+}
 
 /// The `com-amazonaws-costexplorer-awsinsightsindexservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -98,15 +151,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it. Cost Explorer keeps the framework's generic
+        // `ValidationException` report for almost everything — but not for a member
+        // whose operation admits only part of the enum shape it targets, where that
+        // report would name values the operation refuses. `narrowed_enum_refusal`
+        // holds one row per such member and declines the rest, so the generic
+        // validator stays in place for every other operation and member.
+        match refusal {
+            Refusal::Invalid(violations) => violations.iter().find_map(narrowed_enum_refusal),
+            // Authentication refusals, and any refusal kind added later, keep the
+            // framework's wording.
+            _ => None,
+        }
     }
 
     fn override_routing_error(
@@ -135,5 +191,97 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The value set the boundary validator reports for the `Context` enum shape
+    /// (`smithy_query(query="shape", shape="Context")`).
+    fn context_enum() -> Vec<String> {
+        ["COST_AND_USAGE", "RESERVATIONS", "SAVINGS_PLANS"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    }
+
+    fn violation(path: &str, kind: ViolationKind) -> Violation {
+        Violation {
+            path: path.to_string(),
+            kind,
+            value: Some("whatever the caller sent".to_string()),
+        }
+    }
+
+    /// The narrowed member is reworded to the operation's fixed sentence.
+    #[test]
+    fn a_narrowed_enum_member_takes_the_operation_scoped_sentence() {
+        let refused = narrowed_enum_refusal(&violation(
+            "context",
+            ViolationKind::EnumValue(context_enum()),
+        ))
+        .expect("case \"context against the whole Context enum\": expected a rewording");
+        assert_eq!(
+            (refused.code.as_str(), refused.message.as_str()),
+            (
+                "ValidationException",
+                crate::ops::get_dimension_values::CONTEXT_REJECTION_MESSAGE
+            ),
+            "case \"context against the whole Context enum\": got {refused:?}"
+        );
+    }
+
+    /// Everything else keeps the framework's generic report — including a `context`
+    /// member of some UNRELATED enum, which is what keeps this row from spreading to a
+    /// same-named member added to another operation later.
+    #[test]
+    fn every_other_violation_keeps_the_generic_report() {
+        let unrelated_enum = ["ALPHA", "BETA", "GAMMA", "DELTA"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+        let cases = [
+            (
+                "a context member of an unrelated enum",
+                violation("context", ViolationKind::EnumValue(unrelated_enum)),
+            ),
+            (
+                "a context member checked against exactly the admissible set",
+                violation(
+                    "context",
+                    ViolationKind::EnumValue(
+                        crate::ops::get_dimension_values::ADMISSIBLE_CONTEXTS
+                            .iter()
+                            .map(|value| value.to_string())
+                            .collect(),
+                    ),
+                ),
+            ),
+            (
+                "a context member failing a constraint that is not the enum",
+                violation("context", ViolationKind::MaxLength(8)),
+            ),
+            (
+                "another enum member this service does not narrow",
+                violation("dimension", ViolationKind::EnumValue(context_enum())),
+            ),
+            (
+                "an absent required member",
+                Violation {
+                    path: "timePeriod".to_string(),
+                    kind: ViolationKind::MissingRequiredMember,
+                    value: None,
+                },
+            ),
+        ];
+        for (label, violation) in cases {
+            assert_eq!(
+                narrowed_enum_refusal(&violation),
+                None,
+                "case {label:?}: expected the framework's own wording"
+            );
+        }
     }
 }
