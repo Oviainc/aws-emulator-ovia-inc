@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportPlaybackKeyPair
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportPlaybackKeyPair`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportPlaybackKeyPair::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Imports the public portion of a customer-generated key pair and persists it as a
+//! playback key pair, so `GetPlaybackKeyPair` answers from what was imported.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +79,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use md5::{Digest, Md5};
+use spki::der::Decode as _;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -97,11 +93,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivs-amazoninteractivevi
 // here — hence the `ImportPlaybackKeyPairError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivs#ImportPlaybackKeyPair")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivs#ImportPlaybackKeyPair",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ImportPlaybackKeyPairErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
@@ -158,18 +158,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportPlaybackKeyPair` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportPlaybackKeyPairErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportPlaybackKeyPair"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ImportPlaybackKeyPairErrorModeled::InternalServerException(InternalServerException {
+                exception_message: Some("the IVS store is unavailable".to_string()),
+                ..Default::default()
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // `PlaybackPublicKeyMaterial` carries no modelled pattern, so the boundary
+        // validator cannot have checked that the material really is a public key:
+        // this handler is where that is decided.
+        let key_der = public_key_der(&input.public_key_material).map_err(|message| {
+            audit(ctx, "", "", "rejected-invalid-material");
+            ImportPlaybackKeyPairErrorModeled::ValidationException(ValidationException {
+                exception_message: Some(message),
+                ..Default::default()
+            })
+        })?;
+        let fingerprint = fingerprint(&key_der);
+
+        let mut store = state.lock();
+        // The fingerprint identifies the key material itself, so an already-imported
+        // key is a conflicting import however its PEM was wrapped and whatever name
+        // and tags accompany it — which is what `ConflictException` (HTTP 409),
+        // modelled on this operation and on no read, says.
+        if let Some(existing) = store
+            .playback_key_pairs
+            .values()
+            .find(|pair| pair.fingerprint.as_deref() == Some(fingerprint.as_str()))
+        {
+            let existing_arn = existing.arn.clone().unwrap_or_default();
+            drop(store);
+            audit(ctx, &fingerprint, &existing_arn, "rejected-conflict");
+            return Err(ImportPlaybackKeyPairErrorModeled::ConflictException(
+                ConflictException {
+                    exception_message: Some(format!(
+                        "a playback key pair with fingerprint {fingerprint} is already imported as {existing_arn}"
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+        // The store grows by one key pair per call and lives for the life of the
+        // process, so the growth is capped; past the cap the service answers the
+        // quota error it models rather than accepting another entry.
+        if store.playback_key_pairs.len() >= crate::state::MAX_PLAYBACK_KEY_PAIRS {
+            drop(store);
+            audit(ctx, &fingerprint, "", "rejected-quota");
+            return Err(
+                ImportPlaybackKeyPairErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        exception_message: Some(format!(
+                            "the number of playback key pairs would exceed the limit of {}",
+                            crate::state::MAX_PLAYBACK_KEY_PAIRS
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_hex("playback-key", 6);
+        let arn = crate::state::playback_key_pair_arn(&region, &id);
+        let key_pair = PlaybackKeyPair {
+            arn: Some(arn.clone()),
+            // The name does not need to be unique and the model gives it no default,
+            // so a caller that sent none gets the empty string back.
+            name: Some(input.name.unwrap_or_default()),
+            fingerprint: Some(fingerprint),
+            tags: Some(input.tags.unwrap_or_default()),
+        };
+        store.playback_key_pairs.insert(arn, key_pair.clone());
+        drop(store);
+
+        audit(
+            ctx,
+            key_pair.fingerprint.as_deref().unwrap_or_default(),
+            key_pair.arn.as_deref().unwrap_or_default(),
+            "imported",
+        );
+
+        Ok(ImportPlaybackKeyPairOutput {
+            key_pair: Some(key_pair),
+        })
     }
+}
+
+/// The audit record for an import: who presented which access key id, which key
+/// pair the call touched, and the outcome.
+///
+/// The imported material itself is never logged — only its fingerprint, which is the
+/// public identifier the response already carries — and neither is any secret: the
+/// access key id is the public half the request carries in its SigV4 scope.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    fingerprint: &str,
+    arn: &str,
+    outcome: &str,
+) {
+    ::tracing::info!(
+        operation = "ImportPlaybackKeyPair",
+        access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+        key_pair_arn = %arn,
+        fingerprint = %fingerprint,
+        outcome = outcome,
+        "ivs state change"
+    );
+}
+
+/// The DER `SubjectPublicKeyInfo` a caller's `publicKeyMaterial` carries, or the
+/// reason to refuse the import.
+///
+/// The model documents the member as "the public portion of a customer-generated key
+/// pair", and IVS's private-channel setup produces exactly one form of it: an ECDSA
+/// public key in a `PUBLIC KEY` PEM block (`openssl ec -in private.pem -pubout`).
+/// So the material is decoded as PEM, its tag must be exactly `PUBLIC KEY`, the bytes
+/// it carries must parse as a `SubjectPublicKeyInfo`, and that key's algorithm must
+/// be the elliptic-curve one — `id-ecPublicKey`, OID [`EC_PUBLIC_KEY_OID`]. Anything
+/// else (prose, a private key, a truncated structure, a key of another algorithm) is
+/// refused with the operation's `ValidationException` rather than persisted and
+/// fingerprinted. The curve itself is NOT constrained: the model names no curve, so
+/// any EC key the caller generated is accepted.
+fn public_key_der(material: &str) -> Result<Vec<u8>, String> {
+    let block = pem::parse(material.trim())
+        .map_err(|error| format!("publicKeyMaterial is not a PEM block: {error}"))?;
+    if block.tag() != "PUBLIC KEY" {
+        return Err(format!(
+            "publicKeyMaterial must be a PUBLIC KEY PEM block, got a {} block",
+            block.tag()
+        ));
+    }
+    let key = spki::SubjectPublicKeyInfoRef::from_der(block.contents())
+        .map_err(|error| format!("publicKeyMaterial is not a DER-encoded public key: {error}"))?;
+    let algorithm = key.algorithm.oid.to_string();
+    if algorithm != EC_PUBLIC_KEY_OID {
+        return Err(format!(
+            "publicKeyMaterial must be an ECDSA public key (algorithm {EC_PUBLIC_KEY_OID}), \
+             got algorithm {algorithm}"
+        ));
+    }
+    Ok(block.into_contents())
+}
+
+/// `id-ecPublicKey`, the `SubjectPublicKeyInfo` algorithm of every ECDSA public key
+/// (RFC 5480 §2.1.1), which is the kind of key a playback key pair holds.
+const EC_PUBLIC_KEY_OID: &str = "1.2.840.10045.2.1";
+
+/// The fingerprint of an imported key: the MD5 digest of the key's DER
+/// `SubjectPublicKeyInfo`, as colon-separated lowercase hex byte pairs.
+///
+/// That is the form `PlaybackKeyPairFingerprint` ("Key-pair identifier") carries, and
+/// the same value `openssl pkey -pubin -pubout -outform DER | md5` prints: it is
+/// computed from the imported material alone, so the same key always fingerprints to
+/// the same string and every read of the pair answers that one value.
+fn fingerprint(public_key_der: &[u8]) -> String {
+    Md5::digest(public_key_der)
+        .iter()
+        .map(|byte| hex::encode([*byte]))
+        .collect::<Vec<_>>()
+        .join(":")
 }
