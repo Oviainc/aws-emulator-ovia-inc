@@ -35,7 +35,10 @@ const LIST_OPERATIONS: [(&str, &str, u32); 5] = [
 ];
 
 /// A router with only this service mounted — one emulator "session".
-struct Emulator {
+///
+/// `pub(crate)` so a sibling suite in this test target drives the emulator through the
+/// same front door rather than standing up a second harness of its own.
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
@@ -49,12 +52,12 @@ impl Emulator {
     }
 
     /// A session over a fresh engine.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_engine(&Arc::new(engine::InMemoryEngine::new()))
     }
 
     /// POST `path_and_query` with a JSON body; returns the status and parsed body.
-    async fn post(&self, path_and_query: &str, body: &str) -> (u16, Value) {
+    pub(crate) async fn post(&self, path_and_query: &str, body: &str) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("http://localhost{path_and_query}"))
@@ -73,7 +76,7 @@ impl Emulator {
     }
 
     /// POST and require HTTP 200.
-    async fn ok(&self, path_and_query: &str, body: &str) -> Value {
+    pub(crate) async fn ok(&self, path_and_query: &str, body: &str) -> Value {
         let (status, parsed) = self.post(path_and_query, body).await;
         assert_eq!(
             status, 200,
@@ -84,7 +87,7 @@ impl Emulator {
 }
 
 /// The wire error code of a failure response: the last segment of its `__type`.
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -100,7 +103,7 @@ fn error_code(body: &Value) -> String {
 /// Checks the pagination contract as it goes: no page exceeds the `MaxResults` asked
 /// for, no item is returned twice, a `NextToken` never accompanies an empty page, and
 /// the walk terminates on a page that carries no token.
-async fn drain(
+pub(crate) async fn drain(
     emulator: &Emulator,
     path: &str,
     items_key: &str,

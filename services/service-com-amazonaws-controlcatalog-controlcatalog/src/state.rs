@@ -159,33 +159,81 @@ impl ComAmazonawsControlcatalogControlcatalogState {
     /// Resolve an accepted control ARN to the stored control.
     ///
     /// GetControl's documentation: it "accepts controltower or controlcatalog control
-    /// ARNs as input" and "returns a controlcatalog ARN format". A `controlcatalog`
-    /// ARN is the record's own key; a `controltower` ARN names the control by the
-    /// identifier after `control/`, and its Region segment says where the control was
-    /// enabled rather than which control it is, so the identifier alone resolves it.
+    /// ARNs as input" and "returns a controlcatalog ARN format", and gives the two
+    /// accepted forms as `arn:{PARTITION}:controlcatalog:::control/
+    /// {CONTROL_CATALOG_OPAQUE_ID}` and `arn:{PARTITION}:controltower:{REGION}::control/
+    /// {CONTROL_TOWER_OPAQUE_ID}`. What names the control is therefore the identifier
+    /// after `control/`, read in the namespace the service segment selects; `{PARTITION}`
+    /// says which partition the caller writes the ARN in and `{REGION}` where the control
+    /// was enabled, so neither segment is part of a control's identity. An ARN of either
+    /// form whose identifier the catalog publishes resolves, whatever partition it is
+    /// written in — the catalog is global, and publishes one control per identifier.
     pub fn resolve_control(&self, requested_arn: &str) -> Option<&Control> {
-        if let Some(control) = self.controls.get(requested_arn) {
-            return Some(control);
+        match ControlArnRef::parse(requested_arn)? {
+            ControlArnRef::Catalog(identifier) => {
+                self.controls.get(&catalog_arn("control", identifier))
+            }
+            ControlArnRef::ControlTower(identifier) => self.controls.values().find(|control| {
+                control
+                    .control_tower_identifier
+                    .as_deref()
+                    .is_some_and(|stored| stored == identifier)
+            }),
         }
-        let identifier = control_tower_identifier(requested_arn)?;
-        self.controls.values().find(|control| {
-            control
-                .control_tower_identifier
-                .as_deref()
-                .is_some_and(|id| id == identifier)
-        })
     }
 }
 
-/// The identifier of a `controltower` control ARN
-/// (`arn:{partition}:controltower:{region}::control/{ID}`), or `None` for any other
-/// ARN form.
-fn control_tower_identifier(arn: &str) -> Option<&str> {
-    let fields: Vec<&str> = arn.splitn(6, ':').collect();
-    if fields.len() != 6 || fields[2] != "controltower" {
-        return None;
+/// What an accepted control ARN names: the identifier it carries, in the namespace its
+/// service segment selects. Any other ARN names no control at all.
+#[derive(Debug)]
+enum ControlArnRef<'a> {
+    /// A `controlcatalog` ARN's `{CONTROL_CATALOG_OPAQUE_ID}` — the opaque identifier
+    /// this catalog publishes a control under.
+    Catalog(&'a str),
+    /// A `controltower` ARN's `{CONTROL_TOWER_OPAQUE_ID}` — the Control Tower identifier
+    /// of a control that is also a Control Tower control.
+    ControlTower(&'a str),
+}
+
+impl<'a> ControlArnRef<'a> {
+    /// Read an ARN as the control it names, or `None` when it names none.
+    fn parse(arn: &'a str) -> Option<Self> {
+        let mut fields = arn.splitn(6, ':');
+        let (
+            Some("arn"),
+            Some(partition),
+            Some(service),
+            Some(region),
+            // Neither accepted form carries an account id.
+            Some(""),
+            Some(resource),
+        ) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        )
+        else {
+            return None;
+        };
+        // The modeled `ControlArn` pattern admits the `aws` partition family only:
+        // ^arn:(aws(?:[-a-z]*)?):(controlcatalog|controltower):[a-zA-Z0-9-]*::control/…
+        if !partition.starts_with("aws") {
+            return None;
+        }
+        let identifier = resource.strip_prefix("control/")?;
+        if identifier.is_empty() {
+            return None;
+        }
+        match service {
+            // The global catalog form carries no Region segment.
+            "controlcatalog" if region.is_empty() => Some(Self::Catalog(identifier)),
+            "controltower" => Some(Self::ControlTower(identifier)),
+            _ => None,
+        }
     }
-    fields[5].strip_prefix("control/")
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
