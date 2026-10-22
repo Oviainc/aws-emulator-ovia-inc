@@ -17,6 +17,8 @@ mod config_aggregator_lifecycle;
 mod config_delivery_channel_status;
 #[path = "all/config_read_shape_and_compliance.rs"]
 mod config_read_shape_and_compliance;
+#[path = "all/config_retention_configuration_lifecycle.rs"]
+mod config_retention_configuration_lifecycle;
 #[path = "all/config_setup_and_rule_loop.rs"]
 mod config_setup_and_rule_loop;
 #[path = "all/list_configuration_recorders.rs"]
