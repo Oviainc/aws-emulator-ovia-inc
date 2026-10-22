@@ -7,28 +7,40 @@
 //! the AI benchmarking control plane's workload configurations are kept here, in
 //! `BTreeMap`s keyed by the resource name AWS keys them by, so `ListModels` has one
 //! stable order to sort and paginate over and every `Describe*` replays exactly what
-//! the matching `Create*` stored. The Studio
-//! AppImageConfig registry and the Git repositories `CreateCodeRepository` registers
-//! are kept the same way, keyed by `AppImageConfigName` and `CodeRepositoryName`.
+//! the matching `Create*` stored. The Studio AppImageConfig registry, the Git
+//! repositories `CreateCodeRepository` registers and the processing jobs
+//! `CreateProcessingJob` accepts are kept the same way, keyed by `AppImageConfigName`,
+//! `CodeRepositoryName` and `ProcessingJobName`.
 //!
 //! Studio apps live here too, keyed by the [`AppKey`] their five input members name
 //! rather than by a bare name, because that tuple — domain, owning user profile or
 //! space, app type, app name — is what identifies one app.
+//!
+//! # A job's status is moved by the CLOCK, never by a read
+//!
+//! A resource AWS returns in a non-terminal status (an endpoint in `Creating`, a
+//! processing job in `InProgress`) owes its next move to the clock: the instant it falls
+//! due is stored at create time and the reporting operations only materialise what is
+//! already due ([`Endpoint::settle_status`], [`ProcessingJob::settle_status`]), so a read
+//! never changes what a later caller sees and the transient status is observable because
+//! the span is never zero.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AdditionalInferenceSpecificationDefinition, ArtifactSource, AsyncInferenceConfig,
-    BatchDataCaptureConfig, CodeEditorAppImageConfig, ContainerDefinition, DataCaptureConfig,
-    DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig, GitConfig, IamIdentity,
-    InferenceExecutionConfig, InferenceSpecification, JupyterLabAppImageConfig,
-    KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties, MetricsConfig,
-    ModelCardSecurityConfig, ModelClientConfig, ModelLifeCycle, ModelMetrics,
+    AdditionalInferenceSpecificationDefinition, AppSpecification, ArtifactSource,
+    AsyncInferenceConfig, BatchDataCaptureConfig, CodeEditorAppImageConfig, ContainerDefinition,
+    DataCaptureConfig, DataProcessing, DriftCheckBaselines, ExperimentConfig, ExplainerConfig,
+    GitConfig, IamIdentity, InferenceExecutionConfig, InferenceSpecification,
+    JupyterLabAppImageConfig, KernelGatewayImageConfig, ManagedConfiguration, MetadataProperties,
+    MetricsConfig, ModelCardSecurityConfig, ModelClientConfig, ModelLifeCycle, ModelMetrics,
     ModelPackageModelCard, ModelPackageSecurityConfig, ModelPackageStatusDetails,
-    ModelPackageStatusItem, ModelPackageValidationSpecification, ParallelismConfiguration,
-    ProductionVariant, ProductionVariantSummary, ResourceSpec, SourceAlgorithmSpecification, Tag,
-    TransformInput, TransformOutput, TransformResources, UserContext, VpcConfig,
+    ModelPackageStatusItem, ModelPackageValidationSpecification, NetworkConfig,
+    ParallelismConfiguration, ProcessingInput, ProcessingOutputConfig, ProcessingResources,
+    ProcessingStoppingCondition, ProductionVariant, ProductionVariantSummary, ResourceSpec,
+    SourceAlgorithmSpecification, Tag, TransformInput, TransformOutput, TransformResources,
+    UserContext, VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -104,6 +116,8 @@ pub const ARTIFACT_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`]. Bounds the model-card store, and is what `CreateModelCard`
 /// answers `ResourceLimitExceeded` past.
 pub const MODEL_CARD_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`].
+pub const PROCESSING_JOB_QUOTA: usize = 1_000;
 
 /// The lineage group every lineage entity this account creates belongs to.
 ///
@@ -112,6 +126,40 @@ pub const MODEL_CARD_QUOTA: usize = 1_000;
 /// each entity in it; this emulator models no other lineage group, so every artifact
 /// reports this one.
 pub const DEFAULT_LINEAGE_GROUP: &str = "sagemaker-default-lineage-group";
+
+/// How long after `CreateProcessingJob` the clock owes the job's move out of
+/// `InProgress` into its terminal status.
+///
+/// A span chosen by this emulator (AWS documents no duration for a processing run),
+/// inside the 250–750 ms band the project fixes for a transition the clock owes. It is
+/// never zero, so a caller that describes the job straight after creating it still
+/// observes `InProgress`, and one that waits (as `aws sagemaker wait
+/// processing-job-completed` does) observes the terminal status, so a waiter terminates.
+pub const PROCESSING_JOB_ENDS_AFTER: Duration = Duration::from_millis(400);
+
+/// `ProcessingJobStatus`'s members this emulator moves a processing job through (the
+/// modelled enum also carries `Completed`, `Stopping` and `Stopped`, which this slice
+/// does not reach). Named once here so no handler compares a bare string literal.
+pub const PROCESSING_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`PROCESSING_STATUS_IN_PROGRESS`].
+pub const PROCESSING_STATUS_FAILED: &str = "Failed";
+
+/// `FailureReason` of a processing job whose container image could not be run here.
+///
+/// A processing job runs a customer Docker image (`AppSpecification$ImageUri`). This
+/// emulator has no container runtime, and the engine contract
+/// (`vendor/engine/src/lib.rs`) forbids reporting a status, duration or exit code for
+/// work nothing ran — so the run the caller asked for ends in the modelled `Failed`
+/// state with this reason, and no `ProcessingStartTime` or `ExitMessage` is invented.
+/// Everything around the run — accepting the job, validating it, minting its ARN,
+/// replaying it, reporting its terminal status — is real.
+pub const NO_CONTAINER_RUNTIME_REASON: &str =
+    "This emulator has no container runtime, so the processing job's container image was \
+     never started";
+
+/// The instance count a processing cluster runs when the request names none, per
+/// `ProcessingClusterConfig$InstanceCount`'s doc: "The default value is 1."
+pub const DEFAULT_PROCESSING_INSTANCE_COUNT: i32 = 1;
 
 /// How long after `DeletePipeline` the clock owes the pipeline's disappearance.
 ///
@@ -487,6 +535,65 @@ impl Endpoint {
         false
     }
 }
+
+/// A processing job created by `CreateProcessingJob`, as `DescribeProcessingJob`
+/// replays it.
+///
+/// `ends_at` is the instant the clock owes the move out of `InProgress`; it is stored,
+/// never slept on, and materialised by whichever reporting call first runs at or after
+/// it (see [`ProcessingJob::settle_status`]).
+#[derive(Debug, Clone)]
+pub struct ProcessingJob {
+    pub name: String,
+    pub arn: String,
+    pub role_arn: String,
+    pub app_specification: AppSpecification,
+    pub processing_inputs: Option<Vec<ProcessingInput>>,
+    pub processing_output_config: Option<ProcessingOutputConfig>,
+    /// The requested resources with the documented defaults applied and, when the
+    /// request named `InstancePreferences`, the instance type the service selected
+    /// from them.
+    pub processing_resources: ProcessingResources,
+    pub stopping_condition: Option<ProcessingStoppingCondition>,
+    pub environment: Option<std::collections::HashMap<String, String>>,
+    pub network_config: Option<NetworkConfig>,
+    pub experiment_config: Option<ExperimentConfig>,
+    pub tags: Vec<Tag>,
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub creation_time: SystemTime,
+    pub last_modified_time: SystemTime,
+    pub processing_end_time: Option<SystemTime>,
+    pub ends_at: SystemTime,
+}
+
+impl ProcessingJob {
+    /// Materialise the move out of `InProgress` the clock already owes.
+    ///
+    /// This is the one write a reporting operation may make: the move was due at
+    /// `ends_at` whether or not anybody described the job, so the observer makes no
+    /// difference to the result. `LastModifiedTime` and `ProcessingEndTime` take the
+    /// instant the move was due, not "now", so both are stable across later reads.
+    ///
+    /// The terminal status is [`PROCESSING_STATUS_FAILED`] with
+    /// [`NO_CONTAINER_RUNTIME_REASON`]: nothing ran the job's container image, so no
+    /// `Completed` status, `ProcessingStartTime` or `ExitMessage` is invented for it.
+    ///
+    /// Answers whether the transition happened on this call, so the caller can record it.
+    pub fn settle_status(&mut self, now: SystemTime) -> bool {
+        if self.status == PROCESSING_STATUS_IN_PROGRESS && now >= self.ends_at {
+            self.status = PROCESSING_STATUS_FAILED.to_string();
+            self.failure_reason = Some(NO_CONTAINER_RUNTIME_REASON.to_string());
+            // The instant the service gave up on the run, which is when the job
+            // ended. No start time is recorded beside it: the container never started.
+            self.processing_end_time = Some(self.ends_at);
+            self.last_modified_time = self.ends_at;
+            return true;
+        }
+        false
+    }
+}
+
 
 /// A pipeline created by `CreatePipeline`, as `DescribePipeline` replays it and
 /// `DeletePipeline` retires it.
@@ -1048,6 +1155,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// two spellings. See [`TrialComponent`], at the end of this module with the rest of
     /// the experiment-tracking slice.
     pub trial_components: BTreeMap<String, TrialComponent>,
+    /// Keyed by `ProcessingJobName`.
+    pub processing_jobs: BTreeMap<String, ProcessingJob>,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -1155,6 +1264,12 @@ impl ComAmazonawsSagemakerSagemakerState {
         self.artifacts
             .values()
             .find(|artifact| artifact.region == region && artifact.name.as_deref() == Some(name))
+    }
+
+    /// Whether another processing job fits, i.e. the store is below
+    /// [`PROCESSING_JOB_QUOTA`].
+    pub fn processing_jobs_below_quota(&self) -> bool {
+        self.processing_jobs.len() < PROCESSING_JOB_QUOTA
     }
 
     /// The model package the call that presented `token` registered under the same
