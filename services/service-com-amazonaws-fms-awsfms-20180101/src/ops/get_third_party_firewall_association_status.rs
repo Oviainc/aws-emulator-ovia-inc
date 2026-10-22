@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetThirdPartyFirewallAssociationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetThirdPartyFirewallAssociationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetThirdPartyFirewallAssociationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the onboarding status of the Firewall Manager administrator with a
+//! third-party firewall vendor's tenant, and the status of the account's
+//! Marketplace subscription to that vendor. A REPORTING operation: the only
+//! write it makes is materialising the transition the CLOCK already made due
+//! (an `ONBOARDING` / `OFFBOARDING` association reaches its terminal status
+//! [`crate::state::ASSOCIATION_SETTLE`] after the call that started it, whether
+//! or not anybody asks).
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: with no Firewall Manager default administrator association in this
+//! account/Region the read is refused by [`crate::state::require_administrator`]
+//! BEFORE the vendor association is looked up, rather than answering a
+//! status-specific `ResourceNotFoundException`.
+//!
+//! With an administrator associated and no association to this vendor, the
+//! administrator does not exist as a tenant administrator and the account holds
+//! no subscription, which the modelled `NOT_EXIST` / `NO_SUBSCRIPTION` statuses
+//! report; neither is an error.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +177,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetThirdPartyFirewallAssociationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetThirdPartyFirewallAssociationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetThirdPartyFirewallAssociationStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetThirdPartyFirewallAssociationStatusErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the Firewall Manager store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The authorization gate, BEFORE the vendor association is looked up.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        let (firewall_status, marketplace_status) = match store
+            .third_party_firewalls
+            .get_mut(&input.third_party_firewall)
+        {
+            Some(record) => {
+                // The clock-due transition, materialised on read because it was
+                // owed at that instant even if nobody had called.
+                record.settle(now);
+                (
+                    record.status.clone(),
+                    record.marketplace_onboarding_status.clone(),
+                )
+            }
+            None => (
+                crate::state::THIRD_PARTY_FIREWALL_NOT_EXIST.to_string(),
+                crate::state::MARKETPLACE_ONBOARDING_NO_SUBSCRIPTION.to_string(),
+            ),
+        };
+        Ok(GetThirdPartyFirewallAssociationStatusOutput {
+            third_party_firewall_status: Some(firewall_status),
+            marketplace_onboarding_status: Some(marketplace_status),
+        })
     }
 }

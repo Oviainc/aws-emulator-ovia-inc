@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourceSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourceSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourceSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates or updates a Firewall Manager resource set, which `GetResourceSet`
+//! reads back. A MUTATING operation: a request that carries no `Id` creates a
+//! resource set and mints its `Id`, `UpdateToken` and ARN; one that carries an
+//! `Id` replaces that resource set's document.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: with no Firewall Manager default administrator association in this
+//! account/Region the call is refused by [`crate::state::require_administrator`]
+//! BEFORE any member of the payload is examined, so a bogus `ResourceTypeList`
+//! entry and a valid one are refused identically and NOTHING is created — a
+//! following `GetResourceSet` / `ListResourceSets` is refused the same way.
+//!
+//! The `ResourceTypeList` entries themselves are stored as sent: which resource
+//! types exist is the CloudFormation type registry's catalog, which this
+//! emulator does not hold, so beyond the modelled length and pattern (enforced
+//! at the boundary) there is nothing here to check them against.
+//!
+//! `UpdateToken` follows the member's own documentation: not allowed on a create,
+//! optional on an update (present makes the change CONDITIONAL on it still
+//! matching, absent makes it unconditional), and rotated by every successful
+//! write so the caller's copy goes stale.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +135,15 @@ impl From<PutResourceSetErrorModeled> for PutResourceSetError {
     }
 }
 
+/// The number of resource sets this service stores before it refuses to create
+/// another. An EMULATOR-CHOSEN bound, not an AWS-documented quota number:
+/// Firewall Manager's published resource-set quota is adjustable, so the exact
+/// value is ours. What is modelled is the BEHAVIOUR — the service bounds how
+/// many objects an account can create and answers `LimitExceededException` once
+/// the bound is reached, the condition that error's own documentation names — so
+/// the store cannot grow without limit.
+const MAX_RESOURCE_SETS: usize = 250;
+
 /// The `PutResourceSet` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,18 +180,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourceSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourceSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourceSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourceSetErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The authorization gate, BEFORE any member of the payload is examined.
+        crate::state::require_administrator(&store, &region)?;
+
+        // The SERVICE-OWNED members are taken out of the stored copy:
+        // `ResourceSetRecord` is the single source of truth for the `Id`, the
+        // `UpdateToken`, the `LastUpdateTime` and the `ResourceSetStatus`, and
+        // `ResourceSetRecord::resource_set()` overlays them for every reader.
+        let mut resource_set = input.resource_set.clone();
+        let requested_id = resource_set.id.take();
+        let requested_token = resource_set.update_token.take();
+        resource_set.last_update_time = None;
+        resource_set.resource_set_status = None;
+
+        let record = match requested_id {
+            // UPDATE: the id names an existing resource set.
+            Some(id) => {
+                let Some(existing) = store.resource_sets.get(&id) else {
+                    return Err(PutResourceSetErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!("no resource set with the id {id}")),
+                        },
+                    )
+                    .into());
+                };
+                // "You can't change the name of a resource set after you create
+                // it" — `ResourceSet$Name`'s own documentation.
+                if resource_set.name != existing.resource_set.name {
+                    return Err(PutResourceSetErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "the name of resource set {id} cannot be changed after it is \
+                                 created"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                // A token that IS sent makes the update conditional on the
+                // resource set not having changed since it was read; the model
+                // documents `InvalidTokenException` for a stale one, which this
+                // operation does not list, so the refusal is the modelled
+                // "the operation wasn't possible".
+                if requested_token
+                    .as_deref()
+                    .is_some_and(|token| token != existing.update_token)
+                {
+                    return Err(PutResourceSetErrorModeled::InvalidOperationException(
+                        InvalidOperationException {
+                            message: Some(
+                                "the UpdateToken in the request does not match the UpdateToken \
+                                 of the current resource set"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::ResourceSetRecord {
+                    id,
+                    arn: existing.arn.clone(),
+                    // A successful write makes the caller's token stale, so the
+                    // next conditional update has to read the current one back.
+                    update_token: crate::state::mint_identifier(),
+                    resource_set,
+                    // An absent optional `TagList` is "unchanged", not "empty".
+                    tags: input
+                        .tag_list
+                        .clone()
+                        .unwrap_or_else(|| existing.tags.clone()),
+                    // The resources associated with the set are its own
+                    // membership, changed by BatchAssociateResource /
+                    // BatchDisassociateResource and not by rewriting the
+                    // document.
+                    resources: existing.resources.clone(),
+                    created_at: existing.created_at,
+                    updated_at: now,
+                }
+            }
+            // CREATE: mint the identifiers and the ARN.
+            None => {
+                // "Update tokens are not allowed when creating a resource set" —
+                // `ResourceSet$UpdateToken`'s own documentation.
+                if requested_token.is_some() {
+                    return Err(PutResourceSetErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                "UpdateToken is not allowed when creating a resource set"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+                if store.resource_sets.len() >= MAX_RESOURCE_SETS {
+                    return Err(PutResourceSetErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "the maximum of {MAX_RESOURCE_SETS} Firewall Manager resource \
+                                 sets has already been created"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                let id = crate::state::mint_base62_id();
+                crate::state::ResourceSetRecord {
+                    arn: crate::state::resource_set_arn(&region, &id),
+                    id,
+                    update_token: crate::state::mint_identifier(),
+                    resource_set,
+                    // A new resource carries only the tags the create sent.
+                    tags: input.tag_list.clone().unwrap_or_default(),
+                    resources: ::std::collections::BTreeSet::new(),
+                    created_at: now,
+                    updated_at: now,
+                }
+            }
+        };
+
+        store
+            .tags_by_arn
+            .insert(record.arn.clone(), record.tags.clone());
+        let output = PutResourceSetOutput {
+            resource_set: record.resource_set(),
+            resource_set_arn: record.arn.clone(),
+        };
+        store.resource_sets.insert(record.id.clone(), record);
+        Ok(output)
     }
 }

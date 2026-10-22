@@ -34,12 +34,19 @@ pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 /// A fresh emulator: one shared engine, this service mounted on a router.
 ///
 /// `pub(crate)` so a sibling suite in this test target drives the service through
-/// the same wire harness rather than building a second copy of it.
+/// the same wire harness rather than building a second copy of it. A suite that
+/// also needs to reach the store uses [`emulator_with_engine`].
 pub(crate) fn emulator() -> MultiServiceRouter {
+    emulator_with_engine().0
+}
+
+/// [`emulator`], with the shared engine handed back too, for a suite that seeds
+/// the store the way a handler reaches it (`state::service_state`).
+pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// A SigV4 credential scope naming this service and Region — the signal the

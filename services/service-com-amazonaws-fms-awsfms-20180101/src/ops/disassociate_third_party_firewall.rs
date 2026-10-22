@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateThirdPartyFirewall
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateThirdPartyFirewall`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateThirdPartyFirewall::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the Firewall Manager administrator from a third-party firewall
+//! vendor's tenant. A MUTATING operation: it starts the teardown, so the
+//! association's status becomes `OFFBOARDING` and the CLOCK makes
+//! `OFFBOARD_COMPLETE` due
+//! [`crate::state::ASSOCIATION_SETTLE`] later — a caller that reads the status
+//! immediately still sees `OFFBOARDING`.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: a caller that is not the Firewall Manager default administrator of
+//! this account/Region is refused by [`crate::state::require_administrator`]
+//! BEFORE the vendor association is looked up — per the recorded behaviour the
+//! refusal is the generic authorization error, not the
+//! `InvalidOperationException` the model documents.
+//!
+//! With an administrator associated and no association to this vendor, there is
+//! nothing to tear down, which the modelled `NOT_EXIST` status reports; it is
+//! not an error. Calling it twice is idempotent: the second call does not push
+//! the due instant back.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +163,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateThirdPartyFirewall` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateThirdPartyFirewallErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateThirdPartyFirewall"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateThirdPartyFirewallErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the Firewall Manager store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The authorization gate, BEFORE the vendor association is looked up.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        let Some(record) = store
+            .third_party_firewalls
+            .get_mut(&input.third_party_firewall)
+        else {
+            // No association to this vendor: nothing to tear down, which
+            // `NOT_EXIST` reports.
+            return Ok(DisassociateThirdPartyFirewallOutput {
+                third_party_firewall_status: Some(
+                    crate::state::THIRD_PARTY_FIREWALL_NOT_EXIST.to_string(),
+                ),
+            });
+        };
+        // Materialise whatever the clock already made due, then start the
+        // teardown from the status that is actually current.
+        record.settle(now);
+        record.start_offboarding(now);
+        Ok(DisassociateThirdPartyFirewallOutput {
+            third_party_firewall_status: Some(record.status.clone()),
+        })
     }
 }

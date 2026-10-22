@@ -10,9 +10,11 @@
 //! pagination token codec), kept in one place so two handlers cannot disagree.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{Policy, PolicySummary, Tag};
+use crate::ops::types::{
+    AppsListData, DiscoveredResource, Policy, PolicySummary, ProtocolsListData, ResourceSet, Tag,
+};
 
 /// The Region an emulated service reports when the request carries no SigV4
 /// credential scope to read one from (an unsigned request).
@@ -53,6 +55,41 @@ pub const SCOPE_ID_TYPE_ACCOUNT: &str = "ACCOUNT";
 /// administrator can manage and delete it. One of
 /// [`crate::ops::types::CUSTOMER_POLICY_STATUS_VALUES`].
 pub const POLICY_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The default `ResourceSetStatus` of a resource set an administrator created:
+/// it is in the administrator's Region scope, so the administrator can manage
+/// and delete it. One of [`crate::ops::types::RESOURCE_SET_STATUS_VALUES`].
+pub const RESOURCE_SET_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `ThirdPartyFirewallAssociationStatus` of a third-party firewall that was
+/// never associated with this organisation. One of
+/// [`crate::ops::types::THIRD_PARTY_FIREWALL_ASSOCIATION_STATUS_VALUES`].
+pub const THIRD_PARTY_FIREWALL_NOT_EXIST: &str = "NOT_EXIST";
+
+/// `ThirdPartyFirewallAssociationStatus` of an association that is being torn
+/// down: the transient status a `DisassociateThirdPartyFirewall` starts.
+pub const THIRD_PARTY_FIREWALL_OFFBOARDING: &str = "OFFBOARDING";
+
+/// `ThirdPartyFirewallAssociationStatus` of a torn-down association: the
+/// terminal status the clock makes due after [`ASSOCIATION_SETTLE`].
+pub const THIRD_PARTY_FIREWALL_OFFBOARD_COMPLETE: &str = "OFFBOARD_COMPLETE";
+
+/// `MarketplaceSubscriptionOnboardingStatus` of an account with no Marketplace
+/// subscription to a third-party firewall. One of
+/// [`crate::ops::types::MARKETPLACE_SUBSCRIPTION_ONBOARDING_STATUS_VALUES`].
+pub const MARKETPLACE_ONBOARDING_NO_SUBSCRIPTION: &str = "NO_SUBSCRIPTION";
+
+/// How long a third-party firewall association stays in a transient status
+/// (`ONBOARDING` / `OFFBOARDING`) before the clock makes the terminal one due.
+///
+/// An EMULATOR-CHOSEN span, not an AWS-documented duration: Firewall Manager
+/// publishes no settling time for an association. It is deliberately NON-ZERO
+/// and inside the emulator's 250-750 ms band, so a caller that reads the status
+/// straight after the call still observes the transient status, and
+/// deliberately short so a test can wait it out. The due instant is STORED on
+/// the record (see [`ThirdPartyFirewallRecord::settles_at`]); nothing sleeps
+/// for it.
+pub const ASSOCIATION_SETTLE: Duration = Duration::from_millis(400);
 
 /// One stored Firewall Manager policy: the modelled `Policy` exactly as the
 /// caller sent it (plus the identifiers the service minted), its ARN, the
@@ -101,6 +138,169 @@ impl PolicyRecord {
     }
 }
 
+/// The Firewall Manager SNS notification channel: the topic Firewall Manager
+/// records its activity to, and the role that lets it publish there. ONE per
+/// account/Region, which is why it is an `Option` rather than a map.
+#[derive(Debug, Clone)]
+pub struct NotificationChannelRecord {
+    pub sns_topic_arn: String,
+    pub sns_role_name: String,
+    /// When `PutNotificationChannel` last wrote the channel. Recorded because
+    /// the channel is a configuration with a history, though no modelled member
+    /// of `GetNotificationChannelResponse` reports it.
+    pub configured_at: SystemTime,
+}
+
+/// One stored Firewall Manager resource set: the modelled `ResourceSet` exactly
+/// as the caller sent it (plus the identifiers the service minted), its ARN, the
+/// current update token, its tags, and the resource URIs associated with it.
+///
+/// `resources` is a `BTreeSet`: associating a URI twice is the same association
+/// (the set is the membership, not a log of calls), and the total order makes a
+/// later page of `ListResourceSetResources` resumable from a key.
+#[derive(Debug, Clone)]
+pub struct ResourceSetRecord {
+    pub id: String,
+    pub arn: String,
+    pub update_token: String,
+    pub resource_set: ResourceSet,
+    pub tags: Vec<Tag>,
+    pub resources: BTreeSet<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl ResourceSetRecord {
+    /// The stored resource set as `PutResourceSet` / `GetResourceSet` report it:
+    /// the caller's own members, with the service-owned `Id`, `UpdateToken`,
+    /// `LastUpdateTime` and `ResourceSetStatus` filled in from the record, so a
+    /// read never reports a stale token or a status the caller invented.
+    pub fn resource_set(&self) -> ResourceSet {
+        let mut resource_set = self.resource_set.clone();
+        resource_set.id = Some(self.id.clone());
+        resource_set.update_token = Some(self.update_token.clone());
+        resource_set.last_update_time = Some(::aws_smithy_types::DateTime::from(self.updated_at));
+        resource_set.resource_set_status = Some(RESOURCE_SET_STATUS_ACTIVE.to_string());
+        resource_set
+    }
+}
+
+/// One stored Firewall Manager applications list, keyed in
+/// [`ComAmazonawsFmsAwsfms20180101State::apps_lists`] by the `ListId` the
+/// service minted.
+///
+/// `default_list` distinguishes a Firewall Manager MANAGED list from one a
+/// customer created: `GetAppsList`'s `DefaultList` member selects between the
+/// two namespaces, so a customer list is not reported as a managed one. The
+/// emulator seeds no managed lists.
+#[derive(Debug, Clone)]
+pub struct AppsListRecord {
+    pub list_id: String,
+    pub list_arn: String,
+    pub update_token: String,
+    pub default_list: bool,
+    pub list: AppsListData,
+    pub tags: Vec<Tag>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl AppsListRecord {
+    /// The stored list as a reader reports it: the caller's own members with the
+    /// service-owned `ListId`, `ListUpdateToken` and timestamps overlaid from
+    /// the record.
+    pub fn list(&self) -> AppsListData {
+        let mut list = self.list.clone();
+        list.list_id = Some(self.list_id.clone());
+        list.list_update_token = Some(self.update_token.clone());
+        list.create_time = Some(::aws_smithy_types::DateTime::from(self.created_at));
+        list.last_update_time = Some(::aws_smithy_types::DateTime::from(self.updated_at));
+        list
+    }
+}
+
+/// One stored Firewall Manager protocols list. The protocols-list twin of
+/// [`AppsListRecord`], with the same `default_list` split between managed and
+/// customer lists.
+#[derive(Debug, Clone)]
+pub struct ProtocolsListRecord {
+    pub list_id: String,
+    pub list_arn: String,
+    pub update_token: String,
+    pub default_list: bool,
+    pub list: ProtocolsListData,
+    pub tags: Vec<Tag>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl ProtocolsListRecord {
+    /// The stored list as `GetProtocolsList` reports it: the caller's own
+    /// members with the service-owned `ListId`, `ListUpdateToken` and timestamps
+    /// overlaid from the record.
+    pub fn list(&self) -> ProtocolsListData {
+        let mut list = self.list.clone();
+        list.list_id = Some(self.list_id.clone());
+        list.list_update_token = Some(self.update_token.clone());
+        list.create_time = Some(::aws_smithy_types::DateTime::from(self.created_at));
+        list.last_update_time = Some(::aws_smithy_types::DateTime::from(self.updated_at));
+        list
+    }
+}
+
+/// The association between this organisation and ONE third-party firewall
+/// vendor, keyed in
+/// [`ComAmazonawsFmsAwsfms20180101State::third_party_firewalls`] by the
+/// `ThirdPartyFirewall` enum value.
+///
+/// `settles_at` / `settles_to` carry the transition the CLOCK owes: an
+/// association that is onboarding or offboarding reaches its terminal status
+/// [`ASSOCIATION_SETTLE`] after the call that started it, whether or not anybody
+/// asks. Readers materialise it with [`Self::settle`]; nothing sleeps.
+#[derive(Debug, Clone)]
+pub struct ThirdPartyFirewallRecord {
+    pub status: String,
+    pub settles_to: Option<String>,
+    pub settles_at: Option<SystemTime>,
+    pub marketplace_onboarding_status: String,
+}
+
+impl ThirdPartyFirewallRecord {
+    /// Apply the clock-due transition: once `settles_at` has passed, the status
+    /// IS the terminal one, because the transition was owed at that instant even
+    /// if nobody had called. Materialising it is the ONLY write a reporting
+    /// operation makes.
+    pub fn settle(&mut self, now: SystemTime) {
+        let due = self
+            .settles_at
+            .is_some_and(|at| now >= at)
+            .then(|| self.settles_to.clone())
+            .flatten();
+        if let Some(status) = due {
+            self.status = status;
+            self.settles_to = None;
+            self.settles_at = None;
+        }
+    }
+
+    /// Start tearing the association down: the status becomes `OFFBOARDING` now
+    /// and the clock owes `OFFBOARD_COMPLETE` [`ASSOCIATION_SETTLE`] later.
+    ///
+    /// Idempotent: an association that is already offboarding or offboarded has
+    /// nothing left to start, so its due instant is not pushed back by a second
+    /// call.
+    pub fn start_offboarding(&mut self, now: SystemTime) {
+        if self.status == THIRD_PARTY_FIREWALL_OFFBOARDING
+            || self.status == THIRD_PARTY_FIREWALL_OFFBOARD_COMPLETE
+        {
+            return;
+        }
+        self.status = THIRD_PARTY_FIREWALL_OFFBOARDING.to_string();
+        self.settles_to = Some(THIRD_PARTY_FIREWALL_OFFBOARD_COMPLETE.to_string());
+        self.settles_at = Some(now + ASSOCIATION_SETTLE);
+    }
+}
+
 /// Per-service state for com-amazonaws-fms-awsfms-20180101. A handler reaches it through [`service_state`].
 ///
 /// `policies` is a `BTreeMap` so a page boundary is a key in a total order:
@@ -126,8 +326,33 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     /// and this map dropped, once a Firewall Manager resource other than a policy
     /// is stored here too.
     pub tags_by_arn: HashMap<String, Vec<Tag>>,
+    /// Stored resource sets, keyed by the `Base62Id` this service minted. A
+    /// `BTreeMap` for the same reason as `policies`: a page boundary is a key in
+    /// a total order.
+    pub resource_sets: BTreeMap<String, ResourceSetRecord>,
+    /// Stored applications lists, keyed by `ListId`.
+    pub apps_lists: BTreeMap<String, AppsListRecord>,
+    /// Stored protocols lists, keyed by `ListId`.
+    pub protocols_lists: BTreeMap<String, ProtocolsListRecord>,
+    /// The single SNS notification channel, if one was configured.
+    pub notification_channel: Option<NotificationChannelRecord>,
+    /// The third-party firewall associations, keyed by the `ThirdPartyFirewall`
+    /// enum value. An absent entry is `NOT_EXIST`, not an error.
+    pub third_party_firewalls: BTreeMap<String, ThirdPartyFirewallRecord>,
+    /// The organisation's resources that are available to be associated with a
+    /// resource set, keyed by the resource URI (its ARN) so the total order
+    /// makes a `ListDiscoveredResources` page resumable from a key.
+    ///
+    /// This is an INVENTORY, not a cache: Firewall Manager discovers it from the
+    /// member accounts of the organisation, and the emulator has no member
+    /// accounts to discover from, so it is empty unless something put a resource
+    /// in it. `ListDiscoveredResources` reports what is here, filtered by the
+    /// request's member accounts and resource type — never a resource it made up.
+    pub discovered_resources: BTreeMap<String, DiscoveredResource>,
 }
 
+/// The administrator gate every organisation-scoped Firewall Manager operation
+/// runs FIRST lives beside the state it reads: see [`require_administrator`].
 impl ComAmazonawsFmsAwsfms20180101State {
     /// The `PolicyId` of the stored policy whose ARN is `arn`, or `None` when no
     /// stored Firewall Manager resource carries that ARN.
@@ -290,6 +515,12 @@ pub fn is_account_id(value: &str) -> bool {
 ///
 /// Generic over the operation's modeled error enum, so every administrator-gated
 /// handler shares this one gate.
+///
+/// Called BEFORE any identifier is looked up and before any payload is validated,
+/// so a nonexistent id, a malformed ARN and a well-formed request all get the SAME
+/// refusal: an authorization decision that leaked whether the resource exists would
+/// tell an unauthorized caller what the organization holds. A refused call therefore
+/// also writes nothing.
 pub fn require_administrator<'store, E>(
     store: &'store ComAmazonawsFmsAwsfms20180101State,
     region: &str,
@@ -328,6 +559,74 @@ pub fn policy_arn(region: &str, policy_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("policy/{policy_id}"))
 }
 
+/// The ARN of a Firewall Manager resource set:
+/// `arn:aws:fms:<region>:<account>:resource-set/<Id>`.
+pub fn resource_set_arn(region: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("resource-set/{id}"))
+}
+
+/// The ARN of a Firewall Manager applications list:
+/// `arn:aws:fms:<region>:<account>:applications-list/<ListId>`.
+pub fn apps_list_arn(region: &str, list_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("applications-list/{list_id}"),
+    )
+}
+
+/// The ARN of a Firewall Manager protocols list:
+/// `arn:aws:fms:<region>:<account>:protocols-list/<ListId>`.
+pub fn protocols_list_arn(region: &str, list_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("protocols-list/{list_id}"))
+}
+
+/// The fields of an AWS ARN, `arn:<partition>:<service>:<region>:<account>:<resource>`,
+/// as borrowed slices of the value that was parsed.
+///
+/// The resource field is everything after the fifth colon, so a resource id that
+/// contains colons (`loadbalancer/app/x:1`) stays whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedArn<'a> {
+    pub partition: &'a str,
+    pub service: &'a str,
+    pub region: &'a str,
+    pub account: &'a str,
+    pub resource: &'a str,
+}
+
+/// Parse an ARN, or `None` when `value` is not one at all: six colon-separated
+/// fields, the first literally `arn`, and a non-empty partition, service and
+/// resource. The region and account fields MAY be empty — a global service's ARN
+/// leaves them so.
+pub fn parse_arn(value: &str) -> Option<ParsedArn<'_>> {
+    let mut fields = value.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let parsed = ParsedArn {
+        partition: fields.next()?,
+        service: fields.next()?,
+        region: fields.next()?,
+        account: fields.next()?,
+        resource: fields.next()?,
+    };
+    let complete = !parsed.partition.is_empty()
+        && !parsed.service.is_empty()
+        && !parsed.resource.is_empty();
+    complete.then_some(parsed)
+}
+
+/// The ARN partition this emulator's own resources live in, read off an ARN
+/// built by [`engine::emulator_arn`] rather than written here as a literal, so
+/// the partition has one source of truth.
+pub fn emulator_partition() -> String {
+    let minted = ::engine::emulator_arn(ARN_NAMESPACE, DEFAULT_REGION, "probe");
+    parse_arn(&minted)
+        .map(|arn| arn.partition.to_string())
+        .unwrap_or_default()
+}
+
 /// Encode a page boundary (the key the next page starts at — a `PolicyId` for
 /// `ListPolicies`, an account id for `ListMemberAccounts` and
 /// `ListAdminsManagingAccount`) as an opaque
@@ -337,7 +636,27 @@ pub fn policy_arn(region: &str, policy_id: &str) -> String {
 /// (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`) and its 1..4096 length, and makes it
 /// opaque to a caller: nothing in it is meaningful without decoding.
 pub fn encode_page_token(policy_id: &str) -> String {
-    ::hex::encode(policy_id)
+    encode_key_token(policy_id)
+}
+
+/// Encode an arbitrary page boundary (the store key the next page starts at) as
+/// an opaque `PaginationToken`, for the paginated operations whose key is not a
+/// `PolicyId`.
+///
+/// Hex for the same reasons as [`encode_page_token`]: it keeps the token inside
+/// the modelled `PaginationToken` pattern and length whatever the key contains,
+/// and nothing in it is meaningful to a caller without decoding.
+pub fn encode_key_token(key: &str) -> String {
+    ::hex::encode(key)
+}
+
+/// Decode a `PaginationToken` produced by [`encode_key_token`]. `None` when the
+/// token was not produced by this service: a value that is not hex, not UTF-8,
+/// empty, or carries a control character is no store key of ours.
+pub fn decode_key_token(token: &str) -> Option<String> {
+    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let is_key = !decoded.is_empty() && !decoded.chars().any(char::is_control);
+    is_key.then_some(decoded)
 }
 
 /// Decode a `PaginationToken` produced by [`encode_page_token`]. `None` when the
@@ -348,7 +667,7 @@ pub fn encode_page_token(policy_id: &str) -> String {
 /// so a foreign token that happens to be valid hex is refused rather than
 /// resumed from as an arbitrary key.
 pub fn decode_page_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
+    let decoded = decode_key_token(token)?;
     let is_policy_id = decoded.len() == 36
         && decoded
             .chars()
@@ -381,6 +700,22 @@ pub fn decode_account_page_token(token: &str) -> Option<String> {
 /// hex-encoding are the `sha2` and `hex` crates' work, not hand-written here,
 /// and nothing from the request goes into it.
 pub fn mint_identifier() -> String {
+    mint_hex(36)
+}
+
+/// Mint a fresh service-owned `Base62Id`: 22 characters matching the model's
+/// `com.amazonaws.fms#Base62Id` (`^[a-z0-9A-Z]{22}$`, length 22), which is what
+/// a resource set's `Id` is.
+///
+/// The same mint as [`mint_identifier`], cut to 22 characters: hex digits are a
+/// subset of base62, so a hex string satisfies the base62 pattern.
+pub fn mint_base62_id() -> String {
+    mint_hex(22)
+}
+
+/// The mint behind [`mint_identifier`] and [`mint_base62_id`]: `len` lowercase
+/// hex characters of the SHA-256 of a process-wide counter and the clock.
+fn mint_hex(len: usize) -> String {
     use ::sha2::Digest;
 
     /// Distinguishes mints within one process; `Relaxed` is enough because only
@@ -395,7 +730,8 @@ pub fn mint_identifier() -> String {
     hasher.update(counter.to_be_bytes());
     hasher.update(nanos.to_be_bytes());
     let mut id = ::hex::encode(hasher.finalize());
-    // SHA-256 renders as 64 hex characters, so the modelled 36 are always there.
-    id.truncate(36);
+    // SHA-256 renders as 64 hex characters, so every modelled length asked for
+    // here is always there.
+    id.truncate(len);
     id
 }
