@@ -86,6 +86,21 @@
 //!   action to occur.
 //! * `ResourceNotFoundException` (HTTP 400) — A resource such as a private CA, S3 bucket,
 //!   certificate, audit report, or policy cannot be found.
+//!
+//! ## What this handler does
+//!
+//! A delete marks the CA deleted and starts its restoration period; nothing is dropped
+//! from state until that period runs out:
+//!
+//! * a CA in one of the deletable statuses (`crate::state::DELETABLE_STATUSES`) becomes
+//!   `DELETED`, remembering the status it held so a restore can put it back;
+//! * the restoration period is the `PermanentDeletionTimeInDays` the request named, else
+//!   the documented default of 30 days — except for a CA deleted in `CREATING` or
+//!   `FAILED`, which is assigned none and so cannot be restored;
+//! * any other status (`ACTIVE`, which must be disabled first, and a CA that is already
+//!   `DELETED`) is refused with the modelled `InvalidStateException`;
+//! * the record itself is dropped only once the restoration period has passed, which is a
+//!   change the clock owes (see `crate::state::CertificateAuthorityRecord::is_permanently_deleted`).
 
 #[allow(unused_imports)]
 use super::types::*;

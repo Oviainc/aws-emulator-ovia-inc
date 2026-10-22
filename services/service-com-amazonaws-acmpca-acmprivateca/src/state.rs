@@ -145,6 +145,14 @@ pub const ISSUANCE_INVALID_STATE_MESSAGE: &str =
 /// the CA matches: one sentence about the certificate, naming no ARN of its own.
 pub const CERTIFICATE_NOT_FOUND_MESSAGE: &str = "Could not find specified certificate.";
 
+/// What Amazon Web Services Private CA answers when a deleted CA has no restoration
+/// period to be restored inside: "A private CA deleted in the CREATING or FAILED state
+/// has no assigned restoration period and cannot be restored."
+/// (`DeleteCertificateAuthority` docs).
+pub const RESTORE_WITHOUT_RESTORATION_PERIOD_MESSAGE: &str =
+    "The certificate authority is not in a valid state for restoration; it was deleted \
+     with no assigned restoration period.";
+
 /// The sentence this service answers a permission-not-found refusal with: one sentence
 /// about the permission, in the form the service's other not-found refusals take
 /// ([`CERTIFICATE_NOT_FOUND_MESSAGE`]) and naming no principal of its own.
