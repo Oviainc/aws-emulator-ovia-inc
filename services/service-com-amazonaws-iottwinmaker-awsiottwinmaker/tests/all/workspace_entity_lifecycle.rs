@@ -11,172 +11,13 @@
 //! derived from the stored tree, a page sequence partitions the listing, and a
 //! delete is observable to the next caller.
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use service_com_amazonaws_iottwinmaker_awsiottwinmaker::state::{
     DEFAULT_PAGE_SIZE, MAX_COMPONENTS_RETURNED, MAX_ENTITIES_PER_WORKSPACE, MAX_PAGE_SIZE,
     MAX_WORKSPACES,
 };
-use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request here signs for; it must show up in every minted ARN.
-const REGION: &str = "us-west-2";
-/// The account segment `engine::emulator_arn` stamps into every ARN.
-const ACCOUNT: &str = "000000000000";
-
-/// How long after `CreateEntity` the entity's `CREATING` -> `ACTIVE` transition
-/// falls due, plus a margin for a loaded test host.
-const ACTIVATION_WAIT: Duration = Duration::from_millis(900);
-
-/// One dispatched response: status, the restJson1 error code (which this
-/// protocol carries in `x-amzn-errortype`), and the parsed JSON body.
-#[derive(Debug)]
-struct Resp {
-    status: u16,
-    error_type: Option<String>,
-    body: Value,
-}
-
-impl Resp {
-    fn member(&self, name: &str) -> &Value {
-        &self.body[name]
-    }
-}
-
-/// One emulator: a shared engine with only this service mounted on it.
-struct Emulator {
-    router: MultiServiceRouter,
-}
-
-impl Emulator {
-    fn new() -> Self {
-        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-        let mut router = MultiServiceRouter::new();
-        // These tests send unsigned-but-scoped requests: the `Authorization`
-        // header is what routes them and names the region, not what authorises
-        // them.
-        router.set_request_authentication(false);
-        router.register_service(
-            service_com_amazonaws_iottwinmaker_awsiottwinmaker::EmulatedService::new(engine),
-        );
-        Self { router }
-    }
-
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Resp {
-        let payload = match &body {
-            Some(value) => {
-                bytes::Bytes::from(serde_json::to_vec(value).expect("serialize the request body"))
-            }
-            None => bytes::Bytes::new(),
-        };
-        let host = format!("api.iottwinmaker.{REGION}.amazonaws.com");
-        let request = http::Request::builder()
-            .method(method)
-            .uri(format!("https://{host}{path}"))
-            .header("host", host)
-            .header("content-type", "application/json")
-            .header(
-                "authorization",
-                format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/iottwinmaker/\
-                     aws4_request, SignedHeaders=host, Signature=0"
-                ),
-            )
-            .body(payload)
-            .expect("build the request");
-
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let error_type = response
-            .headers()
-            .get("x-amzn-errortype")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let raw = response.into_body();
-        let body = if raw.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&raw).unwrap_or(Value::Null)
-        };
-        Resp {
-            status,
-            error_type,
-            body,
-        }
-    }
-
-    async fn create_workspace(&self, workspace_id: &str) -> Resp {
-        self.call(
-            "POST",
-            &format!("/workspaces/{workspace_id}"),
-            Some(json!({})),
-        )
-        .await
-    }
-
-    async fn get_workspace(&self, id_or_arn: &str) -> Resp {
-        self.call("GET", &format!("/workspaces/{id_or_arn}"), None).await
-    }
-
-    async fn create_entity(&self, workspace_id: &str, body: Value) -> Resp {
-        self.call(
-            "POST",
-            &format!("/workspaces/{workspace_id}/entities"),
-            Some(body),
-        )
-        .await
-    }
-
-    async fn get_entity(&self, workspace_id: &str, entity_id: &str) -> Resp {
-        self.call(
-            "GET",
-            &format!("/workspaces/{workspace_id}/entities/{entity_id}"),
-            None,
-        )
-        .await
-    }
-
-    async fn list_entities(&self, workspace_id: &str, body: Value) -> Resp {
-        self.call(
-            "POST",
-            &format!("/workspaces/{workspace_id}/entities-list"),
-            Some(body),
-        )
-        .await
-    }
-
-    async fn delete_entity(&self, workspace_id: &str, entity_id: &str, recursive: bool) -> Resp {
-        let query = if recursive { "?isRecursive=true" } else { "" };
-        self.call(
-            "DELETE",
-            &format!("/workspaces/{workspace_id}/entities/{entity_id}{query}"),
-            None,
-        )
-        .await
-    }
-
-    async fn delete_workspace(&self, workspace_id: &str) -> Resp {
-        self.call("DELETE", &format!("/workspaces/{workspace_id}"), None)
-            .await
-    }
-}
-
-fn workspace_arn(workspace_id: &str) -> String {
-    format!("arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}")
-}
-
-fn entity_arn(workspace_id: &str, entity_id: &str) -> String {
-    format!("arn:aws:iottwinmaker:{REGION}:{ACCOUNT}:workspace/{workspace_id}/entity/{entity_id}")
-}
-
-/// Percent-encode a value for use as a non-greedy `@httpLabel`, the way an SDK
-/// does: `:` and `/` are reserved in a path segment, so an ARN passed as the
-/// `IdOrArn` label arrives encoded.
-fn encode_label(value: &str) -> String {
-    value.replace('%', "%25").replace(':', "%3A").replace('/', "%2F")
-}
+use crate::harness::{encode_label, entity_arn, workspace_arn, Emulator, Resp};
 
 /// The ids reported by one `ListEntities` page, in the order the page gave them.
 fn page_ids(resp: &Resp) -> Vec<String> {
@@ -334,7 +175,22 @@ async fn a_workspace_reads_back_exactly_what_was_created() {
                 "case {workspace_id:?} read by {lookup:?}: expected an updateDateTime, got {:?}",
                 read.member("updateDateTime")
             );
-            for member in ["description", "s3Location", "role"] {
+            // `description` is a member every workspace CARRIES — the empty
+            // string when the create named none — so a read reports it either
+            // way; `s3Location` and `role` are absent until a create names
+            // them.
+            let described = read.body.get("description").cloned();
+            assert_eq!(
+                described,
+                Some(
+                    request
+                        .get("description")
+                        .cloned()
+                        .unwrap_or_else(|| json!(""))
+                ),
+                "case {workspace_id:?} read by {lookup:?}: description did not round-trip, got {described:?}"
+            );
+            for member in ["s3Location", "role"] {
                 let expected = request.get(member).cloned();
                 let actual = read.body.get(member).cloned();
                 assert_eq!(
@@ -461,8 +317,8 @@ async fn an_entity_reads_back_exactly_what_was_created() {
         );
         assert_eq!(
             created.member("state").as_str(),
-            Some("CREATING"),
-            "case {case:?}: a fresh entity is returned CREATING, got {:?}",
+            Some("ACTIVE"),
+            "case {case:?}: a created entity is reported in the terminal ACTIVE state, got {:?}",
             created.member("state")
         );
 
@@ -483,9 +339,16 @@ async fn an_entity_reads_back_exactly_what_was_created() {
             "case {case:?}: entityName did not round-trip, got {:?}",
             read.member("entityName")
         );
+        // The entity carries a description either way: the one the create
+        // named, or the empty string when it named none.
         assert_eq!(
             read.body.get("description").cloned(),
-            request.get("description").cloned(),
+            Some(
+                request
+                    .get("description")
+                    .cloned()
+                    .unwrap_or_else(|| json!(""))
+            ),
             "case {case:?}: description did not round-trip, got {:?}",
             read.body.get("description")
         );
@@ -583,17 +446,16 @@ async fn an_entity_reads_back_exactly_what_was_created() {
     }
 }
 
-/// RULE: a resource the service returns in a non-terminal state owes the clock
-/// its transition — a fresh entity is `CREATING` when read straight back and
-/// `ACTIVE` once its activation has fallen due — and every read reports the same
-/// state for the same entity.
+/// RULE: a create COMPLETES within the call that asked for it — `CreateEntity`
+/// reports the terminal `ACTIVE` state, every later read of that entity reports
+/// the same state, and reading it does not change it for the next caller.
+///
+/// The rows differ in how many entities are created before anything is read,
+/// because the state belongs to each entity rather than to the workspace.
 #[tokio::test]
-async fn a_fresh_entity_moves_from_creating_to_active_on_the_clock() {
+async fn a_created_entity_is_active_and_stays_active_across_reads() {
     let emulator = Emulator::new();
-    assert_eq!(emulator.create_workspace("ws").await.status, 200);
 
-    // The rows differ in how many entities are in flight at once: the state is
-    // per entity, so each must transition on its own due instant.
     for count in [1usize, 3] {
         let workspace = format!("ws{count}");
         assert_eq!(emulator.create_workspace(&workspace).await.status, 200);
@@ -607,47 +469,34 @@ async fn a_fresh_entity_moves_from_creating_to_active_on_the_clock() {
                 .await;
             assert_eq!(
                 created.member("state").as_str(),
-                Some("CREATING"),
-                "case {count} entity {entity_id:?}: CreateEntity must report CREATING, got {created:?}"
-            );
-        }
-
-        for entity_id in &ids {
-            let read = emulator.get_entity(&workspace, entity_id).await;
-            assert_eq!(
-                read.member("status")["state"].as_str(),
-                Some("CREATING"),
-                "case {count} entity {entity_id:?}: a read straight after the create must still \
-                 see CREATING, got {read:?}"
-            );
-        }
-        let listed = emulator.list_entities(&workspace, json!({})).await;
-        for summary in listed.member("entitySummaries").as_array().expect("summaries") {
-            assert_eq!(
-                summary["status"]["state"].as_str(),
-                Some("CREATING"),
-                "case {count}: ListEntities must agree with GetEntity, got {summary:?}"
-            );
-        }
-
-        tokio::time::sleep(ACTIVATION_WAIT).await;
-
-        for entity_id in &ids {
-            let read = emulator.get_entity(&workspace, entity_id).await;
-            assert_eq!(
-                read.member("status")["state"].as_str(),
                 Some("ACTIVE"),
-                "case {count} entity {entity_id:?}: the entity must be ACTIVE once its \
-                 activation fell due, got {read:?}"
+                "case {count} entity {entity_id:?}: CreateEntity must report the state it stored, \
+                 got {created:?}"
             );
         }
-        let listed = emulator.list_entities(&workspace, json!({})).await;
-        for summary in listed.member("entitySummaries").as_array().expect("summaries") {
-            assert_eq!(
-                summary["status"]["state"].as_str(),
-                Some("ACTIVE"),
-                "case {count}: ListEntities must agree with GetEntity, got {summary:?}"
-            );
+
+        // Read each entity TWICE: a read reports the stored state and leaves it
+        // alone, so the second read of an entity — and of its neighbours — sees
+        // exactly what the first did.
+        for round in 0..2 {
+            for entity_id in &ids {
+                let read = emulator.get_entity(&workspace, entity_id).await;
+                assert_eq!(
+                    read.member("status")["state"].as_str(),
+                    Some("ACTIVE"),
+                    "case {count} entity {entity_id:?} round {round}: GetEntity must report \
+                     ACTIVE, got {read:?}"
+                );
+            }
+            let listed = emulator.list_entities(&workspace, json!({})).await;
+            for summary in listed.member("entitySummaries").as_array().expect("summaries") {
+                assert_eq!(
+                    summary["status"]["state"].as_str(),
+                    Some("ACTIVE"),
+                    "case {count} round {round}: ListEntities must agree with GetEntity, got \
+                     {summary:?}"
+                );
+            }
         }
     }
 }

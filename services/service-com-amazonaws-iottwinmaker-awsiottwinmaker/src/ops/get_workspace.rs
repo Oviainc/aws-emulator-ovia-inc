@@ -171,7 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let not_found = || {
             GetWorkspaceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(format!("workspace {} not found", input.workspace_id)),
+                message: Some(crate::state::workspace_not_found_message(
+                    &input.workspace_id,
+                )),
             })
         };
         let workspace_id = state
@@ -182,7 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetWorkspaceOutput {
             workspace_id: workspace.workspace_id.clone(),
             arn: workspace.arn.clone(),
-            description: workspace.description.clone(),
+            // Present, not omitted: a workspace carries a description (the
+            // empty string when its create named none), as an entity's does.
+            description: Some(workspace.description.clone()),
             // Omitted rather than reported as an empty list while nothing has
             // linked a service into the workspace: the member is optional and
             // the sync-job slice is what populates it.

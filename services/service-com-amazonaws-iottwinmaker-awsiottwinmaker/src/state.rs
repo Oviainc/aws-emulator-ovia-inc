@@ -9,11 +9,13 @@
 //! copies of one entity.
 //!
 //! Nothing derivable is stored: `hasChildEntities` is computed by scanning the
-//! workspace's entities for the id as a parent, and an entity's `state` is
-//! computed from the instant its `CREATING` -> `ACTIVE` transition falls due.
+//! workspace's entities for the id as a parent. An entity's `state`, by
+//! contrast, IS stored — a create settles it in `ACTIVE` within the call that
+//! asked for it, so there is no provisioning instant for a read to compute a
+//! transient state from.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 /// The `ParentEntityId` sentinel the service uses for an entity with no parent.
 /// Taken from the `ParentEntityId` pattern, which admits the literal `$ROOT`
@@ -23,21 +25,17 @@ pub const ROOT_PARENT_ENTITY_ID: &str = "$ROOT";
 /// The `State` enum values this slice produces. The full value list is
 /// `STATE_VALUES` in `ops::types` (`CREATING`, `UPDATING`, `DELETING`, `ACTIVE`,
 /// `ERROR`).
-pub const STATE_CREATING: &str = "CREATING";
-/// See [`STATE_CREATING`].
-pub const STATE_ACTIVE: &str = "ACTIVE";
-/// See [`STATE_CREATING`].
-pub const STATE_DELETING: &str = "DELETING";
-
-/// How long after `CreateEntity` the `CREATING` -> `ACTIVE` transition the clock
-/// owes falls due.
 ///
-/// AWS returns a freshly created entity in the non-terminal `CREATING` state and
-/// moves it to `ACTIVE` on its own; no documented duration governs how long that
-/// takes, so this span is chosen (and deliberately non-zero, so a caller that
-/// reads straight back still observes `CREATING`). It is never slept on: the due
-/// instant is stored and every read compares it against the clock.
-pub const ENTITY_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
+/// `ACTIVE` is the state an entity SETTLES in, and the one a stored entity
+/// carries: a create completes within the call that asked for it, so no entity
+/// is ever persisted in the non-terminal `CREATING` state — recorded traffic
+/// reads a just-created entity back as `ACTIVE`, with no step anywhere in the
+/// corpus observing it `CREATING`. The other values belong to transitions a
+/// later slice owns (`UPDATING` for an update in flight, `ERROR` for a failed
+/// one); `DELETING` is what `DeleteEntity` reports for the removal it performs.
+pub const STATE_ACTIVE: &str = "ACTIVE";
+/// See [`STATE_ACTIVE`].
+pub const STATE_DELETING: &str = "DELETING";
 
 /// The region an emulated ARN is built in when a request carries no SigV4
 /// credential scope to read one from.
@@ -106,7 +104,11 @@ pub enum ResourceRef {
 pub struct Workspace {
     pub workspace_id: String,
     pub arn: String,
-    pub description: Option<String>,
+    /// The workspace's description, the empty string when the create named
+    /// none: `Description` is modelled `@length 0..2048`, so the empty string
+    /// is a legal value, and the service carries the member on every resource
+    /// rather than leaving it absent. See [`Entity::description`].
+    pub description: String,
     pub s3_location: Option<String>,
     pub role: Option<String>,
     /// Other AWS services linked into this workspace. Populated by the sync-job
@@ -190,7 +192,13 @@ pub struct Entity {
     pub entity_name: String,
     pub arn: String,
     pub workspace_id: String,
-    pub description: Option<String>,
+    /// The entity's description, the empty string when the create named none.
+    ///
+    /// A description is a member every entity carries rather than one it may
+    /// lack: `Description` admits the empty string (`@length 0..2048`), and a
+    /// read reports the member for an entity whose description is empty instead
+    /// of omitting it, so a client that reads it back needs no null guard.
+    pub description: String,
     /// [`ROOT_PARENT_ENTITY_ID`] when the entity was created without a parent.
     pub parent_entity_id: String,
     /// The entity's components, keyed by component name.
@@ -198,20 +206,36 @@ pub struct Entity {
     pub tags: BTreeMap<String, String>,
     pub creation_date_time: SystemTime,
     pub update_date_time: SystemTime,
-    /// The instant the `CREATING` -> `ACTIVE` transition the clock owes falls
-    /// due. See [`ENTITY_ACTIVATION_SPAN`].
-    pub active_date_time: SystemTime,
+    /// The entity's `State`: the state the STORED record carries, so every
+    /// reader reports the same one and no read has to recompute it. A create
+    /// settles the entity in [`STATE_ACTIVE`] (see its docs); the operations a
+    /// later slice implements are what write any other value here.
+    pub state: String,
 }
 
 impl Entity {
-    /// The entity's `State` as of `now`: `CREATING` until its activation falls
-    /// due, `ACTIVE` from then on.
-    pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if now < self.active_date_time {
-            STATE_CREATING
-        } else {
-            STATE_ACTIVE
-        }
+    /// The entity's modelled `Status`: its stored state, with the `error`
+    /// structure every reported status carries. See [`status`].
+    pub fn status(&self) -> crate::ops::types::Status {
+        status(&self.state)
+    }
+}
+
+/// The modelled `Status` of a resource in `state`.
+///
+/// Both of `Status`'s members are optional in the model, but the service
+/// reports the structure WHOLE: `error` is a present `ErrorDetails` — carrying
+/// neither a code nor a message while nothing has failed — rather than an
+/// absent member, so a client that reads `status.error` without a null guard
+/// sees an empty structure instead of nothing. A failed resource is the same
+/// structure with its `code`/`message` filled in.
+pub fn status(state: &str) -> crate::ops::types::Status {
+    crate::ops::types::Status {
+        state: Some(state.to_string()),
+        error: Some(crate::ops::types::ErrorDetails {
+            code: None,
+            message: None,
+        }),
     }
 }
 
@@ -293,6 +317,22 @@ impl ComAmazonawsIottwinmakerAwsiottwinmakerState {
             _ => None,
         }
     }
+}
+
+/// The message for an entity the workspace the request named does not hold.
+///
+/// Built from the request: it names the entity that was looked for and the
+/// workspace it was looked for in, which is the construction the service's own
+/// `ResourceNotFoundException` for an entity uses.
+pub fn entity_not_found_message(workspace_id: &str, entity_id: &str) -> String {
+    format!("Entity {entity_id} in workspace {workspace_id} not found.")
+}
+
+/// The message for a workspace this service does not hold: built from the
+/// request, naming the workspace that was looked for. Same construction as
+/// [`entity_not_found_message`], one level up the resource tree.
+pub fn workspace_not_found_message(workspace_id: &str) -> String {
+    format!("Workspace {workspace_id} not found.")
 }
 
 /// The region to build an ARN in for this request: the region of its SigV4
