@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeModelPackageGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeModelPackageGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeModelPackageGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replays the model package group `CreateModelPackageGroup` stored under this
+//! name, accepting either the group's name or its ARN (the modelled `ArnOrName` input), and
+//! refuses a name no group is stored under. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +138,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeModelPackageGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeModelPackageGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeModelPackageGroup"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // `ModelPackageGroupName` is modelled `ArnOrName`: the caller may address the group
+        // by name or by its full ARN, and both name the same stored record.
+        let name = crate::state::name_from_arn_or_name(&input.model_package_group_name);
+
+        let store = state.lock();
+        let Some(group) = store.model_package_groups.get(name) else {
+            // Never a 200 with empty fields: a caller cannot tell that from a group that
+            // exists and carries nothing.
+            let arn = crate::state::resource_arn(
+                &crate::state::request_region(ctx),
+                "model-package-group",
+                name,
+            );
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Model Package Group \"{arn}\" does not exist."
+            )));
+        };
+
+        Ok(DescribeModelPackageGroupOutput {
+            model_package_group_name: group.name.clone(),
+            model_package_group_arn: group.arn.clone(),
+            model_package_group_description: group.description.clone(),
+            creation_time: crate::state::timestamp(group.creation_time),
+            created_by: group.created_by.clone(),
+            model_package_group_status: group.status.clone(),
+            managed_configuration: group.managed_configuration.clone(),
+        })
     }
 }

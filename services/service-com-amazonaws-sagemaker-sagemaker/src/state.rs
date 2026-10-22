@@ -11,9 +11,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AsyncInferenceConfig, ContainerDefinition, DataCaptureConfig, ExplainerConfig,
-    InferenceExecutionConfig, MetricsConfig, ProductionVariant, ProductionVariantSummary, Tag,
-    VpcConfig,
+    AsyncInferenceConfig, ContainerDefinition, DataCaptureConfig, ExplainerConfig, IamIdentity,
+    InferenceExecutionConfig, ManagedConfiguration, MetricsConfig, ProductionVariant,
+    ProductionVariantSummary, Tag, UserContext, VpcConfig,
 };
 
 /// The ARN service namespace (`arnNamespace` in the model's `aws.api#service` trait,
@@ -46,6 +46,8 @@ pub const MODEL_QUOTA: usize = 1_000;
 pub const ENDPOINT_CONFIG_QUOTA: usize = 1_000;
 /// See [`MODEL_QUOTA`].
 pub const ENDPOINT_QUOTA: usize = 1_000;
+/// See [`MODEL_QUOTA`].
+pub const MODEL_PACKAGE_GROUP_QUOTA: usize = 1_000;
 
 /// The most models `ListModels` returns in one page, including when `MaxResults` is
 /// absent or larger.
@@ -62,6 +64,16 @@ pub const MAX_PAGE_SIZE: i32 = 50;
 pub const STATUS_CREATING: &str = "Creating";
 /// See [`STATUS_CREATING`].
 pub const STATUS_IN_SERVICE: &str = "InService";
+
+/// The `ModelPackageGroupStatus` a model package group carries once `CreateModelPackageGroup`
+/// has returned.
+///
+/// A model group is a registry container, not a provisioned resource: the call that creates
+/// it is synchronous, and the group is immediately usable (a model package can be registered
+/// into it on the very next call). So it is born in this TERMINAL status and the clock owes
+/// it no later transition — the modelled enum's `Pending`/`InProgress` describe a group
+/// whose creation is still in flight, which never happens here.
+pub const STATUS_COMPLETED: &str = "Completed";
 
 /// A model created by `CreateModel`, as `DescribeModel` and `ListModels` replay it.
 #[derive(Debug, Clone)]
@@ -141,6 +153,23 @@ impl Endpoint {
     }
 }
 
+/// A model package group created by `CreateModelPackageGroup`, as
+/// `DescribeModelPackageGroup` replays it.
+///
+/// `created_by` is stored at creation rather than rebuilt per read, so every later read
+/// reports the identity that actually created the group.
+#[derive(Debug, Clone)]
+pub struct ModelPackageGroup {
+    pub name: String,
+    pub arn: String,
+    pub description: Option<String>,
+    pub managed_configuration: Option<ManagedConfiguration>,
+    pub status: String,
+    pub created_by: UserContext,
+    pub tags: Vec<Tag>,
+    pub creation_time: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-sagemaker-sagemaker. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSagemakerSagemakerState {
@@ -150,6 +179,8 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     pub endpoint_configs: BTreeMap<String, EndpointConfig>,
     /// Keyed by `EndpointName`.
     pub endpoints: BTreeMap<String, Endpoint>,
+    /// Keyed by `ModelPackageGroupName`.
+    pub model_package_groups: BTreeMap<String, ModelPackageGroup>,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -167,6 +198,12 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another endpoint fits, i.e. the store is below [`ENDPOINT_QUOTA`].
     pub fn endpoints_below_quota(&self) -> bool {
         self.endpoints.len() < ENDPOINT_QUOTA
+    }
+
+    /// Whether another model package group fits, i.e. the store is below
+    /// [`MODEL_PACKAGE_GROUP_QUOTA`].
+    pub fn model_package_groups_below_quota(&self) -> bool {
+        self.model_package_groups.len() < MODEL_PACKAGE_GROUP_QUOTA
     }
 }
 
@@ -236,6 +273,64 @@ pub fn record_state_change(
 /// service mints, for the three resource kinds it owns.
 pub fn resource_arn(region: &str, kind: &str, name: &str) -> String {
     ::emulator_server::emulator_arn(ARN_SERVICE, region, &format!("{kind}/{name}"))
+}
+
+/// The resource NAME an `ArnOrName`-typed member addresses.
+///
+/// Several SageMaker readers accept either a bare name or the resource's full ARN for the
+/// same resource (the `ArnOrName` shape), and the store is keyed by the name — so an ARN is
+/// reduced to the resource portion after its final `/`. A value that is not an ARN is
+/// already a name and is returned unchanged.
+pub fn name_from_arn_or_name(value: &str) -> &str {
+    match value.strip_prefix("arn:") {
+        Some(_) => value.split('/').next_back().unwrap_or(value),
+        None => value,
+    }
+}
+
+/// The IAM user name the request's SigV4 credential names, or a fixed `emulator`
+/// principal when the request carries no usable access key id.
+///
+/// The access key id is request text and the value is spliced into an ARN, whose segments
+/// are positional, so anything not shaped like an access key id is replaced rather than
+/// interpolated. `extract_akid` performs no verification — the emulator verifies signatures
+/// at its boundary.
+fn caller_principal(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+    let shaped_like_an_access_key_id = !akid.is_empty()
+        && akid.len() <= 128
+        && akid.chars().all(|character| character.is_ascii_alphanumeric());
+    if shaped_like_an_access_key_id {
+        akid
+    } else {
+        "emulator".to_string()
+    }
+}
+
+/// The `UserContext` SageMaker records as the creator of a resource.
+///
+/// The emulator serves no Studio domain, so the Studio members (`UserProfileArn`,
+/// `UserProfileName`, `DomainId`) are ABSENT rather than empty: a caller cannot tell an
+/// empty profile name from a missing one. The IAM identity is the one the request signed
+/// with. `PrincipalId` and `SourceIdentity` stay absent — this emulator models no IAM
+/// principal ids, and inventing one would report an identity that does not exist.
+pub fn caller_user_context(ctx: &smithy_server_runtime::OperationContext<'_>) -> UserContext {
+    let principal = caller_principal(ctx);
+    UserContext {
+        user_profile_arn: None,
+        user_profile_name: None,
+        domain_id: None,
+        iam_identity: Some(IamIdentity {
+            // IAM is global, so the region segment is empty.
+            arn: Some(::emulator_server::emulator_arn(
+                "iam",
+                "",
+                &format!("user/{principal}"),
+            )),
+            principal_id: None,
+            source_identity: None,
+        }),
+    }
 }
 
 /// A stored `SystemTime` as the modelled `Timestamp` the wire carries.
