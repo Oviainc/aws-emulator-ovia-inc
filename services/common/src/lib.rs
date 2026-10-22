@@ -17,6 +17,11 @@
 //!   is modelled against, so no two services answer "does this subnet exist"
 //!   differently.
 //!
+//! Beside them, [`iot_job_executions`] is the IoT job-execution store the IoT
+//! control plane writes (a job targets a thing) and the IoT Jobs data plane reads
+//! and updates (the device polls, starts and reports) — ONE store in the shared
+//! engine, so the two services cannot hold two copies of one execution.
+//!
 //! # Why a shared rule
 //!
 //! The router resolves a request's routing key from the SigV4 credential scope
@@ -74,6 +79,7 @@
 //! should inline the rule again — call this crate.
 
 pub mod front_door;
+pub mod iot_job_executions;
 pub mod network;
 
 use emulator_server::{resolve_route_key, service_from_target, ROOT_PATH_SEGMENT};

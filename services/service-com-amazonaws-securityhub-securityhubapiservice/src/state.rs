@@ -276,6 +276,13 @@ pub const STATE_UNAVAILABLE_MESSAGE: &str = "the Security Hub CSPM state store i
 
 /// The message a hub-scoped operation refuses a caller with when the account is not
 /// subscribed to Security Hub CSPM in the request's Region.
+///
+/// Only a HUB-SCOPED operation — one that reads or writes this account's hub,
+/// findings, insights, action targets, members or standards subscriptions — has that
+/// precondition. An operation that reports the service's own published metadata (the
+/// standards catalog, the product catalog, the security-control definitions) answers
+/// every caller, subscribed or not: those are the reads a client makes to discover
+/// what it can enable, before any hub exists.
 pub fn not_subscribed_message(account_id: &str, region: &str) -> String {
     format!("Account {account_id} is not subscribed to Security Hub CSPM in Region {region}")
 }
@@ -379,33 +386,67 @@ pub struct StandardDefinition {
 }
 
 /// The standards this emulator knows, from the AWS Security Hub user guide's
-/// "Security Hub standards reference" (names, ARNs and the two standards enabled by
-/// default). `GetEnabledStandards` reports the subscriptions created from these, so a
-/// standard absent here is one no operation can enable.
-pub const STANDARDS_CATALOG: [StandardDefinition; 7] = [
+/// "Security Hub standards reference" (names, ARNs, descriptions, the evaluated cloud
+/// provider and the two standards enabled by default). `GetEnabledStandards` reports
+/// the subscriptions created from these, so a standard absent here is one no operation
+/// can enable.
+///
+/// Ordered by `Name`, which is the order `DescribeStandards` reports the catalog in,
+/// so a page boundary falls in the same place on every call.
+pub const STANDARDS_CATALOG: [StandardDefinition; 10] = [
+    StandardDefinition {
+        slug: "ai-security-best-practices",
+        version: "1.0.0",
+        name: "AI Security Best Practices v1.0.0",
+        description: "The AI Security Best Practices standard is a set of automated security checks that detect when your artificial intelligence and machine learning workloads, and the resources they run on, do not align with security best practices.",
+        provider: "AWS",
+        enabled_by_default: false,
+        partition_wide_ruleset: false,
+    },
     StandardDefinition {
         slug: "aws-foundational-security-best-practices",
         version: "1.0.0",
         name: "AWS Foundational Security Best Practices v1.0.0",
-        description: "The AWS Foundational Security Best Practices standard is a set of automated security checks that detect when AWS accounts and deployed resources do not align with security best practices.",
+        description: "The AWS Foundational Security Best Practices standard is a set of automated security checks that detect when AWS accounts and deployed resources do not align to security best practices. The standard is defined by AWS security experts. This curated set of controls helps improve your security posture in AWS, and cover AWS's most popular and foundational services.",
         provider: "AWS",
         enabled_by_default: true,
+        partition_wide_ruleset: false,
+    },
+    StandardDefinition {
+        slug: "aws-resource-tagging-standard",
+        version: "1.0.0",
+        name: "AWS Resource Tagging Standard v1.0.0",
+        description: "The AWS Resource Tagging Standard is a set of automated controls that detect when deployed resources do not carry the tags your organization requires, so that you can keep your tagging strategy consistent.",
+        provider: "AWS",
+        enabled_by_default: false,
+        partition_wide_ruleset: false,
+    },
+    StandardDefinition {
+        slug: "azure-foundational-security-best-practices",
+        version: "1.0.0",
+        name: "Azure Foundational Security Best Practices v1.0.0",
+        description: "The Azure Foundational Security Best Practices standard is a set of automated security checks that detect when your Microsoft Azure subscriptions and the resources deployed in them do not align to security best practices.",
+        provider: "Azure",
+        enabled_by_default: false,
         partition_wide_ruleset: false,
     },
     StandardDefinition {
         slug: "cis-aws-foundations-benchmark",
         version: "1.2.0",
         name: "CIS AWS Foundations Benchmark v1.2.0",
-        description: "The Center for Internet Security (CIS) AWS Foundations Benchmark v1.2.0 is a set of security configuration best practices for AWS.",
+        description: "The Center for Internet Security (CIS) AWS Foundations Benchmark v1.2.0 is a set of security configuration best practices for AWS. This Security Hub standard automatically checks for your compliance readiness against a subset of CIS requirements.",
         provider: "AWS",
         enabled_by_default: true,
+        // The recorded catalog reports this standard with the partition-wide
+        // `ruleset/` ARN that predates the per-Region `standards/` form; every other
+        // standard carries the Region.
         partition_wide_ruleset: true,
     },
     StandardDefinition {
         slug: "cis-aws-foundations-benchmark",
         version: "1.4.0",
         name: "CIS AWS Foundations Benchmark v1.4.0",
-        description: "The Center for Internet Security (CIS) AWS Foundations Benchmark v1.4.0 is a set of security configuration best practices for AWS.",
+        description: "The Center for Internet Security (CIS) AWS Foundations Benchmark v1.4.0 is a set of security configuration best practices for AWS. This Security Hub standard automatically checks for your compliance readiness against a subset of CIS requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -414,7 +455,7 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 7] = [
         slug: "cis-aws-foundations-benchmark",
         version: "3.0.0",
         name: "CIS AWS Foundations Benchmark v3.0.0",
-        description: "The Center for Internet Security (CIS) AWS Foundations Benchmark v3.0.0 is a set of security configuration best practices for AWS.",
+        description: "The Center for Internet Security (CIS) AWS Foundations Benchmark v3.0.0 is a set of security configuration best practices for AWS. This Security Hub standard automatically checks for your compliance readiness against a subset of CIS requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -423,7 +464,7 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 7] = [
         slug: "nist-800-53",
         version: "5.0.0",
         name: "NIST SP 800-53 Rev. 5",
-        description: "NIST SP 800-53 Rev. 5 provides a catalog of security and privacy controls for information systems and organizations.",
+        description: "NIST SP 800-53 Rev. 5 provides a catalog of security and privacy controls for information systems and organizations. This Security Hub standard automatically checks for your compliance readiness against a subset of NIST SP 800-53 Rev. 5 requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -432,16 +473,16 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 7] = [
         slug: "pci-dss",
         version: "3.2.1",
         name: "PCI DSS v3.2.1",
-        description: "The Payment Card Industry Data Security Standard (PCI DSS) v3.2.1 is an information security standard for entities that store, process, or transmit cardholder data.",
+        description: "The Payment Card Industry Data Security Standard (PCI DSS) v3.2.1 is an information security standard for entities that store, process, or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
     },
     StandardDefinition {
-        slug: "aws-resource-tagging-standard",
-        version: "1.0.0",
-        name: "AWS Resource Tagging Standard v1.0.0",
-        description: "The AWS Resource Tagging Standard is a set of automated security checks that detect when deployed resources do not carry the tags your organization requires.",
+        slug: "pci-dss",
+        version: "4.0.1",
+        name: "PCI DSS v4.0.1",
+        description: "The Payment Card Industry Data Security Standard (PCI DSS) v4.0.1 is an information security standard for entities that store, process, or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,
@@ -784,10 +825,13 @@ pub fn resource_tags_mut<'a>(
         .map(|hub| &mut hub.tags)
 }
 
-/// The company every standard in [`STANDARDS_CATALOG`] is managed by: "For existing
-/// standards, the value is equal to `Amazon Web Services`"
-/// (`smithy_query(query="shape", shape="StandardsManagedBy")`, member `Company`).
-pub const STANDARDS_MANAGED_BY_COMPANY: &str = "Amazon Web Services";
+/// The company every standard in [`STANDARDS_CATALOG`] is managed by. The model's
+/// prose says "For existing standards, the value is equal to `Amazon Web Services`"
+/// (`smithy_query(query="shape", shape="StandardsManagedBy")`, member `Company`), but
+/// the service answers the short company identifier `AWS` on the wire, which is what
+/// a client comparing `StandardsManagedBy.Company` sees; the wire form wins over the
+/// doc's expansion of it.
+pub const STANDARDS_MANAGED_BY_COMPANY: &str = "AWS";
 
 /// The product every standard in [`STANDARDS_CATALOG`] is managed by: "the value is
 /// equal to the Amazon Web Services service that manages the standard"

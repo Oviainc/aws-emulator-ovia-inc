@@ -264,9 +264,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             settings: input.settings,
             queue,
-            priority: input.priority,
-            status_update_interval: input.status_update_interval,
-            acceleration_settings: input.acceleration_settings,
+            // Service-applied when the request omits them, exactly as on a job: the
+            // default priority, the default status-update cadence and acceleration left
+            // off. Persisted, so create, read, list and update all report the same value.
+            priority: input.priority.unwrap_or(crate::state::DEFAULT_PRIORITY),
+            status_update_interval: input
+                .status_update_interval
+                .unwrap_or_else(|| crate::state::DEFAULT_STATUS_UPDATE_INTERVAL.to_string()),
+            acceleration_settings: input
+                .acceleration_settings
+                .unwrap_or_else(crate::state::default_acceleration_settings),
             hop_destinations: input.hop_destinations.unwrap_or_default(),
             // A template a caller creates is custom; only built-in templates are SYSTEM.
             template_type: crate::state::TYPE_CUSTOM.to_string(),

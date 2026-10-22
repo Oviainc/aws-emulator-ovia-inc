@@ -8,12 +8,13 @@
 //! here, as the member documents ("Unless set to false, the response contains the
 //! job document. The default is true").
 //!
-//! `DescribeJobExecution`'s `TerminalStateException` (410) and
-//! `InvalidRequestException` (400) are deliberately NOT produced here: this
-//! operation reports the stored execution, including one in a terminal status
-//! (the bootstrap issue requires exactly that), and the request combinations the
-//! real service refuses are filed as their own issue along with the rest of the
-//! long tail (clock-driven `TIMED_OUT`, certificate validation, throttling).
+//! A FINISHED execution is refused rather than reported: an execution in a terminal
+//! status answers the model's `TerminalStateException` (410), which is what
+//! distinguishes "this execution finished" from the 404 `ResourceNotFoundException`
+//! of a thing/job pair that has no execution at all. `InvalidRequestException` (400)
+//! is still not produced here: the request combinations the real service refuses are
+//! filed as their own issue along with the rest of the long tail (clock-driven
+//! `TIMED_OUT`, certificate validation, throttling).
 //!
 //! ## Shape of an operation
 //!
@@ -176,22 +177,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DescribeJobExecutionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no job execution {} for thing {}",
-                        input.job_id, input.thing_name
+                    message: Some(crate::state::not_found_message(
+                        &input.job_id,
+                        &input.thing_name,
                     )),
                 },
             )
             .into());
         };
 
+        // An execution that has reached a terminal status is FINISHED, and this
+        // device-facing read serves the executions a device can still act on: the
+        // model's own `TerminalStateException` ("The job is in a terminal state",
+        // HTTP 410) is the answer, which is what tells a client "this execution
+        // finished" apart from the 404 "no such execution" above.
+        if record.is_terminal() {
+            return Err(DescribeJobExecutionErrorModeled::TerminalStateException(
+                TerminalStateException {
+                    message: Some(crate::state::TERMINAL_STATE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // "Unless set to false, the response contains the job document. The
         // default is true."
         let include_job_document = input.include_job_document.unwrap_or(true);
         Ok(DescribeJobExecutionOutput {
-            execution: Some(
-                record.to_job_execution(include_job_document, crate::state::now_epoch_seconds()),
-            ),
+            execution: Some(crate::state::to_job_execution(
+                record,
+                include_job_document,
+                crate::state::now_epoch_seconds(),
+            )),
         })
     }
 }

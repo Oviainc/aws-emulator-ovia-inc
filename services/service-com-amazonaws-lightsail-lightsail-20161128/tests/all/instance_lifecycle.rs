@@ -140,7 +140,10 @@ pub(crate) fn error_code(body: &Value) -> String {
 
 /// Whether `value` has the shape of the UUID Lightsail's instance and operation
 /// ids take: five hex groups of 8-4-4-4-12.
-fn is_uuid_shaped(value: &str) -> bool {
+///
+/// `pub(crate)` so a sibling suite in this test target checks a minted id the same
+/// way.
+pub(crate) fn is_uuid_shaped(value: &str) -> bool {
     let lengths: Vec<usize> = value.split('-').map(str::len).collect();
     lengths == vec![8, 4, 4, 4, 12]
         && value.chars().all(|c| c == '-' || c.is_ascii_hexdigit())

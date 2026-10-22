@@ -256,17 +256,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `UserName` is a uniqueness claim within the identity store, so a second
         // create naming one that is taken conflicts rather than storing a duplicate.
         // The member is optional in the model, so a request without one claims nothing.
-        // The name itself is `@sensitive` and so stays out of the message.
-        if let Some(taken_by) = input
+        // The conflict names the CLAIM that was violated and nothing else: neither the
+        // `@sensitive` name nor the id of the user that already holds it.
+        if input
             .user_name
             .as_deref()
-            .and_then(|user_name| store.user_name_index.get(user_name))
+            .is_some_and(|user_name| store.user_name_index.contains_key(user_name))
         {
             return Err(CreateUserErrorModeled::ConflictException(
-                crate::state::uniqueness_conflict(format!(
-                    "a user with this UserName already exists in identity store {} (UserId {taken_by})",
-                    store.identity_store_id
-                )),
+                crate::state::uniqueness_conflict(crate::state::UniquenessClaim::UserName),
             )
             .into());
         }

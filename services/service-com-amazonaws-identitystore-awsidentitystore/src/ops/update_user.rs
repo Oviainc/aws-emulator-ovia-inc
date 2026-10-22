@@ -242,23 +242,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `UserName` is a uniqueness claim within the identity store, so an update
         // taking one another user already holds conflicts instead of storing a
-        // duplicate. The name itself is `@sensitive` and so stays out of the message.
-        if updated.user_name != stored.user_name {
-            if let Some(taken_by) = updated
+        // duplicate. The conflict names the CLAIM that was violated and nothing else:
+        // neither the `@sensitive` name nor the id of the user that already holds it.
+        if updated.user_name != stored.user_name
+            && updated
                 .user_name
                 .as_deref()
                 .and_then(|user_name| store.user_name_index.get(user_name))
-                .filter(|taken_by| *taken_by != &updated.user_id)
-            {
-                return Err(UpdateUserErrorModeled::ConflictException(
-                    crate::state::uniqueness_conflict(format!(
-                        "a user with this UserName already exists in identity store {} \
-                         (UserId {taken_by})",
-                        store.identity_store_id
-                    )),
-                )
-                .into());
-            }
+                .is_some_and(|taken_by| *taken_by != updated.user_id)
+        {
+            return Err(UpdateUserErrorModeled::ConflictException(
+                crate::state::uniqueness_conflict(crate::state::UniquenessClaim::UserName),
+            )
+            .into());
         }
 
         updated.record_update(::std::time::SystemTime::now());

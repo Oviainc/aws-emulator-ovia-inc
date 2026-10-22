@@ -263,9 +263,12 @@ async fn every_started_command_is_persisted_as_a_queued_execution_of_its_thing()
             execution["status"], "QUEUED",
             "case {case:?}: expected QUEUED, got {execution}"
         );
-        assert_eq!(
-            execution["thingName"], thing_name,
-            "case {case:?}: expected the thing from targetArn, got {execution}"
+        assert!(
+            execution["thingName"].is_null(),
+            "case {case:?}: the device-facing read does not echo the thing its own URI \
+             names (the recorded `$next` and read steps of \
+             iotjobsdata-job-execution-queue-poll-and-start carry no thingName), \
+             got {execution}"
         );
         let document: Value = serde_json::from_str(
             execution["jobDocument"]
@@ -521,7 +524,8 @@ async fn the_execution_lifecycle_is_persisted_and_read_back_at_every_step() {
         "includeJobDocument=true returns the document, got {updated}"
     );
 
-    // Finishing it removes it from both pending lists but keeps it readable.
+    // Finishing it removes it from both pending lists and ends the device's view of
+    // it: the read is then refused as terminal.
     let (status, finished) = emulator
         .update(
             thing,
@@ -544,15 +548,21 @@ async fn the_execution_lifecycle_is_persisted_and_read_back_at_every_step() {
         job_ids(&pending["queuedJobs"]).is_empty() && job_ids(&pending["inProgressJobs"]).is_empty(),
         "a terminal execution is in neither pending list, got {pending}"
     );
+    // And the device-facing read refuses it as finished (410) rather than reporting
+    // it or claiming it never existed (404).
     let (status, described) = emulator.describe(thing, &id, "").await;
-    assert_eq!(status, 200, "a terminal execution stays readable, got {status}");
     assert_eq!(
-        described["execution"]["status"], "SUCCEEDED",
-        "expected the terminal status, got {described}"
+        status, 410,
+        "a finished execution is refused as terminal, got {status} {described}"
+    );
+    assert_eq!(
+        error_code(&described),
+        "TerminalStateException",
+        "expected TerminalStateException, got {described}"
     );
     assert!(
-        described["execution"]["approximateSecondsBeforeTimedOut"].is_null(),
-        "a terminal execution has no timer left, got {described}"
+        described["execution"].is_null(),
+        "a refusal carries no execution, got {described}"
     );
 }
 
@@ -671,7 +681,8 @@ async fn pending_executions_are_reported_and_served_oldest_first() {
 }
 
 /// RULE: a status in the model's terminal set ends the execution — it leaves both
-/// pending lists and accepts no further update (409) — while a pending status
+/// pending lists, its read is refused 410 `TerminalStateException` and it accepts no
+/// further update (409 `InvalidStateTransitionException`) — while a pending status
 /// keeps it in the list its status names.
 #[tokio::test]
 async fn each_modeled_status_lands_the_execution_in_the_right_list() {
@@ -697,10 +708,24 @@ async fn each_modeled_status_lands_the_execution_in_the_right_list() {
                 && job_ids(&pending["inProgressJobs"]).is_empty(),
             "case {status:?}: a terminal execution is in neither list, got {pending}"
         );
-        let (_, described) = emulator.describe(&thing, &id, "").await;
+        let (code, described) = emulator.describe(&thing, &id, "").await;
         assert_eq!(
-            described["execution"]["status"], *status,
-            "case {status:?}: expected the stored terminal status, got {described}"
+            code, 410,
+            "case {status:?}: a finished execution is refused as terminal, got {code} {described}"
+        );
+        assert_eq!(
+            error_code(&described),
+            "TerminalStateException",
+            "case {status:?}: expected TerminalStateException, got {described}"
+        );
+        // The refusal states the condition it refused on; it carries nothing from
+        // the request, so it is one message for every terminal status.
+        assert_eq!(
+            described["message"].as_str(),
+            Some(
+                "Job Execution has reached terminal state. It is neither IN_PROGRESS nor QUEUED"
+            ),
+            "case {status:?}: expected the terminal-state message, got {described}"
         );
 
         // `$next` has nothing left to start: a 200 with no execution.
@@ -728,10 +753,20 @@ async fn each_modeled_status_lands_the_execution_in_the_right_list() {
                 "InvalidStateTransitionException",
                 "case {status:?} -> {next_status:?}: expected InvalidStateTransitionException, got {refused}"
             );
-            let (_, described) = emulator.describe(&thing, &id, "").await;
+            // The refusal names the job, the thing and the status the execution
+            // finished in — all three from the request and the stored record — so a
+            // refused update is visibly one that changed nothing.
+            let expected_message =
+                format!("Job {id} for {thing} has already finished with status {status}");
             assert_eq!(
-                described["execution"]["status"], *status,
-                "case {status:?} -> {next_status:?}: the refused update changed nothing, got {described}"
+                refused["message"].as_str(),
+                Some(expected_message.as_str()),
+                "case {status:?} -> {next_status:?}: expected {expected_message:?}, got {refused}"
+            );
+            let (code, described) = emulator.describe(&thing, &id, "").await;
+            assert_eq!(
+                code, 410,
+                "case {status:?} -> {next_status:?}: the refused update left it finished, got {code} {described}"
             );
         }
     }
@@ -878,6 +913,14 @@ async fn unknown_executions_are_404_but_a_thing_with_none_still_reports() {
             "ResourceNotFoundException",
             "case {case:?}: expected ResourceNotFoundException, got {body}"
         );
+        // The refusal's message is built from the two request members that name the
+        // execution, so it states which job on which thing was not found.
+        let expected_message = format!("Job {job_id} not found for {thing}");
+        assert_eq!(
+            body["message"].as_str(),
+            Some(expected_message.as_str()),
+            "case {case:?}: expected the message {expected_message:?}, got {body}"
+        );
 
         let mut request = json!({"status": "SUCCEEDED"});
         for (name, value) in update_extra.as_object().into_iter().flatten() {
@@ -900,6 +943,11 @@ async fn unknown_executions_are_404_but_a_thing_with_none_still_reports() {
                 error_code(&body),
                 "ResourceNotFoundException",
                 "case {case:?}: expected ResourceNotFoundException, got {body}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(expected_message.as_str()),
+                "case {case:?}: the update's refusal follows the same message rule, got {body}"
             );
         }
     }
@@ -1091,11 +1139,12 @@ async fn the_execution_store_is_bounded_per_thing() {
         );
         finished.push(id);
     }
-    // Every one of them is still readable while the bound is not exceeded.
+    // Every one of them is still HELD while the bound is not exceeded: a finished
+    // execution the store holds is refused as terminal (410), not as absent (404).
     let (status, described) = emulator.describe(thing, &finished[0], "").await;
     assert_eq!(
-        status, 200,
-        "case at the retention bound: the oldest finished execution is still readable, got {status} {described}"
+        status, 410,
+        "case at the retention bound: the oldest finished execution is still held, got {status} {described}"
     );
 
     // Enqueueing one more evicts the OLDEST finished execution and keeps the rest.
@@ -1108,7 +1157,7 @@ async fn the_execution_store_is_bounded_per_thing() {
     for (index, id) in finished.iter().enumerate().skip(1) {
         let (status, kept) = emulator.describe(thing, id, "").await;
         assert_eq!(
-            status, 200,
+            status, 410,
             "case finished {index}: a newer finished execution is kept, got {status} {kept}"
         );
     }
@@ -1314,9 +1363,8 @@ async fn status_details_are_bounded_and_an_over_bound_map_changes_nothing() {
             described["execution"]["versionNumber"], 1,
             "case {case:?}: the refused calls must change nothing, got {described}"
         );
-        assert_eq!(
-            described["execution"]["statusDetails"],
-            json!({}),
+        assert!(
+            described["execution"]["statusDetails"].is_null(),
             "case {case:?}: the refused calls must store no details, got {described}"
         );
 

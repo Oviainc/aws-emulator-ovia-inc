@@ -14,9 +14,11 @@
 //!   the body's `__type` telling one from another, and a server error on its own 5xx.
 //!   The `@httpError` an error shape declares is not the status on the wire
 //!   ([`service_com_amazonaws_servicequotas_servicequotasv20190624::scaffolded::wire_http_status`]).
-//! * a request that breaks a rule the model declares is refused with the MODELED
-//!   `IllegalArgumentException`, whose `Message` member names the member the caller got
-//!   wrong — spelled as the model spells it — and the constraint that member failed.
+//! * a request that breaks a rule the model declares is refused on HTTP 400, with the
+//!   error code of the validator that owns the member it names — the modelled
+//!   `IllegalArgumentException` for the members Service Quotas validates itself, and
+//!   `ValidationException` for the members its request-validation front end owns — and
+//!   a message naming that member and the constraint it failed.
 //!
 //! This suite carries its own client because it reads the whole response BODY (the
 //! `Message` member), while `quota_workflow`'s refusal helper reports only the status
@@ -87,7 +89,13 @@ impl Client {
     }
 }
 
-/// The error code a refusal carries (`__type` on awsJson), and its `Message` member.
+/// The error code a refusal carries (`__type` on awsJson), and the message member
+/// whichever validator answered wrote.
+///
+/// The modelled `IllegalArgumentException` carries `Message` (its own modelled member),
+/// while the synthetic `ValidationException` the request validator answers with carries
+/// the protocol's generic lowercase `message`; a client reads whichever its SDK maps,
+/// so this reads both.
 fn error_of(body: &Value) -> (String, Option<String>) {
     let code = body
         .get("__type")
@@ -96,6 +104,7 @@ fn error_of(body: &Value) -> (String, Option<String>) {
         .to_string();
     let message = body
         .get("Message")
+        .or_else(|| body.get("message"))
         .and_then(Value::as_str)
         .map(str::to_string);
     (code, message)
@@ -184,128 +193,192 @@ async fn a_lookup_that_names_nothing_is_a_client_fault_on_400() {
     }
 }
 
-/// A value that breaks a rule the model declares is refused with the modeled
-/// `IllegalArgumentException`, and its `Message` names the member and the constraint.
+/// A value that breaks a rule the model declares is refused on HTTP 400 by the
+/// validator that owns the member it names, with a message naming that member and the
+/// constraint.
 #[tokio::test]
-async fn a_modelled_constraint_refusal_names_the_member_and_the_rule() {
+async fn a_constraint_refusal_names_its_validator_the_member_and_the_rule() {
     let client = client("us-east-1");
     let over_long_service_code = "v".repeat(64);
     let over_long_quota_code = "v".repeat(129);
+    let over_long_request_id = "r".repeat(129);
 
-    // Each row: why it is invalid, the operation, the request, the member the refusal
-    // must name (as the MODEL spells it), and the rule it must state. Every constraint
-    // and every bound below is read off the model
+    // Each row: why it is invalid, the operation, the request, the error code the
+    // refusal must carry, and the whole clause its message must start with. Every
+    // constraint and every bound below is read off the model
     // (`smithy_query(query="operation", operation="GetServiceQuota,ListServiceQuotas,\
     // GetRequestedServiceQuotaChange,ListRequestedServiceQuotaChangeHistoryByQuota,\
     // ListServices,CreateSupportCase")`), so the rows span the constraint KINDS the
     // model uses — `@pattern`, both `@length` bounds, both `@range` bounds, an
     // enumerated value set and `@required` — on several members and operations.
+    //
+    // The CODE column is the recorded split between the two validators (see
+    // `src/service.rs::FRONT_END_VALIDATED_MEMBERS`): `RequestId` is refused by the
+    // request-validation front end, as `ValidationException` naming the member the way
+    // the wire spells it; every other member is refused by Service Quotas itself, as
+    // the modelled `IllegalArgumentException` naming the member the way the MODEL
+    // spells it.
+    const ILLEGAL: &str = "IllegalArgumentException";
+    const VALIDATION: &str = "ValidationException";
     let rows: Vec<(&str, &str, Value, &str, String)> = vec![
         (
             "a quota code outside its pattern",
             "GetServiceQuota",
             json!({"ServiceCode": "vpc", "QuotaCode": "1-bad code"}),
-            "QuotaCode",
+            ILLEGAL,
             // `@pattern ^[a-zA-Z][a-zA-Z0-9-]{1,128}$` on GetServiceQuotaRequest$QuotaCode.
-            "Member must satisfy regular expression pattern: [a-zA-Z][a-zA-Z0-9-]{1,128}"
+            "QuotaCode failed to satisfy constraint: Member must satisfy regular expression \
+             pattern: [a-zA-Z][a-zA-Z0-9-]{1,128}"
                 .to_string(),
         ),
         (
             "a service code outside its pattern",
             "ListServiceQuotas",
             json!({"ServiceCode": "1-not-a-service"}),
-            "ServiceCode",
+            ILLEGAL,
             // `@pattern ^[a-zA-Z][a-zA-Z0-9-]{1,63}$` on ListServiceQuotasRequest$ServiceCode.
-            "Member must satisfy regular expression pattern: [a-zA-Z][a-zA-Z0-9-]{1,63}"
+            "ServiceCode failed to satisfy constraint: Member must satisfy regular expression \
+             pattern: [a-zA-Z][a-zA-Z0-9-]{1,63}"
                 .to_string(),
         ),
         (
             "a request id outside its pattern",
             "GetRequestedServiceQuotaChange",
             json!({"RequestId": "-leading-dash"}),
-            "RequestId",
+            VALIDATION,
             // `@pattern ^[0-9a-zA-Z][a-zA-Z0-9-]{1,128}$` — a different character class
             // from the two above, so the rule is not read off one member.
-            "Member must satisfy regular expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{1,128}"
+            "Value at 'requestId' failed to satisfy constraint: Member must satisfy regular \
+             expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{1,128}"
+                .to_string(),
+        ),
+        (
+            // The same member on ANOTHER operation — one this emulator still answers
+            // with a 501 for a request the model accepts — so the validator that owns
+            // it is a property of the member, not of one operation.
+            "a request id outside its pattern on an operation that is still a stub",
+            "CreateSupportCase",
+            json!({"RequestId": "!!!not-a-valid-request-id!!!"}),
+            VALIDATION,
+            "Value at 'requestId' failed to satisfy constraint: Member must satisfy regular \
+             expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{1,128}"
+                .to_string(),
+        ),
+        (
+            "a request id past its length maximum",
+            "GetRequestedServiceQuotaChange",
+            json!({"RequestId": over_long_request_id}),
+            VALIDATION,
+            // `@length 1..128`: the same member, a different constraint kind.
+            "Value at 'requestId' failed to satisfy constraint: Member must have length less \
+             than or equal to 128"
+                .to_string(),
+        ),
+        (
+            "an absent request id",
+            "CreateSupportCase",
+            json!({}),
+            VALIDATION,
+            // An absent member is the one case a clause reports a value — the `null`
+            // the request shape has, not anything the caller sent.
+            "Value null at 'requestId' failed to satisfy constraint: Member must not be null"
                 .to_string(),
         ),
         (
             "a service code past its length maximum",
             "ListServiceQuotas",
             json!({"ServiceCode": over_long_service_code}),
-            "ServiceCode",
+            ILLEGAL,
             // `@length 1..63`.
-            "Member must have length less than or equal to 63".to_string(),
+            "ServiceCode failed to satisfy constraint: Member must have length less than or \
+             equal to 63"
+                .to_string(),
         ),
         (
             "a quota code past its length maximum",
             "GetServiceQuota",
             json!({"ServiceCode": "vpc", "QuotaCode": over_long_quota_code}),
-            "QuotaCode",
+            ILLEGAL,
             // `@length 1..128`.
-            "Member must have length less than or equal to 128".to_string(),
+            "QuotaCode failed to satisfy constraint: Member must have length less than or \
+             equal to 128"
+                .to_string(),
         ),
         (
             "an empty quota code, below its length minimum",
             "GetServiceQuota",
             json!({"ServiceCode": "vpc", "QuotaCode": ""}),
-            "QuotaCode",
-            "Member must have length greater than or equal to 1".to_string(),
+            ILLEGAL,
+            "QuotaCode failed to satisfy constraint: Member must have length greater than or \
+             equal to 1"
+                .to_string(),
         ),
         (
             "a page size below its range",
             "ListServices",
             json!({"MaxResults": 0}),
-            "MaxResults",
+            ILLEGAL,
             // `@range 1..100` on MaxResults.
-            "Member must have value greater than or equal to 1".to_string(),
+            "MaxResults failed to satisfy constraint: Member must have value greater than or \
+             equal to 1"
+                .to_string(),
         ),
         (
             "a page size above its range",
             "ListServiceQuotas",
             json!({"ServiceCode": "vpc", "MaxResults": 101}),
-            "MaxResults",
-            "Member must have value less than or equal to 100".to_string(),
+            ILLEGAL,
+            "MaxResults failed to satisfy constraint: Member must have value less than or \
+             equal to 100"
+                .to_string(),
         ),
         (
             "a status outside the enumerated set",
             HISTORY,
             json!({"ServiceCode": "vpc", "QuotaCode": "L-F678F1CE", "Status": "NOT_A_STATUS"}),
-            "Status",
+            ILLEGAL,
             // The `RequestStatus` enum: the refusal states the published value set,
             // which this row only pins the opening of — the members and their order are
             // the model's.
-            "Member must satisfy enum value set: [".to_string(),
+            "Status failed to satisfy constraint: Member must satisfy enum value set: ["
+                .to_string(),
         ),
         (
             "an absent required member",
             "GetServiceQuota",
             json!({"ServiceCode": "vpc"}),
-            "QuotaCode",
+            ILLEGAL,
             // `@required`, found while READING the request rather than by walking it.
-            "Member must not be null".to_string(),
+            "QuotaCode failed to satisfy constraint: Member must not be null".to_string(),
         ),
         (
             "an absent required member on a listing",
             HISTORY,
             json!({"ServiceCode": "vpc"}),
-            "QuotaCode",
-            "Member must not be null".to_string(),
+            ILLEGAL,
+            "QuotaCode failed to satisfy constraint: Member must not be null".to_string(),
         ),
         (
             // A constraint is a property of the INPUT SHAPE, so it is refused the same
-            // way whoever would serve the request — including an operation this
-            // emulator still answers with a 501.
-            "a bad request id on an operation that is still a stub",
-            "CreateSupportCase",
-            json!({"RequestId": "-leading-dash"}),
-            "RequestId",
-            "Member must satisfy regular expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{1,128}"
+            // way whoever would serve the request — and BEFORE the handler's own gate,
+            // which would otherwise refuse this template call for the account's lack
+            // of an organization.
+            "a bad quota code on a template operation, refused ahead of its gate",
+            "PutServiceQuotaIncreaseRequestIntoTemplate",
+            json!({
+                "ServiceCode": "vpc",
+                "QuotaCode": "1-bad code",
+                "AwsRegion": "us-east-1",
+                "DesiredValue": 10.0,
+            }),
+            ILLEGAL,
+            "QuotaCode failed to satisfy constraint: Member must satisfy regular expression \
+             pattern: [a-zA-Z][a-zA-Z0-9-]{1,128}"
                 .to_string(),
         ),
     ];
 
-    for (why, operation, body, member, rule) in rows {
+    for (why, operation, body, expected_code, clause) in rows {
         let case = format!("{why} ({operation})");
         let (status, parsed) = client.call(operation, body).await;
         let (code, message) = error_of(&parsed);
@@ -314,21 +387,25 @@ async fn a_modelled_constraint_refusal_names_the_member_and_the_rule() {
             "case {case}: expected HTTP 400, got {status} with {parsed}"
         );
         assert!(
-            code.contains("IllegalArgumentException"),
-            "case {case}: expected IllegalArgumentException, got {code:?} in {parsed}"
+            code.contains(expected_code),
+            "case {case}: expected {expected_code}, got {code:?} in {parsed}"
         );
-        let expected = format!("{member} failed to satisfy constraint: {rule}");
         let message = message.unwrap_or_else(|| {
-            panic!("case {case}: expected a Message member, got {parsed}");
+            panic!("case {case}: expected a message member, got {parsed}");
         });
         assert!(
-            message.starts_with(&expected),
-            "case {case}: expected Message starting {expected:?}, got {message:?}"
+            message.starts_with(&clause),
+            "case {case}: expected a message starting {clause:?}, got {message:?}"
+        );
+        // Neither validator quotes the rejected value back into the 400.
+        assert!(
+            !message.contains("1-bad code") && !message.contains("!!!"),
+            "case {case}: the refusal must not echo the rejected value, got {message:?}"
         );
     }
 
-    // The construction rule stated whole, on the member the pattern rule is published
-    // for: nothing before the member name, nothing after the pattern.
+    // The construction rule stated whole, on each validator's own form: nothing before
+    // the member, nothing after the pattern.
     let (_, parsed) = client
         .call(
             "GetServiceQuota",
@@ -342,7 +419,22 @@ async fn a_modelled_constraint_refusal_names_the_member_and_the_rule() {
             "QuotaCode failed to satisfy constraint: Member must satisfy regular expression \
              pattern: [a-zA-Z][a-zA-Z0-9-]{1,128}"
         ),
-        "case the whole constraint clause: got {parsed}"
+        "case the whole constraint clause, service-validated: got {parsed}"
+    );
+    let (_, parsed) = client
+        .call(
+            "GetRequestedServiceQuotaChange",
+            json!({"RequestId": "!!!not-a-valid-request-id!!!"}),
+        )
+        .await;
+    let (_, message) = error_of(&parsed);
+    assert_eq!(
+        message.as_deref(),
+        Some(
+            "Value at 'requestId' failed to satisfy constraint: Member must satisfy regular \
+             expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{1,128}"
+        ),
+        "case the whole constraint clause, front-end-validated: got {parsed}"
     );
 }
 

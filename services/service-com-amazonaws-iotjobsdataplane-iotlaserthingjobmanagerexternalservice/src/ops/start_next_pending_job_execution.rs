@@ -80,9 +80,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{
-    MAX_STEP_TIMEOUT_MINUTES, MIN_STEP_TIMEOUT_MINUTES, STATUS_IN_PROGRESS,
-};
+use crate::state::{MAX_STEP_TIMEOUT_MINUTES, MIN_STEP_TIMEOUT_MINUTES};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -219,17 +217,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            record.status = STATUS_IN_PROGRESS.to_string();
-            // `startedAt` is when the execution started, so resuming one that is
-            // already in progress keeps its original start time.
-            record.started_at = Some(record.started_at.unwrap_or(now));
+            // `start` moves the status to `IN_PROGRESS`; `startedAt` is when the
+            // execution started, so resuming one that is already in progress keeps
+            // its original start time — and the job's in-progress timer, which that
+            // first start armed.
+            record.start(now);
             record.arm_step_timer(input.step_timeout_in_minutes, now);
             record.last_updated_at = now;
             // This IS a device update, so the version moves.
             record.version_number += 1;
             // The device needs the job document to run the job, so it is always
             // part of this response.
-            record.to_job_execution(true, now)
+            crate::state::to_job_execution(record, true, now)
         };
 
         Ok(StartNextPendingJobExecutionOutput {

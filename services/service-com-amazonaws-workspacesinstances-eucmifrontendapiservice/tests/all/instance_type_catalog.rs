@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use wsinst::ops::types::{
     BILLING_MODE_VALUES, INSTANCE_CONFIGURATION_TENANCY_ENUM_VALUES, PLATFORM_TYPE_ENUM_VALUES,
 };
-use wsinst::state::{InstanceTypeSpec, CATALOG_BILLING_MODES, INSTANCE_TYPE_CATALOG};
+use wsinst::state::{instance_type_catalog, InstanceTypeSpec, CATALOG_BILLING_MODES};
 
 /// The `X-Amz-Target` prefix from the crate's `OPERATIONS.md` wire-protocol section.
 const TARGET_PREFIX: &str = "EUCMIFrontendAPIService";
@@ -170,9 +170,9 @@ fn expected_combinations(spec: &InstanceTypeSpec) -> BTreeSet<Combination> {
 
 /// Every catalogued instance type name, in catalog order.
 fn catalogued_names() -> Vec<String> {
-    INSTANCE_TYPE_CATALOG
+    instance_type_catalog()
         .iter()
-        .map(|spec| spec.instance_type.to_string())
+        .map(|spec| spec.instance_type.clone())
         .collect()
 }
 
@@ -188,7 +188,7 @@ async fn walk(
     // The catalog is finite and a page carries at least one entry, so this many
     // requests is past any legitimate walk: a token that never terminates is a bug,
     // not a hang.
-    for _ in 0..(INSTANCE_TYPE_CATALOG.len() + 2) {
+    for _ in 0..(instance_type_catalog().len() + 2) {
         let page = ok(router, "ListInstanceTypes", request.clone()).await;
         let page_names = names(&page);
         page_lengths.push(page_names.len());
@@ -222,7 +222,7 @@ async fn the_catalog_is_reported_in_full_and_is_not_per_account_state() {
 
     for entry in entries(&page) {
         let name = entry["InstanceType"].as_str().unwrap_or_default().to_string();
-        let spec = INSTANCE_TYPE_CATALOG
+        let spec = instance_type_catalog()
             .iter()
             .find(|spec| spec.instance_type == name)
             .unwrap_or_else(|| panic!("case {name}: reported an instance type the catalog does not hold"));
@@ -288,10 +288,10 @@ async fn a_filter_reports_exactly_the_instance_types_that_support_the_combinatio
                         "Tenancy": tenancy,
                     }
                 });
-                let expected: Vec<String> = INSTANCE_TYPE_CATALOG
+                let expected: Vec<String> = instance_type_catalog()
                     .iter()
                     .filter(|spec| spec.supports(billing_mode, platform_type, tenancy))
-                    .map(|spec| spec.instance_type.to_string())
+                    .map(|spec| spec.instance_type.clone())
                     .collect();
 
                 let page = ok(&router, "ListInstanceTypes", filter.clone()).await;
@@ -342,7 +342,9 @@ async fn paging_walks_the_same_catalog_at_every_page_size() {
     let catalog_len = full.len();
 
     // `ListInstanceTypesMaxResults` is `range 1..600`: both published bounds are here,
-    // plus the sizes either side of the catalog's own length.
+    // plus the sizes either side of the catalog's own length. The catalog fits inside
+    // the modelled maximum page, so a size past its length is clamped to that maximum
+    // rather than sent outside the modelled range.
     let page_sizes = [
         1,
         2,
@@ -350,7 +352,7 @@ async fn paging_walks_the_same_catalog_at_every_page_size() {
         7,
         catalog_len - 1,
         catalog_len,
-        catalog_len + 1,
+        (catalog_len + 1).min(600),
         600,
     ];
     for size in page_sizes {
@@ -386,10 +388,10 @@ async fn paging_walks_the_same_catalog_at_every_page_size() {
         "PlatformType": "Windows",
         "Tenancy": "DEDICATED",
     });
-    let expected: Vec<String> = INSTANCE_TYPE_CATALOG
+    let expected: Vec<String> = instance_type_catalog()
         .iter()
         .filter(|spec| spec.supports("MONTHLY", "Windows", "DEDICATED"))
-        .map(|spec| spec.instance_type.to_string())
+        .map(|spec| spec.instance_type.clone())
         .collect();
     for size in [1, 2, expected.len()] {
         let (reported, _, _) = walk(
@@ -465,7 +467,7 @@ async fn a_request_outside_the_modelled_pagination_contract_is_refused() {
     let token = first
         .get("NextToken")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("a one-entry page of an 18-entry catalog carries a NextToken, got {first}"));
+        .unwrap_or_else(|| panic!("a one-entry page of a multi-entry catalog carries a NextToken, got {first}"));
     let second = ok(
         &router,
         "ListInstanceTypes",
@@ -489,24 +491,24 @@ async fn the_catalog_rows_are_modelled_names_in_a_stable_order() {
     // one: the catalog spans more than a page at every size tested, and both tenancy
     // sets are populated, so `InstanceConfigurationFilter` has something to select on.
     assert!(
-        INSTANCE_TYPE_CATALOG.len() >= 8,
+        instance_type_catalog().len() >= 8,
         "the catalog must span more than one page at the sizes tested, got {} rows",
-        INSTANCE_TYPE_CATALOG.len()
+        instance_type_catalog().len()
     );
     assert!(
-        INSTANCE_TYPE_CATALOG
+        instance_type_catalog()
             .iter()
             .any(|spec| spec.tenancies.contains(&"DEDICATED")),
         "the catalog must hold at least one instance type offering DEDICATED tenancy"
     );
     assert!(
-        INSTANCE_TYPE_CATALOG
+        instance_type_catalog()
             .iter()
             .any(|spec| !spec.tenancies.contains(&"DEDICATED")),
         "the catalog must hold at least one instance type that is SHARED-tenancy only"
     );
     assert!(
-        INSTANCE_TYPE_CATALOG
+        instance_type_catalog()
             .iter()
             .any(|spec| spec.platform_types.len() < PLATFORM_TYPE_ENUM_VALUES.len()),
         "the catalog must hold at least one instance type that carries only some platforms"
@@ -547,7 +549,7 @@ async fn the_catalog_rows_are_modelled_names_in_a_stable_order() {
     // documented dimensions in `state.rs` (GPU families carry no Red Hat or SUSE
     // image; the burstable `t3` family is shared-tenancy only).
     let row = |name: &str| {
-        INSTANCE_TYPE_CATALOG
+        instance_type_catalog()
             .iter()
             .find(|spec| spec.instance_type == name)
             .unwrap_or_else(|| panic!("the catalog holds {name}"))

@@ -40,10 +40,14 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
+
+/// How this service words a request the boundary validator refused. A submodule rather
+/// than a block in this file: it is the longest of the seams and it is driven by the
+/// MODEL (the constraint a value failed, the shapes a member targets), while everything
+/// else here is routing.
+pub mod validation;
 
 /// The `com-amazonaws-identitystore-awsidentitystore` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -97,16 +101,31 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // This service states a constraint violation in the AWS validation envelope
+        // with its own three rules — the reported `@pattern` is the expression the
+        // service applies rather than the model's trait text, a `@sensitive` member's
+        // value is not echoed, and violations on the elements of a list member are
+        // reported once at that member with its element shape's whole constraint set.
+        // All three live in [`validation`].
+        //
+        // The STATUS and the CODE are already what the model declares for this
+        // refusal (`ValidationException`, `@httpError(400)`); only the MESSAGE
+        // differs. The code is restated unchanged alongside it, because `Refused`
+        // carries both and a message without its matching code is worse than leaving
+        // both alone.
+        //
+        // An authentication refusal is left to the framework: it is not a
+        // modelled-input failure and this service does not restate it.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        Some(Refused {
+            code: "ValidationException".to_string(),
+            message: validation::message(violations)?,
+        })
     }
 
     fn override_routing_error(

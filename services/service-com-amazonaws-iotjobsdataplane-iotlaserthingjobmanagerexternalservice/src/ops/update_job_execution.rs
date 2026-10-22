@@ -235,9 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(UpdateJobExecutionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "no job execution {} for thing {}",
-                        input.job_id, input.thing_name
+                    message: Some(crate::state::not_found_message(
+                        &input.job_id,
+                        &input.thing_name,
                     )),
                 },
             )
@@ -270,14 +270,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An execution that has reached a terminal status is finished: no further
         // update can move it — the case `InvalidStateTransitionException` itself
         // documents ("an attempt to change a request in state SUCCESS to state
-        // IN_PROGRESS").
+        // IN_PROGRESS"). The 409 is what tells a client retrying after a terminal
+        // transition apart from one naming an execution that does not exist (404).
         if record.is_terminal() {
             return Err(
                 UpdateJobExecutionErrorModeled::InvalidStateTransitionException(
                     InvalidStateTransitionException {
-                        message: Some(format!(
-                            "job execution {} is in terminal status {} and cannot be changed to {}",
-                            record.job_id, record.status, input.status
+                        message: Some(crate::state::already_finished_message(
+                            &record.job_id,
+                            &record.thing_name,
+                            &record.status,
                         )),
                     },
                 )
@@ -298,8 +300,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         record.status = input.status.clone();
         record.arm_step_timer(input.step_timeout_in_minutes, now);
-        if record.status == STATUS_IN_PROGRESS && record.started_at.is_none() {
-            record.started_at = Some(now);
+        if record.status == STATUS_IN_PROGRESS {
+            // The device reporting IN_PROGRESS is a start: it records `startedAt`
+            // and arms the job's in-progress timer on the first one.
+            record.start(now);
         }
         record.last_updated_at = now;
         // "Job execution versions are incremented each time they are updated by a
@@ -311,11 +315,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             execution_state: input
                 .include_job_execution_state
                 .unwrap_or(false)
-                .then(|| record.to_execution_state()),
+                .then(|| crate::state::to_execution_state(record)),
             job_document: input
                 .include_job_document
                 .unwrap_or(false)
-                .then(|| record.job_document.clone()),
+                .then(|| record.job_document.clone())
+                .flatten(),
         })
     }
 }

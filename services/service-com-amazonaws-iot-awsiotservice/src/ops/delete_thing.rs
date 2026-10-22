@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteThing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteThing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteThing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the thing from the registry, so a later read of that name is the
+//! modelled 404. It is IDEMPOTENT, exactly as the operation documents: "Returns
+//! successfully with no error if the deletion is successful or you specify a thing
+//! that doesn't exist" — so a name the registry does not hold is a 200, not a 404.
+//! An `expectedVersion` that does not match the stored record is the modelled
+//! `VersionConflictException` (409) and deletes nothing.
+//!
+//! A thing's JOB EXECUTIONS are not touched: they are the IoT Jobs data plane's
+//! records, keyed by the thing NAME, and that surface accepts a name the registry
+//! does not hold (see `CreateJob`). Deleting the executions of a job is `DeleteJob`'s
+//! own documented behaviour.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +154,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteThing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteThingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteThing"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteThingErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // "If the version of the record in the registry does not match the expected
+        // version specified in the request, the DeleteThing request is rejected with
+        // a VersionConflictException" — checked BEFORE anything is removed, so a
+        // rejected delete leaves the thing exactly as it was.
+        if let Some(expected) = input.expected_version {
+            if let Some(registered) = store.things.get(&input.thing_name) {
+                if registered.version != expected {
+                    return Err(DeleteThingErrorModeled::VersionConflictException(
+                        VersionConflictException {
+                            message: Some(format!(
+                                "expectedVersion {expected} does not match the version {} of thing {}",
+                                registered.version, registered.thing_name
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // Idempotent by documentation: a name the registry does not hold is still a
+        // success, so a retried delete does not turn into a 404.
+        store.things.remove(&input.thing_name);
+        Ok(DeleteThingOutput {})
     }
 }

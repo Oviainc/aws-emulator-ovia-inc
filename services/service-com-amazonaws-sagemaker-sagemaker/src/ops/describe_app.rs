@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeApp
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeApp`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeApp::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: replays the app `CreateApp` stored under the same
+//! [`crate::state::AppKey`], materialising the `Pending` -> `InService` transition the
+//! clock already owes, and refuses a key nothing created with the modelled
+//! `ResourceNotFound`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +178,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeApp` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAppErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeApp"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| DescribeAppError::validation(crate::state::NO_STATE))?;
+
+        let key = crate::state::app_key(
+            &input.domain_id,
+            input.user_profile_name.as_deref(),
+            input.space_name.as_deref(),
+            &input.app_type,
+            &input.app_name,
+        )
+        .map_err(DescribeAppError::validation)?;
+        let arn = crate::state::app_arn(&crate::state::request_region(ctx), &key);
+
+        let mut store = state.lock();
+        let Some(app) = store.apps.get_mut(&key) else {
+            return Err(DescribeAppErrorModeled::ResourceNotFound(ResourceNotFound {
+                // Same wording `DeleteApp` refuses with: the app's ARN, which names every
+                // member that identifies it, inside the sentence that says it is not there.
+                message: Some(format!("App [{arn}] does not exist.")),
+            })
+            .into());
+        };
+
+        // The only write a reporting call makes: the launch the clock already owed. It
+        // was due at the stored instant whether or not anybody described the app, so a
+        // waiter terminates and no caller's read changes the outcome.
+        let settled = app.settle_status(::std::time::SystemTime::now());
+        // The ARN the create stored, which the output reports and the state-change record
+        // below names — cloned once, since `output` borrows nothing of the store.
+        let app_arn = app.arn.clone();
+
+        let output = DescribeAppOutput {
+            app_arn: Some(app_arn.clone()),
+            app_type: Some(key.app_type.clone()),
+            app_name: Some(key.app_name.clone()),
+            domain_id: Some(key.domain_id.clone()),
+            user_profile_name: key.owner.user_profile_name(),
+            space_name: key.owner.space_name(),
+            status: Some(app.status.clone()),
+            recovery_mode: app.recovery_mode,
+            creation_time: Some(crate::state::timestamp(app.creation_time)),
+            resource_spec: app.resource_spec.clone(),
+            // This emulator runs no Studio app container, so nothing has health-checked
+            // the app and no user has touched it: there is no timestamp to report for
+            // either, and no failure to report on an app that is launching or running.
+            last_health_check_timestamp: None,
+            last_user_activity_timestamp: None,
+            failure_reason: None,
+            // Trusted identity propagation and the built-in lifecycle configuration are
+            // domain- and space-level settings written by `CreateDomain` / `CreateSpace`,
+            // which are still scaffolds, so this emulator holds nothing to report.
+            effective_trusted_identity_propagation_status: None,
+            built_in_lifecycle_config_arn: None,
+        };
+        drop(store);
+
+        if settled {
+            // The transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, &app_arn, ctx);
+        }
+        Ok(output)
     }
 }

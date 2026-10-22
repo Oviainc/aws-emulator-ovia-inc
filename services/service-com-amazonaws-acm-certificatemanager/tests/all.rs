@@ -19,3 +19,5 @@ mod certificate_list_filters;
 mod certificate_validation_state_machine;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/validation_domain_superdomain.rs"]
+mod validation_domain_superdomain;

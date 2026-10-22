@@ -3,7 +3,7 @@
 //! @op ListInstanceTypes
 //!
 //! Reports this service's instance-type catalog
-//! ([`crate::state::INSTANCE_TYPE_CATALOG`]): the instance types WorkSpaces Instances
+//! ([`crate::state::instance_type_catalog`]): the instance types WorkSpaces Instances
 //! supports, each with the configuration combinations it supports. Reporting only —
 //! the catalog is fixed service data, not per-account state, so no operation can
 //! create or change an instance type and this one writes nothing (`@readonly`).
@@ -212,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut instance_types = Vec::new();
         let mut next_token = None;
-        for spec in &crate::state::INSTANCE_TYPE_CATALOG[resume_from..] {
+        for spec in &crate::state::instance_type_catalog()[resume_from..] {
             if filter.is_some_and(|wanted| {
                 !spec.supports(&wanted.billing_mode, &wanted.platform_type, &wanted.tenancy)
             }) {
@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             if instance_types.len() == page_size {
                 // One past the page: its name is what the next page resumes at.
-                next_token = Some(crate::state::encode_next_token(spec.instance_type));
+                next_token = Some(crate::state::encode_next_token(&spec.instance_type));
                 break;
             }
             instance_types.push(spec.info());

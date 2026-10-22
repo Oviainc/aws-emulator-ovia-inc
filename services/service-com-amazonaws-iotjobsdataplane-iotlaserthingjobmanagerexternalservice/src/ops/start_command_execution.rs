@@ -92,13 +92,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{JobExecutionRecord, STATUS_QUEUED};
+use crate::state::JobExecutionRecord;
 
 /// `JobDocument`'s modeled maximum length (len 0..32768).
 const MAX_JOB_DOCUMENT_LEN: usize = 32_768;
-
-/// `ThingName`'s modeled maximum length (len 1..128).
-const MAX_THING_NAME_LEN: usize = 128;
 
 /// The thing name `target_arn` names, as the device whose queue the execution is
 /// enqueued on. `targetArn` is documented as "the ARN of the device where the
@@ -125,20 +122,16 @@ fn thing_name_from_target_arn(target_arn: &str) -> Result<String, StartCommandEx
     let Some(thing_name) = resource.strip_prefix("thing/") else {
         return Err(invalid("must name a thing, as arn:<partition>:iot:<region>:<account>:thing/<name>"));
     };
-    // The ARN's resource segment has to satisfy `ThingName` for the execution to
-    // be reachable through the `/things/{thingName}/jobs` operations. Smithy
-    // `length` counts characters, so the check does too.
-    let thing_name_len = thing_name.chars().count();
-    if thing_name_len == 0 || thing_name_len > MAX_THING_NAME_LEN {
-        return Err(invalid("names a thing whose name is not 1..128 characters long"));
-    }
-    if !thing_name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
-    {
-        return Err(invalid(
-            "names a thing whose name does not match ^[a-zA-Z0-9:_-]+$",
-        ));
+    // The ARN's resource segment has to satisfy `ThingName` for the execution to be
+    // reachable through the `/things/{thingName}` operations. The rule is the shared
+    // one every service of the IoT family parses a thing ARN with
+    // (`service_common::iot_job_executions::is_modeled_thing_name`), so the two
+    // planes cannot disagree about which names are addressable.
+    if !::service_common::iot_job_executions::is_modeled_thing_name(thing_name) {
+        return Err(invalid(&format!(
+            "names a thing whose name is not 1..{} characters matching ^[a-zA-Z0-9:_-]+$",
+            ::service_common::iot_job_executions::MAX_THING_NAME_LEN
+        )));
     }
     Ok(thing_name.to_string())
 }
@@ -371,28 +364,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = crate::state::now_epoch_seconds();
-        let execution_id = state.mint_execution_id();
-        if let Err(quota) = state.try_insert_execution(JobExecutionRecord {
-            job_id: execution_id.clone(),
+        let execution_id = crate::state::mint_execution_id(&mut state);
+        let mut record = JobExecutionRecord::queued(
+            execution_id.clone(),
             thing_name,
-            status: STATUS_QUEUED.to_string(),
-            status_details: std::collections::BTreeMap::new(),
-            queued_at: now,
-            started_at: None,
-            last_updated_at: now,
-            // A device update has not happened yet, so this is version 1.
-            version_number: 1,
-            // This call mints a new job id, so the device has run no earlier
-            // execution of it: this is that job's first execution on the device.
-            execution_number: 1,
-            step_timeout_expires_at: None,
-            // "A timer is started as soon as the command execution is created" —
-            // `executionTimeoutSeconds`.
-            execution_timeout_expires_at: input
-                .execution_timeout_seconds
-                .map(|seconds| now.saturating_add(seconds)),
-            job_document: document,
-        }) {
+            Some(document),
+            now,
+        );
+        // "A timer is started as soon as the command execution is created" —
+        // `executionTimeoutSeconds`.
+        record.execution_timeout_expires_at = input
+            .execution_timeout_seconds
+            .map(|seconds| now.saturating_add(seconds));
+        if let Err(quota) = state.try_insert_execution(record) {
             return Err(
                 StartCommandExecutionErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
