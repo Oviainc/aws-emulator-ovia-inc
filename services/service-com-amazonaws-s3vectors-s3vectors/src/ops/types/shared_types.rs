@@ -29,6 +29,28 @@ pub struct ConflictException {
     pub message: String,
 }
 
+/// One entry of [`ValidationException::field_list`]: the path of the member that
+/// failed validation and why it failed.
+#[smithy_macros::smithy(shape = "com.amazonaws.s3vectors#ValidationExceptionField")]
+#[derive(Debug, Clone, Default)]
+pub struct ValidationExceptionField {
+    pub path: String,
+    pub message: String,
+}
+
+/// The service's OWN `ValidationException` (HTTP 400). Preferred over
+/// `crate::scaffolded::Scaffolded::validation`, because the modelled shape
+/// carries `fieldList` — the member path a client reads to point at the input it
+/// has to fix. It is a service-wide ("common") error rather than one listed on
+/// each operation, so an operation that returns it widens it in with
+/// `#[operation_error(.., extra_errors = ["ValidationException"])]`.
+#[smithy_macros::smithy(shape = "com.amazonaws.s3vectors#ValidationException")]
+#[derive(Debug, Clone, Default)]
+pub struct ValidationException {
+    pub message: String,
+    pub field_list: Option<Vec<ValidationExceptionField>>,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.s3vectors#EncryptionConfiguration")]
 #[derive(Debug, Clone, Default)]
 pub struct EncryptionConfiguration {

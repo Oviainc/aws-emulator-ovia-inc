@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVectorBucket
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVectorBucket`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVectorBucket::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored vector bucket from [`crate::state`], refusing a
+//! bucket that still holds vector indexes. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -88,9 +82,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // here — hence the `DeleteVectorBucketError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3vectors#DeleteVectorBucket")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3vectors#DeleteVectorBucket",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum DeleteVectorBucketErrorModeled {
+    ValidationException(ValidationException),
     ConflictException(ConflictException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -147,18 +145,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVectorBucket` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVectorBucketErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVectorBucket"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteVectorBucketErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let bucket_name = crate::state::resolve_bucket_name(
+            input.vector_bucket_name.as_deref(),
+            input.vector_bucket_arn.as_deref(),
+        )
+        .map_err(refusal)?;
+
+        let mut store = state.lock();
+        let bucket = store.bucket(&bucket_name).map_err(refusal)?;
+        // "All vector indexes in the vector bucket must be deleted before the vector
+        // bucket can be deleted" — so a non-empty bucket is refused rather than
+        // silently dropping the indexes it holds.
+        if !bucket.indexes.is_empty() {
+            return Err(DeleteVectorBucketErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "vector bucket {bucket_name} still holds {} vector index(es); \
+                     delete them before deleting the vector bucket",
+                    bucket.indexes.len()
+                ),
+            })
+            .into());
+        }
+        let arn = bucket.arn.clone();
+        store.buckets.remove(&bucket_name);
+        store.tags.remove(&arn);
+
+        Ok(DeleteVectorBucketOutput {})
+    }
+}
+
+/// Lift a refusal from `crate::state` into this operation's modelled error channel.
+fn refusal(error: crate::state::LookupError) -> DeleteVectorBucketError {
+    if error.is_not_found() {
+        DeleteVectorBucketErrorModeled::NotFoundException(error.not_found_exception()).into()
+    } else {
+        DeleteVectorBucketErrorModeled::ValidationException(error.validation_exception()).into()
     }
 }

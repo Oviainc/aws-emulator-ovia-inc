@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVectorBucket
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVectorBucket`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVectorBucket::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a vector bucket in [`crate::state`] and returns the ARN it
+//! minted for it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -100,9 +93,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // here — hence the `CreateVectorBucketError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3vectors#CreateVectorBucket")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3vectors#CreateVectorBucket",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum CreateVectorBucketErrorModeled {
+    ValidationException(ValidationException),
     ConflictException(ConflictException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -159,18 +156,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVectorBucket` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVectorBucketErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVectorBucket"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateVectorBucketErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        crate::state::validate_resource_name("vectorBucketName", &input.vector_bucket_name)
+            .map_err(refusal)?;
+        let encryption = crate::state::encryption_record(
+            input.encryption_configuration.as_ref(),
+            crate::state::EncryptionRecord::default(),
+        )
+        .map_err(refusal)?;
+
+        // The ARN is minted once, here, from the region the caller signed for, and is
+        // what every later read of this bucket reports.
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::bucket_arn(&region, &input.vector_bucket_name);
+
+        let mut store = state.lock();
+        if store.buckets.contains_key(&input.vector_bucket_name) {
+            return Err(CreateVectorBucketErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "vector bucket already exists: {}",
+                    input.vector_bucket_name
+                ),
+            })
+            .into());
+        }
+        // The store is this process's memory, so the ceilings in `crate::state`
+        // are what keep a create loop from growing it without bound.
+        if let Some(message) = crate::state::bucket_quota_exceeded(&store) {
+            return Err(quota_exceeded(message));
+        }
+        if let Some(message) = input.tags.as_ref().and_then(crate::state::tag_quota_exceeded) {
+            return Err(quota_exceeded(message));
+        }
+        store.buckets.insert(
+            input.vector_bucket_name.clone(),
+            crate::state::VectorBucketRecord {
+                name: input.vector_bucket_name.clone(),
+                arn: arn.clone(),
+                creation_time: ::std::time::SystemTime::now(),
+                encryption,
+                default_index_mode: None,
+                indexes: ::std::collections::BTreeMap::new(),
+            },
+        );
+        if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
+            store.tags.insert(arn.clone(), tags.into_iter().collect());
+        }
+
+        Ok(CreateVectorBucketOutput {
+            vector_bucket_arn: arn,
+        })
     }
+}
+
+/// Lift a refusal from `crate::state` into this operation's modelled error channel.
+/// Only the `ValidationException` case can arise here: CreateVectorBucket resolves no
+/// existing resource, so no lookup can miss.
+fn refusal(error: crate::state::LookupError) -> CreateVectorBucketError {
+    CreateVectorBucketErrorModeled::ValidationException(error.validation_exception()).into()
+}
+
+/// The modelled quota refusal (HTTP 402) for a request the store has no room for.
+fn quota_exceeded(message: String) -> CreateVectorBucketError {
+    CreateVectorBucketErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message,
+    })
+    .into()
 }

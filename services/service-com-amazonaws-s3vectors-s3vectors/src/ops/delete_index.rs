@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored vector index, and every vector it holds, from
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -83,9 +76,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // here — hence the `DeleteIndexError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3vectors#DeleteIndex")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3vectors#DeleteIndex",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum DeleteIndexErrorModeled {
+    ValidationException(ValidationException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -141,18 +138,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIndex"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteIndexErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let (bucket_name, index_name) = crate::state::resolve_index_name(
+            input.vector_bucket_name.as_deref(),
+            input.index_name.as_deref(),
+            input.index_arn.as_deref(),
+        )
+        .map_err(refusal)?;
+
+        let mut store = state.lock();
+        // Resolved first, so deleting an index that is not there is the 404 rather
+        // than a silent success.
+        let arn = store.index(&bucket_name, &index_name).map_err(refusal)?.arn.clone();
+        store
+            .bucket_mut(&bucket_name)
+            .map_err(refusal)?
+            .indexes
+            .remove(&index_name);
+        store.tags.remove(&arn);
+
+        Ok(DeleteIndexOutput {})
+    }
+}
+
+/// Lift a refusal from `crate::state` into this operation's modelled error channel.
+fn refusal(error: crate::state::LookupError) -> DeleteIndexError {
+    if error.is_not_found() {
+        DeleteIndexErrorModeled::NotFoundException(error.not_found_exception()).into()
+    } else {
+        DeleteIndexErrorModeled::ValidationException(error.validation_exception()).into()
     }
 }

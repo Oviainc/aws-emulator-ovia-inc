@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIndex
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIndex`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIndex::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: registers a vector index under its parent vector bucket in
+//! [`crate::state`] and returns the ARN it minted for it. This is the ONLY file to
+//! touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -115,9 +109,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // here — hence the `CreateIndexError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3vectors#CreateIndex")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3vectors#CreateIndex",
+    extra_errors = ["ValidationException"]
+)]
 #[derive(Debug)]
 pub enum CreateIndexErrorModeled {
+    ValidationException(ValidationException),
     ConflictException(ConflictException),
     NotFoundException(NotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
@@ -175,18 +173,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIndex` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIndexErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIndex"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateIndexErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let bucket_name = crate::state::resolve_bucket_name(
+            input.vector_bucket_name.as_deref(),
+            input.vector_bucket_arn.as_deref(),
+        )
+        .map_err(refusal)?;
+        crate::state::validate_resource_name("indexName", &input.index_name).map_err(refusal)?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::index_arn(&region, &bucket_name, &input.index_name);
+
+        let mut store = state.lock();
+        let bucket = store.bucket(&bucket_name).map_err(refusal)?;
+        if bucket.indexes.contains_key(&input.index_name) {
+            return Err(CreateIndexErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "vector index already exists: {} in vector bucket {bucket_name}",
+                    input.index_name
+                ),
+            })
+            .into());
+        }
+        // An index with no encryption configuration of its own uses the parent
+        // bucket's, and inherits the bucket's default index mode.
+        let encryption = crate::state::encryption_record(
+            input.encryption_configuration.as_ref(),
+            bucket.encryption.clone(),
+        )
+        .map_err(refusal)?;
+        let index_mode = bucket.default_index_mode.clone();
+        // The store is this process's memory, so the ceilings in `crate::state`
+        // are what keep a create loop from growing it without bound.
+        if let Some(message) = crate::state::index_quota_exceeded(bucket) {
+            return Err(quota_exceeded(message));
+        }
+        if let Some(message) = input.tags.as_ref().and_then(crate::state::tag_quota_exceeded) {
+            return Err(quota_exceeded(message));
+        }
+
+        let record = crate::state::VectorIndexRecord {
+            bucket_name: bucket_name.clone(),
+            name: input.index_name.clone(),
+            arn: arn.clone(),
+            creation_time: ::std::time::SystemTime::now(),
+            data_type: input.data_type,
+            dimension: input.dimension,
+            distance_metric: input.distance_metric,
+            non_filterable_metadata_keys: input
+                .metadata_configuration
+                .map(|configuration| configuration.non_filterable_metadata_keys),
+            encryption,
+            index_mode,
+            vectors: ::std::collections::BTreeMap::new(),
+        };
+        store
+            .bucket_mut(&bucket_name)
+            .map_err(refusal)?
+            .indexes
+            .insert(input.index_name.clone(), record);
+        if let Some(tags) = input.tags.filter(|tags| !tags.is_empty()) {
+            store.tags.insert(arn.clone(), tags.into_iter().collect());
+        }
+
+        Ok(CreateIndexOutput { index_arn: arn })
     }
+}
+
+/// Lift a refusal from `crate::state` into this operation's modelled error channel:
+/// an absent parent vector bucket is the 404, a broken input rule the 400.
+fn refusal(error: crate::state::LookupError) -> CreateIndexError {
+    if error.is_not_found() {
+        CreateIndexErrorModeled::NotFoundException(error.not_found_exception()).into()
+    } else {
+        CreateIndexErrorModeled::ValidationException(error.validation_exception()).into()
+    }
+}
+
+/// The modelled quota refusal (HTTP 402) for a request the store has no room for.
+fn quota_exceeded(message: String) -> CreateIndexError {
+    CreateIndexErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message,
+    })
+    .into()
 }
