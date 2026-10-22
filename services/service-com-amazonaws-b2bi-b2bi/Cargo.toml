@@ -8,6 +8,8 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# Hex codec for the opaque `nextToken` the @paginated List operations issue.
+hex = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
