@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 CreateDBSnapshotError::from(CreateDBSnapshotErrorModeled::DBInstanceNotFoundFault(
                     DBInstanceNotFoundFault {
-                        message: Some(format!("DBInstance {source_identifier} not found")),
+                        message: Some(format!("DBInstance {source_identifier} not found.")),
                     },
                 ))
             })?;

@@ -1917,7 +1917,7 @@ async fn instance_filters_select_by_every_documented_name() {
         "emu-filter-pg",
         "postgres",
         "db.t3.micro",
-        &params!["DBClusterIdentifier" => "emu-cluster", "Domain" => "d-emu1"],
+        &params!["Domain" => "d-emu1"],
     )
     .await;
     create_available_instance(&router, "emu-filter-my", "mysql", "db.t3.micro", &[]).await;
@@ -1952,10 +1952,15 @@ async fn instance_filters_select_by_every_documented_name() {
             expected: &["emu-filter-pg"],
         },
         FilterCase {
+            // `CreateDBInstance` resolves `DBClusterIdentifier` against this service's DB
+            // cluster records before admitting the instance, and this service holds none
+            // (every operation that could create a cluster is still a scaffolded 501), so
+            // no instance here belongs to a cluster and this filter selects nothing. The
+            // refusal itself is pinned in `docdb_query_surface`.
             case: "by cluster",
             name: "db-cluster-id",
             value: "emu-cluster".to_string(),
-            expected: &["emu-filter-pg"],
+            expected: &[],
         },
         FilterCase {
             case: "by domain",

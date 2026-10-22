@@ -760,7 +760,9 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
         /// engines (Oracle, SQL Server) on multithreaded Intel classes only.
         core_count: Option<(&'static str, &'static str)>,
         /// `SupportsClusters` — a Multi-AZ DB cluster, offered on the MySQL and
-        /// PostgreSQL engines and never on a burstable class.
+        /// PostgreSQL engines and never on a burstable class; an engine of another control
+        /// plane this door serves (DocumentDB, Neptune) reports it for every option, since
+        /// such an instance is only ever a member of its cluster.
         supports_clusters: bool,
         /// `SupportsDedicatedLogVolume` — a volume ordered with the instance, which
         /// Aurora's cluster-managed storage does not take.
@@ -859,7 +861,7 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             activity_stream_modes: &[],
             // Not a core-licensed engine, and its storage is cluster-managed.
             core_count: None,
-            supports_clusters: false,
+            supports_clusters: true,
             supports_dedicated_log_volume: false,
         },
         CapabilityCase {
@@ -867,7 +869,8 @@ async fn an_options_capabilities_follow_its_engine_and_its_class() {
             db_instance_class: "db.t3.medium",
             activity_stream_modes: &[],
             core_count: None,
-            supports_clusters: false,
+            // A cluster member whatever its class, burstable included.
+            supports_clusters: true,
             supports_dedicated_log_volume: false,
         },
     ];

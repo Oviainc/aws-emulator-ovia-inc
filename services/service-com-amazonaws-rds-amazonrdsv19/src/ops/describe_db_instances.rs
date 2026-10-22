@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         DescribeDBInstancesError::from(
                             DescribeDBInstancesErrorModeled::DBInstanceNotFoundFault(
                                 DBInstanceNotFoundFault {
-                                    message: Some(format!("DBInstance {identifier} not found")),
+                                    message: Some(format!("DBInstance {identifier} not found.")),
                                 },
                             ),
                         )

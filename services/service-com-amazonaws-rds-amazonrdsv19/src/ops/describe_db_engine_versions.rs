@@ -187,19 +187,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_filter_terms(&filters)
             .map_err(DescribeDBEngineVersionsError::validation)?;
 
+        // The CA certificates every entry of this report can be launched with: read ONCE
+        // from the certificate catalogue, because they are a property of the catalogue and
+        // the instant the request arrived, not of any one engine version.
+        let certificates = crate::state::supported_ca_certificate_identifiers();
         // `catalogue()` yields the rows in catalogue order, so the keys below ascend and
         // `paginate` can cut a page from them directly.
         let matching: Vec<(String, CreateCustomDBEngineVersionOutput)> = catalogue()
             .filter(|(_, entry, _)| matches_request(entry, &input, &filters))
-            .map(|(index, entry, facts)| (page_key(index), to_wire(entry, facts, index, &input)))
+            .map(|(index, entry, facts)| {
+                (
+                    page_key(index),
+                    to_wire(entry, facts, index, &input, &certificates),
+                )
+            })
             .collect();
         // `DefaultOnly` reports "only the default version of the specified engine or the
         // engine and major version combination" — so there has to BE a specified engine
-        // whose default to report, and this service has to publish a default for it. A
-        // request that names no engine at all, or one this service publishes no default
-        // version for, resolves to no default: it is refused as the parameter
-        // combination it is, rather than answered with an arbitrary version or with an
-        // empty list that would read as "this engine has no default".
+        // whose default to report, and this door has to resolve a default for it (see
+        // [`resolves_a_default_version`]: it resolves none for an engine it reports on
+        // behalf of another control plane). A request that names no engine at all, or one
+        // whose default does not resolve here, resolves to no default: it is refused as
+        // the parameter combination it is, rather than answered with an arbitrary version
+        // or with an empty list that would read as "this engine has no versions".
         if input.default_only == Some(true) {
             let engine_named = input.engine.is_some()
                 || input.db_parameter_group_family.is_some()
@@ -207,12 +217,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     matches!(filter.name.as_str(), "engine" | "db-parameter-group-family")
                 });
             if !engine_named || matching.is_empty() {
-                return Err(
-                    DescribeDBEngineVersionsError::invalid_parameter_combination(format!(
-                        "RDS can't find a default engine version for {}",
-                        requested_engine(&input, &filters)
-                    )),
-                );
+                return Err(DescribeDBEngineVersionsError::invalid_parameter_combination(
+                    NO_DEFAULT_ENGINE_VERSION,
+                ));
             }
         }
 
@@ -267,32 +274,12 @@ fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
 /// exactly two valid statuses, "`available`" and "`deprecated`".
 pub(crate) const STATUS_AVAILABLE: &str = "available";
 
-/// How the request named the engine whose DEFAULT version it asked for — what the
-/// refusal of an unresolvable `DefaultOnly` request quotes back, so the caller can see
-/// which combination resolved to no default version.
-fn requested_engine(input: &DescribeDBEngineVersionsInput, filters: &[Filter]) -> String {
-    let mut named: Vec<String> = Vec::new();
-    if let Some(engine) = &input.engine {
-        named.push(format!("Engine={engine}"));
-    }
-    if let Some(version) = &input.engine_version {
-        named.push(format!("EngineVersion={version}"));
-    }
-    if let Some(family) = &input.db_parameter_group_family {
-        named.push(format!("DBParameterGroupFamily={family}"));
-    }
-    for filter in filters {
-        named.push(format!(
-            "Filters[{}]={}",
-            filter.name,
-            filter.values.join(",")
-        ));
-    }
-    if named.is_empty() {
-        return "a request naming no engine".to_string();
-    }
-    named.join(", ")
-}
+/// The refusal of a `DefaultOnly` request that resolves to no default engine version.
+///
+/// The whole message, exactly as this front door states it: the combination that failed
+/// to resolve is the request's own, and the refusal names no part of it (the status and
+/// the `InvalidParameterCombination` code are what a client branches on).
+const NO_DEFAULT_ENGINE_VERSION: &str = "RDS can't find a default engine version.";
 
 /// An engine version AWS no longer offers for a new instance. `IncludeAll` is what asks
 /// for these: "Specifies whether to also list the engine versions that aren't available.
@@ -491,18 +478,6 @@ impl VersionProfile {
         self
     }
 }
-
-/// `SupportedCACertificateIdentifiers`: the CA certificates a DB instance of an engine
-/// version can be given through `CreateDBInstance`'s `CACertificateIdentifier`.
-///
-/// The member's own documentation points at "Using SSL/TLS to encrypt a connection to a
-/// DB instance"; these are the Amazon RDS certificate authorities that page publishes —
-/// one ECDSA and two RSA CAs — which every engine version in this catalogue supports.
-const CA_CERTIFICATE_IDENTIFIERS: &[&str] = &[
-    "rds-ca-ecc384-g1",
-    "rds-ca-rsa2048-g1",
-    "rds-ca-rsa4096-g1",
-];
 
 /// The `SupportedFeatureNames` of an RDS for MySQL version.
 ///
@@ -1553,6 +1528,45 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
     ),
 ];
 
+/// Whether `engine` is a CLUSTER engine — one whose instances are members of a DB
+/// cluster, which owns their storage and their endpoints: the Aurora engines, and the
+/// Amazon DocumentDB and Amazon Neptune engines this same front door serves
+/// (`src/service.rs`).
+///
+/// `pub(crate)` because `DescribeOrderableDBInstanceOptions` reports on the same engines
+/// and must not disagree with this report about which of them are cluster engines.
+pub(crate) fn is_cluster_engine(engine: &str) -> bool {
+    crate::state::is_aurora(engine) || serves_another_control_plane(engine)
+}
+
+/// Whether `engine` belongs to ANOTHER control plane this one front door serves: the
+/// Amazon DocumentDB and Amazon Neptune engines, whose own APIs (`aws docdb …`,
+/// `aws neptune …`) are served on this endpoint because all three models publish the same
+/// wire identity (`src/service.rs`). Their names are the valid values documented on
+/// `CreateDBClusterMessage$Engine` in those models, and are not values THIS model's
+/// `Engine` member lists.
+///
+/// `pub(crate)` because `DescribeOrderableDBInstanceOptions` reports on the same engines.
+pub(crate) fn serves_another_control_plane(engine: &str) -> bool {
+    matches!(engine, "docdb" | "neptune")
+}
+
+/// Whether a DEFAULT engine version resolves for `engine` on this front door — what
+/// `DefaultOnly` selects, and so what decides between a report and an
+/// `InvalidParameterCombination` refusal.
+///
+/// An engine this door reports on behalf of ANOTHER control plane
+/// ([`serves_another_control_plane`]), whose own API owns the engine version a cluster is
+/// created with (`CreateDBClusterMessage$EngineVersion` in those models: "The
+/// --engine-version will default to the latest major engine version"), publishes NO
+/// default version here: the default-version registry this report reads is the RDS DB
+/// instance engines' own. Recorded behaviour on the DocumentDB engine is this refusal, not
+/// an answer naming a version. The versions themselves are still reported; only the
+/// DEFAULT of them is not a thing this door resolves.
+fn resolves_a_default_version(engine: &str) -> bool {
+    !serves_another_control_plane(engine)
+}
+
 /// The engine facts of `engine`, or `None` for an engine this service reports no
 /// versions for (the `custom-oracle-*` engines, and any value that is not an engine).
 pub(crate) fn engine_facts(engine: &str) -> Option<&'static EngineFacts> {
@@ -1696,11 +1710,12 @@ fn matches_request(
     if input.default_only == Some(true) {
         let narrowed_to_a_major_version =
             input.engine_version.is_some() || input.db_parameter_group_family.is_some();
-        let keep = if narrowed_to_a_major_version {
-            entry.default_level.is_major_default()
-        } else {
-            entry.default_level.is_engine_default()
-        };
+        let keep = resolves_a_default_version(entry.engine)
+            && if narrowed_to_a_major_version {
+                entry.default_level.is_major_default()
+            } else {
+                entry.default_level.is_engine_default()
+            };
         if !keep {
             return false;
         }
@@ -1788,6 +1803,7 @@ fn to_wire(
     facts: &EngineFacts,
     index: usize,
     input: &DescribeDBEngineVersionsInput,
+    certificates: &[String],
 ) -> CreateCustomDBEngineVersionOutput {
     let profile = entry.profile;
     let supported_character_sets = (input.list_supported_character_sets == Some(true)
@@ -1817,7 +1833,16 @@ fn to_wire(
         status: Some(entry.status.to_string()),
         supported_engine_modes: Some(strings(profile.engine_modes)),
         supported_feature_names: Some(strings(profile.feature_names)),
-        supported_ca_certificate_identifiers: Some(strings(CA_CERTIFICATE_IDENTIFIERS)),
+        // `SupportedCACertificateIdentifiers`: the CA certificates an instance of this
+        // version can be given through `CreateDBInstance`'s `CACertificateIdentifier`. The
+        // member's documentation points at "Using SSL/TLS to encrypt a connection to a DB
+        // instance", and the certificate authorities that page publishes are the ones THIS
+        // service already reports through `DescribeCertificates` — so the list is read from
+        // that ONE catalogue (`crate::state::CA_CERTIFICATES`) rather than restated here,
+        // and the two reports cannot name different certificates. An entry whose
+        // `ValidTill` has passed is left out: an expired certificate is not one a new
+        // instance can be launched with.
+        supported_ca_certificate_identifiers: Some(certificates.to_vec()),
         exportable_log_types: Some(strings(facts.exportable_log_types)),
         supports_log_exports_to_cloudwatch_logs: Some(!facts.exportable_log_types.is_empty()),
         supports_read_replica: Some(profile.supports_read_replica),
