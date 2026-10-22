@@ -15,6 +15,8 @@
 mod id_mapping_workflow_lifecycle;
 #[path = "all/matching_workflow_update.rs"]
 mod matching_workflow_update;
+#[path = "all/provider_service_catalog.rs"]
+mod provider_service_catalog;
 #[path = "all/response_messages.rs"]
 mod response_messages;
 #[path = "all/schema_mapping_workflow_lifecycle.rs"]

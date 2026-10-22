@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProviderServices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProviderServices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Pages over the Region's provider-service catalog, held in
+//! [`crate::state::ComAmazonawsEntityresolutionAwsveniceserviceState::provider_services`],
+//! and mints nothing: a provider service is AWS-managed catalog data with no create
+//! API, so this is a PURE READ and two consecutive calls answer identically.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProviderServices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `providerName` is a filter over that catalog, `maxResults` bounds the page and
+//! `nextToken` resumes one, both over the catalog's own stable key order
+//! (`<providerName>/<providerServiceName>`), so `GetProviderService` resolves exactly
+//! the ARNs a page reported.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +150,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProviderServices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProviderServicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProviderServices"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListProviderServicesErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "the Entity Resolution emulator has no state store attached".to_string(),
+                ),
+            })
+        })?;
+
+        if input
+            .next_token
+            .as_deref()
+            .is_some_and(|token| !crate::state::is_issued_provider_service_token(token))
+        {
+            return Err(ListProviderServicesErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some("Invalid nextToken".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A `ProviderServiceArn` is region-scoped and derived from the catalog entry,
+        // so the region this request was signed for is what the reported ARNs name.
+        let region = crate::state::request_region(ctx.parts());
+
+        // A pure read over the catalog, in its own
+        // (`providerName/providerServiceName`) key order.
+        let store = state.lock();
+        let (provider_service_summaries, next_token) = crate::state::page(
+            store
+                .provider_services
+                .iter()
+                .filter(|(_, stored)| {
+                    // `providerName` is modelled optional, so an absent one is "every
+                    // provider" rather than none; a supplied one selects that
+                    // provider's services exactly, and an unknown name selects none.
+                    input
+                        .provider_name
+                        .as_deref()
+                        .is_none_or(|provider_name| stored.provider_name == provider_name)
+                })
+                .map(|(catalog_key, stored)| {
+                    (
+                        catalog_key.clone(),
+                        ProviderServiceSummary {
+                            provider_service_arn: stored.arn(&region),
+                            provider_name: stored.provider_name.clone(),
+                            provider_service_display_name: stored
+                                .provider_service_display_name
+                                .clone(),
+                            provider_service_name: stored.provider_service_name.clone(),
+                            provider_service_type: stored.provider_service_type.clone(),
+                        },
+                    )
+                }),
+            input.next_token.as_deref(),
+            crate::state::page_size(input.max_results, MAX_RESULTS),
+        );
+
+        Ok(ListProviderServicesOutput {
+            provider_service_summaries: Some(provider_service_summaries),
+            next_token,
+        })
     }
 }
+
+/// The largest page `ListProviderServices` serves, and the page it serves a caller
+/// that set no bound: `maxResults` is modelled `range 15..25`
+/// (`smithy_query(query="operation",operation="ListProviderServices")`), so 25 is the
+/// most a caller can ask for and the most this serves.
+const MAX_RESULTS: usize = 25;
