@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInputSecurityGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInputSecurityGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInputSecurityGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +140,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInputSecurityGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInputSecurityGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInputSecurityGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
+
+        // The whitelist rules are validated BEFORE anything is written, so a
+        // refused request mints no group and leaves no partial one behind.
+        let requested = input.whitelist_rules.unwrap_or_default();
+        let mut whitelist_rules: Vec<String> = Vec::with_capacity(requested.len());
+        for (index, rule) in requested.into_iter().enumerate() {
+            let cidr = rule.cidr.ok_or_else(|| {
+                bad_request(format!(
+                    "WhitelistRules[{index}].Cidr is required: a whitelist rule must name an IPv4 CIDR to whitelist"
+                ))
+            })?;
+            if !crate::state::is_ipv4_cidr(&cidr) {
+                return Err(bad_request(format!(
+                    "WhitelistRules[{index}].Cidr must be an IPv4 CIDR with a prefix length of 0 to 32 (for example 10.0.0.0/16); got {cidr:?}"
+                )));
+            }
+            whitelist_rules.push(cidr);
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // The response reports which channels use the new group, so this handler
+        // reads the channel store: `settle` materialises the channel transitions
+        // the clock had already made due, which were owed whether or not this
+        // create ran.
+        state.settle(now);
+
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit: once it is full the operation's own modelled throttle is
+        // the answer, not another group.
+        if state.input_security_groups_are_full() {
+            return Err(CreateInputSecurityGroupErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This emulator stores at most {} input security groups; delete one before creating another",
+                        crate::state::MAX_INPUT_SECURITY_GROUPS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_input_security_group_id();
+        let arn =
+            ::engine::emulator_arn("medialive", &region, &format!("inputSecurityGroup:{id}"));
+        // Everything the request supplied is stored verbatim; the response is then
+        // read back out of the stored record, never from `input`. `State`,
+        // `Inputs` and `Channels` are not stored at all: they report what
+        // currently uses the group, so they are derived on every read.
+        state.input_security_groups.insert(
+            id.clone(),
+            crate::state::InputSecurityGroupRecord {
+                id: id.clone(),
+                arn,
+                whitelist_rules,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        let security_group = state
+            .input_security_group_description(&id)
+            .ok_or_else(unavailable)?;
+        Ok(CreateInputSecurityGroupOutput {
+            security_group: Some(security_group),
+        })
     }
+}
+
+/// Refuse a request whose whitelist rules are not IPv4 CIDRs, with the
+/// operation's own modelled client error (HTTP 400).
+fn bad_request(message: String) -> CreateInputSecurityGroupError {
+    CreateInputSecurityGroupErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the group in. A modelled server error, never a
+/// fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateInputSecurityGroupError {
+    CreateInputSecurityGroupErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }
