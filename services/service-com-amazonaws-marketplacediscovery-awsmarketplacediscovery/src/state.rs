@@ -33,7 +33,7 @@ use crate::ops::types::{
     DataArtifact, DataExchangeFulfillmentOption, DocumentItem,
     Ec2ImageBuilderComponentFulfillmentOption, EksAddOnFulfillmentOption,
     EksAddOnOperatingSystem, FreeTrialPricingTerm, FulfillmentOption, FulfillmentOptionSummary,
-    GrantItem, HelmFulfillmentOption,
+    GrantItem, HelmFulfillmentOption, RenewalTerm,
     HelmOperatingSystem, LegalTerm, ListingBadge, ListingSummary,
     ListingSummaryAssociatedEntity, OfferInformation, OfferSetInformation, OfferTerm, PricingModel,
     PricingUnit, ProductInformation, ProfessionalServicesFulfillmentOption,
@@ -94,6 +94,22 @@ pub const LISTING_BADGE_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("FREE_TRIAL", "Free trial"),
     ("MULTI_PRODUCT", "Multiple products"),
     ("QUICK_LAUNCH", "Quick Launch"),
+];
+
+/// The human-readable name of every purchase-option badge, which is what
+/// `PurchaseOptionBadge$displayName` carries.
+///
+/// Source: the `PurchaseOptionBadgeType` enum
+/// (`smithy_query(query="shape",shape="PurchaseOptionBadgeType")`), generated as
+/// `PURCHASE_OPTION_BADGE_TYPE_VALUES`; the names are AWS's label for each value
+/// (`AUTO_RENEW` is rendered hyphenated, "Auto-renew"). The order is the enum's, so two
+/// purchase options never disagree about where a badge appears, exactly as
+/// [`LISTING_BADGE_DISPLAY_NAMES`] does for a listing.
+pub const PURCHASE_OPTION_BADGE_DISPLAY_NAMES: &[(&str, &str)] = &[
+    ("PRIVATE_PRICING", "Private pricing"),
+    ("FUTURE_DATED", "Future dated"),
+    ("REPLACEMENT_OFFER", "Replacement offer"),
+    ("AUTO_RENEW", "Auto-renew"),
 ];
 
 /// The human-readable name of every fulfillment option type, which is what both
@@ -427,7 +443,6 @@ pub struct Offer {
     pub agreement_proposal_id: String,
     pub replacement_agreement_id: Option<String>,
     pub pricing_model: PricingModel,
-    pub badges: Vec<PurchaseOptionBadge>,
     pub visibility_scope: String,
 }
 
@@ -629,6 +644,74 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
             .collect()
     }
 
+    /// The badges an OFFER reports: one per special attribute the offer's OWN record has,
+    /// in [`PURCHASE_OPTION_BADGE_DISPLAY_NAMES`] order.
+    ///
+    /// `GetOfferOutput$badges` is "Badges indicating special attributes of the offer, such
+    /// as private pricing, future dated, or replacement offer" and
+    /// `PurchaseOptionSummary$badges` says the same of a purchase option — so a badge
+    /// RESTATES something the stored offer already says, and is derived from it rather than
+    /// stored beside it, where it could claim an attribute the offer does not have (an
+    /// `AUTO_RENEW` badge on an offer with no renewal term, say) or omit one it does.
+    ///
+    /// What each badge type restates:
+    ///
+    /// * `PRIVATE_PRICING` — the offer's visibility scope is `PRIVATE`, the scope
+    ///   `PurchaseOptionFilter$filterValues` calls "private offers and offer sets visible
+    ///   to you".
+    /// * `FUTURE_DATED` — the offer's `availableFromTime` ("when the purchase option became
+    ///   available to the buyer") is still ahead of `now_secs`.
+    /// * `REPLACEMENT_OFFER` — the offer carries a `replacementAgreementId`, "the identifier
+    ///   of the existing agreement that this offer would replace".
+    /// * `AUTO_RENEW` — the offer carries a `renewalTerm`, which "enables automatic agreement
+    ///   renewal" (`smithy_query(query="shape",shape="RenewalTerm")`).
+    pub fn offer_badges(&self, offer: &Offer, now_secs: i64) -> Vec<PurchaseOptionBadge> {
+        purchase_option_badges(
+            offer.visibility_scope == VISIBILITY_PRIVATE,
+            future_dated(offer.available_from_time, now_secs),
+            offer.replacement_agreement_id.is_some(),
+            self.renews_automatically(&offer.offer_id),
+        )
+    }
+
+    /// The badges an OFFER SET reports, derived the same way as an offer's.
+    ///
+    /// The set's own record carries its visibility scope and availability date, so
+    /// `PRIVATE_PRICING` and `FUTURE_DATED` come from it. `REPLACEMENT_OFFER` and
+    /// `AUTO_RENEW` are properties of the offers it bundles, and a badge on the SET claims
+    /// its attribute of the whole bundle — so each is reported only when every bundled offer
+    /// has it, and an empty set claims neither.
+    pub fn offer_set_badges(
+        &self,
+        offer_set: &OfferSet,
+        now_secs: i64,
+    ) -> Vec<PurchaseOptionBadge> {
+        let offers: Vec<&Offer> = offer_set
+            .offer_ids
+            .iter()
+            .filter_map(|offer_id| self.offers.get(offer_id))
+            .collect();
+        let every_offer = |predicate: &dyn Fn(&Offer) -> bool| {
+            !offers.is_empty() && offers.iter().all(|offer| predicate(offer))
+        };
+        purchase_option_badges(
+            offer_set.visibility_scope == VISIBILITY_PRIVATE,
+            future_dated(offer_set.available_from_time, now_secs),
+            every_offer(&|offer| offer.replacement_agreement_id.is_some()),
+            every_offer(&|offer| self.renews_automatically(&offer.offer_id)),
+        )
+    }
+
+    /// Whether the offer's terms include a renewal term, the term that "enables automatic
+    /// agreement renewal".
+    fn renews_automatically(&self, offer_id: &str) -> bool {
+        self.offer_terms.get(offer_id).is_some_and(|terms| {
+            terms
+                .iter()
+                .any(|term| matches!(term, OfferTerm::renewalTerm(_)))
+        })
+    }
+
     /// The fulfillment option summaries a LISTING reports: one per distinct fulfillment
     /// option type its associated products offer, in product order.
     ///
@@ -718,7 +801,7 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
                     available_from_time: offer.available_from_time.map(datetime),
                     expiration_time: offer.expiration_time.map(datetime),
                     seller_of_record: offer.seller_of_record.clone(),
-                    badges: Some(offer.badges.clone()),
+                    badges: Some(self.offer_badges(offer, now_secs)),
                     associated_entities: self.offer_associated_entities(offer, preferred),
                 },
                 product_ids,
@@ -752,7 +835,7 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
                     available_from_time: offer_set.available_from_time.map(datetime),
                     expiration_time: offer_set.expiration_time.map(datetime),
                     seller_of_record: offer_set.seller_of_record.clone(),
-                    badges: Some(Vec::new()),
+                    badges: Some(self.offer_set_badges(offer_set, now_secs)),
                     associated_entities,
                 },
                 product_ids,
@@ -797,6 +880,36 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
             })
             .collect()
     }
+}
+
+/// The badge list a purchase option reports for the attributes its record has, in
+/// [`PURCHASE_OPTION_BADGE_DISPLAY_NAMES`] order.
+///
+/// A badge type the model gains later is not claimed until its attribute is named here.
+fn purchase_option_badges(
+    private_pricing: bool,
+    future_dated: bool,
+    replacement_offer: bool,
+    auto_renew: bool,
+) -> Vec<PurchaseOptionBadge> {
+    PURCHASE_OPTION_BADGE_DISPLAY_NAMES
+        .iter()
+        .filter(|(badge_type, _)| match *badge_type {
+            "PRIVATE_PRICING" => private_pricing,
+            "FUTURE_DATED" => future_dated,
+            "REPLACEMENT_OFFER" => replacement_offer,
+            "AUTO_RENEW" => auto_renew,
+            _ => false,
+        })
+        .map(|(badge_type, display_name)| purchase_option_badge(badge_type, display_name))
+        .collect()
+}
+
+/// Whether a purchase option's availability date is still ahead of `now_secs`, which is
+/// what its `FUTURE_DATED` badge restates. An option with no availability date became
+/// available when it was created, so it is never future dated.
+fn future_dated(available_from_time: Option<i64>, now_secs: i64) -> bool {
+    available_from_time.is_some_and(|available_from| available_from > now_secs)
 }
 
 /// `AVAILABLE` until the expiration instant passes, `EXPIRED` after it; an option with no
@@ -1963,6 +2076,21 @@ fn support_term(id: &str, refund_policy: &str) -> OfferTerm {
     })
 }
 
+/// A renewal term: the term that "enables automatic agreement renewal", and the record a
+/// purchase option's `AUTO_RENEW` badge restates. `max_renewals` absent means unlimited
+/// renewals (`RenewalTerm$maxRenewals`).
+fn renewal_term(id: &str, max_renewals: Option<i32>) -> OfferTerm {
+    OfferTerm::renewalTerm(RenewalTerm {
+        id: id.to_string(),
+        r#type: "RenewalTerm".to_string(),
+        max_renewals,
+        lockout_period: None,
+        adjustment_deadline: None,
+        price_increase: None,
+        term_templates: None,
+    })
+}
+
 fn recurring_payment_term(id: &str, price: &str) -> OfferTerm {
     OfferTerm::recurringPaymentTerm(RecurringPaymentTerm {
         id: id.to_string(),
@@ -2183,7 +2311,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             agreement_proposal_id: "ap-0001-analytics-annual".to_string(),
             replacement_agreement_id: None,
             pricing_model: pricing_model("CONTRACT", "Contract"),
-            badges: vec![purchase_option_badge("AUTO_RENEW", "Auto renew")],
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -2199,6 +2326,9 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "Users",
             ),
             recurring_payment_term("t-0001-recurring", "1200.00"),
+            // An annual contract that renews automatically, which is what this offer's
+            // AUTO_RENEW badge restates.
+            renewal_term("t-0001-renewal", Some(3)),
             legal_term(
                 "t-0001-legal",
                 "StandardEula",
@@ -2221,7 +2351,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             agreement_proposal_id: "ap-0002-analytics-usage".to_string(),
             replacement_agreement_id: Some("ag-0001-analytics-legacy".to_string()),
             pricing_model: pricing_model("USAGE", "Usage based"),
-            badges: vec![purchase_option_badge("FUTURE_DATED", "Future dated")],
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -2370,7 +2499,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             agreement_proposal_id: "ap-0003-firewall-hourly".to_string(),
             replacement_agreement_id: None,
             pricing_model: pricing_model("USAGE", "Usage based"),
-            badges: Vec::new(),
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -2464,7 +2592,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             agreement_proposal_id: "ap-0004-datafeed-contract".to_string(),
             replacement_agreement_id: None,
             pricing_model: pricing_model("CONTRACT", "Contract"),
-            badges: vec![purchase_option_badge("PRIVATE_PRICING", "Private pricing")],
             visibility_scope: VISIBILITY_PRIVATE.to_string(),
         },
     );
@@ -2629,7 +2756,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             agreement_proposal_id: "ap-0005-mlkit-usage".to_string(),
             replacement_agreement_id: None,
             pricing_model: pricing_model("USAGE", "Usage based"),
-            badges: Vec::new(),
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -2736,7 +2862,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             agreement_proposal_id: "ap-0006-devtools-byol".to_string(),
             replacement_agreement_id: None,
             pricing_model: pricing_model("BYOL", "Bring your own licence"),
-            badges: Vec::new(),
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -2834,7 +2959,6 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
             agreement_proposal_id: "ap-0007-backup-contract".to_string(),
             replacement_agreement_id: None,
             pricing_model: pricing_model("CONTRACT", "Contract"),
-            badges: vec![purchase_option_badge("AUTO_RENEW", "Auto renew")],
             visibility_scope: VISIBILITY_PUBLIC.to_string(),
         },
     );
@@ -2850,6 +2974,9 @@ fn seed_catalog() -> ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryStat
                 "Tiers",
             ),
             recurring_payment_term("t-0007-recurring", "450.00"),
+            // Renews for as long as the buyer keeps it: a renewal term with no
+            // `maxRenewals` is "unlimited renewals".
+            renewal_term("t-0007-renewal", None),
         ],
     );
 
@@ -3343,7 +3470,6 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
                 agreement_proposal_id: format!("ap-{sequence:04}-{slug}"),
                 replacement_agreement_id: None,
                 pricing_model: pricing_model(model_type, model_name),
-                badges: vec![purchase_option_badge("AUTO_RENEW", "Auto renew")],
                 visibility_scope: VISIBILITY_PUBLIC.to_string(),
             },
         );
@@ -3362,10 +3488,15 @@ fn seed_breadth(state: &mut ComAmazonawsMarketplacediscoveryAwsmarketplacediscov
                 unit_name,
                 "0.05",
             )),
-            "CONTRACT" => terms.push(recurring_payment_term(
-                &format!("t-{sequence:04}-recurring"),
-                "900.00",
-            )),
+            "CONTRACT" => {
+                terms.push(recurring_payment_term(
+                    &format!("t-{sequence:04}-recurring"),
+                    "900.00",
+                ));
+                // A contract renews at the end of each agreement period, which is what
+                // this offer's AUTO_RENEW badge restates.
+                terms.push(renewal_term(&format!("t-{sequence:04}-renewal"), Some(2)));
+            }
             // BYOL and FREE carry no payment term: the buyer pays the seller directly, or
             // nothing at all.
             _ => {}
