@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutScalingPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutScalingPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutScalingPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -230,18 +221,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutScalingPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutScalingPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutScalingPolicy"))
+        use crate::state::{
+            check_dimension_namespace, check_enum, scaling_policy_arn, PolicyKey,
+            ScalingPolicyRecord, TargetKey,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutScalingPolicyErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        check_enum(
+            "serviceNamespace",
+            &input.service_namespace,
+            SERVICE_NAMESPACE_VALUES,
+        )
+        .map_err(validation)?;
+        check_enum(
+            "scalableDimension",
+            &input.scalable_dimension,
+            SCALABLE_DIMENSION_VALUES,
+        )
+        .map_err(validation)?;
+        check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
+            .map_err(validation)?;
+        if let Some(policy_type) = input.policy_type.as_deref() {
+            check_enum("policyType", policy_type, POLICY_TYPE_VALUES).map_err(validation)?;
+        }
+
+        let key = PolicyKey {
+            target: TargetKey {
+                service_namespace: input.service_namespace.clone(),
+                resource_id: input.resource_id.clone(),
+                scalable_dimension: input.scalable_dimension.clone(),
+            },
+            policy_name: input.policy_name.clone(),
+        };
+
+        let mut state = state.lock();
+
+        // A policy only exists against a registered scalable target: "You cannot create
+        // a scaling policy until you have registered the resource as a scalable target."
+        if !state.targets.contains_key(&key.target) {
+            return Err(PutScalingPolicyErrorModeled::ObjectNotFoundException(
+                ObjectNotFoundException {
+                    message: Some(format!(
+                        "No scalable target found for service namespace: {}, resource ID: {}, \
+                         scalable dimension: {}",
+                        key.target.service_namespace,
+                        key.target.resource_id,
+                        key.target.scalable_dimension
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let stored = state.policies.get(&key).cloned();
+
+        // `PolicyType` "is required if you are creating a scaling policy"; re-putting an
+        // existing policy without one keeps the type it was created with.
+        let policy_type = match (input.policy_type.clone(), stored.as_ref()) {
+            (Some(policy_type), _) => policy_type,
+            (None, Some(existing)) => existing.policy_type.clone(),
+            (None, None) => {
+                return Err(validation(
+                    "PolicyType is required when creating a scaling policy",
+                ))
+            }
+        };
+
+        // Merge each configuration the request carries over the stored one, then keep
+        // only the configuration that belongs to the effective policy type: a policy
+        // carries exactly one, so switching a policy's type drops the old one.
+        let mut step_config = input
+            .step_scaling_policy_configuration
+            .clone()
+            .or_else(|| stored.as_ref().and_then(|p| p.step_config.clone()));
+        let mut target_tracking_config = input
+            .target_tracking_scaling_policy_configuration
+            .clone()
+            .or_else(|| stored.as_ref().and_then(|p| p.target_tracking_config.clone()));
+        let mut predictive_config = input
+            .predictive_scaling_policy_configuration
+            .clone()
+            .or_else(|| stored.as_ref().and_then(|p| p.predictive_config.clone()));
+
+        let missing_member = match policy_type.as_str() {
+            "StepScaling" => {
+                target_tracking_config = None;
+                predictive_config = None;
+                step_config
+                    .is_none()
+                    .then_some("StepScalingPolicyConfiguration")
+            }
+            "PredictiveScaling" => {
+                step_config = None;
+                target_tracking_config = None;
+                predictive_config
+                    .is_none()
+                    .then_some("PredictiveScalingPolicyConfiguration")
+            }
+            // `TargetTrackingScaling`, the only remaining modelled value.
+            _ => {
+                step_config = None;
+                predictive_config = None;
+                target_tracking_config
+                    .is_none()
+                    .then_some("TargetTrackingScalingPolicyConfiguration")
+            }
+        };
+        if let Some(member) = missing_member {
+            return Err(validation(format!(
+                "A {policy_type} policy requires {member}"
+            )));
+        }
+
+        // The ARN and the creation time are minted once per policy identity and survive
+        // every later Put for the same (namespace, resource, dimension, policy name).
+        let (policy_arn, creation_time) = match stored.as_ref() {
+            Some(existing) => (existing.policy_arn.clone(), existing.creation_time),
+            None => {
+                // The emulator's own store bound, checked only on the create path so an
+                // update of an existing policy still succeeds at the ceiling.
+                if state.policies.len() >= crate::state::MAX_SCALING_POLICIES {
+                    return Err(PutScalingPolicyErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(format!(
+                                "This emulator holds at most {} scaling policies; delete one \
+                                 before creating another",
+                                crate::state::MAX_SCALING_POLICIES
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                (
+                    scaling_policy_arn(&crate::state::request_region(ctx.parts()), &key),
+                    ::std::time::SystemTime::now(),
+                )
+            }
+        };
+
+        let record = ScalingPolicyRecord {
+            policy_arn: policy_arn.clone(),
+            policy_type,
+            step_config,
+            target_tracking_config,
+            predictive_config,
+            // The CloudWatch alarms a target-tracking policy owns are created in
+            // CloudWatch, which this emulator does not drive, so the list stays as
+            // persisted rather than carrying invented alarm names.
+            alarms: stored.map(|p| p.alarms).unwrap_or_default(),
+            creation_time,
+        };
+        let alarms = record.alarms.clone();
+        state.policies.insert(key, record);
+
+        Ok(PutScalingPolicyOutput {
+            policy_arn,
+            alarms: Some(alarms),
+        })
     }
+}
+
+/// This operation's modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> PutScalingPolicyError {
+    PutScalingPolicyErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+    })
+    .into()
 }
