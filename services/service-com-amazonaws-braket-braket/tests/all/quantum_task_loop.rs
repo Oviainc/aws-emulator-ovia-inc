@@ -419,8 +419,10 @@ async fn search_devices_keeps_exactly_the_devices_each_filter_names() {
     );
 
     // A filter naming something that is not a member of the device summary is refused,
-    // not silently ignored.
-    for name in ["deviceCapabilities", "DeviceArn", "arn", ""] {
+    // not silently ignored. These names are all well-formed values of the filter's
+    // `name` member (`@length` 1..64), so the operation itself is what refuses them,
+    // as its modelled `ValidationException`.
+    for name in ["deviceCapabilities", "DeviceArn", "arn"] {
         let reply = braket
             .search_devices(json!({
                 "filters": [{ "name": name, "values": ["anything"] }],
@@ -438,6 +440,26 @@ async fn search_devices_keeps_exactly_the_devices_each_filter_names() {
             reply.error
         );
     }
+
+    // An EMPTY filter name is outside that member's `@length`, so the request never
+    // reaches the operation: the body-rejection layer in front of the service answers
+    // it (see `request_body_rejection.rs` for that rule over the whole service).
+    let reply = braket
+        .search_devices(json!({
+            "filters": [{ "name": "", "values": ["anything"] }],
+        }))
+        .await;
+    assert_eq!(
+        reply.status, 400,
+        "case empty filter name: expected 400, got {} {}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error.as_deref(),
+        Some("BadRequestException"),
+        "case empty filter name: expected BadRequestException, got {:?}",
+        reply.error
+    );
 }
 
 /// Paging returns every match exactly once, in one stable order, whatever the page
