@@ -19,12 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::DateTime;
 
-use ::aws_smithy_schema_server::constraints;
-use ::smithy_server_runtime::Violation;
-
 use crate::ops::types::{
     InternalServerException, InvoiceUnit, InvoiceUnitRule, ResourceNotFoundException, ResourceTag,
-    ValidationException, ValidationExceptionField,
 };
 
 /// Per-service state for com-amazonaws-invoicing-invoicing. A handler reaches it through [`service_state`].
@@ -271,48 +267,11 @@ pub fn no_such_resource(arn: &str) -> ResourceNotFoundException {
     }
 }
 
-/// `ValidationExceptionReason$fieldValidationFailed` — a named member of the request
-/// carries a value the service does not accept. One of the values the modelled
-/// `ValidationExceptionReason` enum admits ([`VALIDATION_EXCEPTION_REASON_VALUES`]).
-///
-/// [`VALIDATION_EXCEPTION_REASON_VALUES`]: crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES
-pub const REASON_FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
-
-/// How many violations one refusal states. Each one is rendered TWICE into the body (a
-/// clause of `message` and a `fieldList` entry) and each clause interpolates the
-/// rejected value, so an unbounded count turns a small request into an arbitrarily
-/// large refusal. The bound is the boundary validator's own (`MAX_VIOLATIONS` in
-/// `aws_smithy_schema_server::constraints`), so the two refusal paths read alike.
-const MAX_VIOLATIONS: usize = 100;
-
-/// The 400 `ValidationException` that states `violations` — a member constraint the
-/// request failed — in the shape's own modelled members.
-///
-/// ONE rendering for every refused member, wherever the refusal is found: `message` is
-/// the `N validation error(s) detected: …` envelope the boundary validator words,
-/// `reason` is [`REASON_FIELD_VALIDATION_FAILED`], and `fieldList` carries one entry
-/// per violation — `name` the dotted member path, `message` that violation's own
-/// clause naming the constraint it failed. A client can therefore branch on `reason`
-/// and report which member was rejected and why, instead of parsing the prose.
-pub fn field_validation_failed(violations: &[Violation]) -> ValidationException {
-    let violations = &violations[..violations.len().min(MAX_VIOLATIONS)];
-    ValidationException {
-        message: constraints::envelope(violations).or_else(|| {
-            Some("The input fails to satisfy the constraints specified by an Amazon Web Services service.".to_string())
-        }),
-        resource_name: None,
-        reason: Some(REASON_FIELD_VALIDATION_FAILED.to_string()),
-        field_list: Some(
-            violations
-                .iter()
-                .map(|violation| ValidationExceptionField {
-                    name: violation.path.clone(),
-                    message: violation.message(),
-                })
-                .collect(),
-        ),
-    }
-}
+// The 400 `ValidationException` that states a member constraint the request failed
+// lives in `crate::service::validation`, with the rest of how this service WORDS a
+// refusal: the `message` envelope, each `fieldList` entry's own clause and the `reason`
+// they are stated under are one rendering, reached by every refusal this service
+// answers.
 
 /// The 500 a handler answers when the engine it was constructed with is not the shared
 /// in-memory engine, so this service has no store to read. Never construct an engine in
