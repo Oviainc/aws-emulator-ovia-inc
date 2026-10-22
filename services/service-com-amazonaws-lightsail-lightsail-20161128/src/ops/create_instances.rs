@@ -198,10 +198,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modelled `@required` members and every pattern on this input is a
         // modelled constraint, so the centralized walk refused anything outside
         // them before this body ran. What is left is what the model cannot
-        // express: the bundle and the availability zone must name things this
-        // service serves, no name may already be taken, and the caller-sized
-        // lists must be within the store's bounds. Every one of those is checked
-        // BEFORE the first write, so a refused request creates nothing.
+        // express: the blueprint, the bundle and the availability zone must name
+        // things this service serves, no name may already be taken, and the
+        // caller-sized lists must be within the store's bounds. Every one of
+        // those is checked BEFORE the first write, so a refused request creates
+        // nothing.
+        //
+        // The blueprint is resolved against the published catalog, and an id the
+        // catalog does not hold — or holds only as a retired image — is the
+        // service's `DoesNotExist` rejection rather than an instance running an
+        // image that does not exist.
+        if !crate::state::blueprint_is_creatable(&input.blueprint_id) {
+            return Err(blueprint_does_not_exist(&input.blueprint_id));
+        }
         let bundle = crate::state::bundle_spec(&input.bundle_id).ok_or_else(|| {
             invalid(format!(
                 "bundleId '{}' names no Lightsail bundle: its leading size token must be \
@@ -340,6 +349,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// The request names a blueprint this service cannot create an instance from:
+/// one the published catalog does not hold at all, or one it holds as an
+/// inactive (retired) image, which `CreateInstances$blueprintId` says is not
+/// available for a new instance. Lightsail answers both with its `DoesNotExist`
+/// envelope — HTTP 400, wire error `NotFoundException` — whose message names the
+/// rejected blueprint, which is why the two cases read alike.
+fn blueprint_does_not_exist(blueprint_id: &str) -> CreateInstancesError {
+    crate::scaffolded::Scaffolded::does_not_exist(format!(
+        "The specified blueprint does not exist or is deprecated: {blueprint_id}"
+    ))
 }
 
 /// This operation's 400 refusal for a request the model admits but the service

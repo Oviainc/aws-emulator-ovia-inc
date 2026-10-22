@@ -530,6 +530,225 @@ pub fn blueprint_name(blueprint_id: &str) -> String {
         .join(" ")
 }
 
+/// One entry of the instance blueprint catalog: a virtual private server image
+/// an instance can be created from.
+///
+/// This is a PUBLISHED catalog, not per-account state — every account sees the
+/// same entries — which is why it is a `const` table rather than a field on the
+/// store, exactly like the bundle and Region catalogs above.
+#[derive(Debug, Clone, Copy)]
+pub struct BlueprintSpec {
+    /// `Blueprint$blueprintId`: the id a `CreateInstances` request names
+    /// (`amazon_linux_2023`, `wordpress`).
+    pub blueprint_id: &'static str,
+    /// `Blueprint$type`, one of the modelled `BlueprintType` enum's two values
+    /// (`smithy_query(query="shape",shape="BlueprintType")`): `os` for an
+    /// operating-system image, `app` for an application stack.
+    pub blueprint_type: &'static str,
+    /// `Blueprint$isActive`. From that member's own documentation: "Inactive
+    /// blueprints are listed to support customers with existing instances but
+    /// are not necessarily available for launch of new instances" — and
+    /// `CreateInstances$blueprintId` says "Use active blueprints when creating
+    /// new instances", so only an active entry can be created from.
+    pub is_active: bool,
+}
+
+/// One value of the modelled `BlueprintType` enum: an operating-system image.
+pub const BLUEPRINT_TYPE_OS: &str = "os";
+
+/// One value of the modelled `BlueprintType` enum: an application stack.
+pub const BLUEPRINT_TYPE_APP: &str = "app";
+
+/// The instance blueprints this service publishes — the catalog `GetBlueprints`
+/// reports and `CreateInstances` resolves `blueprintId` against.
+///
+/// SOURCE: the blueprint ids Lightsail's instance-image list publishes (the
+/// Lightsail console's "Select a blueprint" catalog, which `GetBlueprints`
+/// answers from): the operating-system families `amazon_linux`, `ubuntu`,
+/// `debian`, `almalinux`, `centos_stream`, `freebsd`, `opensuse` and
+/// `windows_server`, each at the releases Lightsail offers, plus the
+/// Bitnami-packaged and hosting-panel application stacks. An entry whose
+/// upstream release has reached end of life stays in the catalog but is marked
+/// inactive, which is the state Lightsail keeps a retired image in so existing
+/// instances still resolve it while a new instance cannot be launched from it.
+pub const BLUEPRINTS: &[BlueprintSpec] = &[
+    // Operating systems.
+    BlueprintSpec {
+        blueprint_id: "amazon_linux_2",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "amazon_linux_2023",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "almalinux_9",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "centos_stream_9",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "debian_10",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        // Debian 10 is past its upstream end of life.
+        is_active: false,
+    },
+    BlueprintSpec {
+        blueprint_id: "debian_11",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "debian_12",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "freebsd_14",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "opensuse_15",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "ubuntu_18_04",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        // Ubuntu 18.04 LTS is past its upstream end of standard support.
+        is_active: false,
+    },
+    BlueprintSpec {
+        blueprint_id: "ubuntu_20_04",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "ubuntu_22_04",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "ubuntu_24_04",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "windows_server_2016",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "windows_server_2019",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "windows_server_2022",
+        blueprint_type: BLUEPRINT_TYPE_OS,
+        is_active: true,
+    },
+    // Application stacks.
+    BlueprintSpec {
+        blueprint_id: "cpanel_whm_almalinux",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "django",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "drupal",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "ghost_bitnami",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "gitlab",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "joomla",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "lamp_8_bitnami",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "magento",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "mean",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "nginx",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "nodejs",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "plesk_ubuntu_18_0_35",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "redmine",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "wordpress",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+    BlueprintSpec {
+        blueprint_id: "wordpress_multisite",
+        blueprint_type: BLUEPRINT_TYPE_APP,
+        is_active: true,
+    },
+];
+
+/// The blueprint `blueprint_id` names — active or not, since an instance already
+/// running a retired image still has to resolve it — or `None` when this service
+/// publishes no such blueprint.
+pub fn blueprint_spec(blueprint_id: &str) -> Option<BlueprintSpec> {
+    BLUEPRINTS
+        .iter()
+        .find(|spec| spec.blueprint_id == blueprint_id)
+        .copied()
+}
+
+/// Whether a new instance can be created from `blueprint_id`: the catalog holds
+/// it AND the entry is still active.
+pub fn blueprint_is_creatable(blueprint_id: &str) -> bool {
+    blueprint_spec(blueprint_id).is_some_and(|spec| spec.is_active)
+}
+
 // ---------------------------------------------------------------------------
 // Relational database blueprints
 // ---------------------------------------------------------------------------

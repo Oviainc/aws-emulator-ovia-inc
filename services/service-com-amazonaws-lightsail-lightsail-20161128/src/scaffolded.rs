@@ -40,6 +40,18 @@
 //! place it can return an error its own model does not declare — `validation` above,
 //! for a service whose model carries no client-input error. Delete the wrapper and the
 //! handler has no way to refuse a bad request at all.
+//!
+//! ## This service's not-found envelope
+//!
+//! It is also where an error whose WIRE rendering differs from its modelled traits
+//! lives. Lightsail answers a request naming a resource it cannot find with HTTP 400
+//! and the body's `code` set to `DoesNotExist`, even though the model declares
+//! `@httpError(404)` on `NotFoundException`; a Lightsail SDK client maps the failure
+//! from the body, not the status. The generated error enum takes its status straight
+//! from the model's trait, so that envelope is [`Scaffolded::NotFound`] — built through
+//! [`Scaffolded::resource_does_not_exist`] (the resource-type/name message) or
+//! [`Scaffolded::does_not_exist`] (any other `DoesNotExist` wording). EVERY not-found
+//! path in this crate goes through one of those two, so one rule serves them all.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -177,6 +189,21 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The value Lightsail puts in the `code` member of a rejection whose cause is that
+/// the resource — or the catalog entry — the request names does not exist.
+///
+/// A Lightsail SDK client branches on THIS, not on the HTTP status: the body's `code`
+/// is what tells "already gone" apart from a transport failure.
+pub const DOES_NOT_EXIST_CODE: &str = "DoesNotExist";
+
+/// The HTTP status Lightsail answers its `NotFoundException` with ON THE WIRE.
+///
+/// The model declares `@httpError(404)` on the shape, but the recorded Lightsail
+/// endpoint answers **400** for a resource it cannot find, with the shape name in
+/// `__type` and `DoesNotExist` in the body's `code`. The recorded wire status governs,
+/// so this status — not the modelled one — is what [`Scaffolded::NotFound`] renders.
+pub const NOT_FOUND_WIRE_STATUS: u16 = 400;
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +212,16 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// The modelled `NotFoundException`, rendered at the status Lightsail answers it
+    /// with on the wire ([`NOT_FOUND_WIRE_STATUS`]) rather than the `@httpError(404)`
+    /// the model declares.
+    ///
+    /// It is a variant of its own, and not [`Modeled`](Self::Modeled), because the
+    /// generated error enum reads its status straight off the model's trait and so can
+    /// only answer 404. The BODY is the modelled shape and its schema, so the wire
+    /// `__type` and every member (`code`, `message`, `docs`, `tip`) are exactly the
+    /// model's.
+    NotFound(crate::ops::types::NotFoundException),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
     ///
@@ -202,6 +239,29 @@ impl<E> Scaffolded<E> {
     /// The scaffold signal for `operation`.
     pub fn not_implemented(operation: &str) -> Self {
         Self::NotImplemented(NotImplemented::new(operation))
+    }
+
+    /// Lightsail's rejection of a request that names a resource this account does not
+    /// hold: HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist`, and
+    /// a message built from the request — the resource's type and the identifier the
+    /// request carried.
+    ///
+    /// `resource_type` is a value of the modelled `ResourceType` enum, i.e. one of the
+    /// `crate::state::RESOURCE_TYPE_*` constants, so the message names the resource the
+    /// way every other Lightsail response does.
+    pub fn resource_does_not_exist(resource_type: &str, name: &str) -> Self {
+        Self::does_not_exist(format!("The {resource_type} does not exist: {name}"))
+    }
+
+    /// The same `DoesNotExist` envelope for a rejection whose message is not the
+    /// resource-type/name one — a request naming an entry of a PUBLISHED catalog (a
+    /// blueprint, say) rather than a resource of the account.
+    pub fn does_not_exist(message: impl Into<String>) -> Self {
+        Self::NotFound(crate::ops::types::NotFoundException {
+            code: Some(DOES_NOT_EXIST_CODE.to_string()),
+            message: Some(message.into()),
+            ..Default::default()
+        })
     }
 
     /// Refuse the request as invalid, with HTTP 400 `ValidationException`.
@@ -228,6 +288,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
             Self::Modeled(e) => write!(f, "{e}"),
+            Self::NotFound(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
     }
@@ -240,6 +301,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e.source(),
             Self::Modeled(e) => e.source(),
+            Self::NotFound(e) => e.source(),
             Self::ValidationException(e) => e.source(),
         }
     }
@@ -254,6 +316,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(e) => e,
             Self::Modeled(e) => e.as_serializable(),
+            Self::NotFound(e) => e,
             Self::ValidationException(e) => e,
         }
     }
@@ -262,6 +325,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
             Self::Modeled(e) => e.variant_schema(),
+            // The MODELLED shape's own schema: the body is the model's, only the
+            // status differs from the model's trait.
+            Self::NotFound(_) => &crate::ops::types::SCHEMA_NOT_FOUND_EXCEPTION,
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
     }
@@ -274,6 +340,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
             Self::Modeled(e) => e.shape_name(),
+            Self::NotFound(_) => crate::ops::types::NotFoundException::shape_name(),
             Self::ValidationException(_) => "ValidationException",
         }
     }
@@ -286,6 +353,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            Self::NotFound(_) => NOT_FOUND_WIRE_STATUS,
             Self::ValidationException(_) => 400,
         }
     }
@@ -297,6 +365,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
             Self::Modeled(e) => e.query_error_code(),
+            // The modelled `NotFoundException` carries no `awsQueryError` trait, and
+            // this service's protocol is awsJson1_1 either way.
+            Self::NotFound(_) => None,
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,
         }

@@ -14,8 +14,9 @@
 //! `GetInstance`, `GetInstances` or `GetInstanceState` reports, every
 //! server-assigned member is computed from the request plus the store's own
 //! allocators, a `StopInstance`/`StartInstance` is observable through the next
-//! read, and a name that was never created — or has since been deleted — is a
-//! modelled 404.
+//! read, and a name that was never created — or has since been deleted — is
+//! refused with the service's `DoesNotExist` envelope (pinned in
+//! `instance_error_envelope.rs`).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -125,7 +126,9 @@ impl Emulator {
 
 /// The wire error code of a failure body: awsJson carries it in `__type`, either
 /// bare or namespaced.
-fn error_code(body: &Value) -> String {
+///
+/// `pub(crate)` so a sibling suite in this test target reads the code the same way.
+pub(crate) fn error_code(body: &Value) -> String {
     body["__type"]
         .as_str()
         .unwrap_or("<no __type>")
@@ -839,9 +842,9 @@ async fn starting_a_running_instance_leaves_its_state_alone() {
 // Delete
 // ---------------------------------------------------------------------------
 
-/// RULE: a delete removes the one record, so every later read of that name is a
-/// modelled 404 and the listing no longer carries it — while every other
-/// instance is untouched.
+/// RULE: a delete removes the one record, so every later read of that name is
+/// refused as `DoesNotExist` and the listing no longer carries it — while every
+/// other instance is untouched.
 #[tokio::test]
 async fn deleting_an_instance_removes_it_from_every_read() {
     let emulator = Emulator::new();
@@ -876,21 +879,26 @@ async fn deleting_an_instance_removes_it_from_every_read() {
         .call("GetInstance", json!({"instanceName": "doomed"}))
         .await;
     assert_eq!(
-        status, 404,
-        "case reading a deleted instance: expected 404, got {status} {body:?}"
+        status, 400,
+        "case reading a deleted instance: expected 400, got {status} {body:?}"
     );
     assert_eq!(
         error_code(&body),
         "NotFoundException",
         "case reading a deleted instance: expected NotFoundException, got {body:?}"
     );
+    assert_eq!(
+        body["code"].as_str(),
+        Some("DoesNotExist"),
+        "case reading a deleted instance: expected code DoesNotExist, got {body:?}"
+    );
 
     let (status, body) = emulator
         .call("DeleteInstance", json!({"instanceName": "doomed"}))
         .await;
     assert_eq!(
-        status, 404,
-        "case deleting the same instance twice: expected 404, got {status} {body:?}"
+        status, 400,
+        "case deleting the same instance twice: expected 400, got {status} {body:?}"
     );
 
     let (listed, _) = emulator.all_instance_names().await;
@@ -901,10 +909,12 @@ async fn deleting_an_instance_removes_it_from_every_read() {
     );
 }
 
-/// RULE: a well-formed name that names no stored instance is the modelled 404 on
-/// every operation that takes one — never a 501 and never a hollow 200.
+/// RULE: a well-formed name that names no stored instance is refused with
+/// Lightsail's `DoesNotExist` envelope on every operation that takes one — never a
+/// 501 and never a hollow 200. The envelope itself (status, code and message) is
+/// pinned over a table of names in `instance_error_envelope.rs`.
 #[tokio::test]
-async fn an_unknown_instance_is_a_modelled_404_everywhere() {
+async fn an_unknown_instance_does_not_exist_everywhere() {
     let emulator = Emulator::new();
     for operation in [
         "GetInstance",
@@ -917,13 +927,18 @@ async fn an_unknown_instance_is_a_modelled_404_everywhere() {
             .call(operation, json!({"instanceName": "never-created"}))
             .await;
         assert_eq!(
-            status, 404,
-            "case {operation} on an unknown name: expected 404, got {status} {body:?}"
+            status, 400,
+            "case {operation} on an unknown name: expected 400, got {status} {body:?}"
         );
         assert_eq!(
             error_code(&body),
             "NotFoundException",
             "case {operation} on an unknown name: expected NotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body["code"].as_str(),
+            Some("DoesNotExist"),
+            "case {operation} on an unknown name: expected code DoesNotExist, got {body:?}"
         );
     }
 }

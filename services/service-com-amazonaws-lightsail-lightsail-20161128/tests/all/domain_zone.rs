@@ -14,7 +14,7 @@
 //! from the request plus the store's own allocators — so a later `GetDomain`
 //! reports exactly that record; a name that is not a DNS domain name, or one the
 //! account already holds, is refused and stores nothing; and a name that was
-//! never created is a modelled 404.
+//! never created is refused with the service's `DoesNotExist` envelope.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -444,9 +444,15 @@ async fn a_name_that_is_not_a_domain_name_is_refused_and_stores_nothing() {
             .call("GetDomain", json!({"domainName": name}))
             .await;
         assert_eq!(
-            read_status, 404,
-            "case {case}: a refused create stores nothing, so the read must be a 404, \
-             got {read_status} {read_body:?}"
+            read_status, 400,
+            "case {case}: a refused create stores nothing, so the read must be refused \
+             too, got {read_status} {read_body:?}"
+        );
+        assert_eq!(
+            read_body["code"].as_str(),
+            Some("DoesNotExist"),
+            "case {case}: a refused create stores nothing, so the read must answer code \
+             DoesNotExist, got {read_body:?}"
         );
     }
 }
@@ -487,10 +493,12 @@ async fn an_existing_domain_cannot_be_created_again() {
     );
 }
 
-/// RULE: a well-formed name that names no stored recordset is the modelled 404 —
+/// RULE: a well-formed name that names no stored recordset is refused with the
+/// service's `DoesNotExist` envelope — HTTP 400, `NotFoundException`, body code
+/// `DoesNotExist` and a message naming the resource type and the requested name —
 /// never a 501 and never a hollow 200.
 #[tokio::test]
-async fn an_unknown_domain_is_a_modelled_404() {
+async fn an_unknown_domain_does_not_exist() {
     let emulator = Emulator::new();
     emulator
         .ok("CreateDomain", json!({"domainName": "present.example"}))
@@ -499,13 +507,23 @@ async fn an_unknown_domain_is_a_modelled_404() {
     for name in ["absent.example", "present.example.extra", "other.test"] {
         let (status, body) = emulator.call("GetDomain", json!({"domainName": name})).await;
         assert_eq!(
-            status, 404,
-            "case reading {name}: expected a 404, got {status} {body:?}"
+            status, 400,
+            "case reading {name}: expected a 400, got {status} {body:?}"
         );
         assert_eq!(
             error_code(&body),
             "NotFoundException",
             "case reading {name}: expected the modelled NotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body["code"].as_str(),
+            Some("DoesNotExist"),
+            "case reading {name}: expected code DoesNotExist, got {body:?}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(format!("The Domain does not exist: {name}").as_str()),
+            "case reading {name}: expected the resource-type/name message, got {body:?}"
         );
     }
 }
