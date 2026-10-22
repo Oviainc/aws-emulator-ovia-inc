@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportSourceCredentials
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportSourceCredentials`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportSourceCredentials::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists one set of source-repository credentials per server type: this is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +152,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportSourceCredentials` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportSourceCredentialsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportSourceCredentials"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which always builds the shared
+            // `InMemoryEngine`: this operation models no server fault, and 501 is
+            // the only honest answer for "this emulator cannot serve the call at
+            // all".
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "ImportSourceCredentials (this engine carries no CodeBuild state)",
+            ));
+        };
+
+        // AWS documents this on `authType`: "An OAUTH connection is not supported by
+        // the API and must be created using the CodeBuild console." The value is in
+        // the enum, so the boundary validator admits it and the refusal is this
+        // operation's to make.
+        if input.auth_type == crate::state::CONSOLE_ONLY_AUTH_TYPE {
+            return Err(ImportSourceCredentialsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "authType {} is not supported by the API and must be created \
+                         using the CodeBuild console",
+                        crate::state::CONSOLE_ONLY_AUTH_TYPE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `username` is documented as "The Bitbucket username when the authType is
+        // BASIC_AUTH. This parameter is not valid for other types of source providers
+        // or connections."
+        if input.username.is_some() && input.auth_type != crate::state::USERNAME_AUTH_TYPE {
+            return Err(ImportSourceCredentialsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "username is not valid for authType {}; it is only valid for {}",
+                        input.auth_type,
+                        crate::state::USERNAME_AUTH_TYPE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::source_credential_arn(&region, &input.server_type);
+        // "Set to false to prevent overwriting the repository source credentials. Set
+        // to true to overwrite the repository source credentials. The default value is
+        // true."
+        let should_overwrite = input.should_overwrite.unwrap_or(true);
+
+        let mut guard = state.lock();
+        if guard.source_credentials.contains_key(&input.server_type) && !should_overwrite {
+            return Err(
+                ImportSourceCredentialsErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "Source credentials already exist for serverType {}: {arn}",
+                            input.server_type
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The token itself is NOT persisted: nothing here authenticates to a source
+        // provider and no operation reports it back, so the secret is dropped. For the
+        // two auth types whose token is a resource identifier rather than a secret it
+        // is kept as `resource` — `SourceCredentialsInfo$resource` is "The connection
+        // ARN if your authType is CODECONNECTIONS or SECRETS_MANAGER".
+        let resource = crate::state::RESOURCE_ARN_AUTH_TYPES
+            .contains(&input.auth_type.as_str())
+            .then(|| input.token.clone());
+
+        guard.source_credentials.insert(
+            input.server_type.clone(),
+            crate::state::StoredSourceCredentials {
+                arn: arn.clone(),
+                server_type: input.server_type,
+                auth_type: input.auth_type,
+                resource,
+            },
+        );
+
+        Ok(ImportSourceCredentialsOutput { arn: Some(arn) })
     }
 }
