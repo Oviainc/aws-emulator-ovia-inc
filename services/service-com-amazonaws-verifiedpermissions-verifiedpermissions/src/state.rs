@@ -444,6 +444,17 @@ pub struct Policy {
     pub last_updated_date: DateTime,
 }
 
+/// Why a `policyStoreId` request member named no store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreLookupMiss {
+    /// The reference was `policy-store-alias/<name>` and no alias is named
+    /// `<name>`.
+    AliasNotFound,
+    /// The reference named a store id — directly, or through an alias that does
+    /// resolve — that no policy store has.
+    StoreNotFound,
+}
+
 /// A `type::"id"` pair, as both `EntityIdentifier` and `ActionIdentifier` carry it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeEntity {
@@ -476,16 +487,27 @@ impl ComAmazonawsVerifiedpermissionsVerifiedpermissionsState {
     /// `policyStoreId` field, the operation will fail with a `ResourceNotFound`
     /// exception".
     pub fn resolve_store_id(&self, reference: &str) -> Option<String> {
+        self.lookup_store_id(reference).ok()
+    }
+
+    /// [`Self::resolve_store_id`], but saying WHICH reference failed: an alias
+    /// name no active alias carries is a different miss from a store id no store
+    /// has, and the batch operations report the two with distinct codes.
+    pub fn lookup_store_id(&self, reference: &str) -> Result<String, StoreLookupMiss> {
         let candidate = if reference.starts_with(ALIAS_PREFIX) {
-            let alias = self.aliases.get(reference)?;
-            if alias.state != ALIAS_STATE_ACTIVE {
-                return None;
-            }
-            alias.policy_store_id.clone()
+            self.aliases
+                .get(reference)
+                .filter(|alias| alias.state == ALIAS_STATE_ACTIVE)
+                .ok_or(StoreLookupMiss::AliasNotFound)?
+                .policy_store_id
+                .clone()
         } else {
             reference.to_string()
         };
-        self.policy_stores.contains_key(&candidate).then_some(candidate)
+        self.policy_stores
+            .contains_key(&candidate)
+            .then_some(candidate)
+            .ok_or(StoreLookupMiss::StoreNotFound)
     }
 
     /// Resolve a `resourceArn` request member to the `policyStoreId` of the
