@@ -2,10 +2,11 @@
 
 //! Engine state for the com-amazonaws-redshiftserverless-redshiftserverless service.
 //!
-//! The namespace + workgroup store, plus the little that every handler of that resource
-//! pair shares: the server-derived fields (id, ARN, endpoint address, creation date), the
-//! clock-owed status transition a just-created or just-modified workgroup settles
-//! through, and the opaque page token the two paginated lists hand out.
+//! The namespace + workgroup store and the usage limits taken out over them, plus the
+//! little that every handler of those resources shares: the server-derived fields (id,
+//! ARN, endpoint address, creation date), the clock-owed status transition a just-created
+//! or just-modified workgroup settles through, and the opaque page token the paginated
+//! lists hand out.
 //!
 //! `src/ops/mod.rs` is generated, so a helper more than one operation reaches lives here
 //! rather than in a second module under `src/ops/`.
@@ -13,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::ops::types::{Namespace, Tag, Workgroup};
+use crate::ops::types::{Namespace, Tag, UsageLimit, Workgroup};
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
 /// (`smithy_query(query="service_info")` -> `awsService.arnNamespace`). Also its SigV4
@@ -67,6 +68,16 @@ pub const WORKGROUP_MODIFYING: &str = "MODIFYING";
 /// See [`WORKGROUP_CREATING`].
 pub const WORKGROUP_DELETING: &str = "DELETING";
 
+/// `CreateUsageLimit`'s `period` default. From the model's `CreateUsageLimitRequest$period`
+/// doc: "The time period that the amount applies to. A weekly period begins on Sunday. The
+/// default is monthly."
+pub const DEFAULT_USAGE_LIMIT_PERIOD: &str = "monthly";
+
+/// `CreateUsageLimit`'s `breachAction` default. From the model's
+/// `CreateUsageLimitRequest$breachAction` doc: "The action that Amazon Redshift Serverless
+/// takes when the limit is reached. The default is log."
+pub const DEFAULT_USAGE_LIMIT_BREACH_ACTION: &str = "log";
+
 /// The `NamespaceStatus` values this slice reports
 /// (`smithy_query(query="shape", shape="NamespaceStatus")` -> AVAILABLE, MODIFYING,
 /// DELETING). There is no `CREATING`: a namespace holds no compute, so it is available as
@@ -96,6 +107,15 @@ pub fn namespace_arn(region: &str, namespace_id: &str) -> String {
 /// `arn:aws:redshift-serverless:<region>:<account>:workgroup/<workgroupId>`.
 pub fn workgroup_arn(region: &str, workgroup_id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("workgroup/{workgroup_id}"))
+}
+
+/// `arn:aws:redshift-serverless:<region>:<account>:usage-limit/<usageLimitId>`.
+pub fn usage_limit_arn(region: &str, usage_limit_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("usage-limit/{usage_limit_id}"),
+    )
 }
 
 /// The DNS address of the endpoint a workgroup serves:
@@ -203,6 +223,10 @@ pub struct ComAmazonawsRedshiftserverlessRedshiftserverlessState {
     pub namespaces: BTreeMap<String, NamespaceRecord>,
     /// Workgroups by `workgroupName`.
     pub workgroups: BTreeMap<String, WorkgroupRecord>,
+    /// Usage limits by `usageLimitId`, which is this resource's identity in the API:
+    /// `GetUsageLimit`, `UpdateUsageLimit` and `DeleteUsageLimit` all address them by it.
+    /// The resource is held whole, so every reader answers what the create stored.
+    pub usage_limits: BTreeMap<String, UsageLimit>,
 }
 
 impl ComAmazonawsRedshiftserverlessRedshiftserverlessState {
@@ -214,6 +238,39 @@ impl ComAmazonawsRedshiftserverlessRedshiftserverlessState {
         for record in self.workgroups.values_mut() {
             record.settle(now);
         }
+    }
+
+    /// True when `arn` is the ARN of a namespace or a workgroup this store holds — the
+    /// Redshift Serverless resources a usage limit can be created for. Compared against
+    /// the STORED ARNs rather than re-derived, so it accepts exactly what a create
+    /// returned.
+    pub fn holds_resource_arn(&self, arn: &str) -> bool {
+        self.namespaces
+            .values()
+            .any(|record| record.namespace.namespace_arn.as_deref() == Some(arn))
+            || self
+                .workgroups
+                .values()
+                .any(|record| record.workgroup.workgroup_arn.as_deref() == Some(arn))
+    }
+
+    /// The id of the usage limit already covering (`resource_arn`, `usage_type`,
+    /// `period`), if the store holds one. That triple is what a usage limit caps, so a
+    /// second limit over it would be two answers to one question and is refused.
+    pub fn usage_limit_covering(
+        &self,
+        resource_arn: &str,
+        usage_type: &str,
+        period: &str,
+    ) -> Option<&str> {
+        self.usage_limits
+            .values()
+            .find(|limit| {
+                limit.resource_arn.as_deref() == Some(resource_arn)
+                    && limit.usage_type.as_deref() == Some(usage_type)
+                    && limit.period.as_deref() == Some(period)
+            })
+            .and_then(|limit| limit.usage_limit_id.as_deref())
     }
 
     /// The names of the workgroups attached to `namespace_name`, in list order. A

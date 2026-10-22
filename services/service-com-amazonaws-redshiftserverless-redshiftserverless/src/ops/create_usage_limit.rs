@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUsageLimit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUsageLimit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a `usageLimitId` and an ARN for the limit, stores it in
+//! [`crate::state::ComAmazonawsRedshiftserverlessRedshiftserverlessState::usage_limits`]
+//! keyed by that id, and answers with the record it stored, so `GetUsageLimit` reports
+//! exactly these bytes back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUsageLimit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A limit is taken out over a Redshift Serverless resource the account holds — the ARN
+//! of one of its namespaces or workgroups — and one (resourceArn, usageType, period)
+//! triple carries at most one limit, so a second create over the same triple is a
+//! conflict rather than a second record. Those two rules also bound the store: the
+//! account's namespace and workgroup quotas times the modelled usage types and periods.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +158,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUsageLimit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUsageLimitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUsageLimit"))
+        // `amount`'s rule is documented on the member — "The value must be a positive
+        // number" — and `Long` carries no modelled range, so the boundary validator
+        // cannot have refused a zero or a negative one.
+        if input.amount <= 0 {
+            return Err(CreateUsageLimitErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!("amount {} must be a positive number", input.amount),
+                },
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateUsageLimitErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the redshift-serverless store is unreachable".to_string(),
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // A usage limit caps the usage of an EXISTING resource of this service, named by
+        // its ARN; there is nothing to cap on a resource the account does not hold.
+        if !state.holds_resource_arn(&input.resource_arn) {
+            return Err(CreateUsageLimitErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no Amazon Redshift Serverless resource with the ARN {}",
+                        input.resource_arn
+                    ),
+                    resource_name: Some(input.resource_arn.clone()),
+                },
+            )
+            .into());
+        }
+
+        let period = input
+            .period
+            .unwrap_or_else(|| crate::state::DEFAULT_USAGE_LIMIT_PERIOD.to_string());
+        let breach_action = input
+            .breach_action
+            .unwrap_or_else(|| crate::state::DEFAULT_USAGE_LIMIT_BREACH_ACTION.to_string());
+
+        // (resourceArn, usageType, period) is what a limit caps, so the store holds at
+        // most one limit over it: a second create is a conflict, not a second record.
+        if let Some(existing) =
+            state.usage_limit_covering(&input.resource_arn, &input.usage_type, &period)
+        {
+            return Err(CreateUsageLimitErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "usage limit {existing} already limits {} usage of {} per {period}",
+                    input.usage_type, input.resource_arn
+                ),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let usage_limit_id = crate::state::new_resource_id();
+        let usage_limit = UsageLimit {
+            usage_limit_arn: Some(crate::state::usage_limit_arn(&region, &usage_limit_id)),
+            usage_limit_id: Some(usage_limit_id.clone()),
+            resource_arn: Some(input.resource_arn),
+            usage_type: Some(input.usage_type),
+            amount: Some(input.amount),
+            period: Some(period),
+            breach_action: Some(breach_action),
+        };
+
+        // The answer comes out of the STORED record, so what this caller reads is what a
+        // later `GetUsageLimit` reads.
+        state.usage_limits.insert(usage_limit_id.clone(), usage_limit);
+        Ok(CreateUsageLimitOutput {
+            usage_limit: state.usage_limits.get(&usage_limit_id).cloned(),
+        })
     }
 }

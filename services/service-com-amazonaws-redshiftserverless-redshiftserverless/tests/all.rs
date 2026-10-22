@@ -15,3 +15,5 @@
 mod namespace_workgroup_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/usage_limit_lifecycle.rs"]
+mod usage_limit_lifecycle;
